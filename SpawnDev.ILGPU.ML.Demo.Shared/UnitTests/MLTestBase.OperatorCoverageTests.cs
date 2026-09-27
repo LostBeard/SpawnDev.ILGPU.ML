@@ -2083,6 +2083,36 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Op_MVN_NchwKeepChannel_MeanNearZero() => await RunTest(async accelerator =>
+    {
+        // [1,2,2,2] NCHW default axes {0,2,3} — GPU keep-channel path.
+        var input = new float[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(8);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(inBuf.View, new[] { 1, 2, 2, 2 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 1, 2, 2, 2 }) },
+            Attributes = new Dictionary<string, object> { ["axes"] = new long[] { 0, 2, 3 } },
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "X" },
+            // No ConstantValues — GPU path must not need host staging.
+        };
+        await reg.Resolve("MeanVarianceNormalization")!.ExecuteAsync(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 8);
+        // Channel 0: indices 0..3, channel 1: 4..7 — each group mean ≈ 0
+        float m0 = (result[0] + result[1] + result[2] + result[3]) / 4f;
+        float m1 = (result[4] + result[5] + result[6] + result[7]) / 4f;
+        if (MathF.Abs(m0) > 1e-4f || MathF.Abs(m1) > 1e-4f)
+            throw new Exception($"MVN channel means expected ~0, got m0={m0}, m1={m1}");
+        if (!result.Any(v => v > 0.1f) || !result.Any(v => v < -0.1f))
+            throw new Exception($"MVN expected both +/− values, got [{string.Join(",", result)}]");
+        Console.WriteLine($"[MVN] NCHW keep-channel means m0={m0:E2} m1={m1:E2} — PASS");
+    });
+
+    [TestMethod]
     public async Task Op_Compress_SelectsNonZero() => await RunTest(async accelerator =>
     {
         var input = new float[] { 10f, 20f, 30f, 40f, 50f };
@@ -2998,38 +3028,185 @@ public abstract partial class MLTestBase
         }
     });
 
-    // ── Sequence/Optional/String pass-through operators ──
-    // These operate on non-float tensor types — verify they execute without crashing
+    // ── Sequence / Optional / String / ImageDecoder (host OnnxValue) ──
 
     [TestMethod]
-    public async Task Op_SequenceTypes_Execute() => await RunTest(async accelerator =>
+    public async Task Op_SequenceConstruct_At_Length_Erase() => await RunTest(async accelerator =>
     {
+        using var aBuf = accelerator.Allocate1D(new float[] { 1, 2 });
+        using var bBuf = accelerator.Allocate1D(new float[] { 3, 4 });
+        using var lenBuf = accelerator.Allocate1D<float>(1);
+        using var atBuf = accelerator.Allocate1D<float>(2);
+        using var posBuf = accelerator.Allocate1D(new float[] { 0 });
         var reg = new OperatorRegistry(accelerator);
-        var names = new[] { "SequenceConstruct", "SequenceEmpty", "SequenceAt", "SequenceInsert",
-            "SequenceErase", "SequenceLength", "SequenceMap", "ConcatFromSequence", "SplitToSequence" };
-        foreach (var name in names)
-            if (reg.Resolve(name) == null) throw new Exception($"{name} not registered");
-        Console.WriteLine($"[Sequence] All {names.Length} sequence operators registered — PASS");
-        await Task.CompletedTask;
+        var host = new Dictionary<string, OnnxValue>();
+
+        // Construct from two tensors
+        var constructOut = new Tensor(accelerator.Allocate1D<float>(1).View, new[] { 1 }); // placeholder
+        var ctxC = MakeOpCtx(accelerator,
+            new[] { new Tensor(aBuf.View, new[] { 2 }), new Tensor(bBuf.View, new[] { 2 }) },
+            new[] { constructOut },
+            inputNames: new[] { "a", "b" }, outputNames: new[] { "seq" });
+        ctxC.HostValues = host;
+        reg.Resolve("SequenceConstruct")!.Execute(ctxC);
+        if (!host.TryGetValue("seq", out var seqVal) || seqVal.Kind != OnnxValueKind.Sequence || seqVal.AsSequence().Count != 2)
+            throw new Exception("SequenceConstruct did not produce a 2-element sequence");
+
+        // Length
+        var ctxL = MakeOpCtx(accelerator,
+            new[] { constructOut },
+            new[] { new Tensor(lenBuf.View, new[] { 1 }) },
+            inputNames: new[] { "seq" }, outputNames: new[] { "len" });
+        ctxL.HostValues = host;
+        reg.Resolve("SequenceLength")!.Execute(ctxL);
+        await accelerator.SynchronizeAsync();
+        var len = await lenBuf.CopyToHostAsync<float>(0, 1);
+        if (len[0] != 2f) throw new Exception($"SequenceLength expected 2, got {len[0]}");
+
+        // At(0)
+        var ctxA = MakeOpCtx(accelerator,
+            new[] { constructOut, new Tensor(posBuf.View, new[] { 1 }) },
+            new[] { new Tensor(atBuf.View, new[] { 2 }) },
+            inputNames: new[] { "seq", "pos" }, outputNames: new[] { "item" },
+            constants: new Dictionary<string, float[]> { ["pos"] = new float[] { 0 } });
+        ctxA.HostValues = host;
+        reg.Resolve("SequenceAt")!.Execute(ctxA);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, atBuf.View, new float[] { 1, 2 }, 0f, "SequenceAt: ");
+
+        // Erase(0) → length 1
+        var ctxE = MakeOpCtx(accelerator,
+            new[] { constructOut, new Tensor(posBuf.View, new[] { 1 }) },
+            new[] { constructOut },
+            inputNames: new[] { "seq", "pos" }, outputNames: new[] { "seq2" },
+            constants: new Dictionary<string, float[]> { ["pos"] = new float[] { 0 } });
+        ctxE.HostValues = host;
+        reg.Resolve("SequenceErase")!.Execute(ctxE);
+        if (host["seq2"].AsSequence().Count != 1)
+            throw new Exception($"SequenceErase expected length 1, got {host["seq2"].AsSequence().Count}");
+        Console.WriteLine("[Sequence] Construct/At/Length/Erase — PASS");
     });
 
     [TestMethod]
-    public async Task Op_OptionalTypes_Execute() => await RunTest(async accelerator =>
+    public async Task Op_SequenceMap_BodyRelu() => await RunTest(async accelerator =>
     {
+        // SequenceMap body = Relu: maps each tensor element through the subgraph.
+        using var aBuf = accelerator.Allocate1D(new float[] { -1f, 2f });
+        using var bBuf = accelerator.Allocate1D(new float[] { -3f, 4f });
         var reg = new OperatorRegistry(accelerator);
-        foreach (var name in new[] { "Optional", "OptionalGetElement", "OptionalHasElement" })
-            if (reg.Resolve(name) == null) throw new Exception($"{name} not registered");
-        Console.WriteLine("[Optional] All optional operators registered — PASS");
-        await Task.CompletedTask;
+        var host = new Dictionary<string, OnnxValue>
+        {
+            ["seq"] = OnnxValue.FromSequence(new[]
+            {
+                OnnxValue.FromTensor(new Tensor(aBuf.View, new[] { 2 })),
+                OnnxValue.FromTensor(new Tensor(bBuf.View, new[] { 2 })),
+            }),
+        };
+        var body = new Onnx.OnnxGraphProto
+        {
+            Name = "seqmap_relu",
+            Inputs = { new Onnx.OnnxValueInfoProto { Name = "x", Shape = { new Onnx.OnnxDimension { DimValue = 2 } } } },
+            Outputs = { new Onnx.OnnxValueInfoProto { Name = "y", Shape = { new Onnx.OnnxDimension { DimValue = 2 } } } },
+            Nodes = { new Onnx.OnnxNodeProto { OpType = "Relu", Inputs = { "x" }, Outputs = { "y" } } },
+        };
+        var placeholder = new Tensor(accelerator.Allocate1D<float>(1).View, new[] { 1 });
+        var ctx = MakeOpCtx(accelerator,
+            new[] { placeholder },
+            new[] { placeholder },
+            attrs: new Dictionary<string, object> { ["body"] = body },
+            inputNames: new[] { "seq" }, outputNames: new[] { "mapped" },
+            registry: reg);
+        ctx.HostValues = host;
+        await reg.Resolve("SequenceMap")!.ExecuteAsync(ctx);
+        await accelerator.SynchronizeAsync();
+        var mapped = host["mapped"].AsSequence();
+        if (mapped.Count != 2) throw new Exception($"SequenceMap expected 2 outputs, got {mapped.Count}");
+        if (mapped[0].Tensor == null || mapped[1].Tensor == null)
+            throw new Exception("SequenceMap outputs must be tensors");
+        await AssertCloseGpu(accelerator, mapped[0].Tensor.Data, new float[] { 0f, 2f }, 0f, "SequenceMap[0]: ");
+        await AssertCloseGpu(accelerator, mapped[1].Tensor.Data, new float[] { 0f, 4f }, 0f, "SequenceMap[1]: ");
+        Console.WriteLine("[SequenceMap] body Relu — PASS");
     });
 
     [TestMethod]
-    public async Task Op_StringTypes_Execute() => await RunTest(async accelerator =>
+    public async Task Op_Optional_RoundTrip() => await RunTest(async accelerator =>
+    {
+        using var inBuf = accelerator.Allocate1D(new float[] { 9, 8 });
+        using var outBuf = accelerator.Allocate1D<float>(2);
+        using var hasBuf = accelerator.Allocate1D<float>(1);
+        var reg = new OperatorRegistry(accelerator);
+        var host = new Dictionary<string, OnnxValue>();
+        var placeholder = new Tensor(accelerator.Allocate1D<float>(1).View, new[] { 1 });
+
+        var ctxO = MakeOpCtx(accelerator,
+            new[] { new Tensor(inBuf.View, new[] { 2 }) },
+            new[] { placeholder },
+            inputNames: new[] { "x" }, outputNames: new[] { "opt" });
+        ctxO.HostValues = host;
+        reg.Resolve("Optional")!.Execute(ctxO);
+
+        var ctxH = MakeOpCtx(accelerator,
+            new[] { placeholder },
+            new[] { new Tensor(hasBuf.View, new[] { 1 }) },
+            inputNames: new[] { "opt" }, outputNames: new[] { "has" });
+        ctxH.HostValues = host;
+        reg.Resolve("OptionalHasElement")!.Execute(ctxH);
+        await accelerator.SynchronizeAsync();
+        var has = await hasBuf.CopyToHostAsync<float>(0, 1);
+        if (has[0] != 1f) throw new Exception($"OptionalHasElement expected 1, got {has[0]}");
+
+        var ctxG = MakeOpCtx(accelerator,
+            new[] { placeholder },
+            new[] { new Tensor(outBuf.View, new[] { 2 }) },
+            inputNames: new[] { "opt" }, outputNames: new[] { "y" });
+        ctxG.HostValues = host;
+        reg.Resolve("OptionalGetElement")!.Execute(ctxG);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, new float[] { 9, 8 }, 0f, "OptionalGetElement: ");
+        Console.WriteLine("[Optional] wrap/has/get — PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_StringConcat_Normalizer_Split() => await RunTest(async accelerator =>
     {
         var reg = new OperatorRegistry(accelerator);
-        foreach (var name in new[] { "StringConcat", "StringNormalizer", "StringSplit" })
-            if (reg.Resolve(name) == null) throw new Exception($"{name} not registered");
-        Console.WriteLine("[String] All string operators registered — PASS");
+        var host = new Dictionary<string, OnnxValue>
+        {
+            ["a"] = OnnxValue.FromString("Hello"),
+            ["b"] = OnnxValue.FromString("World"),
+        };
+        using var dummy = accelerator.Allocate1D<float>(1);
+        var dummyT = new Tensor(dummy.View, new[] { 1 });
+
+        var ctxC = MakeOpCtx(accelerator, new[] { dummyT, dummyT }, new[] { dummyT },
+            inputNames: new[] { "a", "b" }, outputNames: new[] { "cat" });
+        ctxC.HostValues = host;
+        reg.Resolve("StringConcat")!.Execute(ctxC);
+        if (host["cat"].AsString() != "HelloWorld")
+            throw new Exception($"StringConcat expected HelloWorld, got {host["cat"].AsString()}");
+
+        host["s"] = OnnxValue.FromString("AbC");
+        var ctxN = MakeOpCtx(accelerator, new[] { dummyT }, new[] { dummyT },
+            inputNames: new[] { "s" }, outputNames: new[] { "n" },
+            attrs: new Dictionary<string, object> { ["case_change_action"] = "LOWER" });
+        ctxN.HostValues = host;
+        reg.Resolve("StringNormalizer")!.Execute(ctxN);
+        if (host["n"].AsString() != "abc")
+            throw new Exception($"StringNormalizer expected abc, got {host["n"].AsString()}");
+
+        host["line"] = OnnxValue.FromString("a,b,c");
+        using var lenOut = accelerator.Allocate1D<float>(3);
+        using var countOut = accelerator.Allocate1D<float>(1);
+        var ctxS = MakeOpCtx(accelerator, new[] { dummyT },
+            new[] { dummyT, new Tensor(lenOut.View, new[] { 3 }), new Tensor(countOut.View, new[] { 1 }) },
+            inputNames: new[] { "line" }, outputNames: new[] { "parts", "lens", "n" },
+            attrs: new Dictionary<string, object> { ["delimiter"] = "," });
+        ctxS.HostValues = host;
+        reg.Resolve("StringSplit")!.Execute(ctxS);
+        var parts = host["parts"].AsSequence();
+        if (parts.Count != 3 || parts[1].AsString() != "b")
+            throw new Exception("StringSplit failed");
+        Console.WriteLine("[String] Concat/Normalizer/Split — PASS");
         await Task.CompletedTask;
     });
 
@@ -3130,12 +3307,31 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Op_ImageDecoder_PassThrough() => await RunTest(async accelerator =>
+    public async Task Op_ImageDecoder_PngToFloat() => await RunTest(async accelerator =>
     {
+        // 2x2 RGB red/green/blue/white PNG via PngEncoder
+        var rgba = new byte[]
+        {
+            255,0,0,255,  0,255,0,255,
+            0,0,255,255,  255,255,255,255,
+        };
+        var png = SpawnDev.ILGPU.ML.Preprocessing.PngEncoder.Encode(rgba, 2, 2);
+        using var outBuf = accelerator.Allocate1D<float>(2 * 2 * 3);
+        using var dummyIn = accelerator.Allocate1D<float>(1);
         var reg = new OperatorRegistry(accelerator);
-        if (reg.Resolve("ImageDecoder") == null) throw new Exception("ImageDecoder not registered");
-        Console.WriteLine("[ImageDecoder] Registered — PASS (preprocessing, not tensor compute)");
-        await Task.CompletedTask;
+        var host = new Dictionary<string, OnnxValue> { ["bytes"] = OnnxValue.FromBytes(png) };
+        var ctx = MakeOpCtx(accelerator,
+            new[] { new Tensor(dummyIn.View, new[] { 1 }) },
+            new[] { new Tensor(outBuf.View, new[] { 2, 2, 3 }) },
+            inputNames: new[] { "bytes" }, outputNames: new[] { "img" });
+        ctx.HostValues = host;
+        reg.Resolve("ImageDecoder")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, 12);
+        // First pixel red ≈ (1,0,0)
+        if (MathF.Abs(got[0] - 1f) > 1e-3f || got[1] > 1e-3f || got[2] > 1e-3f)
+            throw new Exception($"ImageDecoder first pixel expected red, got ({got[0]},{got[1]},{got[2]})");
+        Console.WriteLine("[ImageDecoder] PNG→float RGB — PASS");
     });
 
     [TestMethod]
@@ -3190,6 +3386,32 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[MaxRoiPool] result: [{string.Join(",", result)}] — PASS");
     });
 
+    /// <summary>
+    /// Red-check: MaxRoiPool must work with GPU-resident inputs (no ConstantValues staging).
+    /// A Fill-zeros silent path would pass the shape and fail this oracle.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_MaxRoiPool_GpuResident_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var x = new float[] { 1,2,3,4, 5,6,7,8, 9,10,11,12, 13,14,15,16 };
+        var rois = new float[] { 0, 0, 0, 3, 3 };
+        using var xBuf = accelerator.Allocate1D(x);
+        using var roiBuf = accelerator.Allocate1D(rois);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = MakeOpCtx(accelerator,
+            new[] { new Tensor(xBuf.View, new[] { 1, 1, 4, 4 }), new Tensor(roiBuf.View, new[] { 1, 5 }) },
+            new[] { new Tensor(outBuf.View, new[] { 1, 1, 2, 2 }) },
+            attrs: new Dictionary<string, object> { ["pooled_shape"] = new long[] { 2, 2 }, ["spatial_scale"] = 1f },
+            inputNames: new[] { "X", "rois" });
+        // No constants — forces the GPU kernel path.
+        reg.Resolve("MaxRoiPool")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 4);
+        if (result[3] != 16f) throw new Exception($"MaxRoiPool GPU-resident expected 16 at [1,1], got {result[3]}");
+        Console.WriteLine($"[MaxRoiPool] GPU-resident result: [{string.Join(",", result)}] — PASS");
+    });
+
     [TestMethod]
     public async Task Op_RoiAlign_Runs() => await RunTest(async accelerator =>
     {
@@ -3211,6 +3433,28 @@ public abstract partial class MLTestBase
         bool allPositive = result.All(v => v > 0);
         if (!allPositive) throw new Exception($"RoiAlign produced non-positive values: [{string.Join(",", result)}]");
         Console.WriteLine($"[RoiAlign] result: [{string.Join(",", result.Select(v => v.ToString("F2")))}] — PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_RoiAlign_GpuResident_Runs() => await RunTest(async accelerator =>
+    {
+        var x = new float[] { 1,2,3,4, 5,6,7,8, 9,10,11,12, 13,14,15,16 };
+        var rois = new float[] { 0, 0, 3, 3 };
+        using var xBuf = accelerator.Allocate1D(x);
+        using var roiBuf = accelerator.Allocate1D(rois);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = MakeOpCtx(accelerator,
+            new[] { new Tensor(xBuf.View, new[] { 1, 1, 4, 4 }), new Tensor(roiBuf.View, new[] { 1, 4 }) },
+            new[] { new Tensor(outBuf.View, new[] { 1, 1, 2, 2 }) },
+            attrs: new Dictionary<string, object> { ["output_height"] = 2L, ["output_width"] = 2L, ["spatial_scale"] = 1f, ["sampling_ratio"] = 2L },
+            inputNames: new[] { "X", "rois" });
+        reg.Resolve("RoiAlign")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 4);
+        if (!result.All(v => v > 0))
+            throw new Exception($"RoiAlign GPU-resident non-positive: [{string.Join(",", result)}]");
+        Console.WriteLine($"[RoiAlign] GPU-resident — PASS");
     });
 
     // ═══════════════════════════════════════════════════════════

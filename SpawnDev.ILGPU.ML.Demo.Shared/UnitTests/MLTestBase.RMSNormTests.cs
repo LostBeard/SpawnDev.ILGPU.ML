@@ -145,4 +145,93 @@ public abstract partial class MLTestBase
         AssertCloseQuant(got, expected, 2e-4f, "RMSNorm not-mean-centered");
         Console.WriteLine("[RMSNorm] confirmed TRUE RMS (no mean subtraction) — floor-bug regression guard");
     });
+
+    /// <summary>
+    /// ORT contrib <c>SimplifiedLayerNormalization</c> is RMSNorm under another name — the
+    /// vision_encoder_fp16.onnx (Florence/Phi-style) path the Model Inspector flagged as unsupported
+    /// until this op was registered. Same 2-input weighted case as <see cref="RMSNorm_Weighted_MatchesCPU"/>.
+    /// </summary>
+    [TestMethod]
+    public async Task SimplifiedLayerNormalization_Weighted_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        const int rows = 7, C = 48;
+        const float eps = 1e-6f;
+        var rng = new Random(917);
+        var x = new float[rows * C];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 4 - 2);
+        var weight = new float[C];
+        for (int i = 0; i < C; i++) weight[i] = (float)(rng.NextDouble() * 1.5 + 0.25);
+
+        var expected = RmsNormCpu(x, weight, rows, C, eps);
+
+        using var inBuf = accelerator.Allocate1D(x);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        using var registry = new OperatorRegistry(accelerator);
+        var op = registry.Resolve("SimplifiedLayerNormalization");
+        var pool = new BufferPool(accelerator);
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(inBuf.View, new[] { rows, C }),
+                new Tensor(wBuf.View, new[] { C }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { rows, C }) },
+            Attributes = new Dictionary<string, object> { ["epsilon"] = eps, ["axis"] = -1 },
+            Pool = pool,
+            InputNames = new[] { "x", "scale" },
+        });
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, x.Length);
+
+        AssertCloseQuant(got, expected, 2e-4f, "SimplifiedLayerNormalization weighted");
+        Console.WriteLine("[SimplifiedLayerNormalization] weighted (2-input) matches RMSNorm CPU oracle");
+    });
+
+    [TestMethod]
+    public async Task SimplifiedLayerNormalization_WithBias_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        const int rows = 4, C = 32;
+        const float eps = 1e-5f;
+        var rng = new Random(42);
+        var x = new float[rows * C];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 4 - 2);
+        var weight = new float[C];
+        var bias = new float[C];
+        for (int i = 0; i < C; i++)
+        {
+            weight[i] = (float)(rng.NextDouble() * 1.5 + 0.25);
+            bias[i] = (float)(rng.NextDouble() * 0.5 - 0.25);
+        }
+
+        var expected = RmsNormCpu(x, weight, rows, C, eps);
+        for (int i = 0; i < expected.Length; i++) expected[i] += bias[i % C];
+
+        using var inBuf = accelerator.Allocate1D(x);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        using var registry = new OperatorRegistry(accelerator);
+        var op = registry.Resolve("SimplifiedLayerNormalization");
+        var pool = new BufferPool(accelerator);
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(inBuf.View, new[] { rows, C }),
+                new Tensor(wBuf.View, new[] { C }),
+                new Tensor(bBuf.View, new[] { C }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { rows, C }) },
+            Attributes = new Dictionary<string, object> { ["epsilon"] = eps, ["axis"] = -1 },
+            Pool = pool,
+            InputNames = new[] { "x", "scale", "B" },
+        });
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, x.Length);
+
+        AssertCloseQuant(got, expected, 2e-4f, "SimplifiedLayerNormalization + bias");
+        Console.WriteLine("[SimplifiedLayerNormalization] 3-input (scale+bias) matches RMSNorm+AddBias oracle");
+    });
 }

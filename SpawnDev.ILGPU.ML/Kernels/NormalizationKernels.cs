@@ -81,6 +81,17 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _instanceNormApplyKernel;
 
+    // MeanVarianceNormalization — contiguous [groups, red] and NCHW keep-channel paths.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, float>? _mvnContigStatsKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _mvnContigApplyKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float>? _mvnNchwChannelStatsKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int>? _mvnNchwChannelApplyKernel;
+
     // In-place apply: ONE feature buffer (data, read+write) instead of separate input+output. A SINGLE
     // read_write binding, so WebGPU's "no buffer bound to two storage slots" rule is satisfied (unlike calling
     // the two-param apply with input==output). Pass-2 reads data[idx] then writes the same [idx] AFTER pass-1
@@ -997,5 +1008,111 @@ public class NormalizationKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             int>(RMSNormApplyNoWeightImpl);
+        _mvnContigStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, float>(MVNContigStatsImpl);
+        _mvnContigApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MVNContigApplyImpl);
+        _mvnNchwChannelStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float>(MVNNchwChannelStatsImpl);
+        _mvnNchwChannelApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(MVNNchwChannelApplyImpl);
+    }
+
+    /// <summary>
+    /// Contiguous MeanVarianceNormalization: input laid out as [groups, reductionSize].
+    /// Used when reduce axes are the trailing dims (or N=1 NCHW keep-channel).
+    /// </summary>
+    public void MeanVarianceNormContiguous(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int groups, int reductionSize, float epsilon = 1e-9f)
+    {
+        EnsureLoaded();
+        var (means, invStds) = GetStatsScratch(groups);
+        _mvnContigStatsKernel!(groups, input, means.View, invStds.View, reductionSize, epsilon);
+        _mvnContigApplyKernel!(groups * reductionSize, input, output, means.View, invStds.View, reductionSize);
+    }
+
+    /// <summary>
+    /// NCHW MeanVarianceNormalization reducing axes {0,2,3} (keep channel) — ONNX default.
+    /// One mean/invStd per channel across N×H×W (strided when N&gt;1).
+    /// </summary>
+    public void MeanVarianceNormNchwKeepChannel(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int N, int C, int H, int W, float epsilon = 1e-9f)
+    {
+        EnsureLoaded();
+        var (means, invStds) = GetStatsScratch(C);
+        _mvnNchwChannelStatsKernel!(C, input, means.View, invStds.View, N, C, H, W, epsilon);
+        _mvnNchwChannelApplyKernel!(N * C * H * W, input, output, means.View, invStds.View, N, C, H, W);
+    }
+
+    private static void MVNContigStatsImpl(Index1D g,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> meanOut,
+        ArrayView1D<float, Stride1D.Dense> invStdOut,
+        int reductionSize, float eps)
+    {
+        int baseIdx = g * reductionSize;
+        float sum = 0f, sumSq = 0f;
+        for (int i = 0; i < reductionSize; i++)
+        {
+            float v = input[baseIdx + i];
+            sum += v; sumSq += v * v;
+        }
+        float mean = sum / reductionSize;
+        float var = sumSq / reductionSize - mean * mean;
+        if (var < 0f) var = 0f;
+        meanOut[g] = mean;
+        invStdOut[g] = 1f / MathF.Sqrt(var + eps);
+    }
+
+    private static void MVNContigApplyImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int reductionSize)
+    {
+        int g = idx / reductionSize;
+        output[idx] = (input[idx] - means[g]) * invStds[g];
+    }
+
+    private static void MVNNchwChannelStatsImpl(Index1D c,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> meanOut,
+        ArrayView1D<float, Stride1D.Dense> invStdOut,
+        int N, int C, int H, int W, float eps)
+    {
+        int red = N * H * W;
+        float sum = 0f, sumSq = 0f;
+        for (int n = 0; n < N; n++)
+        {
+            int nBase = (n * C + c) * H * W;
+            for (int i = 0; i < H * W; i++)
+            {
+                float v = input[nBase + i];
+                sum += v; sumSq += v * v;
+            }
+        }
+        float mean = sum / red;
+        float var = sumSq / red - mean * mean;
+        if (var < 0f) var = 0f;
+        meanOut[c] = mean;
+        invStdOut[c] = 1f / MathF.Sqrt(var + eps);
+    }
+
+    private static void MVNNchwChannelApplyImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int N, int C, int H, int W)
+    {
+        int spatial = H * W;
+        int c = (idx / spatial) % C;
+        output[idx] = (input[idx] - means[c]) * invStds[c];
     }
 }

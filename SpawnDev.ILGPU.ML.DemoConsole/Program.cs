@@ -44,6 +44,31 @@ if (args.Length >= 1 && (args[0] == "FACEDETECT" || args[0] == "DETECTPROBE"))
             if (f.Landmarks != null && f.Landmarks.Count > 0)
                 Console.WriteLine($"    landmarks=[{string.Join("; ", f.Landmarks.Select(p => $"({p.X:F0},{p.Y:F0})"))}]");
         }
+        // Machine-readable dump for oracle A/B (tools/_scratch/oracle_face_detect.py).
+        {
+            var dumpPath = Path.GetFullPath("_scratch/ours_face_portrait.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(dumpPath)!);
+            var dump = new
+            {
+                engine = "SpawnDev.ILGPU.ML",
+                backend = acc.AcceleratorType.ToString(),
+                image = "samples/portrait.jpg",
+                width = w,
+                height = h,
+                faces = result.Faces.Select(f => new
+                {
+                    conf = f.Confidence,
+                    x = f.X,
+                    y = f.Y,
+                    w = f.Width,
+                    h = f.Height,
+                    landmarks = f.Landmarks.Select(p => new[] { p.X, p.Y }).ToArray(),
+                }).ToArray(),
+            };
+            await File.WriteAllTextAsync(dumpPath, System.Text.Json.JsonSerializer.Serialize(dump,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"  wrote {dumpPath}");
+        }
         // Portrait face is roughly centered; a useful box should cover image center.
         if (result.FaceCount > 0)
         {
@@ -73,7 +98,32 @@ if (args.Length >= 1 && (args[0] == "FACEDETECT" || args[0] == "DETECTPROBE"))
         Console.WriteLine($"street {w}x{h}: objects={result.Objects.Length} in {result.InferenceTimeMs:F1}ms");
         foreach (var o in result.Objects.Take(15))
             Console.WriteLine($"  {o.Label} {o.Confidence:P0} box=({o.X:F0},{o.Y:F0},{o.Width:F0}x{o.Height:F0})");
-    }
+        {
+            var dumpPath = Path.GetFullPath("_scratch/ours_detect_street.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(dumpPath)!);
+            var dump = new
+            {
+                engine = "SpawnDev.ILGPU.ML",
+                backend = acc.AcceleratorType.ToString(),
+                image = "samples/street.jpg",
+                width = w,
+                height = h,
+                confThreshold = 0.5f,
+                objects = result.Objects.Select(o => new
+                {
+                    label = o.Label,
+                    classId = o.ClassId,
+                    conf = o.Confidence,
+                    x = o.X,
+                    y = o.Y,
+                    w = o.Width,
+                    h = o.Height,
+                }).ToArray(),
+            };
+            await File.WriteAllTextAsync(dumpPath, System.Text.Json.JsonSerializer.Serialize(dump,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"  wrote {dumpPath}");
+        }    }
     return 0;
 }
 

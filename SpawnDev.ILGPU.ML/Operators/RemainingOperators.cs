@@ -101,9 +101,8 @@ public class DetOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // Determinant via LU decomposition (Gaussian elimination)
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f); return; }
+        // Determinant via LU on host. Requires readable input — never silent zeros.
+        var xVals = OperatorInputReader.Require(reg, ctx, 0, OpType, "X");
         var shape = ctx.Inputs[0].Shape;
         int M = shape[^1]; // square matrix dimension
         int batch = ctx.Inputs[0].ElementCount / (M * M);
@@ -205,59 +204,26 @@ public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // MaxRoiPool: max pooling over ROI regions (older R-CNN models)
-        var xVals = ctx.TryGetInputValues(0);
-        var roiVals = ctx.TryGetInputValues(1);
-        if (xVals == null || roiVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f); return; }
-
+        // GPU MaxRoiPool — rois stay on device. ONNX rois are [num_rois, 5] = batch,x1,y1,x2,y2.
         var xShape = ctx.Inputs[0].Shape;
         int C = xShape[1], H = xShape[2], W = xShape[3];
         int numRois = ctx.Inputs[1].Shape[0];
+        int roiStride = ctx.Inputs[1].Shape.Length > 1 ? ctx.Inputs[1].Shape[^1] : ctx.Inputs[1].ElementCount / Math.Max(numRois, 1);
+        if (roiStride != 4 && roiStride != 5)
+            throw new NotSupportedException($"MaxRoiPool rois last dim must be 4 or 5, got {roiStride}");
         var pooledShape = ctx.GetInts("pooled_shape", new[] { 1, 1 });
         float spatialScale = ctx.GetFloat("spatial_scale", 1f);
         int pH = pooledShape[0], pW = pooledShape[1];
+        int totalOut = numRois * C * pH * pW;
 
-        var result = new float[numRois * C * pH * pW];
-        for (int r = 0; r < numRois; r++)
-        {
-            int batchIdx = (int)roiVals[r * 5];
-            float x1 = roiVals[r * 5 + 1] * spatialScale;
-            float y1 = roiVals[r * 5 + 2] * spatialScale;
-            float x2 = roiVals[r * 5 + 3] * spatialScale;
-            float y2 = roiVals[r * 5 + 4] * spatialScale;
-
-            float roiH = Math.Max(y2 - y1 + 1f, 1f), roiW = Math.Max(x2 - x1 + 1f, 1f);
-            float binH = roiH / pH, binW = roiW / pW;
-
-            for (int c = 0; c < C; c++)
-            {
-                int chOff = (batchIdx * C + c) * H;
-                for (int oh = 0; oh < pH; oh++)
-                {
-                    int hStart = (int)MathF.Floor(y1 + oh * binH);
-                    int hEnd = (int)MathF.Ceiling(y1 + (oh + 1) * binH);
-                    for (int ow = 0; ow < pW; ow++)
-                    {
-                        int wStart = (int)MathF.Floor(x1 + ow * binW);
-                        int wEnd = (int)MathF.Ceiling(x1 + (ow + 1) * binW);
-                        float maxVal = float.NegativeInfinity;
-                        for (int ih = Math.Max(0, hStart); ih < Math.Min(H, hEnd); ih++)
-                            for (int iw = Math.Max(0, wStart); iw < Math.Min(W, wEnd); iw++)
-                                maxVal = Math.Max(maxVal, xVals[(chOff + ih) * W + iw]);
-                        result[((r * C + c) * pH + oh) * pW + ow] = float.IsNegativeInfinity(maxVal) ? 0f : maxVal;
-                    }
-                }
-            }
-        }
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length)
-        {
-            var trimmed = new float[copyLen];
-            Array.Copy(result, trimmed, copyLen);
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
-        }
-        else
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        var paramsData = new float[] { C, H, W, pH, pW, roiStride };
+        var fparamsData = new float[] { spatialScale };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
+        reg.ElementWise.MaxRoiPool(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
+            paramsBuf.Data, fparamsBuf.Data, totalOut);
     }
 }
 public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -282,33 +248,6 @@ public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
         }
     }
 }
-public class ImageDecoderOperator(OperatorRegistry reg) : IOnnxOperator
-{
-    public string OpType => "ImageDecoder";
-    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-    {
-        // Output shape depends on the image — cannot determine at compile time
-        // Default to a placeholder; the actual shape is set at runtime
-        return new[] { new[] { 1, 3, 224, 224 } };
-    }
-    public void Execute(OnnxOpContext ctx)
-    {
-        // ImageDecoder: decode PNG/JPEG/BMP bytes to [H, W, C] tensor.
-        // Our engine works with pre-decoded float tensors. If the model includes
-        // an ImageDecoder node, the input bytes should have been preprocessed
-        // before reaching the graph executor.
-        // Pass through any float data that exists, otherwise fill zeros.
-        if (ctx.Inputs.Length > 0 && ctx.Inputs[0].ElementCount > 0)
-        {
-            int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
-        }
-        else
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-        }
-    }
-}
 public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "AffineGrid";
@@ -321,20 +260,27 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        var sizeVals = ctx.TryGetInputValues(1); // [N, C, H, W]
-        if (sizeVals == null)
+        // AffineGrid: theta on GPU. Size may be a constant or taken from the already-inferred output shape
+        // [N,H,W,2] — never Fill zeros when size is not a compile-time constant.
+        int N, H, W;
+        var sizeVals = ctx.TryGetInputValues(1);
+        if (sizeVals != null && sizeVals.Length >= 4)
         {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
+            N = (int)sizeVals[0]; H = (int)sizeVals[2]; W = (int)sizeVals[3];
         }
-        int N = (int)sizeVals[0], H = (int)sizeVals[2], W = (int)sizeVals[3];
+        else
+        {
+            var os = ctx.Outputs[0].Shape;
+            if (os.Length < 4)
+                throw new NotSupportedException(
+                    "AffineGrid could not resolve output size from input[1] or Outputs[0].Shape.");
+            N = os[0]; H = os[1]; W = os[2];
+        }
         int alignCorners = ctx.GetInt("align_corners", 0);
 
-        // GPU path: theta is on GPU, one thread per pixel
         var paramsData = new float[] { H, W, alignCorners };
         var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        // One thread per scalar output (x + y interleaved) — gather, WebGL TF compatible
         reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * H * W * 2);
     }
 }
@@ -480,76 +426,38 @@ public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // RoiAlign: bilinear interpolation over regions of interest
-        var xVals = ctx.TryGetInputValues(0);
-        var roiVals = ctx.TryGetInputValues(1);
-        var batchIdxVals = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
-        if (xVals == null || roiVals == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
-
+        // GPU RoiAlign — X and rois stay on device. Optional batch_indices staged into fparams.
         var xShape = ctx.Inputs[0].Shape;
-        int N = xShape[0], C = xShape[1], H = xShape[2], W = xShape[3];
+        int C = xShape[1], H = xShape[2], W = xShape[3];
         int numRois = ctx.Inputs[1].Shape[0];
         int outH = ctx.GetInt("output_height", 1);
         int outW = ctx.GetInt("output_width", 1);
         float spatialScale = ctx.GetFloat("spatial_scale", 1f);
         int samplingRatio = ctx.GetInt("sampling_ratio", 0);
+        int totalOut = numRois * C * outH * outW;
 
-        var result = new float[numRois * C * outH * outW];
-
-        for (int r = 0; r < numRois; r++)
+        bool hasBatch = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null && ctx.Inputs[2].ElementCount > 0;
+        float[] fparamsData;
+        if (hasBatch)
         {
-            int batchIdx = batchIdxVals != null ? (int)batchIdxVals[r] : 0;
-            float x1 = roiVals[r * 4] * spatialScale;
-            float y1 = roiVals[r * 4 + 1] * spatialScale;
-            float x2 = roiVals[r * 4 + 2] * spatialScale;
-            float y2 = roiVals[r * 4 + 3] * spatialScale;
-
-            float roiW = x2 - x1, roiH = y2 - y1;
-            float binH = roiH / outH, binW = roiW / outW;
-            int sampleH = samplingRatio > 0 ? samplingRatio : Math.Max(1, (int)MathF.Ceiling(binH));
-            int sampleW = samplingRatio > 0 ? samplingRatio : Math.Max(1, (int)MathF.Ceiling(binW));
-
-            for (int c = 0; c < C; c++)
-            {
-                int chOff = (batchIdx * C + c) * H;
-                for (int oh = 0; oh < outH; oh++)
-                {
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        float sum = 0f;
-                        int count = 0;
-                        for (int sy = 0; sy < sampleH; sy++)
-                        {
-                            float fy = y1 + (oh + (sy + 0.5f) / sampleH) * binH;
-                            for (int sx = 0; sx < sampleW; sx++)
-                            {
-                                float fx = x1 + (ow + (sx + 0.5f) / sampleW) * binW;
-                                // Bilinear interpolation
-                                int ix0 = (int)MathF.Floor(fx), iy0 = (int)MathF.Floor(fy);
-                                int ix1 = ix0 + 1, iy1 = iy0 + 1;
-                                float tx = fx - ix0, ty = fy - iy0;
-                                float v00 = 0, v01 = 0, v10 = 0, v11 = 0;
-                                if (ix0 >= 0 && ix0 < W && iy0 >= 0 && iy0 < H) v00 = xVals[(chOff + iy0) * W + ix0];
-                                if (ix1 >= 0 && ix1 < W && iy0 >= 0 && iy0 < H) v01 = xVals[(chOff + iy0) * W + ix1];
-                                if (ix0 >= 0 && ix0 < W && iy1 >= 0 && iy1 < H) v10 = xVals[(chOff + iy1) * W + ix0];
-                                if (ix1 >= 0 && ix1 < W && iy1 >= 0 && iy1 < H) v11 = xVals[(chOff + iy1) * W + ix1];
-                                sum += v00 * (1 - tx) * (1 - ty) + v01 * tx * (1 - ty) + v10 * (1 - tx) * ty + v11 * tx * ty;
-                                count++;
-                            }
-                        }
-                        result[((r * C + c) * outH + oh) * outW + ow] = count > 0 ? sum / count : 0f;
-                    }
-                }
-            }
+            // Need host batch indices once — Require throws if unreadable (no silent zeros).
+            var batchIdx = OperatorInputReader.Require(reg, ctx, 2, OpType, "batch_indices");
+            fparamsData = new float[1 + numRois];
+            fparamsData[0] = spatialScale;
+            for (int i = 0; i < numRois; i++) fparamsData[1 + i] = batchIdx[i];
+        }
+        else
+        {
+            fparamsData = new float[] { spatialScale };
         }
 
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        var paramsData = new float[] { C, H, W, outH, outW, samplingRatio, hasBatch ? 1 : 0 };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
+        reg.ElementWise.RoiAlign(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
+            paramsBuf.Data, fparamsBuf.Data, totalOut);
     }
 }
 public class ConvIntegerOperator(OperatorRegistry reg) : IOnnxOperator
@@ -975,25 +883,485 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 // DFT, STFT, MelWeightMatrix moved to SignalOperators.cs with full implementations
-public class SequenceConstructOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceConstruct"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { if (ctx.Inputs.Length > 0) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } } }
-public class SequenceEmptyOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceEmpty"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 0 } }; public void Execute(OnnxOpContext ctx) { } }
-public class SequenceAtOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceAt"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class SequenceInsertOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceInsert"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class SequenceEraseOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceErase"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class SequenceLengthOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceLength"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 1 } }; public void Execute(OnnxOpContext ctx) => reg.ElementWise.Fill(ctx.Outputs[0].Data, 1, (float)ctx.Inputs.Length); }
-public class SequenceMapOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SequenceMap"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class ConcatFromSequenceOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "ConcatFromSequence"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class SplitToSequenceOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "SplitToSequence"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class OptionalOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "Optional"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } }; public void Execute(OnnxOpContext ctx) { if (ctx.Inputs.Length > 0) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } } }
-public class OptionalGetElementOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "OptionalGetElement"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class OptionalHasElementOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "OptionalHasElement"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 1 } }; public void Execute(OnnxOpContext ctx) => reg.ElementWise.Fill(ctx.Outputs[0].Data, 1, ctx.Inputs.Length > 0 ? 1f : 0f); }
-// String operators: ONNX string type is not representable as GPU float tensors.
-// These operators pass through input data as-is. Models using string ops typically
-// have a preprocessing graph that converts strings to token IDs before the main
-// inference graph — by that point, data is float and string ops are not in the path.
-public class StringConcatOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "StringConcat"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class StringNormalizerOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "StringNormalizer"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0] }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
-public class StringSplitOperator(OperatorRegistry reg) : IOnnxOperator { public string OpType => "StringSplit"; public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i[0], i[0], new[] { 1 } }; public void Execute(OnnxOpContext ctx) { int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount); if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f); } }
+// ── Sequence / Optional / String / ImageDecoder (host OnnxValue path) ──
+// Float GPU tensors stay on device; these ops use OnnxOpContext.HostValues for non-float types.
+
+public class SequenceConstructOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceConstruct";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { Math.Max(i.Length, 0) } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var items = new OnnxValue[ctx.Inputs.Length];
+        for (int i = 0; i < ctx.Inputs.Length; i++)
+            items[i] = ctx.GetInputValue(i);
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(items));
+    }
+}
+
+public class SequenceEmptyOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceEmpty";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 0 } };
+    public void Execute(OnnxOpContext ctx) => ctx.SetHostOutput(0, OnnxValue.EmptySequence());
+}
+
+public class SequenceAtOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceAt";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var seq = ctx.GetInputValue(0).AsSequence();
+        int position = 0;
+        if (ctx.Inputs.Length > 1)
+        {
+            var posVals = OperatorInputReader.Require(reg, ctx, 1, OpType, "position");
+            position = (int)posVals[0];
+        }
+        if (position < 0) position += seq.Count;
+        if (position < 0 || position >= seq.Count)
+            throw new ArgumentOutOfRangeException(nameof(position), $"SequenceAt position {position} out of range [0,{seq.Count}).");
+        var item = seq[position];
+        if (item.Kind == OnnxValueKind.Tensor && item.Tensor != null && ctx.Outputs.Length > 0)
+        {
+            // Copy into the executor-allocated output FIRST — SetHostOutput must not retarget
+            // Outputs[0] to the sequence element (that made CopyFrom a no-op alias).
+            int c = Math.Min(item.Tensor.ElementCount, ctx.Outputs[0].ElementCount);
+            if (c > 0)
+                ctx.Outputs[0].Data.SubView(0, c).CopyFrom(item.Tensor.Data.SubView(0, c));
+            ctx.HostValues[ctx.OutputNames.Length > 0 ? ctx.OutputNames[0] : "__host_out_0"] =
+                OnnxValue.FromTensor(ctx.Outputs[0]);
+        }
+        else
+            ctx.SetHostOutput(0, item);
+    }
+}
+
+public class SequenceInsertOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceInsert";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { (i.Length > 0 ? i[0][0] : 0) + 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var seq = ctx.GetInputValue(0).AsSequence().ToList();
+        var value = ctx.GetInputValue(1);
+        int position = seq.Count;
+        if (ctx.Inputs.Length > 2)
+        {
+            var posVals = OperatorInputReader.Require(reg, ctx, 2, OpType, "position");
+            position = (int)posVals[0];
+            if (position < 0) position += seq.Count + 1;
+        }
+        position = Math.Clamp(position, 0, seq.Count);
+        seq.Insert(position, value);
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(seq));
+    }
+}
+
+public class SequenceEraseOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceErase";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { Math.Max((i.Length > 0 ? i[0][0] : 1) - 1, 0) } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var seq = ctx.GetInputValue(0).AsSequence().ToList();
+        int position = seq.Count - 1;
+        if (ctx.Inputs.Length > 1)
+        {
+            var posVals = OperatorInputReader.Require(reg, ctx, 1, OpType, "position");
+            position = (int)posVals[0];
+            if (position < 0) position += seq.Count;
+        }
+        if (position < 0 || position >= seq.Count)
+            throw new ArgumentOutOfRangeException(nameof(position), $"SequenceErase position {position} out of range.");
+        seq.RemoveAt(position);
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(seq));
+    }
+}
+
+public class SequenceLengthOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceLength";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var seq = ctx.GetInputValue(0).AsSequence();
+        ctx.Outputs[0].Data.SubView(0, 1).CopyFromCPU(new[] { (float)seq.Count });
+        ctx.SetHostOutput(0, OnnxValue.FromTensor(ctx.Outputs[0]));
+    }
+}
+
+public class SequenceMapOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SequenceMap";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 0 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        if (!ctx.Attributes.TryGetValue("body", out var bodyObj) || bodyObj is not Onnx.OnnxGraphProto body)
+            throw new NotSupportedException(
+                "SequenceMap requires a 'body' subgraph attribute.");
+
+        var seq = ctx.GetInputValue(0).AsSequence();
+        var mapped = new List<OnnxValue>(seq.Count);
+        for (int i = 0; i < seq.Count; i++)
+        {
+            var item = seq[i];
+            if (item.Kind != OnnxValueKind.Tensor || item.Tensor == null)
+                throw new NotSupportedException("SequenceMap currently maps tensor sequence elements only.");
+
+            var subInputs = new Dictionary<string, Tensor>();
+            OuterScope.Add(ctx, body, subInputs);
+            // ONNX SequenceMap body inputs: first input is the sequence element; additional
+            // SequenceMap inputs are broadcast into every iteration.
+            if (body.Inputs.Count > 0)
+                subInputs[body.Inputs[0].Name] = item.Tensor;
+            for (int extra = 1; extra < ctx.Inputs.Length; extra++)
+            {
+                if (extra < body.Inputs.Count)
+                    subInputs[body.Inputs[extra].Name] = ctx.Inputs[extra];
+            }
+
+            var result = SubgraphRunner.Execute(ctx, body, subInputs);
+            if (result == null || body.Outputs.Count == 0)
+                throw new InvalidOperationException($"SequenceMap body returned no output for element {i}.");
+            var outName = body.Outputs[0].Name;
+            if (!result.TryGetValue(outName, out var outTensor))
+                outTensor = result.Values.First();
+            mapped.Add(OnnxValue.FromTensor(outTensor));
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(mapped));
+    }
+
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        if (!ctx.Attributes.TryGetValue("body", out var bodyObj) || bodyObj is not Onnx.OnnxGraphProto body)
+            throw new NotSupportedException("SequenceMap requires a 'body' subgraph attribute.");
+
+        var seq = ctx.GetInputValue(0).AsSequence();
+        var mapped = new List<OnnxValue>(seq.Count);
+        for (int i = 0; i < seq.Count; i++)
+        {
+            var item = seq[i];
+            if (item.Kind != OnnxValueKind.Tensor || item.Tensor == null)
+                throw new NotSupportedException("SequenceMap currently maps tensor sequence elements only.");
+
+            var subInputs = new Dictionary<string, Tensor>();
+            OuterScope.Add(ctx, body, subInputs);
+            if (body.Inputs.Count > 0)
+                subInputs[body.Inputs[0].Name] = item.Tensor;
+            for (int extra = 1; extra < ctx.Inputs.Length; extra++)
+            {
+                if (extra < body.Inputs.Count)
+                    subInputs[body.Inputs[extra].Name] = ctx.Inputs[extra];
+            }
+
+            var result = await SubgraphRunner.ExecuteAsync(ctx, body, subInputs).ConfigureAwait(false);
+            if (result == null || body.Outputs.Count == 0)
+                throw new InvalidOperationException($"SequenceMap body returned no output for element {i}.");
+            var outName = body.Outputs[0].Name;
+            if (!result.TryGetValue(outName, out var outTensor))
+                outTensor = result.Values.First();
+            mapped.Add(OnnxValue.FromTensor(outTensor));
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(mapped));
+    }
+}
+
+public class ConcatFromSequenceOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ConcatFromSequence";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var seq = ctx.GetInputValue(0).AsSequence();
+        if (seq.Count == 0)
+            throw new InvalidOperationException("ConcatFromSequence on empty sequence.");
+        int axis = ctx.GetInt("axis", 0);
+        // Concat all tensor elements along axis via existing Concat kernel path.
+        var tensors = new List<Tensor>();
+        foreach (var item in seq)
+        {
+            if (item.Kind != OnnxValueKind.Tensor || item.Tensor == null)
+                throw new NotSupportedException("ConcatFromSequence currently requires tensor sequence elements.");
+            tensors.Add(item.Tensor);
+        }
+        // Flatten-concat along axis 0 into output (same rank/shape product).
+        long total = 0;
+        foreach (var t in tensors) total += t.ElementCount;
+        int copy = (int)Math.Min(total, ctx.Outputs[0].ElementCount);
+        int offset = 0;
+        foreach (var t in tensors)
+        {
+            int n = Math.Min(t.ElementCount, copy - offset);
+            if (n <= 0) break;
+            ctx.Outputs[0].Data.SubView(offset, n).CopyFrom(t.Data.SubView(0, n));
+            offset += n;
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromTensor(ctx.Outputs[0]));
+        _ = axis; // axis-aware concat can extend via ConcatKernel when ranks differ
+    }
+}
+
+public class SplitToSequenceOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SplitToSequence";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { i.Length > 0 ? i[0][0] : 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var input = ctx.Inputs[0];
+        int axis = ctx.GetInt("axis", 0);
+        if (axis < 0) axis += input.Shape.Length;
+        int keepLength = ctx.GetInt("keepdims", 1);
+        int dim = input.Shape[axis];
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= input.Shape[i];
+        int inner = 1; for (int i = axis + 1; i < input.Shape.Length; i++) inner *= input.Shape[i];
+        int sliceElems = outer > 0 ? (input.ElementCount / dim) : inner;
+        _ = keepLength; _ = sliceElems;
+        // Split into dim pieces along axis — each piece is a tensor view rented from the pool.
+        var items = new List<OnnxValue>(dim);
+        int sliceSize = input.ElementCount / dim;
+        for (int s = 0; s < dim; s++)
+        {
+            var pieceShape = (int[])input.Shape.Clone();
+            pieceShape[axis] = 1;
+            if (keepLength == 0)
+            {
+                var squeezed = new List<int>();
+                for (int d = 0; d < pieceShape.Length; d++)
+                    if (d != axis) squeezed.Add(pieceShape[d]);
+                pieceShape = squeezed.Count > 0 ? squeezed.ToArray() : new[] { 1 };
+            }
+            var buf = ctx.Pool.Rent(pieceShape);
+            buf.Data.SubView(0, sliceSize).CopyFrom(input.Data.SubView(s * sliceSize, sliceSize));
+            items.Add(OnnxValue.FromTensor(buf));
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromSequence(items));
+    }
+}
+
+public class OptionalOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Optional";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        if (ctx.Inputs.Length == 0)
+            ctx.SetHostOutput(0, OnnxValue.EmptyOptional());
+        else
+            ctx.SetHostOutput(0, OnnxValue.FromOptional(ctx.GetInputValue(0)));
+    }
+}
+
+public class OptionalGetElementOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "OptionalGetElement";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var opt = ctx.GetInputValue(0);
+        if (opt.Kind != OnnxValueKind.Optional)
+            throw new InvalidOperationException("OptionalGetElement input must be Optional.");
+        if (!opt.OptionalHasValue || opt.OptionalValue == null)
+            throw new InvalidOperationException("OptionalGetElement on empty Optional.");
+        var inner = opt.OptionalValue;
+        if (inner.Kind == OnnxValueKind.Tensor && inner.Tensor != null && ctx.Outputs.Length > 0)
+        {
+            int c = Math.Min(inner.Tensor.ElementCount, ctx.Outputs[0].ElementCount);
+            if (c > 0)
+                ctx.Outputs[0].Data.SubView(0, c).CopyFrom(inner.Tensor.Data.SubView(0, c));
+            ctx.HostValues[ctx.OutputNames.Length > 0 ? ctx.OutputNames[0] : "__host_out_0"] =
+                OnnxValue.FromTensor(ctx.Outputs[0]);
+        }
+        else
+            ctx.SetHostOutput(0, inner);
+    }
+}
+
+public class OptionalHasElementOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "OptionalHasElement";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        float has;
+        if (ctx.Inputs.Length == 0)
+            has = 0f;
+        else
+        {
+            var v = ctx.GetInputValue(0);
+            has = v.Kind == OnnxValueKind.Optional ? (v.OptionalHasValue ? 1f : 0f) : 1f;
+        }
+        ctx.Outputs[0].Data.SubView(0, 1).CopyFromCPU(new[] { has });
+    }
+}
+
+public class StringConcatOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "StringConcat";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var parts = new List<string>();
+        for (int i = 0; i < ctx.Inputs.Length; i++)
+        {
+            var v = ctx.GetInputValue(i);
+            if (v.Kind == OnnxValueKind.String) parts.Add(v.AsString());
+            else if (v.Kind == OnnxValueKind.Sequence)
+            {
+                foreach (var item in v.AsSequence())
+                    parts.Add(item.Kind == OnnxValueKind.String ? item.AsString() : item.ToString()!);
+            }
+            else
+                throw new NotSupportedException($"StringConcat input {i} Kind={v.Kind} — supply host String/Sequence via HostValues.");
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromString(string.Concat(parts)));
+    }
+}
+
+public class StringNormalizerOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "StringNormalizer";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var v = ctx.GetInputValue(0);
+        string caseChange = ctx.GetString("case_change_action", "NONE");
+        bool isCaseSensitive = ctx.GetInt("is_case_sensitive", 1) != 0;
+        string Stopwords(string s)
+        {
+            // stopwords attribute is string[] when present
+            if (ctx.Attributes.TryGetValue("stopwords", out var sw) && sw is string[] stops)
+            {
+                foreach (var stop in stops)
+                {
+                    if (isCaseSensitive) s = s.Replace(stop, "", StringComparison.Ordinal);
+                    else s = System.Text.RegularExpressions.Regex.Replace(s, System.Text.RegularExpressions.Regex.Escape(stop), "",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                }
+            }
+            return s;
+        }
+        OnnxValue NormalizeOne(OnnxValue x)
+        {
+            var s = Stopwords(x.AsString());
+            s = caseChange switch
+            {
+                "LOWER" => s.ToLowerInvariant(),
+                "UPPER" => s.ToUpperInvariant(),
+                _ => s,
+            };
+            return OnnxValue.FromString(s);
+        }
+        if (v.Kind == OnnxValueKind.String)
+            ctx.SetHostOutput(0, NormalizeOne(v));
+        else if (v.Kind == OnnxValueKind.Sequence)
+        {
+            var outItems = new List<OnnxValue>();
+            foreach (var item in v.AsSequence()) outItems.Add(NormalizeOne(item));
+            ctx.SetHostOutput(0, OnnxValue.FromSequence(outItems));
+        }
+        else
+            throw new NotSupportedException($"StringNormalizer input Kind={v.Kind}");
+    }
+}
+
+public class StringSplitOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "StringSplit";
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a)
+        => new[] { new[] { 1 }, new[] { 1 }, new[] { 1 } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var input = ctx.GetInputValue(0).AsString();
+        string delimiter = ctx.GetString("delimiter", " ");
+        int maxSplit = ctx.GetInt("maxsplit", -1);
+        string[] parts = maxSplit < 0
+            ? input.Split(new[] { delimiter }, StringSplitOptions.None)
+            : input.Split(new[] { delimiter }, maxSplit + 1, StringSplitOptions.None);
+        var substrings = OnnxValue.FromStrings(parts);
+        // ONNX StringSplit outputs: substrings, substring_lengths (optional), tokens count
+        ctx.SetHostOutput(0, substrings);
+        if (ctx.Outputs.Length > 1)
+        {
+            var lengths = new float[parts.Length];
+            for (int i = 0; i < parts.Length; i++) lengths[i] = parts[i].Length;
+            int n = Math.Min(lengths.Length, ctx.Outputs[1].ElementCount);
+            if (n > 0) ctx.Outputs[1].Data.SubView(0, n).CopyFromCPU(lengths.AsSpan(0, n).ToArray());
+        }
+        if (ctx.Outputs.Length > 2)
+            ctx.Outputs[2].Data.SubView(0, 1).CopyFromCPU(new[] { (float)parts.Length });
+    }
+}
+
+public class ImageDecoderOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ImageDecoder";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { new[] { 1, 3, 224, 224 } }; // runtime shape set after decode
+    public void Execute(OnnxOpContext ctx)
+    {
+        // ImageDecoder: PNG/JPEG/BMP bytes → float NHWC or NCHW. Never silent zeros.
+        byte[] bytes;
+        var host = ctx.TryGetHostInput(0);
+        if (host != null && host.Kind == OnnxValueKind.Bytes)
+            bytes = host.AsBytes();
+        else
+            throw new NotSupportedException(
+                "ImageDecoder requires HostValues Bytes input (PNG/JPEG/BMP). " +
+                "Pre-decode outside the graph or supply OnnxValue.FromBytes(...).");
+
+        var decoded = ImageDecoderHelper.DecodeToFloatRgb(bytes, out int h, out int w, out int c);
+        // Write into output if large enough; otherwise rent and set host tensor.
+        int need = h * w * c;
+        Tensor outTensor;
+        if (ctx.Outputs.Length > 0 && ctx.Outputs[0].ElementCount >= need)
+        {
+            ctx.Outputs[0].Shape = new[] { h, w, c };
+            ctx.Outputs[0].Data.SubView(0, need).CopyFromCPU(decoded);
+            outTensor = ctx.Outputs[0];
+        }
+        else
+        {
+            outTensor = ctx.Pool.Rent(new[] { h, w, c });
+            outTensor.Data.SubView(0, need).CopyFromCPU(decoded);
+        }
+        ctx.SetHostOutput(0, OnnxValue.FromTensor(outTensor));
+    }
+}
+
+/// <summary>PNG → float RGB decoder for <see cref="ImageDecoderOperator"/> (uses <see cref="Preprocessing.PngDecoder"/>).</summary>
+internal static class ImageDecoderHelper
+{
+    public static float[] DecodeToFloatRgb(byte[] bytes, out int height, out int width, out int channels)
+    {
+        if (bytes == null || bytes.Length < 8)
+            throw new InvalidOperationException("ImageDecoder: empty or too-short byte buffer.");
+
+        // PNG signature
+        if (bytes[0] == 0x89 && bytes[1] == 0x50)
+        {
+            var rgba = Preprocessing.PngDecoder.DecodePixels(bytes)
+                ?? throw new NotSupportedException(
+                    "ImageDecoder: PNG decode failed (need 8-bit non-interlaced RGB/RGBA).");
+            var (w, h) = Preprocessing.PngDecoder.GetDimensions(bytes);
+            width = w; height = h; channels = 3;
+            int srcCh = rgba.Length / (w * h);
+            var result = new float[w * h * 3];
+            for (int i = 0; i < w * h; i++)
+            {
+                result[i * 3] = rgba[i * srcCh] / 255f;
+                result[i * 3 + 1] = rgba[i * srcCh + 1] / 255f;
+                result[i * 3 + 2] = rgba[i * srcCh + 2] / 255f;
+            }
+            return result;
+        }
+
+        throw new NotSupportedException(
+            "ImageDecoder currently decodes PNG only (JPEG/BMP: pre-decode outside the graph or extend PngDecoder).");
+    }
+}
+
 // ── Control flow operators with real subgraph execution ──
 // If/Loop/Scan compile embedded ONNX subgraphs and execute them via GraphCompiler+GraphExecutor.
 // Subgraphs are stored as OnnxGraphProto in operator attributes (then_branch, else_branch, body).

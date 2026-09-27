@@ -223,6 +223,29 @@ public class RMSNormOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
+        => RmsNormExecute.Run(reg, ctx, allowOptionalBias: false);
+}
+
+/// <summary>
+/// Microsoft ONNX Runtime contrib op — mathematically identical to <c>RMSNormalization</c>
+/// (no mean subtraction): <c>Y = (X / sqrt(Mean(X^2)+eps)) * scale [+ B]</c>.
+/// Vision encoders (Florence / Phi / similar) export this name instead of the ONNX-standard
+/// <c>RMSNormalization</c>. Optional bias (3rd input) is applied via <c>AddBias</c> after the norm.
+/// </summary>
+public class SimplifiedLayerNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SimplifiedLayerNormalization";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+        => RmsNormExecute.Run(reg, ctx, allowOptionalBias: true);
+}
+
+/// <summary>Shared Execute body for <see cref="RMSNormOperator"/> and
+/// <see cref="SimplifiedLayerNormalizationOperator"/>.</summary>
+file static class RmsNormExecute
+{
+    public static void Run(OperatorRegistry reg, OnnxOpContext ctx, bool allowOptionalBias)
     {
         int axis = ctx.GetInt("axis", -1);
         float eps = ctx.GetFloat("epsilon", 1e-6f);
@@ -232,11 +255,18 @@ public class RMSNormOperator(OperatorRegistry reg) : IOnnxOperator
         int C = 1; for (int i = axis; i < shape.Length; i++) C *= shape[i];
 
         bool hasWeight = ctx.Inputs.Length > 1 && ctx.Inputs[1] != null;
+        bool hasBias = allowOptionalBias && ctx.Inputs.Length > 2 && ctx.Inputs[2] != null;
+
+        var outData = ctx.Outputs[0].Data;
         if (hasWeight)
-            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
-                ctx.Inputs[1].Data, rows, C, eps);
+            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, outData, ctx.Inputs[1].Data, rows, C, eps);
         else
-            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, rows, C, eps);
+            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, outData, rows, C, eps);
+
+        // ORT contrib SimplifiedLayerNormalization optional B: last-dim broadcast add.
+        // AddBias is in-place on outData (separate dispatch from RMSNorm — no aliasing).
+        if (hasBias)
+            reg.ElementWise.AddBias(outData, ctx.Inputs[2].Data, (int)outData.Length, C);
     }
 }
 
@@ -2699,14 +2729,9 @@ public class NonMaxSuppressionOperator(OperatorRegistry reg) : IOnnxOperator
         if (ctx.Inputs.Length > 3) { var v = ctx.TryGetInputValues(3); if (v != null && v.Length > 0) iouThreshold = v[0]; }
         if (ctx.Inputs.Length > 4) { var v = ctx.TryGetInputValues(4); if (v != null && v.Length > 0) scoreThreshold = v[0]; }
 
-        // Read boxes and scores to CPU (NMS is small data, CPU is fine)
-        var boxVals = ctx.TryGetInputValues(0);
-        var scoreVals = ctx.TryGetInputValues(1);
-        if (boxVals == null || scoreVals == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
+        // Read boxes and scores to CPU (NMS is small data, CPU is fine). Never silent zeros.
+        var boxVals = OperatorInputReader.Require(reg, ctx, 0, OpType, "boxes");
+        var scoreVals = OperatorInputReader.Require(reg, ctx, 1, OpType, "scores");
 
         var boxShape = ctx.Inputs[0].Shape; // [N, num_boxes, 4]
         var scoreShape = ctx.Inputs[1].Shape; // [N, num_classes, num_boxes]

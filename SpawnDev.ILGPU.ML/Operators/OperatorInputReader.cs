@@ -102,8 +102,33 @@ internal static class OperatorInputReader
         var name = index < ctx.InputNames.Length ? ctx.InputNames[index] : null;
         if (!string.IsNullOrEmpty(name) && cache.TryGetValue(name, out var hit)) return hit;
 
-        var vals = await ReadAsync(reg, ctx, index);
+        var vals = await ReadAsync(reg, ctx, index).ConfigureAwait(false);
         if (vals != null && !string.IsNullOrEmpty(name)) cache[name] = vals;
+        return vals;
+    }
+
+    /// <summary>
+    /// Host values for input <paramref name="index"/>, or throws if unreadable.
+    /// Prefer this over Fill-zeros / CopyFrom-identity when an op cannot run without host data.
+    /// </summary>
+    public static float[] Require(OperatorRegistry reg, OnnxOpContext ctx, int index, string opType, string inputLabel)
+    {
+        var vals = Read(reg, ctx, index);
+        if (vals == null)
+            throw new NotSupportedException(
+                $"{opType} could not read input '{inputLabel}' (index {index}). " +
+                "On browser backends implement ExecuteAsync and use ReadAsync; " +
+                "never Fill zeros or pass the input through unchanged.");
+        return vals;
+    }
+
+    /// <summary>Browser-safe host values, or throws (same contract as <see cref="Require"/>).</summary>
+    public static async Task<float[]> RequireAsync(OperatorRegistry reg, OnnxOpContext ctx, int index, string opType, string inputLabel)
+    {
+        var vals = await ReadAsync(reg, ctx, index).ConfigureAwait(false);
+        if (vals == null)
+            throw new NotSupportedException(
+                $"{opType} could not read input '{inputLabel}' (index {index}).");
         return vals;
     }
 }

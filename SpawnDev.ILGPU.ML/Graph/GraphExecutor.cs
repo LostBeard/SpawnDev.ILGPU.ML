@@ -1101,6 +1101,8 @@ public class GraphExecutor : IDisposable
     {
         // Tensor registry: maps value names to tensors
         var tensors = new Dictionary<string, Tensor>();
+        // Host-side Sequence/Optional/String/Bytes values (shared for the whole run).
+        var hostValues = new Dictionary<string, OnnxValue>(StringComparer.Ordinal);
 
         // Register inputs
         foreach (var (name, tensor) in inputs)
@@ -1971,10 +1973,12 @@ public class GraphExecutor : IDisposable
                 Pool = _pool,
                 Format = Format,
                 InputNames = node.InputNames,
+                OutputNames = node.OutputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
                 IntegerTensorNames = _integerTensorNames,
+                HostValues = hostValues,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
             // An operator whose outputs are ALL empty has nothing to compute, and running it anyway means
@@ -2803,6 +2807,7 @@ public class GraphExecutor : IDisposable
         var _runSw = System.Diagnostics.Stopwatch.StartNew();
         var _drainSw = new System.Diagnostics.Stopwatch();
         var tensors = new Dictionary<string, Tensor>();
+        var hostValues = new Dictionary<string, OnnxValue>(StringComparer.Ordinal);
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
 
@@ -4315,6 +4320,7 @@ public class GraphExecutor : IDisposable
                 Pool = _pool,
                 Format = Format,
                 InputNames = node.InputNames,
+                OutputNames = node.OutputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
@@ -4322,6 +4328,7 @@ public class GraphExecutor : IDisposable
                 // The live tensor map, so control-flow bodies can resolve outer-scope references. Passed by
                 // reference - no copy - and read only by If/Loop/Scan.
                 ScopeTensors = tensors,
+                HostValues = hostValues,
             };
             // ── LFM2 short-conv decode intercept (conv analogue of the FusedAttention KV intercept above) ──
             // When the conv-state cache is active, run ShortConv THROUGH it so a decode step (pastLen>0) sees

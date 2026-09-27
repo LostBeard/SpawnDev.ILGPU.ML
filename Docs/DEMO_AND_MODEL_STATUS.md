@@ -41,7 +41,7 @@
 | `/explain` | Model explainability | 🟡 **PARTIAL** | Intercepts the executor; works on a limited set of models |
 | `/train` | On-device training (Draw to Learn) | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` |
 | `/image-to-3d` | Image → 3D model | 🚧 **WIP** | Coming-soon banner honest. `GenerateModel()` is a **no-op**; download/open empty |
-| `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — currently **204**) |
+| `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — see [operators.md](operators.md)) |
 | `/pipelines` | Pipeline catalog | Meta | Status badges must match this doc |
 | `/getting-started` | Getting started | Doc | Install + first-run walkthrough |
 | `/models` | Model browser | Meta | HuggingFace hub browser |
@@ -77,7 +77,7 @@
   - `tools/drive-ml-pages-smoke.cs` — every route mounts (no pageerror).
   - `tools/drive-ml-pages.cs` — verified routes that can seed inputs and assert a **result element**.
   Two rules the driver encodes the hard way: a page's logging is incidental (EmbeddingsPage logs ONLY on error), and a page that validates its inputs no-ops silently when you seed only the first one. Only routes marked ✅ VERIFIED belong in the inference gate table.
-- **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` — never hardcode it again.
+- **Operator support** — code SSO is `OperatorRegistry.BuiltinOpTypes`; human doc is [operators.md](operators.md). Count is rendered live on Home — never hardcode it again.
 - **Before any "N tests passing" claim**, cite the latest PMT results JSON, not a memorized number.
 - **A demo graduates to ✅ VERIFIED only when a passing E2E test is cited here.** Adding a page is not the same as verifying it.
 - **`/pipelines` badges, nav menu badges, and README demo blurbs must not contradict this table.** Nav mapping: VERIFIED = no badge, PARTIAL = `beta`, WIP = `soon`. If they diverge, this file wins — fix the page/README/nav.

@@ -938,50 +938,74 @@ public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOper
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // MVN: normalize over specified axes (default: 0,2,3 = batch+spatial, keep channel)
-        // y = (x - mean(x, axes)) / sqrt(variance(x, axes) + eps)
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            int n = ctx.Inputs[0].ElementCount;
-            ctx.Outputs[0].Data.SubView(0, n).CopyFrom(ctx.Inputs[0].Data.SubView(0, n));
-            return;
-        }
+        if (!TryGpu(ctx))
+            ExecuteHost(ctx, ResolveAxes(ctx), OperatorInputReader.Require(reg, ctx, 0, OpType, "X"));
+    }
 
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        if (!TryGpu(ctx))
+            ExecuteHost(ctx, ResolveAxes(ctx),
+                await OperatorInputReader.RequireAsync(reg, ctx, 0, OpType, "X").ConfigureAwait(false));
+    }
+
+    private static (int[] shape, int[] axes, float eps) ResolveAxes(OnnxOpContext ctx)
+    {
         var shape = ctx.Inputs[0].Shape;
         int rank = shape.Length;
-
-        // Parse axes — default is {0, 2, 3} for NCHW (normalize over batch+spatial, keep channel)
+        float eps = 1e-9f;
         int[] axes;
         if (ctx.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] axLong)
             axes = axLong.Select(a => (int)(a < 0 ? a + rank : a)).ToArray();
         else
             axes = rank == 4 ? new[] { 0, 2, 3 } : Enumerable.Range(0, rank).Where(i => i != 1).ToArray();
+        return (shape, axes, eps);
+    }
 
+    /// <summary>True when a GPU kernel handled the op (NCHW keep-channel or contiguous suffix).</summary>
+    private bool TryGpu(OnnxOpContext ctx)
+    {
+        var (shape, axes, eps) = ResolveAxes(ctx);
+        int rank = shape.Length;
+
+        // GPU fast path: NCHW keep-channel (ONNX default axes {0,2,3}).
+        if (rank == 4 && IsAxesSet(axes, 0, 2, 3))
+        {
+            int N = shape[0], C = shape[1], H = shape[2], W = shape[3];
+            reg.Normalization.MeanVarianceNormNchwKeepChannel(
+                ctx.Inputs[0].Data, ctx.Outputs[0].Data, N, C, H, W, eps);
+            return true;
+        }
+
+        // GPU fast path: reduce over a suffix of dims → contiguous [groups, red].
+        if (TryContiguousSuffix(shape, axes, out int groups, out int red))
+        {
+            reg.Normalization.MeanVarianceNormContiguous(
+                ctx.Inputs[0].Data, ctx.Outputs[0].Data, groups, red, eps);
+            return true;
+        }
+        return false;
+    }
+
+    private void ExecuteHost(OnnxOpContext ctx, (int[] shape, int[] axes, float eps) plan, float[] xVals)
+    {
+        var (shape, axes, eps) = plan;
+        int rank = shape.Length;
         var axisSet = new HashSet<int>(axes);
-        float eps = 1e-9f;
-
-        // Compute strides
         var strides = new int[rank];
         strides[rank - 1] = 1;
         for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * shape[d + 1];
 
-        // Determine reduction group: dimensions NOT in axes are the "keep" dims
-        int totalElements = xVals.Length;
         int reductionSize = 1;
         foreach (int a in axes) reductionSize *= shape[a];
-        int groupCount = totalElements / reductionSize;
-
+        int totalElements = xVals.Length;
         var result = new float[totalElements];
-
-        // For each unique combination of kept dimensions, compute mean+var over reduction dims
         var keepDims = Enumerable.Range(0, rank).Where(d => !axisSet.Contains(d)).ToArray();
         var keepShape = keepDims.Select(d => shape[d]).ToArray();
         int keepTotal = keepShape.Length > 0 ? keepShape.Aggregate(1, (a, b) => a * b) : 1;
 
         for (int g = 0; g < keepTotal; g++)
         {
-            // Decode group index into kept-dimension coordinates
             var keepCoords = new int[keepDims.Length];
             int tmp = g;
             for (int i = keepDims.Length - 1; i >= 0; i--)
@@ -989,17 +1013,11 @@ public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOper
                 keepCoords[i] = tmp % keepShape[i];
                 tmp /= keepShape[i];
             }
-
-            // Collect all indices belonging to this group
             var indices = new List<int>();
             CollectIndices(shape, axes, axisSet, keepDims, keepCoords, strides, 0, 0, indices);
-
-            // Compute mean
             float mean = 0f;
             foreach (int idx in indices) mean += xVals[idx];
             mean /= indices.Count;
-
-            // Compute variance
             float variance = 0f;
             foreach (int idx in indices)
             {
@@ -1008,14 +1026,33 @@ public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOper
             }
             variance /= indices.Count;
             float invStd = 1f / MathF.Sqrt(variance + eps);
-
-            // Normalize
             foreach (int idx in indices)
                 result[idx] = (xVals[idx] - mean) * invStd;
         }
+        ctx.Outputs[0].Data.SubView(0, result.Length).CopyFromCPU(result);
+    }
 
-        int total = result.Length;
-        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
+    private static bool IsAxesSet(int[] axes, params int[] expected)
+    {
+        if (axes.Length != expected.Length) return false;
+        var set = new HashSet<int>(axes);
+        foreach (var e in expected) if (!set.Contains(e)) return false;
+        return true;
+    }
+
+    /// <summary>True when axes are exactly the trailing dims → layout is [groups, red] contiguous.</summary>
+    private static bool TryContiguousSuffix(int[] shape, int[] axes, out int groups, out int red)
+    {
+        groups = 1; red = 1;
+        int rank = shape.Length;
+        if (axes.Length == 0 || axes.Length >= rank) return false;
+        var sorted = axes.OrderBy(a => a).ToArray();
+        int first = rank - axes.Length;
+        for (int i = 0; i < sorted.Length; i++)
+            if (sorted[i] != first + i) return false;
+        for (int d = 0; d < first; d++) groups *= shape[d];
+        for (int d = first; d < rank; d++) red *= shape[d];
+        return groups > 0 && red > 0;
     }
 
     private static void CollectIndices(int[] shape, int[] axes, HashSet<int> axisSet, int[] keepDims, int[] keepCoords, int[] strides, int dim, int baseIdx, List<int> indices)
@@ -1142,16 +1179,13 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[0], inputs[0], inputs[0], new[] { 1 } }; // Y, indices, inverse_indices, counts
     public void Execute(OnnxOpContext ctx)
-    {
-        // Unique: return sorted unique elements with indices, inverse_indices, and counts
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            int count = ctx.Inputs[0].ElementCount;
-            ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
-            return;
-        }
+        => ExecuteCore(ctx, OperatorInputReader.Require(reg, ctx, 0, OpType, "X"));
 
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+        => ExecuteCore(ctx, await OperatorInputReader.RequireAsync(reg, ctx, 0, OpType, "X").ConfigureAwait(false));
+
+    private void ExecuteCore(OnnxOpContext ctx, float[] xVals)
+    {
         int sorted = ctx.GetInt("sorted", 1);
 
         // Find unique values preserving first-occurrence order
@@ -1359,13 +1393,8 @@ public class NegativeLogLikelihoodLossOperator(OperatorRegistry reg) : IOnnxOper
     {
         // NLLLoss: -sum(target * log_prob) / N
         // Input[0] = log-probabilities [N, C], Input[1] = target [N] (class indices)
-        var logProbs = ctx.TryGetInputValues(0);
-        var targets = ctx.TryGetInputValues(1);
-        if (logProbs == null || targets == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
+        var logProbs = OperatorInputReader.Require(reg, ctx, 0, OpType, "log_probs");
+        var targets = OperatorInputReader.Require(reg, ctx, 1, OpType, "target");
         var shape = ctx.Inputs[0].Shape;
         int N = shape[0], C = shape.Length > 1 ? shape[1] : 1;
         float loss = 0f;
@@ -1394,14 +1423,8 @@ public class SoftmaxCrossEntropyLossOperator(OperatorRegistry reg) : IOnnxOperat
     {
         // SoftmaxCE: softmax(logits) → -log(p[target]) → reduce
         // Input[0] = logits [N, C], Input[1] = target [N]
-        var logits = ctx.TryGetInputValues(0);
-        var targets = ctx.TryGetInputValues(1);
-        if (logits == null || targets == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            if (ctx.Outputs.Length > 1) reg.ElementWise.Fill(ctx.Outputs[1].Data, ctx.Outputs[1].ElementCount, 0f);
-            return;
-        }
+        var logits = OperatorInputReader.Require(reg, ctx, 0, OpType, "logits");
+        var targets = OperatorInputReader.Require(reg, ctx, 1, OpType, "target");
         var shape = ctx.Inputs[0].Shape;
         int N = shape[0], C = shape.Length > 1 ? shape[1] : 1;
         var logProbs = new float[N * C];

@@ -24,7 +24,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Local GGUF LLM inference + Ollama-compatible server** *(new in preview.5)* — run quantized LLMs (Qwen, Gemma, Llama) fully on your GPU with KV-cache decode; the Example 06 server is a drop-in Ollama replacement (OpenAI, Ollama, and Anthropic-Messages APIs) that works with the Claude CLI. ~51 tok/s decode on qwen2.5-coder:7b Q4_K_M (RTX 4070) via dp4a int8 GEMV + warp-cooperative register/flash attention (CUDA + WebGPU).
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
-- **~194 ONNX operators registered** (exact count is `OperatorRegistry.BuiltinOpTypes.Count`, rendered live on the Home page — not all are full-spec-complete; some are registered pass-throughs) — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
+- **ONNX operators** — registered set is `OperatorRegistry.BuiltinOpTypes` (count rendered live on the Home page). Not all are full-spec-complete; some are pass-throughs. See [**Docs/operators.md**](Docs/operators.md) — do not hardcode the count here.
 - **7 inference model formats + 4 mesh/splat IO formats** — *inference loaders:* ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. *Mesh/splat import-export (not inference):* SPZ, PLY, glTF, OBJ. Zero-dependency, auto-detected from magic bytes. First pure C# SPZ parser. (Loading a format ≠ running every model in it end-to-end — see the status doc.)
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.
@@ -375,29 +375,9 @@ Every model is automatically optimized during compilation:
 | **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
 | **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
 
-### ~194 ONNX Operators Registered
+### ONNX operators
 
-**Core Math:** Abs, Add, Sub, Mul, Div, Pow, Sqrt, Exp, Log, Neg, Reciprocal, Floor, Ceil, Mod, Clip, Min, Max, Sign, Erf, CumSum
-**Trig:** Sin, Cos, Tan, Acos, Acosh, Asin, Asinh, Atan, Atanh, Cosh, Sinh
-**Activations:** Relu, Sigmoid, Tanh, Gelu, LeakyRelu, HardSigmoid, HardSwish, Elu, Celu, Selu, Softplus, Softsign, Mish, ThresholdedRelu, PRelu, SiLU
-**Comparison:** Equal, Greater, GreaterOrEqual, Less, LessOrEqual, And, Or, Xor, Not, IsNaN, IsInf
-**Reduction:** ReduceSum, ReduceMean, ReduceMax, ReduceMin, ReduceProd, ReduceL1, ReduceL2, ReduceSumSquare, ReduceLogSum, ReduceLogSumExp
-**Shape:** Reshape, Squeeze, Unsqueeze, Flatten, Expand, Shape, Slice, Concat, Split, Transpose, Tile, Pad, Compress, EyeLike, Trilu, Unique, ReverseSequence, CenterCropPad
-**Pooling:** MaxPool, AveragePool, GlobalAveragePool, GlobalMaxPool, LpPool, GlobalLpPool, MaxUnpool, MaxRoiPool
-**Normalization:** BatchNormalization, InstanceNormalization, LayerNormalization, GroupNormalization, LRN, MeanVarianceNormalization, LpNormalization
-**Convolution:** Conv, ConvTranspose, ConvInteger, DeformConv
-**Linear:** MatMul, Gemm (transA+transB), MatMulInteger, QLinearMatMul, QLinearConv
-**Gather/Scatter:** Gather, GatherElements, GatherND, ScatterND (add/mul/min/max reduction), ScatterElements, Scatter
-**Data:** Constant, ConstantOfShape, Cast, CastLike, Identity, Size, OneHot, Range, NonZero, TopK, ArgMax, ArgMin, Round
-**Quantization:** DequantizeLinear, QuantizeLinear, DynamicQuantizeLinear
-**Bitwise:** BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot, BitShift
-**Signal:** DFT, STFT, MelWeightMatrix, HannWindow, HammingWindow, BlackmanWindow
-**Recurrent:** RNN, LSTM, GRU (bidirectional, peepholes, layout support)
-**Control Flow:** If, Loop, Scan (real subgraph execution via SubgraphRunner)
-**Detection:** NonMaxSuppression, RoiAlign, AffineGrid, GridSample, Col2Im
-**Random:** RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike, Bernoulli, Multinomial
-**Misc:** Dropout, Where, Resize, Upsample, DepthToSpace, SpaceToDepth, Einsum, Softmax, LogSoftmax, Hardmax, Sum, Mean, Det, ImageDecoder
-**Sequence/Optional/String:** Full pass-through support for non-tensor ONNX types
+Registered op-types live in `OperatorRegistry.BuiltinOpTypes` (live count on the Home page). Policy, aliases (including `SimplifiedLayerNormalization`), and how the Model Inspector answers "supported?" are documented in [**Docs/operators.md**](Docs/operators.md) — do not paste the list here.
 
 ### Pipeline Classes (18 implemented; not all verified end-to-end — see status doc)
 

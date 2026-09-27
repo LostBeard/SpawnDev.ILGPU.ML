@@ -1306,19 +1306,19 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> rois, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsArr, ArrayView1D<float, Stride1D.Dense> fparams)
     {
-        // int params: [C, Hin, Win, outH, outW, samplingRatio] (float-stored, cast to int)
+        // int params: [C, Hin, Win, outH, outW, samplingRatio, hasBatchIdx] (float-stored)
         // float params: [spatialScale]
-        // rois: [numRois, 4] (x1, y1, x2, y2) or [numRois, 5] (batchIdx, x1, y1, x2, y2)
+        // rois: [numRois, 4] (x1,y1,x2,y2). When hasBatchIdx!=0, batch indices live in fparams[1..]
         int C = (int)paramsArr[0]; int Hin = (int)paramsArr[1]; int Win = (int)paramsArr[2];
         int outH = (int)paramsArr[3]; int outW = (int)paramsArr[4]; int samplingRatio = (int)paramsArr[5];
+        int hasBatchIdx = (int)paramsArr[6];
         float spatialScale = fparams[0];
-        // idx = r * C * outH * outW + c * outH * outW + oh * outW + ow
         int tmp = idx;
         int ow = tmp % outW; tmp /= outW;
         int oh = tmp % outH; tmp /= outH;
         int c = tmp % C; int r = tmp / C;
-        // Get ROI bounds
-        int roiOff = r * 4; // assume 4-element ROIs with batch_indices separate
+        int batchIdx = hasBatchIdx != 0 ? (int)fparams[1 + r] : 0;
+        int roiOff = r * 4;
         float x1 = rois[roiOff] * spatialScale;
         float y1 = rois[roiOff + 1] * spatialScale;
         float x2 = rois[roiOff + 2] * spatialScale;
@@ -1330,14 +1330,13 @@ public class ElementWiseKernels : IDisposable
         int sW = samplingRatio > 0 ? samplingRatio : (int)MathF.Ceiling(binW);
         if (sH < 1) sH = 1; if (sW < 1) sW = 1;
         float sum = 0f;
-        int chOff = c * Hin; // batch index 0 for simplicity
+        int chOff = (batchIdx * C + c) * Hin;
         for (int sh = 0; sh < sH; sh++)
         {
             float fy = y1 + binH * (oh + (sh + 0.5f) / sH);
             for (int sw = 0; sw < sW; sw++)
             {
                 float fx = x1 + binW * (ow + (sw + 0.5f) / sW);
-                // Bilinear
                 int x0i = (int)MathF.Floor(fx); int y0i = (int)MathF.Floor(fy);
                 float tx = fx - x0i; float ty = fy - y0i;
                 float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
@@ -1633,22 +1632,32 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> rois, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsArr, ArrayView1D<float, Stride1D.Dense> fparams)
     {
-        // params: [C, H, W, outH, outW] (float-stored, cast to int)
+        // params: [C, H, W, outH, outW, roiStride] (float-stored, cast to int)
+        //   roiStride=5 → ONNX [batch, x1, y1, x2, y2]; roiStride=4 → [x1,y1,x2,y2] batch 0
         // fparams: [spatialScale]
         int C = (int)paramsArr[0]; int H = (int)paramsArr[1]; int W = (int)paramsArr[2];
         int outH = (int)paramsArr[3]; int outW = (int)paramsArr[4];
+        int roiStride = (int)paramsArr[5];
         float spatialScale = fparams[0];
         int tmp = idx;
         int ow = tmp % outW; tmp /= outW;
         int oh = tmp % outH; tmp /= outH;
         int c = tmp % C; int r = tmp / C;
-        int roiOff = r * 4;
-        float x1 = rois[roiOff] * spatialScale;
-        float y1 = rois[roiOff + 1] * spatialScale;
-        float x2 = rois[roiOff + 2] * spatialScale;
-        float y2 = rois[roiOff + 3] * spatialScale;
-        float roiW = x2 - x1; if (roiW < 1f) roiW = 1f;
-        float roiH = y2 - y1; if (roiH < 1f) roiH = 1f;
+        int roiOff = r * roiStride;
+        int batchIdx = 0;
+        int xyOff = roiOff;
+        if (roiStride >= 5)
+        {
+            batchIdx = (int)rois[roiOff];
+            xyOff = roiOff + 1;
+        }
+        float x1 = rois[xyOff] * spatialScale;
+        float y1 = rois[xyOff + 1] * spatialScale;
+        float x2 = rois[xyOff + 2] * spatialScale;
+        float y2 = rois[xyOff + 3] * spatialScale;
+        // ONNX / Caffe MaxRoiPool: inclusive end (+1), matching the former CPU path.
+        float roiW = x2 - x1 + 1f; if (roiW < 1f) roiW = 1f;
+        float roiH = y2 - y1 + 1f; if (roiH < 1f) roiH = 1f;
         float binH = roiH / outH; float binW = roiW / outW;
         int hStart = (int)MathF.Floor(y1 + binH * oh);
         int hEnd = (int)MathF.Ceiling(y1 + binH * (oh + 1));
@@ -1657,14 +1666,14 @@ public class ElementWiseKernels : IDisposable
         if (hStart < 0) hStart = 0; if (hEnd > H) hEnd = H;
         if (wStart < 0) wStart = 0; if (wEnd > W) wEnd = W;
         float maxVal = -1e10f;
-        int chOff = c * H;
+        int chOff = (batchIdx * C + c) * H;
         for (int ih = hStart; ih < hEnd; ih++)
             for (int iw = wStart; iw < wEnd; iw++)
             {
                 float v = input[(chOff + ih) * W + iw];
                 if (v > maxVal) maxVal = v;
             }
-        output[idx] = maxVal;
+        output[idx] = maxVal < -1e9f ? 0f : maxVal;
     }
 
     private static void MaxUnpoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> vals,

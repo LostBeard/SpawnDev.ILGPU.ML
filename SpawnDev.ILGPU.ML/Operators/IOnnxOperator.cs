@@ -61,6 +61,17 @@ public class OnnxOpContext
     /// Maps tensor name → float[] values. Populated during session creation.</summary>
     public Dictionary<string, float[]>? ConstantValues { get; init; }
 
+    /// <summary>
+    /// Host-side ONNX values (Sequence / Optional / String / Bytes) keyed by tensor name.
+    /// Shared with the executor for the life of a Run — float GPU tensors stay in <see cref="Inputs"/>/
+    /// <see cref="Outputs"/>; non-float types never go through <c>ArrayView1D&lt;float&gt;</c>.
+    /// Always non-null so sequence/string ops can SetHostOutput without a special executor path.
+    /// </summary>
+    public Dictionary<string, OnnxValue> HostValues { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>Output names parallel to <see cref="Outputs"/> — used to write <see cref="HostValues"/>.</summary>
+    public string[] OutputNames { get; init; } = Array.Empty<string>();
+
     /// <summary>Quantized weight buffers (Q4_0, Q8_0, etc.) stored as raw bytes on GPU.
     /// When a weight tensor name appears here, operators should use fused dequantization
     /// kernels instead of regular float operations. Maps tensor name → byte ArrayView.</summary>
@@ -121,6 +132,44 @@ public class OnnxOpContext
         var name = InputNames[inputIndex];
         if (string.IsNullOrEmpty(name)) return null;
         return ConstantValues.TryGetValue(name, out var vals) ? vals : null;
+    }
+
+    /// <summary>Host <see cref="OnnxValue"/> for input <paramref name="inputIndex"/>, or null.</summary>
+    public OnnxValue? TryGetHostInput(int inputIndex)
+    {
+        if (inputIndex >= InputNames.Length) return null;
+        var name = InputNames[inputIndex];
+        if (string.IsNullOrEmpty(name)) return null;
+        return HostValues.TryGetValue(name, out var v) ? v : null;
+    }
+
+    /// <summary>Resolve input as host value: HostValues entry, else wrap the GPU <see cref="Tensor"/>.</summary>
+    public OnnxValue GetInputValue(int inputIndex)
+    {
+        var host = TryGetHostInput(inputIndex);
+        if (host != null) return host;
+        if (inputIndex >= Inputs.Length || Inputs[inputIndex] == null)
+            throw new InvalidOperationException($"GetInputValue({inputIndex}): no input tensor.");
+        return OnnxValue.FromTensor(Inputs[inputIndex]);
+    }
+
+    /// <summary>Write a host value for output <paramref name="outputIndex"/> into <see cref="HostValues"/>.</summary>
+    public void SetHostOutput(int outputIndex, OnnxValue value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        string name;
+        if (outputIndex < OutputNames.Length && !string.IsNullOrEmpty(OutputNames[outputIndex]))
+            name = OutputNames[outputIndex];
+        else
+            name = $"__host_out_{outputIndex}";
+        HostValues[name] = value;
+        // If the value is a Tensor AND the output slot is a placeholder / different buffer,
+        // leave Outputs[i] as the executor-owned buffer — callers that need the tensor on the
+        // output slot should CopyFrom into Outputs[i] then wrap that. Retargeting Outputs[i]
+        // here made SequenceAt/OptionalGetElement CopyFrom alias no-ops.
+        if (value.Kind == OnnxValueKind.Tensor && value.Tensor != null && outputIndex < Outputs.Length
+            && Outputs[outputIndex].ElementCount == 0)
+            Outputs[outputIndex] = value.Tensor;
     }
 
     // ── Typed attribute accessors ──

@@ -25,8 +25,10 @@ public class OperatorRegistry : IDisposable
     /// by <c>MLTestBase.Op_BuiltinOpTypes_MatchesLiveRegistry</c>, which constructs a real
     /// registry and asserts <see cref="SupportedOps"/> set-equals this manifest. Add or remove
     /// a <c>Register(...)</c> call and forget to mirror it here (or vice versa) and that test
-    /// fails. Do NOT maintain a second, divergent op list anywhere — point it at this one.
-    /// (Stale parallel lists are exactly what made GPT-2 falsely report 90% compatibility.)
+    /// fails. Do NOT maintain a second, divergent op list anywhere — point it at this one
+    /// (Model Inspector, Home count, Docs/operators.md all do). Stale parallel lists are
+    /// exactly what made GPT-2 falsely report 90% compatibility.
+    /// Human-facing policy: <c>Docs/operators.md</c>.
     /// </summary>
     public static readonly IReadOnlySet<string> BuiltinOpTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
@@ -52,7 +54,7 @@ public class OperatorRegistry : IDisposable
         "RMSNormalization",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
         "SequenceAt", "SequenceConstruct", "SequenceEmpty", "SequenceErase", "SequenceInsert", "SequenceLength", "SequenceMap", "Shape",
-        "Shrink", "SiLU", "Sigmoid", "Sign", "Sin", "Sinh", "Size", "Slice",
+        "Shrink", "SiLU", "Sigmoid", "Sign", "SimplifiedLayerNormalization", "Sin", "Sinh", "Size", "Slice",
         "Softmax", "SoftmaxCrossEntropyLoss", "Softplus", "Softsign", "SpaceToDepth", "Split", "SplitToSequence", "Sqrt", "SwiGLU",
         "Squeeze", "StringConcat", "StringNormalizer", "StringSplit", "Sub", "Sum", "Tan", "Tanh",
         "ThresholdedRelu", "Tile", "TopK", "Transpose", "Trilu", "Unique", "Unsqueeze", "Upsample",
@@ -402,6 +404,8 @@ public class OperatorRegistry : IDisposable
         // True RMSNorm (every RMS decoder: llama/mistral/qwen/gemma). Distinct from the
         // mean-centered LayerNormalization — see RMSNormOperator.
         Register(new RMSNormOperator(this));
+        // ORT contrib alias of RMSNorm (Florence / Phi vision encoders, etc.).
+        Register(new SimplifiedLayerNormalizationOperator(this));
         Register(new ShortConvOperator(this));
         Register(new GatedDeltaNetOperator(this));
         Register(new AddRMSNormOperator(this));

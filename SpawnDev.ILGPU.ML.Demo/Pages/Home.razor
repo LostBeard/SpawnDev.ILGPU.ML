@@ -611,9 +611,8 @@
 </style>
 
 @code {
-    // Operator count is rendered LIVE from OperatorRegistry.BuiltinOpTypes - the registry's documented
-    // SINGLE SOURCE OF TRUTH - so this marketing copy can never drift from the code again. A hardcoded
-    // "71" here (vs the real ~194) is exactly the "stale parallel list" the registry header warns against.
+    // Operator count is rendered LIVE from OperatorRegistry.BuiltinOpTypes (Docs/operators.md).
+    // Never hardcode a number here — Home once showed "71" that way.
     // BuiltinOpTypes is designed to be read standalone (no accelerator), so this is cheap + safe.
     int OperatorCount => SpawnDev.ILGPU.ML.Operators.OperatorRegistry.BuiltinOpTypes.Count;
 }

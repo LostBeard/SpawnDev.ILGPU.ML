@@ -35,10 +35,13 @@ var sources = Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories)
 var registry = sources.FirstOrDefault(f => f.EndsWith("OperatorRegistry.cs"));
 if (registry == null) { Console.WriteLine("OperatorRegistry.cs not found"); return 2; }
 var registryText = File.ReadAllText(registry);
-var listStart = registryText.IndexOf("BuiltinOpTypes", StringComparison.Ordinal);
-if (listStart < 0) { Console.WriteLine("BuiltinOpTypes not found"); return 2; }
-var listEnd = registryText.IndexOf("};", listStart, StringComparison.Ordinal);
-var listBody = registryText[listStart..(listEnd < 0 ? registryText.Length : listEnd)];
+// Match the FIELD body only — IndexOf("BuiltinOpTypes") hits the XML doc first and would
+// also capture cref="SupportedOps" from the summary as a false "listed but not implemented".
+var fieldMatch = Regex.Match(registryText,
+    @"public static readonly IReadOnlySet<string> BuiltinOpTypes\s*=\s*new HashSet<string>[^{]*\{(.*?)\n\s*\};",
+    RegexOptions.Singleline);
+if (!fieldMatch.Success) { Console.WriteLine("BuiltinOpTypes field body not found"); return 2; }
+var listBody = fieldMatch.Groups[1].Value;
 var advertised = Regex.Matches(listBody, "\"([A-Za-z0-9_]+)\"")
     .Select(m => m.Groups[1].Value).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
 
@@ -65,7 +68,9 @@ var opStart = new Regex(@"OpType\s*=>\s*""([A-Za-z0-9_]+)""");
 var nullGuard = new Regex(@"==\s*null\)\s*(\{)?\s*$|==\s*null\s*\|\|");
 // ⚠⚠ Must match a return on the SAME line as the guard: `if (w == null || r == null) return;`
 // is how RNN/LSTM/GRU silently produce nothing, and an anchored ^ regex missed all three.
+// Also catch one-line Fill+return (Det): `if (xVals == null) { Fill(...); return; }`
 var silentReturn = new Regex(@"(^|\)\s*)(return;|return\s+new\[\]|\{\s*return;)");
+var oneLineFillReturn = new Regex(@"==\s*null\)\s*\{\s*.*Fill\(.*return;");
 var passThrough = new Regex(@"CopyFrom\(|\.Scale\(.*,\s*1f\)|ElementWise\.Fill\(");
 var shapeFromInput = new Regex(@"InferOutputShapes\([^)]*\)\s*=>\s*new\[\]\s*\{\s*i(nputs)?\.Length\s*>\s*0\s*\?\s*i(nputs)?\[0\]");
 
@@ -81,6 +86,12 @@ foreach (var f in sources)
 
         if (shapeFromInput.IsMatch(lines[i]))
             suspects.Add((current, Path.GetFileName(f), i + 1, "shape from inputs[0]", lines[i].Trim()));
+
+        if (oneLineFillReturn.IsMatch(lines[i]))
+        {
+            suspects.Add((current, Path.GetFileName(f), i + 1, "falls back to input/zeros", lines[i].Trim()));
+            continue;
+        }
 
         // A null guard whose body only returns / copies / fills is the silent-wrong-answer shape.
         if (nullGuard.IsMatch(lines[i]))
