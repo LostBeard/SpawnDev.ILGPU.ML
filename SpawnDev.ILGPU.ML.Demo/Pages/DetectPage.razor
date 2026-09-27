@@ -52,7 +52,7 @@
         <BoundingBoxOverlay Detections="@_detections"
                             ImageWidth="@_imageWidth" ImageHeight="@_imageHeight"
                             ConfidenceThreshold="@(_confidenceThreshold / 100f)">
-            <img src="@_imageDataUrl" alt="Input" style="max-width:100%; display:block;" />
+            <img src="@_imageDataUrl" alt="Input" style="width:100%; display:block;" />
         </BoundingBoxOverlay>
         <div class="result-actions">
             <button class="action-btn" @onclick="ClearStillImage">Try Another Image</button>

@@ -93,9 +93,17 @@ public class ObjectDetectionPipeline : IDisposable
     {
         var sw = Stopwatch.StartNew();
 
-        // Preprocess: RGBA → NCHW float [0,1], letterbox to inputSize
+        // YOLOv8 contract: letterbox (aspect-preserving) + NCHW float [0,1] — NOT ImageNet mean/std,
+        // NOT stretch-to-square. Comment used to claim letterbox while Forward() defaults did neither;
+        // YoloPostProcessor then unmapped as if letterboxed → boxes landed nowhere near the objects
+        // (live /detect Street: one mis-placed "traffic light"). Same Letterbox() ints drive both sides.
+        var (contentW, contentH, padX, padY) = Kernels.ImagePreprocessKernel.Letterbox(
+            width, height, _inputSize, _inputSize);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize);
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
+            mean: new[] { 0f, 0f, 0f },
+            std: new[] { 1f, 1f, 1f },
+            preserveAspect: true);
 
         // Run inference
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
@@ -112,7 +120,7 @@ public class ObjectDetectionPipeline : IDisposable
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
-        // Postprocess: transpose, filter, NMS
+        // Postprocess: transpose, filter, NMS — pass the SAME letterbox rect the preprocess used
         var detections = YoloPostProcessor.Process(
             outputData,
             numClasses: _labels.Length,
@@ -121,7 +129,11 @@ public class ObjectDetectionPipeline : IDisposable
             inputWidth: _inputSize,
             inputHeight: _inputSize,
             originalWidth: width,
-            originalHeight: height);
+            originalHeight: height,
+            contentW: contentW,
+            contentH: contentH,
+            padX: padX,
+            padY: padY);
 
         sw.Stop();
 

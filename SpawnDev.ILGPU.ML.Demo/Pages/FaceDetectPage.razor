@@ -105,7 +105,7 @@
             <button class="action-btn clear-btn" @onclick="ClearStillImage">Try Another Image</button>
             @if (_faces != null && _faces.Count == 0)
             {
-                <span class="no-faces-hint">No faces detected — BlazeFace NHWC forward is still wrong vs MediaPipe (engine bug). Portrait should light up once that gate is green.</span>
+                <span class="no-faces-hint">No faces detected — try a clearer frontal portrait, or lower lighting glare.</span>
             }
         </div>
     }
@@ -363,7 +363,7 @@
             _stillImageWidth = w;
             _stillImageHeight = h;
 
-            await RunDetection(rgbaPixels, w, h);
+            await RunDetection(rgbaPixels, w, h, maxFaces: 1);
         }
         catch (Exception ex)
         {
@@ -383,7 +383,7 @@
             if (_pipeline == null) return;
             var rgbaPixels = new int[frameBytes.Length / 4];
             Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
-            await RunDetection(rgbaPixels, 640, 480);
+            await RunDetection(rgbaPixels, 640, 480, maxFaces: 4);
         }
         catch (Exception ex)
         {
@@ -397,12 +397,12 @@
         }
     }
 
-    private async Task RunDetection(int[] rgbaPixels, int width, int height)
+    private async Task RunDetection(int[] rgbaPixels, int width, int height, int maxFaces = 1)
     {
         _isRunning = true;
         try
         {
-            var result = await _pipeline!.DetectAsync(rgbaPixels, width, height);
+            var result = await _pipeline!.DetectAsync(rgbaPixels, width, height, maxFaces: maxFaces);
             _inferenceMs = result.InferenceTimeMs;
             _faceCount = result.FaceCount;
             _faces = result.Faces.Select(f => new FaceDetection

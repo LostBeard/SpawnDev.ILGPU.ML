@@ -48,38 +48,42 @@ public class FaceDetectionPipeline : IDisposable
     public async Task<FaceDetectionResult> DetectAsync(
         int[] rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
-        float iouThreshold = 0.3f)
+        float iouThreshold = 0.3f,
+        int maxFaces = 1)
     {
         using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
-        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold)
+        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold, maxFaces)
             .ConfigureAwait(false);
     }
 
     public async Task<FaceDetectionResult> DetectAsync(
         TypedArray rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
-        float iouThreshold = 0.3f)
+        float iouThreshold = 0.3f,
+        int maxFaces = 1)
     {
         using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
-        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold)
+        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold, maxFaces)
             .ConfigureAwait(false);
     }
 
     public Task<FaceDetectionResult> DetectAsync(
         ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
-        float iouThreshold = 0.3f)
-        => DetectCoreAsync(rgbaPixels, width, height, confidenceThreshold, iouThreshold);
+        float iouThreshold = 0.3f,
+        int maxFaces = 1)
+        => DetectCoreAsync(rgbaPixels, width, height, confidenceThreshold, iouThreshold, maxFaces);
 
     public Task<FaceDetectionResult> DetectAsync(
         MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
-        float iouThreshold = 0.3f)
-        => DetectCoreAsync(rgbaPixels.View, width, height, confidenceThreshold, iouThreshold);
+        float iouThreshold = 0.3f,
+        int maxFaces = 1)
+        => DetectCoreAsync(rgbaPixels.View, width, height, confidenceThreshold, iouThreshold, maxFaces);
 
     private async Task<FaceDetectionResult> DetectCoreAsync(
         ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
-        float confidenceThreshold, float iouThreshold)
+        float confidenceThreshold, float iouThreshold, int maxFaces)
     {
         var sw = Stopwatch.StartNew();
 
@@ -108,7 +112,7 @@ public class FaceDetectionPipeline : IDisposable
         var classificators = await ReadOutputAsync(outputs, clsName, 896).ConfigureAwait(false);
 
         var faces = DecodeDetections(regressors, classificators, width, height,
-            contentW, contentH, padX, padY, confidenceThreshold, iouThreshold);
+            contentW, contentH, padX, padY, confidenceThreshold, iouThreshold, maxFaces);
 
         sw.Stop();
 
@@ -151,7 +155,7 @@ public class FaceDetectionPipeline : IDisposable
     private DetectedFace[] DecodeDetections(float[] regressors, float[] classificators,
         int imageWidth, int imageHeight,
         int contentW, int contentH, int padX, int padY,
-        float confThreshold, float iouThreshold)
+        float confThreshold, float iouThreshold, int maxFaces)
     {
         var candidates = new List<DetectedFace>();
         int numAnchors = _anchors.GetLength(0);
@@ -181,8 +185,16 @@ public class FaceDetectionPipeline : IDisposable
             {
                 float ly = regressors[regBase + 4 + j * 2] / scale + _anchors[i, 1];
                 float lx = regressors[regBase + 4 + j * 2 + 1] / scale + _anchors[i, 0];
-                landmarks.Add((MapX(lx, contentW, padX, imageWidth), MapY(ly, contentH, padY, imageHeight)));
+                landmarks.Add((
+                    Clamp(MapX(lx, contentW, padX, imageWidth), 0, imageWidth),
+                    Clamp(MapY(ly, contentH, padY, imageHeight), 0, imageHeight)));
             }
+
+            // Clamp to image — BlazeFace often predicts slightly outside the frame.
+            x1 = Clamp(x1, 0, imageWidth);
+            y1 = Clamp(y1, 0, imageHeight);
+            x2 = Clamp(x2, 0, imageWidth);
+            y2 = Clamp(y2, 0, imageHeight);
 
             candidates.Add(new DetectedFace
             {
@@ -195,25 +207,74 @@ public class FaceDetectionPipeline : IDisposable
             });
         }
 
+        // MediaPipe Face Detector uses WEIGHTED NMS (merge overlapping boxes by score), not hard
+        // suppress. Hard NMS at IoU 0.3 left near-duplicate shifted boxes on portrait (IoU~0.19)
+        // plus a hair false-positive → live Faces:2 with wrong overlays.
+        var merged = WeightedNms(candidates, iouThreshold);
+        if (maxFaces > 0 && merged.Count > maxFaces)
+            merged = merged.Take(maxFaces).ToList();
+        return merged.ToArray();
+    }
+
+    /// <summary>
+    /// MediaPipe-style weighted NMS: overlapping detections are blended by confidence instead of
+    /// discarding the lower-scoring one. Returns highest-confidence-first.
+    /// </summary>
+    private static List<DetectedFace> WeightedNms(List<DetectedFace> candidates, float iouThreshold)
+    {
         candidates.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
+        var remaining = new List<DetectedFace>(candidates);
         var kept = new List<DetectedFace>();
-        var suppressed = new bool[candidates.Count];
 
-        for (int i = 0; i < candidates.Count; i++)
+        while (remaining.Count > 0)
         {
-            if (suppressed[i]) continue;
-            kept.Add(candidates[i]);
+            var seed = remaining[0];
+            remaining.RemoveAt(0);
 
-            for (int j = i + 1; j < candidates.Count; j++)
+            float sumW = seed.Confidence;
+            float x = seed.X * seed.Confidence;
+            float y = seed.Y * seed.Confidence;
+            float w = seed.Width * seed.Confidence;
+            float h = seed.Height * seed.Confidence;
+            float conf = seed.Confidence;
+            var landmarks = seed.Landmarks;
+            var landmarkAcc = landmarks.Select(p => (p.X * seed.Confidence, p.Y * seed.Confidence)).ToList();
+
+            for (int i = remaining.Count - 1; i >= 0; i--)
             {
-                if (suppressed[j]) continue;
-                if (IoU(candidates[i], candidates[j]) > iouThreshold)
-                    suppressed[j] = true;
+                if (IoU(seed, remaining[i]) <= iouThreshold) continue;
+                var o = remaining[i];
+                float sw = o.Confidence;
+                sumW += sw;
+                x += o.X * sw;
+                y += o.Y * sw;
+                w += o.Width * sw;
+                h += o.Height * sw;
+                if (o.Confidence > conf) conf = o.Confidence;
+                if (o.Landmarks.Count == landmarkAcc.Count)
+                {
+                    for (int k = 0; k < landmarkAcc.Count; k++)
+                        landmarkAcc[k] = (landmarkAcc[k].Item1 + o.Landmarks[k].X * sw,
+                            landmarkAcc[k].Item2 + o.Landmarks[k].Y * sw);
+                }
+                remaining.RemoveAt(i);
             }
+
+            kept.Add(new DetectedFace
+            {
+                X = x / sumW,
+                Y = y / sumW,
+                Width = w / sumW,
+                Height = h / sumW,
+                Confidence = conf,
+                Landmarks = landmarkAcc.Select(p => (p.Item1 / sumW, p.Item2 / sumW)).ToList(),
+            });
         }
 
-        return kept.ToArray();
+        return kept;
     }
+
+    private static float Clamp(float v, float lo, float hi) => v < lo ? lo : (v > hi ? hi : v);
 
     private float MapX(float nx, int contentW, int padX, int imageWidth)
     {

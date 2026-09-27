@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.32 (2026-09-27) - /face + /detect wrong boxes
+
+**`/detect` root cause:** `ObjectDetectionPipeline` commented "letterbox + [0,1]" but called
+`ImagePreprocessKernel.Forward()` with defaults — **stretch-to-square + ImageNet mean/std**.
+`YoloPostProcessor` then unmapped as if letterboxed → live Street showed one mis-placed
+"traffic light". Fix: `preserveAspect: true`, mean/std `0/1`, pass the same `Letterbox()`
+ints into postprocess.
+
+**`/face` root cause:** forward was already green (classificator/regressor relRMS ~3e-4); hard
+NMS kept near-duplicate + hair false-positive (MediaPipe Face Detector defaults `num_faces=1`
++ weighted NMS). Fix: weighted NMS, `maxFaces` default 1, clamp boxes; Portrait gate now
+requires the top box cover image center and `FaceCount ≤ 1`.
+
+**Gates:** `Pipeline_BlazeFace_Portrait_DetectsFace` (geometry), `Pipeline_YOLOv8_Street_DetectsPeopleOrCars`
+(+ `samples/street_rgba.bin`).
+
 ## 5.2.31 (2026-09-27) - COI SW: capture script URL before async unregister
 
 **Bug fix:** `registerFresh` ran after `getRegistrations().then(...)`, by which time

@@ -20,6 +20,10 @@ public static class YoloPostProcessor
     /// <param name="inputHeight">Model input height (640)</param>
     /// <param name="originalWidth">Original image width (for rescaling boxes)</param>
     /// <param name="originalHeight">Original image height (for rescaling boxes)</param>
+    /// <param name="contentW">Letterbox content width in model pixels (0 = derive via float scale)</param>
+    /// <param name="contentH">Letterbox content height in model pixels</param>
+    /// <param name="padX">Letterbox left pad in model pixels</param>
+    /// <param name="padY">Letterbox top pad in model pixels</param>
     public static List<Detection> Process(
         float[] output,
         int numClasses = 80,
@@ -29,7 +33,11 @@ public static class YoloPostProcessor
         int inputWidth = 640,
         int inputHeight = 640,
         int originalWidth = 640,
-        int originalHeight = 480)
+        int originalHeight = 480,
+        int contentW = 0,
+        int contentH = 0,
+        int padX = -1,
+        int padY = -1)
     {
         int channels = 4 + numClasses; // 84 for COCO
 
@@ -85,18 +93,25 @@ public static class YoloPostProcessor
             results.AddRange(kept);
         }
 
-        // Rescale boxes from model input coords to original image coords
-        // Assumes letterbox padding (aspect-preserving resize)
-        float scale = Math.Min((float)inputWidth / originalWidth, (float)inputHeight / originalHeight);
-        float padX = (inputWidth - originalWidth * scale) / 2;
-        float padY = (inputHeight - originalHeight * scale) / 2;
+        // Rescale boxes from model-input coords to original image coords.
+        // Prefer the same Letterbox() ints the preprocess used (rounding-stable). Float scale
+        // fallback keeps older unit tests that never passed a rect working.
+        int px = padX, py = padY, cw = contentW, ch = contentH;
+        if (cw <= 0 || ch <= 0 || px < 0 || py < 0)
+        {
+            float scale = Math.Min((float)inputWidth / originalWidth, (float)inputHeight / originalHeight);
+            px = (int)((inputWidth - originalWidth * scale) / 2);
+            py = (int)((inputHeight - originalHeight * scale) / 2);
+            cw = Math.Max(1, (int)(originalWidth * scale));
+            ch = Math.Max(1, (int)(originalHeight * scale));
+        }
 
         foreach (var det in results)
         {
-            det.X1 = (det.X1 - padX) / scale;
-            det.Y1 = (det.Y1 - padY) / scale;
-            det.X2 = (det.X2 - padX) / scale;
-            det.Y2 = (det.Y2 - padY) / scale;
+            det.X1 = (det.X1 - px) / cw * originalWidth;
+            det.Y1 = (det.Y1 - py) / ch * originalHeight;
+            det.X2 = (det.X2 - px) / cw * originalWidth;
+            det.Y2 = (det.Y2 - py) / ch * originalHeight;
 
             // Clamp to image bounds
             det.X1 = Math.Max(0, det.X1);

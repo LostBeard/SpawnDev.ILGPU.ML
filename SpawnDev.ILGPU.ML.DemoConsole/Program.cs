@@ -12,6 +12,71 @@ using System.Text.Json;
 // Auto-flush stdout so PlaywrightMultiTest sees output immediately
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
 
+// Live-bug probes (NOT PMT): dump box geometry for /face portrait and /detect street.
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- FACEDETECT [CUDA]
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- DETECTPROBE [CUDA]
+if (args.Length >= 1 && (args[0] == "FACEDETECT" || args[0] == "DETECTPROBE"))
+{
+    var mode = args[0];
+    var backend = args.Length > 1 ? args[1].ToUpperInvariant() : "CUDA";
+    using var ctx = MLContext.Create().ToContext();
+    using Accelerator acc = backend == "CPU"
+        ? ctx.CreateCPUAccelerator(0)
+        : ctx.CreateCudaAccelerator(0);
+    Console.WriteLine($"{mode} backend={acc.AcceleratorType}");
+
+    if (mode == "FACEDETECT")
+    {
+        var modelPath = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/models/blaze-face/model.tflite");
+        var rgbaPath = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/samples/portrait_rgba.bin");
+        var modelBytes = await File.ReadAllBytesAsync(modelPath);
+        var bin = await File.ReadAllBytesAsync(rgbaPath);
+        int w = BitConverter.ToInt32(bin, 0), h = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[w * h];
+        Buffer.BlockCopy(bin, 8, pixels, 0, w * h * 4);
+        using var session = InferenceSession.CreateFromFile(acc, modelBytes);
+        using var pipeline = new SpawnDev.ILGPU.ML.Pipelines.FaceDetectionPipeline(session, acc);
+        var result = await pipeline.DetectAsync(pixels, w, h);
+        Console.WriteLine($"portrait {w}x{h}: faces={result.FaceCount} in {result.InferenceTimeMs:F1}ms");
+        foreach (var f in result.Faces)
+        {
+            Console.WriteLine($"  conf={f.Confidence:P1} box=({f.X:F1},{f.Y:F1},{f.Width:F1}x{f.Height:F1})");
+            if (f.Landmarks != null && f.Landmarks.Count > 0)
+                Console.WriteLine($"    landmarks=[{string.Join("; ", f.Landmarks.Select(p => $"({p.X:F0},{p.Y:F0})"))}]");
+        }
+        // Portrait face is roughly centered; a useful box should cover image center.
+        if (result.FaceCount > 0)
+        {
+            var top = result.Faces[0];
+            float cx = top.X + top.Width / 2, cy = top.Y + top.Height / 2;
+            bool coversCenter = top.X < w * 0.5f && top.X + top.Width > w * 0.5f
+                && top.Y < h * 0.5f && top.Y + top.Height > h * 0.45f;
+            Console.WriteLine($"  topCenter=({cx:F0},{cy:F0}) coversImgCenter={coversCenter}");
+        }
+    }
+    else
+    {
+        var modelPath = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/models/yolov8n/model.onnx");
+        var rgbaPath = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/samples/street_rgba.bin");
+        if (!File.Exists(modelPath) || !File.Exists(rgbaPath))
+        {
+            Console.WriteLine($"MISSING model={File.Exists(modelPath)} rgba={File.Exists(rgbaPath)} ({rgbaPath})");
+            return 1;
+        }
+        var bin = await File.ReadAllBytesAsync(rgbaPath);
+        int w = BitConverter.ToInt32(bin, 0), h = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[w * h];
+        Buffer.BlockCopy(bin, 8, pixels, 0, w * h * 4);
+        using var session = InferenceSession.CreateFromOnnx(acc, await File.ReadAllBytesAsync(modelPath));
+        using var pipeline = new SpawnDev.ILGPU.ML.Pipelines.ObjectDetectionPipeline(session, acc);
+        var result = await pipeline.DetectAsync(pixels, w, h, confidenceThreshold: 0.5f);
+        Console.WriteLine($"street {w}x{h}: objects={result.Objects.Length} in {result.InferenceTimeMs:F1}ms");
+        foreach (var o in result.Objects.Take(15))
+            Console.WriteLine($"  {o.Label} {o.Confidence:P0} box=({o.X:F0},{o.Y:F0},{o.Width:F0}x{o.Height:F0})");
+    }
+    return 0;
+}
+
 // BlazeFace TFLite parity probe (NOT a PMT test):
 //   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- BLAZEDIFF [CUDA|CPU]
 if (args.Length >= 1 && args[0] == "BLAZEDIFF")

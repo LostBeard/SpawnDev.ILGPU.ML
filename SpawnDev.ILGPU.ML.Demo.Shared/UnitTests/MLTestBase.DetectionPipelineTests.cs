@@ -229,6 +229,61 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// YOLOv8 street sample: letterbox+[0,1] preprocess must place boxes on people/cars.
+    /// The previous stretch+ImageNet path + letterbox unmap put a lone "traffic light" nowhere near lights.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Pipeline_YOLOv8_Street_DetectsPeopleOrCars() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        byte[] onnxBytes;
+        try { onnxBytes = await http.GetByteArrayAsync("models/yolov8n/model.onnx"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"YOLOv8 model missing: {ex.Message}"); }
+        if (onnxBytes.Length != 12823637)
+            throw new Exception($"YOLOv8 expected 12823637 bytes, got {onnxBytes.Length}");
+
+        byte[] bin;
+        try { bin = await http.GetByteArrayAsync("samples/street_rgba.bin"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"street_rgba.bin missing: {ex.Message}"); }
+
+        int width = BitConverter.ToInt32(bin, 0);
+        int height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+        using var pipeline = new ObjectDetectionPipeline(session, accelerator);
+        var result = await pipeline.DetectAsync(pixels, width, height, confidenceThreshold: 0.5f);
+
+        Console.WriteLine($"[YOLOv8] street {width}x{height}: objects={result.Objects.Length} in {result.InferenceTimeMs:F1}ms");
+        foreach (var o in result.Objects.Take(10))
+            Console.WriteLine($"  {o.Label} {o.Confidence:P0} box=({o.X:F0},{o.Y:F0},{o.Width:F0}x{o.Height:F0})");
+
+        if (result.Objects.Length < 2)
+            throw new Exception($"street should yield ≥2 detections at conf≥0.5, got {result.Objects.Length}");
+
+        bool hasPersonOrCar = result.Objects.Any(o =>
+            o.Label is "person" or "car" or "truck" or "bus");
+        if (!hasPersonOrCar)
+            throw new Exception(
+                $"street detections have no person/car (got: {string.Join(", ", result.Objects.Select(o => o.Label))})");
+
+        foreach (var o in result.Objects.Take(5))
+        {
+            if (o.X < -1 || o.Y < -1 || o.X + o.Width > width + 1 || o.Y + o.Height > height + 1)
+                throw new Exception($"box out of bounds: {o.Label} ({o.X},{o.Y},{o.Width}x{o.Height}) vs {width}x{height}");
+            if (o.Width < 8 || o.Height < 8)
+                throw new Exception($"degenerate box {o.Label} {o.Width}x{o.Height}");
+            float cy = o.Y + o.Height / 2f;
+            if (cy < height * 0.25f)
+                throw new Exception(
+                    $"{o.Label} center y={cy:F0} is in the sky/building tops — letterbox remap likely wrong");
+        }
+    });
+
+    /// <summary>
     /// End-to-end BlazeFace on a real portrait: must detect ≥1 face.
     /// Pins MediaPipe short-range decode (896 anchors, [-1,1] letterbox, reverse_output_order).
     /// The previous strides-[8,16]/[0,1]/xy path returned Faces: 0 on every /face sample.
@@ -282,5 +337,18 @@ public abstract partial class MLTestBase
             throw new Exception($"top face confidence {top.Confidence} below MediaPipe min_score_thresh 0.5");
         if (top.Width < 10 || top.Height < 10)
             throw new Exception($"degenerate box {top.Width}x{top.Height}");
+        // Geometry gate: prior gate only checked FaceCount≥1, so wrong boxes still passed (live /face
+        // showed Faces:2 neither on the person). Portrait face covers image center.
+        float cx = top.X + top.Width / 2f, cy = top.Y + top.Height / 2f;
+        bool coversCenter = top.X < width * 0.5f && top.X + top.Width > width * 0.5f
+            && top.Y < height * 0.55f && top.Y + top.Height > height * 0.35f;
+        Console.WriteLine($"[BlazeFace] topCenter=({cx:F0},{cy:F0}) coversImgCenter={coversCenter}");
+        if (!coversCenter)
+            throw new Exception(
+                $"top face box ({top.X:F0},{top.Y:F0},{top.Width:F0}x{top.Height:F0}) does not cover "
+                + $"portrait center ({width / 2},{height / 2}) — decode/NMS still wrong.");
+        if (result.FaceCount > 1)
+            throw new Exception(
+                $"expected ≤1 face on single-person portrait (MediaPipe num_faces default), got {result.FaceCount}");
     });
 }

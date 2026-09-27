@@ -21,12 +21,12 @@
 | `/classify` | Image classification | ✅ **VERIFIED** | `CreateFromFile_SqueezeNet_CatClassification`, `OptimizedPipeline_SqueezeNet_SameResult`; MobileNetV2 graph tests |
 | `/style` | Neural style transfer | ✅ **VERIFIED** | ORT-matched 5 styles: `Reference_StyleMosaic/Candy/Pointilism/RainPrincess/Udnie_MatchesOnnxRuntime` |
 | `/depth` | Depth estimation (Depth Anything) | ✅ **VERIFIED** | `Reference_DepthAnything_MatchesOnnxRuntime`, `DA3Small_DepthMap_NotFlat`, `CreateFromFile_DepthAnything_Inference` |
-| `/detect` | Object detection (YOLOv8) | 🟡 **PARTIAL** | Loads (5.2.30 known-size). **Live results bad** (TJ 2026-09-27) — see `Plans/handoff-face-detect-live-bad-2026-09-27.md`. PMT gates exist; re-verify vs live before VERIFIED. |
+| `/detect` | Object detection (YOLOv8) | 🟡 **PARTIAL** | 5.2.32: letterbox+[0,1] preprocess fix (was stretch+ImageNet; boxes wrong). PMT Street/Reference green Cuda+WebGPU. **Re-check live after deploy** before VERIFIED. |
+| `/face` | Face detection (BlazeFace) | 🟡 **PARTIAL** | 5.2.32: weighted NMS + maxFaces=1 (MediaPipe default); Portrait geometry gate. PMT Portrait green Cuda+WebGPU. **Re-check live after deploy** before VERIFIED. |
 | `/pose` | Pose estimation (MoveNet) | ✅ **VERIFIED** | `Reference_MoveNetLightning_MatchesOnnxRuntime`, `Pipeline_MoveNet_DetectsKeypoints` (asymmetric-pad decode fixed) |
 | `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Reference_CLIPVision_MatchesOnnxRuntime` (runs the model against ORT). ⚠️ Previously also cited `Pipeline_CLIP_Reference_CatIsTopMatch`, which never ran the model - it asserted the reference JSON was well formed, and is now named `ReferenceData_CLIP_FixtureIsWellFormed` |
 | `/remove-bg` | Background removal (RMBG) | ✅ **VERIFIED** | `Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask` (perf caveats on WebGPU compile) |
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
-| `/face` | Face detection (BlazeFace) | 🟡 **PARTIAL** | Loads + PMT Reference/Portrait green (5.2.29 NHWC). **Live results bad** (TJ 2026-09-27) — see `Plans/handoff-face-detect-live-bad-2026-09-27.md`. Do not mark VERIFIED until live matches. |
 | `/sentiment` | Sentiment (DistilBERT-SST2) | ✅ **VERIFIED** | `Sentiment_DistilBertSST2_ClassifiesPositiveAndNegative`; **live gate 2026-09-26** `drive-ml-pages.cs` → `.sentiment-verdict` = POSITIVE |
 | `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` on **all-MiniLM-L6-v2** (384-dim, all six backends). **Page re-pointed 2026-09-26** off DistilBertSST2 (classifier `logits` [1,2] — threw at runtime). Gate: `drive-ml-pages.cs` `/embeddings` |
 | `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
@@ -57,9 +57,9 @@
 | SqueezeNet / MobileNetV2 | ✅ | ✅ classification | ORT-aligned |
 | Style-transfer (5 styles) | ✅ | ✅ | ORT-matched |
 | Depth Anything V2 Small | ✅ | ✅ | ORT-matched |
-| YOLOv8-nano | ✅ | 🟡 live bad | Loads; TJ: live /detect bad 2026-09-27 — handoff |
+| YOLOv8-nano | ✅ | 🟡 pending live | 5.2.32 letterbox+[0,1]; PMT Street green — re-check /detect after deploy |
 | MoveNet Lightning | ✅ | ✅ | ORT-matched |
-| BlazeFace | ✅ | 🟡 live bad | PMT green; TJ: live /face bad 2026-09-27 — handoff |
+| BlazeFace | ✅ | 🟡 pending live | 5.2.32 weighted NMS + maxFaces=1; PMT Portrait geometry green — re-check /face after deploy |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
 | DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |
