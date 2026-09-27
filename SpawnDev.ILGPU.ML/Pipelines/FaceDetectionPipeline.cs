@@ -9,16 +9,20 @@ using System.Diagnostics;
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
 /// <summary>
-/// Face detection pipeline for BlazeFace (MediaPipe).
+/// Face detection pipeline for BlazeFace (MediaPipe short-range).
 /// Handles image preprocessing, GPU inference, anchor decoding, and NMS.
-///
-/// Usage:
-///   var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
-///   var pipeline = new FaceDetectionPipeline(session, accelerator);
-///   var result = await pipeline.DetectAsync(rgbaPixels, width, height);
-///   foreach (var face in result.Faces)
-///       Console.WriteLine($"Face at ({face.X:F0},{face.Y:F0}) conf={face.Confidence:P0}");
 /// </summary>
+/// <remarks>
+/// MediaPipe short-range contract: input [-1,1] letterboxed 128×128, strides [8,16,16,16] → 896
+/// anchors, <c>reverse_output_order</c> yxhw boxes. Decode matches that.
+/// <para>
+/// ⚠️ 2026-09-27: on the local/MediaPipe 229746-byte model, classificators vs the ORT/TFLite
+/// reference still diverge at relRMS ~240 (<c>Pipeline_BlazeFace_Reference_MatchesOnnxRuntime</c>).
+/// Until that NHWC forward is fixed, DetectAsync will typically return 0 faces above the 0.5
+/// MediaPipe score threshold even with a correct decode. Do not mark /face VERIFIED on finite
+/// regressors alone.
+/// </para>
+/// </remarks>
 public class FaceDetectionPipeline : IDisposable
 {
     private readonly InferenceSession _session;
@@ -35,11 +39,11 @@ public class FaceDetectionPipeline : IDisposable
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
         _inputSize = inputSize;
         _anchors = GenerateAnchors(inputSize);
+        if (_anchors.GetLength(0) != 896)
+            throw new InvalidOperationException(
+                $"BlazeFace short-range expects 896 anchors, GenerateAnchors produced {_anchors.GetLength(0)}");
     }
 
-    /// <summary>
-    /// Detect faces in an RGBA image.
-    /// </summary>
     /// <remarks>
     /// ⚠️ IN A BROWSER, prefer <see cref="DetectAsync(TypedArray, int, int, float, float)"/> or a
     /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
@@ -54,10 +58,6 @@ public class FaceDetectionPipeline : IDisposable
             .ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
-    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
-    /// </summary>
     public async Task<FaceDetectionResult> DetectAsync(
         TypedArray rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
@@ -68,14 +68,12 @@ public class FaceDetectionPipeline : IDisposable
             .ConfigureAwait(false);
     }
 
-    /// <summary>GPU-resident packed RGBA — no upload.</summary>
     public Task<FaceDetectionResult> DetectAsync(
         ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
         float iouThreshold = 0.3f)
         => DetectCoreAsync(rgbaPixels, width, height, confidenceThreshold, iouThreshold);
 
-    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
     public Task<FaceDetectionResult> DetectAsync(
         MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
@@ -88,30 +86,32 @@ public class FaceDetectionPipeline : IDisposable
     {
         var sw = Stopwatch.StartNew();
 
-        // Preprocess: RGBA → NCHW float [0,1] for 128×128
+        // MediaPipe ImageToTensorCalculator: keep_aspect_ratio + float range [-1, 1]
+        var (contentW, contentH, padX, padY) = ImagePreprocessKernel.Letterbox(
+            width, height, _inputSize, _inputSize);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.ForwardNormalized01(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize);
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
+            mean: new[] { 0.5f, 0.5f, 0.5f },
+            std: new[] { 0.5f, 0.5f, 0.5f },
+            preserveAspect: true);
 
-        // BlazeFace expects NHWC — transpose NCHW→NHWC on GPU (no CPU round-trip)
         int H = _inputSize, W = _inputSize;
         using var nhwcBuf = _accelerator.Allocate1D<float>(3 * H * W);
         new TransposeKernel(_accelerator).Transpose(preprocessed.View, nhwcBuf.View,
             new[] { 3, H, W }, new[] { 1, 2, 0 }); // CHW → HWC
         var inputTensor = new Tensor(nhwcBuf.View, new[] { 1, H, W, 3 });
 
-        // Run inference — BlazeFace has 2 outputs: regressors [1,896,16] and classificators [1,896,1]
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         }).ConfigureAwait(false);
 
-        // Read outputs
-        var regressors = await ReadOutputAsync(outputs, 0, 896 * 16).ConfigureAwait(false);
-        var classificators = await ReadOutputAsync(outputs, 1, 896).ConfigureAwait(false);
+        var (regName, clsName) = ResolveOutputNames();
+        var regressors = await ReadOutputAsync(outputs, regName, 896 * 16).ConfigureAwait(false);
+        var classificators = await ReadOutputAsync(outputs, clsName, 896).ConfigureAwait(false);
 
-        // Decode detections
         var faces = DecodeDetections(regressors, classificators, width, height,
-            confidenceThreshold, iouThreshold);
+            contentW, contentH, padX, padY, confidenceThreshold, iouThreshold);
 
         sw.Stop();
 
@@ -122,10 +122,25 @@ public class FaceDetectionPipeline : IDisposable
         };
     }
 
-    private async Task<float[]> ReadOutputAsync(Dictionary<string, Tensor> outputs, int index, int expectedElems)
+    private (string Regressors, string Classificators) ResolveOutputNames()
     {
-        var outputName = _session.OutputNames.Length > index ? _session.OutputNames[index] : null;
-        if (outputName == null || !outputs.ContainsKey(outputName))
+        string? reg = null, cls = null;
+        foreach (var n in _session.OutputNames)
+        {
+            var lower = n.ToLowerInvariant();
+            if (lower.Contains("regress") || lower.Contains("box"))
+                reg ??= n;
+            else if (lower.Contains("classif") || lower.Contains("score") || lower.Contains("conf"))
+                cls ??= n;
+        }
+        reg ??= _session.OutputNames.Length > 0 ? _session.OutputNames[0] : "";
+        cls ??= _session.OutputNames.Length > 1 ? _session.OutputNames[1] : reg;
+        return (reg, cls);
+    }
+
+    private async Task<float[]> ReadOutputAsync(Dictionary<string, Tensor> outputs, string outputName, int expectedElems)
+    {
+        if (string.IsNullOrEmpty(outputName) || !outputs.ContainsKey(outputName))
             return new float[expectedElems];
 
         var output = outputs[outputName];
@@ -137,10 +152,13 @@ public class FaceDetectionPipeline : IDisposable
     }
 
     private DetectedFace[] DecodeDetections(float[] regressors, float[] classificators,
-        int imageWidth, int imageHeight, float confThreshold, float iouThreshold)
+        int imageWidth, int imageHeight,
+        int contentW, int contentH, int padX, int padY,
+        float confThreshold, float iouThreshold)
     {
         var candidates = new List<DetectedFace>();
         int numAnchors = _anchors.GetLength(0);
+        float scale = _inputSize;
 
         for (int i = 0; i < numAnchors && i < classificators.Length; i++)
         {
@@ -150,38 +168,36 @@ public class FaceDetectionPipeline : IDisposable
             int regBase = i * 16;
             if (regBase + 15 >= regressors.Length) continue;
 
-            // Decode box (relative to anchor)
-            float cx = regressors[regBase + 0] / _inputSize + _anchors[i, 0];
-            float cy = regressors[regBase + 1] / _inputSize + _anchors[i, 1];
-            float w = regressors[regBase + 2] / _inputSize;
-            float h = regressors[regBase + 3] / _inputSize;
+            // MediaPipe reverse_output_order: [y_center, x_center, h, w], keypoints (y,x)*6
+            float cy = regressors[regBase + 0] / scale + _anchors[i, 1];
+            float cx = regressors[regBase + 1] / scale + _anchors[i, 0];
+            float h = regressors[regBase + 2] / scale;
+            float w = regressors[regBase + 3] / scale;
 
-            float x1 = (cx - w / 2) * imageWidth;
-            float y1 = (cy - h / 2) * imageHeight;
-            float bw = w * imageWidth;
-            float bh = h * imageHeight;
+            float x1 = MapX(cx - w / 2, contentW, padX, imageWidth);
+            float y1 = MapY(cy - h / 2, contentH, padY, imageHeight);
+            float x2 = MapX(cx + w / 2, contentW, padX, imageWidth);
+            float y2 = MapY(cy + h / 2, contentH, padY, imageHeight);
 
-            // Decode 6 landmarks
-            var landmarks = new List<(float X, float Y)>();
+            var landmarks = new List<(float X, float Y)>(6);
             for (int j = 0; j < 6; j++)
             {
-                float lx = (regressors[regBase + 4 + j * 2] / _inputSize + _anchors[i, 0]) * imageWidth;
-                float ly = (regressors[regBase + 4 + j * 2 + 1] / _inputSize + _anchors[i, 1]) * imageHeight;
-                landmarks.Add((lx, ly));
+                float ly = regressors[regBase + 4 + j * 2] / scale + _anchors[i, 1];
+                float lx = regressors[regBase + 4 + j * 2 + 1] / scale + _anchors[i, 0];
+                landmarks.Add((MapX(lx, contentW, padX, imageWidth), MapY(ly, contentH, padY, imageHeight)));
             }
 
             candidates.Add(new DetectedFace
             {
                 X = x1,
                 Y = y1,
-                Width = bw,
-                Height = bh,
+                Width = MathF.Max(0, x2 - x1),
+                Height = MathF.Max(0, y2 - y1),
                 Confidence = score,
                 Landmarks = landmarks,
             });
         }
 
-        // NMS
         candidates.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
         var kept = new List<DetectedFace>();
         var suppressed = new bool[candidates.Count];
@@ -202,6 +218,20 @@ public class FaceDetectionPipeline : IDisposable
         return kept.ToArray();
     }
 
+    private float MapX(float nx, int contentW, int padX, int imageWidth)
+    {
+        float lx = nx * _inputSize - padX;
+        if (contentW <= 0) return nx * imageWidth;
+        return lx / contentW * imageWidth;
+    }
+
+    private float MapY(float ny, int contentH, int padY, int imageHeight)
+    {
+        float ly = ny * _inputSize - padY;
+        if (contentH <= 0) return ny * imageHeight;
+        return ly / contentH * imageHeight;
+    }
+
     private static float IoU(DetectedFace a, DetectedFace b)
     {
         float x1 = MathF.Max(a.X, b.X);
@@ -215,20 +245,18 @@ public class FaceDetectionPipeline : IDisposable
         return union > 0 ? intersection / union : 0;
     }
 
-    private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
+    private static float Sigmoid(float x)
+    {
+        if (x > 100f) x = 100f;
+        if (x < -100f) x = -100f;
+        return 1f / (1f + MathF.Exp(-x));
+    }
 
-    /// <summary>
-    /// Generate BlazeFace anchors following the MediaPipe SSD anchor specification.
-    /// Strides [8, 16] produce 16×16 and 8×8 grids, 2 anchors per cell.
-    /// Total: (16×16×2) + (8×8×2) = 512 + 128 = 640... but BlazeFace front-camera
-    /// uses a different config that produces 896 anchors.
-    /// </summary>
+    /// <summary>MediaPipe short-range: strides [8,16,16,16], 2 anchors/cell → 896.</summary>
     private static float[,] GenerateAnchors(int inputSize)
     {
         var anchors = new List<(float cx, float cy)>();
-
-        // MediaPipe BlazeFace anchor spec: strides [8, 16], 2 anchors per position
-        int[] strides = { 8, 16 };
+        int[] strides = { 8, 16, 16, 16 };
         foreach (int stride in strides)
         {
             int gridH = inputSize / stride;

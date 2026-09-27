@@ -103,6 +103,10 @@
         </div>
         <div class="result-actions">
             <button class="action-btn clear-btn" @onclick="ClearStillImage">Try Another Image</button>
+            @if (_faces != null && _faces.Count == 0)
+            {
+                <span class="no-faces-hint">No faces detected — BlazeFace NHWC forward is still wrong vs MediaPipe (engine bug). Portrait should light up once that gate is green.</span>
+            }
         </div>
     }
     else
@@ -156,6 +160,7 @@
     .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
     .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
     .clear-btn:hover { background: rgba(255,255,255,0.1); }
+    .no-faces-hint { color: #94a3b8; font-size: 0.85rem; align-self: center; }
 
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
     .error-banner { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); border-radius: 8px; color: #fca5a5; font-size: 0.85rem; }
@@ -187,6 +192,7 @@
     private List<ImageDropZone.SampleImage> _faceSamples = new()
     {
         new() { Label = "Portrait", Url = "samples/portrait.jpg" },
+        // Cat/Dog are useful negatives — BlazeFace should return 0 faces.
         new() { Label = "Cat", Url = "samples/cat.jpg" },
         new() { Label = "Dog", Url = "samples/dog.jpg" },
     };

@@ -194,34 +194,95 @@ public abstract partial class MLTestBase
         if (session.OutputNames.Length < 2)
             throw new Exception($"BlazeFace expected 2 outputs, got {session.OutputNames.Length}");
 
-        // Compare regressors
-        var regOutput = outputs[session.OutputNames[0]];
-        int regElems = regOutput.ElementCount;
-        using var regReadBuf = accelerator.Allocate1D<float>(regElems);
-        new ElementWiseKernels(accelerator).Scale(regOutput.Data.SubView(0, regElems), regReadBuf.View, regElems, 1f);
+        // Classificators are the detection gate (soft "finite regressors" was a false VERIFIED).
+        var refClsBytes = await http.GetByteArrayAsync("references/blaze-face/cat_output_classificators.bin");
+        var expectedCls = new float[refClsBytes.Length / 4];
+        Buffer.BlockCopy(refClsBytes, 0, expectedCls, 0, refClsBytes.Length);
+
+        var clsName = session.OutputNames.FirstOrDefault(n =>
+            n.Contains("classif", StringComparison.OrdinalIgnoreCase)) ?? session.OutputNames[1];
+        var clsOutput = outputs[clsName];
+        int clsElems = Math.Min(clsOutput.ElementCount, expectedCls.Length);
+        using var clsReadBuf = accelerator.Allocate1D<float>(clsElems);
+        new ElementWiseKernels(accelerator).Scale(clsOutput.Data.SubView(0, clsElems), clsReadBuf.View, clsElems, 1f);
         await accelerator.SynchronizeAsync();
-        var actualReg = await regReadBuf.CopyToHostAsync<float>(0, regElems);
+        var actualCls = await clsReadBuf.CopyToHostAsync<float>(0, clsElems);
 
-        var refRegBytes = await http.GetByteArrayAsync("references/blaze-face/cat_output_regressors.bin");
-        var expectedReg = new float[refRegBytes.Length / 4];
-        Buffer.BlockCopy(refRegBytes, 0, expectedReg, 0, refRegBytes.Length);
-
-        // Validate model produces finite output with correct shape.
-        // Exact ORT match not possible: ORT runs TFLite in NHWC, our engine converts to NCHW.
-        // Spatial operations produce different results in different layouts.
-        // The FaceDetectionPipeline demo handles NHWC correctly for production use.
-        int nanCount = 0; float absMax = 0;
-        for (int i = 0; i < Math.Min(actualReg.Length, 100); i++)
+        float maxAct = float.NegativeInfinity, maxExp = float.NegativeInfinity;
+        double sumSq = 0, sumDiff = 0;
+        int n = Math.Min(actualCls.Length, expectedCls.Length);
+        for (int i = 0; i < n; i++)
         {
-            if (float.IsNaN(actualReg[i]) || float.IsInfinity(actualReg[i])) nanCount++;
-            else absMax = MathF.Max(absMax, MathF.Abs(actualReg[i]));
+            if (actualCls[i] > maxAct) maxAct = actualCls[i];
+            if (expectedCls[i] > maxExp) maxExp = expectedCls[i];
+            sumSq += expectedCls[i] * expectedCls[i];
+            double d = actualCls[i] - expectedCls[i];
+            sumDiff += d * d;
         }
-        Console.WriteLine($"[Pipeline] BlazeFace: regressors={regElems}, absMax={absMax:F2}, NaN={nanCount}");
-        if (nanCount > regElems / 10)
-            throw new Exception($"BlazeFace regressors have {nanCount} NaN values");
-        if (absMax == 0)
-            throw new Exception("BlazeFace regressors are all zeros");
+        double relRms = Math.Sqrt(sumDiff / Math.Max(1e-12, sumSq));
+        Console.WriteLine(
+            $"[Pipeline] BlazeFace classificators: maxAct={maxAct:F3} maxExp={maxExp:F3} relRMS={relRms:E2} n={n}");
+        // Face detection is unusable when classificators diverge this far — do not soften this gate.
+        // Soft "finite regressors" used to keep /face marked VERIFIED while live Faces: 0 (relRMS~240, 2026-09-27).
+        if (relRms > 0.05)
+            throw new Exception(
+                $"BlazeFace NHWC forward diverges from TFLite reference: maxAct={maxAct:F3} maxExp={maxExp:F3} "
+                + $"relRMS={relRms:E2} (need ≤0.05). /face will show Faces: 0 until this is fixed.");
+    });
 
-        Console.WriteLine($"[Pipeline] BlazeFace inference: PASS (finite output, {regElems} regressors)");
+    /// <summary>
+    /// End-to-end BlazeFace on a real portrait: must detect ≥1 face.
+    /// Pins MediaPipe short-range decode (896 anchors, [-1,1] letterbox, reverse_output_order).
+    /// The previous strides-[8,16]/[0,1]/xy path returned Faces: 0 on every /face sample.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Pipeline_BlazeFace_Portrait_DetectsFace() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        byte[] modelBytes;
+        try { modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"BlazeFace model missing: {ex.Message}"); }
+
+        byte[] bin;
+        try { bin = await http.GetByteArrayAsync("samples/portrait_rgba.bin"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"portrait_rgba.bin missing: {ex.Message}"); }
+
+        int width = BitConverter.ToInt32(bin, 0);
+        int height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+        Console.WriteLine($"[BlazeFace] outputs=[{string.Join(", ", session.OutputNames)}]");
+        using var pipeline = new FaceDetectionPipeline(session, accelerator);
+
+        // Diagnostic: raw max score before decode (catches swapped outputs / wrong norm)
+        {
+            using var rgbaBuf = accelerator.Allocate1D(pixels);
+            // Re-run through public API after logging scores via a lowered threshold probe
+        }
+
+        var resultLoose = await pipeline.DetectAsync(pixels, width, height, confidenceThreshold: 0.01f);
+        Console.WriteLine($"[BlazeFace] loose(0.01) faces={resultLoose.FaceCount}");
+        if (resultLoose.FaceCount > 0)
+            Console.WriteLine($"[BlazeFace] loose top conf={resultLoose.Faces[0].Confidence:P2}");
+
+        var result = await pipeline.DetectAsync(pixels, width, height);
+
+        Console.WriteLine(
+            $"[BlazeFace] portrait {width}x{height}: faces={result.FaceCount} in {result.InferenceTimeMs:F1}ms");
+        if (result.FaceCount < 1)
+            throw new Exception(
+                $"BlazeFace detected 0 faces on samples/portrait.jpg (loose@0.01 got {resultLoose.FaceCount}). "
+                + "decode/preprocess still wrong.");
+        var top = result.Faces[0];
+        Console.WriteLine(
+            $"[BlazeFace] top face conf={top.Confidence:P1} box=({top.X:F0},{top.Y:F0},{top.Width:F0}x{top.Height:F0})");
+        if (top.Confidence < 0.5f)
+            throw new Exception($"top face confidence {top.Confidence} below MediaPipe min_score_thresh 0.5");
+        if (top.Width < 10 || top.Height < 10)
+            throw new Exception($"degenerate box {top.Width}x{top.Height}");
     });
 }

@@ -2,6 +2,16 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.28 (2026-09-27) - BlazeFace decode fixed; NHWC forward still red
+
+**Decode:** `FaceDetectionPipeline` now matches MediaPipe short-range (896 anchors, [-1,1]
+letterbox, yxhw). That alone does **not** make `/face` detect faces.
+
+**Root cause of Faces: 0:** TFLite NHWC forward diverges from the reference classificators
+(relRMS ~240 on `cat_input.bin`). The old "VERIFIED" gate only checked finite regressors.
+`Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` now requires classificator relRMS ≤ 0.05.
+Demo status: `/face` → PARTIAL until that gate is green.
+
 ## 5.2.27 (2026-09-27) - Face: known-size load; COI SW buffers bodies
 
 **Bug fix:** Build `2026-09-27 04:32:24 UTC` still FlatBuffer-OOB at buffer length 199050. A truncated
