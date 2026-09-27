@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.31 (2026-09-27) - COI SW: capture script URL before async unregister
+
+**Bug fix:** `registerFresh` ran after `getRegistrations().then(...)`, by which time
+`document.currentScript` is null → `Cannot read properties of null (reading 'src')`.
+Capture `currentScript.src` (with baseURI fallback) synchronously before the promise chain.
+
 ## 5.2.30 (2026-09-27) - /detect known-size YOLOv8 load (truncated ONNX)
 
 **Bug fix:** `/detect` hit the same GH Pages truncated-cache trap as `/face`: a short body
