@@ -2,6 +2,27 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.24 (2026-09-26) - Universal stream load (`CreateFromStreamAsync`)
+
+The README has claimed "Universal Model Loading" for a long time. `CreateFromFile` / `CreateFromFileAsync`
+already auto-detected from magic bytes, and the Model Inspector streamed a prefix to detect format — but
+the **browser load path** still required knowing the format up front (`CreateFromOnnxStreamAsync` /
+`CreateFromGGUFStreamAsync`). That gap is closed.
+
+- **`InferenceSession.CreateFromStreamAsync`** — seekable stream → detect (256-byte prefix, same contract as
+  `ModelInspectorHelper.InspectAsync`) → dispatch:
+  - ONNX → `CreateFromOnnxStreamAsync` (weights stream to GPU)
+  - GGUF → `CreateFromGGUFStreamAsync` (weights stream to GPU)
+  - TFLite / SafeTensors / PyTorch / CoreML / TFGraphDef → drain when ≤ 256 MB, then `CreateFromFile`
+    (those formats still lack a dedicated stream create; larger files throw rather than WASM-OOM)
+- **`InferenceSession.DetectModelFormatAsync`** — public stream twin of `DetectModelFormat(byte[])`;
+  rewinds seekable streams. SafeTensors uses the inspector's prefix-tolerant probe.
+- **`CreateFromHuggingFaceAsync`** — uses `CreateFromStreamAsync` after detect (GGUF/TFLite/… through the
+  hub helper, not ONNX-only). ONNX with external data still falls through to the byte[] + `.onnx_data` path.
+- Docs: Getting Started + README Universal section lead with `CreateFromStreamAsync`.
+- Tests: `CreateFromStream_SqueezeNet_MatchesOnnxStream`, `DetectModelFormatAsync_Fixtures_MatchByteDetect`,
+  `CreateFromStream_TFLite_BlazeFace_Loads`.
+
 ## 5.2.23 (2026-09-26) - System One library is generic (Snake stays in the demo)
 
 **Bugfix:** 5.2.22 shipped `SystemOneSnakeSpec` and `CreateForSnake` inside the NuGet package.

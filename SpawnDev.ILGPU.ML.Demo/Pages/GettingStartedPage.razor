@@ -49,17 +49,19 @@ dotnet add package SpawnDev.SpawnJS</code></pre>
                 <p class="step-desc">
                     Prefer streaming weights through the hub into OPFS — never materialize a large model as a
                     <code>byte[]</code> on the WASM heap. <code>HubModelSource</code> is the default (plain HTTP + OPFS).
-                    Optional P2P delivery is a separate package: <code>SpawnDev.ILGPU.ML.WebTorrent</code>.
+                    <code>CreateFromStreamAsync</code> auto-detects ONNX / GGUF / TFLite / … from magic bytes
+                    (same prefix as the Model Inspector). Optional P2P delivery is a separate package:
+                    <code>SpawnDev.ILGPU.ML.WebTorrent</code>.
                 </p>
                 <div class="code-block">
 <pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML</span>;
 <span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Hub</span>;
 
-<span class="cm">// Browser path (preferred): stream from hub → OPFS → GPU</span>
+<span class="cm">// Browser path (preferred): stream from hub → OPFS → GPU (format auto-detected)</span>
 <span class="kw">using var</span> source = <span class="kw">new</span> <span class="ty">HubModelSource</span>(JS);   <span class="cm">// or inject as a singleton</span>
 <span class="kw">await using var</span> stream = <span class="kw">await</span> source.<span class="fn">OpenAsync</span>(
     <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
-<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromOnnxStreamAsync</span>(accelerator, stream);
+<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromStreamAsync</span>(accelerator, stream);
 
 <span class="cm">// Convenience wrapper (same delivery under the hood; needs the filename):</span>
 <span class="kw">using var</span> hub = <span class="kw">new</span> <span class="ty">ModelHub</span>(JS);

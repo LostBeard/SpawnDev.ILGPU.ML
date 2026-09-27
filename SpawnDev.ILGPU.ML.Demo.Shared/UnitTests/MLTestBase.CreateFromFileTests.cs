@@ -716,6 +716,135 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Universal stream load: <see cref="InferenceSession.CreateFromStreamAsync"/> auto-detects ONNX from
+    /// magic bytes (same prefix contract as the Model Inspector) and must match
+    /// <see cref="InferenceSession.CreateFromOnnxStreamAsync"/> bit-for-bit on weights / nodes / top-5.
+    /// This is the API the README "Universal Model Loading" claim needs for browser / OPFS / hub streams —
+    /// not only <c>CreateFromFile(byte[])</c>.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task CreateFromStream_SqueezeNet_MatchesOnnxStream() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var bytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var (pixels, width, height) = await LoadCatImage(http);
+
+        using var autoMs = new MemoryStream(bytes, writable: false);
+        using var knownMs = new MemoryStream(bytes, writable: false);
+        using var autoSession = await InferenceSession.CreateFromStreamAsync(
+            accelerator, autoMs, streamThreshold: 4096);
+        using var knownSession = await InferenceSession.CreateFromOnnxStreamAsync(
+            accelerator, knownMs, streamThreshold: 4096);
+
+        Console.WriteLine($"[CreateFromStream] auto: {autoSession}  known: {knownSession}");
+
+        if (autoSession.WeightCount != knownSession.WeightCount)
+            throw new Exception(
+                $"weight count mismatch: auto={autoSession.WeightCount} known={knownSession.WeightCount}");
+        if (autoSession.NodeCount != knownSession.NodeCount)
+            throw new Exception(
+                $"node count mismatch: auto={autoSession.NodeCount} known={knownSession.NodeCount}");
+
+        var autoPipe = new ClassificationPipeline(autoSession, accelerator);
+        var knownPipe = new ClassificationPipeline(knownSession, accelerator);
+        var autoRes = await autoPipe.ClassifyAsync(pixels, width, height, 10);
+        var knownRes = await knownPipe.ClassifyAsync(pixels, width, height, 10);
+
+        int n = Math.Min(5, Math.Min(autoRes.Count(), knownRes.Count()));
+        if (n == 0) throw new Exception("classification returned no results");
+
+        for (int i = 0; i < n; i++)
+            if (autoRes[i].ClassIndex != knownRes[i].ClassIndex)
+                throw new Exception(
+                    $"top-{i} class differs: auto={autoRes[i].ClassIndex} known={knownRes[i].ClassIndex}");
+
+        float confDiff = Math.Abs(autoRes[0].Confidence - knownRes[0].Confidence);
+        if (confDiff > 1e-3f)
+            throw new Exception(
+                $"top-1 confidence mismatch: auto={autoRes[0].Confidence:F6} known={knownRes[0].Confidence:F6}");
+
+        Console.WriteLine(
+            $"[CreateFromStream] PASS — CreateFromStreamAsync == CreateFromOnnxStreamAsync "
+            + $"(top-1 class {autoRes[0].ClassIndex} @ {autoRes[0].Confidence:P2})");
+        autoPipe.Dispose();
+        knownPipe.Dispose();
+    });
+
+    /// <summary>
+    /// <see cref="InferenceSession.DetectModelFormatAsync"/> must match <see cref="InferenceSession.DetectModelFormat"/>
+    /// for every local fixture, and leave a seekable stream at Position 0 so the next create can reuse it.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task DetectModelFormatAsync_Fixtures_MatchByteDetect() => await RunTest(async accelerator =>
+    {
+        _ = accelerator; // format detect is CPU-only; RunTest still gives HttpClient / backend gating
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var files = new[]
+        {
+            "models/squeezenet/model.onnx",
+            "test-models/test.gguf",
+            "test-models/test.safetensors",
+            "test-models/test.pt",
+        };
+
+        foreach (var file in files)
+        {
+            byte[] bytes;
+            try { bytes = await http.GetByteArrayAsync(file); }
+            catch (HttpRequestException)
+            {
+                Console.WriteLine($"[DetectStream] skip {file} (not available)");
+                continue;
+            }
+
+            var expected = InferenceSession.DetectModelFormat(bytes);
+            using var ms = new MemoryStream(bytes, writable: false);
+            var fromStream = await InferenceSession.DetectModelFormatAsync(ms);
+            if (fromStream != expected)
+                throw new Exception($"{file}: stream detect={fromStream}, byte detect={expected}");
+            if (ms.Position != 0)
+                throw new Exception($"{file}: DetectModelFormatAsync left Position={ms.Position}, expected 0");
+            Console.WriteLine($"[DetectStream] {file} → {fromStream} (rewound)");
+        }
+
+        Console.WriteLine("[DetectStream] PASS");
+    });
+
+    /// <summary>
+    /// Non-ONNX / non-GGUF formats without a dedicated streaming create still load via
+    /// <see cref="InferenceSession.CreateFromStreamAsync"/> when the file fits the drain cap
+    /// (BlazeFace TFLite — same fixture as <c>AutoDetect_LoadOnnxAndTFLite</c>).
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task CreateFromStream_TFLite_BlazeFace_Loads() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        byte[] bytes;
+        try { bytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite"); }
+        catch (HttpRequestException ex)
+        {
+            throw new UnsupportedTestException(
+                $"models/blaze-face/model.tflite not served by this lane ({ex.Message})");
+        }
+
+        using var ms = new MemoryStream(bytes, writable: false);
+        using var session = await InferenceSession.CreateFromStreamAsync(accelerator, ms);
+        Console.WriteLine($"[CreateFromStream_TFLite] {session}");
+        if (session.NodeCount <= 0)
+            throw new Exception($"TFLite stream create produced an empty graph: NodeCount={session.NodeCount}");
+        Console.WriteLine($"[CreateFromStream_TFLite] PASS — {session.NodeCount} nodes");
+    });
+
+    /// <summary>
     /// FP16 weight streaming: a fp16-source weight that needs an fp32 GPU buffer must upload the raw fp16
     /// bytes to the GPU and upcast Half→float ON THE GPU (browser: zero-copy, bytes never enter .NET) — NOT
     /// read into a managed byte[] + CPU BitConverter loop (the old path that pulled every SD-Turbo weight

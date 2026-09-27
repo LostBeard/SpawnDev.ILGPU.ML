@@ -72,24 +72,31 @@ One API loads models from any ML ecosystem. Format is auto-detected from magic b
 | **Core ML** (.mlmodel) | Apple, iOS/macOS | Apple's Neural Engine models. |
 
 ```csharp
-// All of these work — format detected automatically from magic bytes
+// Browser / OPFS / hub (preferred): seekable stream — format auto-detected, ONNX/GGUF stream to GPU
+await using var stream = await hubSource.OpenAsync(repoId, "model.onnx"); // or .gguf / .tflite / …
+using var session = await InferenceSession.CreateFromStreamAsync(accelerator, stream);
+
+// In-memory bytes — same auto-detect
 var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
-// Or load from HTTP with auto-detection
+// HTTP download into byte[] (desktop / small models — avoid for large browser weights)
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
 
 // Format-specific when you know the type
 var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, onnxStream);
 var session = InferenceSession.CreateFromTFLite(accelerator, tfliteBytes);
 var session = InferenceSession.CreateFromGGUF(accelerator, ggufBytes);
+var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, ggufStream);
 var session = InferenceSession.CreateFromSafeTensors(accelerator, safetensorBytes);
 var session = InferenceSession.CreateFromPyTorch(accelerator, ptBytes);
 var session = InferenceSession.CreateFromCoreML(accelerator, mlmodelBytes);
 var session = InferenceSession.CreateFromTFGraphDef(accelerator, pbBytes);
 ```
 
+`CreateFromStreamAsync` is the twin of the Model Inspector's streaming detect: a short magic-byte prefix, then dispatch. ONNX and GGUF keep weights on the stream→GPU path; other formats drain when ≤ 256 MB (then `CreateFromFile`). Requires a **seekable** stream (HubModelSource / OPFS / MemoryStream / FileStream) — not a one-shot HTTP body.
 ## Transformers.js-style API — `Tensor<T>`, `OwnedTensor<T>`, `RunOwnedAsync`
 
 If you've used [Transformers.js](https://huggingface.co/docs/transformers.js) or ONNX Runtime, the input/output ergonomics will feel familiar. Models accept named `Tensor<T>` inputs and return an `OwnedTensorMap<T>` — a disposable bag of named outputs. Caller owns every output buffer, and `using` cleans them up in one go.
@@ -307,12 +314,15 @@ GraphCompiler (200+ operators + fused ops → execution plan)
 GraphExecutor (topological dispatch, buffer recycling, periodic flush)
     |
     v
-InferenceSession (public API: CreateFromFileAsync / Run / RunAsync)
+InferenceSession (public API: CreateFromStreamAsync / CreateFromFileAsync / Run / RunAsync)
 ```
 
 **Model loading** — one API, any format:
 ```csharp
-// Auto-detect format from magic bytes
+// Seekable stream (browser / OPFS / hub) — auto-detect, ONNX/GGUF stream to GPU
+using var session = await InferenceSession.CreateFromStreamAsync(accelerator, stream);
+
+// HTTP → byte[] (desktop / small models)
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");

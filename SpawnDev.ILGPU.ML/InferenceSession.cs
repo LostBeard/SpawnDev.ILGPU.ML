@@ -645,6 +645,183 @@ public class InferenceSession : IDisposable
         };
     }
 
+    /// <summary>
+    /// Bytes read to detect format from a stream — same prefix size as
+    /// <see cref="Onnx.ModelInspectorHelper.InspectAsync"/>. Covers every magic-byte check without
+    /// reading weight blobs.
+    /// </summary>
+    public const int StreamDetectPrefixBytes = 256;
+
+    /// <summary>
+    /// Largest model that may be drained into a managed <c>byte[]</c> when a format has no streaming
+    /// create path yet (TFLite, SafeTensors, …). Larger files must wait for a format-specific stream
+    /// loader — do NOT raise this to "fix" browser OOMs.
+    /// </summary>
+    public const long MaxByteArrayLoadFromStream = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Create an InferenceSession from a seekable model <see cref="Stream"/> — the browser path that
+    /// matches what <see cref="Onnx.ModelInspectorHelper.InspectAsync"/> already does for inspection.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reads a short magic-byte prefix, detects the format, rewinds, then dispatches:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><see cref="ModelFormat.ONNX"/> → <see cref="CreateFromOnnxStreamAsync"/> (weights stream to GPU)</item>
+    /// <item><see cref="ModelFormat.GGUF"/> → <see cref="CreateFromGGUFStreamAsync"/> (weights stream to GPU)</item>
+    /// <item>Other inference formats → drain into <c>byte[]</c> then <see cref="CreateFromFile"/> when the
+    /// file is at most <see cref="MaxByteArrayLoadFromStream"/> (those formats still lack a streaming
+    /// create; the inspector already streams their headers). Larger files throw rather than OOM.</item>
+    /// </list>
+    /// <para>
+    /// 🔴 Requires a <b>seekable</b> stream (OPFS / HubModelSource / MemoryStream / FileStream). ONNX and
+    /// GGUF stream loaders seek to each weight; a forward-only HTTP body cannot be used here — cache it
+    /// first (that is what <see cref="Hub.HubModelSource"/> does).
+    /// </para>
+    /// </remarks>
+    public static async Task<InferenceSession> CreateFromStreamAsync(
+        Accelerator accelerator, Stream stream,
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true,
+        int streamThreshold = 1024 * 1024,
+        Stream? externalDataStream = null,
+        CancellationToken ct = default,
+        Action<Graph.ModelGraph>? prepareGraph = null)
+    {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (!stream.CanSeek)
+            throw new ArgumentException(
+                "CreateFromStreamAsync requires a seekable stream (format detection rewinds, and ONNX/GGUF "
+                + "stream loaders seek to each weight). Use HubModelSource.OpenAsync / OPFS / MemoryStream / "
+                + "FileStream — not a one-shot HTTP response body.", nameof(stream));
+
+        onProgress?.Invoke("detect", 0);
+        var format = await DetectModelFormatAsync(stream, ct).ConfigureAwait(false);
+        onProgress?.Invoke("detect", 100);
+
+        // Detection leaves Position at 0 when the stream is seekable (DetectModelFormatAsync rewinds).
+        if (stream.Position != 0)
+            stream.Seek(0, SeekOrigin.Begin);
+
+        return format switch
+        {
+            ModelFormat.ONNX => await CreateFromOnnxStreamAsync(
+                accelerator, stream, onProgress, inputShapes, enableOptimization, streamThreshold,
+                externalDataStream, ct, prepareGraph).ConfigureAwait(false),
+
+            ModelFormat.GGUF => await CreateFromGGUFStreamAsync(
+                accelerator, stream, onProgress, ct).ConfigureAwait(false),
+
+            ModelFormat.TFLite or ModelFormat.SafeTensors or ModelFormat.PyTorch
+                or ModelFormat.CoreML or ModelFormat.TFGraphDef
+                => await CreateFromFileAfterDrainAsync(
+                    accelerator, stream, format, onProgress, inputShapes, enableOptimization, ct)
+                    .ConfigureAwait(false),
+
+            _ => throw new NotSupportedException(
+                $"Streaming load does not support format '{format}'. Supported for auto-detect create: "
+                + "ONNX, GGUF (streamed), and TFLite / SafeTensors / PyTorch / CoreML / TFGraphDef "
+                + $"(drained when ≤ {MaxByteArrayLoadFromStream / (1024 * 1024)} MB)."),
+        };
+    }
+
+    /// <summary>
+    /// Detect model format from a stream by reading at most <see cref="StreamDetectPrefixBytes"/> —
+    /// never the weight section. Rewinds a seekable stream to its start afterward.
+    /// </summary>
+    /// <remarks>
+    /// Same contract as the Model Inspector: SafeTensors is probed prefix-tolerantly (a short buffer
+    /// would otherwise fail <see cref="DetectModelFormat"/>'s header-size check and mis-detect).
+    /// </remarks>
+    public static async Task<ModelFormat> DetectModelFormatAsync(Stream stream, CancellationToken ct = default)
+    {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+
+        long start = 0;
+        if (stream.CanSeek)
+            start = stream.Position;
+
+        var prefix = new byte[StreamDetectPrefixBytes];
+        int prefixLen = await ReadUpToAsync(stream, prefix, 0, prefix.Length, ct).ConfigureAwait(false);
+
+        ModelFormat format;
+        if (IsSafeTensorsPrefix(prefix, prefixLen))
+            format = ModelFormat.SafeTensors;
+        else
+        {
+            var detectBuf = prefixLen == prefix.Length ? prefix : prefix.AsSpan(0, prefixLen).ToArray();
+            format = DetectModelFormat(detectBuf);
+        }
+
+        if (stream.CanSeek)
+            stream.Seek(start, SeekOrigin.Begin);
+        else if (prefixLen > 0)
+            throw new NotSupportedException(
+                "DetectModelFormatAsync consumed a prefix from a non-seekable stream and cannot rewind. "
+                + "Pass a seekable stream (HubModelSource / OPFS / MemoryStream).");
+
+        return format;
+    }
+
+    private static async Task<InferenceSession> CreateFromFileAfterDrainAsync(
+        Accelerator accelerator, Stream stream, ModelFormat format,
+        Action<string, int>? onProgress,
+        Dictionary<string, int[]>? inputShapes,
+        bool enableOptimization,
+        CancellationToken ct)
+    {
+        long len = stream.CanSeek ? stream.Length - stream.Position : -1;
+        if (len < 0)
+            throw new NotSupportedException(
+                $"{format} streaming create is not implemented yet, and the stream length is unknown so "
+                + "it cannot be drained safely. Cache the file (HubModelSource) or use CreateFrom"
+                + $"{format}(byte[]) for small models.");
+        if (len > MaxByteArrayLoadFromStream)
+            throw new NotSupportedException(
+                $"{format} is {len:N0} bytes — streaming create for this format is not implemented yet, "
+                + $"and draining more than {MaxByteArrayLoadFromStream / (1024 * 1024)} MB into a managed "
+                + "byte[] is refused (browser WASM OOM). Use CreateFromOnnxStreamAsync / "
+                + "CreateFromGGUFStreamAsync for large models, or wait for a streaming loader for "
+                + $"{format}.");
+
+        onProgress?.Invoke("download", 0);
+        var bytes = new byte[len];
+        int read = 0;
+        while (read < bytes.Length)
+        {
+            int n = await stream.ReadAsync(bytes.AsMemory(read, bytes.Length - read), ct).ConfigureAwait(false);
+            if (n == 0)
+                throw new EndOfStreamException($"Expected {bytes.Length} bytes for {format}, got {read}.");
+            read += n;
+        }
+        onProgress?.Invoke("download", 100);
+        return CreateFromFile(accelerator, bytes, onProgress, inputShapes, enableOptimization);
+    }
+
+    private static bool IsSafeTensorsPrefix(byte[] prefix, int prefixLen)
+    {
+        // Mirror ModelInspectorHelper: headerSize as uint64 + '{' — do NOT require headerSize <
+        // buffer.Length (that is what made short prefixes fail DetectModelFormat for large ST files).
+        if (prefixLen < 9) return false;
+        long headerSize = BitConverter.ToInt64(prefix, 0);
+        if (headerSize < 2 || headerSize > 100_000_000L) return false;
+        return prefix[8] == (byte)'{';
+    }
+
+    private static async Task<int> ReadUpToAsync(Stream stream, byte[] buffer, int offset, int count, CancellationToken ct)
+    {
+        int total = 0;
+        while (total < count)
+        {
+            int n = await stream.ReadAsync(buffer.AsMemory(offset + total, count - total), ct).ConfigureAwait(false);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
     /// <summary>Detect model format from magic bytes.</summary>
     public static ModelFormat DetectModelFormat(byte[] data)
     {
@@ -757,7 +934,7 @@ public class InferenceSession : IDisposable
         // Model delivery no longer depends on WebTorrent at all - ML does not reference it - so the torrent
         // branch is gone. For P2P delivery, reference SpawnDev.ILGPU.ML.WebTorrent and pass its
         // HubModelStream (an IModelSource) to a pipeline, or open the stream yourself and call
-        // CreateFromOnnxStreamAsync.
+        // CreateFromStreamAsync (auto-detect) or CreateFromOnnxStreamAsync when you know it is ONNX.
         //
         // PREFER the streaming path: hub.OpenStreamAsync hands back an OPFS stream, which is an
         // IJSReadStream - so the graph structure is parsed from the stream and each weight is seeked to and
@@ -768,22 +945,33 @@ public class InferenceSession : IDisposable
         // External-data models (weights in a sibling .onnx_data file) still take the byte[] path: resolving
         // those needs the parsed model plus a second file, which the block below already handles.
         //
-        // ⚠️ Known inefficiency, stated rather than hidden: when the model has no external data this parses
-        // the stream TWICE - once to answer "does it have external data", then again inside
-        // CreateFromOnnxStreamAsync. Both reads come from the OPFS-cached blob so it is cheap, but the right
-        // fix is a stream entry point that accepts an already-parsed model.
+        // Auto-detect via CreateFromStreamAsync so a .gguf / .tflite opened through this helper still works —
+        // the old path always called CreateFromOnnxStreamAsync and could only load ONNX.
 #pragma warning disable CS0618 // the documented ModelHub fallback above - obsolete on purpose, kept working
         var hubStream = await hub.OpenStreamAsync(repoId, filename, revision).ConfigureAwait(false);
         if (hubStream != null)
         {
             await using (hubStream)
             {
-                var probe = await Onnx.OnnxParser.ParseFromStreamAsync(hubStream, 1024 * 1024).ConfigureAwait(false);
-                if (!Onnx.OnnxLoader.HasExternalData(probe))
+                var streamFormat = await DetectModelFormatAsync(hubStream, CancellationToken.None).ConfigureAwait(false);
+                if (streamFormat == ModelFormat.ONNX)
+                {
+                    // ONNX may declare external data — probe structure only, then either stream the single
+                    // file or fall through to the byte[] + .onnx_data path below.
+                    var probe = await Onnx.OnnxParser.ParseFromStreamAsync(hubStream, 1024 * 1024).ConfigureAwait(false);
+                    if (!Onnx.OnnxLoader.HasExternalData(probe))
+                    {
+                        hubStream.Position = 0;
+                        onProgress?.Invoke("download", 100);
+                        return await CreateFromStreamAsync(accelerator, hubStream, onProgress, inputShapes)
+                            .ConfigureAwait(false);
+                    }
+                }
+                else
                 {
                     hubStream.Position = 0;
                     onProgress?.Invoke("download", 100);
-                    return await CreateFromOnnxStreamAsync(accelerator, hubStream, onProgress, inputShapes)
+                    return await CreateFromStreamAsync(accelerator, hubStream, onProgress, inputShapes)
                         .ConfigureAwait(false);
                 }
             }
