@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.25 (2026-09-27) - Do not ship truncated HTTP downloads
+
+**Bug fix:** `DownloadBytesChunkedAsync` returned `result[..totalRead]` when browser WASM streaming
+stopped early (`totalRead > 0` but `< Content-Length`). That prefix became a "valid" byte[] for
+`CreateFromFileAsync` / TFLite parse and exploded as `IndexOutOfRangeException` in
+`FlatBufferReader.ReadInt32` / `ReadString` - measured on
+https://lostbeard.github.io/SpawnDev.ILGPU.ML/face (BlazeFace). Incomplete streams now fall through to
+`ReadAsByteArrayAsync`. FlatBuffer reader bounds errors name truncation as the usual cause.
+
 ## 5.2.24 (2026-09-26) - Universal stream load (`CreateFromStreamAsync`)
 
 The README has claimed "Universal Model Loading" for a long time. `CreateFromFile` / `CreateFromFileAsync`

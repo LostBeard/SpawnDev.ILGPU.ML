@@ -3085,9 +3085,14 @@ public class InferenceSession : IDisposable
                         await Task.Yield();
                 }
 
-                // Verify we got data — browser WASM may return 0 bytes with streaming
-                if (totalRead > 0)
-                    return totalRead == result.Length ? result : result[..totalRead];
+                // Verify we got the FULL body. Browser WASM streaming can stop early (read==0 before
+                // Content-Length bytes arrive). Returning result[..totalRead] here used to ship a
+                // truncated .tflite that then exploded in FlatBufferReader.ReadInt32 as
+                // IndexOutOfRangeException — measured on https://lostbeard.github.io/SpawnDev.ILGPU.ML/face
+                // (BlazeFace, 2026-09-27): full file on disk / desktop HTTP, truncated in WASM stream.
+                if (totalRead == result.Length)
+                    return result;
+                // Incomplete — fall through to ReadAsByteArrayAsync below (do NOT return a prefix).
             }
             else
             {
@@ -3117,7 +3122,8 @@ public class InferenceSession : IDisposable
             _ = ex;
         }
 
-        // Fallback: standard byte array download (works on all platforms including browser WASM)
+        // Fallback: standard byte array download (works on all platforms including browser WASM).
+        // Also the recovery path when streaming returned a PREFIX of Content-Length (see above).
         onProgress?.Invoke("download", 0);
         using var fallbackResponse = await http.GetAsync(url);
         fallbackResponse.EnsureSuccessStatusCode();

@@ -1,3 +1,6 @@
+using System.IO;
+using System.Net;
+using System.Net.Http;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
@@ -7,6 +10,62 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 public abstract partial class MLTestBase
 {
+    /// <summary>
+    /// Browser WASM streaming can stop early (read==0 before Content-Length bytes arrive).
+    /// Returning a PREFIX used to ship a truncated .tflite that then exploded in FlatBufferReader
+    /// as IndexOutOfRangeException on https://lostbeard.github.io/SpawnDev.ILGPU.ML/face (2026-09-27).
+    /// Incomplete stream MUST fall through to ReadAsByteArrayAsync and return the FULL body.
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task DownloadBytesChunked_IncompleteStream_FallsBackToFullBody() => await RunTest(async accelerator =>
+    {
+        _ = accelerator;
+        var full = new byte[8192];
+        for (int i = 0; i < full.Length; i++) full[i] = (byte)(i & 0xFF);
+
+        var handler = new IncompleteThenFullHandler(full);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("http://test.local/") };
+        var got = await InferenceSession.DownloadBytesChunkedAsync(http, "http://test.local/model.bin");
+
+        if (got.Length != full.Length)
+            throw new Exception($"expected full {full.Length} bytes, got {got.Length}");
+        for (int i = 0; i < full.Length; i++)
+            if (got[i] != full[i])
+                throw new Exception($"byte mismatch at {i}: got {got[i]}, expected {full[i]}");
+        // RED-CHECK: if the truncated prefix is returned, CallCount stays 1 (no fallback GET).
+        if (handler.CallCount < 2)
+            throw new Exception(
+                $"fallback never ran (GETs={handler.CallCount}) - truncated Content-Length prefix was accepted");
+        Console.WriteLine(
+            $"[DownloadChunked] incomplete stream recovered via fallback ({got.Length} bytes, {handler.CallCount} GETs)");
+    });
+
+    /// <summary>First GET: Content-Length = full, body = first half then EOF. Second GET: full body.</summary>
+    private sealed class IncompleteThenFullHandler : HttpMessageHandler
+    {
+        private readonly byte[] _full;
+        public int CallCount;
+        public IncompleteThenFullHandler(byte[] full) => _full = full;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            if (CallCount == 1)
+            {
+                var half = new byte[_full.Length / 2];
+                Buffer.BlockCopy(_full, 0, half, 0, half.Length);
+                var content = new StreamContent(new MemoryStream(half));
+                content.Headers.ContentLength = _full.Length;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+            }
+
+            var fullContent = new ByteArrayContent(_full);
+            fullContent.Headers.ContentLength = _full.Length;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = fullContent });
+        }
+    }
+
     /// <summary>
     /// Test TFLite model loading and compilation via InferenceSession.
     /// Uses the BlazeFace model if available.

@@ -24,8 +24,14 @@ public class FlatBufferReader
     public ushort ReadUInt16(int offset) =>
         (ushort)(_data[offset] | (_data[offset + 1] << 8));
 
-    public int ReadInt32(int offset) =>
-        _data[offset] | (_data[offset + 1] << 8) | (_data[offset + 2] << 16) | (_data[offset + 3] << 24);
+    public int ReadInt32(int offset)
+    {
+        if ((uint)offset + 4u > (uint)_data.Length)
+            throw new InvalidDataException(
+                $"FlatBuffers ReadInt32 offset {offset} is outside buffer length {_data.Length} - "
+                + "usually a truncated download (incomplete Content-Length stream), not a bad schema.");
+        return _data[offset] | (_data[offset + 1] << 8) | (_data[offset + 2] << 16) | (_data[offset + 3] << 24);
+    }
 
     public uint ReadUInt32(int offset) => (uint)ReadInt32(offset);
 
@@ -173,6 +179,10 @@ public class FlatBufferReader
     {
         if (stringOffset == 0) return "";
         int len = ReadInt32(stringOffset);
+        if (len < 0 || (long)stringOffset + 4 + len > _data.Length)
+            throw new InvalidDataException(
+                $"FlatBuffers ReadString at {stringOffset} wants {len} bytes past buffer length {_data.Length} - "
+                + "usually a truncated download, not a bad schema.");
         return System.Text.Encoding.UTF8.GetString(_data, stringOffset + 4, len);
     }
 
