@@ -18,16 +18,30 @@ public partial class BenchmarkPage : IDisposable
 
     private Context? _context;
 
+    /// <summary>
+    /// Accelerators kept for the life of the page. Disposing a WebGPU accelerator destroys its
+    /// GPUDevice; creating a second one from the same Context device often fails (adapter/device
+    /// already spent), which is why a re-run used to mark WebGPU "(unavailable)".
+    /// </summary>
+    private readonly Dictionary<string, Accelerator> _accelerators = new(StringComparer.Ordinal);
+
+    /// <summary>Stable group titles — MatMul used to bake GFLOPS into the name and split groups.</summary>
+    private static readonly string[] TestOrder =
+    [
+        "MatMul 512x512",
+        "Classification (SqueezeNet)",
+        "Style Transfer (Mosaic)",
+        "Super Resolution (ESPCN 3x)",
+    ];
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
-            // Detect device info
             try
             {
                 using var navigator = JS.Get<Navigator>("navigator");
                 _userAgent = navigator.UserAgent;
-                // Try to get GPU info from WebGPU adapter
                 using var gpu = JS.Get<GPU>("navigator.gpu");
                 if (gpu != null)
                 {
@@ -41,7 +55,6 @@ public partial class BenchmarkPage : IDisposable
             }
             catch { }
 
-            // Create context with all backends
             try
             {
                 var builder = MLContext.Create();
@@ -63,17 +76,16 @@ public partial class BenchmarkPage : IDisposable
         _completedTests = 0;
         _copied = false;
 
-        // Count total tests
         var backends = new List<string>();
         if (_benchWebGPU) backends.Add("WebGPU");
         if (_benchWebGL) backends.Add("WebGL");
         if (_benchWasm) backends.Add("Wasm");
 
         var tests = new List<string>();
-        if (_runMatMul) tests.Add("MatMul");
-        if (_runClassification) tests.Add("Classification");
-        if (_runSuperRes) tests.Add("Super Resolution");
-        if (_runStyleTransfer) tests.Add("Style Transfer");
+        if (_runMatMul) tests.Add("MatMul 512x512");
+        if (_runClassification) tests.Add("Classification (SqueezeNet)");
+        if (_runStyleTransfer) tests.Add("Style Transfer (Mosaic)");
+        if (_runSuperRes) tests.Add("Super Resolution (ESPCN 3x)");
 
         _totalTests = backends.Count * tests.Count;
         if (_totalTests == 0) { _isRunning = false; return; }
@@ -83,46 +95,46 @@ public partial class BenchmarkPage : IDisposable
 
         foreach (var backendId in backends)
         {
-            Accelerator? accelerator = null;
             try
             {
                 _currentTest = $"Creating {backendId} accelerator...";
                 StateHasChanged();
                 await Task.Yield();
 
-                accelerator = await CreateAcceleratorForBackendAsync(backendId);
+                var accelerator = await GetOrCreateAcceleratorAsync(backendId);
                 if (accelerator == null)
                 {
-                    // Skip this backend — mark all its tests as failed
                     foreach (var test in tests)
                     {
-                        _results.Add(new BenchResult { TestName = test, BackendName = $"{backendId} (unavailable)", InferenceMs = -1 });
+                        _results.Add(new BenchResult
+                        {
+                            TestName = test,
+                            BackendName = backendId,
+                            InferenceMs = -1,
+                            Detail = "unavailable",
+                        });
                         _completedTests++;
                     }
                     continue;
                 }
 
-                // Run each selected test on this backend
-                if (_runMatMul && tests.Contains("MatMul"))
+                if (_runMatMul)
                     await RunMatMulBench(accelerator, backendId);
 
-                if (_runClassification && tests.Contains("Classification"))
+                if (_runClassification)
                     await RunClassificationBench(accelerator, backendId);
 
-                if (_runSuperRes && tests.Contains("Super Resolution"))
-                    await RunSuperResBench(accelerator, backendId);
-
-                if (_runStyleTransfer && tests.Contains("Style Transfer"))
+                if (_runStyleTransfer)
                     await RunStyleTransferBench(accelerator, backendId);
+
+                if (_runSuperRes)
+                    await RunSuperResBench(accelerator, backendId);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Benchmark] {backendId} error: {ex.Message}");
+                Console.WriteLine($"[Benchmark] {backendId} error: {ex}");
             }
-            finally
-            {
-                accelerator?.Dispose();
-            }
+            // Do NOT dispose the accelerator here — see _accelerators remarks.
         }
 
         _isRunning = false;
@@ -132,6 +144,7 @@ public partial class BenchmarkPage : IDisposable
 
     private async Task RunMatMulBench(Accelerator accelerator, string backendName)
     {
+        const string testName = "MatMul 512x512";
         _currentTest = $"MatMul GFLOPS on {backendName}...";
         _progressPercent = (float)_completedTests / _totalTests * 100;
         StateHasChanged();
@@ -141,7 +154,6 @@ public partial class BenchmarkPage : IDisposable
         {
             var matMul = new SpawnDev.ILGPU.ML.MatMulKernel(accelerator);
 
-            // 512x512 matrix multiply — 2 * 512^3 = 268M FLOPs per run
             int M = 512, K = 512, N = 512;
             long flopsPerRun = 2L * M * K * N;
 
@@ -149,17 +161,13 @@ public partial class BenchmarkPage : IDisposable
             using var b = accelerator.Allocate1D<float>(K * N);
             using var c = accelerator.Allocate1D<float>(M * N);
 
-            // Warmup run (triggers kernel compilation)
             matMul.MatMul(a.View, b.View, c.View, M, K, N);
             await accelerator.SynchronizeAsync();
 
-            // Timed runs
             int runs = 5;
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < runs; i++)
-            {
                 matMul.MatMul(a.View, b.View, c.View, M, K, N);
-            }
             await accelerator.SynchronizeAsync();
             sw.Stop();
 
@@ -168,9 +176,10 @@ public partial class BenchmarkPage : IDisposable
 
             _results.Add(new BenchResult
             {
-                TestName = $"MatMul 512x512 ({gflops:F1} GFLOPS)",
+                TestName = testName,
                 BackendName = backendName,
                 InferenceMs = totalMs / runs,
+                Detail = $"{gflops:F1} GFLOPS",
             });
 
             Console.WriteLine($"[Benchmark] MatMul/{backendName}: {totalMs / runs:F1}ms/run, {gflops:F1} GFLOPS");
@@ -178,7 +187,13 @@ public partial class BenchmarkPage : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[Benchmark] MatMul/{backendName} failed: {ex.Message}");
-            _results.Add(new BenchResult { TestName = "MatMul 512x512", BackendName = $"{backendName} (error)", InferenceMs = -1 });
+            _results.Add(new BenchResult
+            {
+                TestName = testName,
+                BackendName = backendName,
+                InferenceMs = -1,
+                Detail = "error",
+            });
         }
 
         _completedTests++;
@@ -188,6 +203,7 @@ public partial class BenchmarkPage : IDisposable
 
     private async Task RunClassificationBench(Accelerator accelerator, string backendName)
     {
+        const string testName = "Classification (SqueezeNet)";
         _currentTest = $"Classification on {backendName}...";
         _progressPercent = (float)_completedTests / _totalTests * 100;
         StateHasChanged();
@@ -197,16 +213,12 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub1 = new ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 accelerator, hub1, ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
                 http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new ClassificationPipeline(session, accelerator);
-
-            // Create a simple test image (gradient)
             int w = 224, h = 224;
             var pixels = CreateGradientImage(w, h);
 
@@ -216,10 +228,10 @@ public partial class BenchmarkPage : IDisposable
 
             _results.Add(new BenchResult
             {
-                TestName = "Classification (SqueezeNet)",
+                TestName = testName,
                 BackendName = backendName,
                 InferenceMs = sw.Elapsed.TotalMilliseconds,
-                ModelLoadMs = loadMs
+                ModelLoadMs = loadMs,
             });
 
             Console.WriteLine($"[Benchmark] Classification/{backendName}: {sw.Elapsed.TotalMilliseconds:F1}ms (load: {loadMs:F0}ms) — {results[0].Label}");
@@ -230,7 +242,13 @@ public partial class BenchmarkPage : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[Benchmark] Classification/{backendName} failed: {ex.Message}");
-            _results.Add(new BenchResult { TestName = "Classification (SqueezeNet)", BackendName = $"{backendName} (error)", InferenceMs = -1 });
+            _results.Add(new BenchResult
+            {
+                TestName = testName,
+                BackendName = backendName,
+                InferenceMs = -1,
+                Detail = "error",
+            });
         }
 
         _completedTests++;
@@ -240,6 +258,7 @@ public partial class BenchmarkPage : IDisposable
 
     private async Task RunSuperResBench(Accelerator accelerator, string backendName)
     {
+        const string testName = "Super Resolution (ESPCN 3x)";
         _currentTest = $"Super Resolution on {backendName}...";
         _progressPercent = (float)_completedTests / _totalTests * 100;
         StateHasChanged();
@@ -249,15 +268,12 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub2 = new ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 accelerator, hub2, ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx",
                 http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new SuperResolutionPipeline(session, accelerator);
-
             int w = 64, h = 64;
             var pixels = CreateGradientImage(w, h);
 
@@ -267,10 +283,10 @@ public partial class BenchmarkPage : IDisposable
 
             _results.Add(new BenchResult
             {
-                TestName = "Super Resolution (ESPCN 3x)",
+                TestName = testName,
                 BackendName = backendName,
                 InferenceMs = sw.Elapsed.TotalMilliseconds,
-                ModelLoadMs = loadMs
+                ModelLoadMs = loadMs,
             });
 
             Console.WriteLine($"[Benchmark] SuperRes/{backendName}: {sw.Elapsed.TotalMilliseconds:F1}ms (load: {loadMs:F0}ms) — {w}x{h} → {result.Width}x{result.Height}");
@@ -281,7 +297,13 @@ public partial class BenchmarkPage : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[Benchmark] SuperRes/{backendName} failed: {ex.Message}");
-            _results.Add(new BenchResult { TestName = "Super Resolution (ESPCN 3x)", BackendName = $"{backendName} (error)", InferenceMs = -1 });
+            _results.Add(new BenchResult
+            {
+                TestName = testName,
+                BackendName = backendName,
+                InferenceMs = -1,
+                Detail = "error",
+            });
         }
 
         _completedTests++;
@@ -291,6 +313,7 @@ public partial class BenchmarkPage : IDisposable
 
     private async Task RunStyleTransferBench(Accelerator accelerator, string backendName)
     {
+        const string testName = "Style Transfer (Mosaic)";
         _currentTest = $"Style Transfer on {backendName}...";
         _progressPercent = (float)_completedTests / _totalTests * 100;
         StateHasChanged();
@@ -300,15 +323,12 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub3 = new ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 accelerator, hub3, ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx",
                 http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new StyleTransferPipeline(session, accelerator);
-
             int w = 224, h = 224;
             var pixels = CreateGradientImage(w, h);
 
@@ -318,10 +338,10 @@ public partial class BenchmarkPage : IDisposable
 
             _results.Add(new BenchResult
             {
-                TestName = "Style Transfer (Mosaic)",
+                TestName = testName,
                 BackendName = backendName,
                 InferenceMs = sw.Elapsed.TotalMilliseconds,
-                ModelLoadMs = loadMs
+                ModelLoadMs = loadMs,
             });
 
             Console.WriteLine($"[Benchmark] Style/{backendName}: {sw.Elapsed.TotalMilliseconds:F1}ms (load: {loadMs:F0}ms)");
@@ -332,12 +352,29 @@ public partial class BenchmarkPage : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[Benchmark] Style/{backendName} failed: {ex.Message}");
-            _results.Add(new BenchResult { TestName = "Style Transfer (Mosaic)", BackendName = $"{backendName} (error)", InferenceMs = -1 });
+            _results.Add(new BenchResult
+            {
+                TestName = testName,
+                BackendName = backendName,
+                InferenceMs = -1,
+                Detail = "error",
+            });
         }
 
         _completedTests++;
         _progressPercent = (float)_completedTests / _totalTests * 100;
         StateHasChanged();
+    }
+
+    private async Task<Accelerator?> GetOrCreateAcceleratorAsync(string backendId)
+    {
+        if (_accelerators.TryGetValue(backendId, out var existing))
+            return existing;
+
+        var created = await CreateAcceleratorForBackendAsync(backendId);
+        if (created != null)
+            _accelerators[backendId] = created;
+        return created;
     }
 
     private async Task<Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
@@ -353,7 +390,11 @@ public partial class BenchmarkPage : IDisposable
                 _ => null
             };
         }
-        catch { return null; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Benchmark] CreateAccelerator {backendId} failed: {ex}");
+            return null;
+        }
     }
 
     private async Task<Accelerator?> TryCreateAsync<TDevice>() where TDevice : Device
@@ -361,6 +402,25 @@ public partial class BenchmarkPage : IDisposable
         var devices = _context!.GetDevices<TDevice>();
         return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
     }
+
+    /// <summary>Groups with a fixed test order so MatMul / Classification / … stay together.</summary>
+    private IEnumerable<IGrouping<string, BenchResult>> GroupedResults()
+    {
+        var byName = _results.GroupBy(r => r.TestName).ToDictionary(g => g.Key, g => g);
+        foreach (var name in TestOrder)
+        {
+            if (byName.TryGetValue(name, out var g))
+                yield return g;
+        }
+        foreach (var g in byName.Values)
+        {
+            if (!TestOrder.Contains(g.Key))
+                yield return g;
+        }
+    }
+
+    private static List<BenchResult> Ranked(IEnumerable<BenchResult> group)
+        => group.OrderBy(r => r.InferenceMs < 0 ? double.MaxValue : r.InferenceMs).ToList();
 
     private async Task CopyResults()
     {
@@ -370,16 +430,23 @@ public partial class BenchmarkPage : IDisposable
         if (_gpuName != null) lines.Add($"GPU: {_gpuName}");
         lines.Add("");
 
-        foreach (var group in _results.Where(r => r.InferenceMs > 0).GroupBy(r => r.TestName))
+        foreach (var group in GroupedResults())
         {
             lines.Add($"  {group.Key}:");
-            var sorted = group.OrderBy(r => r.InferenceMs).ToList();
+            var sorted = Ranked(group);
             int rank = 0;
             foreach (var r in sorted)
             {
                 rank++;
+                if (r.InferenceMs < 0)
+                {
+                    lines.Add($"    — {r.BackendName}: {r.Detail ?? "failed"}");
+                    continue;
+                }
                 var medal = rank switch { 1 => "1st", 2 => "2nd", 3 => "3rd", _ => $"{rank}th" };
-                lines.Add($"    {medal} {r.BackendName}: {r.InferenceMs:F1}ms (load: {r.ModelLoadMs:F0}ms)");
+                var extra = string.IsNullOrEmpty(r.Detail) ? "" : $" ({r.Detail})";
+                var load = r.ModelLoadMs > 0 ? $", load {r.ModelLoadMs:F0}ms" : "";
+                lines.Add($"    {medal} {r.BackendName}: {r.InferenceMs:F1}ms{extra}{load}");
             }
         }
 
@@ -433,7 +500,13 @@ public partial class BenchmarkPage : IDisposable
 
     public void Dispose()
     {
+        foreach (var acc in _accelerators.Values)
+        {
+            try { acc.Dispose(); } catch { }
+        }
+        _accelerators.Clear();
         _context?.Dispose();
+        _context = null;
     }
 
     public class BenchResult
@@ -442,5 +515,7 @@ public partial class BenchmarkPage : IDisposable
         public string BackendName { get; set; } = "";
         public double InferenceMs { get; set; }
         public double ModelLoadMs { get; set; }
+        /// <summary>Extra for the row (e.g. GFLOPS, or "unavailable" / "error").</summary>
+        public string? Detail { get; set; }
     }
 }

@@ -53,28 +53,47 @@
         <div class="bench-results-section">
             <h2 class="results-title">Results</h2>
 
-            @foreach (var group in _results.GroupBy(r => r.TestName))
+            @foreach (var group in GroupedResults())
             {
                 <div class="result-group">
                     <h3 class="group-title">@group.Key</h3>
                     <div class="result-bars">
-                        @{ var sorted = group.OrderBy(r => r.InferenceMs).ToList(); }
-                        @{ var maxMs = sorted.Max(r => r.InferenceMs); }
-                        @{ int rank = 0; }
+                        @{
+                            var sorted = Ranked(group);
+                            var ok = sorted.Where(r => r.InferenceMs > 0).ToList();
+                            var maxMs = ok.Count > 0 ? ok.Max(r => r.InferenceMs) : 1;
+                            var bestMs = ok.Count > 0 ? ok[0].InferenceMs : 0;
+                            int rank = 0;
+                        }
                         @foreach (var r in sorted)
                         {
                             rank++;
-                            <div class="result-bar-row">
-                                <span class="result-medal">@(rank switch { 1 => "🥇", 2 => "🥈", 3 => "🥉", _ => "" })</span>
+                            var failed = r.InferenceMs < 0;
+                            <div class="result-bar-row @(failed ? "failed" : "")">
+                                <span class="result-medal">@(failed ? "" : rank switch { 1 => "🥇", 2 => "🥈", 3 => "🥉", _ => "" })</span>
                                 <span class="result-backend">@r.BackendName</span>
                                 <div class="result-bar-track">
-                                    <div class="result-bar-fill @(rank == 1 ? "fastest" : "")"
-                                         style="width: @(r.InferenceMs / maxMs * 100)%;"></div>
+                                    @if (!failed)
+                                    {
+                                        <div class="result-bar-fill @(rank == 1 ? "fastest" : "")"
+                                             style="width: @(r.InferenceMs / maxMs * 100)%;"></div>
+                                    }
                                 </div>
-                                <span class="result-time">@r.InferenceMs.ToString("F1") ms</span>
-                                @if (rank > 1)
+                                @if (failed)
                                 {
-                                    <span class="result-ratio">@((r.InferenceMs / sorted[0].InferenceMs).ToString("F1"))x</span>
+                                    <span class="result-time fail">@(r.Detail ?? "failed")</span>
+                                }
+                                else
+                                {
+                                    <span class="result-time">@r.InferenceMs.ToString("F1") ms</span>
+                                    @if (!string.IsNullOrEmpty(r.Detail))
+                                    {
+                                        <span class="result-detail">@r.Detail</span>
+                                    }
+                                    else if (rank > 1 && bestMs > 0)
+                                    {
+                                        <span class="result-ratio">@((r.InferenceMs / bestMs).ToString("F1"))x</span>
+                                    }
                                 }
                             </div>
                         }
@@ -149,12 +168,15 @@
     .result-bars { display: flex; flex-direction: column; gap: 0.5rem; }
     .result-bar-row { display: flex; align-items: center; gap: 0.5rem; }
     .result-medal { min-width: 24px; font-size: 1.1rem; text-align: center; }
-    .result-backend { min-width: 70px; color: #cbd5e1; font-size: 0.85rem; font-weight: 600; }
+    .result-backend { min-width: 80px; color: #cbd5e1; font-size: 0.85rem; font-weight: 600; }
     .result-bar-track { flex: 1; height: 28px; background: rgba(255,255,255,0.04); border-radius: 6px; overflow: hidden; }
     .result-bar-fill { height: 100%; background: linear-gradient(90deg, #64748b, #94a3b8); border-radius: 6px; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
     .result-bar-fill.fastest { background: linear-gradient(90deg, #3b82f6, #8b5cf6); }
     .result-time { min-width: 70px; text-align: right; color: #e2e8f0; font-size: 0.85rem; font-family: 'JetBrains Mono', monospace; font-weight: 700; }
+    .result-time.fail { color: #fca5a5; font-weight: 600; text-transform: lowercase; }
+    .result-detail { min-width: 72px; text-align: right; color: #94a3b8; font-size: 0.75rem; font-family: monospace; }
     .result-ratio { min-width: 40px; text-align: right; color: #64748b; font-size: 0.75rem; font-family: monospace; }
+    .result-bar-row.failed { opacity: 0.75; }
 
     .bench-actions { display: flex; gap: 0.5rem; margin-top: 1.5rem; justify-content: center; flex-wrap: wrap; }
     .bench-copy-btn, .bench-tweet-btn, .bench-rerun-btn {
