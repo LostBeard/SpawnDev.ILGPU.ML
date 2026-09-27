@@ -2,6 +2,14 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.30 (2026-09-27) - /detect known-size YOLOv8 load (truncated ONNX)
+
+**Bug fix:** `/detect` hit the same GH Pages truncated-cache trap as `/face`: a short body
+whose Content-Length matched the short length → protobuf
+`Sub-message extends past end of data` while parsing YOLOv8 ONNX. `DetectPage` now
+`GetByteArrayAsync` + asserts **12823637** bytes with `?v=` cache-bust (same pattern as
+FaceDetectPage / BlazeFace).
+
 ## 5.2.29 (2026-09-27) - BlazeFace /face green: NHWC MaxPool + depthwise fused-act field
 
 **Root cause of Faces: 0 (two bugs):**

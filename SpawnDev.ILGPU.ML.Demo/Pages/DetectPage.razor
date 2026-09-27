@@ -299,11 +299,27 @@
 
             // Bundled demo copy only — same bytes as the hub file, no hub round-trip.
             // A hub fallback after local failure threw 502 noise and looked like a double load.
-            var session = await InferenceSession.CreateFromFileAsync(
-                _accelerator, Http, "models/yolov8n/model.onnx",
+            //
+            // Known size + cache-bust: same truncated-cache trap as /face (GH Pages HTTP cache
+            // can serve a short body whose Content-Length matches the short length). Measured
+            // symptom: protobuf "Sub-message extends past end of data" while parsing YOLOv8 ONNX.
+            const int yoloBytes = 12823637;
+            var modelUrl = $"models/yolov8n/model.onnx?v={yoloBytes}";
+            _modelProgress = 50;
+            StateHasChanged();
+            var bytes = await Http.GetByteArrayAsync(modelUrl);
+            Console.WriteLine($"[Detect] downloaded {bytes.Length} bytes (expect {yoloBytes})");
+            if (bytes.Length != yoloBytes)
+                throw new InvalidDataException(
+                    $"YOLOv8 download truncated or corrupt: got {bytes.Length} bytes, expected {yoloBytes}. "
+                    + "Unregister the site's service worker (DevTools → Application) and reload.");
+            _modelProgress = 70;
+            StateHasChanged();
+            var session = InferenceSession.CreateFromFile(
+                _accelerator, bytes,
                 onProgress: (stage, pct) =>
                 {
-                    _modelProgress = 40 + pct * 0.55;
+                    _modelProgress = 70 + pct * 0.25;
                     StateHasChanged();
                 });
 
