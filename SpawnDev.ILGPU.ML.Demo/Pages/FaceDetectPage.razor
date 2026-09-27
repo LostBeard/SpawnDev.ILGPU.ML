@@ -1,7 +1,6 @@
 @page "/face"
 @using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
-@using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
 @implements IDisposable
 
@@ -268,27 +267,16 @@
             _modelProgress = 40;
             StateHasChanged();
 
-            // Local wwwroot first — hub.spawndev.com returns 502 for litert-community/blaze-face
-            // (verified 2026-09-26). The demo ships models/blaze-face/model.tflite for this reason.
-            InferenceSession session;
-            try
-            {
-                session = await InferenceSession.CreateFromFileAsync(
-                    _accelerator, Http, "models/blaze-face/model.tflite",
-                    onProgress: (stage, pct) =>
-                    {
-                        _modelProgress = 40 + pct * 0.55;
-                        StateHasChanged();
-                    });
-            }
-            catch (Exception localEx)
-            {
-                Console.WriteLine($"[Face] Local model failed ({localEx.Message}); trying hub…");
-                using var hub = new Hub.ModelHub(JS);
-                session = await InferenceSession.CreateFromHuggingFaceAsync(
-                    _accelerator, hub, Hub.ModelHub.KnownModels.BlazeFace, "model.tflite",
-                    http: Http);
-            }
+            // Bundled demo copy only — do NOT fall through to hub.spawndev.com.
+            // litert-community/blaze-face returns 502 on the hub (2026-09-26); a hub fallback just
+            // threw after a working (or almost-working) local path and looked like the demo was broken.
+            var session = await InferenceSession.CreateFromFileAsync(
+                _accelerator, Http, "models/blaze-face/model.tflite",
+                onProgress: (stage, pct) =>
+                {
+                    _modelProgress = 40 + pct * 0.55;
+                    StateHasChanged();
+                });
 
             _pipeline?.Dispose();
             _pipeline = new Pipelines.FaceDetectionPipeline(session, _accelerator);

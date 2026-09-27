@@ -1,7 +1,6 @@
 @page "/detect"
 @using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
-@using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
 @using SpawnDev.ILGPU.WebGPU
 @using SpawnDev.ILGPU.WebGPU.Backend
@@ -298,32 +297,15 @@
             _modelProgress = 40;
             StateHasChanged();
 
-            // Prefer the bundled demo copy — always available, no hub dependency.
-            // Fall back to hub if the local file is missing (e.g. stripped publish).
-            InferenceSession session;
-            try
-            {
-                session = await InferenceSession.CreateFromFileAsync(
-                    _accelerator, Http, "models/yolov8n/model.onnx",
-                    onProgress: (stage, pct) =>
-                    {
-                        _modelProgress = 40 + pct * 0.55;
-                        StateHasChanged();
-                    });
-            }
-            catch (Exception localEx)
-            {
-                Console.WriteLine($"[Detect] Local model failed ({localEx.Message}); trying hub…");
-                using var hub = new Hub.ModelHub(JS);
-                session = await InferenceSession.CreateFromHuggingFaceAsync(
-                    _accelerator, hub, Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
-                    http: Http,
-                    onProgress: (stage, pct) =>
-                    {
-                        _modelProgress = 40 + pct * 0.55;
-                        StateHasChanged();
-                    });
-            }
+            // Bundled demo copy only — same bytes as the hub file, no hub round-trip.
+            // A hub fallback after local failure threw 502 noise and looked like a double load.
+            var session = await InferenceSession.CreateFromFileAsync(
+                _accelerator, Http, "models/yolov8n/model.onnx",
+                onProgress: (stage, pct) =>
+                {
+                    _modelProgress = 40 + pct * 0.55;
+                    StateHasChanged();
+                });
 
             _pipeline?.Dispose();
             _pipeline = new Pipelines.ObjectDetectionPipeline(session, _accelerator);
