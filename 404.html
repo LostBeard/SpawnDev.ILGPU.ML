@@ -16,7 +16,7 @@
     <meta property="og:description" content="GPU-accelerated ML inference in C#. Style transfer, image classification, super resolution — all running in your browser via WebGPU. No server needed." />
     <meta property="og:type" content="website" />
     <title>SpawnDev.ILGPU.ML</title>
-    <link href="_framework/dotnet.sgbt4z1jlo.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-TJ+yfmz/sx1G27g5M8w/9zZtvKlZQiTMcVR9hRsD7po=" />
+    <link href="_framework/dotnet.ykf9vreqh1.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-3h3lrbm8m1+tVTLrZltFnhXP8leseK98UeXW6MjZCr8=" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
     <link rel="stylesheet" href="css/app.css" />
     <link rel="icon" type="image/png" href="favicon.png" />
@@ -26,18 +26,18 @@
     "./_framework/blazor.webassembly.js": "./_framework/blazor.webassembly.w3qd1tpl0e.js",
     "./_framework/dotnet.native.js": "./_framework/dotnet.native.87xg72lh3g.js",
     "./_framework/dotnet.runtime.js": "./_framework/dotnet.runtime.v06hirbjsv.js",
-    "./_framework/dotnet.js": "./_framework/dotnet.sgbt4z1jlo.js"
+    "./_framework/dotnet.js": "./_framework/dotnet.ykf9vreqh1.js"
   },
   "scopes": {},
   "integrity": {
     "./_framework/blazor.webassembly.js": "sha256-lDXsDYFgm62F+YUvxES7IOTCXYpiHpU3uR45YdC6mq4=",
     "./_framework/blazor.webassembly.w3qd1tpl0e.js": "sha256-lDXsDYFgm62F+YUvxES7IOTCXYpiHpU3uR45YdC6mq4=",
-    "./_framework/dotnet.js": "sha256-TJ+yfmz/sx1G27g5M8w/9zZtvKlZQiTMcVR9hRsD7po=",
+    "./_framework/dotnet.js": "sha256-3h3lrbm8m1+tVTLrZltFnhXP8leseK98UeXW6MjZCr8=",
     "./_framework/dotnet.native.87xg72lh3g.js": "sha256-7LS509vjcxKrVFNFeEcSzWa4Cw4AOIZZ1kfJIoTPi6s=",
     "./_framework/dotnet.native.js": "sha256-7LS509vjcxKrVFNFeEcSzWa4Cw4AOIZZ1kfJIoTPi6s=",
     "./_framework/dotnet.runtime.js": "sha256-QbnqrZGHtGq7wudS17/AYEPpH9JkphrsyVllD6JHmds=",
     "./_framework/dotnet.runtime.v06hirbjsv.js": "sha256-QbnqrZGHtGq7wudS17/AYEPpH9JkphrsyVllD6JHmds=",
-    "./_framework/dotnet.sgbt4z1jlo.js": "sha256-TJ+yfmz/sx1G27g5M8w/9zZtvKlZQiTMcVR9hRsD7po="
+    "./_framework/dotnet.ykf9vreqh1.js": "sha256-3h3lrbm8m1+tVTLrZltFnhXP8leseK98UeXW6MjZCr8="
   }
 }</script>
 </head>
@@ -60,8 +60,10 @@
         <a href="." class="reload">Reload</a>
         <span class="dismiss">🗙</span>
     </div>
-    <!-- Registers SW (COI headers + torrent streaming), waits for ready, then loads Blazor -->
-    <script src="blazor-coi-serviceworker.js"></script>
+    <!-- Registers SW (COI headers). ?v= busts GH Pages/Fastly cache when the SW body changes —
+         measured 2026-09-27: gh-pages had the /models/ bypass but lostbeard.github.io still
+         served the old worker (max-age=600 HIT) and /face kept truncating BlazeFace. -->
+    <script src="blazor-coi-serviceworker.js?v=5.2.26"></script>
     <script src="_framework/blazor.webassembly.w3qd1tpl0e.js"></script>
 </body>
 
