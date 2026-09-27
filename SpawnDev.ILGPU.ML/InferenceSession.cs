@@ -3035,6 +3035,7 @@ public class InferenceSession : IDisposable
     public static async Task<byte[]> DownloadBytesChunkedAsync(HttpClient http, string url,
         Action<string, int>? onProgress = null)
     {
+        long? expectedLength = null;
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -3056,6 +3057,7 @@ public class InferenceSession : IDisposable
             response.EnsureSuccessStatusCode();
 
             var contentLength = response.Content.Headers.ContentLength;
+            expectedLength = contentLength;
             using var stream = await response.Content.ReadAsStreamAsync();
 
             // If content length is known, read in 1MB chunks with progress
@@ -3086,13 +3088,12 @@ public class InferenceSession : IDisposable
                 }
 
                 // Verify we got the FULL body. Browser WASM streaming can stop early (read==0 before
-                // Content-Length bytes arrive). Returning result[..totalRead] here used to ship a
-                // truncated .tflite that then exploded in FlatBufferReader.ReadInt32 as
-                // IndexOutOfRangeException — measured on https://lostbeard.github.io/SpawnDev.ILGPU.ML/face
-                // (BlazeFace, 2026-09-27): full file on disk / desktop HTTP, truncated in WASM stream.
+                // Content-Length bytes arrive) — especially when a COI service worker re-wraps
+                // `response.body` (same-origin /models/* on GH Pages). Returning a prefix used to
+                // ship a truncated .tflite into FlatBufferReader (BlazeFace 229746→199050, 2026-09-27).
                 if (totalRead == result.Length)
                     return result;
-                // Incomplete — fall through to ReadAsByteArrayAsync below (do NOT return a prefix).
+                // Incomplete — fall through to a non-streaming, cache-busted GET below.
             }
             else
             {
@@ -3122,12 +3123,28 @@ public class InferenceSession : IDisposable
             _ = ex;
         }
 
-        // Fallback: standard byte array download (works on all platforms including browser WASM).
-        // Also the recovery path when streaming returned a PREFIX of Content-Length (see above).
+        // Fallback: non-streaming byte-array download. No WebAssemblyEnableStreamingResponse.
+        // Cache-bust so a truncated streaming response previously stored by the browser HTTP cache
+        // cannot be replayed as a "successful" short body (same BlazeFace failure after the
+        // prefix-return fix alone — fallback still returned 199050 from cache).
         onProgress?.Invoke("download", 0);
-        using var fallbackResponse = await http.GetAsync(url);
+        var fallbackUrl = url.Contains('?', StringComparison.Ordinal)
+            ? url + "&_dl=" + DateTime.UtcNow.Ticks
+            : url + "?_dl=" + DateTime.UtcNow.Ticks;
+        using var fallbackRequest = new HttpRequestMessage(HttpMethod.Get, fallbackUrl);
+        fallbackRequest.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
+        {
+            NoCache = true,
+            NoStore = true,
+        };
+        using var fallbackResponse = await http.SendAsync(fallbackRequest);
         fallbackResponse.EnsureSuccessStatusCode();
         var bytes = await fallbackResponse.Content.ReadAsByteArrayAsync();
+        var fallbackCl = fallbackResponse.Content.Headers.ContentLength ?? expectedLength;
+        if (fallbackCl.HasValue && bytes.Length != fallbackCl.Value)
+            throw new InvalidDataException(
+                $"Download of '{url}' truncated: got {bytes.Length} bytes, Content-Length {fallbackCl.Value}. "
+                + "A COI service worker re-wrapping response.body is a common cause for same-origin model URLs.");
         onProgress?.Invoke("download", 100);
         return bytes;
     }

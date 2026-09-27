@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.26 (2026-09-27) - COI SW must not re-wrap same-origin model fetches
+
+**Bug fix:** `/face` on GH Pages still got BlazeFace as 199050 of 229746 bytes after 5.2.25. Not an
+async-`Stream` / `IJSReadStream` issue — `CreateFromFileAsync` downloads a `byte[]` via HttpClient.
+Root cause: `blazor-coi-serviceworker.js` re-wrapped same-origin `/models/*` with
+`new Response(response.body)`, which truncates Blazor streaming reads. Hub downloads were fine (cross-origin,
+SW skipped). SW now bypasses `/models/` and model extensions. `DownloadBytesChunkedAsync` fallback is
+cache-busted, non-streaming, and throws if the body length still disagrees with Content-Length.
+
 ## 5.2.25 (2026-09-27) - Do not ship truncated HTTP downloads
 
 **Bug fix:** `DownloadBytesChunkedAsync` returned `result[..totalRead]` when browser WASM streaming

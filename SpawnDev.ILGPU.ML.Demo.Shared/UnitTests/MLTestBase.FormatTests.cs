@@ -40,6 +40,46 @@ public abstract partial class MLTestBase
             $"[DownloadChunked] incomplete stream recovered via fallback ({got.Length} bytes, {handler.CallCount} GETs)");
     });
 
+    /// <summary>
+    /// Fallback that is ALSO short of Content-Length must THROW — not hand a truncated byte[] to TFLite parse.
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task DownloadBytesChunked_FallbackAlsoShort_Throws() => await RunTest(async accelerator =>
+    {
+        _ = accelerator;
+        var full = new byte[8192];
+        for (int i = 0; i < full.Length; i++) full[i] = (byte)(i & 0xFF);
+
+        var handler = new AlwaysShortHandler(full);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("http://test.local/") };
+        try
+        {
+            await InferenceSession.DownloadBytesChunkedAsync(http, "http://test.local/model.bin");
+            throw new Exception("truncated download did not throw");
+        }
+        catch (InvalidDataException ex) when (ex.Message.Contains("truncated", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[DownloadChunked] short fallback refused: {ex.Message}");
+        }
+    });
+
+    /// <summary>Every GET: Content-Length = full, body = first half then EOF.</summary>
+    private sealed class AlwaysShortHandler : HttpMessageHandler
+    {
+        private readonly byte[] _full;
+        public AlwaysShortHandler(byte[] full) => _full = full;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var half = new byte[_full.Length / 2];
+            Buffer.BlockCopy(_full, 0, half, 0, half.Length);
+            var content = new StreamContent(new MemoryStream(half));
+            content.Headers.ContentLength = _full.Length;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        }
+    }
+
     /// <summary>First GET: Content-Length = full, body = first half then EOF. Second GET: full body.</summary>
     private sealed class IncompleteThenFullHandler : HttpMessageHandler
     {
