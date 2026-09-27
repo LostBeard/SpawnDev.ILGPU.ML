@@ -8,6 +8,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 `document.currentScript` is null → `Cannot read properties of null (reading 'src')`.
 Capture `currentScript.src` (with baseURI fallback) synchronously before the promise chain.
 
+**Note (not a code fix):** TJ reports live `/face` and `/detect` load and run but give **bad
+results**. Status → PARTIAL. Handoff: `Plans/handoff-face-detect-live-bad-2026-09-27.md`.
+
 ## 5.2.30 (2026-09-27) - /detect known-size YOLOv8 load (truncated ONNX)
 
 **Bug fix:** `/detect` hit the same GH Pages truncated-cache trap as `/face`: a short body
