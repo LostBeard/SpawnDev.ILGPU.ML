@@ -5,7 +5,7 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<Version>5.2.32</Version>
-		<PackageReleaseNotes>v5.2.24: CreateFromStreamAsync — universal seekable-stream load with magic-byte auto-detect (ONNX/GGUF stream to GPU). See CHANGELOG.</PackageReleaseNotes>
+		<PackageReleaseNotes>v5.2.32: Fix /face and /detect wrong boxes — YOLOv8 letterbox+[0,1] preprocess; BlazeFace weighted NMS + maxFaces=1. See CHANGELOG.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
