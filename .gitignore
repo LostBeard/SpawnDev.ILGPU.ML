@@ -383,7 +383,15 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-tiny/
 
 # Diagnostic scratch (GGUF capture/teacher-forcing dumps, probe scripts, fetched refs)
 _scratch/
+# Agent / one-off publish+probe dumps — use _scratch/ or %TEMP%, never invent new repo-root folders
+_pubcheck/
+_pub*/
 Examples/04.GGUFTextGen.Console/*.txt
+
+# Local face/detect A/B stills (not fixtures)
+face_ours_vs_litert.jpg
+*_ours_vs_*.jpg
+*_ours_vs_*.png
 
 # PMT background-run pid/scratch files (rig bookkeeping, never committed)
 pmt_*.pid
