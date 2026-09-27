@@ -4,7 +4,10 @@
 
 <div class="gs-page">
     <h1 class="gs-title">Getting Started</h1>
-    <p class="gs-intro">Add GPU-accelerated ML inference to your .NET app in 5 minutes. Works in Blazor WASM and desktop.</p>
+    <p class="gs-intro">
+        Add GPU-accelerated ML inference to your .NET app. Same C# runs in Blazor WASM and on desktop —
+        WebGPU / WebGL / Wasm in the browser, CUDA / OpenCL / CPU on the desktop. No ONNX Runtime.
+    </p>
 
     <div class="gs-steps">
         <div class="gs-step">
@@ -12,7 +15,9 @@
             <div class="step-content">
                 <h3>Install</h3>
                 <div class="code-block">
-                    <pre><code>dotnet add package SpawnDev.ILGPU.ML</code></pre>
+                    <pre><code>dotnet add package SpawnDev.ILGPU.ML
+<span class="cm"># Browser (Blazor WASM) also needs SpawnJS:</span>
+dotnet add package SpawnDev.SpawnJS</code></pre>
                 </div>
             </div>
         </div>
@@ -20,11 +25,14 @@
         <div class="gs-step">
             <div class="step-number">2</div>
             <div class="step-content">
-                <h3>Create Accelerator</h3>
-                <p class="step-desc">Auto-selects the best GPU backend (WebGPU → WebGL → Wasm in browser, CUDA → OpenCL → CPU on desktop).</p>
+                <h3>Create an accelerator</h3>
+                <p class="step-desc">
+                    <code>MLContext</code> enables Algorithms (required for MathF on CUDA/OpenCL).
+                    <code>AllAcceleratorsAsync</code> discovers browser devices; preferred order is
+                    WebGPU → WebGL → Wasm in the browser, CUDA → OpenCL → CPU on desktop.
+                </p>
                 <div class="code-block">
-<pre><code><span class="kw">using</span> <span class="ns">ILGPU</span>;
-<span class="kw">using</span> <span class="ns">SpawnDev.ILGPU</span>;
+<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML</span>;
 
 <span class="kw">var</span> builder = <span class="ty">MLContext</span>.<span class="fn">Create</span>();
 <span class="kw">await</span> builder.<span class="fn">AllAcceleratorsAsync</span>();
@@ -37,27 +45,31 @@
         <div class="gs-step">
             <div class="step-number">3</div>
             <div class="step-content">
-                <h3>Load a Model</h3>
-                <p class="step-desc">Load ONNX models from HuggingFace — cached locally via OPFS. No server needed.</p>
+                <h3>Load a model</h3>
+                <p class="step-desc">
+                    Prefer streaming weights through the hub into OPFS — never materialize a large model as a
+                    <code>byte[]</code> on the WASM heap. <code>HubModelSource</code> is the default (plain HTTP + OPFS).
+                    Optional P2P delivery is a separate package: <code>SpawnDev.ILGPU.ML.WebTorrent</code>.
+                </p>
                 <div class="code-block">
-<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Hub</span>;
+<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML</span>;
+<span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Hub</span>;
 
-<span class="cm">// Load via ModelHub (preferred — handles caching, progress, CDN)</span>
+<span class="cm">// Browser path (preferred): stream from hub → OPFS → GPU</span>
+<span class="kw">using var</span> source = <span class="kw">new</span> <span class="ty">HubModelSource</span>(JS);   <span class="cm">// or inject as a singleton</span>
+<span class="kw">await using var</span> stream = <span class="kw">await</span> source.<span class="fn">OpenAsync</span>(
+    <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
+<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromOnnxStreamAsync</span>(accelerator, stream);
+
+<span class="cm">// Convenience wrapper (same delivery under the hood; needs the filename):</span>
 <span class="kw">using var</span> hub = <span class="kw">new</span> <span class="ty">ModelHub</span>(JS);
-<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromHuggingFaceAsync</span>(
-    accelerator, hub, <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.<span class="fn">SqueezeNet</span>);
+<span class="kw">var</span> session2 = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromHuggingFaceAsync</span>(
+    accelerator, hub, <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
 
-<span class="cm">// Or by repo + file - routed through our hub, which caches and adds CORS</span>
-<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromFileAsync</span>(
-    accelerator, httpClient,
-    <span class="ty">HuggingFaceClient</span>.<span class="fn">GetDownloadUrl</span>(<span class="st">"onnxmodelzoo/squeezenet"</span>, <span class="st">"squeezenet1.1-7.onnx"</span>));
-
-<span class="cm">// For MODEL WEIGHTS prefer the streaming path - a seekable lazy-hash torrent whose</span>
-<span class="cm">// bytes stay JS-side and download on demand, instead of a byte[] on the WASM heap:</span>
-<span class="kw">var</span> hub = <span class="kw">new</span> <span class="ty">HubModelStream</span>(webTorrentClient, httpClient);
-<span class="kw">var</span> model = <span class="kw">await</span> hub.<span class="fn">OpenAsync</span>(<span class="st">"onnxmodelzoo/squeezenet"</span>, <span class="st">"squeezenet1.1-7.onnx"</span>);
-<span class="kw">await using</span> (model.Stream)
-    session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromOnnxStreamAsync</span>(accelerator, model.Stream);</code></pre>
+<span class="cm">// Desktop / small files: URL through the hub (CORS + cache). Avoid for large browser weights.</span>
+<span class="kw">var</span> url = <span class="ty">HuggingFaceClient</span>.<span class="fn">GetDownloadUrl</span>(
+    <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
+<span class="kw">var</span> session3 = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromFileAsync</span>(accelerator, httpClient, url);</code></pre>
                 </div>
             </div>
         </div>
@@ -65,17 +77,17 @@
         <div class="gs-step">
             <div class="step-number">4</div>
             <div class="step-content">
-                <h3>Run Inference</h3>
+                <h3>Run inference</h3>
                 <p class="step-desc">Create a pipeline, feed it data, get results. All on GPU.</p>
                 <div class="code-block">
-<pre><code><span class="cm">// Image classification</span>
+<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Pipelines</span>;
+
 <span class="kw">var</span> pipeline = <span class="kw">new</span> <span class="ty">ClassificationPipeline</span>(session, accelerator);
 <span class="kw">var</span> results = <span class="kw">await</span> pipeline.<span class="fn">ClassifyAsync</span>(rgbaPixels, width, height);
 
 <span class="kw">foreach</span> (<span class="kw">var</span> r <span class="kw">in</span> results)
     Console.<span class="fn">WriteLine</span>(<span class="st">$"</span>{r.Label}: {r.Confidence:P1}<span class="st">"</span>);
-<span class="cm">// tiger cat: 52.0%</span>
-<span class="cm">// tabby: 39.7%</span></code></pre>
+<span class="cm">// e.g. tiger cat: 52.0%</span></code></pre>
                 </div>
             </div>
         </div>
@@ -83,26 +95,31 @@
         <div class="gs-step">
             <div class="step-number">5</div>
             <div class="step-content">
-                <h3>Inspect Any Model</h3>
-                <p class="step-desc">Check if a model is compatible before loading it.</p>
+                <h3>Inspect a model</h3>
+                <p class="step-desc">
+                    Check structure and operator compatibility before loading. Prefer the
+                    <a href="inspector">Model Inspector</a> demo for large files (streaming, structure-only).
+                </p>
                 <div class="code-block">
-<pre><code><span class="cm">// Parse and inspect any .onnx file</span>
-<span class="kw">var</span> summary = <span class="ty">OnnxLoader</span>.<span class="fn">GetModelSummary</span>(onnxBytes);
-<span class="cm">// "Model: squeezenet (opset 9), 66 nodes, 52 weights, 1.2M params"</span>
+<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Onnx</span>;
 
-<span class="cm">// Check operator compatibility</span>
+<span class="cm">// Small models only — materializes the whole byte[] on the managed heap</span>
+<span class="kw">var</span> summary = <span class="ty">OnnxLoader</span>.<span class="fn">GetModelSummary</span>(onnxBytes);
 <span class="kw">var</span> compat = <span class="ty">ModelInspectorHelper</span>.<span class="fn">CheckCompatibility</span>(onnxBytes);
-<span class="cm">// "Fully compatible (18 operators supported)"</span></code></pre>
+<span class="cm">// compat.IsFullyCompatible / compat.SupportedOps / …</span></code></pre>
                 </div>
             </div>
         </div>
     </div>
 
     <div class="gs-section">
-        <h2>Blazor WASM Setup</h2>
-        <p>For browser apps, add SpawnDev.SpawnJS and disable trimming:</p>
+        <h2>Blazor WASM setup</h2>
+        <p>
+            Register SpawnJS in <code>Program.cs</code> (<code>builder.Services.AddSpawnJSRuntime(...)</code>).
+            ILGPU needs IL reflection at runtime — keep trimming and AOT off:
+        </p>
         <div class="code-block">
-<pre><code><span class="cm">&lt;!-- In your .csproj --&gt;</span>
+<pre><code><span class="cm">&lt;!-- In your .csproj — required for ILGPU --&gt;</span>
 <span class="tag">&lt;PropertyGroup&gt;</span>
     <span class="tag">&lt;PublishTrimmed&gt;</span>false<span class="tag">&lt;/PublishTrimmed&gt;</span>
     <span class="tag">&lt;RunAOTCompilation&gt;</span>false<span class="tag">&lt;/RunAOTCompilation&gt;</span>
@@ -111,31 +128,39 @@
     </div>
 
     <div class="gs-section">
-        <h2>Available Pipelines</h2>
+        <h2>Try a demo</h2>
+        <p>
+            Verified pipelines below. Full catalog (including beta / planned) is on
+            <a href="pipelines">Pipelines</a>; honest status is in
+            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML/blob/master/Docs/DEMO_AND_MODEL_STATUS.md" target="_blank" rel="noopener">DEMO_AND_MODEL_STATUS.md</a>.
+        </p>
         <div class="pipeline-grid">
-            <a href="classify" class="pipeline-card"><span>&#x1F3AF;</span> Image Classification</a>
-            <a href="depth" class="pipeline-card"><span>&#x1F30A;</span> Depth Estimation</a>
-            <a href="detect" class="pipeline-card"><span>&#x1F50D;</span> Object Detection</a>
+            <a href="classify" class="pipeline-card"><span>&#x1F3AF;</span> Classification</a>
+            <a href="depth" class="pipeline-card"><span>&#x1F30A;</span> Depth</a>
+            <a href="detect" class="pipeline-card"><span>&#x1F50D;</span> Detection</a>
             <a href="style" class="pipeline-card"><span>&#x1F3A8;</span> Style Transfer</a>
             <a href="super-res" class="pipeline-card"><span>&#x1F52C;</span> Super Resolution</a>
             <a href="remove-bg" class="pipeline-card"><span>&#x2702;</span> Background Removal</a>
-            <a href="pose" class="pipeline-card"><span>&#x1F3CB;</span> Pose Estimation</a>
+            <a href="pose" class="pipeline-card"><span>&#x1F3CB;</span> Pose</a>
             <a href="face" class="pipeline-card"><span>&#x1F642;</span> Face Detection</a>
             <a href="clip" class="pipeline-card"><span>&#x1F516;</span> Zero-Shot (CLIP)</a>
             <a href="whisper" class="pipeline-card"><span>&#x1F3A4;</span> Speech to Text</a>
+            <a href="tts" class="pipeline-card"><span>&#x1F50A;</span> Text to Speech</a>
             <a href="embeddings" class="pipeline-card"><span>&#x1F50E;</span> Semantic Search</a>
-            <a href="explain" class="pipeline-card"><span>&#x1F441;</span> Inside the Network</a>
-            <a href="depth-voxel" class="pipeline-card"><span>&#x1F3D4;</span> Live Depth</a>
+            <a href="sentiment" class="pipeline-card"><span>&#x1F642;</span> Sentiment</a>
+            <a href="generate" class="pipeline-card"><span>&#x2728;</span> Image Generation</a>
+            <a href="ai-chat" class="pipeline-card"><span>&#x1F4AC;</span> AI Chat (GGUF)</a>
+            <a href="snake" class="pipeline-card"><span>&#x1F40D;</span> System One Snake</a>
         </div>
     </div>
 
     <div class="gs-section">
         <h2>Links</h2>
         <div class="link-grid">
-            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank" class="link-card">
+            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank" rel="noopener" class="link-card">
                 <span>&#x1F4BB;</span> GitHub Repository
             </a>
-            <a href="https://www.nuget.org/packages/SpawnDev.ILGPU.ML" target="_blank" class="link-card">
+            <a href="https://www.nuget.org/packages/SpawnDev.ILGPU.ML" target="_blank" rel="noopener" class="link-card">
                 <span>&#x1F4E6;</span> NuGet Package
             </a>
             <a href="inspector" class="link-card">
@@ -143,6 +168,9 @@
             </a>
             <a href="benchmark" class="link-card">
                 <span>&#x26A1;</span> Benchmark Your Device
+            </a>
+            <a href="pipelines" class="link-card">
+                <span>&#x1F4CB;</span> Pipeline Catalog
             </a>
         </div>
     </div>
@@ -153,15 +181,17 @@
 <style>
     .gs-page { max-width: 800px; margin: 0 auto; }
     .gs-title { font-size: 2rem; font-weight: 800; color: #f1f5f9; margin-bottom: 0.5rem; }
-    .gs-intro { color: #64748b; font-size: 1.05rem; margin-bottom: 2rem; }
+    .gs-intro { color: #64748b; font-size: 1.05rem; margin-bottom: 2rem; line-height: 1.55; }
 
     .gs-steps { display: flex; flex-direction: column; gap: 2rem; margin-bottom: 3rem; }
 
     .gs-step { display: flex; gap: 1.5rem; }
     .step-number { flex: 0 0 40px; height: 40px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.2rem; box-shadow: 0 4px 12px rgba(139,92,246,0.3); }
-    .step-content { flex: 1; }
+    .step-content { flex: 1; min-width: 0; }
     .step-content h3 { color: #f1f5f9; font-size: 1.15rem; margin-bottom: 0.4rem; }
-    .step-desc { color: #64748b; font-size: 0.9rem; margin-bottom: 0.5rem; }
+    .step-desc { color: #64748b; font-size: 0.9rem; margin-bottom: 0.5rem; line-height: 1.45; }
+    .step-desc a { color: #a5b4fc; }
+    .step-desc code { font-size: 0.85em; color: #94a3b8; }
 
     .code-block { background: #0f172a; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 1rem; overflow-x: auto; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.85rem; line-height: 1.5; }
     .code-block pre { margin: 0; }
@@ -175,7 +205,8 @@
 
     .gs-section { margin-bottom: 2.5rem; }
     .gs-section h2 { color: #f1f5f9; font-size: 1.3rem; margin-bottom: 1rem; }
-    .gs-section p { color: #64748b; font-size: 0.9rem; margin-bottom: 0.75rem; }
+    .gs-section p { color: #64748b; font-size: 0.9rem; margin-bottom: 0.75rem; line-height: 1.45; }
+    .gs-section p a { color: #a5b4fc; }
 
     .pipeline-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.5rem; }
     .pipeline-card { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.75rem; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); color: #cbd5e1; font-size: 0.85rem; text-decoration: none; transition: all 0.15s; }
