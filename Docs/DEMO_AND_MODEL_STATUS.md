@@ -57,9 +57,9 @@
 | SqueezeNet / MobileNetV2 | ✅ | ✅ classification | ORT-aligned |
 | Style-transfer (5 styles) | ✅ | ✅ | ORT-matched |
 | Depth Anything V2 Small | ✅ | ✅ | ORT-matched |
-| YOLOv8-nano | ✅ | ✅ | ORT-matched |
+| YOLOv8-nano | ✅ | 🟡 live bad | Loads; TJ: live /detect bad 2026-09-27 — handoff |
 | MoveNet Lightning | ✅ | ✅ | ORT-matched |
-| BlazeFace | ✅ | ✅ VERIFIED | classificator relRMS ~4.6e-4 (5.2.29 NHWC MaxPool + depthwise fused-act) |
+| BlazeFace | ✅ | 🟡 live bad | PMT green; TJ: live /face bad 2026-09-27 — handoff |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
 | DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |
