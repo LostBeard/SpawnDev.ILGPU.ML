@@ -455,7 +455,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does |
 |------|-------------|
-| **Image Generation** | **Coming soon.** SD-Turbo UI exists; diffusion math is tested; there is **no** working end-to-end image output on this page yet (STATUS: WIP). |
+| **Image Generation** | SD-Turbo text→image on your GPU (single-step, ~2.5 GB opt-in download). Same `ImageGenerationPipeline` as SpawnDev.AI. |
 | **Image to 3D (TripoSR)** | **Coming soon.** Generate/download/open are no-ops. Format helpers exist; the reconstruction model path is not wired. |
 | **Image to Gaussian Splats (LGM)** | Planned — single image → splats → [SpawnScene](https://github.com/LostBeard/SpawnScene). Not a working demo page yet. |
 | **Depth Voxel** | Route mounts; depth colormap can run. The promised 3D voxel/splat viewer was never built (STATUS: PARTIAL; hidden from nav). |

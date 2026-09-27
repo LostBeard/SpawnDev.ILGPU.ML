@@ -41,7 +41,7 @@
 | `/assistant` | AI assistant (chat) | 🟡 **PARTIAL** | Real DistilGPT-2 when a model is loaded; **falls back to `GetPlaceholderResponse` when none loaded**. README claims of Phi-4 14B / SpeechT5 voice are **aspirational — not what this page does today** |
 | `/comic-chat` | Multi-character chat | 🟡 **PARTIAL** | Same as assistant — real text-gen when loaded, `GetPlaceholderComicResponse` otherwise. No Phi-4 tiering on this page |
 | `/train` | On-device training (Draw to Learn) | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` |
-| `/generate` | Image generation (SD-Turbo) | 🚧 **WIP** | Coming-soon banner honest. Diffusion **math** tested; **no SD-Turbo end-to-end image test**. Generate is not a working demo |
+| `/generate` | Image generation (SD-Turbo) | ✅ **VERIFIED** | `SDTurbo_Generate_E2E` (WebGPU/CUDA/OpenCL; Wasm skipped — weight paging tracked). Same `ImageGenerationPipeline` as SpawnDev.AI `AiImageEngine`. Demo page: opt-in load on first Generate (was Coming-soon stub that never called `LoadModelAsync`). |
 | `/image-to-3d` | Image → 3D model | 🚧 **WIP** | Coming-soon banner honest. `GenerateModel()` is a **no-op**; download/open empty |
 | `/voice-collab` | Voice collaboration | 🚧 **WIP** | Coming-soon banner honest. Phase 1: browser Web Speech API; **GPU Whisper path disabled** |
 | `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — currently **204**) |
@@ -67,7 +67,7 @@
 | all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; **the model `/embeddings` uses** |
 | Whisper | ✅ | ✅ full STT E2E | `Pipeline_Whisper_TranscribesKnownSpeech` (encoder+decoder) on all six backends |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
-| SD-Turbo | ✅ | 🚧 | no end-to-end image test / demo Coming soon |
+| SD-Turbo | ✅ | ✅ E2E | `SDTurbo_Generate_E2E` + WebGPU multi-gen gates; `/generate` wired |
 | GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | Autoregressive KV-cache decode verified on desktop; browser `/ai-chat` streams GGUF (manual confirm for full file-pick→generate) |
 
 ## Keeping this honest

@@ -6,9 +6,7 @@
 <PageTitle>Image Generation — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Image Generation"
-            Status="DemoLayout.DemoStatus.ComingSoon"
-            StatusMessage="SD-Turbo generation isn't wired end to end yet — the diffusion math is tested but there's no working image output. Coming soon."
-            Description="Generate images from text descriptions using Stable Diffusion. Runs entirely in your browser via WebGPU."
+            Description="Generate images from text with SD-Turbo — single-step diffusion on your GPU. Same ImageGenerationPipeline as SpawnDev.AI."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -25,29 +23,31 @@
     <div class="gen-prompt-section">
         <label class="gen-label">Prompt:</label>
         <div class="gen-prompt-row">
-            <input type="text" class="gen-prompt-input" @bind="_prompt"
-                   placeholder="A serene mountain landscape at sunset with a lake reflection" />
-            <button class="gen-btn" @onclick="GenerateImage" disabled="@(!_isModelLoaded || _isRunning)">
-                @(_isRunning ? "Generating..." : "Generate")
+            <input type="text" class="gen-prompt-input" @bind="_prompt" @bind:event="oninput"
+                   placeholder="A serene mountain landscape at sunset with a lake reflection"
+                   disabled="@(_isModelLoading || _isRunning)" />
+            <button class="gen-btn" @onclick="GenerateImage"
+                    disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isModelLoading || _isRunning)">
+                @GenerateButtonLabel
             </button>
         </div>
 
         <div class="gen-settings">
             <div class="gen-setting">
                 <label>Steps:</label>
-                <input type="number" min="1" max="50" @bind="_numSteps" class="gen-setting-input" />
+                <input type="number" min="1" max="50" @bind="_numSteps" class="gen-setting-input" disabled="@(_isRunning)" />
             </div>
             <div class="gen-setting">
                 <label>Guidance:</label>
-                <input type="number" min="0" max="20" step="0.5" @bind="_guidanceScale" class="gen-setting-input" />
+                <input type="number" min="0" max="20" step="0.5" @bind="_guidanceScale" class="gen-setting-input" disabled="@(_isRunning)" title="SD-Turbo is designed for guidance 0" />
             </div>
             <div class="gen-setting">
                 <label>Seed:</label>
-                <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" />
+                <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" disabled="@(_isRunning)" />
             </div>
             <div class="gen-setting">
                 <label>Size:</label>
-                <select @bind="_imageSize" class="gen-setting-select">
+                <select @bind="_imageSize" class="gen-setting-select" disabled="@(_isRunning)">
                     <option value="256">256x256</option>
                     <option value="512">512x512</option>
                 </select>
@@ -59,7 +59,7 @@
             <div class="gen-negative">
                 <label class="gen-label">Negative prompt:</label>
                 <input type="text" class="gen-prompt-input" @bind="_negativePrompt"
-                       placeholder="blurry, low quality, distorted" />
+                       placeholder="blurry, low quality, distorted" disabled="@(_isRunning)" />
             </div>
         }
         else
@@ -72,7 +72,7 @@
     {
         <div class="gen-progress">
             <div class="gen-progress-bar">
-                <div class="gen-progress-fill" style="width: @(_currentStep * 100.0 / _numSteps)%;"></div>
+                <div class="gen-progress-fill" style="width: @(_currentStep * 100.0 / Math.Max(1, _numSteps))%"></div>
             </div>
             <span class="gen-progress-text">Step @_currentStep / @_numSteps</span>
         </div>
@@ -98,14 +98,22 @@
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            Image generation requires SD Turbo (~2.5 GB across 3 models). The first load downloads from HuggingFace and caches in your browser. Subsequent loads are instant.
+            SD-Turbo is ~2.5&nbsp;GB (text encoder + U-Net + VAE). Enter a prompt and click
+            <strong>Download &amp; Generate</strong> — weights stream from the hub into OPFS on first use
+            (same path as SpawnDev.AI). Cached after that. Manage cache on
+            <a href="cache">Model Cache</a>.
         </div>
+    }
+
+    @if (_error != null)
+    {
+        <div class="error-banner">@_error</div>
     }
 
     <PrivacyBadge />
 
     <PipelineHowTo OurCode="@_howToCs"
-                   DocsNote="Not a Transformers.js task — Stable Diffusion text→image on your GPU. (Demo coming soon.)" />
+                   DocsNote="Not a Transformers.js task — Stable Diffusion text→image on your GPU. Same ImageGenerationPipeline as SpawnDev.AI." />
 
 </DemoLayout>
 
@@ -190,27 +198,28 @@
     .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
     .clear-btn:hover { background: rgba(255,255,255,0.1); }
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+    .model-needed a { color: #fcd34d; }
+    .error-banner { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; color: #fca5a5; font-size: 0.85rem; white-space: pre-wrap; }
 </style>
 
 @code {
-    // "Show how" — the actual SD-Turbo text→image path this page runs (no Transformers.js equivalent exists).
+    // Same path SpawnDev.AI.AiImageEngine uses: ImageGenerationPipeline.CreateAsync + RunAsync.
+    // Evidence: SDTurbo_Generate_E2E (HeavyModel) + SDTurbo_WebGPU_ImageGen_MultiGen.
+    // The prior "Coming soon" stub never called LoadModelAsync, so Generate stayed disabled forever.
     private const string _howToCs = """
-// Stream the SD-Turbo sub-models (text encoder, U-Net, VAE) from the hub to YOUR GPU.
-// Plain HTTP, cached in OPFS - no WebTorrent needed. (Swap in a HubModelStream, which
-// implements the same IModelSource, to deliver over torrents instead.)
-var source = new HubModelSource(JS);   // or inject it as a singleton
+var source = new HubModelSource(JS);   // or inject as a singleton
 var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, source,
     onProgress: (stage, pct) => Show($"{stage} {pct}%"));
 
-// Diffusion text→image — runs entirely on-device, no server, no ONNX Runtime
 pipe.NumInferenceSteps = 1;   // SD-Turbo: single step
+pipe.GuidanceScale = 0f;      // SD-Turbo: no CFG
 pipe.Width = pipe.Height = 512;
-var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a mountain lake at sunset" });
+var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a photo of a cat" });
 ShowImage(result.ImageRGBA, result.Width, result.Height);
 """;
 
     private string _selectedBackend = "WebGPU";
-    private string _prompt = "";
+    private string _prompt = "a photo of a cat";
     private string _negativePrompt = "";
     private bool _showNegative;
     private int _numSteps = 1;
@@ -222,7 +231,14 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
     private string? _generatedImageUrl;
+    private string? _error;
     private string _modelStatusText = "SD Turbo";
+
+    private string GenerateButtonLabel =>
+        _isModelLoading ? "Loading…"
+        : _isRunning ? "Generating…"
+        : !_isModelLoaded ? "Download & Generate"
+        : "Generate";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -236,14 +252,14 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _pipeline;
 
-    // OPT-IN / Coming Soon: this stub must NOT download anything on page entry. SD-Turbo is ~2.5 GB
-    // across 3 models and is streamed by LoadModelAsync — that is intentionally no longer called on
-    // render. The Generate button stays disabled until a model is loaded, which the stub never does.
+    // OPT-IN: ~2.5 GB SD-Turbo is NOT downloaded on page entry. First Generate click loads it
+    // (same lazy residency as SpawnDev.AI.AiImageEngine.GenerateAsync).
 
     private async Task LoadModelAsync()
     {
         try
         {
+            _error = null;
             _isModelLoading = true;
             StateHasChanged();
 
@@ -253,29 +269,42 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
                 await builder.AllAcceleratorsAsync();
                 _context = builder.ToContext();
             }
+            _accelerator?.Dispose();
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
-            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+            if (_accelerator == null)
+            {
+                _error = "No GPU accelerator available (need WebGPU).";
+                return;
+            }
 
-            // Stream the SD-Turbo sub-models from the hub over plain HTTP, cached in OPFS (seekable,
-            // persisted across reloads, weight-by-weight to GPU) - the old ModelHub.LoadAsync path
-            // materialized the 1.7GB U-Net as a byte[] and OOM'd before /generate could run.
-            // HubModelSource, not HubModelStream: delivery no longer needs WebTorrent. Swap in a
-            // HubModelStream here (it implements the same IModelSource) to get torrent delivery instead.
-            var modelSource = ModelSource;
+            _pipeline?.Dispose();
+            // HubModelSource streams ONNX weights over HTTP into OPFS — never a 1.7GB U-Net byte[].
             _pipeline = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(
-                _accelerator, modelSource, onProgress: (stage, pct) =>
+                _accelerator, ModelSource, onProgress: (stage, pct) =>
                 {
                     _modelStatusText = $"SD Turbo — {stage}";
                     _modelProgress = pct;
-                    StateHasChanged();
+                    InvokeAsync(StateHasChanged);
                 });
+
+            if (_pipeline == null || !_pipeline.IsReady)
+            {
+                _error = "SD-Turbo pipeline failed to become ready after load.";
+                _pipeline?.Dispose();
+                _pipeline = null;
+                return;
+            }
 
             _modelStatusText = "SD Turbo";
             _isModelLoaded = true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Generate] Error: {ex.Message}");
+            _error = ex.Message;
+            Console.WriteLine($"[Generate] Load error: {ex}");
+            _pipeline?.Dispose();
+            _pipeline = null;
+            _isModelLoaded = false;
         }
         finally
         {
@@ -284,14 +313,34 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        bool wasLoaded = _isModelLoaded;
+        _pipeline?.Dispose();
+        _pipeline = null;
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already in use.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
+    }
 
     private async Task GenerateImage()
     {
-        if (_pipeline == null) return;
+        if (string.IsNullOrWhiteSpace(_prompt)) return;
+        _error = null;
+        _generatedImageUrl = null;
+
+        // Lazy load on first generate — matches AiImageEngine.
+        if (!_isModelLoaded && !_isModelLoading)
+            await LoadModelAsync();
+        if (_pipeline == null || !_isModelLoaded) return;
+
         _isRunning = true;
         _currentStep = 0;
-        _generatedImageUrl = null;
         StateHasChanged();
         await Task.Yield();
 
@@ -318,7 +367,10 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Generate] Error: {ex.Message}");
+            _error = ex.Message;
+            Console.WriteLine($"[Generate] Error: {ex}");
+            if (_pipeline != null)
+                _pipeline.OnProgress -= OnPipelineProgress;
         }
 
         _isRunning = false;
@@ -329,7 +381,7 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
     {
         _currentStep = step;
         _numSteps = total;
-        StateHasChanged();
+        _ = InvokeAsync(StateHasChanged);
     }
 
     private void DownloadResult()
@@ -349,7 +401,7 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
         catch { }
     }
 
-    private void ClearResult() { _generatedImageUrl = null; _currentStep = 0; StateHasChanged(); }
+    private void ClearResult() { _generatedImageUrl = null; _currentStep = 0; _error = null; StateHasChanged(); }
 
     public void Dispose()
     {
