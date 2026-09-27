@@ -102,6 +102,17 @@ if (typeof window !== 'undefined') {
             return; // Let the browser handle it natively
         }
 
+        // Do NOT re-wrap same-origin model binaries. `new Response(response.body, …)` below
+        // truncates Blazor HttpClient streaming reads — measured on GH Pages /face (BlazeFace
+        // 229746 → 199050 bytes, FlatBuffer ReadInt32 OOB, 2026-09-27). Cross-origin hub
+        // downloads already bypass this SW; wwwroot /models/* must too. COEP/COOP on the
+        // document (HTML) is what enables SharedArrayBuffer; same-origin .tflite/.onnx do not
+        // need those headers re-applied on the Response.
+        if (url.pathname.indexOf("/models/") !== -1
+            || /\.(tflite|onnx|gguf|bin|ort|safetensors)$/i.test(url.pathname)) {
+            return;
+        }
+
         event.respondWith(
             fetch(event.request)
                 .then(function (response) {
