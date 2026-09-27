@@ -14,7 +14,8 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// </summary>
 /// <remarks>
 /// MediaPipe short-range contract: input [-1,1] letterboxed 128×128, strides [8,16,16,16] → 896
-/// anchors, <c>reverse_output_order</c> yxhw boxes. Decode matches that.
+/// anchors. Regressor layout for this TFLite is SSD <c>[x,y,w,h] + (x,y)*6</c> (not
+/// calculator <c>reverse_output_order</c>).
 /// <para>
 /// Forward parity (5.2.29): TFLite NHWC MaxPool + correct DepthwiseConv fused-activation field.
 /// Gate: <c>Pipeline_BlazeFace_Reference_MatchesOnnxRuntime</c> (classificator relRMS ≤ 0.05).
@@ -169,11 +170,14 @@ public class FaceDetectionPipeline : IDisposable
             int regBase = i * 16;
             if (regBase + 15 >= regressors.Length) continue;
 
-            // MediaPipe reverse_output_order: [y_center, x_center, h, w], keypoints (y,x)*6
-            float cy = regressors[regBase + 0] / scale + _anchors[i, 1];
-            float cx = regressors[regBase + 1] / scale + _anchors[i, 0];
-            float h = regressors[regBase + 2] / scale;
-            float w = regressors[regBase + 3] / scale;
+            // This short-range TFLite emits SSD order [x_center, y_center, w, h] then keypoints
+            // (x,y)*6 — NOT MediaPipe calculator reverse_output_order (y,x,h,w). Proved 2026-09-27:
+            // yxhw left the box roughly OK (h≈w) but put green dots nowhere on eyes/nose/mouth;
+            // xywh matches LiteRT+Comfy decode and lands RE/LE/nose/mouth on the portrait features.
+            float cx = regressors[regBase + 0] / scale + _anchors[i, 0];
+            float cy = regressors[regBase + 1] / scale + _anchors[i, 1];
+            float w = regressors[regBase + 2] / scale;
+            float h = regressors[regBase + 3] / scale;
 
             float x1 = MapX(cx - w / 2, contentW, padX, imageWidth);
             float y1 = MapY(cy - h / 2, contentH, padY, imageHeight);
@@ -183,8 +187,8 @@ public class FaceDetectionPipeline : IDisposable
             var landmarks = new List<(float X, float Y)>(6);
             for (int j = 0; j < 6; j++)
             {
-                float ly = regressors[regBase + 4 + j * 2] / scale + _anchors[i, 1];
-                float lx = regressors[regBase + 4 + j * 2 + 1] / scale + _anchors[i, 0];
+                float lx = regressors[regBase + 4 + j * 2] / scale + _anchors[i, 0];
+                float ly = regressors[regBase + 4 + j * 2 + 1] / scale + _anchors[i, 1];
                 landmarks.Add((
                     Clamp(MapX(lx, contentW, padX, imageWidth), 0, imageWidth),
                     Clamp(MapY(ly, contentH, padY, imageHeight), 0, imageHeight)));

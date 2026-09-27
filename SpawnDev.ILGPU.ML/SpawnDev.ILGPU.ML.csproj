@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.32</Version>
-		<PackageReleaseNotes>v5.2.32: Fix /face and /detect wrong boxes — YOLOv8 letterbox+[0,1] preprocess; BlazeFace weighted NMS + maxFaces=1. See CHANGELOG.</PackageReleaseNotes>
+		<Version>5.2.33</Version>
+		<PackageReleaseNotes>v5.2.33: BlazeFace landmark decode is SSD xywh (not reverse yxhw) — green dots on eyes/nose/mouth. See CHANGELOG.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

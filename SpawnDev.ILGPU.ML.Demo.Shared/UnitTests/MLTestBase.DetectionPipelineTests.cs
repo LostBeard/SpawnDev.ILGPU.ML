@@ -285,8 +285,9 @@ public abstract partial class MLTestBase
 
     /// <summary>
     /// End-to-end BlazeFace on a real portrait: must detect ≥1 face.
-    /// Pins MediaPipe short-range decode (896 anchors, [-1,1] letterbox, reverse_output_order).
+    /// Pins MediaPipe short-range decode (896 anchors, [-1,1] letterbox, SSD xywh keypoints).
     /// The previous strides-[8,16]/[0,1]/xy path returned Faces: 0 on every /face sample.
+    /// yxhw (reverse_output_order) left the box OK but landmarks off-feature — geometry gate below.
     /// </summary>
     [TestMethod(Timeout = 120000)]
     public async Task Pipeline_BlazeFace_Portrait_DetectsFace() => await RunTest(async accelerator =>
@@ -350,5 +351,26 @@ public abstract partial class MLTestBase
         if (result.FaceCount > 1)
             throw new Exception(
                 $"expected ≤1 face on single-person portrait (MediaPipe num_faces default), got {result.FaceCount}");
+
+        // Landmark geometry: RE/LE/nose/mouth must sit on the face (yxhw decode put them on
+        // cheek/chin/forehead while the box still looked fine — gate must catch that).
+        if (top.Landmarks == null || top.Landmarks.Count < 4)
+            throw new Exception($"expected ≥4 landmarks, got {top.Landmarks?.Count ?? 0}");
+        var (rex, rey) = top.Landmarks[0];
+        var (lex, ley) = top.Landmarks[1];
+        var (nx, ny) = top.Landmarks[2];
+        var (mx, my) = top.Landmarks[3];
+        Console.WriteLine(
+            $"[BlazeFace] landmarks RE=({rex:F0},{rey:F0}) LE=({lex:F0},{ley:F0}) nose=({nx:F0},{ny:F0}) mouth=({mx:F0},{my:F0})");
+        if (rex >= lex)
+            throw new Exception($"right-eye x ({rex}) should be left of left-eye x ({lex}) in image space");
+        if (MathF.Abs(rey - ley) > top.Height * 0.25f)
+            throw new Exception($"eyes not level: RE.y={rey} LE.y={ley} (face h={top.Height}) — keypoint xy order wrong?");
+        if (nx < rex || nx > lex)
+            throw new Exception($"nose x={nx} not between eyes [{rex},{lex}]");
+        if (ny < MathF.Min(rey, ley) || ny > my)
+            throw new Exception($"nose y={ny} not between eyes and mouth (eyes~{rey}, mouth={my})");
+        if (my < ny)
+            throw new Exception($"mouth y={my} above nose y={ny}");
     });
 }

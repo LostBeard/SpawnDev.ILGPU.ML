@@ -2,6 +2,14 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.33 (2026-09-27) - BlazeFace landmarks xywh (not reverse yxhw)
+
+**Bug:** `/face` box was correct after 5.2.32 but the 6 green landmark dots sat on
+cheek/chin/forehead. Root cause: decode treated regressors as MediaPipe calculator
+`reverse_output_order` `[y,x,h,w]+(y,x)*6`. This short-range TFLite emits SSD
+`[x,y,w,h]+(x,y)*6` (LiteRT oracle + Comfy). Near-square boxes hid the box error;
+keypoints could not. Portrait gate now asserts eyes level, nose between eyes, mouth below nose.
+
 ## 5.2.32 (2026-09-27) - /face + /detect wrong boxes
 
 **`/detect` root cause:** `ObjectDetectionPipeline` commented "letterbox + [0,1]" but called
