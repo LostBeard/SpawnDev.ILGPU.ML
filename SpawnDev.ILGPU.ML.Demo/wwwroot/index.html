@@ -42,8 +42,10 @@
         <a href="." class="reload">Reload</a>
         <span class="dismiss">🗙</span>
     </div>
-    <!-- Registers SW (COI headers + torrent streaming), waits for ready, then loads Blazor -->
-    <script src="blazor-coi-serviceworker.js"></script>
+    <!-- Registers SW (COI headers). ?v= busts GH Pages/Fastly cache when the SW body changes —
+         measured 2026-09-27: gh-pages had the /models/ bypass but lostbeard.github.io still
+         served the old worker (max-age=600 HIT) and /face kept truncating BlazeFace. -->
+    <script src="blazor-coi-serviceworker.js?v=5.2.26"></script>
     <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
 </body>
 
