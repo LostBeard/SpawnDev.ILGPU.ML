@@ -2,6 +2,13 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34-local.5 (unreleased) - SpawnDev.ILGPU 5.2.18-local.7 (Wasm SIMD / WebGL correctness, Wasm dispatch cost)
+
+Takes SpawnDev.ILGPU **5.2.18-local.7**: two Wasm SIMD silent-wrong-result bugs (non-unit-stride addresses such as
+struct fields vectorized as contiguous; if-conversion dropping the second route into a join) and a WebGL one (a
+struct-buffer FIELD read returned 0), all live in 5.2.17; and Wasm non-barrier dispatches of small grids now use
+one worker instead of the whole pool (32-element launch 2.1 -> 1.05 ms). See SpawnDev.ILGPU's CHANGELOG.
+
 ## 5.2.34-local.4 (unreleased) - SpawnDev.ILGPU 5.2.18-local.6 (CPU lane loop)
 
 Moves from SpawnDev.ILGPU 5.2.17 to **5.2.18-local.6**, which runs lane-independent CPU kernels in a plain lane loop
