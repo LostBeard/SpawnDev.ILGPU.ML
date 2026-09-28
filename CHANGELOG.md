@@ -2,6 +2,16 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34-local.4 (unreleased) - SpawnDev.ILGPU 5.2.18-local.6 (CPU lane loop)
+
+Moves from SpawnDev.ILGPU 5.2.17 to **5.2.18-local.6**, which runs lane-independent CPU kernels in a plain lane loop
+instead of on the cooperative lane threads (0.685 -> 0.004 ms per trivial launch). `SystemOne_Snake_BehavioralClone_
+AgreesWithTeacher` timed out at 300 s on the CPU lane in the 2026-09-28 release sweep (10,240 train steps x ~35
+launches); it now passes in **9 s** (agreement 99.6%, policy mean 46.1). Training is bit-identical with the lane loop on
+and off (`SNAKEPROF CPU 256` fingerprint, loss 0x3A5F820F both ways, 1.06 vs 27.1 ms/step). Also brings in the ILGPU
+changes since 5.2.17: WebGPU/WebGL loop-exit and view-helper miscompile fixes, one WebGPU pipeline per kernel, and the
+WebGPU live-buffer accounting / creation sites. New DemoConsole probe `SNAKEPROF [CPU|Cuda|OpenCL] [steps]`.
+
 ## 5.2.34-local.3 (unreleased) - unnamed pool rents come back after their node
 
 **Bug:** `BufferPool.Return` keys on the tensor NAME, so an unnamed `Rent` - every operator's private temp: de-alias

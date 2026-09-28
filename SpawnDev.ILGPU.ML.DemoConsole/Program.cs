@@ -909,6 +909,52 @@ if (args.Length > 0 && args[0] == "STYLEBISECT")
 // Investigation diagnostic (NOT a PMT test): tight-loop repro for the intermittent CPU-backend
 // non-determinism in GGUFDecodeKVCache. Discriminates which path (full-recompute shared kernels
 // vs decode-specific) is non-deterministic. Usage: KVRACE [iters] [CPU|Cuda|OpenCL]
+// Investigation diagnostic (NOT a PMT test): prices SystemOne behavioral-clone training per backend - the
+// CPU/Wasm lanes timed out SystemOne_Snake_BehavioralClone_AgreesWithTeacher at 300 s while CUDA ran it in 3 s.
+// Splits a TrainStep's cost into (kernel-launch overhead x launches) vs everything else.
+// Usage: SNAKEPROF [CPU|Cuda|OpenCL] [steps]
+if (args.Length > 0 && args[0] == "SNAKEPROF")
+{
+    string backend = args.Length > 1 ? args[1] : "CPU";
+    int steps = args.Length > 2 && int.TryParse(args[2], out var sn) ? sn : 64;
+    ILGPU.Runtime.CPU.CPUAccelerator.DisableLaneLoop = Environment.GetEnvironmentVariable("SNAKEPROF_LANELOOP") == "0";
+    using var ctx = MLContext.CreateContext();
+    using Accelerator acc = backend switch
+    {
+        "Cuda" => ctx.CreateCudaAccelerator(0),
+        "OpenCL" => ILGPU.Runtime.OpenCL.CLContextExtensions.CreateCLAccelerator(ctx, 0),
+        _ => ctx.CreateCPUAccelerator(0),
+    };
+    using var head = SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake.SnakeSystemOneSpec.CreateHead(acc);
+    var (inputs, labels, count) = SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake.SnakeSystemOneTrainer.CollectDataset(1024, seed: 7);
+    int bs = 32, dim = head.StateDim;
+    var bIn = new float[bs * dim]; var bLab = new int[bs];
+    Array.Copy(inputs, bIn, bIn.Length); Array.Copy(labels, bLab, bs);
+    head.TrainStep(bIn, bLab, bs, 0.05f); await head.FlushAsync();   // warm: kernel compile
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    for (int i = 0; i < steps; i++) { head.TrainStep(bIn, bLab, bs, 0.05f); if ((i + 1) % 8 == 0) await head.FlushAsync(); }
+    await head.FlushAsync();
+    double stepMs = sw.Elapsed.TotalMilliseconds / steps;
+    // Bit-level fingerprint of the trained head (last loss + probabilities on a fixed probe) so two runs -
+    // e.g. CPU lane loop on vs off (SNAKEPROF_LANELOOP=0) - can be compared exactly, not by eye.
+    float lastLoss = await head.ReadLastLossAsync(bs);
+    var probs = await head.PredictProbsAsync(bIn.AsSpan(0, dim).ToArray());
+    Console.WriteLine($"[SNAKEPROF] fingerprint loss=0x{BitConverter.SingleToInt32Bits(lastLoss):X8} ({lastLoss:G9}) probs=" +
+                      string.Join(",", probs.Select(p => $"0x{BitConverter.SingleToInt32Bits(p):X8}")));
+    var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(acc);
+    using var a = acc.Allocate1D<float>(32); using var b = acc.Allocate1D<float>(32);
+    ew.Scale(a.View, b.View, 32, 1f); await acc.SynchronizeAsync();
+    int launches = 2000;
+    sw.Restart();
+    for (int i = 0; i < launches; i++) ew.Scale(a.View, b.View, 32, 1f);
+    await acc.SynchronizeAsync();
+    double launchMs = sw.Elapsed.TotalMilliseconds / launches;
+    Console.WriteLine($"[SNAKEPROF] {acc.AcceleratorType} {acc.Name}: TrainStep {stepMs:F3} ms/step ({steps} steps) | " +
+                      $"trivial 32-elem launch {launchMs:F4} ms | step = {stepMs / launchMs:F1} launch-equivalents | " +
+                      $"projected full BC (10,240 steps) {stepMs * 10240 / 1000:F0} s");
+    return 0;
+}
+
 if (args.Length > 0 && args[0] == "KVRACE")
 {
     int iters = args.Length > 1 && int.TryParse(args[1], out var n) ? n : 200;
