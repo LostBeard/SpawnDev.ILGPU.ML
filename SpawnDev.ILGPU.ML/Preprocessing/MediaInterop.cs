@@ -106,6 +106,70 @@ public class MediaInterop
     }
 
     /// <summary>
+    /// Decode an ENCODED image (JPEG / PNG / WebP / ... — a <see cref="Blob"/>, which includes a <c>File</c>
+    /// from a file picker or OPFS) to RGBA pixels that stay in JS, at most <paramref name="maxLongEdge"/>
+    /// pixels on its longest edge (0 = full size). The caller disposes <c>Pixels</c>.
+    /// </summary>
+    /// <remarks>
+    /// The browser decodes (EXIF orientation applied, as <c>createImageBitmap</c> does by default) and the
+    /// RESIZE happens in the canvas draw, so a full-size bitmap never becomes an array anywhere — a 12 MP phone
+    /// photo bound for a 1024 px pipeline is read as 0.8 MP. Uses the global <c>createImageBitmap</c> and an
+    /// <see cref="OffscreenCanvas"/>, so it works on the main thread and in workers.
+    /// ⚠️ This is the encoded-image twin of <see cref="FromBlobAsync"/>, which copies the pixels into a managed
+    /// <c>byte[]</c>. That one existed alone, so every multi-image importer used it (or hand-rolled
+    /// <c>ReadBytes()</c>) — 35 phone photos at full size is ~1.7 GB on the 2 GB WASM heap, and a SpawnScene
+    /// project died exactly there (2026-09-28).
+    /// </remarks>
+    public static async Task<(Uint8ClampedArray Pixels, int Width, int Height, int SourceWidth, int SourceHeight)>
+        FromBlobJSAsync(Blob source, int maxLongEdge = 0)
+    {
+        using var bitmap = await SpawnJSRuntime.Instance.CallAsync<Blob, ImageBitmap>("createImageBitmap", source);
+        int srcW = (int)bitmap.Width, srcH = (int)bitmap.Height;
+        var (w, h) = FitLongEdge(srcW, srcH, maxLongEdge);
+        using var canvas = new OffscreenCanvas(w, h);
+        using var ctx = canvas.Get2DContext();
+        ctx.DrawImage(bitmap, 0, 0, w, h);
+        using var imageData = ctx.GetImageData(0, 0, w, h);
+        return (imageData.Data, w, h, srcW, srcH);
+    }
+
+    /// <summary>
+    /// Decode an encoded image (see <see cref="FromBlobJSAsync"/>) straight into a new device buffer of packed
+    /// RGBA — one <c>int</c> per pixel, R in the low byte, row-major, <c>Width * Height</c> elements. The pixels
+    /// go browser decoder → canvas → GPU and never enter the .NET heap. The caller owns (disposes) the buffer.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The accelerator is not a browser backend (see <see cref="UploadToDevice{T}"/>).</exception>
+    public static async Task<(MemoryBuffer1D<int, Stride1D.Dense> Rgba, int Width, int Height, int SourceWidth, int SourceHeight)>
+        DecodeToDeviceAsync(Blob source, Accelerator accelerator, int maxLongEdge = 0)
+    {
+        var (pixels, w, h, srcW, srcH) = await FromBlobJSAsync(source, maxLongEdge);
+        using (pixels)
+        {
+            var buffer = accelerator.Allocate1D<int>((long)w * h);
+            try
+            {
+                UploadToDevice(pixels, buffer);
+            }
+            catch
+            {
+                buffer.Dispose();
+                throw;
+            }
+            return (buffer, w, h, srcW, srcH);
+        }
+    }
+
+    /// <summary>The largest size with the same aspect whose longest edge is at most <paramref name="maxLongEdge"/>
+    /// (0 = unchanged); never enlarges.</summary>
+    public static (int Width, int Height) FitLongEdge(int width, int height, int maxLongEdge)
+    {
+        int longest = Math.Max(width, height);
+        if (maxLongEdge <= 0 || longest <= maxLongEdge) return (width, height);
+        float s = (float)maxLongEdge / longest;
+        return (Math.Max(1, (int)MathF.Round(width * s)), Math.Max(1, (int)MathF.Round(height * s)));
+    }
+
+    /// <summary>
     /// Uploads a JS typed array straight into a device buffer — the whole point of the <c>...JS</c> methods
     /// above. Works for any element type because the copy is bytes: RGBA pixels into an <c>int</c> buffer
     /// (4 bytes per pixel is exactly the RGBA layout, so no repack is needed or performed), PCM samples into
