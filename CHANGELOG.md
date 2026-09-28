@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.35 - decode an encoded image straight to the GPU
+
+`MediaInterop.DecodeToDeviceAsync(Blob, Accelerator, maxLongEdge)` and `MediaInterop.FromBlobJSAsync(Blob,
+maxLongEdge)`: a JPEG / PNG / WebP Blob (including a `File` from a file picker or OPFS) is decoded by the browser
+(EXIF orientation applied), resized in the `OffscreenCanvas` draw, and uploaded with `UploadToDevice` - the pixels
+go decoder -> canvas -> GPU and never enter the .NET heap. Works on the main thread and in workers. Plus
+`FitLongEdge`.
+
+Why: the only encoded-image entry point, `FromBlobAsync`, returns a managed `byte[]`, so importers copied every
+full-size photo into .NET - a 35-photo SpawnScene project ran the 2 GB WASM heap out of memory on gh-pages
+(2026-09-28). With `DecodeToDeviceAsync` the same project runs at 23-28 MB of managed heap.
+
+Tests: `MLTestBase.BlobDecode_ToDevice_ExactPixelsAndResize` (exact colours at full size, 1024 cap, 50 px) and
+`BlobDecode_ToDevice_PixelsNeverEnterManagedHeap` (4000x3000: managed heap +0.00 MB, vs +45.78 MB through
+`FromBlobAsync` on the same image). Additive only - no existing API changed; still on SpawnDev.ILGPU 5.2.18.
+
 ## 5.2.34 - GPU memory leaks fixed; SpawnDev.ILGPU 5.2.18
 
 Releases 5.2.34-local.1 .. local.5 below, plus **SpawnDev.ILGPU 5.2.18** (final): params buffers are

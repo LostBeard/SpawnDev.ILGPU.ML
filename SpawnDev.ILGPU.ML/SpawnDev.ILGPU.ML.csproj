@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.34</Version>
-		<PackageReleaseNotes>v5.2.34: GPU memory leaks fixed (params buffers, depth pipeline weights, per-node pool scratch - DAv3 warm forward allocates nothing); SpawnDev.ILGPU 5.2.18. See CHANGELOG.</PackageReleaseNotes>
+		<Version>5.2.35</Version>
+		<PackageReleaseNotes>v5.2.35: MediaInterop.DecodeToDeviceAsync / FromBlobJSAsync - an encoded image (Blob / File) decoded and resized by the browser straight to the GPU, pixels never enter the .NET heap. See CHANGELOG.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
