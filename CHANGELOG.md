@@ -2,6 +2,28 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34-local.3 (unreleased) - unnamed pool rents come back after their node
+
+**Bug:** `BufferPool.Return` keys on the tensor NAME, so an unnamed `Rent` - every operator's private temp: de-alias
+copies, params uploads, transpose staging - could never be returned and stayed allocated until the pool was
+disposed. DAv3-Small allocated **16 fresh buffers on every warm forward** (CUDA, single-view 518 and 4-view), all
+traced to `ConcatOperator`'s de-alias copy for the RoPE `cat(x, x)` nodes: 9 directly, 7 as named rents missing a
+bucket those copies had drained. SpawnScene's 83-pass TruckFull cascade accumulated ~1,300.
+**Fix:** while a graph run executes, unnamed Rents are recorded as NODE-SCOPED SCRATCH
+(`BufferPool.SwapScratchSink`) and returned after the node - on `RunAsync`'s deferred drain schedule, immediately on
+sync `Run` (like that path's other releases). A scratch buffer one of the node's outputs still views (SplitToSequence
+pieces in a host Sequence) is an escape and stays out of the pool, as before. Nothing is recorded in a capture regime
+(`SuppressDrains` / `UseCaptureParamSlots`): a replayed plan re-runs no C#, so CPU-written scratch must keep its bytes.
+Nested runs (If/Loop/Scan bodies) save and restore the caller's sink. Every operator is covered; no call site changed.
+**Also fixed:** the pool's ownership diagnostics compared a view's `Buffer` (the RAW accelerator buffer) against the
+`MemoryBuffer1D` wrapper - never equal - so every Return reported ALIEN-RETURN and `ML_STRICT_RETURN=1` would have
+skipped every Return. `GraphExecutor.CurrentRunNodeIndex` is now restored after a run (it stayed at the last node
+forever) and published on sync `Run` too; new `CurrentRunOpType`; `RecentFreshAllocNames` entries carry `@node:op`.
+**Gates:** `DA3_WarmForward_AllocatesNothing` (HeavyModel; 16 -> 0 fresh per warm pass, relRMS vs ORT unchanged
+2.0e-6 / 1.5e-6), `PoolScratch_ConcatSelf_WarmRunsAllocateNothing` and `PoolScratch_EscapedSequencePieceIsNotRecycled`
+(every backend; red-checked per path: sink off in RunAsync / in Run -> pool grows; escape check off in RunAsync / in
+Run -> the sequence piece reads another tensor's data). DAv3 ORT parity single/multi-view incl. CUDA capture+replay green.
+
 ## 5.2.34-local.2 (unreleased) - disposing a depth pipeline frees its model
 
 **Bug:** `DepthEstimationPipeline.CreateFromStreamsAsync` / `CreateFromHubAsync` create the `InferenceSession`, but

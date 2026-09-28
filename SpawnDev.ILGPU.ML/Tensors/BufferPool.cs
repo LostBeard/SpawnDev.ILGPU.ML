@@ -340,7 +340,7 @@ public class BufferPool : IDisposable
     {
         foreach (var stack in _buckets.Values)
             foreach (var b in stack)
-                if (ReferenceEquals(b, buffer)) return true;
+                if (ReferenceEquals(b.Buffer, buffer)) return true;   // a view's Buffer is the RAW buffer, not the MemoryBuffer1D wrapper
         return false;
     }
 
@@ -388,6 +388,41 @@ public class BufferPool : IDisposable
     }
 
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
+
+    // ── Node-scoped scratch (unnamed Rents made while a graph run is executing) ──
+    //
+    // Return keys on the tensor NAME, so an unnamed Rent can never be Returned: every operator that took a
+    // private temp (a de-alias copy, a params upload, a transpose staging buffer) kept it until the pool was
+    // disposed. MEASURED 2026-09-28, DAv3-Small on CUDA: 16 fresh buffers on EVERY warm forward, all traced to
+    // ConcatOperator's de-alias copy (the RoPE `cat(x, x)` nodes) - directly, or by draining a bucket a later
+    // named Rent then missed. SpawnScene's 83-pass TruckFull cascade accumulated ~1,300 of them.
+    // While a run has a sink installed, unnamed Rents are recorded here; the executor hands each node's
+    // scratch back on its deferred-release schedule, except any buffer the node's outputs still view (an
+    // escape, e.g. SplitToSequence's pieces), which stays out of the pool exactly as before.
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _scratchSink;
+
+    /// <summary>Install the list unnamed Rents are recorded into (null = record nothing) and return the previous
+    /// one, so a nested run (an If/Loop/Scan body sharing this pool) can restore its caller's sink.</summary>
+    internal List<MemoryBuffer1D<float, Stride1D.Dense>>? SwapScratchSink(List<MemoryBuffer1D<float, Stride1D.Dense>>? sink)
+    {
+        var prev = _scratchSink;
+        _scratchSink = sink;
+        return prev;
+    }
+
+    /// <summary>Put an unnamed scratch buffer (see <see cref="SwapScratchSink"/>) back in its free bucket. The
+    /// caller owns the timing: on browser backends only after a drain, like every other deferred release.</summary>
+    internal void ReturnScratch(MemoryBuffer1D<float, Stride1D.Dense> buffer)
+    {
+        ReturnLog?.Add(("(scratch)", buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
+        int bucketSize = (int)buffer.Length;
+        if (!_buckets.TryGetValue(bucketSize, out var stack))
+        {
+            stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
+            _buckets[bucketSize] = stack;
+        }
+        stack.Push(buffer);
+    }
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _namedBuffers = new();
@@ -437,6 +472,7 @@ public class BufferPool : IDisposable
             if (PoisonRentedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
             var tensor = new Tensor(buffer.View, shape, name);
             if (name != null) { NoteRebind(name, buffer); _namedBuffers[name] = buffer; }
+            else _scratchSink?.Add(buffer);
             if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(buffer)} reuse");
             UpdatePeaks();
             return tensor;
@@ -464,7 +500,7 @@ public class BufferPool : IDisposable
         // still OOM. Models that fit never hit this; models that don't are bounded to their live set.
         TotalDeviceAllocations++;
         if (TraceFreshAllocNames && RecentFreshAllocNames.Count < 4000)
-            RecentFreshAllocNames.Add($"{name ?? "(unnamed)"}#{bucketSize}");
+            RecentFreshAllocNames.Add($"{name ?? "(unnamed)"}#{bucketSize}@{Graph.GraphExecutor.CurrentRunNodeIndex}:{Graph.GraphExecutor.CurrentRunOpType}");
         var _allocSw = System.Diagnostics.Stopwatch.StartNew();
         MemoryBuffer1D<float, Stride1D.Dense> newBuffer = _accelerator.AllocateWithReclaim(
             () => _accelerator.Allocate1D<float>(bucketSize),   // allocate
@@ -488,6 +524,7 @@ public class BufferPool : IDisposable
             Console.WriteLine($"[NEW-ALLOC] node {Graph.GraphExecutor.CurrentRunNodeIndex} {newBuffer.LengthInBytes / 1048576.0:F1}MiB name='{name}' bucket={bucketSize}");
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) { NoteRebind(name, newBuffer); _namedBuffers[name] = newBuffer; }
+        else _scratchSink?.Add(newBuffer);
         if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(newBuffer)} fresh");
         UpdatePeaks();
         return newTensor;
@@ -618,6 +655,11 @@ public class BufferPool : IDisposable
     /// appeared once across a 12-forward run while plain ALIEN-RETURN fired 201 times. So the orphaned
     /// buffers are NOT plain entries of that list - sub-views resolving to a parent buffer, or permanent
     /// allocations tracked elsewhere, are the candidates. Removed rather than left as dead code.
+    /// 🔴 2026-09-28: the likelier reason it never matched is that every identity check here compared a view's
+    /// <c>Buffer</c> (the RAW accelerator buffer) against the <c>MemoryBuffer1D</c> WRAPPER - two different
+    /// objects for the same memory, so no comparison could ever succeed. That also made every Return report
+    /// ALIEN-RETURN (SpawnScene <c>&amp;pooltrace=2</c>: 40,709 lines on a bit-exact run) and would have made
+    /// <see cref="StrictReturnIdentity"/> skip every Return. The checks now compare <c>buffer.Buffer</c>.
     /// </remarks>
     public void Return(Tensor tensor)
     {
@@ -627,10 +669,10 @@ public class BufferPool : IDisposable
             if (StrictReturnIdentity)
             {
                 var own = BufferOf(tensor.Data);
-                if (own != null && !ReferenceEquals(own, buffer))
+                if (own != null && !ReferenceEquals(own, buffer.Buffer))
                 {
                     if (TracePoolOwnership)
-                        PoolViolation($"STRICT-SKIP '{name}': record {Bid(buffer)} != this tensor's {Bid(own)}, " +
+                        PoolViolation($"STRICT-SKIP '{name}': record {Bid(buffer.Buffer)} != this tensor's {Bid(own)}, " +
                                       $"not pooling (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
                     return;
                 }
@@ -638,7 +680,7 @@ public class BufferPool : IDisposable
             if (TracePoolOwnership)
             {
                 var actual = BufferOf(tensor.Data);
-                if (actual != null && !ReferenceEquals(actual, buffer))
+                if (actual != null && !ReferenceEquals(actual, buffer.Buffer))
                     // ownAlreadyFree DISCRIMINATES the two ways the record can diverge from the tensor:
                     //   true  - this exact tensor was ALREADY Returned once; the name was then re-Rented, and
                     //           this second Return pools the new, live buffer. A double Return.
@@ -652,7 +694,7 @@ public class BufferPool : IDisposable
                     // evidence it is usually BENIGN (a view or handoff carrying a name it never Rented).
                     // Do not read a count of these as a count of corruptions. USE-AFTER-RETURN is the
                     // unambiguous one; this is a lead, not a verdict.
-                    PoolViolation($"ALIEN-RETURN '{name}': pooling {Bid(buffer)} but this tensor views {Bid(actual)} " +
+                    PoolViolation($"ALIEN-RETURN '{name}': pooling {Bid(buffer.Buffer)} but this tensor views {Bid(actual)} " +
                                   $"- the name's record is not this tensor's buffer (often benign; see notes) " +
                                   $"(node {Graph.GraphExecutor.CurrentRunNodeIndex}, ownAlreadyFree={IsBufferFree(actual)})");
             }
@@ -730,9 +772,9 @@ public class BufferPool : IDisposable
             if (TracePoolOwnership)
             {
                 var actual = BufferOf(tensor.Data);
-                if (actual != null && !ReferenceEquals(actual, buffer))
-                    PoolViolation($"ALIEN-RETURN (fp16) '{name}': pooling {Bid(buffer)} but this tensor views {Bid(actual)} " +
-                                  $"- {Bid(buffer)} goes into the free bucket while STILL LIVE (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                if (actual != null && !ReferenceEquals(actual, buffer.Buffer))
+                    PoolViolation($"ALIEN-RETURN (fp16) '{name}': pooling {Bid(buffer.Buffer)} but this tensor views {Bid(actual)} " +
+                                  $"- {Bid(buffer.Buffer)} goes into the free bucket while STILL LIVE (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
             }
             _halfNamedBuffers.Remove(name);
             ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));

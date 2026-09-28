@@ -972,6 +972,53 @@ public class GraphExecutor : IDisposable
     public static int CurrentRunNodeIndex = -1;
 
     /// <summary>
+    /// The scratch buffers node <paramref name="n"/> rented (see <see cref="Tensors.BufferPool.SwapScratchSink"/>)
+    /// that may go back to the pool: all of them except any one of n's outputs still views. Clears
+    /// <paramref name="nodeScratch"/>. Shared by <see cref="Run"/> and <see cref="RunAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// An escaped buffer outlives the node - SplitToSequence's pieces live on in a host Sequence, and an op
+    /// may hand a temp out as its output - so recycling it would alias a live value. It stays out of the pool,
+    /// which is what every unnamed Rent used to do.
+    /// ⚠️ RAW buffers on both sides: a view's <c>Buffer</c> is the raw accelerator buffer, NOT the
+    /// <c>MemoryBuffer1D</c> wrapper the pool holds (<c>MemoryBuffer&lt;TView&gt;.Buffer =&gt; View.Buffer</c>),
+    /// so the scratch side compares <c>b.Buffer</c>.
+    /// </remarks>
+    private static List<MemoryBuffer1D<float, Stride1D.Dense>> TakeReleasableScratch(
+        List<MemoryBuffer1D<float, Stride1D.Dense>> nodeScratch, CompiledNode? n,
+        Dictionary<string, Tensor> tensors, Dictionary<string, HalfTensor>? halfTensors,
+        Dictionary<string, OnnxValue> hostValues)
+    {
+        HashSet<MemoryBuffer>? escaped = null;
+        void Escape(MemoryBuffer? b) { if (b != null) (escaped ??= new HashSet<MemoryBuffer>(ReferenceEqualityComparer.Instance)).Add(b); }
+        void EscapeView(ArrayView1D<float, Stride1D.Dense> v) { try { Escape(((IArrayView)v).Buffer); } catch { } }
+        void EscapeValue(OnnxValue? v)
+        {
+            if (v == null) return;
+            if (v.Tensor != null) EscapeView(v.Tensor.Data);
+            if (v.Sequence != null) foreach (var item in v.Sequence) EscapeValue(item);
+            EscapeValue(v.OptionalValue);
+        }
+        if (n != null)
+            foreach (var outName in n.OutputNames)
+            {
+                if (string.IsNullOrEmpty(outName)) continue;
+                if (tensors.TryGetValue(outName, out var t)) EscapeView(t.Data);
+                if (halfTensors != null && halfTensors.TryGetValue(outName, out var h)) { try { Escape(((IArrayView)h.Data).Buffer); } catch { } }
+                if (hostValues.TryGetValue(outName, out var hv)) EscapeValue(hv);
+            }
+        var release = new List<MemoryBuffer1D<float, Stride1D.Dense>>(nodeScratch.Count);
+        foreach (var b in nodeScratch)
+            if (escaped == null || !escaped.Contains(b.Buffer)) release.Add(b);
+        nodeScratch.Clear();
+        return release;
+    }
+
+    /// <summary>DIAGNOSTIC: op type of the node at <see cref="CurrentRunNodeIndex"/>, so a pool miss can name the
+    /// operator that rented it (see <see cref="Tensors.BufferPool.RecentFreshAllocNames"/>). Null when no run is active.</summary>
+    public static string? CurrentRunOpType;
+
+    /// <summary>
     /// The intermediate-tensor pool this executor rents from. Exposed so a session can hand the SAME pool
     /// to the executors it recompiles for other input shapes - see <paramref name="sharedPool"/>.
     /// </summary>
@@ -1099,6 +1146,22 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
     {
+        // Node-scoped scratch, as in RunAsync (see TakeReleasableScratch), except returned right after the node
+        // like this path's other releases: every browser backend orders a host write after the dispatches
+        // already queued against that buffer (WebGPU flushes first, Wasm snapshots on the race, WebGL uploads
+        // before the next dispatch), so the next Rent's CopyFromCPU cannot reach a kernel still pending.
+        // Restores the caller's sink and published node: SubgraphRunner runs If/Loop/Scan bodies through here,
+        // INSIDE an outer node.
+        var nodeScratch = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        int prevNode = CurrentRunNodeIndex;
+        string? prevOp = CurrentRunOpType;
+        var prevSink = _pool.SwapScratchSink(SuppressDrains || UseCaptureParamSlots ? null : nodeScratch);
+        try { return RunCore(inputs, nodeScratch); }
+        finally { CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
+    }
+
+    private Dictionary<string, Tensor> RunCore(Dictionary<string, Tensor> inputs, List<MemoryBuffer1D<float, Stride1D.Dense>> nodeScratch)
+    {
         // Tensor registry: maps value names to tensors
         var tensors = new Dictionary<string, Tensor>();
         // Host-side Sequence/Optional/String/Bytes values (shared for the whole run).
@@ -1161,6 +1224,8 @@ public class GraphExecutor : IDisposable
         int nodeIdx = 0;
         foreach (var node in _graph.Nodes)
         {
+            CurrentRunNodeIndex = nodeIdx;   // pool-miss / reclaim attribution, as in RunAsync
+            CurrentRunOpType = node.OpType;
             if (VerboseLogging)
             {
                 var shapeInfo = string.Join(", ", node.OutputShapes.Select(s => $"[{string.Join(",", s)}]"));
@@ -2047,6 +2112,9 @@ public class GraphExecutor : IDisposable
                     }
                 }
             }
+            if (nodeScratch.Count > 0)
+                foreach (var b in TakeReleasableScratch(nodeScratch, node, tensors, null, hostValues))
+                    _pool.ReturnScratch(b);
 
             nodeIdx++;
         }
@@ -2781,6 +2849,21 @@ public class GraphExecutor : IDisposable
 
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
+        // Restore (not clear) the published node on exit: a subgraph executor (If/Loop/Scan body) runs INSIDE
+        // an outer node, so the outer run's node is the right attribution again once the body returns. Without
+        // this the last node of the last run stayed published forever, and pool misses made outside any run
+        // (pipeline pre/post-processing) were blamed on it.
+        // Same for the pool's scratch sink: a body run that shares this pool installs its own and must hand the
+        // outer node's back, or the outer node's remaining unnamed Rents would be recorded nowhere.
+        int prevNode = CurrentRunNodeIndex;
+        string? prevOp = CurrentRunOpType;
+        var prevSink = _pool.SwapScratchSink(null);
+        try { return await RunAsyncCore(inputs); }
+        finally { CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
+    }
+
+    private async Task<Dictionary<string, Tensor>> RunAsyncCore(Dictionary<string, Tensor> inputs)
+    {
         // Pool state at the START of a capture pass. A miss COUNT says the capture allocated; this says
         // WHY - an empty pool (warm primed nothing that survived) reads very differently from a pool full
         // of the wrong bucket sizes, and the priming fix is different for each. Rides the existing
@@ -2870,6 +2953,15 @@ public class GraphExecutor : IDisposable
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
         long pendingReleaseBytes = 0; // bytes of buffers in pendingReleases; triggers an early drain past the cap
+        // Unnamed Rents made by the node now executing (see BufferPool.SwapScratchSink), and those waiting for
+        // the next drain. Not recorded in a capture regime: a captured plan replays WITHOUT running C#, so a
+        // scratch buffer an op filled from the CPU (a params upload) must still hold those bytes at replay -
+        // recycling it into a later node would hand the replay that node's data. There the old behaviour (kept
+        // until the pool is disposed) is the correct one, and capture-slot Rents never reach the sink anyway.
+        var nodeScratch = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        var pendingScratch = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        _pool.SwapScratchSink(SuppressDrains || UseCaptureParamSlots ? null : nodeScratch);
+        CompiledNode? scratchNode = null;
         // Mixed-precision activations (ActivationDtype != F32): eligible float feature-map intermediates are
         // stored low-p here (NOT in `tensors`); consumers convert back to an fp32 temp at input-gather.
         // Empty + untouched when ActivationDtype == F32 (the whole path is guarded), so F32 is unchanged.
@@ -3016,6 +3108,21 @@ public class GraphExecutor : IDisposable
             }
         }
 
+        // Schedule the scratch node `n` rented for release at the next drain - all of it except buffers one of
+        // n's outputs still views. Those escaped the node (SplitToSequence's pieces live on in a host Sequence;
+        // an op may hand a temp out as its output) and recycling them would alias a live value, so they stay
+        // out of the pool as every unnamed Rent used to. Called at the top of the NEXT node, which every path
+        // through the loop body reaches, and once after the loop.
+        void ScheduleNodeScratch(CompiledNode? n)
+        {
+            if (nodeScratch.Count == 0) return;
+            foreach (var b in TakeReleasableScratch(nodeScratch, n, tensors, halfTensors, hostValues))
+            {
+                pendingScratch.Add(b);
+                pendingReleaseBytes += b.LengthInBytes;
+            }
+        }
+
         // Periodic GPU command-buffer drain: flush + wait every SyncIntervalNodes nodes, or early when the
         // deferred-release backlog exceeds MaxPendingReleaseBytes, then return the deferred buffers. Shared by
         // both execution paths so peak GPU memory is bounded to ~(live set + cap) regardless of which path ran.
@@ -3040,6 +3147,8 @@ public class GraphExecutor : IDisposable
                 }
                 _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
                 // Now safe to return deferred buffers — GPU has finished reading them
+                foreach (var b in pendingScratch) _pool.ReturnScratch(b);
+                pendingScratch.Clear();
                 if (pinCounter != null && capturePinned.Count > 0)
                 {
                     // Pinned buffers stay out of the pool until the end of the forward (the final release
@@ -3131,7 +3240,11 @@ public class GraphExecutor : IDisposable
 
         foreach (var node in _graph.Nodes)
         {
+            // The previous node is finished on every path through this body (including each `continue`).
+            ScheduleNodeScratch(scratchNode);
+            scratchNode = node;
             CurrentRunNodeIndex = nodeIdx;   // published for BufferPool reclaim attribution (see CurrentRunNodeIndex doc)
+            CurrentRunOpType = node.OpType;
             if (pinCounter != null)
             {
                 // The previous node has finished (every path ends it before the next iteration); its
@@ -4774,6 +4887,7 @@ public class GraphExecutor : IDisposable
             if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value)
                 break;
         }
+        ScheduleNodeScratch(scratchNode);   // the last node's scratch; returned after the final sync below
 
         // Final yield + sync. Skip the yield during capture: Task.Yield ALWAYS reschedules onto another
         // thread-pool thread, and cuStreamEndCapture must run on the thread that began the capture. With the
@@ -4818,8 +4932,11 @@ public class GraphExecutor : IDisposable
                 _pool.Return(t);
             foreach (var h in pendingHalfReleases)
                 _pool.ReturnHalf(h);
+            foreach (var b in pendingScratch)
+                _pool.ReturnScratch(b);
             pendingReleases.Clear();
             pendingHalfReleases.Clear();
+            pendingScratch.Clear();
             // The TAIL backlog - whatever accumulated since the last periodic drain. Without this the
             // deferred-bytes total under-reports by up to one whole cap's worth on every run.
             LastRunDeferredReleaseBytes += pendingReleaseBytes;
