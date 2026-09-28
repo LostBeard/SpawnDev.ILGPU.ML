@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34 - GPU memory leaks fixed; SpawnDev.ILGPU 5.2.18
+
+Releases 5.2.34-local.1 .. local.5 below, plus **SpawnDev.ILGPU 5.2.18** (final): params buffers are
+content-addressed instead of one leaked buffer per op call (local.1); disposing a depth pipeline frees the model
+it created (local.2); unnamed pool rents are node-scoped scratch, so a warm DAv3 forward allocates nothing (local.3);
+SpawnDev.ILGPU 5.2.18 brings the CPU lane loop (Snake BC on CPU 300 s timeout -> 9 s), the Wasm dispatch-cost
+work (Snake BC on Wasm 300 s timeout -> 160 s), and four silent wrong-result fixes (Wasm SIMD x2, WebGL struct
+fields, Wasm host writes behind queued dispatches).
+
+## 5.2.34-local.6 (unreleased) - SpawnDev.ILGPU 5.2.18-local.8
+
+SpawnDev.ILGPU 5.2.18-local.8: Wasm host writes ordered behind queued dispatches (a stale-snapshot silent wrong
+result in 5.2.17) and shape-only Wasm worker scripts. `SystemOne_Snake_BehavioralClone_AgreesWithTeacher` passes on
+the Wasm lane in 160 s (was a 300 s timeout), agreement 100%.
+
 ## 5.2.34-local.5 (unreleased) - SpawnDev.ILGPU 5.2.18-local.7 (Wasm SIMD / WebGL correctness, Wasm dispatch cost)
 
 Takes SpawnDev.ILGPU **5.2.18-local.7**: two Wasm SIMD silent-wrong-result bugs (non-unit-stride addresses such as
