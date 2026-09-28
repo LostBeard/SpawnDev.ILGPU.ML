@@ -7,8 +7,12 @@ rem
 rem  Usage (launch OUTSIDE the agent shell's job object, per the global Rule 5b,
 rem  so the sweep survives the session that started it):
 rem
+rem    $st = New-CimInstance -CimClass (Get-CimClass Win32_ProcessStartup -Namespace root/cimv2) `
+rem            -ClientOnly -Property @{ ShowWindow = [uint16]0 }
 rem    Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-rem      CommandLine='cmd.exe /c ""<repo>\tools\run-scoped-gate.cmd" "DA3Small" "pmt-da3""'}
+rem      CommandLine='cmd.exe /c ""<repo>\tools\run-scoped-gate.cmd" "DA3Small" "pmt-da3""'; ProcessStartupInformation=$st}
+rem  ShowWindow=0 is REQUIRED: without it every launch leaves a blank Windows Terminal window on the
+rem  desktop (TJ had 8, 2026-09-28). Do NOT add CreateFlags - WMI rejects CREATE_NO_WINDOW (rv 21).
 rem
 rem  Start-Process inherits the shell's job object and dies with it. WMI parents to
 rem  WmiPrvSE and still lands in SessionId 1, so non-headless Chromium works.

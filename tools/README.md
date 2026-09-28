@@ -251,9 +251,16 @@ A full six-backend sweep is the release gate, not routine.
 ### `run-full-gate.cmd` - the whole suite, for a change that cannot be scoped
 
 ```
+$st = New-CimInstance -CimClass (Get-CimClass Win32_ProcessStartup -Namespace root/cimv2) `
+        -ClientOnly -Property @{ ShowWindow = [uint16]0 }   # REQUIRED - see below
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-  CommandLine='cmd.exe /c ""<repo>	oolsun-full-gate.cmd" "pmt-full""'}
+  CommandLine='cmd.exe /c ""<repo>\tools\run-full-gate.cmd" "pmt-full""'; ProcessStartupInformation=$st}
 ```
+
+🔴 `ShowWindow = 0` is REQUIRED: a WMI-launched cmd.exe otherwise opens a blank Windows Terminal window that
+stays on the desktop until the process exits - and a server that never exits keeps it forever (TJ had 8,
+2026-09-28). Do NOT add `CreateFlags`: WMI rejects CREATE_NO_WINDOW (ReturnValue 21, nothing launched).
+Check ReturnValue == 0.
 
 `%1` = log basename (default `pmt-full`). For the shared machinery every model goes through - the CPU shape
 interpreter, `GraphCompiler`, the executor's node loop, `BufferPool`. A scoped run cannot cover those: the
@@ -267,8 +274,10 @@ interpreter/executor change verified.
 ### `run-scoped-gate.cmd` - scoped HeavyModel gates that outlive the shell
 
 ```
+$st = New-CimInstance -CimClass (Get-CimClass Win32_ProcessStartup -Namespace root/cimv2) `
+        -ClientOnly -Property @{ ShowWindow = [uint16]0 }   # REQUIRED - see below
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-  CommandLine='cmd.exe /c ""<repo>\tools\run-scoped-gate.cmd" "DA3Small" "pmt-da3""'}
+  CommandLine='cmd.exe /c ""<repo>\tools\run-scoped-gate.cmd" "DA3Small" "pmt-da3""'; ProcessStartupInformation=$st}
 ```
 
 `%1` = `PMT_FILTER` value (comma-separated = OR), `%2` = log basename. Writes to `%GATE_LOG_DIR%`

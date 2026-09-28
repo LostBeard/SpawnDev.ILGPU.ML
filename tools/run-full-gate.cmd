@@ -13,8 +13,12 @@ rem     OpenCL on the one GPU causes D3D12 DEVICE_REMOVED. Do BOTH before
 rem     calling an interpreter/executor change verified.
 rem
 rem  Launch OUTSIDE the agent shell's job object (global Rule 5b):
+rem    $st = New-CimInstance -CimClass (Get-CimClass Win32_ProcessStartup -Namespace root/cimv2) `
+rem            -ClientOnly -Property @{ ShowWindow = [uint16]0 }
 rem    Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-rem      CommandLine='cmd.exe /c ""<repo>\tools\run-full-gate.cmd" "pmt-full""'}
+rem      CommandLine='cmd.exe /c ""<repo>\tools\run-full-gate.cmd" "pmt-full""'; ProcessStartupInformation=$st}
+rem  ShowWindow=0 is REQUIRED: without it every launch leaves a blank Windows Terminal window on the
+rem  desktop (TJ had 8, 2026-09-28). Do NOT add CreateFlags - WMI rejects CREATE_NO_WINDOW (rv 21).
 rem ============================================================================
 setlocal
 cd /d "%~dp0.."
