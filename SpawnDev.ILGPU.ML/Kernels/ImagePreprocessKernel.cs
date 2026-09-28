@@ -15,9 +15,24 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 ///
 /// This replaces 4 separate kernels with one GPU pass — no intermediate buffers.
 /// </summary>
-public partial class ImagePreprocessKernel
+public partial class ImagePreprocessKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
+
+    // Kernel params: one WRITE-ONCE device buffer per distinct content (ContentParamBuffers). A reused buffer
+    // rewritten per call needed a pending-command flush before every write to stay race-free on WebGPU; a
+    // same-sized frame now reuses its params with no write and no flush.
+    private ContentParamBuffers<float>? _floatParams;
+    private ContentParamBuffers<int>? _intParams;
+    private ArrayView1D<float, Stride1D.Dense> FloatParams(float[] p) => (_floatParams ??= new ContentParamBuffers<float>(_accelerator)).Get(p);
+    private ArrayView1D<int, Stride1D.Dense> IntParams(int[] p) => (_intParams ??= new ContentParamBuffers<int>(_accelerator)).Get(p);
+
+    /// <summary>Frees the params buffers. The kernel stays usable (they are re-created on demand).</summary>
+    public void Dispose()
+    {
+        _floatParams?.Dispose(); _floatParams = null;
+        _intParams?.Dispose(); _intParams = null;
+    }
 
     // params: [srcW, srcH, dstW, dstH] + mean[3] + invStd[3] + [padX, padY, contentW, contentH]
     private Action<Index1D,
@@ -117,7 +132,6 @@ public partial class ImagePreprocessKernel
         output[idx] = (pixel - mean) * invStd;
     }
 
-    private MemoryBuffer1D<float, Stride1D.Dense>? _paramsBuf;
 
     /// <summary>
     /// Preprocess RGBA image for model inference.
@@ -146,8 +160,7 @@ public partial class ImagePreprocessKernel
         int cw = 0, ch = 0, px = 0, py = 0;
         if (preserveAspect) (cw, ch, px, py) = Letterbox(srcW, srcH, dstW, dstH);
 
-        _paramsBuf ??= _accelerator.Allocate1D<float>(ParamCount);
-        _paramsBuf.CopyFromCPU(new float[] {
+        var p = FloatParams(new float[] {
             srcW, srcH, dstW, dstH,
             mean[0], mean[1], mean[2],
             1f / std[0], 1f / std[1], 1f / std[2],
@@ -155,7 +168,7 @@ public partial class ImagePreprocessKernel
         });
 
         int totalOutput = 3 * dstH * dstW;
-        _preprocessKernel!(totalOutput, rgba, output, _paramsBuf.View);
+        _preprocessKernel!(totalOutput, rgba, output, p);
     }
 
     /// <summary>
@@ -203,14 +216,13 @@ public partial class ImagePreprocessKernel
         ArrayView1D<float, Stride1D.Dense> output,
         int srcW, int srcH, int dstW, int dstH)
     {
-        _paramsBuf ??= _accelerator.Allocate1D<float>(ParamCount);
-        _paramsBuf.CopyFromCPU(new float[] { srcW, srcH, dstW, dstH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        var p = FloatParams(new float[] { srcW, srcH, dstW, dstH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 
         _yChannelKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(YChannelImpl);
-        _yChannelKernel(dstH * dstW, rgba, output, _paramsBuf.View);
+        _yChannelKernel(dstH * dstW, rgba, output, p);
     }
 
     /// <summary>

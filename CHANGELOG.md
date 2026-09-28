@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34-local.2 (unreleased) - disposing a depth pipeline frees its model
+
+**Bug:** `DepthEstimationPipeline.CreateFromStreamsAsync` / `CreateFromHubAsync` create the `InferenceSession`, but
+`Dispose()` never disposed it (the session was reachable only through `Session`), so unloading a depth model left its
+weights on the GPU - DAv3: ~100 MB in 335 buffers that SpawnScene could never get back before training.
+**Fix:** the factories construct the pipeline with the new `ownsSession: true`; `Dispose()` then disposes the session.
+A session passed to the constructor stays caller-owned (default `ownsSession: false`, unchanged). New
+`InferenceSession.IsDisposed`. Gate: `DepthPipeline_Dispose_FreesTheSessionItCreated` (red with the owned dispose
+removed).
+
+`ImagePreprocessKernel` is now `IDisposable` (the pipeline disposes it) and its params use `ContentParamBuffers`
+instead of one buffer rewritten per call - the rewrite needed a pending-command flush before every write to stay
+race-free on WebGPU; a same-sized frame now reuses its params with no write and no flush.
+
 ## 5.2.34-local.1 (unreleased) - params buffers no longer leak one per call
 
 **Bug:** every Broadcast/Where (`ElementWiseKernels`), Slice, GatherGenericFloat/GatherElements, Scatter and

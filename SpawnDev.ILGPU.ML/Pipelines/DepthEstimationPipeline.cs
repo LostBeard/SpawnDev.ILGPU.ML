@@ -42,6 +42,9 @@ public enum DepthResizeMode
 public class DepthEstimationPipeline : IDisposable
 {
     private readonly InferenceSession _session;
+    // True when THIS pipeline created the session (CreateFromStreamsAsync / CreateFromHubAsync): Dispose then frees
+    // the model's weights too. A session passed to the constructor belongs to the caller, as before.
+    private readonly bool _ownsSession;
     private readonly Accelerator _accelerator;
     private readonly Kernels.ImagePreprocessKernel _preprocess;
     private readonly Kernels.ImagePostprocessKernel _postprocess;
@@ -274,10 +277,13 @@ public class DepthEstimationPipeline : IDisposable
         return _session.ReleaseWorkingMemory();
     }
 
+    /// <param name="ownsSession">Dispose <paramref name="session"/> (and with it the model's GPU weights) when this
+    /// pipeline is disposed. The factories pass true; a caller-supplied session defaults to caller-owned.</param>
     public DepthEstimationPipeline(InferenceSession session, Accelerator accelerator,
-        int inputSize = 0)
+        int inputSize = 0, bool ownsSession = false)
     {
         _session = session;
+        _ownsSession = ownsSession;
         _accelerator = accelerator;
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
         _postprocess = new Kernels.ImagePostprocessKernel(accelerator);
@@ -326,7 +332,10 @@ public class DepthEstimationPipeline : IDisposable
         var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelStream,
             onProgress: onProgress, inputShapes: inputShapes, externalDataStream: externalDataStream, ct: ct)
             .ConfigureAwait(false);
-        return new DepthEstimationPipeline(session, accelerator, inputSize);
+        // The pipeline created this session, so it owns it: disposing the pipeline must free the weights. Before,
+        // nobody could - the session was reachable only through Session - and an app that unloaded the model to
+        // make room kept ~100 MB of DAv3 weights in 335 buffers on the GPU (SpawnScene, 2026-09-27).
+        return new DepthEstimationPipeline(session, accelerator, inputSize, ownsSession: true);
     }
 
     /// <summary>
@@ -1110,5 +1119,7 @@ public class DepthEstimationPipeline : IDisposable
         _nativeScratch?.Dispose();
         _nativeScratch = null;
         _postprocess.Dispose();
+        _preprocess.Dispose();
+        if (_ownsSession) _session.Dispose();
     }
 }

@@ -3155,8 +3155,12 @@ public class InferenceSession : IDisposable
         return bytes;
     }
 
+    /// <summary>True once <see cref="Dispose"/> has run (its weights and buffers are freed).</summary>
+    public bool IsDisposed { get; private set; }
+
     public void Dispose()
     {
+        IsDisposed = true;
         _convStateCache?.Dispose(); _convStateCache = null;   // session-owned conv-state buffers (LFM2 decode)
         _executor.Dispose();
         // Dispose per-shape recompiled executors (each owns its own intermediate buffer pool).

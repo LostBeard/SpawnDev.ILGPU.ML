@@ -74,10 +74,7 @@ public partial class ImagePreprocessKernel
         ArrayView1D<int, Stride1D.Dense>>? _resampleRgbaKernel;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _resampleNchwKernel;
-    // One params buffer PER STAGE: both are written before either stage is dispatched, so the pair
-    // costs one pending-command flush (WebGPU CopyFromCPU flushes before its writeBuffer), not two.
-    private MemoryBuffer1D<int, Stride1D.Dense>? _stage1Params;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _stage2Params;
+    // Stage params come from the content-addressed IntParams / FloatParams (see ImagePreprocessKernel.cs).
 
     /// <summary>
     /// DA3 reference preprocessing of one packed-RGBA image into <paramref name="output"/>
@@ -111,16 +108,12 @@ public partial class ImagePreprocessKernel
         _resampleNchwKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(ResampleNchwImpl);
-        _stage1Params ??= _accelerator.Allocate1D<int>(5);
-        _stage2Params ??= _accelerator.Allocate1D<float>(11);
-
-        if (stage1) _stage1Params.CopyFromCPU(new[] { srcW, srcH, w1, h1, mode1 });
-        _stage2Params.CopyFromCPU(new float[] {
+        var stage2Params = FloatParams(new float[] {
             s2W, s2H, w, h, mode2,
             mean[0], mean[1], mean[2], 1f / std[0], 1f / std[1], 1f / std[2] });
 
-        if (stage1) _resampleRgbaKernel(w1 * h1, rgba, scratch, _stage1Params.View);
-        _resampleNchwKernel(3 * w * h, stage1 ? scratch : rgba, output, _stage2Params.View);
+        if (stage1) _resampleRgbaKernel(w1 * h1, rgba, scratch, IntParams(new[] { srcW, srcH, w1, h1, mode1 }));
+        _resampleNchwKernel(3 * w * h, stage1 ? scratch : rgba, output, stage2Params);
         return (w, h);
     }
 
