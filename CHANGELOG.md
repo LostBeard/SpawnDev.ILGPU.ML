@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.36 - on SpawnDev.ILGPU 5.2.22
+
+Dependency release: SpawnDev.ILGPU 5.2.18 -> 5.2.22 - WebGPU shader validation fixes (a pointer alias declared twice;
+a synthetic loop counter declared out of scope - both made the pipeline invalid) and WebGL f64 constant / duplicated
+store fixes (silent wrong results). No ML source changes.
+
 ## 5.2.35 - decode an encoded image straight to the GPU
 
 `MediaInterop.DecodeToDeviceAsync(Blob, Accelerator, maxLongEdge)` and `MediaInterop.FromBlobJSAsync(Blob,
