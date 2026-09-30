@@ -1,11 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk.Razor">
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.37</Version>
-		<PackageReleaseNotes>v5.2.37: on SpawnDev.ILGPU 5.2.24 - fixes a WebGPU GPU hang (DXGI_ERROR_DEVICE_HUNG) and WebGL wrong values in PadKernel reflect/edge padding (style transfer), and a WebGPU miscompile where a strided loop after another loop started every thread at 0. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.2.38</Version>
+		<PackageReleaseNotes>v5.2.38: on SpawnDev.ILGPU 5.2.25 + SpawnDev.SpawnJS 2.1.20 - the uncaptured WebGPU forward is ~10-30x faster (DAv3 Small 518: 3.2 s -> ~100 ms, DAv2 285 -> ~60 ms): Einsum on the GPU, readbacks only for values a host slot needs, submit-only drains, input-independent node folding. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -34,8 +34,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.20-local.2" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.25-local.8" />
+		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.20" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.25" />
 	</ItemGroup>
 
 	<ItemGroup>

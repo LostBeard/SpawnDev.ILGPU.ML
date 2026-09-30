@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 5.2.38 (unreleased) - the uncaptured WebGPU forward: Einsum on the GPU, no data readbacks, input-independent folding
+## 5.2.38 - 2026-09-30 - on SpawnDev.ILGPU 5.2.25 - the uncaptured WebGPU forward: Einsum on the GPU, no data readbacks, input-independent folding
 
 TJ's bar (2026-09-30): the PLAIN forward - no graph capture, no replay - must beat Transformers.js (DAv3 Small 518
 warm = 61 ms), and the host only orchestrates. Measured with `DirectForwardProfile_DAv3Small_518` /
@@ -33,7 +33,8 @@ warm = 61 ms), and the host only orchestrates. Measured with `DirectForwardProfi
   capture, fp16 activations and decode state. Gated bit-identical (fold on vs off) in the profile test.
 - `GraphExecutor.LastRunOpLog` is formatted on read (it formatted a string per executed node per forward).
 - Regression: CUDA 888/0, OpenCL 886/0, WebGPU 913/0 (baseline 887/885/912); DAv3 ORT parity suites green.
-- Requires SpawnDev.ILGPU 5.2.25 (dispatch batching: 433 -> 41 us host per dispatch) and SpawnDev.SpawnJS 2.1.20.
+- Dependency release: SpawnDev.ILGPU 5.2.24 -> 5.2.25 (WebGPU dispatch batching: 433 -> ~40 us host per dispatch;
+  OpenCL/WebGL/Wasm fixes) and SpawnDev.SpawnJS 2.1.19 -> 2.1.20.
 
 ## 5.2.37 - on SpawnDev.ILGPU 5.2.24
 
