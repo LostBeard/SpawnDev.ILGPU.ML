@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.36</Version>
-		<PackageReleaseNotes>v5.2.35: MediaInterop.DecodeToDeviceAsync / FromBlobJSAsync - an encoded image (Blob / File) decoded and resized by the browser straight to the GPU, pixels never enter the .NET heap. See CHANGELOG.</PackageReleaseNotes>
+		<Version>5.2.37</Version>
+		<PackageReleaseNotes>v5.2.37: on SpawnDev.ILGPU 5.2.24 - fixes a WebGPU GPU hang (DXGI_ERROR_DEVICE_HUNG) and WebGL wrong values in PadKernel reflect/edge padding (style transfer), and a WebGPU miscompile where a strided loop after another loop started every thread at 0. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -35,7 +35,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.19" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.22" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.24" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.37 - on SpawnDev.ILGPU 5.2.24
+
+Dependency release: SpawnDev.ILGPU 5.2.22 -> 5.2.24.
+- **WebGPU GPU hang / WebGL wrong values in `PadKernel`** (ILGPU 5.2.24): an if/else merge inside a loop with a
+  `break` put the loop latch in one arm only. Reflect/edge padding (style-mosaic's first node) spun forever on WebGPU
+  (DXGI_ERROR_DEVICE_HUNG - every later test in the lane then failed at requestDevice) and was wrong on WebGL.
+- **WebGPU: a strided loop directly after another loop started every thread at 0** (ILGPU 5.2.23).
+
+Tests: `PadKernel_StyleMosaicShape_AllModesMatchCpu` (new: [1,3,224,224] -> [1,3,232,232], all modes vs CPU).
+`ModelInspector_Onnx_Transformers_Inspect` now inspects over `HttpRangeStream` and asserts the bytes fetched: it used a
+forward-only response stream, where skipping a weight blob means reading and discarding it - all ~880 MB of GPT-2 +
+DistilBERT passed through .NET Wasm (and timed out under load). Now 3.7 MB of 652.6 MB (0.57%) and 2.8 MB of 267.9 MB
+(1.05%). Full PMT: 5421 passed, 117 skipped; the one failure was that test's old version (passes after the fix).
+
 ## 5.2.36 - on SpawnDev.ILGPU 5.2.22
 
 Dependency release: SpawnDev.ILGPU 5.2.18 -> 5.2.22 - WebGPU shader validation fixes (a pointer alias declared twice;

@@ -71,18 +71,29 @@ public class ModelInspectorTests
 
     /// <summary>
     /// ONNX inspection: transformer models (GPT-2 ~623MB, DistilBERT ~256MB) report millions of params
-    /// + MatMul/Gemm. Inspected via STREAMING (InspectAsync over the HTTP response stream) — the weights
-    /// are skipped, never buffered, so this never materializes the multi-hundred-MB file in memory. This
-    /// is the exact path the demo runs when a user drops a large model. I/O-bound (large transfer), so a
-    /// generous timeout, not the 30s compute default.
+    /// + MatMul/Gemm. Inspected over byte-range HTTP (<see cref="HttpRangeStream"/>): InspectAsync seeks past
+    /// every weight blob, so only the graph structure crosses the wire and the .NET boundary - asserted via
+    /// <see cref="HttpRangeStream.BytesFetched"/>, because a regression that starts reading weights still returns
+    /// the right structure. (Until 2026-09-30 this used the forward-only response stream, where "skip" means
+    /// read-and-discard: all ~880 MB passed through .NET Wasm.)
     /// </summary>
     [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_Onnx_Transformers_Inspect()
     {
         foreach (var path in new[] { "models/gpt2/model.onnx", "models/distilbert-sst2/model.onnx" })
         {
-            using var stream = await _http.GetStreamAsync(path);
+            // RANGED, not GetStreamAsync: a forward-only response stream cannot Seek, so SkipAsync reads and
+            // discards every weight blob - all ~880 MB crossed JS -> .NET only to be thrown away (and the test
+            // timed out under load, 2026-09-30). HttpRangeStream seeks past them; only structure is fetched.
+            using var head = await _http.SendAsync(new HttpRequestMessage(HttpMethod.Head, path));
+            head.EnsureSuccessStatusCode();
+            long length = head.Content.Headers.ContentLength
+                ?? throw new Exception($"{path}: HEAD returned no Content-Length");
+            await using var stream = new SpawnDev.ILGPU.ML.Hub.HttpRangeStream(_http, path, length);
             var r = await ModelInspectorHelper.InspectAsync(stream);
+            if (stream.BytesFetched >= length / 2)
+                throw new Exception($"{path}: fetched {stream.BytesFetched} of {length} bytes - reading weights, not structure");
+            Console.WriteLine($"[inspector] {path}: fetched {stream.BytesFetched:N0} of {length:N0} bytes ({100.0 * stream.BytesFetched / length:F2}%)");
             if (r.NodeCount <= 0) throw new Exception($"{path}: NodeCount={r.NodeCount}");
             if (r.TotalParameters < 1_000_000) throw new Exception($"{path}: params={r.TotalParameters}, expected millions");
             if (!r.Operators.Any(o => o.OpType is "MatMul" or "Gemm"))
