@@ -1,4 +1,4 @@
-using ILGPU.Runtime;
+﻿using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Operators;
@@ -9,9 +9,17 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// where possible (broadcast multiply, batched MatMul) with CPU fallback for
 /// arbitrary contractions.
 /// </summary>
-public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
+public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
     public string OpType => "Einsum";
+
+    Kernels.EinsumKernel? _gpu;
+
+    public void Dispose()
+    {
+        _gpu?.Dispose();
+        _gpu = null;
+    }
 
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
@@ -168,6 +176,27 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                     return true;
                 }
             }
+        }
+
+        // GPU general path: any 1- or 2-input equation (outer products like DAv3's i,j->ij / m,d->md, reductions,
+        // transposes, diagonals, multi-label contractions). One dispatch on the tensors where they already live. It
+        // replaced the CPU contraction, which cost DAv3 ~70 ms per einsum (1.8 s of an uncaptured forward) plus an
+        // upload, and on every backend is also the capture-safe path (an ordinary recorded dispatch).
+        if (ctx.Inputs.Length is 1 or 2)
+        {
+            for (int i = 0; i < ctx.Inputs.Length; i++)
+                if (LowPWeightDispatch.IsLowP(ctx.Inputs[i]))
+                    throw new NotSupportedException($"Einsum: native low-precision input {i} (DType {ctx.Inputs[i].DType}) has no float data; consume it as MatMul/Gemm or add a low-p einsum kernel.");
+            int outCount = ctx.Outputs[0].ElementCount;
+            if (outCount == 0) return true;
+            var shapes = new int[ctx.Inputs.Length][];
+            for (int i = 0; i < ctx.Inputs.Length; i++) shapes[i] = ctx.Inputs[i].Shape;
+            var table = Kernels.EinsumKernel.BuildTable(parsed.InputLabels, shapes, parsed.OutputLabels, dimSizes);
+            (_gpu ??= new Kernels.EinsumKernel(reg.Accelerator)).Run(
+                ctx.Inputs[0].Data,
+                ctx.Inputs.Length == 2 ? ctx.Inputs[1].Data : null,
+                ctx.Outputs[0].Data.SubView(0, outCount), outCount, table);
+            return true;
         }
 
         return false;

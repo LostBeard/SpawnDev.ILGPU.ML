@@ -1,6 +1,39 @@
-# SpawnDev.ILGPU.ML Changelog
+﻿# SpawnDev.ILGPU.ML Changelog
 
 Notable changes per release. Pre-stable; API will change between preview drops.
+
+## 5.2.38 (unreleased) - the uncaptured WebGPU forward: Einsum on the GPU, no data readbacks, input-independent folding
+
+TJ's bar (2026-09-30): the PLAIN forward - no graph capture, no replay - must beat Transformers.js (DAv3 Small 518
+warm = 61 ms), and the host only orchestrates. Measured with `DirectForwardProfile_DAv3Small_518` /
+`_DAv2Small_518` (WebGPU, RTX 4070; per-op wall/dispatch/readback/alloc, submit callers, GC, phase split).
+
+| | DAv3 Small 518 warm | DAv2 Small 518 warm |
+|---|---|---|
+| before | 3.0-3.3 s | ~285 ms |
+| after (this release, on ILGPU 5.2.25) | ~91-125 ms | ~58-67 ms |
+
+- **Einsum runs on the GPU** (`Kernels/EinsumKernel`): any 1- or 2-input equation - outer products, contractions,
+  transposes, diagonals (a repeated label's stride is the sum of its positions), reductions. DAv3's 26 RoPE einsums
+  were a CPU loop at ~70 ms each (1.8 s of a 3.2 s forward). Test: `Op_Einsum_GeneralGpu_MatchesReference` (7
+  equations incl. DAv3's real sizes) - all lanes; red-checked.
+- **Readback only when a host value is really read** (`GraphExecutor.HostValueInputSlots`): a small output is read back
+  iff a shape-driving parameter (Reshape shape, Slice bounds, Range, ...) or a host-only operator path depends on it,
+  closed backwards through the graph (`Shape` needs no data). DAv3: 57 -> 3 readbacks per forward (~330 ms). The
+  previous rule pinned anything it could not prove unused, so ops took CPU shortcuts on data they were handed.
+  ⚠️ Host-only paths still owed a GPU kernel: Tile (general N-D), OneHot, Hardmax (non-last axis), Clip with
+  runtime bounds, Einsum with 3+ inputs.
+- **Submit-only drain points on WebGPU** (`GraphExecutor.QueueOrderedDrains`): the queue already orders every reuse of
+  a recycled buffer after the work that read it, so a drain point submits instead of awaiting the GPU. Output
+  bit-identical (the profile test gates it).
+- **Input-independent folding** (`GraphExecutor.FoldInputIndependentNodes`): nodes whose value depends only on the
+  executor's fixed input shapes and constants run once (on the GPU), their frontier outputs (tensors, and shape
+  values materialized for GPU consumers) are kept in executor-owned buffers, and later forwards skip them. DAv3:
+  1,678 of 2,524 compiled nodes, dispatches 1,775 -> 787, ~360 -> ~100 ms. Keyed by the input shapes; off under
+  capture, fp16 activations and decode state. Gated bit-identical (fold on vs off) in the profile test.
+- `GraphExecutor.LastRunOpLog` is formatted on read (it formatted a string per executed node per forward).
+- Regression: CUDA 888/0, OpenCL 886/0, WebGPU 913/0 (baseline 887/885/912); DAv3 ORT parity suites green.
+- Requires SpawnDev.ILGPU 5.2.25 (dispatch batching: 433 -> 41 us host per dispatch) and SpawnDev.SpawnJS 2.1.20.
 
 ## 5.2.37 - on SpawnDev.ILGPU 5.2.24
 

@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Operators;
@@ -1902,6 +1902,81 @@ public abstract partial class MLTestBase
         await reg.Resolve("Einsum")!.ExecuteAsync(ctx);
         await accelerator.SynchronizeAsync();
         await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-3f, "Einsum general (async dynamic readback): ");
+    });
+
+    /// <summary>
+    /// The GPU general einsum (Kernels.EinsumKernel) for every equation the matmul / broadcast fast paths leave, via the
+    /// SYNC Execute - there is no readback on this path, so it must be exact on the browser backends too. Includes DAv3
+    /// Small's two real equations at their real sizes (i,j->ij and m,d->md: RoPE positions x frequencies), which ran a
+    /// CPU loop at ~70 ms each (1.8 s of an uncaptured 3.2 s forward) before this kernel.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_Einsum_GeneralGpu_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var cases = new (string Eq, int[][] Shapes)[]
+        {
+            ("i,j->ij", new[] { new[] { 1369 }, new[] { 32 } }),     // DAv3: 37x37 patch positions x 32 frequencies
+            ("m,d->md", new[] { new[] { 37 }, new[] { 16 } }),
+            ("ij->ji", new[] { new[] { 5, 7 } }),                     // transpose
+            ("ii->i", new[] { new[] { 6, 6 } }),                      // diagonal: a repeated label
+            ("ij->i", new[] { new[] { 9, 13 } }),                     // reduction
+            ("ijk,jk->i", new[] { new[] { 4, 5, 3 }, new[] { 5, 3 } }), // two contracted labels
+            ("ij->", new[] { new[] { 4, 3 } }),                       // full sum to a scalar
+        };
+        var reg = new OperatorRegistry(accelerator);
+        var rng = new Random(1234);
+        foreach (var (eq, shapes) in cases)
+        {
+            var ins = eq.Split("->")[0].Split(',');
+            var outLabels = eq.Split("->")[1];
+            var data = shapes.Select(sh => Enumerable.Range(0, sh.Aggregate(1, (x, y) => x * y)).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray()).ToArray();
+            var size = new Dictionary<char, int>();
+            for (int i = 0; i < ins.Length; i++) for (int d = 0; d < ins[i].Length; d++) size[ins[i][d]] = shapes[i][d];
+            var outShape = outLabels.Select(c => size[c]).ToArray();
+            int outCount = outShape.Aggregate(1, (x, y) => x * y);
+            // reference: iterate every assignment of ALL labels, accumulate into the output cell
+            var all = size.Keys.ToArray();
+            var expected = new float[outCount];
+            int combos = all.Aggregate(1, (x, c) => x * size[c]);
+            var val = new Dictionary<char, int>();
+            for (int k = 0; k < combos; k++)
+            {
+                int r = k;
+                for (int l = all.Length - 1; l >= 0; l--) { val[all[l]] = r % size[all[l]]; r /= size[all[l]]; }
+                float prod = 1f;
+                bool consistent = true;
+                for (int i = 0; i < ins.Length; i++)
+                {
+                    int flat = 0;
+                    for (int d = 0; d < ins[i].Length; d++) flat = flat * shapes[i][d] + val[ins[i][d]];
+                    prod *= data[i][flat];
+                }
+                if (!consistent) continue;
+                int o = 0;
+                foreach (var c in outLabels) o = o * size[c] + val[c];
+                expected[o] += prod;
+            }
+            var bufs = data.Select(d => accelerator.Allocate1D(d)).ToArray();
+            using var outBuf = accelerator.Allocate1D<float>(Math.Max(1, outCount));
+            try
+            {
+                var ctx = new OnnxOpContext
+                {
+                    Inputs = bufs.Select((b, i) => new Tensor(b.View, shapes[i])).ToArray(),
+                    Outputs = new[] { new Tensor(outBuf.View, outShape) },
+                    Attributes = new Dictionary<string, object> { ["equation"] = eq },
+                    Pool = new BufferPool(accelerator),
+                    InputNames = ins.Select((_, i) => "in" + i).ToArray(),
+                };
+                reg.Resolve("Einsum")!.Execute(ctx);
+                await accelerator.SynchronizeAsync();
+                await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outCount), expected, 1e-4f, $"Einsum GPU '{eq}': ");
+            }
+            finally
+            {
+                foreach (var b in bufs) b.Dispose();
+            }
+        }
     });
 
     [TestMethod]

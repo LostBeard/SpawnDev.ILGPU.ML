@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Operators;
@@ -73,6 +73,103 @@ public class GraphExecutor : IDisposable
     /// </para>
     /// </remarks>
     private HashSet<string>? _inputTaintedOutputs;
+
+    /// <summary>
+    /// Run each INPUT-INDEPENDENT node once per executor and reuse its result on every later forward. True by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// An executor is compiled for fixed input shapes, so a node whose value depends only on those shapes and on
+    /// constants - never on the input DATA (the complement of <see cref="_inputTaintedOutputs"/>) - computes the
+    /// same thing on every forward: RoPE position and frequency tables, camera-decoder constants, and the whole
+    /// shape-plumbing subgraph (Shape/Gather/Unsqueeze/Concat/Cast...). This is the constant folding
+    /// ONNX Runtime's graph optimizer does. MEASURED 2026-09-30: 1,678 of DAv3 Small's 2,607 nodes are
+    /// input-independent, executed every forward at ~100 us of host time each.
+    /// </para>
+    /// <para>
+    /// The GPU still computes them - on the first forward, as always. The executor then keeps only the FRONTIER
+    /// (the folded outputs a non-folded node consumes) in executor-owned buffers (one GPU-to-GPU copy each, once),
+    /// plus the host values the shape interpreter produced for folded outputs. Later forwards bind those, skip
+    /// every folded node, and still release the inputs a folded node would have consumed (a Shape reads a data
+    /// tensor that must go back to the pool on time).
+    /// </para>
+    /// <para>
+    /// ⚠️ Plain forwards only: never under capture (the plan records what actually ran), never with fp16
+    /// activations (the frontier would be half tensors), never with decode-time state (KV caches, conv state).
+    /// Random, control-flow and Sequence ops never fold, and neither does anything downstream of them.
+    /// </para>
+    /// </remarks>
+    public static bool FoldInputIndependentNodes = true;
+    private bool[]? _foldNode;                                // per node index: skipped on a warm forward
+    private HashSet<string>? _foldFrontier;                   // folded outputs a non-folded node consumes
+    private Dictionary<string, Tensor>? _foldTensors;         // executor-owned copies of the frontier tensors
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _foldBuffers;   // ...and the buffers behind them
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _foldPendingBuffers; // a recording forward's copies, until committed
+    private Dictionary<string, float[]>? _foldValues;         // runtimeConstants of folded outputs
+    private Dictionary<string, float[]>? _foldInterp;         // shapeInterpVals of folded outputs
+    private bool _foldReady, _foldDisabled;
+    private string? _foldInputSig;                            // the input shapes the fold was recorded at
+
+    /// <summary>DIAGNOSTIC: nodes the most recent RunAsync skipped because their folded result was reused.</summary>
+    public static int LastRunFoldedNodes;
+    /// <summary>DIAGNOSTIC: why the most recent RunAsync did or did not fold (see FoldInputIndependentNodes).</summary>
+    public static string LastRunFoldState = "";
+    private string? _foldAbortReason;
+
+    /// <summary>DIAGNOSTIC (filled only while <see cref="OpProfile"/> is set): host ms of the node loop by phase -
+    /// [0 prelude + shape interpreter, 1 input gather, 2 runtime shape resolution, 3 output rent,
+    /// 4 context + Execute, 5 post (readback checks, releases, drain)].</summary>
+    public static readonly double[] OpPhaseMs = new double[6];
+
+    /// <summary>Ops never folded (nondeterministic, control flow, host sequences) - nor anything downstream of them.</summary>
+    private static readonly HashSet<string> NeverFoldOps = new(StringComparer.Ordinal)
+    {
+        "Constant", "RandomNormal", "RandomUniform", "RandomNormalLike", "RandomUniformLike", "Multinomial", "Bernoulli",
+        "Dropout", "If", "Loop", "Scan", "SequenceConstruct", "SequenceEmpty", "SequenceAt", "SequenceInsert",
+        "SequenceErase", "SequenceLength", "SplitToSequence", "ConcatFromSequence", "Optional", "OptionalGetElement",
+        "OptionalHasElement",
+    };
+
+    /// <summary>Builds <see cref="_foldNode"/> and <see cref="_foldFrontier"/> from the input-taint set.</summary>
+    private void BuildFoldSet(HashSet<string> tainted, HashSet<string> graphOutputs)
+    {
+        var nodes = _graph.Nodes;
+        var fold = new bool[nodes.Length];
+        // Values that may differ between forwards: input-tainted, or produced by a node that is not folded.
+        var varying = new HashSet<string>(tainted, StringComparer.Ordinal);
+        var foldedOutputs = new HashSet<string>(StringComparer.Ordinal);
+        int count = 0;
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            var n = nodes[i];
+            // A Constant always runs (it is free) and its value never varies, so it neither folds nor blocks.
+            if (n.OpType == "Constant") continue;
+            bool ok = !NeverFoldOps.Contains(n.OpType) && n.OutputNames.Length > 0;
+            if (ok && n.OpType is not ("Shape" or "Size"))   // Shape/Size read the (fixed) shape, never the data
+                foreach (var inp in n.InputNames)
+                    if (!string.IsNullOrEmpty(inp) && varying.Contains(inp)) { ok = false; break; }
+            if (ok)
+                foreach (var o in n.OutputNames)
+                    if (!string.IsNullOrEmpty(o) && graphOutputs.Contains(o)) { ok = false; break; }
+            fold[i] = ok;
+            foreach (var o in n.OutputNames)
+            {
+                if (string.IsNullOrEmpty(o)) continue;
+                if (ok) foldedOutputs.Add(o); else varying.Add(o);
+            }
+            if (ok) count++;
+        }
+        if (count == 0) { _foldNode = null; _foldFrontier = null; return; }
+        var frontier = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            if (fold[i]) continue;
+            foreach (var inp in nodes[i].InputNames)
+                if (!string.IsNullOrEmpty(inp) && foldedOutputs.Contains(inp)) frontier.Add(inp);
+        }
+        _foldNode = fold;
+        _foldFrontier = frontier;
+    }
 
     /// <summary>True when <paramref name="name"/>'s value depends on graph-input DATA. See <see cref="_inputTaintedOutputs"/>.</summary>
     private bool IsInputTainted(string? name)
@@ -202,6 +299,7 @@ public class GraphExecutor : IDisposable
                 if (!string.IsNullOrEmpty(outName)) tainted.Add(outName);
         }
         _inputTaintedOutputs = tainted;
+        BuildFoldSet(tainted, graphOutputs);
 
         _cleanConstants = clean;
         _baseRefCounts = rc; // set LAST so the null-check above is the completion signal
@@ -292,6 +390,26 @@ public class GraphExecutor : IDisposable
     /// held longer (higher peak GPU memory). Tunable so the autoregressive decode loop can trade
     /// memory for latency.</summary>
     public static int SyncIntervalNodes = 64;
+
+    /// <summary>
+    /// WebGPU plain forward (no capture): a drain point SUBMITS the pending command encoder (<c>Flush</c>) and returns
+    /// the deferred buffers to the pool, instead of awaiting GPU completion. True by default.
+    /// </summary>
+    /// <remarks>
+    /// The deferral exists so a kernel still queued against a dead buffer cannot see a later Rent's writes. On WebGPU
+    /// that is guaranteed by the queue itself: every later use of a recycled buffer - a dispatch, or a
+    /// <c>CopyFromCPU</c> (which flushes pending dispatches before its <c>writeBuffer</c>) - executes after the work
+    /// already submitted, and <c>destroy()</c> on a buffer of SUBMITTED work is legal (the pool's reclaim flushes
+    /// first too). So the host wait bought nothing but a round trip per drain: DAv3 Small 518 paid 104 of them,
+    /// ~410 ms of an uncaptured forward whose whole GPU budget in Transformers.js is 61 ms. The buffers are returned
+    /// at exactly the same points, so peak memory and the math are unchanged.
+    /// <para>
+    /// ⚠️ WebGPU ONLY and never during capture: Wasm runs dispatches on a worker pool that is NOT queue-ordered
+    /// against the host (a recycled SharedArrayBuffer region can be rewritten under a still-queued dispatch - see
+    /// CLAUDE.md), and a capture pass keeps its real drains (see <see cref="KeepDrainsDuringCapture"/>).
+    /// </para>
+    /// </remarks>
+    public static bool QueueOrderedDrains = true;
 
     /// <summary>Per-session override of <see cref="SyncIntervalNodes"/>. Null = use the static default.</summary>
     /// <remarks>
@@ -498,10 +616,39 @@ public class GraphExecutor : IDisposable
     }
 
     /// <summary>
-    /// DIAGNOSTIC: captures the OpType + node index of every operator run in
-    /// the most recent RunAsync invocation. Cleared at the start of each call.
+    /// DIAGNOSTIC: the OpType + node index of every operator run in the most recent RunAsync invocation
+    /// ("0042 MatMul", "0043 Reshape~view", ...). Cleared at the start of each call.
     /// </summary>
-    public static List<string> LastRunOpLog { get; } = new();
+    /// <remarks>
+    /// Formatted ON READ: the run records (index, op, tag) and nothing else. It used to format one interpolated
+    /// string per executed node on every forward - a diagnostic nobody reads unless something failed, paid ~900
+    /// times per DAv3 forward in the WASM interpreter.
+    /// </remarks>
+    public static List<string> LastRunOpLog
+    {
+        get
+        {
+            var list = new List<string>(_opLog.Count);
+            foreach (var (idx, op, tag) in _opLog) list.Add(tag == null ? $"{idx:D4} {op}" : $"{idx:D4} {op}~{tag}");
+            return list;
+        }
+    }
+    private static readonly List<(int Idx, string Op, string? Tag)> _opLog = new();
+
+    /// <summary>The last <paramref name="n"/> entries of <see cref="LastRunOpLog"/>, joined for an error message.</summary>
+    private static string OpLogTail(int n = 40)
+    {
+        int start = Math.Max(0, _opLog.Count - n);
+        var sb = new System.Text.StringBuilder();
+        for (int i = start; i < _opLog.Count; i++)
+        {
+            var (idx, op, tag) = _opLog[i];
+            if (i > start) sb.Append(" | ");
+            sb.Append(idx.ToString("D4")).Append(' ').Append(op);
+            if (tag != null) sb.Append('~').Append(tag);
+        }
+        return sb.ToString();
+    }
 
     /// <summary>
     /// When non-null, captures first 10 values of each node's output for debugging.
@@ -892,6 +1039,24 @@ public class GraphExecutor : IDisposable
     /// const-folding (enableOptimization) these shape/scalar values are computed at compile time and
     /// this drops toward 0. Reset at the start of every RunAsync.</summary>
     public static int LastRunReadbackCount;
+
+    /// <summary>
+    /// Opt-in (null = off, zero cost) HOST profile of a forward by op type: wall time of each node's WHOLE loop iteration
+    /// (input gather, shape work, rents/releases, Execute, readbacks, drains - everything the executor does for that node)
+    /// plus the WebGPU dispatches, readbacks and drains it caused. Set to a fresh dictionary before a run, read after.
+    /// Built to find where an UNCAPTURED browser forward spends time between dispatches (DAv3 518: ~1.75 s of 3 s).
+    /// </summary>
+    public static Dictionary<string, OpProfileEntry>? OpProfile { get; set; }
+    public sealed class OpProfileEntry
+    {
+        public int Count;
+        public double WallMs;
+        public long Dispatches;
+        public int Readbacks;
+        public int Drains;
+        /// <summary>Managed bytes allocated on this thread during the node's iteration (GC pressure).</summary>
+        public long AllocBytes;
+    }
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those mid-graph readbacks. Reset per RunAsync.</summary>
     public static double LastRunReadbackMs;
     /// <summary>DIAGNOSTIC: "OpType:outName" of every mid-graph readback that actually fired in the most
@@ -912,6 +1077,9 @@ public class GraphExecutor : IDisposable
     public static int LastRunSyncDrainCount;
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those periodic + final GPU sync-drains. Reset per RunAsync.</summary>
     public static double LastRunSyncDrainMs;
+    /// <summary>DIAGNOSTIC: how many of the periodic drains the deferred-release BYTE cap fired (the rest are the
+    /// node cadence plus the final drain). Reset per RunAsync.</summary>
+    public static int LastRunSyncDrainByBytesCount;
 
     /// <summary>DIAGNOSTIC: total bytes of intermediates deferred for release across the most recent
     /// RunAsync, and the largest backlog reached before a drain cleared it. Reset per RunAsync.</summary>
@@ -2878,13 +3046,14 @@ public class GraphExecutor : IDisposable
                 + $"buckets[{_pool.BucketProfileSummary()}]\n"); } catch { }
         }
         ForwardGeneration++;   // signals per-forward "stable capture slot" counters to reset (CUDA-graph capture)
-        LastRunOpLog.Clear();
+        _opLog.Clear();
         LastRunIntegerDivCount = 0;
         LastRunReadbackCount = 0;
         LastRunReadbackMs = 0;
         LastRunReadbackNames.Clear();
         LastRunSyncDrainCount = 0;
         LastRunSyncDrainMs = 0;
+        LastRunSyncDrainByBytesCount = 0;
         LastRunDeferredReleaseBytes = 0;
         LastRunPeakPendingReleaseBytes = 0;
         var _runSw = System.Diagnostics.Stopwatch.StartNew();
@@ -2967,6 +3136,92 @@ public class GraphExecutor : IDisposable
         // Empty + untouched when ActivationDtype == F32 (the whole path is guarded), so F32 is unchanged.
         var halfTensors = new Dictionary<string, HalfTensor>();
         var pendingHalfReleases = new List<HalfTensor>();
+
+        // Input-independent folding (see FoldInputIndependentNodes).
+        if (_foldPendingBuffers != null)
+        {
+            // A recording forward that never committed (it threw): its copies may still be referenced by
+            // submitted work, so drain before freeing them.
+            await _accelerator.SynchronizeAsync();
+            foreach (var b in _foldPendingBuffers) b.Dispose();
+            _foldPendingBuffers = null;
+        }
+        // The fold is valid for the input SHAPES it was recorded at. An executor normally has fixed shapes, but one
+        // without a recompile graph runs whatever it is given - so key it, and drop it when the shapes change.
+        string? foldSig = null;
+        if (FoldInputIndependentNodes && _foldNode != null && !_foldDisabled)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var (nm, t) in inputs) sb.Append(nm).Append(':').Append(string.Join(",", t.Shape)).Append('|');
+            foldSig = sb.ToString();
+            if (_foldReady && foldSig != _foldInputSig)
+            {
+                await _accelerator.SynchronizeAsync();
+                foreach (var b in _foldBuffers!) b.Dispose();
+                _foldBuffers = null; _foldTensors = null; _foldValues = null; _foldInterp = null; _foldReady = false;
+            }
+        }
+        bool foldEligible = FoldInputIndependentNodes && _foldNode != null && !_foldDisabled
+            && !SuppressDrains && !UseCaptureParamSlots && ActivationDtype == ActivationPrecision.F32
+            && DecodeKVCache == null && ConvStateCache == null && (_kvCacheInfo?.NumLayers ?? 0) == 0 && !BreakAtNode.HasValue;
+        bool foldWarm = foldEligible && _foldReady;
+        bool foldRecord = foldEligible && !_foldReady;
+        Dictionary<string, Tensor>? foldTensorsRec = null;
+        Dictionary<string, float[]>? foldValuesRec = null, foldInterpRec = null;
+        bool foldAbort = false;
+        LastRunFoldedNodes = 0;
+        LastRunFoldState = !FoldInputIndependentNodes ? "off"
+            : _foldNode == null ? "no foldable nodes"
+            : _foldDisabled ? $"disabled ({_foldAbortReason})"
+            : SuppressDrains || UseCaptureParamSlots ? "capture"
+            : ActivationDtype != ActivationPrecision.F32 ? $"activations {ActivationDtype}"
+            : DecodeKVCache != null || ConvStateCache != null || (_kvCacheInfo?.NumLayers ?? 0) > 0 ? "decode state"
+            : BreakAtNode.HasValue ? "break"
+            : foldWarm ? $"warm ({_foldTensors!.Count} frontier tensors, {_foldValues!.Count} values)"
+            : $"recording ({_foldNode.Count(f => f)} foldable nodes, frontier {_foldFrontier!.Count})";
+        if (foldWarm)
+        {
+            foreach (var (nm, t) in _foldTensors!) { tensors[nm] = t; refCounts[nm] = int.MaxValue; }
+            foreach (var (nm, v) in _foldValues!) runtimeConstants[nm] = v;
+            foreach (var (nm, v) in _foldInterp!) shapeInterpVals[nm] = v;
+        }
+        else if (foldRecord)
+        {
+            foldTensorsRec = new(StringComparer.Ordinal);
+            foldValuesRec = new(StringComparer.Ordinal);
+            foldInterpRec = new(StringComparer.Ordinal);
+            _foldPendingBuffers = new();
+        }
+        // Keeps a folded node's results: every host value it produced, and an executor-owned copy of each
+        // frontier tensor. Called for node i at the top of iteration i+1 - its outputs are still live there
+        // (only LATER nodes consume them) and its kernel is already recorded, so the copy lands after it.
+        void FoldKeep(int idx)
+        {
+            var n = _graph.Nodes[idx];
+            foreach (var o in n.OutputNames)
+            {
+                if (string.IsNullOrEmpty(o)) continue;
+                if (runtimeConstants.TryGetValue(o, out var v)) foldValuesRec![o] = v;
+                if (shapeInterpVals.TryGetValue(o, out var sv)) foldInterpRec![o] = sv;
+                if (!_foldFrontier!.Contains(o)) continue;
+                if (halfTensors.ContainsKey(o)) { foldAbort = true; _foldAbortReason ??= $"half tensor {o}"; continue; }
+                if (tensors.TryGetValue(o, out var t))
+                {
+                    int count = t.ElementCount;
+                    if (count > 0 && t.Data.Length >= count)
+                    {
+                        var buf = _accelerator.Allocate1D<float>(count);
+                        _foldPendingBuffers!.Add(buf);
+                        buf.View.SubView(0, count).CopyFrom(t.Data.SubView(0, count));
+                        foldTensorsRec![o] = new Tensor(buf.View, t.Shape.ToArray(), o);
+                    }
+                    else foldTensorsRec![o] = t;   // shape-only / empty: no data to keep, the tensor itself is enough
+                }
+                else if (!runtimeConstants.ContainsKey(o)) { foldAbort = true; _foldAbortReason ??= $"{n.OpType} {o}: no tensor, no value"; }
+            }
+        }
+        int foldLoopIdx = -1;
+
 
         // Capture pass keeping its drains: outputs of nodes that recorded no GPU work (see
         // CaptureRecordedWorkCounter). Null outside that regime, so a normal forward is untouched.
@@ -3134,13 +3389,21 @@ public class GraphExecutor : IDisposable
             if (SuppressDrains && !KeepDrainsDuringCapture) return;
             if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes - pinnedBytesFloor >= EffectiveMaxPendingReleaseBytes)
             {
+                if (nodeIdx % EffectiveSyncInterval != 0) LastRunSyncDrainByBytesCount++;
                 _drainSw.Restart();
-                try { await _accelerator.SynchronizeAsync(); }
+                try
+                {
+                    // See QueueOrderedDrains: on a WebGPU plain forward the queue orders every reuse after the
+                    // submitted work, so submitting is enough - no host round trip.
+                    if (QueueOrderedDrains && !SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.WebGPU)
+                        _accelerator.Flush();
+                    else
+                        await _accelerator.SynchronizeAsync();
+                }
                 catch (Exception syncEx)
                 {
-                    var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
-                    var tailLen = LastRunOpLog.Count - tailStart;
-                    var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                    var tailLen = Math.Min(40, _opLog.Count);
+                    var tail = OpLogTail(40);
                     throw new Exception(
                         $"[GE node-{nodeIdx} sync] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
                         $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
@@ -3238,8 +3501,53 @@ public class GraphExecutor : IDisposable
             return halfOut;
         }
 
+        // OpProfile bookkeeping (see OpProfile). Each iteration closes the PREVIOUS node's interval, so every `continue`
+        // path is covered without touching the loop body.
+        var opProf = OpProfile;
+        string? opProfPrev = null;
+        long opProfT0 = 0, opProfD0 = 0, opProfA0 = 0;
+        int opProfR0 = 0, opProfS0 = 0;
+        void OpProfileMark(string? nextOp)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long d = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuDispatchCount;
+            if (opProfPrev != null)
+            {
+                if (!opProf!.TryGetValue(opProfPrev, out var e)) opProf[opProfPrev] = e = new OpProfileEntry();
+                e.Count++;
+                e.WallMs += (now - opProfT0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                e.Dispatches += d - opProfD0;
+                e.Readbacks += LastRunReadbackCount - opProfR0;
+                e.Drains += LastRunSyncDrainCount - opProfS0;
+                e.AllocBytes += GC.GetAllocatedBytesForCurrentThread() - opProfA0;
+            }
+            opProfPrev = nextOp; opProfT0 = now; opProfD0 = d; opProfR0 = LastRunReadbackCount; opProfS0 = LastRunSyncDrainCount;
+            opProfA0 = GC.GetAllocatedBytesForCurrentThread();
+        }
+
+        int phCur = -1;
+        long phT = 0;
+        void PhaseMark(int next)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (phCur >= 0) OpPhaseMs[phCur] += (now - phT) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            phCur = next; phT = now;
+        }
+        if (opProf != null) System.Array.Clear(OpPhaseMs);
+
         foreach (var node in _graph.Nodes)
         {
+            if (opProf != null) OpProfileMark(node.OpType);
+            if (opProf != null) PhaseMark(0);
+            foldLoopIdx++;
+            if (foldRecord && foldLoopIdx > 0 && _foldNode![foldLoopIdx - 1]) FoldKeep(foldLoopIdx - 1);
+            if (foldWarm && _foldNode![foldLoopIdx])
+            {
+                // Folded: its result is bound already. Its inputs are still consumed, so release them on time.
+                ReleaseConsumedInputs(node);
+                LastRunFoldedNodes++;
+                continue;
+            }
             // The previous node is finished on every path through this body (including each `continue`).
             ScheduleNodeScratch(scratchNode);
             scratchNode = node;
@@ -3355,7 +3663,7 @@ public class GraphExecutor : IDisposable
                     ReleaseConsumedInputs(node);
                     ReleaseDeadOutputs(node);
                     nodeIdx++;
-                    LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~cpu-elided");
+                    _opLog.Add((nodeIdx, node.OpType, "cpu-elided"));
                     continue;
                 }
             }
@@ -3383,13 +3691,14 @@ public class GraphExecutor : IDisposable
                     ReleaseConsumedInputs(node);
                     ReleaseDeadOutputs(node);
                     nodeIdx++;
-                    LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~f16");
+                    _opLog.Add((nodeIdx, node.OpType, "f16"));
                     await DrainPointAsync();
                     if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
                     continue;
                 }
             }
 
+            if (opProf != null) PhaseMark(1);
             var nodeInputs = new Tensor[node.InputNames.Length];
             for (int i = 0; i < node.InputNames.Length; i++)
             {
@@ -3425,6 +3734,17 @@ public class GraphExecutor : IDisposable
                             // is skipped under SuppressDrains (the warm pass already wrote this slot; value is constant).
                             var matView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlotFloat(cval);
                             mt = new Tensor(matView, new[] { cval.Length }, name);
+                        }
+                        else if (foldRecord && _foldFrontier!.Contains(name))
+                        {
+                            // A folded value materialized for a GPU consumer: keep it (executor-owned, never pooled),
+                            // so a warm forward finds it bound instead of re-uploading it every time.
+                            var fbuf = _accelerator.Allocate1D<float>(cval.Length);
+                            _foldPendingBuffers!.Add(fbuf);
+                            fbuf.View.SubView(0, cval.Length).CopyFromCPU(cval);
+                            mt = new Tensor(fbuf.View, new[] { cval.Length }, name);
+                            foldTensorsRec![name] = mt;
+                            refCounts[name] = int.MaxValue;
                         }
                         else
                         {
@@ -3467,6 +3787,7 @@ public class GraphExecutor : IDisposable
             // Full runtime re-inference caused cascading shape mismatches in attention blocks;
             // dynamic input shapes are instead handled by InferenceSession recompiling the graph
             // for the actual shape, so this executor always runs a graph compiled for THESE dims.
+            if (opProf != null) PhaseMark(2);
             int[][] runtimeOutputShapes = node.OutputShapes;
 
             // 🔴 RE-INFER WHEN THIS RUN'S INPUT SHAPES ARE NOT THE ONES THE COMPILER PREDICTED FROM.
@@ -4292,7 +4613,7 @@ public class GraphExecutor : IDisposable
                             }
                         }
                         nodeIdx++;
-                        LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~view");
+                        _opLog.Add((nodeIdx, node.OpType, "view"));
                         await DrainPointAsync();
                         if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
                         continue;
@@ -4338,13 +4659,14 @@ public class GraphExecutor : IDisposable
                         }
                     }
                     nodeIdx++;
-                    LastRunOpLog.Add($"{nodeIdx:D4} InstanceNormalization~inplace");
+                    _opLog.Add((nodeIdx, "InstanceNormalization", "inplace"));
                     await DrainPointAsync();
                     if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
                     continue;
                 }
             }
 
+            if (opProf != null) PhaseMark(3);
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
@@ -4425,6 +4747,7 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            if (opProf != null) PhaseMark(4);
             var ctx = new OnnxOpContext
             {
                 Inputs = nodeInputs,
@@ -4657,6 +4980,7 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            if (opProf != null) PhaseMark(5);
             // Capture small intermediate outputs as runtime constants.
             // Only sync+readback for truly small shape tensors (≤64 elements) that downstream
             // operators need for parameter resolution (Slice starts/ends, Reshape dims, Expand shapes).
@@ -4785,9 +5109,8 @@ public class GraphExecutor : IDisposable
                             // hiccups. Inline-augment with op log; no wrapping because
                             // SpawnDev.UnitTesting.UnitTestRunner unwraps InnerException on
                             // report and would lose the augmentation.
-                            var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
-                            var tailLen = LastRunOpLog.Count - tailStart;
-                            var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                            var tailLen = Math.Min(40, _opLog.Count);
+                            var tail = OpLogTail(40);
                             var exType = captureEx.GetType().Name;
                             string dataLenStr;
                             try { dataLenStr = outTensor.Data.Length.ToString(); } catch { dataLenStr = "(unreadable)"; }
@@ -4877,7 +5200,7 @@ public class GraphExecutor : IDisposable
             ReleaseDeadOutputs(node);
 
             nodeIdx++;
-            LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}");
+            _opLog.Add((nodeIdx, node.OpType, null));
 
             // Flush GPU command buffer periodically (every SyncIntervalNodes, or early when the deferred-release
             // backlog exceeds MaxPendingReleaseBytes) and return the drained buffers. See DrainPointAsync.
@@ -4886,6 +5209,25 @@ public class GraphExecutor : IDisposable
             // DIAGNOSTIC: stop early at requested node count to bisect failures.
             if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value)
                 break;
+        }
+        if (opProf != null) { OpProfileMark(null); PhaseMark(-1); }
+        if (foldRecord)
+        {
+            if (foldLoopIdx >= 0 && _foldNode![foldLoopIdx]) FoldKeep(foldLoopIdx);
+            if (foldAbort)
+            {
+                _foldDisabled = true;   // left in _foldPendingBuffers: freed after a drain at the next forward
+            }
+            else
+            {
+                _foldTensors = foldTensorsRec;
+                _foldValues = foldValuesRec;
+                _foldInterp = foldInterpRec;
+                _foldBuffers = _foldPendingBuffers;
+                _foldPendingBuffers = null;
+                _foldInputSig = foldSig;
+                _foldReady = true;
+            }
         }
         ScheduleNodeScratch(scratchNode);   // the last node's scratch; returned after the final sync below
 
@@ -4919,11 +5261,10 @@ public class GraphExecutor : IDisposable
             try { await _accelerator.SynchronizeAsync(); }
             catch (Exception syncEx)
             {
-                var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
-                var tailLen = LastRunOpLog.Count - tailStart;
-                var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                var tailLen = Math.Min(40, _opLog.Count);
+                var tail = OpLogTail(40);
                 throw new Exception(
-                    $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
+                    $"[GE final sync, {_opLog.Count} ops total] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
                     $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
             }
             _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
@@ -5156,6 +5497,9 @@ public class GraphExecutor : IDisposable
         //
         // Nothing may read an executor after Dispose, so dropping these is safe.
         _cleanConstants = null;
+        if (_foldBuffers != null) { foreach (var b in _foldBuffers) b.Dispose(); _foldBuffers = null; }
+        if (_foldPendingBuffers != null) { foreach (var b in _foldPendingBuffers) b.Dispose(); _foldPendingBuffers = null; }
+        _foldTensors = null; _foldValues = null; _foldInterp = null; _foldReady = false;
         _captureRuntimeSeed = null;
         _readbackProbe = null;
         _readbackStable = null;
@@ -5180,238 +5524,143 @@ public class GraphExecutor : IDisposable
     // WebGPU GPT-2, a ~32% decode cost for values nothing consumes. We pre-compute, from the static graph,
     // the outputs whose readback is provably unnecessary and skip them.
 
-    /// <summary>Ops whose output is ALWAYS feature/data and is never consumed as a runtime-constant
-    /// param value (reductions to a mean/var, activations, big matmuls). Conservative on purpose — only
-    /// ops that cannot appear in a shape/index computation. Dual-use ops (Add/Sub/Mul/Div/Pow, ReduceSum/
-    /// ReduceProd, Shape/Gather/Concat/Cast) are deliberately EXCLUDED.</summary>
-    private static readonly HashSet<string> ReadbackFeatureOnlyProducers = new(StringComparer.Ordinal)
-    {
-        "ReduceMean", "ReduceMax", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare",
-        "Sqrt", "Softmax", "LogSoftmax", "Gelu", "Erf", "Relu", "LeakyRelu", "PRelu",
-        "Sigmoid", "Tanh", "HardSigmoid", "HardSwish", "SiLU", "Mish", "Softplus", "Elu", "Selu", "Celu",
-        "MatMul", "Gemm", "Conv", "ConvTranspose", "LayerNormalization", "BatchNormalization",
-        "InstanceNormalization", "GroupNormalization", "RMSNormalization",
-        // Pure data movers. Each one's Execute was READ and does nothing but copy GPU tensors plus consult
-        // shape metadata or an attribute - none touches a host value:
-        //   Concat    - copy loops over its inputs, axis is an attribute
-        //   Transpose - reg.Transpose over GPU data, `perm` is an attribute
-        //   Squeeze / Unsqueeze - a single GPU-to-GPU Scale of input 0
-        //   Reshape   - a single GPU-to-GPU CopyFrom of input 0
-        // ⚠️ These also appear in ReadbackRequiresValueConsumers, and that is not a contradiction: the two
-        // sets answer different questions. As a CONSUMER, Reshape needs a host value for its SHAPE input;
-        // as a PRODUCER, its output needs no readback unless something downstream reads it - which the
-        // needsValue fixed point below decides. Being in both is the accurate description.
-        // MEASURED on Silero VAD: these five entries are what let the last five per-frame readbacks go.
-        "Concat", "Transpose", "Squeeze", "Unsqueeze", "Reshape",
-        // ⭐ MatMulInteger, and it is here as a CONSUMER above all. Its Execute was READ and, since the
-        // zero-point counts were switched from a host readback to ctx.Inputs[i].ElementCount, it touches no
-        // host value at all - every operand is used as a GPU tensor.
-        //
-        // That is what lets DynamicQuantizeLinear's 1-element y_scale / y_zero_point outputs be skipped by
-        // the allConsumersFeatureOnly rule, WITHOUT naming DynamicQuantizeLinear itself as a feature-only
-        // producer. The distinction matters: QLinearMatMul genuinely reads its scales as host values
-        // (ScaleInPlace takes the scalar as a kernel argument), so a producer-side skip would starve it and
-        // return silence. Letting the consumer analysis decide keeps that case correct automatically.
-        //
-        // MEASURED on ZipVoice's fm_decoder, ONE Euler step: 593 readbacks, 566 of them
-        // DynamicQuantizeLinear - 95% - and 19,217 ms of a ~42 s synthesis spent in readbacks overall.
-        "MatMulInteger",
-        // ⭐ Mul, on the same grounds as Slice below: its host-value path is OPPORTUNISTIC, not required.
-        // ElementWiseOperators' binary path reads `bVals` to build a scalar/expanded operand, but the
-        // else-branch is "General N-D broadcast on GPU - handles arbitrary shape combinations", taking
-        // b.Data directly. So losing the promotion costs a fast path, not correctness.
-        //
-        // This is what releases the OTHER half of DynamicQuantizeLinear's readbacks: y_zero_point is
-        // consumed by MatMulInteger (above), while y_scale feeds the dequantising Mul. MEASURED after the
-        // MatMulInteger change alone, ONE Euler step went 566 -> 283 DynamicQuantizeLinear readbacks -
-        // exactly half, one output freed and one still pinned.
-        //
-        // ⚠️ Its own output stays protected: rule (a) keeps the readback whenever ANY consumer is in
-        // ReadbackRequiresValueConsumers, so a Mul that really is computing a dimension for a Reshape is
-        // untouched.
-        "Mul",
-        // Slice is here as a PRODUCER, and it is the subtle one. Its Execute does opportunistically read
-        // input 0's value for a small-tensor CPU path - but that path FALLS THROUGH correctly to the GPU
-        // kernel when no host value is available, so losing the promotion costs a fast path, not
-        // correctness. And whenever a Slice output really IS a shape vector, the needsValue fixed point
-        // below keeps its readback, because the consumer that reads it (Reshape's shape input, say) says so.
-        // ⚠️ MEASURED why this matters beyond a readback saved: promoting a small DATA tensor makes the
-        // shape interpreter believe it KNOWS the value, so ShapeInterpElideDispatch drops its dispatch -
-        // and under capture/replay that freezes it at its CAPTURE-TIME value. Silero's
-        // adaptive_normalization slices are audio-derived, so the whole frame silently normalised against a
-        // stale frame (0.036 drift by frame 20), and on CUDA the readback's SynchronizeAsync inside a
-        // graph-capture region was an outright access violation. One cause, both failures.
-        "Slice",
-        // LSTM earns its place only because the recurrence now runs on the accelerator
-        // (Kernels/RecurrentKernels). Before that it read X and h/c back on every call and this entry
-        // would have been wrong. It stays correct even on the layout=1 host fallback, because that path
-        // reads its tensors DIRECTLY through OperatorInputReader rather than through runtimeConstants -
-        // so skipping the promotion costs it nothing. GRU and RNN are deliberately NOT here: they are
-        // still host-side, and adding them would be a guess rather than a measurement.
-        "LSTM",
-    };
-
     /// <summary>
-    /// For an op in <see cref="ReadbackRequiresValueConsumers"/>, WHICH input positions actually need a
-    /// host value. An op absent from this map keeps the old all-inputs-need-it behaviour.
+    /// Every (op, input position) whose VALUE is read on the host. A small (≤64-element) node output is read
+    /// back only if a value in this table - directly, or through the ops that compute it - depends on it
+    /// (see <see cref="BuildReadbackSkipSet"/>). An op or position absent from the table needs no host value:
+    /// its operator runs on the GPU tensor.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The requires-value list is per-OP, which is far too coarse for the ops that take a data tensor plus
-    /// a small parameter tensor. <c>Squeeze(data, axes)</c> needs a value for AXES and never looks at
-    /// DATA - but listing "Squeeze" forced a readback of whatever fed input 0. MEASURED on Silero VAD:
-    /// six of sixteen per-frame readbacks were both LSTM nodes' three outputs, promoted to host constants
-    /// solely because a Squeeze consumed them, and on WebGPU those readbacks are the dominant frame cost.
+    /// 🔴 This is the rule "the host orchestrates, it does not process" (TJ, 2026-09-30) applied to readbacks.
+    /// The previous rule pinned a readback unless it could PROVE the value unused - per-op lists of "value
+    /// consumers" that covered every input position of Cast, Gather, Concat, ScatterND, Equal, Where... and a
+    /// "feature-only" list for the rest. MEASURED on DAv3 Small 518 (uncaptured WebGPU): 57 readbacks per
+    /// forward, each a GPU sync + mapAsync, ~330 ms of a 650 ms forward - and a closure over the real graph
+    /// shows only THREE of those values feed anything that reads a host value (the rope Range limits and
+    /// one Expand shape). The rest were RoPE frequencies, camera-decoder parameters and interpolation
+    /// coordinates: data, read back only so an operator could take an opportunistic CPU path with them.
     /// </para>
     /// <para>
-    /// ⚠️ Every entry here is VERIFIED against our operator source, not against the ONNX spec from memory,
-    /// because the surrounding comment is right that omission is the dangerous direction. Squeeze,
-    /// Unsqueeze and Reshape were each read and do nothing but a GPU-to-GPU copy of input 0. Slice reads
-    /// inputs 1-4 for its params; it also has an OPTIONAL small-tensor CPU path that uses input 0's value
-    /// when one happens to be available, and falls through to the GPU path correctly when it is not.
-    /// Add an op here only after reading its Execute.
+    /// Two kinds of entry:
+    /// <list type="bullet">
+    /// <item>SHAPE-DRIVING parameters - the value decides an output shape, a dispatch size or a loop count.
+    /// That is orchestration and belongs on the host (shape, starts/ends, axes, repeats, sizes, k, depth).</item>
+    /// <item>HOST-ONLY operator paths - ops whose Execute has NO correct GPU path when the value is absent,
+    /// each verified by reading it: Tile's general N-D case throws, OneHot and 3+-input Einsum are CPU-only,
+    /// Hardmax's non-last-axis case writes zeros, and Clip falls back to +-infinity bounds. ⚠️ Each of these is a
+    /// GPU kernel still owed, not a design choice: when one gets a kernel, delete its entry.</item>
+    /// </list>
+    /// Ops that read a value OPPORTUNISTICALLY (a CPU shortcut when the value happens to be present, a GPU path
+    /// otherwise - Cast, Gather, Where, Expand, Pow, Not, GatherElements, ScatterND, Concat, Equal, ...) are
+    /// deliberately NOT here: without the readback they take the GPU path, which is the point.
+    /// </para>
+    /// <para>
+    /// Ops that fetch a value themselves through <c>OperatorInputReader</c> (If, Loop, the recurrent ops, the
+    /// Sequence ops) do not depend on this table at all - they read the GPU tensor directly.
     /// </para>
     /// </remarks>
-    private static readonly Dictionary<string, int[]> ReadbackValueNeedingInputs =
-        new(StringComparer.Ordinal)
-        {
-            ["Squeeze"] = new[] { 1 },      // axes
-            ["Unsqueeze"] = new[] { 1 },    // axes
-            ["Reshape"] = new[] { 1 },      // shape
-            ["Slice"] = new[] { 1, 2, 3, 4 }, // starts, ends, axes, steps
-        };
+    private static readonly Dictionary<string, int[]> HostValueInputSlots = new(StringComparer.Ordinal)
+    {
+        // ── shape-driving parameters ──
+        ["Reshape"] = new[] { 1 },
+        ["Slice"] = new[] { 1, 2, 3, 4 },
+        ["Expand"] = new[] { 1 },
+        ["Resize"] = new[] { 1, 2, 3 },
+        ["Upsample"] = new[] { 1 },
+        ["Pad"] = new[] { 1, 2, 3 },
+        ["Unsqueeze"] = new[] { 1 },
+        ["Squeeze"] = new[] { 1 },
+        ["Range"] = new[] { 0, 1, 2 },
+        ["Tile"] = new[] { 0, 1 },          // [1] repeats; [0]: the general N-D tile is host-only (see remarks)
+        ["ConstantOfShape"] = new[] { 0 },
+        ["TopK"] = new[] { 1 },
+        ["Split"] = new[] { 1 },
+        ["SplitToSequence"] = new[] { 1 },
+        ["ReduceSum"] = new[] { 1 },
+        ["ReduceProd"] = new[] { 1 },
+        ["ReduceMean"] = new[] { 1 },
+        ["ReduceMax"] = new[] { 1 },
+        ["ReduceMin"] = new[] { 1 },
+        ["ReduceL1"] = new[] { 1 },
+        ["ReduceL2"] = new[] { 1 },
+        ["ReduceSumSquare"] = new[] { 1 },
+        ["ReduceLogSum"] = new[] { 1 },
+        ["ReduceLogSumExp"] = new[] { 1 },
+        ["CumSum"] = new[] { 1 },
+        ["Trilu"] = new[] { 1 },
+        ["NonZero"] = new[] { 0 },
+        ["Compress"] = new[] { 1 },
+        ["Unique"] = new[] { 0 },
+        ["AffineGrid"] = new[] { 1 },
+        ["GridSample"] = System.Array.Empty<int>(),
+        ["HannWindow"] = new[] { 0 },
+        ["HammingWindow"] = new[] { 0 },
+        ["BlackmanWindow"] = new[] { 0 },
+        ["DFT"] = new[] { 1, 2 },
+        ["STFT"] = new[] { 1, 3 },
+        // ── host-only operator paths (GPU kernels owed) ──
+        ["OneHot"] = new[] { 0, 1, 2 },
+        ["Hardmax"] = new[] { 0 },
+        ["Clip"] = new[] { 1, 2 },
+    };
 
-    /// <summary>Whether <paramref name="op"/> needs a host value for the tensor at <paramref name="index"/>.</summary>
-    private static bool ReadbackNeedsValueAt(string op, int index)
-        => !ReadbackValueNeedingInputs.TryGetValue(op, out var idx) || Array.IndexOf(idx, index) >= 0;
+    /// <summary>Ops whose output VALUE is a function of their input's SHAPE only, which the host always has - a
+    /// needed value does not make their input needed.</summary>
+    private static readonly HashSet<string> ShapeOnlyValueOps = new(StringComparer.Ordinal) { "Shape", "Size" };
+
+    /// <summary>Whether input <paramref name="index"/> of <paramref name="node"/> is read as a host value.</summary>
+    private static bool IsHostValueSlot(CompiledNode node, int index)
+    {
+        // Einsum runs 1- and 2-input equations on the GPU (Kernels.EinsumKernel); 3+ inputs is still the CPU
+        // contraction, which needs every operand.
+        if (node.OpType == "Einsum") return node.InputNames.Length > 2;
+        return HostValueInputSlots.TryGetValue(node.OpType, out var slots) && System.Array.IndexOf(slots, index) >= 0;
+    }
 
     /// <summary>
-    /// Ops that never read a host value THEMSELVES, but whose own output value - if something downstream
-    /// needs it - can only be produced by the CPU shape interpreter from their inputs' values.
+    /// The node outputs whose ≤64-element mid-graph readback is skipped: every output no host value depends on.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// These are the ops for which "does this input need a readback" is not answerable locally: it depends
-    /// on whether anything downstream reads the RESULT. <c>Concat</c> is the motivating case and the only
-    /// verified entry - <c>ConcatOperator.Execute</c> works entirely on GPU tensors (copies plus shape
-    /// metadata) and never calls <c>TryGetInputValues</c> or <c>OperatorInputReader</c>. But a Concat is
-    /// also how a Reshape's target shape gets built, and THAT one genuinely needs its inputs' values.
-    /// </para>
-    /// <para>
-    /// Listing it per-op forced the pessimistic answer everywhere. MEASURED on Silero VAD: after the
-    /// per-position fix, all TEN remaining per-frame readbacks were pinned by Concat alone - both LSTM
-    /// nodes' Y_h/Y_c feeding the Concats that build new_h/new_c (graph outputs), and the
-    /// adaptive_normalization slices feeding a Concat whose only consumer is a Conv. Not one of those ten
-    /// values is ever read on the host.
-    /// </para>
-    /// <para>
-    /// ⚠️ Adding an op here is the DANGEROUS direction - it can remove a readback something needed. Only
-    /// add one whose <c>Execute</c> you have read and confirmed touches no host value, and remember the
-    /// propagation below still keeps the readback whenever the output IS needed.
-    /// </para>
+    /// The needed set is seeded from <see cref="HostValueInputSlots"/> and closed BACKWARDS through every op:
+    /// if a node's output value is needed, so are its inputs' values (the CPU shape interpreter computes it from
+    /// them - or, if it cannot, the output itself is read back). The one exception is a shape-only op
+    /// (<see cref="ShapeOnlyValueOps"/>): Shape's value is its input's shape, which needs no data. The graph is
+    /// a DAG and the set only grows, so the loop terminates. Exact either way for every output kept; what
+    /// changes is that nothing is read back unless something reads it.
     /// </remarks>
-    private static readonly HashSet<string> ReadbackValuePropagators = new(StringComparer.Ordinal)
-    {
-        "Concat",
-    };
-
-    /// <summary>Ops that read at least one input's runtime-constant VALUE and have NO correct GPU-only
-    /// fallback for it — i.e. they GENUINELY need the readback (shape/index/param resolution). If an
-    /// output feeds any of these, it is NEVER skipped. Over-inclusion here is safe (it only keeps a
-    /// readback that may be unnecessary); omission is the dangerous direction, so the list is broad.</summary>
-    private static readonly HashSet<string> ReadbackRequiresValueConsumers = new(StringComparer.Ordinal)
-    {
-        "Reshape", "Slice", "Expand", "Resize", "Upsample", "Pad", "Unsqueeze", "Squeeze", "Range",
-        "Tile", "ConstantOfShape", "TopK", "NonZero", "Compress", "Unique", "OneHot", "Gather",
-        "GatherElements", "GatherND", "ScatterElements", "ScatterND", "Scatter", "EyeLike", "Multinomial",
-        "CumSum", "HannWindow", "HammingWindow", "BlackmanWindow", "Cast", "Mod", "Trilu", "Split",
-        "ReduceSum", "ReduceProd", "Concat", "Shape", "Equal", "Where",
-    };
-
-    /// <summary>Build the set of node-output names whose ≤64-elem mid-graph readback can be safely skipped.
-    /// An output is skipped iff (a) NO consumer is in <see cref="ReadbackRequiresValueConsumers"/>, AND
-    /// (b) either its producer is in <see cref="ReadbackFeatureOnlyProducers"/> OR every consumer is itself
-    /// a feature-only (value-never-reading) op. Both directions are conservative: the only outputs removed
-    /// are ones provably read only as GPU tensors, so correctness is unchanged while the wasted per-step
-    /// GPU round-trips disappear.</summary>
     private static HashSet<string> BuildReadbackSkipSet(CompiledGraph graph)
     {
-        var skip = new HashSet<string>(StringComparer.Ordinal);
-        // producer op-type per output, consumer op-types per tensor name
-        var producerOp = new Dictionary<string, string>(StringComparer.Ordinal);
-        // (consumer op, INPUT POSITION). The position is what lets "Squeeze needs axes but not data"
-        // be expressed; without it the requires-value test is per-op and pins a readback on every input.
-        var consumerOps = new Dictionary<string, List<(string Op, int Index)>>(StringComparer.Ordinal);
-        foreach (var node in graph.Nodes)
-        {
-            foreach (var o in node.OutputNames)
-                if (!string.IsNullOrEmpty(o)) producerOp[o] = node.OpType;
-            for (int ii = 0; ii < node.InputNames.Length; ii++)
-            {
-                var inp = node.InputNames[ii];
-                if (string.IsNullOrEmpty(inp)) continue;
-                if (!consumerOps.TryGetValue(inp, out var list))
-                {
-                    list = new List<(string, int)>();
-                    consumerOps[inp] = list;
-                }
-                list.Add((node.OpType, ii));
-            }
-        }
-
-        // Which tensors are genuinely read as a host VALUE, computed backwards to a fixed point.
-        //
-        // The seed is local: a tensor consumed at a position a requires-value op really reads. The
-        // propagation is what the local test could not express - a Concat needs its inputs' values ONLY if
-        // its own output value is needed (it is how a Reshape's target shape gets built), and needs
-        // nothing when it is just concatenating data. Without this, Concat pinned every readback left on
-        // Silero VAD.
         var needsValue = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in graph.Nodes)
-        {
-            if (!ReadbackRequiresValueConsumers.Contains(node.OpType)) continue;
-            if (ReadbackValuePropagators.Contains(node.OpType)) continue;   // seeded by propagation instead
             for (int ii = 0; ii < node.InputNames.Length; ii++)
             {
                 var inp = node.InputNames[ii];
-                if (!string.IsNullOrEmpty(inp) && ReadbackNeedsValueAt(node.OpType, ii))
+                if (!string.IsNullOrEmpty(inp) && IsHostValueSlot(node, ii))
                     needsValue.Add(inp);
             }
-        }
-        // Propagate backwards through the propagators until nothing new is marked. The graph is a DAG and
-        // each pass can only add, so this terminates; models here are small enough that the simple loop is
-        // not worth replacing with a worklist.
         bool grew = true;
         while (grew)
         {
             grew = false;
-            foreach (var node in graph.Nodes)
+            for (int ni = graph.Nodes.Length - 1; ni >= 0; ni--)   // reverse topological: most of the closure in one pass
             {
-                if (!ReadbackValuePropagators.Contains(node.OpType)) continue;
-                bool outputNeeded = node.OutputNames.Any(o => !string.IsNullOrEmpty(o) && needsValue.Contains(o));
+                var node = graph.Nodes[ni];
+                if (ShapeOnlyValueOps.Contains(node.OpType)) continue;
+                bool outputNeeded = false;
+                foreach (var o in node.OutputNames)
+                    if (!string.IsNullOrEmpty(o) && needsValue.Contains(o)) { outputNeeded = true; break; }
                 if (!outputNeeded) continue;
                 foreach (var inp in node.InputNames)
                     if (!string.IsNullOrEmpty(inp) && needsValue.Add(inp)) grew = true;
             }
         }
 
+        var skip = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in graph.Nodes)
-        {
             foreach (var o in node.OutputNames)
-            {
-                if (string.IsNullOrEmpty(o)) continue;
-                var cons = consumerOps.GetValueOrDefault(o);
-                // Something downstream really reads this as a host value → the readback stays.
-                if (needsValue.Contains(o)) continue;
-                bool featureProducer = ReadbackFeatureOnlyProducers.Contains(node.OpType);
-                // Rule B: every consumer is itself a feature-only op (which never reads a value). Vacuously
-                // true for a dead/graph-output tensor (nothing reads its value either).
-                bool allConsumersFeatureOnly = cons == null
-                    || cons.All(c => ReadbackFeatureOnlyProducers.Contains(c.Op));
-                if (featureProducer || allConsumersFeatureOnly)
+                if (!string.IsNullOrEmpty(o) && !needsValue.Contains(o))
                     skip.Add(o);
-            }
-        }
         return skip;
     }
 
