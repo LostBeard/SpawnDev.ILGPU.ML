@@ -122,6 +122,7 @@ public static partial class OnnxParser
                 default: r.SkipField(wire); break;
             }
         }
+        graph.NormalizeAttributeConstants();
         return graph;
     }
 

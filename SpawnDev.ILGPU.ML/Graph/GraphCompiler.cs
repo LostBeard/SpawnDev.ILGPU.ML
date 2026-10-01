@@ -264,7 +264,8 @@ public class GraphCompiler
                 && knownShapes.TryGetValue(node.Inputs[0], out var shapeInputShape)
                 && !dynamicInputs.Contains(node.Inputs[0]))
             {
-                var shapeValues = shapeInputShape;
+                var (shS, shE) = Operators.ShapeOperator.Window(shapeInputShape.Length, node.Attributes);
+                var shapeValues = shapeInputShape[shS..shE];
                 outputShapes = new[] { new[] { shapeValues.Length } };
                 // Store computed values so downstream Reshape/Gather can use them
                 graph.ConstantData ??= new Dictionary<string, int[]>();

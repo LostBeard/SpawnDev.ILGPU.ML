@@ -119,6 +119,7 @@ public static partial class OnnxParser
                 default: await r.SkipFieldAsync(wire).ConfigureAwait(false); break;
             }
         }
+        graph.NormalizeAttributeConstants();
         return graph;
     }
 

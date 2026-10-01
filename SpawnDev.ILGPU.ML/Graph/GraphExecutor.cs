@@ -1957,7 +1957,10 @@ public class GraphExecutor : IDisposable
 
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
             if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
-                runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
+            {
+                var (shS, shE) = Operators.ShapeOperator.Window(nodeInputs[0]!.Shape.Length, node.Attributes);
+                runtimeOutputShapes = new[] { new[] { shE - shS } };
+            }
 
             // Runtime Concat: output shape = input0's shape with the concat axis replaced by the SUM of
             // all inputs' axis dims. Build-time inference leaves the axis dim unresolved when an upstream

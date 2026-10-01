@@ -27,6 +27,37 @@ public class OnnxGraphProto
     public List<OnnxValueInfoProto> Inputs { get; set; } = new();
     public List<OnnxValueInfoProto> Outputs { get; set; } = new();
     public List<OnnxValueInfoProto> ValueInfo { get; set; } = new();
+
+    /// <summary>
+    /// Rewrite every Constant that carries its value as <c>value_int</c>, <c>value_ints</c>, <c>value_float</c> or
+    /// <c>value_floats</c> into the equivalent <c>value</c> tensor (INT64 / FLOAT; scalar for the singular forms, 1-D for
+    /// the plural). The loader, the optimizer and the compiler only read <c>value</c>: these Constants silently produced
+    /// NOTHING (GraphOptimizer's note), and RaCo-ALIKED's patch Reshape target Concat([n], value_ints [3], [42], [42])
+    /// lost its spatial dims ([532480,12,-3,-3], "Slice crashed" at load, 2026-09-30). Called by both parsers.
+    /// </summary>
+    public void NormalizeAttributeConstants()
+    {
+        foreach (var node in Nodes)
+        {
+            if (node.OpType != "Constant" || node.Attributes.Any(a => a.Name == "value" && a.T != null)) continue;
+            OnnxTensorProto? t = null;
+            foreach (var a in node.Attributes)
+            {
+                switch (a.Name)
+                {
+                    case "value_int": t = new OnnxTensorProto { DataType = 7, Dims = Array.Empty<long>(), Int64Data = new[] { a.I } }; break;
+                    case "value_ints": t = new OnnxTensorProto { DataType = 7, Dims = new long[] { a.Ints?.Length ?? 0 }, Int64Data = a.Ints ?? Array.Empty<long>() }; break;
+                    case "value_float": t = new OnnxTensorProto { DataType = 1, Dims = Array.Empty<long>(), FloatData = new[] { a.F } }; break;
+                    case "value_floats": t = new OnnxTensorProto { DataType = 1, Dims = new long[] { a.Floats?.Length ?? 0 }, FloatData = a.Floats ?? Array.Empty<float>() }; break;
+                }
+                if (t != null) break;
+            }
+            if (t == null) continue;
+            t.Name = node.Outputs.Count > 0 ? node.Outputs[0] : "";
+            node.Attributes.RemoveAll(a => a.Name is "value_int" or "value_ints" or "value_float" or "value_floats");
+            node.Attributes.Add(new OnnxAttributeProto { Name = "value", Type = OnnxAttributeType.TENSOR, T = t });
+        }
+    }
 }
 
 /// <summary>A single operation (node) in the graph.</summary>

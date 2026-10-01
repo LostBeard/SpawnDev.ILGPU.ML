@@ -324,17 +324,54 @@ public class UpsampleOperator(OperatorRegistry reg) : IOnnxOperator
 public class ShapeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Shape";
+
+    /// <summary>
+    /// The [start, end) window of the shape this node returns. Opset 15 added <c>start</c> / <c>end</c> (negative = from
+    /// the back, clamped to [0, rank]): <c>Shape(x, start=0, end=1)</c> is x's batch dim alone. Ignoring them returned
+    /// the WHOLE shape - RaCo-ALIKED's patch Reshape (batch x 512 from Shape(images)[0:1]) then became [2,3,1,1] and two
+    /// valid 3x3 convs made [2,12,-3,-3], "Slice crashed" at load (2026-09-30). Every Shape path uses this one rule:
+    /// the operator, the compile-time fold (GraphCompiler) and the runtime output shape (GraphExecutor).
+    /// </summary>
+    public static (int Start, int End) Window(int rank, IReadOnlyDictionary<string, object>? attrs)
+    {
+        static long Get(IReadOnlyDictionary<string, object>? a, string k, long dflt)
+            => a != null && a.TryGetValue(k, out var v) && v != null ? Convert.ToInt64(v) : dflt;
+        long start = Get(attrs, "start", 0), end = Get(attrs, "end", rank);
+        if (start < 0) start += rank;
+        if (end < 0) end += rank;
+        start = Math.Clamp(start, 0, rank);
+        end = Math.Clamp(end, 0, rank);
+        if (end < start) end = start;
+        return ((int)start, (int)end);
+    }
+
+    /// <summary><see cref="Window(int, IReadOnlyDictionary{string, object}?)"/> for the compiler's JSON attributes.</summary>
+    public static (int Start, int End) Window(int rank, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? attrs)
+    {
+        var boxed = new Dictionary<string, object>();
+        if (attrs != null)
+            foreach (var k in new[] { "start", "end" })
+                if (attrs.TryGetValue(k, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.Number) boxed[k] = v.GetInt64();
+        return Window(rank, boxed);
+    }
+
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { new[] { inputs[0].Length } };
+    {
+        var (s, e) = Window(inputs[0].Length, attrs);
+        return new[] { new[] { e - s } };
+    }
+
     public void Execute(OnnxOpContext ctx)
     {
-        // Output the input's shape dimensions as float values via a temporary GPU buffer
+        // Output the input's shape dimensions (the [start, end) window) as float values.
         var shape = ctx.Inputs[0].Shape;
-        var shapeData = new float[shape.Length];
-        for (int i = 0; i < shape.Length; i++)
-            shapeData[i] = shape[i];
+        var (s, e) = Window(shape.Length, ctx.Attributes);
+        var shapeData = new float[e - s];
+        for (int i = 0; i < shapeData.Length; i++)
+            shapeData[i] = shape[s + i];
+        if (shapeData.Length == 0) return;
         // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
-        ctx.Outputs[0].Data.SubView(0, shape.Length).CopyFromCPU(shapeData);
+        ctx.Outputs[0].Data.SubView(0, shapeData.Length).CopyFromCPU(shapeData);
     }
 }
 
