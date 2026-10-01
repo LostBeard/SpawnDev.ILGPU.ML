@@ -2408,134 +2408,92 @@ public class ReduceProdOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class ReduceL1Operator(OperatorRegistry reg) : IOnnxOperator
+/// <summary>
+/// The element-wise-then-sum reductions (2026-10-01): ReduceL1 = Sum|x|, ReduceL2 = sqrt(Sum x^2), ReduceSumSquare =
+/// Sum x^2, ReduceLogSum = log(Sum x), ReduceLogSumExp = log(Sum e^x). Shared because they shared three defects:
+/// Mul(x, x, out) / Sqrt(out, out) / Log(out, out) bound one buffer twice (WebGPU forbids it - RaCo-ALIKED's descriptor
+/// ReduceL2 failed its first browser forward); the pre-transform temp was rented and never returned; and axes came only
+/// from the attribute with a LAST-axis default, while the executor's runtime output shape follows ONNX (opset-18 axes
+/// input, reduce ALL by default) - ReduceOps.ResolveAxes, as ReduceSum uses.
+/// </summary>
+public abstract class ReduceTransformSumOperator(OperatorRegistry reg) : IOnnxOperator
 {
-    public string OpType => "ReduceL1";
+    public abstract string OpType { get; }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
+
+    /// <summary>The per-element transform before the sum, input -> temp; null = sum the input itself.</summary>
+    protected abstract Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre { get; }
+    /// <summary>The in-place transform of the sums; null = none.</summary>
+    protected abstract Action<ArrayView1D<float, Stride1D.Dense>, int>? Post { get; }
+    protected OperatorRegistry Reg => reg;
+
     public void Execute(OnnxOpContext ctx)
     {
-        // ReduceL1 = ReduceSum(Abs(x))
         var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
-        int firstAxis = normalizedAxes[0];
-        int lastAxis = normalizedAxes[^1];
-        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
-        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
-        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
-        // Abs input into temp, then ReduceSum
+        var axes = ReduceOps.ResolveAxes(ctx, shape.Length);
         int count = ctx.Inputs[0].ElementCount;
-        var absBuf = ctx.Pool.Rent(new[] { count });
-        reg.ElementWise.Abs(ctx.Inputs[0].Data, absBuf.Data, count);
-        reg.Reductions.ReduceSum(absBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
+        int outer, reduce, inner;
+        if (axes.Length == 0) { outer = count; reduce = 1; inner = 1; } // noop_with_empty_axes: per-element transform only
+        else
+        {
+            int firstAxis = axes[0], lastAxis = axes[^1];
+            for (int i = 1; i < axes.Length; i++)
+                if (axes[i] != axes[i - 1] + 1)
+                    throw new NotSupportedException($"{OpType}: non-contiguous axes [{string.Join(",", axes)}] of rank {shape.Length}");
+            outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
+            reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
+            inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
+        }
+        var pre = Pre;
+        Tensor? temp = null;
+        var source = ctx.Inputs[0].Data;
+        if (pre != null)
+        {
+            temp = ctx.Pool.Rent(new[] { count });
+            pre(ctx.Inputs[0].Data, temp.Data, count);
+            source = temp.Data;
+        }
+        reg.Reductions.ReduceSum(source, ctx.Outputs[0].Data, outer, reduce, inner);
+        Post?.Invoke(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+        if (temp != null) ctx.Pool.Return(temp);
     }
 }
 
-public class ReduceL2Operator(OperatorRegistry reg) : IOnnxOperator
+public class ReduceL1Operator(OperatorRegistry reg) : ReduceTransformSumOperator(reg)
 {
-    public string OpType => "ReduceL2";
-    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
-    public void Execute(OnnxOpContext ctx)
-    {
-        // ReduceL2 = Sqrt(ReduceSum(x^2))
-        var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
-        int firstAxis = normalizedAxes[0];
-        int lastAxis = normalizedAxes[^1];
-        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
-        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
-        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
-        // Square input, ReduceSum, then Sqrt
-        int count = ctx.Inputs[0].ElementCount;
-        var sqBuf = ctx.Pool.Rent(new[] { count });
-        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.Data, count);
-        reg.Reductions.ReduceSum(sqBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
-        int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Sqrt(ctx.Outputs[0].Data, ctx.Outputs[0].Data, outCount);
-    }
+    public override string OpType => "ReduceL1";
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre => Reg.ElementWise.Abs;
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, int>? Post => null;
 }
 
-public class ReduceSumSquareOperator(OperatorRegistry reg) : IOnnxOperator
+public class ReduceL2Operator(OperatorRegistry reg) : ReduceTransformSumOperator(reg)
 {
-    public string OpType => "ReduceSumSquare";
-    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
-    public void Execute(OnnxOpContext ctx)
-    {
-        // ReduceSumSquare = ReduceSum(x^2)
-        var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
-        int firstAxis = normalizedAxes[0];
-        int lastAxis = normalizedAxes[^1];
-        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
-        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
-        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
-        int count = ctx.Inputs[0].ElementCount;
-        var sqBuf = ctx.Pool.Rent(new[] { count });
-        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.Data, count);
-        reg.Reductions.ReduceSum(sqBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
-    }
+    public override string OpType => "ReduceL2";
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre => Reg.ElementWise.Square;
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, int>? Post => Reg.ElementWise.SqrtInPlace;
 }
 
-public class ReduceLogSumOperator(OperatorRegistry reg) : IOnnxOperator
+public class ReduceSumSquareOperator(OperatorRegistry reg) : ReduceTransformSumOperator(reg)
 {
-    public string OpType => "ReduceLogSum";
-    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
-    public void Execute(OnnxOpContext ctx)
-    {
-        // ReduceLogSum = Log(ReduceSum(x))
-        var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
-        int firstAxis = normalizedAxes[0];
-        int lastAxis = normalizedAxes[^1];
-        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
-        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
-        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
-        reg.Reductions.ReduceSum(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
-        int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Log(ctx.Outputs[0].Data, ctx.Outputs[0].Data, outCount);
-    }
+    public override string OpType => "ReduceSumSquare";
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre => Reg.ElementWise.Square;
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, int>? Post => null;
 }
 
-public class ReduceLogSumExpOperator(OperatorRegistry reg) : IOnnxOperator
+public class ReduceLogSumOperator(OperatorRegistry reg) : ReduceTransformSumOperator(reg)
 {
-    public string OpType => "ReduceLogSumExp";
-    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
-    public void Execute(OnnxOpContext ctx)
-    {
-        // ReduceLogSumExp = Log(ReduceSum(Exp(x)))
-        var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
-        int firstAxis = normalizedAxes[0];
-        int lastAxis = normalizedAxes[^1];
-        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
-        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
-        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
-        int count = ctx.Inputs[0].ElementCount;
-        var expBuf = ctx.Pool.Rent(new[] { count });
-        reg.ElementWise.Exp(ctx.Inputs[0].Data, expBuf.Data, count);
-        reg.Reductions.ReduceSum(expBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
-        int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Log(ctx.Outputs[0].Data, ctx.Outputs[0].Data, outCount);
-    }
+    public override string OpType => "ReduceLogSum";
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre => null;
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, int>? Post => Reg.ElementWise.LogInPlace;
+}
+
+public class ReduceLogSumExpOperator(OperatorRegistry reg) : ReduceTransformSumOperator(reg)
+{
+    // log(sum(exp(x))) WITHOUT the max shift, as before this change: exp overflows for x > ~88.7.
+    public override string OpType => "ReduceLogSumExp";
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? Pre => Reg.ElementWise.Exp;
+    protected override Action<ArrayView1D<float, Stride1D.Dense>, int>? Post => Reg.ElementWise.LogInPlace;
 }
 
 // ── GlobalMaxPool ──

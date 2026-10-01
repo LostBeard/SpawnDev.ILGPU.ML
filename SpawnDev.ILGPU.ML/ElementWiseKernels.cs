@@ -1959,6 +1959,41 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _ceilKernel!(count, input, output); }
     public void Log(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _logKernel!(count, input, output); }
+
+    // Reduce-family helpers (2026-10-01). ReduceL2 / ReduceSumSquare squared with Mul(x, x, out) and finished with
+    // Sqrt(out, out) / Log(out, out): the same buffer in two storage bindings, which WebGPU forbids (RaCo-ALIKED's
+    // descriptor ReduceL2 failed its first browser forward). One input binding each.
+
+    /// <summary>output[i] = input[i] * input[i]. One input binding (Mul(x, x) aliases on WebGPU).</summary>
+    public void Square(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    {
+        _squareKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(SquareImpl);
+        _squareKernel(count, input, output);
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _squareKernel;
+    private static void SquareImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    { float x = input[idx]; output[idx] = x * x; }
+
+    /// <summary>In-place sqrt. Single buffer binding (WebGPU-safe).</summary>
+    public void SqrtInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
+    {
+        _sqrtInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SqrtInPlaceImpl);
+        _sqrtInPlaceKernel(count, data);
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _sqrtInPlaceKernel;
+    private static void SqrtInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
+    { data[idx] = MathF.Sqrt(data[idx]); }
+
+    /// <summary>In-place natural log. Single buffer binding (WebGPU-safe).</summary>
+    public void LogInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
+    {
+        _logInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(LogInPlaceImpl);
+        _logInPlaceKernel(count, data);
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _logInPlaceKernel;
+    private static void LogInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
+    { data[idx] = MathF.Log(data[idx]); }
     public void Round(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _roundKernel!(count, input, output); }
     /// <summary>atan2(y, x) elementwise, with IEEE quadrant and signed-zero semantics.</summary>

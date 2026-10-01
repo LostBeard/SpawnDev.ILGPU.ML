@@ -4,6 +4,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.1-local)
 
+- **ReduceL1 / L2 / SumSquare / LogSum / LogSumExp fixed as a family** (Tuvok, 5.3.1-local.10): ReduceL2 squared with
+  `Mul(x, x, out)` and finished with `Sqrt(out, out)` (LogSum / LogSumExp: `Log(out, out)`), one buffer in two storage
+  bindings, which WebGPU rejects. SpawnScene's RaCo-ALIKED descriptor ReduceL2 failed its first browser forward with
+  "Storage buffer aliasing detected in kernel 'Kernel_MulImpl'". The temp they rented was never returned, and they read
+  axes only from the attribute with a LAST-axis default, while the executor's runtime output shape follows ONNX (axes
+  input at opset 18, reduce ALL by default). Now one `ReduceTransformSumOperator` with `ReduceOps.ResolveAxes` (as
+  ReduceSum), new single-binding kernels `Square`, `SqrtInPlace`, `LogInPlace`, the temp returned, and non-contiguous
+  axes throw instead of reducing the wrong elements. The old `Op_ReduceL2_MatchesCpu` composed the kernels by hand with a
+  COPY of the input, so the operator never ran in a test. Test: `ReduceFamily_Operators_MatchReference`
+  (models/tests/reduce_family.onnx, all five ops through a session vs a double reference; red before the fix on CPU
+  (no-axes reduce-all) and on WebGPU (the aliasing error)). Still open: ReduceLogSumExp has no max shift, so exp
+  overflows above ~88.7.
+
 - **Stream loads accept optimizer-folded constants** (Tuvok, 5.3.1-local.9): `CreateFromOnnxStreamAsync` (and so
   `CreateFromStreamAsync` / every `IModelSource` hub load) checked that each GPU-consumed initializer was uploaded and
   counted the optimizer's folded constants - which the executor uploads itself - as missing. SpawnScene's RaCo-ALIKED hub
