@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.3.0 - 2026-09-30 - on SpawnDev.ILGPU 5.3.0 + SpawnDev.SpawnJS 3.0.0
+
+Dependency release: SpawnDev.SpawnJS 2.1.20 -> 3.0.0 (one-crossing interop) and SpawnDev.ILGPU 5.2.25 -> 5.3.0 (built on
+it; also WebGPU: Dispose submits pending work first). Minor bump because an app that pins SpawnDev.SpawnJS 2.x directly
+now gets NU1605 from this package's dependency - same reasoning as ILGPU 5.3.0.
+
 ## 5.2.38 - 2026-09-30 - on SpawnDev.ILGPU 5.2.25 - the uncaptured WebGPU forward: Einsum on the GPU, no data readbacks, input-independent folding
 
 TJ's bar (2026-09-30): the PLAIN forward - no graph capture, no replay - must beat Transformers.js (DAv3 Small 518
