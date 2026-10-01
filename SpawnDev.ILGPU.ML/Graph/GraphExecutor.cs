@@ -5718,7 +5718,7 @@ public class GraphExecutor : IDisposable
         ["ReduceLogSumExp"] = new[] { 1 },
         ["CumSum"] = new[] { 1 },
         ["Trilu"] = new[] { 1 },
-        ["NonZero"] = new[] { 0 },
+        // (NonZero is not here: it runs on the GPU and reads back only its count - see NonZeroOperator.)
         ["Compress"] = new[] { 1 },
         ["Unique"] = new[] { 0 },
         ["AffineGrid"] = new[] { 1 },

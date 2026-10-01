@@ -863,61 +863,91 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
-/// NonZero: returns indices of non-zero elements as [rank, nnz] tensor.
-/// For attention masks (all 1s), returns all coordinate pairs.
-/// Data-dependent output size — reads input values from runtime constants.
+/// ONNX NonZero: the [rank, count] coordinates of the non-zero input elements, row-major, on the GPU. The count is
+/// data-dependent, so the output buffer is sized for the upper bound (every element) and its SHAPE is set to the real
+/// count after ONE int readback. It used to compute on the CPU from host values - and when the input was too large to
+/// have them (anything over the 64-element readback, e.g. LightGlue's 2048+ mutual-match mask) it assumed EVERY
+/// element non-zero and left the shape at the padded upper bound (2026-10-01).
 /// </summary>
-public class NonZeroOperator(OperatorRegistry reg) : IOnnxOperator
+public class NonZeroOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
+    private Kernels.MissingElementWiseKernels? _kernels;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _countBuf;
+
     public string OpType => "NonZero";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { new[] { inputs[0].Length, inputs[0].Aggregate(1, (a, b) => a * b) } }; // [rank, max_nnz]
+        => new[] { new[] { inputs[0].Length, inputs[0].Aggregate(1, (a, b) => a * b) } }; // [rank, max_nnz] upper bound
+
+    ArrayView1D<int, Stride1D.Dense> Prefix(OnnxOpContext ctx, int n, bool needCount)
+    {
+        _kernels ??= new Kernels.MissingElementWiseKernels(reg.Accelerator);
+        var prefix = _kernels.NonZeroPrefix(ctx.Inputs[0].Data, n);
+        if (needCount)
+        {
+            _countBuf ??= reg.Accelerator.Allocate1D<int>(1);
+            _countBuf.View.CopyFrom(prefix.SubView(n - 1, 1));
+        }
+        return prefix;
+    }
+
+    /// <summary>The count from the input's HOST values when the executor already has them (small constants): no
+    /// readback, and the sync path then works on the browser backends too.</summary>
+    static int? HostCount(OnnxOpContext ctx, int n)
+    {
+        var vals = ctx.TryGetInputValues(0);
+        if (vals == null || vals.Length != n) return null;
+        int c = 0;
+        foreach (var v in vals) if (v != 0f) c++;
+        return c;
+    }
+
+    void Finish(OnnxOpContext ctx, ArrayView1D<int, Stride1D.Dense> prefix, int n, int count)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        var output = ctx.Outputs[0];
+        if ((long)shape.Length * count > output.Data.Length)
+            throw new InvalidOperationException($"NonZero: {count} non-zero elements need {shape.Length * count} slots, the output holds {output.Data.Length}");
+        _kernels!.NonZeroGather(prefix, n, shape, count, output.Data);
+        output.Shape = new[] { shape.Length, count };
+    }
+
     public void Execute(OnnxOpContext ctx)
     {
-        var input = ctx.Inputs[0];
-        var inShape = input.Shape;
-        int rank = inShape.Length;
-        int totalElems = input.ElementCount;
-
-        // Read input values — NonZero is inherently data-dependent
-        var vals = ctx.TryGetInputValues(0);
-        if (vals == null)
+        int n = ctx.Inputs[0].ElementCount;
+        if (n == 0) { ctx.Outputs[0].Shape = new[] { ctx.Inputs[0].Shape.Length, 0 }; return; }
+        var host = HostCount(ctx, n);
+        var prefix = Prefix(ctx, n, host == null);
+        int count;
+        if (host != null) count = host.Value;
+        else
         {
-            // Can't read values — assume all non-zero (common for attention masks)
-            vals = new float[totalElems];
-            for (int i = 0; i < totalElems; i++) vals[i] = 1f;
+            // Sync path (desktop backends): a synchronous one-int readback. The browser backends run ExecuteAsync.
+            reg.Accelerator.Synchronize();
+            count = _countBuf!.View.SubView(0, 1).GetAsArray1D()[0];
         }
+        Finish(ctx, prefix, n, count);
+    }
 
-        // Find non-zero indices
-        var indices = new List<int[]>();
-        var strides = new int[rank];
-        if (rank > 0) strides[rank - 1] = 1;
-        for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * inShape[d + 1];
-
-        for (int i = 0; i < totalElems; i++)
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        int n = ctx.Inputs[0].ElementCount;
+        if (n == 0) { ctx.Outputs[0].Shape = new[] { ctx.Inputs[0].Shape.Length, 0 }; return; }
+        var host = HostCount(ctx, n);
+        var prefix = Prefix(ctx, n, host == null);
+        int count;
+        if (host != null) count = host.Value;
+        else
         {
-            if (vals[i] != 0f)
-            {
-                var coord = new int[rank];
-                int rem = i;
-                for (int d = 0; d < rank; d++) { coord[d] = rem / strides[d]; rem %= strides[d]; }
-                indices.Add(coord);
-            }
+            await reg.Accelerator.SynchronizeAsync();
+            count = (await _countBuf!.CopyToHostAsync<int>(0, 1))[0];
         }
+        Finish(ctx, prefix, n, count);
+    }
 
-        // Output: [rank, nnz] — each row is one dimension's indices
-        int nnz = indices.Count;
-        var result = new float[rank * nnz];
-        for (int d = 0; d < rank; d++)
-            for (int j = 0; j < nnz; j++)
-                result[d * nnz + j] = indices[j][d];
-
-        var output = ctx.Outputs[0];
-        int copyLen = Math.Min(result.Length, output.ElementCount);
-        if (copyLen > 0)
-        {
-            output.Data.SubView(0, copyLen).CopyFromCPU(result.AsSpan(0, copyLen).ToArray());
-        }
+    public void Dispose()
+    {
+        _kernels?.Dispose();
+        _countBuf?.Dispose();
     }
 }
 
@@ -1564,8 +1594,14 @@ public class HardmaxOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class LogSoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
+/// <summary>
+/// ONNX LogSoftmax along any axis, in log space (x - max - log(sum exp(x - max))). It ran Softmax over rows of
+/// shape[axis] - right only for the LAST axis: LightGlue's log-assignment LogSoftmax(axis=1) of [1,2048,2048]
+/// normalized the wrong elements - and took log(softmax), which loses everything below float's range (2026-10-01).
+/// </summary>
+public class LogSoftmaxOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
+    private Kernels.MissingElementWiseKernels? _kernels;
     public string OpType => "LogSoftmax";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
@@ -1573,16 +1609,14 @@ public class LogSoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int axis = ctx.GetInt("axis", -1);
         var shape = ctx.Inputs[0].Shape;
         if (axis < 0) axis += shape.Length;
-        int rows = 1, cols = shape[axis];
-        for (int i = 0; i < axis; i++) rows *= shape[i];
-        // Copy input to output, run softmax, then log (using temp to avoid aliasing)
-        int total = ctx.Inputs[0].ElementCount;
-        ctx.Outputs[0].Data.SubView(0, total).CopyFrom(ctx.Inputs[0].Data.SubView(0, total));
-        reg.Softmax.Forward(ctx.Outputs[0].Data, rows, cols);
-        var tempBuf = ctx.Pool.Rent(new[] { total });
-        reg.ElementWise.Log(ctx.Outputs[0].Data, tempBuf.Data, total);
-        ctx.Outputs[0].Data.SubView(0, total).CopyFrom(tempBuf.Data.SubView(0, total));
+        int outer = 1, inner = 1, axisDim = shape.Length == 0 ? 1 : shape[axis];
+        for (int i = 0; i < axis; i++) outer *= shape[i];
+        for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        if (outer * inner * axisDim == 0) return;
+        (_kernels ??= new Kernels.MissingElementWiseKernels(reg.Accelerator))
+            .LogSoftmax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, axisDim, inner);
     }
+    public void Dispose() => _kernels?.Dispose();
 }
 
 public class PReluOperator(OperatorRegistry reg) : IOnnxOperator

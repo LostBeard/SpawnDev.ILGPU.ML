@@ -37,9 +37,11 @@ public class ActivationKernels
     private static void SigmoidInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     {
         float x = data[idx];
-        if (x > 80f) { data[idx] = 1f; return; }
-        if (x < -80f) { data[idx] = 0f; return; }
-        data[idx] = 1f / (1f + MathF.Exp(-x));
+        // Overflow-free logistic: e = exp(-|x|) is in (0, 1], so nothing overflows and no clamp is needed. The old
+        // clamp sent x < -80 to 0 although sigmoid(-85) = 1.2e-37 is a normal float (Log(Sigmoid) -> -inf).
+        float e = MathF.Exp(-MathF.Abs(x));
+        float s = 1f / (1f + e);
+        data[idx] = x >= 0f ? s : e * s;
     }
 
     private static void TanhInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
@@ -55,10 +57,10 @@ public class ActivationKernels
     private static void SiLUInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     {
         float x = data[idx];
-        if (x > 80f) { return; } // sigmoid(x) ≈ 1, so SiLU(x) ≈ x
-        if (x < -80f) { data[idx] = 0f; return; }
-        float sig = 1f / (1f + MathF.Exp(-x));
-        data[idx] = x * sig;
+        // Overflow-free logistic (see SigmoidInPlaceImpl): no clamps.
+        float e = MathF.Exp(-MathF.Abs(x));
+        float s = 1f / (1f + e);
+        data[idx] = x * (x >= 0f ? s : e * s);
     }
 
     /// <summary>Fused SwiGLU: out = (gate · sigmoid(gate)) · up — the SiLU-gated MLP activation in ONE pass,
@@ -131,9 +133,11 @@ public class ActivationKernels
         ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     {
         float x = input[idx];
-        if (x > 80f) { output[idx] = 1f; return; }
-        if (x < -80f) { output[idx] = 0f; return; }
-        output[idx] = 1f / (1f + MathF.Exp(-x));
+        // Overflow-free logistic: e = exp(-|x|) is in (0, 1], so nothing overflows and no clamp is needed. The old
+        // clamp sent x < -80 to 0 although sigmoid(-85) = 1.2e-37 is a normal float (Log(Sigmoid) -> -inf).
+        float e = MathF.Exp(-MathF.Abs(x));
+        float s = 1f / (1f + e);
+        output[idx] = x >= 0f ? s : e * s;
     }
 
     private static void TanhImpl(Index1D idx,
@@ -150,10 +154,10 @@ public class ActivationKernels
         ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     {
         float x = input[idx];
-        if (x > 80f) { output[idx] = x; return; }
-        if (x < -80f) { output[idx] = 0f; return; }
-        float sig = 1f / (1f + MathF.Exp(-x));
-        output[idx] = x * sig;
+        // Overflow-free logistic (see SigmoidInPlaceImpl): no clamps.
+        float e = MathF.Exp(-MathF.Abs(x));
+        float s = 1f / (1f + e);
+        output[idx] = x * (x >= 0f ? s : e * s);
     }
 
     private static void HardSigmoidImpl(Index1D idx,

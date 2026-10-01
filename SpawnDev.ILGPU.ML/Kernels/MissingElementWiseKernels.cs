@@ -54,6 +54,11 @@ public class MissingElementWiseKernels : IDisposable
         _oldParamsBufs.Clear();
         _topKIdxBuf?.Dispose();
         _topKSortScratch?.Dispose();
+        _nonZeroScratch?.Dispose();
+        _logSoftmaxStats?.Dispose();
+        _nonZeroScratchB?.Dispose();
+        foreach (var buf in _oldNonZeroScratch) buf.Dispose();
+        _oldNonZeroScratch.Clear();
         foreach (var buf in _oldTopKIdxBufs) buf.Dispose();
         _oldTopKIdxBufs.Clear();
     }
@@ -512,6 +517,158 @@ public class MissingElementWiseKernels : IDisposable
                 (aI, bI) = (bI, aI);
             }
         _topKSortGatherKernel(outer * k * inner, aV, aI, outputValues, idxView, k, inner, P);
+    }
+
+    // ──────────────────────────────────────────────
+    //  NonZero (data-dependent output size)
+    // ──────────────────────────────────────────────
+    // Inclusive prefix count of the non-zero flags (Hillis-Steele, log2(n) ping-pong steps, one thread per element
+    // writing only its own slot - WebGL Transform-Feedback safe), ONE int readback of the total, then a gather per
+    // output row: slot j finds the j-th non-zero element by binary search over the prefix (monotonic). Integer
+    // counts are exact at any size.
+
+    private static void NonZeroFlagImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> flags)
+    {
+        flags[i] = input[i] != 0f ? 1 : 0;
+    }
+
+    private static void NonZeroScanStepImpl(Index1D i, ArrayView1D<int, Stride1D.Dense> src, ArrayView1D<int, Stride1D.Dense> dst, int offset)
+    {
+        int v = src[i];
+        if (i >= offset) v += src[i - offset];
+        dst[i] = v;
+    }
+
+    // Row d of the [rank, count] output: coordinate d of the j-th non-zero element, (index / stride) % dim.
+    // `row` is that row's own SubView, so thread j writes slot j: WebGL's Transform Feedback writes a thread's value at
+    // its OWN index, and writing row d at d*count + j there put row 1 on top of row 0. The search runs a fixed
+    // `steps` = ceil(log2 n) + 1 iterations (a uniform loop bound).
+    private static void NonZeroGatherRowImpl(Index1D j, ArrayView1D<int, Stride1D.Dense> prefix, ArrayView1D<float, Stride1D.Dense> row,
+        int n, int stride, int dim, int steps)
+    {
+        int target = j + 1;
+        int lo = 0, hi = n - 1;
+        for (int s = 0; s < steps; s++)
+        {
+            int mid = (lo + hi) / 2;
+            int geq = prefix[mid] >= target ? 1 : 0;
+            if (lo < hi)
+            {
+                if (geq == 1) hi = mid;
+                else lo = mid + 1;
+            }
+        }
+        row[j] = (float)((lo / stride) % dim);
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _nonZeroFlagKernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>? _nonZeroScanKernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _nonZeroGatherKernel;
+    // Ping-pong pair as TWO buffers: two SubViews of one buffer overlap after WebGPU's binding alignment (aliasing).
+    private MemoryBuffer1D<int, Stride1D.Dense>? _nonZeroScratch, _nonZeroScratchB;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldNonZeroScratch = new();
+
+    /// <summary>
+    /// Phase 1 of NonZero: the inclusive prefix count of <paramref name="input"/>'s non-zero elements. Returns the view
+    /// holding it; its LAST element is the total, which the caller reads back (one int) to size the output.
+    /// </summary>
+    public ArrayView1D<int, Stride1D.Dense> NonZeroPrefix(ArrayView1D<float, Stride1D.Dense> input, int n)
+    {
+        _nonZeroFlagKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(NonZeroFlagImpl);
+        _nonZeroScanKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>(NonZeroScanStepImpl);
+        if (_nonZeroScratch == null || _nonZeroScratchB == null || _nonZeroScratch.Length < n)
+        {
+            // Retired, not disposed: a queued dispatch may still reference them (see the class notes).
+            if (_nonZeroScratch != null) _oldNonZeroScratch.Add(_nonZeroScratch);
+            if (_nonZeroScratchB != null) _oldNonZeroScratch.Add(_nonZeroScratchB);
+            _nonZeroScratch = _accelerator.Allocate1D<int>(n);
+            _nonZeroScratchB = _accelerator.Allocate1D<int>(n);
+        }
+        var a = _nonZeroScratch.View.SubView(0, n);
+        var b = _nonZeroScratchB.View.SubView(0, n);
+        _nonZeroFlagKernel(n, input, a);
+        for (int offset = 1; offset < n; offset <<= 1)
+        {
+            _nonZeroScanKernel(n, a, b, offset);
+            (a, b) = (b, a);
+        }
+        return a;
+    }
+
+    /// <summary>
+    /// Phase 2 of NonZero: writes the [rank, <paramref name="count"/>] coordinates (row-major, as float) from the
+    /// prefix <see cref="NonZeroPrefix"/> returned.
+    /// </summary>
+    public void NonZeroGather(ArrayView1D<int, Stride1D.Dense> prefix, int n, int[] shape, int count, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        if (count == 0) return;
+        _nonZeroGatherKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(NonZeroGatherRowImpl);
+        int rank = shape.Length;
+        if (rank == 0)
+            return;   // rank-0 input: output [0, count] holds no values
+        int steps = 1;
+        while ((1 << (steps - 1)) < n) steps++;
+        int stride = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            _nonZeroGatherKernel(count, prefix, output.SubView(d * count, count), n, stride, Math.Max(1, shape[d]), steps);
+            stride *= shape[d];
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    //  LogSoftmax along any axis, computed in log space
+    // ──────────────────────────────────────────────
+    // [outer, axisDim, inner]: per column (outer, inner) the log-sum-exp max + log(sum exp(x - max)), then
+    // out = x - lse. Never log(softmax(x)): that underflows for very negative x (-31.4 where -31.1 is right, -inf past
+    // ~1e-38). Both kernels write only their own slot and loop over the uniform axisDim (WebGL-safe).
+    private static void LogSoftmaxStatsImpl(Index1D c, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> lse,
+        int axisDim, int inner)
+    {
+        int o = c / inner;
+        int i = c - o * inner;
+        int baseIdx = o * axisDim * inner + i;
+        float mx = float.NegativeInfinity;
+        for (int a = 0; a < axisDim; a++)
+        {
+            float v = input[baseIdx + a * inner];
+            if (v > mx) mx = v;
+        }
+        float sum = 0f;
+        for (int a = 0; a < axisDim; a++)
+            sum += MathF.Exp(input[baseIdx + a * inner] - mx);
+        lse[c] = mx + MathF.Log(sum);
+    }
+
+    private static void LogSoftmaxApplyImpl(Index1D t, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> lse,
+        ArrayView1D<float, Stride1D.Dense> output, int axisDim, int inner)
+    {
+        int block = axisDim * inner;
+        int o = t / block;
+        int i = (t - o * block) % inner;
+        output[t] = input[t] - lse[o * inner + i];
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _logSoftmaxStatsKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _logSoftmaxApplyKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _logSoftmaxStats;
+
+    /// <summary>LogSoftmax of an [outer, axisDim, inner] tensor along axisDim. <paramref name="output"/> must not alias
+    /// <paramref name="input"/>.</summary>
+    public void LogSoftmax(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int outer, int axisDim, int inner)
+    {
+        _logSoftmaxStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(LogSoftmaxStatsImpl);
+        _logSoftmaxApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(LogSoftmaxApplyImpl);
+        int cols = outer * inner;
+        if (_logSoftmaxStats == null || _logSoftmaxStats.Length < cols)
+        {
+            // Retired, not disposed: a queued dispatch may still reference it (see the class notes).
+            if (_logSoftmaxStats != null) _oldTopKIdxBufs.Add(_logSoftmaxStats);
+            _logSoftmaxStats = _accelerator.Allocate1D<float>(cols);
+        }
+        var lse = _logSoftmaxStats.View.SubView(0, cols);
+        _logSoftmaxStatsKernel(cols, input, lse, axisDim, inner);
+        _logSoftmaxApplyKernel(cols * axisDim, input, lse, output, axisDim, inner);
     }
 
     /// <summary>

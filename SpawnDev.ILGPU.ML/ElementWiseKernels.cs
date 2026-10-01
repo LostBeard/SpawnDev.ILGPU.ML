@@ -974,7 +974,10 @@ public class ElementWiseKernels : IDisposable
     private static void ExpImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     {
         float x = input[idx];
-        output[idx] = x > 80f ? float.PositiveInfinity : (x < -80f ? 0f : MathF.Exp(x));
+        // Guard at float's TRUE limits only (WGSL leaves an overflowing exp indeterminate): exp(x) is finite up to
+        // ln(FLT_MAX) = 88.72284 and non-zero down to ln(smallest subnormal) = -103.97208. The old +-80 guard returned
+        // +inf for exp(85) = 8.2e36 and 0 for exp(-85) = 1.2e-37 (2026-10-01).
+        output[idx] = x > 88.72284f ? float.PositiveInfinity : (x < -103.97208f ? 0f : MathF.Exp(x));
     }
 
     private static void DivImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
