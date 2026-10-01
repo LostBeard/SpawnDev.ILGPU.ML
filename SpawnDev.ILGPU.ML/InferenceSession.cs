@@ -1763,6 +1763,9 @@ public class InferenceSession : IDisposable
                 if (IsOnnxShapeParamSlot(node.OpType, i)) continue;
                 if (!compiled.InitializerNames.Contains(name)) continue;
                 if (gpuWeights.ContainsKey(name)) continue;
+                // A constant the optimizer folded has no weight here by design: the executor uploads it
+                // (GraphExecutor.UploadOptimizerFoldedInitializers), on every load path.
+                if (compiled.OptimizerFoldedInitializers?.ContainsKey(name) == true) continue;
                 throw new InvalidOperationException(
                     $"GPU-consumed initializer '{name}' was not uploaded (needed by {node.OpType} as input[{i}]). " +
                     "Likely missing external data (model.onnx_data) or a stream-upload skip. " +

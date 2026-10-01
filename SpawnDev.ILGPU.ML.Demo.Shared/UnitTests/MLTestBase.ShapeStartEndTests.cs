@@ -51,6 +51,27 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available for this backend");
         var bytes = await http.GetByteArrayAsync("models/tests/conv_nobias_shape_window.onnx");
         using var session = InferenceSession.CreateFromOnnx(accelerator, bytes);
+        await CheckConvNoBiasShapeWindow(accelerator, session);
+    });
+
+    /// <summary>
+    /// The same model through the STREAM loader (2026-10-01; what the hub / IModelSource path uses): its load-time check
+    /// that every GPU-consumed initializer was uploaded counted the optimizer-folded constants (uploaded by the executor
+    /// afterwards) as missing, so SpawnScene's RaCo-ALIKED hub load threw "GPU-consumed initializer 'val_19' was not
+    /// uploaded (needed by Concat as input[1])" where the byte-array loader worked.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task Shape_StartEnd_OfInitializer_ConvNoBias_StreamLoad() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available for this backend");
+        var bytes = await http.GetByteArrayAsync("models/tests/conv_nobias_shape_window.onnx");
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, new MemoryStream(bytes));
+        await CheckConvNoBiasShapeWindow(accelerator, session);
+    });
+
+    static async Task CheckConvNoBiasShapeWindow(Accelerator accelerator, InferenceSession session)
+    {
         var x = new float[12];
         for (int i = 0; i < 12; i++) x[i] = i;
         using var xB = accelerator.Allocate1D(x);
@@ -82,7 +103,7 @@ public abstract partial class MLTestBase
                 if (MathF.Abs(yv[o * 4 + p] - want) > 1e-4f)
                     throw new Exception($"y[0,{o},{p / 2},{p % 2}] = {yv[o * 4 + p]}, expected {want}");
             }
-    });
+    }
 
     /// <summary>
     /// The optimizer's constant folds on FLOAT constants (2026-10-01). Its fold pass reads ConstantData, an int[]

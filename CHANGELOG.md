@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.1-local)
 
+- **Stream loads accept optimizer-folded constants** (Tuvok, 5.3.1-local.9): `CreateFromOnnxStreamAsync` (and so
+  `CreateFromStreamAsync` / every `IModelSource` hub load) checked that each GPU-consumed initializer was uploaded and
+  counted the optimizer's folded constants - which the executor uploads itself - as missing. SpawnScene's RaCo-ALIKED hub
+  load threw "GPU-consumed initializer 'val_19' was not uploaded (needed by Concat as input[1])" where the byte-array load
+  worked. Test: `Shape_StartEnd_OfInitializer_ConvNoBias_StreamLoad` (the conv-no-bias model through the stream loader;
+  red before the fix on the CPU lane: "'s' was not uploaded (needed by Expand as input[0])").
+
 - **No-readback depth for per-frame consumers** (Geordi, for Anaglyphohol video):
   `DepthEstimationPipeline.EstimateGpuRawAsync(rgba, w, h, rawDepthOut, minMaxOut, outW, outH)` writes the raw depth
   into a caller view and its min/max into a caller 2-float view, ON THE DEVICE. No readback and no per-call
