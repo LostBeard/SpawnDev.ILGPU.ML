@@ -466,6 +466,7 @@ public abstract partial class MLTestBase : IDisposable
         Graph.GraphExecutor.SuppressDrains, Graph.GraphExecutor.UseCaptureParamSlots,
         Graph.GraphExecutor.QueueOrderedDrains, Graph.GraphExecutor.CaptureImmediateReturn,
         Graph.GraphExecutor.KeepDrainsDuringCapture);
+    private static readonly bool _foldWarmSkipDefault = Graph.GraphExecutor.FoldWarmSkipFolded;
 
     private static void ResetStaticCaptureState()
     {
@@ -479,6 +480,8 @@ public abstract partial class MLTestBase : IDisposable
         Graph.GraphExecutor.QueueOrderedDrains = d.OrderedDrains;
         Graph.GraphExecutor.CaptureImmediateReturn = d.ImmediateReturn;
         Graph.GraphExecutor.KeepDrainsDuringCapture = d.KeepDrains;
+        Graph.GraphExecutor.FoldWarmSkipFolded = _foldWarmSkipDefault;
+        Graph.GraphExecutor.DiagSkipOperatorExecute = false;   // ablation switch: garbage outputs while set
         try { Graph.GraphExecutor.CapturedOutputs = null; } catch { }
         try { Graph.GraphExecutor.CapturedNodeInfo = null; } catch { }
         try { Graph.GraphExecutor.CapturedNodeTimingsMs = null; } catch { }

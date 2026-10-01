@@ -79,7 +79,7 @@ public abstract partial class MLTestBase
                     var asp = WebGPUBackend.ProfileCpuArgsSplitMs;
                     Console.WriteLine($"[DirectForwardProfile] {repo} {size} ARGS expand+manifest {asp[0]:F1} + views {asp[1]:F1} + scalars {asp[2]:F1} ms");
                     var ph = Graph.GraphExecutor.OpPhaseMs;
-                    Console.WriteLine($"[DirectForwardProfile] {repo} {size} PHASES prelude {ph[0]:F1} + inputs {ph[1]:F1} + shapes {ph[2]:F1} + rent {ph[3]:F1} + execute {ph[4]:F1} + post {ph[5]:F1} ms");
+                    Console.WriteLine($"[DirectForwardProfile] {repo} {size} PHASES {string.Join(" + ", Graph.GraphExecutor.OpPhaseNames.Select((n, i) => $"{n} {ph[i]:F1}"))} ms");
                     foreach (var (who, cnt) in WebGPUBackend.ProfileBatchSubmitCallers.OrderByDescending(kv => kv.Value).Take(8))
                         Console.WriteLine($"[DirectForwardProfile] {repo} {size} SUBMIT x{cnt} {who}");
                     Console.WriteLine($"[DirectForwardProfile] {repo} {size} RunKernel alloc={WebGPUBackend.ProfileCpuAllocBytes / 1048576.0:F1}MiB over {WebGPUBackend.ProfileCpuDispatchCount} dispatches = shader {WebGPUBackend.ProfileCpuAllocByPhase[0] / 1048576.0:F1} + args {WebGPUBackend.ProfileCpuAllocByPhase[1] / 1048576.0:F1} + bindGroup {WebGPUBackend.ProfileCpuAllocByPhase[2] / 1048576.0:F1} + encode {WebGPUBackend.ProfileCpuAllocByPhase[3] / 1048576.0:F1} MiB");

@@ -1,4 +1,4 @@
-﻿using ILGPU;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Operators;
@@ -103,6 +103,27 @@ public class GraphExecutor : IDisposable
     /// </remarks>
     public static bool FoldInputIndependentNodes = true;
     private bool[]? _foldNode;                                // per node index: skipped on a warm forward
+    // The node indices a WARM forward visits: every non-folded node, plus the folded nodes that consume a VARYING
+    // input (Shape/Size fold on a varying input - and may be its last consumer, so their release must still run).
+    // Every other folded node is skipped without a loop iteration: its inputs are fold results, weights or constants,
+    // none of which a warm forward holds in the pool, so its release is a no-op. DAv3: 2,524 nodes -> ~850 visited.
+    private int[]? _foldWarmOrder;
+    private int _foldWarmSkipped;                             // folded nodes _foldWarmOrder leaves out
+
+    /// <summary>
+    /// A warm folded forward visits only <see cref="_foldWarmOrder"/> instead of walking every folded node (~4 us of
+    /// interpreted bookkeeping each in a browser; DAv3 has 1,678). On by default; the switch exists so a test can
+    /// prove the skip changes nothing - outputs bit-identical, the same bytes released.
+    /// </summary>
+    public static bool FoldWarmSkipFolded = true;
+
+    /// <summary>
+    /// DIAGNOSTIC ABLATION - OUTPUTS ARE GARBAGE WHILE SET. Skips every operator's ExecuteAsync and keeps everything
+    /// else the executor does per node (input gather, shape resolution, rent, release, drains). The time of a forward
+    /// with this set is the executor's own bookkeeping, measured WITHOUT per-node profiling marks - which in a browser
+    /// cost more than the bookkeeping they try to time. Off by default; never set it outside a measurement.
+    /// </summary>
+    public static bool DiagSkipOperatorExecute;
     private HashSet<string>? _foldFrontier;                   // folded outputs a non-folded node consumes
     private Dictionary<string, Tensor>? _foldTensors;         // executor-owned copies of the frontier tensors
     private List<MemoryBuffer1D<float, Stride1D.Dense>>? _foldBuffers;   // ...and the buffers behind them
@@ -114,14 +135,25 @@ public class GraphExecutor : IDisposable
 
     /// <summary>DIAGNOSTIC: nodes the most recent RunAsync skipped because their folded result was reused.</summary>
     public static int LastRunFoldedNodes;
+    /// <summary>DIAGNOSTIC: of <see cref="LastRunFoldedNodes"/>, those a warm forward still VISITED to release a varying
+    /// input (see <see cref="_foldWarmOrder"/>). The rest were skipped without a loop iteration.</summary>
+    public static int LastRunFoldedVisited;
     /// <summary>DIAGNOSTIC: why the most recent RunAsync did or did not fold (see FoldInputIndependentNodes).</summary>
     public static string LastRunFoldState = "";
     private string? _foldAbortReason;
 
-    /// <summary>DIAGNOSTIC (filled only while <see cref="OpProfile"/> is set): host ms of the node loop by phase -
-    /// [0 prelude + shape interpreter, 1 input gather, 2 runtime shape resolution, 3 output rent,
-    /// 4 context + Execute, 5 post (readback checks, releases, drain)].</summary>
-    public static readonly double[] OpPhaseMs = new double[6];
+    /// <summary>DIAGNOSTIC (filled only while <see cref="OpProfile"/> is set): host ms of the node loop by phase, named by
+    /// <see cref="OpPhaseNames"/>. Executed nodes: 0 prelude + shape interpreter, 1 input gather, 2 runtime shape
+    /// resolution, 3 output rent, 4 op context + decode intercepts, 7 the operator's ExecuteAsync (its own host work
+    /// plus the backend's dispatch CPU), 5 small-output readback checks, 8 input/dead-output releases, 9 op log + drain
+    /// point. Folded nodes (input-independent, bound from the fold): 6, all of it.</summary>
+    public static readonly double[] OpPhaseMs = new double[10];
+
+    /// <summary>Names of the <see cref="OpPhaseMs"/> slots, by index.</summary>
+    public static readonly string[] OpPhaseNames =
+    {
+        "prelude", "inputs", "shapes", "rent", "context", "readbackChecks", "folded", "execute", "release", "drain",
+    };
 
     /// <summary>Ops never folded (nondeterministic, control flow, host sequences) - nor anything downstream of them.</summary>
     private static readonly HashSet<string> NeverFoldOps = new(StringComparer.Ordinal)
@@ -141,9 +173,12 @@ public class GraphExecutor : IDisposable
         var varying = new HashSet<string>(tainted, StringComparer.Ordinal);
         var foldedOutputs = new HashSet<string>(StringComparer.Ordinal);
         int count = 0;
+        var consumesVarying = new bool[nodes.Length];
         for (int i = 0; i < nodes.Length; i++)
         {
             var n = nodes[i];
+            foreach (var inp in n.InputNames)
+                if (!string.IsNullOrEmpty(inp) && varying.Contains(inp)) { consumesVarying[i] = true; break; }
             // A Constant always runs (it is free) and its value never varies, so it neither folds nor blocks.
             if (n.OpType == "Constant") continue;
             bool ok = !NeverFoldOps.Contains(n.OpType) && n.OutputNames.Length > 0;
@@ -161,7 +196,7 @@ public class GraphExecutor : IDisposable
             }
             if (ok) count++;
         }
-        if (count == 0) { _foldNode = null; _foldFrontier = null; return; }
+        if (count == 0) { _foldNode = null; _foldFrontier = null; _foldWarmOrder = null; _foldWarmSkipped = 0; return; }
         var frontier = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < nodes.Length; i++)
         {
@@ -171,6 +206,11 @@ public class GraphExecutor : IDisposable
         }
         _foldNode = fold;
         _foldFrontier = frontier;
+        var order = new List<int>(nodes.Length - count + 16);
+        for (int i = 0; i < nodes.Length; i++)
+            if (!fold[i] || consumesVarying[i]) order.Add(i);
+        _foldWarmOrder = order.ToArray();
+        _foldWarmSkipped = nodes.Length - _foldWarmOrder.Length;
     }
 
     /// <summary>True when <paramref name="name"/>'s value depends on graph-input DATA. See <see cref="_inputTaintedOutputs"/>.</summary>
@@ -3216,6 +3256,7 @@ public class GraphExecutor : IDisposable
         Dictionary<string, float[]>? foldValuesRec = null, foldInterpRec = null;
         bool foldAbort = false;
         LastRunFoldedNodes = 0;
+        LastRunFoldedVisited = 0;
         LastRunFoldState = !FoldInputIndependentNodes ? "off"
             : _foldNode == null ? "no foldable nodes"
             : _foldDisabled ? $"disabled ({_foldAbortReason})"
@@ -3581,17 +3622,32 @@ public class GraphExecutor : IDisposable
         }
         if (opProf != null) System.Array.Clear(OpPhaseMs);
 
-        foreach (var node in _graph.Nodes)
+        // Drain cadence for this forward (read once - see DrainDue).
+        int drainInterval = EffectiveSyncInterval;
+        long drainMaxPending = EffectiveMaxPendingReleaseBytes;
+        // The cheap synchronous half of DrainPointAsync's test: most nodes drain nothing, and an awaited async local
+        // function costs a state machine per node in the browser's interpreter even when it returns at once.
+        bool DrainDue() => !(SuppressDrains && !KeepDrainsDuringCapture)
+            && (nodeIdx % drainInterval == 0 || pendingReleaseBytes - pinnedBytesFloor >= drainMaxPending);
+
+        var loopNodes = _graph.Nodes;
+        int[]? warmOrder = foldWarm && FoldWarmSkipFolded ? _foldWarmOrder : null;
+        int loopCount = warmOrder?.Length ?? loopNodes.Length;
+        if (warmOrder != null) LastRunFoldedNodes += _foldWarmSkipped;
+        for (int loopPos = 0; loopPos < loopCount; loopPos++)
         {
+            var node = loopNodes[warmOrder != null ? warmOrder[loopPos] : loopPos];
             if (opProf != null) OpProfileMark(node.OpType);
             if (opProf != null) PhaseMark(0);
-            foldLoopIdx++;
+            foldLoopIdx = warmOrder != null ? warmOrder[loopPos] : foldLoopIdx + 1;
             if (foldRecord && foldLoopIdx > 0 && _foldNode![foldLoopIdx - 1]) FoldKeep(foldLoopIdx - 1);
             if (foldWarm && _foldNode![foldLoopIdx])
             {
+                if (opProf != null) PhaseMark(6);
                 // Folded: its result is bound already. Its inputs are still consumed, so release them on time.
                 ReleaseConsumedInputs(node);
                 LastRunFoldedNodes++;
+                LastRunFoldedVisited++;
                 continue;
             }
             // The previous node is finished on every path through this body (including each `continue`).
@@ -4857,8 +4913,10 @@ public class GraphExecutor : IDisposable
                 // shapeCacheHit: buffer already holds the correct dims from a prior step — skip.
                 // convStateHandled: ShortConv already ran through the conv-state cache above — skip.
                 if (CaptureTraceFile != null && !shapeCacheHit) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> DISPATCH\n"); } catch { } }
-                if (!shapeCacheHit && !convStateHandled && !AllOutputsEmpty(nodeOutputs))
+                if (opProf != null) PhaseMark(7);
+                if (!shapeCacheHit && !convStateHandled && !AllOutputsEmpty(nodeOutputs) && !DiagSkipOperatorExecute)
                     await node.Operator.ExecuteAsync(ctx);
+                if (opProf != null) PhaseMark(4);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
                 // WebGPU command-encoder errors) surface AT the failing node instead of
@@ -5251,15 +5309,17 @@ public class GraphExecutor : IDisposable
             }
 
             // Defer buffer release to sync points to prevent reuse while GPU is in-flight
+            if (opProf != null) PhaseMark(8);
             ReleaseConsumedInputs(node);
             ReleaseDeadOutputs(node);
 
+            if (opProf != null) PhaseMark(9);
             nodeIdx++;
             _opLog.Add((nodeIdx, node.OpType, null));
 
             // Flush GPU command buffer periodically (every SyncIntervalNodes, or early when the deferred-release
             // backlog exceeds MaxPendingReleaseBytes) and return the drained buffers. See DrainPointAsync.
-            await DrainPointAsync();
+            if (DrainDue()) await DrainPointAsync();
 
             // DIAGNOSTIC: stop early at requested node count to bisect failures.
             if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value)

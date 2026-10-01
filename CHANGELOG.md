@@ -15,6 +15,20 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   (all 6 backends), `Depth_NoReadback_CallerBuffers_MatchAllocating` (HeavyModel, all 6: 2 frames + 5 NativeAspect
   shapes queued unsynced, bit-exact vs the allocating path); each guard red-checked.
 
+- **Warm folded forwards skip folded nodes** (Geordi): `GraphExecutor` visits only the non-folded nodes plus the
+  folded ones that consume a varying input (Shape/Size fold on one and may be its last consumer, so their release
+  still runs). DAv3: 2,524 nodes, 1,678 folded, no loop iteration for those. `FoldWarmSkipFolded` (default on) exists
+  for the A/B gate; `LastRunFoldedVisited` reports the kept ones. A per-node drain point is now a synchronous check
+  before the await. MEASURED in a browser (Anaglyphohol DAv3 video, 168x98): 46.2 -> 45.6 ms median - small, because
+  the per-op profile that pointed here was mostly its own overhead (see `DiagSkipOperatorExecute`). Tests:
+  `FoldWarmSkip_ReleasesAndOutputsUnchanged` (models/tests/fold_shape_last_consumer.onnx, all backends: outputs and
+  pool free bytes identical; red-checked - skipping the folded Shape leaves 1 KiB unreleased) and
+  `FoldWarmSkip_DAv2_BitIdentical`.
+- **Diagnostics**: `OpPhaseMs` splits into 10 named phases (`OpPhaseNames`); `DiagSkipOperatorExecute` is an
+  ABLATION switch (skips every operator's ExecuteAsync, outputs garbage) that times the executor's own bookkeeping
+  without per-node marks. MEASURED (same frame): ~48 ms forward, ~10 ms with operators skipped - the operators'
+  ExecuteAsync + dispatch are ~38 ms, the bookkeeping ~10.
+
 ## 5.3.0 - 2026-09-30 - on SpawnDev.ILGPU 5.3.0 + SpawnDev.SpawnJS 3.0.0
 
 Dependency release: SpawnDev.SpawnJS 2.1.20 -> 3.0.0 (one-crossing interop) and SpawnDev.ILGPU 5.2.25 -> 5.3.0 (built on
