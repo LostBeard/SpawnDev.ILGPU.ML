@@ -60,17 +60,31 @@ public class ImagePostprocessKernel : IDisposable
     /// </summary>
     public async Task<(float Min, float Max)> MinMaxAsync(ArrayView1D<float, Stride1D.Dense> data, int count)
     {
+        _minMaxResult ??= _accelerator.Allocate1D<float>(2);
+        MinMax(data, count, _minMaxResult.View);
+        var r = await _minMaxResult.View.SubView(0, 2).CopyToHostAsync();
+        return (r[0], r[1]);
+    }
+
+    /// <summary>
+    /// Min + max of <paramref name="count"/> floats into <paramref name="result"/> (<c>[0]</c> = min, <c>[1]</c> = max)
+    /// ON THE DEVICE - enqueue only, no readback, no host sync. For consumers whose next kernels need the range
+    /// (depth normalization for display, a 3D reprojection): they read it from <paramref name="result"/> and the
+    /// frame never waits on a GPU->CPU round trip. Same two dispatches and NaN rule as <see cref="MinMaxAsync"/>.
+    /// </summary>
+    public void MinMax(ArrayView1D<float, Stride1D.Dense> data, int count, ArrayView1D<float, Stride1D.Dense> result)
+    {
+        if (count <= 0) throw new ArgumentOutOfRangeException(nameof(count), "min/max of an empty range is undefined");
+        if (data.Length < count) throw new ArgumentException($"data has {data.Length} elements, count is {count}", nameof(data));
+        if (result.Length < 2) throw new ArgumentException($"result needs 2 elements (min, max), has {result.Length}", nameof(result));
         const int p = MinMaxP;
         _minMaxPartials ??= _accelerator.Allocate1D<float>(2 * p);
-        _minMaxResult ??= _accelerator.Allocate1D<float>(2);
         _minMaxPartialKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(MinMaxPartialImpl);
         _minMaxFinalKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MinMaxFinalImpl);
         _minMaxPartialKernel(p, data, _minMaxPartials.View, count, p);
-        _minMaxFinalKernel(1, _minMaxPartials.View, _minMaxResult.View, p);
-        var r = await _minMaxResult.View.SubView(0, 2).CopyToHostAsync();
-        return (r[0], r[1]);
+        _minMaxFinalKernel(1, _minMaxPartials.View, result, p);
     }
 
     private static void MinMaxPartialImpl(Index1D tid,

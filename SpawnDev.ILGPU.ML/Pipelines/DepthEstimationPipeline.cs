@@ -655,26 +655,92 @@ public class DepthEstimationPipeline : IDisposable
             int outputWidth = 0, int outputHeight = 0)
         => EstimateGpuRawCoreAsync(rgbaPixels.View, width, height, outputWidth, outputHeight);
 
+    /// <summary>
+    /// The per-frame video path: GPU-resident packed RGBA in, raw depth written into the caller's
+    /// <paramref name="rawDepthOut"/> (at least <c>Width * Height</c> floats) and its min/max into the caller's
+    /// <paramref name="minMaxOut"/> (<c>[0]</c> = min, <c>[1]</c> = max) - both on the device. NOTHING is read back
+    /// and nothing is allocated per call: the frame never waits on a GPU->CPU round trip, and the caller's next
+    /// kernels read the range from <paramref name="minMaxOut"/>. Same values as the allocating overloads.
+    /// </summary>
+    /// <remarks>
+    /// Returns once the work is ENQUEUED; anything dispatched after it on this accelerator sees the results (one
+    /// in-order queue). Like the capture path, one call at a time per pipeline (the input buffer is reused).
+    /// </remarks>
+    /// <exception cref="ArgumentException"><paramref name="rawDepthOut"/> is smaller than the output grid, or
+    /// <paramref name="minMaxOut"/> has fewer than 2 elements.</exception>
+    public async Task<(int Width, int Height)> EstimateGpuRawAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        ArrayView1D<float, Stride1D.Dense> rawDepthOut, ArrayView1D<float, Stride1D.Dense> minMaxOut,
+        int outputWidth = 0, int outputHeight = 0)
+    {
+        if (!rawDepthOut.IsValid) throw new ArgumentException("rawDepthOut is not a valid view", nameof(rawDepthOut));
+        if (minMaxOut.Length < 2)
+            throw new ArgumentException($"minMaxOut needs 2 elements (min, max), has {minMaxOut.Length}", nameof(minMaxOut));
+        var (_, depth, outW, outH) = await ForwardDepthAsync(rgbaPixels, width, height, outputWidth, outputHeight, rawDepthOut)
+            .ConfigureAwait(false);
+        _postprocess.MinMax(depth, outW * outH, minMaxOut);
+        return (outW, outH);
+    }
+
     private async Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
         EstimateGpuRawCoreAsync(ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
             int outputWidth, int outputHeight)
     {
+        var (rawDepth, depth, outW, outH) = await ForwardDepthAsync(rgbaPixels, width, height, outputWidth, outputHeight, default)
+            .ConfigureAwait(false);
+        int outSize = outW * outH;
+        // The only readback: the 8-BYTE min/max scalar pair from the GPU reduction (was: the full ~1MB resized
+        // map + host LINQ - the dominant share of the video-path postprocess cost).
+        var (minD, maxD) = await _postprocess.MinMaxAsync(depth, outSize);
+
+        if (InferenceSession.VerboseLogging)
+        {
+            // Diagnostic-only full readback (the production path above never touches the host).
+            var resizedHost = await rawDepth!.CopyToHostAsync<float>(0, outSize);
+            Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
+        }
+        return (rawDepth!, minD, maxD, outW, outH);
+    }
+
+    /// <summary>The plain (non-capture) forward's input, reused across calls; grown only after an awaited drain.</summary>
+    private MemoryBuffer1D<float, Stride1D.Dense>? _directInput;
+
+    /// <summary>
+    /// Preprocess -> forward -> GPU bilinear resize to the output grid, ENQUEUED (no readback). Writes into
+    /// <paramref name="rawDepthOut"/> when it is a valid view (<c>Owned</c> is then null), otherwise into a fresh
+    /// buffer the caller owns.
+    /// </summary>
+    private async Task<(MemoryBuffer1D<float, Stride1D.Dense>? Owned, ArrayView1D<float, Stride1D.Dense> Depth, int Width, int Height)>
+        ForwardDepthAsync(ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+            int outputWidth, int outputHeight, ArrayView1D<float, Stride1D.Dense> rawDepthOut)
+    {
+        bool callerOut = rawDepthOut.IsValid;
         // Graph-capture path (opt-in; CUDA graphs / WebGPU dispatch plans): preprocess into a STABLE input
         // buffer the captured graph reads, then capture-once / replay-many. The per-frame preprocess dispatch
         // writes fresh data into that stable buffer and is queue-ordered before the replay's submit, so the
         // replay reads the new frame with NO extra copy. Falls back to a normal forward on other backends or
-        // if capture is unavailable (TryCaptureAsync returns null). Non-capture path uses a transient input.
+        // if capture is unavailable (TryCaptureAsync returns null). The non-capture path reuses _directInput: a
+        // per-call transient could not be disposed until the GPU is done with it, and the no-readback overload
+        // never waits for that (Wasm frees on dispose; WebGPU would pay an extra submit per frame).
         bool useCapture = UseCapture;
         var (inW, inH) = ModelInputSize(width, height);
         int inElems = 3 * inW * inH;
-        MemoryBuffer1D<float, Stride1D.Dense>? transientInput = null;
         ArrayView1D<float, Stride1D.Dense> preInput;
         if (useCapture)
             preInput = await SlotInputAsync(_singleSlot, inElems).ConfigureAwait(false);
         else
         {
-            transientInput = _accelerator.Allocate1D<float>(inElems);
-            preInput = transientInput.View;
+            if (_directInput == null || _directInput.Length < inElems)
+            {
+                if (_directInput != null)
+                {
+                    // A queued dispatch may still read the old one: drain first.
+                    await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+                    _directInput.Dispose();
+                }
+                _directInput = _accelerator.Allocate1D<float>(inElems);
+            }
+            preInput = _directInput.View.SubView(0, inElems);
         }
         await PreprocessAsync(rgbaPixels, width, height, preInput).ConfigureAwait(false);
 
@@ -703,39 +769,35 @@ public class DepthEstimationPipeline : IDisposable
         var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
         int outSize = outW * outH;
 
-        // GPU bilinear resize from rawW×rawH → outW×outH. The caller-owned buffer is
-        // returned untouched after this; the only readback is the 8-BYTE min/max scalar
-        // pair from the GPU reduction (was: the full ~1MB resized map + host LINQ - the
-        // dominant share of the video-path postprocess cost).
+        // GPU bilinear resize from rawW×rawH → outW×outH, into the caller's view or a fresh buffer.
         int readRawSize = Math.Min(rawSize, (int)output.Data.Length);
-        var rawDepth = _accelerator.Allocate1D<float>(outSize);
+        if (callerOut && rawDepthOut.Length < outSize)
+        {
+            if (ownOutputs) _session.ReturnOutputs(outputs);   // a throw must not leak the rented outputs
+            throw new ArgumentException($"rawDepthOut has {rawDepthOut.Length} elements, the {outW}x{outH} output needs {outSize}", nameof(rawDepthOut));
+        }
+        var rawDepth = callerOut ? null : _accelerator.Allocate1D<float>(outSize);
+        var depthView = callerOut ? rawDepthOut.SubView(0, outSize) : rawDepth!.View;
         var (cx2, cy2, cw2, ch2) = ContentRect(width, height, rawW, rawH);
         if (cx2 != 0 || cy2 != 0 || cw2 != rawW || ch2 != rawH)
         {
             // Letterboxed input: only the content rect is real picture.
             _postprocess.ResizeBilinearFromRect(
                 output.Data.SubView(0, readRawSize), rawW, rawH, cx2, cy2, cw2, ch2,
-                rawDepth.View, outW, outH);
+                depthView, outW, outH);
         }
         else
         {
             // TensorView<float> carries shape inline — kernel reads dims from D0/D1.
             var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, readRawSize), new[] { rawH, rawW });
-            var dstView = new Tensors.TensorView<float>(rawDepth.View, new[] { outH, outW });
+            var dstView = new Tensors.TensorView<float>(depthView, new[] { outH, outW });
             _postprocess.ResizeBilinear(srcView, dstView);
         }
-        var (minD, maxD) = await _postprocess.MinMaxAsync(rawDepth.View, outSize);
 
-        if (InferenceSession.VerboseLogging)
-        {
-            // Diagnostic-only full readback (the production path above never touches the host).
-            var resizedHost = await rawDepth.CopyToHostAsync<float>(0, outSize);
-            Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
-        }
-
-        transientInput?.Dispose();   // the stable capture input buffer is a member (disposed in Dispose)
-        if (ownOutputs) _session.ReturnOutputs(outputs);   // consumed above (resize + min/max); leaked otherwise
-        return (rawDepth, minD, maxD, outW, outH);
+        // Safe with the resize only ENQUEUED: a returned output goes back to the pool's buckets (not freed), and
+        // whatever rents it next writes it in queue order, after the resize has read it. Leaked otherwise.
+        if (ownOutputs) _session.ReturnOutputs(outputs);
+        return (rawDepth, depthView, outW, outH);
     }
 
     /// <summary>
@@ -1118,6 +1180,8 @@ public class DepthEstimationPipeline : IDisposable
         _multiSlot.Dispose();
         _nativeScratch?.Dispose();
         _nativeScratch = null;
+        _directInput?.Dispose();
+        _directInput = null;
         _postprocess.Dispose();
         _preprocess.Dispose();
         if (_ownsSession) _session.Dispose();

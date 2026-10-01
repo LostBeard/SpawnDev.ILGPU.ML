@@ -2,6 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (5.3.1-local)
+
+- **No-readback depth for per-frame consumers** (Geordi, for Anaglyphohol video):
+  `DepthEstimationPipeline.EstimateGpuRawAsync(rgba, w, h, rawDepthOut, minMaxOut, outW, outH)` writes the raw depth
+  into a caller view and its min/max into a caller 2-float view, ON THE DEVICE. No readback and no per-call
+  allocation, so a video frame never waits on a GPU->CPU round trip; the caller's kernels read the range from
+  `minMaxOut`. The new `ImagePostprocessKernel.MinMax(data, count, result)` (enqueue only) backs it, and `MinMaxAsync` is now
+  that plus the 8-byte readback. The plain forward reuses one input buffer (grown after an awaited drain, as
+  `_nativeScratch`) instead of a per-call transient. A short `rawDepthOut` throws ArgumentException: ILGPU's SubView
+  bounds check is a Trace.Assert that would otherwise kill the browser runtime. Tests: `MinMax_IntoDeviceView_MatchesHost`
+  (all 6 backends), `Depth_NoReadback_CallerBuffers_MatchAllocating` (HeavyModel, all 6: 2 frames + 5 NativeAspect
+  shapes queued unsynced, bit-exact vs the allocating path); each guard red-checked.
+
 ## 5.3.0 - 2026-09-30 - on SpawnDev.ILGPU 5.3.0 + SpawnDev.SpawnJS 3.0.0
 
 Dependency release: SpawnDev.SpawnJS 2.1.20 -> 3.0.0 (one-crossing interop) and SpawnDev.ILGPU 5.2.25 -> 5.3.0 (built on
