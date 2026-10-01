@@ -333,10 +333,13 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     /// <summary>Resolve the 2D conv spatial params (stride, asymmetric pads [top,left,bottom,right], dilations)
     /// from ctx attributes + input/weight shapes. Shared by <see cref="Execute"/> and the precision-aware path so
     /// the SAME_UPPER/SAME_LOWER and asymmetric-pad logic has a single source of truth.</summary>
-    internal static (int stride, int padTop, int padLeft, int padBottom, int padRight, int dilationH, int dilationW)
+    internal static (int stride, int strideW, int padTop, int padLeft, int padBottom, int padRight, int dilationH, int dilationW)
         ResolveConv2DSpatialParams(OnnxOpContext ctx, int[] xShape, int[] wShape, DataFormat fmt)
     {
+        // `stride` is the H (first spatial) stride, `strideW` the W one. They were collapsed to strides[0], so a
+        // non-square stride like (2,1) - common in OCR/audio convs - computed the W axis with the H stride.
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
+        int strideW = strides.Length > 1 ? strides[1] : stride;
         // ONNX `pads` = [x1_begin, x2_begin, x1_end, x2_end] = [top, left, bottom, right] for 2D.
         // Stride-2 SAME convs export asymmetric pads like [0,0,1,1] — keep all four (collapsing shears the grid).
         var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap) ? ap.ToString()! : "NOTSET";
@@ -347,7 +350,6 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
             int inW = xShape.Length >= 4 ? xShape[LayoutHelper.WidthAxis(fmt)] : 1;
             int kHa = wShape.Length >= 4 ? wShape[LayoutHelper.HeightAxis(fmt)] : (wShape.Length >= 3 ? wShape[2] : 1);
             int kWa = wShape.Length >= 4 ? wShape[LayoutHelper.WidthAxis(fmt)] : (wShape.Length >= 3 ? (wShape.Length > 3 ? wShape[3] : 1) : 1);
-            int strideW = strides.Length > 1 ? strides[1] : stride;
             int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kHa - inH);
             int padW = Math.Max(0, ((int)Math.Ceiling((double)inW / strideW) - 1) * strideW + kWa - inW);
             if (autoPad == "SAME_UPPER") { padTop = padH / 2; padBottom = padH - padH / 2; padLeft = padW / 2; padRight = padW - padW / 2; }
@@ -364,7 +366,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         var dilationsAttr = ctx.GetInts("dilations");
         int dilationH = dilationsAttr.Length > 0 ? dilationsAttr[0] : 1;
         int dilationW = dilationsAttr.Length > 1 ? dilationsAttr[1] : dilationH;
-        return (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+        return (stride, strideW, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
     }
 
     /// <summary>Precision-aware (F16) path: standard group-1 NCHW 2D Conv with a low-p activation input and an
@@ -390,8 +392,10 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         int outC = wShape[0];
         if (group != 1) return false;               // only standard (non-grouped, non-depthwise) here
         var (_, _, kH, kW) = LayoutHelper.GetWeightDims(wShape, ctx.Format);
-        var (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
+        var (stride, strideW, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
             ResolveConv2DSpatialParams(ctx, xShape, wShape, ctx.Format);
+        // The precision-aware kernels take one stride; a non-square one runs the fp32 path (exact, convert-around).
+        if (strideW != stride) return false;
 
         // Bias: fp32 input[2] if present (and fp32 — fall back if it's a fp16-stored bias, which is rare/tiny),
         // else the shared zero-bias buffer.
@@ -499,7 +503,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         var fmt = ctx.Format;
-        var (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
+        var (stride, strideW, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
             ResolveConv2DSpatialParams(ctx, x.Shape, w.Shape, fmt);
         int pad = padTop; // Conv1D below uses the (symmetric) begin pad
         int group = ctx.GetInt("group", 1);
@@ -552,40 +556,44 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 // Depthwise conv
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardDepthwiseNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else
                     reg.Conv2D.ForwardDepthwisePadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
             }
             else if (group == 1)
             {
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else if (LowPWeightDispatch.IsLowP(w)) // native low-p weight (NCHW group-1) -> generic low-p kernel, fp32 accumulate
                     LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else
                     reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN);
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {
                 // General grouped convolution: split into groups, conv each, concat
                 int inCPerGroup = inC / group;
                 int outCPerGroup = outC / group;
+                // Per IMAGE as well as per group: a group's channels are contiguous only within one image, so the
+                // group slices below covered image 0 alone and left the rest of a batch unwritten.
+                int outHW = ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3];
+                for (int b = 0; b < batchN; b++)
                 for (int g = 0; g < group; g++)
                 {
-                    int inOffset = g * inCPerGroup * inH * inW;
+                    int inOffset = (b * inC + g * inCPerGroup) * inH * inW;
                     int wOffset = g * outCPerGroup * inCPerGroup * kH * kW;
-                    int outOffset = g * outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3];
+                    int outOffset = (b * outC + g * outCPerGroup) * outHW;
                     // Use standard conv for each group slice
                     reg.Conv2D.ForwardPadded(
                         x.Data.SubView(inOffset, inCPerGroup * inH * inW),
                         w.Data.SubView(wOffset, outCPerGroup * inCPerGroup * kH * kW),
                         bias.SubView(g * outCPerGroup, outCPerGroup),
                         ctx.Outputs[0].Data.SubView(outOffset, outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3]),
-                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, 1, strideW);
                 }
             }
             else

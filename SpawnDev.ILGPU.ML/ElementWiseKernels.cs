@@ -4,7 +4,7 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML;
 
 /// <summary>Binary operations for GPU broadcast kernels.</summary>
-public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrEqual, GreaterOrEqual, And, Or, Xor, Min, Max, PRelu, Mod, BitwiseAnd, BitwiseOr, BitwiseXor, BitShiftLeft, BitShiftRight }
+public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrEqual, GreaterOrEqual, And, Or, Xor, Min, Max, PRelu, Mod, BitwiseAnd, BitwiseOr, BitwiseXor, BitShiftLeft, BitShiftRight, FloorMod }
 
 /// <summary>
 /// Element-wise neural network operations: GELU, ReLU, Add, Mul, AddBias.
@@ -256,7 +256,18 @@ public class ElementWiseKernels : IDisposable
     // Mod and the bitwise/shift family were in the same silently-adding group. ONNX carries integer tensors
     // through this float path, so each converts, operates, and converts back - the same expression the CPU
     // lambda at the call site uses, so the two paths cannot drift.
+    // ONNX Mod fmod=1: truncated remainder, sign of the DIVIDEND (C fmod; exact in IEEE float).
     static float BroadcastModOp(float a, float b) => b != 0f ? a % b : 0f;
+    // ONNX Mod fmod=0 (the default; integer inputs only, per the spec): floored remainder, sign of the DIVISOR
+    // (Python %). Computed in INTEGERS: a float % is not exact on every backend (CUDA returned -7 % 3 = -1.0000005).
+    static float BroadcastFloorModOp(float a, float b)
+    {
+        int ia = (int)a, ib = (int)b;
+        if (ib == 0) return 0f;
+        int r = ia % ib;
+        if (r != 0 && (r < 0) != (ib < 0)) r += ib;
+        return r;
+    }
     static float BroadcastBitwiseAndOp(float a, float b) => (float)((int)a & (int)b);
     static float BroadcastBitwiseOrOp(float a, float b) => (float)((int)a | (int)b);
     static float BroadcastBitwiseXorOp(float a, float b) => (float)((int)a ^ (int)b);
@@ -753,6 +764,7 @@ public class ElementWiseKernels : IDisposable
             BroadcastOp.Max => new DelegateSpecialization<Func<float, float, float>>(BroadcastMaxOp),
             BroadcastOp.PRelu => new DelegateSpecialization<Func<float, float, float>>(BroadcastPReluOp),
             BroadcastOp.Mod => new DelegateSpecialization<Func<float, float, float>>(BroadcastModOp),
+            BroadcastOp.FloorMod => new DelegateSpecialization<Func<float, float, float>>(BroadcastFloorModOp),
             BroadcastOp.BitwiseAnd => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseAndOp),
             BroadcastOp.BitwiseOr => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseOrOp),
             BroadcastOp.BitwiseXor => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseXorOp),

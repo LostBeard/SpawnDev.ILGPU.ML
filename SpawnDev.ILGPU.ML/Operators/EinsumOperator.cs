@@ -151,7 +151,18 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
                 int M = 1; foreach (var d in aFreeDims) M *= dimSizes.GetValueOrDefault(d, 1);
                 int N = 1; foreach (var d in bFreeDims) N *= dimSizes.GetValueOrDefault(d, 1);
 
-                if (batchSize * M * K == ctx.Inputs[0].ElementCount &&
+                // ⚠️ The LAYOUT must be a row-major batched matmul, not just the element counts: A = batch..., aFree...,
+                // k; B = batch..., k, bFree...; out = batch..., aFree..., bFree... (each group in the same order). The
+                // counts alone accepted RaCo-ALIKED's "bkn,kd->bnd" (k in the MIDDLE of A) and multiplied the wrong
+                // elements - its sub-pixel keypoint offsets (2026-10-01). Anything else takes the general kernel below.
+                var batchOrder = aLabels.Where(c => batchLabels.Contains(c)).ToArray();
+                bool rowMajorMatMul =
+                    aLabels.SequenceEqual(batchOrder.Concat(aFreeDims).Append(k))
+                    && bLabels.SequenceEqual(batchOrder.Append(k).Concat(bFreeDims))
+                    && oLabels.SequenceEqual(batchOrder.Concat(aFreeDims).Concat(bFreeDims));
+
+                if (rowMajorMatMul &&
+                    batchSize * M * K == ctx.Inputs[0].ElementCount &&
                     batchSize * K * N == ctx.Inputs[1].ElementCount &&
                     batchSize * M * N == ctx.Outputs[0].ElementCount)
                 {

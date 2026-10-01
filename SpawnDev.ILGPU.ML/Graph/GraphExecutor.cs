@@ -24,6 +24,8 @@ public class GraphExecutor : IDisposable
     private readonly CompiledGraph _graph;
     private readonly BufferPool _pool;
     private readonly Dictionary<string, Tensor> _weights;
+    // Executor-owned buffers for CompiledGraph.OptimizerFoldedInitializers - see the constructor.
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _optimizerFoldedBuffers;
     private readonly Dictionary<string, float[]>? _constantValues;
     private readonly ElementWiseKernels _ew;
 
@@ -1014,6 +1016,11 @@ public class GraphExecutor : IDisposable
     /// on WebGPU GPT-2 (53 readbacks) for values nothing reads. See <see cref="BuildReadbackSkipSet"/>
     /// for the safety rules (never skips anything a value-needing op consumes).</summary>
     private readonly HashSet<string> _readbackSkipNames;
+    /// <summary>Graph inputs a node reads DIRECTLY as a host value (TopK's K, Range's bounds, a Reshape target...).
+    /// Every other host value is a node output, read back after its node runs; a graph input has no producing node,
+    /// so these were never read at all - TopK with K as an input ran with the compile-time upper bound (2026-10-01).
+    /// Direct slots only: an input reaching a host value through other ops is read back at those ops' outputs.</summary>
+    private readonly string[] _hostValueGraphInputs;
     /// <summary>DIAGNOSTIC: count of names in <see cref="_readbackSkipNames"/> for the most recently
     /// constructed executor.</summary>
     public static int LastReadbackSkipCount;
@@ -1228,8 +1235,8 @@ public class GraphExecutor : IDisposable
         _graph = graph;
         _ownsPool = sharedPool == null;
         _pool = sharedPool ?? new BufferPool(accelerator);
-        _weights = weights;
-        _constantValues = constantValues;
+        _weights = UploadOptimizerFoldedInitializers(accelerator, graph, weights, out _optimizerFoldedBuffers);
+        _constantValues = MergeOptimizerFoldedValues(graph, constantValues);
         _quantizedWeights = quantizedWeights;
         _registry = registry;
         // 🔴 THE REGISTRY ALREADY OWNS THESE, and building a second set per executor is what makes a
@@ -1254,6 +1261,7 @@ public class GraphExecutor : IDisposable
         LastIntegerTensorCount = _integerTensorNames.Count;
         LastIntegerTensorNames = _integerTensorNames.ToList();
         _readbackSkipNames = BuildReadbackSkipSet(graph);
+        _hostValueGraphInputs = HostValueGraphInputs(graph, _weights);
         LastReadbackSkipCount = _readbackSkipNames.Count;
 
         // Auto-detect KV cache pattern
@@ -1387,6 +1395,21 @@ public class GraphExecutor : IDisposable
                 if (!constantNodeOutputs.Contains(outName))
                     runtimeConstants.Remove(outName);
         }
+
+        // Host-value graph inputs (see _hostValueGraphInputs). Sync copy: desktop backends only, as below.
+        foreach (var hvName in _hostValueGraphInputs)
+            if (!runtimeConstants.ContainsKey(hvName) && inputs.TryGetValue(hvName, out var hvT)
+                && hvT.ElementCount > 0 && hvT.ElementCount <= 64)
+            {
+                try
+                {
+                    var stage = ReadbackStagingView(hvT.ElementCount);
+                    stage.CopyFrom(hvT.Data.SubView(0, hvT.ElementCount));
+                    _accelerator.Synchronize();
+                    runtimeConstants[hvName] = _readbackStaging!.View.SubView(0, hvT.ElementCount).GetAsArray1D();
+                }
+                catch (NotSupportedException) { /* Browser/WASM backend - no sync copy; use RunAsync */ }
+            }
 
         // Execute each node in topological order
         int nodeIdx = 0;
@@ -1705,7 +1728,7 @@ public class GraphExecutor : IDisposable
                     Format = Format,
                     InputNames = node.InputNames,
                 };
-                var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
+                var (strideC, strideWC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
                     SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
                 var (_, inCC, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
                 var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
@@ -1729,7 +1752,7 @@ public class GraphExecutor : IDisposable
                 int effKHC = dilationHC * (kHC - 1) + 1;
                 int effKWC = dilationWC * (kWC - 1) + 1;
                 int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
-                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideC + 1;
+                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideWC + 1;
                 if (outHC > 0 && outWC > 0)
                 {
                     var resolvedC = (int[])xShapeC.Clone();   // rank 4; batch (axis 0) passes through
@@ -1897,6 +1920,10 @@ public class GraphExecutor : IDisposable
                       + "and its compile-time shape is the [1] placeholder. Emitting a 1-element output here "
                       + "would leave the buffer UNWRITTEN and the consumer reading stale pool memory.");
             }
+
+            // Runtime TopK: K (input[1]) known only now - see TopKRuntimeShapes.
+            if (node.OpType == "TopK" && TopKRuntimeShapes(node, nodeInputs, runtimeConstants) is { } topKShapes)
+                runtimeOutputShapes = topKShapes;
 
             // Runtime ConstantOfShape: output shape = input shape-tensor VALUES (e.g. [77,77]). Placeholder
             // at compile time → fill buffer collapses → CLIP causal mask broke. Same class as Range.
@@ -2915,7 +2942,12 @@ public class GraphExecutor : IDisposable
                 for (int i = 0; i < len; i++)
                 {
                     float av = a[a.Length == 1 ? 0 : i], bv = b[b.Length == 1 ? 0 : i];
-                    outv[i] = node.OpType switch { "Mod" => bv != 0 ? av - bv * (float)System.Math.Floor(av / bv) : 0, "Min" => System.Math.Min(av, bv), "Max" => System.Math.Max(av, bv), _ => av };
+                    // Mod honours fmod exactly as ModOperator does (truncated for fmod=1, floored for the default 0).
+                    outv[i] = node.OpType switch
+                    {
+                        "Mod" => AttrLong("fmod", 0) != 0 ? (bv != 0 ? av % bv : 0) : Operators.ModOperator.FloorMod(av, bv),
+                        "Min" => System.Math.Min(av, bv), "Max" => System.Math.Max(av, bv), _ => av
+                    };
                 }
                 result = outv; return true;
             }
@@ -3083,6 +3115,17 @@ public class GraphExecutor : IDisposable
         // Seeding keeps the elide decisions (and thus the whole rent/dispatch sequence) identical to the warm pass.
         if (UseCaptureParamSlots && SuppressDrains && _captureRuntimeSeed != null)
             foreach (var kv in _captureRuntimeSeed) runtimeConstants[kv.Key] = kv.Value;
+        // Host-value graph inputs (see _hostValueGraphInputs). Skipped mid-capture like every other readback.
+        if (!SuppressDrains)
+            foreach (var hvName in _hostValueGraphInputs)
+                if (!runtimeConstants.ContainsKey(hvName) && inputs.TryGetValue(hvName, out var hvT)
+                    && hvT.ElementCount > 0 && hvT.ElementCount <= 64)
+                {
+                    var stage = ReadbackStagingView(hvT.ElementCount);   // pooled - see _readbackStaging
+                    stage.CopyFrom(hvT.Data.SubView(0, hvT.ElementCount));
+                    await _accelerator.SynchronizeAsync();
+                    runtimeConstants[hvName] = await _readbackStaging!.CopyToHostAsync<float>(0, hvT.ElementCount);
+                }
         // Runtime CPU shape interpreter (gated on ShapeSubgraphFoldEnabled): shape-op outputs it resolves on the
         // CPU this run. Their value is put straight into runtimeConstants and their per-node GPU->CPU readback is
         // skipped - correct by construction because it reads the REAL runtime tensor shapes as tensors flow.
@@ -4067,7 +4110,7 @@ public class GraphExecutor : IDisposable
                     Format = Format,
                     InputNames = node.InputNames,
                 };
-                var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
+                var (strideC, strideWC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
                     SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
                 var (_, inCC, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
                 var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
@@ -4091,7 +4134,7 @@ public class GraphExecutor : IDisposable
                 int effKHC = dilationHC * (kHC - 1) + 1;
                 int effKWC = dilationWC * (kWC - 1) + 1;
                 int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
-                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideC + 1;
+                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideWC + 1;
                 if (outHC > 0 && outWC > 0)
                 {
                     var resolvedC = (int[])xShapeC.Clone();   // rank 4; batch (axis 0) passes through
@@ -4244,6 +4287,10 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime TopK: K (input[1]) known only now - see TopKRuntimeShapes.
+            if (node.OpType == "TopK" && TopKRuntimeShapes(node, nodeInputs, runtimeConstants) is { } topKShapes)
+                runtimeOutputShapes = topKShapes;
+
             // Runtime ConstantOfShape: output shape = input shape-tensor VALUES (e.g. [77,77]). Placeholder
             // at compile time → fill buffer collapses → CLIP causal mask broke. Same class as Range.
             if (node.OpType == "ConstantOfShape" && node.InputNames.Length >= 1 && !string.IsNullOrEmpty(node.InputNames[0])
@@ -4301,9 +4348,12 @@ public class GraphExecutor : IDisposable
                            + $"input=[{string.Join(",", inS)}] -> [{string.Join(",", resolved)}]");
             }
 
-            // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
+            // Runtime Shape: output = the [start, end) window of the input's rank (compile-time buffer can be too small).
             if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
-                runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
+            {
+                var (shS, shE) = Operators.ShapeOperator.Window(nodeInputs[0]!.Shape.Length, node.Attributes);
+                runtimeOutputShapes = new[] { new[] { shE - shS } };
+            }
 
             // Runtime Concat: output shape = input0's shape with the concat axis replaced by the SUM of
             // all inputs' axis dims. Build-time inference leaves the axis dim unresolved when an upstream
@@ -4547,8 +4597,10 @@ public class GraphExecutor : IDisposable
                     refCounts[sName] = int.MaxValue; // retained across runs; never returned to the pool
                     // Publish the dims to downstream VALUE consumers (Reshape/Slice/Concat targets),
                     // exactly as the post-execute readback-capture would, but with no GPU round-trip.
-                    var dimVals = new float[curDims.Length];
-                    for (int d = 0; d < curDims.Length; d++) dimVals[d] = curDims[d];
+                    // The [start, end) window, as ShapeOperator wrote into the cached buffer - not the whole shape.
+                    var (shS, shE) = Operators.ShapeOperator.Window(curDims.Length, node.Attributes);
+                    var dimVals = new float[shE - shS];
+                    for (int d = 0; d < dimVals.Length; d++) dimVals[d] = curDims[shS + d];
                     runtimeConstants[sName] = dimVals;
                     if (readbackThisRun != null && !IsInputTainted(sName)) readbackThisRun[sName] = dimVals;
                 }
@@ -5465,10 +5517,84 @@ public class GraphExecutor : IDisposable
         }
     }
 
+    /// <summary>
+    /// A constant the optimizer folded out of the graph (CompiledGraph.OptimizerFoldedInitializers) and a node consumes
+    /// as DATA has no weight in the caller's dictionary - its value lived only on the optimizer's copy of the graph, so
+    /// every session path (load, recompile-for-shape) missed it: "Tensor 'val_25' not found (needed by Expand)". Upload
+    /// those here, the one place every path goes through, into executor-owned buffers. The caller's dictionary is never
+    /// mutated (a recompiled executor shares the session's): a copy is returned when anything was added.
+    /// </summary>
+    /// <summary>
+    /// TopK's output shape when K (input[1]) is a runtime value: the compiler sized it by the axis length (an upper
+    /// bound), so the real K must come from the runtime constants here. Null when there is nothing to override.
+    /// Shared by RunCore and RunAsyncCore.
+    /// </summary>
+    static int[][]? TopKRuntimeShapes(CompiledNode node, Tensor?[] nodeInputs, Dictionary<string, float[]> runtimeConstants)
+    {
+        if (node.InputNames.Length < 2 || string.IsNullOrEmpty(node.InputNames[1])
+            || nodeInputs.Length < 1 || nodeInputs[0] == null
+            || !runtimeConstants.TryGetValue(node.InputNames[1], out var kv) || kv.Length == 0) return null;
+        var outShape = Operators.TopKOperator.OutputShape(nodeInputs[0]!.Shape, node.Attributes, (int)kv[0]);
+        return new[] { outShape, (int[])outShape.Clone() };
+    }
+
+    static Dictionary<string, Tensor> UploadOptimizerFoldedInitializers(Accelerator accelerator, CompiledGraph graph,
+        Dictionary<string, Tensor> weights, out List<MemoryBuffer1D<float, Stride1D.Dense>>? owned)
+    {
+        owned = null;
+        var folded = graph.OptimizerFoldedInitializers;
+        if (folded == null || folded.Count == 0) return weights;
+        Dictionary<string, Tensor>? merged = null;
+        foreach (var node in graph.Nodes)
+            foreach (var name in node.InputNames)
+            {
+                if (string.IsNullOrEmpty(name) || weights.ContainsKey(name) || (merged != null && merged.ContainsKey(name))) continue;
+                if (!folded.TryGetValue(name, out var f)) continue;
+                long count = 1;
+                foreach (var d in f.Shape) count *= d;
+                if (count != f.Values.Length)
+                    throw new InvalidOperationException($"Optimizer-folded constant '{name}' has {f.Values.Length} values but shape " +
+                        $"[{string.Join(",", f.Shape)}] (consumed by {node.OpType}) - the fold that produced it is wrong.");
+                var buf = accelerator.Allocate1D<float>(Math.Max(1, f.Values.Length));
+                if (f.Values.Length > 0) buf.View.SubView(0, f.Values.Length).CopyFromCPU(f.Values);
+                (owned ??= new()).Add(buf);
+                merged ??= new Dictionary<string, Tensor>(weights);
+                // Rank-0 (CompiledGraph.ScalarTensorNames) is a [] tensor at runtime, as every scalar weight is.
+                bool scalar = graph.ScalarTensorNames != null && graph.ScalarTensorNames.Contains(name) && f.Values.Length == 1;
+                merged[name] = new Tensor(buf.View, scalar ? Array.Empty<int>() : f.Shape, name);
+            }
+        return merged ?? weights;
+    }
+
+    /// <summary>
+    /// The CPU side of <see cref="UploadOptimizerFoldedInitializers"/>: an op that reads a folded constant as a CPU
+    /// value (Range's scalars, Reshape's target, ...) looks in the executor's constants, which came from the caller and
+    /// so never held it either. RaCo-ALIKED: Range(Cast(0), Cast(1792), Cast(1)) with every Cast folded -> "Range:
+    /// scalar inputs not available as runtime constants". Copy-on-write, as above.
+    /// </summary>
+    static Dictionary<string, float[]>? MergeOptimizerFoldedValues(CompiledGraph graph, Dictionary<string, float[]>? constantValues)
+    {
+        var folded = graph.OptimizerFoldedInitializers;
+        if (folded == null || folded.Count == 0) return constantValues;
+        Dictionary<string, float[]>? merged = null;
+        foreach (var (name, f) in folded)
+        {
+            if (constantValues != null && constantValues.ContainsKey(name)) continue;
+            merged ??= constantValues != null ? new Dictionary<string, float[]>(constantValues) : new Dictionary<string, float[]>();
+            merged[name] = f.Values;
+        }
+        return merged ?? constantValues;
+    }
+
     public void Dispose()
     {
         // ⚠️ Only if we made it. A shared pool outlives this executor by design - see the constructor.
         if (_ownsPool) _pool.Dispose();
+        if (_optimizerFoldedBuffers != null)
+        {
+            foreach (var b in _optimizerFoldedBuffers) b.Dispose();
+            _optimizerFoldedBuffers = null;
+        }
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _readbackStaging?.Dispose(); _readbackStaging = null;
@@ -5611,6 +5737,22 @@ public class GraphExecutor : IDisposable
     /// <summary>Ops whose output VALUE is a function of their input's SHAPE only, which the host always has - a
     /// needed value does not make their input needed.</summary>
     private static readonly HashSet<string> ShapeOnlyValueOps = new(StringComparer.Ordinal) { "Shape", "Size" };
+
+    /// <summary>See <see cref="_hostValueGraphInputs"/>.</summary>
+    private static string[] HostValueGraphInputs(CompiledGraph graph, Dictionary<string, Tensor> weights)
+    {
+        var graphInputs = new HashSet<string>(graph.InputNames, StringComparer.Ordinal);
+        var found = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes)
+            for (int ii = 0; ii < node.InputNames.Length; ii++)
+            {
+                var name = node.InputNames[ii];
+                if (!string.IsNullOrEmpty(name) && graphInputs.Contains(name) && !weights.ContainsKey(name)
+                    && IsHostValueSlot(node, ii))
+                    found.Add(name);
+            }
+        return found.ToArray();
+    }
 
     /// <summary>Whether input <paramref name="index"/> of <paramref name="node"/> is read as a host value.</summary>
     private static bool IsHostValueSlot(CompiledNode node, int index)
@@ -5761,6 +5903,15 @@ public class GraphExecutor : IDisposable
                         foreach (var outName in node.OutputNames)
                             if (!string.IsNullOrEmpty(outName))
                                 intNames.Add(outName);
+                        break;
+                    case "Range":
+                        // Output dtype = the inputs' (start/limit/delta share one type). It was missing, so an
+                        // int64 arange and everything computed from it ran with FLOAT semantics (Div no longer
+                        // truncated): RaCo-ALIKED's keypoint row/column split (2026-10-01).
+                        if (node.InputNames.Length > 0 && !string.IsNullOrEmpty(node.InputNames[0])
+                            && intNames.Contains(node.InputNames[0]) && node.OutputNames.Length > 0
+                            && !string.IsNullOrEmpty(node.OutputNames[0]))
+                            intNames.Add(node.OutputNames[0]);
                         break;
                     case "TopK":
                         // Output 0 is values (same dtype as input[0]); output 1 is indices (int).

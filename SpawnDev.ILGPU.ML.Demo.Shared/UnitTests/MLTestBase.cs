@@ -452,8 +452,33 @@ public abstract partial class MLTestBase : IDisposable
     /// lane into a DistilGPT2 OutOfMemory + cascade of follow-on timeouts. Disposes the captured
     /// GPU buffers before dropping them.
     /// </summary>
+    /// <summary>
+    /// The engine's process-wide behaviour switches as they stood BEFORE any test ran (env overrides such as
+    /// ML_NO_SHAPE_ELIDE included). Tests flip these to reach a path; many restored them to hard-coded values
+    /// (the DA3 suites leave fold + elide OFF, while the defaults are ON) or not at all, so every later test in the
+    /// process silently ran a configuration production never uses. Reset at each test's START, with the capture
+    /// state below, for the same zombie-safety reason.
+    /// </summary>
+    private static readonly (bool Fold, bool Elide, bool FoldIndep, bool Validate, bool Suppress, bool ParamSlots,
+        bool OrderedDrains, bool ImmediateReturn, bool KeepDrains) _engineDefaults = (
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled, Graph.GraphExecutor.ShapeInterpElideDispatch,
+        Graph.GraphExecutor.FoldInputIndependentNodes, Graph.GraphExecutor.ShapeInterpValidate,
+        Graph.GraphExecutor.SuppressDrains, Graph.GraphExecutor.UseCaptureParamSlots,
+        Graph.GraphExecutor.QueueOrderedDrains, Graph.GraphExecutor.CaptureImmediateReturn,
+        Graph.GraphExecutor.KeepDrainsDuringCapture);
+
     private static void ResetStaticCaptureState()
     {
+        var d = _engineDefaults;
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = d.Fold;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = d.Elide;
+        Graph.GraphExecutor.FoldInputIndependentNodes = d.FoldIndep;
+        Graph.GraphExecutor.ShapeInterpValidate = d.Validate;
+        Graph.GraphExecutor.SuppressDrains = d.Suppress;
+        Graph.GraphExecutor.UseCaptureParamSlots = d.ParamSlots;
+        Graph.GraphExecutor.QueueOrderedDrains = d.OrderedDrains;
+        Graph.GraphExecutor.CaptureImmediateReturn = d.ImmediateReturn;
+        Graph.GraphExecutor.KeepDrainsDuringCapture = d.KeepDrains;
         try { Graph.GraphExecutor.CapturedOutputs = null; } catch { }
         try { Graph.GraphExecutor.CapturedNodeInfo = null; } catch { }
         try { Graph.GraphExecutor.CapturedNodeTimingsMs = null; } catch { }

@@ -1836,6 +1836,16 @@ public class InferenceSession : IDisposable
             }
         }
 
+        // ONNX rank-0 is recorded, never flattened away - see ModelGraph.ScalarTensorNames. The subgraph builder
+        // (RemainingOperators.ConvertToModelGraph) always did this; the TOP-LEVEL graph never did, so every
+        // Gather with a scalar index kept the gathered axis at top level. Hidden whenever the CPU shape interpreter
+        // elides the whole chain; RaCo-ALIKED's [zeros_like(W-1), W-1] bound pair dispatches (CastLike/Expand) and
+        // came out [2,1] instead of [2] (2026-10-01). Initializer and Constant shapes keep their ONNX dims here.
+        graph.ScalarTensorNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var initName in info.InitializerNames)
+            if (info.ValueShapes.TryGetValue(initName, out var initShape) && initShape.Length == 0)
+                graph.ScalarTensorNames.Add(initName);
+
         // Convert nodes
         foreach (var node in info.Nodes)
         {

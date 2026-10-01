@@ -33,6 +33,11 @@ public class MissingElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _topKKernel;
     private MemoryBuffer1D<float, Stride1D.Dense>? _topKIdxBuf;
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldTopKIdxBufs = new();
+    // TopK sort path: init, one bitonic compare-exchange step, gather. Scratch = (value, index) ping-pong pairs.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _topKSortInitKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _topKSortStepKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _topKSortGatherKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _topKSortScratch;   // 4 x rows*P: valuesA, indicesA, valuesB, indicesB
 
     /// <summary>One buffer per distinct param set - see <see cref="ParamBufferCache{T}"/>.</summary>
     private readonly ParamBufferCache<int> _params = new();
@@ -48,6 +53,7 @@ public class MissingElementWiseKernels : IDisposable
         foreach (var buf in _oldParamsBufs) buf.Dispose();
         _oldParamsBufs.Clear();
         _topKIdxBuf?.Dispose();
+        _topKSortScratch?.Dispose();
         foreach (var buf in _oldTopKIdxBufs) buf.Dispose();
         _oldTopKIdxBufs.Clear();
     }
@@ -331,18 +337,111 @@ public class MissingElementWiseKernels : IDisposable
         outputIndices[g] = (float)bestIdx;
     }
 
+    // ── Sort path (any K, any axis, largest or smallest) ─────────────────────────────────────────────────────
+    // The selection kernel above costs k(k+1)/2 passes over the row, so it is only usable for small K: RaCo-ALIKED
+    // asks for k=2304 of a 65,536-wide row (~1.7e12 reads). This path sorts each row's (value, index) pairs with a
+    // bitonic network over the row padded to P = 2^L, L(L+1)/2 steps of rows*P threads, and gathers the first K.
+    // Every thread writes ONLY its own slot (read src, write dst, ping-pong), which the WebGL Transform-Feedback
+    // path requires. Order: best value first, lower index first among equals (ONNX's sorted=1 order). Padding is
+    // the worst value with an index past every real one, so it always sorts last.
+
+    // t = row * P + p; row = o * inner + i addresses input element (o * axisLen + p) * inner + i.
+    private static void TopKSortInitImpl(Index1D t,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> vals,
+        ArrayView1D<float, Stride1D.Dense> idxs,
+        int axisLen, int inner, int P, int largest)
+    {
+        int row = t / P;
+        int p = t - row * P;
+        int o = row / inner;
+        int i = row - o * inner;
+        if (p < axisLen)
+        {
+            vals[t] = input[(o * axisLen + p) * inner + i];
+        }
+        else
+        {
+            vals[t] = largest != 0 ? float.NegativeInfinity : float.PositiveInfinity;
+        }
+        idxs[t] = (float)p;
+    }
+
+    // One compare-exchange step (block size kStage, partner distance jStage). Thread t keeps the better or the worse
+    // of (self, partner): the lower position of a pair takes the better one inside a best-first block, the worse
+    // one inside a worst-first block.
+    private static void TopKSortStepImpl(Index1D t,
+        ArrayView1D<float, Stride1D.Dense> srcVals,
+        ArrayView1D<float, Stride1D.Dense> srcIdxs,
+        ArrayView1D<float, Stride1D.Dense> dstVals,
+        ArrayView1D<float, Stride1D.Dense> dstIdxs,
+        int P, int kStage, int jStage, int largest)
+    {
+        int row = t / P;
+        int p = t - row * P;
+        int partner = p ^ jStage;
+        int pt = row * P + partner;
+        float av = srcVals[t];
+        float ai = srcIdxs[t];
+        float bv = srcVals[pt];
+        float bi = srcIdxs[pt];
+        int aBetter = 0;
+        if (largest != 0)
+        {
+            if (av > bv) aBetter = 1;
+            if (av == bv && ai < bi) aBetter = 1;
+        }
+        else
+        {
+            if (av < bv) aBetter = 1;
+            if (av == bv && ai < bi) aBetter = 1;
+        }
+        int bestFirst = (p & kStage) == 0 ? 1 : 0;
+        int isLow = p < partner ? 1 : 0;
+        int wantBetter = bestFirst == isLow ? 1 : 0;
+        if (wantBetter == aBetter)
+        {
+            dstVals[t] = av;
+            dstIdxs[t] = ai;
+        }
+        else
+        {
+            dstVals[t] = bv;
+            dstIdxs[t] = bi;
+        }
+    }
+
+    // t walks the OUTPUT [outer, k, inner]: slot j of row (o, i) is sorted position j.
+    private static void TopKSortGatherImpl(Index1D t,
+        ArrayView1D<float, Stride1D.Dense> vals,
+        ArrayView1D<float, Stride1D.Dense> idxs,
+        ArrayView1D<float, Stride1D.Dense> outputValues,
+        ArrayView1D<float, Stride1D.Dense> outputIndices,
+        int k, int inner, int P)
+    {
+        int ki = k * inner;
+        int o = t / ki;
+        int rem = t - o * ki;
+        int j = rem / inner;
+        int i = rem - j * inner;
+        int src = (o * inner + i) * P + j;
+        outputValues[t] = vals[src];
+        outputIndices[t] = idxs[src];
+    }
+
+    /// <summary>
+    /// TopK over <paramref name="axisLen"/> of an [outer, axisLen, inner] input into [outer, k, inner] values and
+    /// (float) indices, best first and lower index first among equals. Small K on the last axis (largest) takes the
+    /// one-dispatch selection kernel; everything else the bitonic sort path. <paramref name="outputIndices"/> may be
+    /// default when the model does not use the indices.
+    /// </summary>
     public void TopK(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> outputValues,
         ArrayView1D<float, Stride1D.Dense> outputIndices,
-        int rows, int cols, int k)
+        int outer, int axisLen, int inner, int k, bool largest)
     {
-        _topKKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int>(TopKStageImpl);
-
+        int rows = outer * inner;
         ArrayView1D<float, Stride1D.Dense> idxView;
         if (outputIndices.Length >= rows * k)
         {
@@ -359,10 +458,60 @@ public class MissingElementWiseKernels : IDisposable
             }
             idxView = _topKIdxBuf.View;
         }
-        // One thread per output slot (rows*k): thread g owns slot g and writes it at its own index
-        // (WebGL Transform-Feedback requires write-index == thread-index — no scatter). Each thread
-        // is self-contained (see TopKStageImpl), so a single dispatch suffices.
-        _topKKernel(rows * k, input, outputValues, idxView, cols, k);
+
+        int L = 0;
+        while ((1 << L) < axisLen) L++;
+        int P = 1 << L;
+        // Selection reads the row k(k+1)/2 times in one dispatch; the sort reads it ~L(L+1)/2 times over L(L+1)/2
+        // dispatches. Selection wins whenever k <= L, and it only exists for the last axis and largest.
+        if (inner == 1 && largest && k <= L)
+        {
+            _topKKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>,
+                int, int>(TopKStageImpl);
+            // One thread per output slot (rows*k): thread g owns slot g and writes it at its own index
+            // (WebGL Transform-Feedback requires write-index == thread-index — no scatter). Each thread
+            // is self-contained (see TopKStageImpl), so a single dispatch suffices.
+            _topKKernel(rows * k, input, outputValues, idxView, axisLen, k);
+            return;
+        }
+
+        _topKSortInitKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(TopKSortInitImpl);
+        _topKSortStepKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(TopKSortStepImpl);
+        _topKSortGatherKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int>(TopKSortGatherImpl);
+
+        long n = (long)rows * P;
+        if (n * 4 > int.MaxValue) throw new NotSupportedException($"TopK: {rows} rows x {P} padded length is too large");
+        if (_topKSortScratch == null || _topKSortScratch.Length < n * 4)
+        {
+            // Retired, not disposed: a dispatch still queued on WebGPU/Wasm may reference it (see the class notes).
+            if (_topKSortScratch != null) _oldTopKIdxBufs.Add(_topKSortScratch);
+            _topKSortScratch = _accelerator.Allocate1D<float>(n * 4);
+        }
+        int ni = (int)n;
+        var sv = _topKSortScratch.View;
+        var aV = sv.SubView(0, ni); var aI = sv.SubView(ni, ni);
+        var bV = sv.SubView(2 * ni, ni); var bI = sv.SubView(3 * ni, ni);
+        int lg = largest ? 1 : 0;
+        _topKSortInitKernel(ni, input, aV, aI, axisLen, inner, P, lg);
+        for (int kStage = 2; kStage <= P; kStage <<= 1)
+            for (int jStage = kStage >> 1; jStage > 0; jStage >>= 1)
+            {
+                _topKSortStepKernel(ni, aV, aI, bV, bI, P, kStage, jStage, lg);
+                (aV, bV) = (bV, aV);
+                (aI, bI) = (bI, aI);
+            }
+        _topKSortGatherKernel(outer * k * inner, aV, aI, outputValues, idxView, k, inner, P);
     }
 
     /// <summary>

@@ -660,34 +660,35 @@ public class GatherElementsOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-/// <summary>Mod: element-wise modulo operation.</summary>
+/// <summary>
+/// ONNX Mod. fmod=1: truncated remainder (sign of the dividend, C fmod). fmod=0 (the default, integer inputs):
+/// floored remainder (sign of the DIVISOR, Python %). Both paths used to be truncated, so -4096 came out where
+/// ONNX says 61440: RaCo-ALIKED's DKD pad amount, (-H*W) mod 65536, was wrong and every keypoint with it
+/// (2026-10-01). The host-constant path also flattened broadcasting to `i % len`; BroadcastBinaryOp's is
+/// shape-aware, so both paths go through it.
+/// </summary>
 public class ModOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Mod";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+
+    /// <summary>Floored integer remainder (see ElementWiseKernels.BroadcastFloorModOp - same formula).</summary>
+    internal static float FloorMod(float a, float b)
+    {
+        int ia = (int)a, ib = (int)b;
+        if (ib == 0) return 0f;
+        int r = ia % ib;
+        if (r != 0 && (r < 0) != (ib < 0)) r += ib;
+        return r;
+    }
+
     public void Execute(OnnxOpContext ctx)
     {
-        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        var aVals = ctx.TryGetInputValues(0);
-        var bVals = ctx.TryGetInputValues(1);
-        if (aVals != null && bVals != null)
-        {
-            int fmod = ctx.GetInt("fmod", 0);
-            int outCount = ctx.Outputs[0].ElementCount;
-            var result = new float[outCount];
-            for (int i = 0; i < outCount; i++)
-            {
-                float av = i < aVals.Length ? aVals[i % aVals.Length] : 0f;
-                float bv = i < bVals.Length ? bVals[i % bVals.Length] : 1f;
-                result[i] = fmod != 0 ? av % bv : (bv != 0 ? (int)av % (int)bv : 0f);
-            }
-            ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
-        }
-        else
-        {
+        if (ctx.GetInt("fmod", 0) != 0)
             BroadcastHelper.BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x % y : 0f, BroadcastOp.Mod);
-        }
+        else
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, FloorMod, BroadcastOp.FloorMod);
     }
 }
 

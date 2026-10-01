@@ -42,6 +42,7 @@ public class GraphCompiler
       try
       {
         // Apply graph optimizations (operator fusion) before compilation
+        var preOptimizeInitializers = new HashSet<string>(graph.Initializers.Keys);
         if (EnableOptimization)
         {
             try { graph = GraphOptimizer.Optimize(graph); }
@@ -70,6 +71,15 @@ public class GraphCompiler
             }
         }
 
+        // Initializers the OPTIMIZER created by folding a node away (e.g. Shape(W) -> its dims). Their values
+        // exist only on the optimizer's COPY of the graph, so no caller's weight upload can see them: carry them on
+        // the CompiledGraph and the executor uploads the ones a node consumes as data (2026-10-01, torch's bias-free
+        // Conv: Expand(0, Expand(Shape(W, end=1), [1])) -> "Tensor 'val_25' not found (needed by Expand)").
+        Dictionary<string, (float[] Values, int[] Shape)>? optimizerFolded = null;
+        foreach (var (name, shape) in graph.Initializers)
+            if (!preOptimizeInitializers.Contains(name) && graph.FloatConstantData.TryGetValue(name, out var foldedVals))
+                (optimizerFolded ??= new())[name] = (foldedVals, shape);
+
         // Validate all ops are supported
         foreach (var node in graph.Nodes)
         {
@@ -96,6 +106,13 @@ public class GraphCompiler
         {
             if (shape != null) knownShapes[name] = shape;
         }
+        // ONNX rank-0 for INFERENCE (ModelGraph.ScalarTensorNames): the optimizer stores every scalar as [1], and
+        // inference that sees [1] keeps a dim ONNX does not have - Sub([], scalar) became [1], Unsqueeze made [1,1]
+        // of it, and RaCo-ALIKED's bound pair came out [2,1] (2026-10-01). Runtime weights of a scalar already carry
+        // shape []; this makes the compile-time shape agree with them.
+        if (graph.ScalarTensorNames != null)
+            foreach (var name in graph.ScalarTensorNames)
+                if (graph.Initializers.ContainsKey(name)) knownShapes[name] = Array.Empty<int>();
         // Pre-register graph output shapes (overrides inferred shapes for Reshape etc.)
         // Stored RAW (dynamic dims stay <=0): a declared dynamic dim must NEVER clobber a
         // correctly-inferred runtime dim. The old code resolved -1 -> 1 here and overrode
@@ -1311,6 +1328,7 @@ public class GraphCompiler
             InitializerDataTypes = graph.InitializerDataTypes,
             ScalarTensorNames = graph.ScalarTensorNames,
             FoldedShapeConstants = foldedConstants,
+            OptimizerFoldedInitializers = optimizerFolded,
         };
       }
       catch (Exception compileEx)
@@ -1415,6 +1433,10 @@ public class CompiledGraph
     /// STILL execute (graph unchanged) - the executor seeds runtimeConstants from these and SKIPS their per-node
     /// &lt;=64-elem capture readback (the GPU-&gt;CPU drain that dominates DAv3-518). Null/empty when the fold is off.</summary>
     public Dictionary<string, float[]>? FoldedShapeConstants { get; init; }
+    /// <summary>Initializers the optimizer CREATED by folding nodes away (name -&gt; fp32 values + shape). They are in
+    /// <see cref="InitializerNames"/> but in no caller's weight dictionary - their values lived only on the optimizer's
+    /// copy of the graph. <see cref="GraphExecutor"/> uploads the ones a node consumes. Null when nothing was folded.</summary>
+    public Dictionary<string, (float[] Values, int[] Shape)>? OptimizerFoldedInitializers { get; init; }
 }
 
 /// <summary>A single compiled operation.</summary>

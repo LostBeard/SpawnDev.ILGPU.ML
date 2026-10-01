@@ -1408,6 +1408,90 @@ public static class GraphOptimizer
     /// (typically Upsample/Resize) reads the shape from ConstantData which was
     /// pre-populated during session creation.
     /// </summary>
+    /// <summary>ONNX integer element types (and BOOL): UINT8, INT8, UINT16, INT16, INT32, INT64, BOOL, UINT32, UINT64.</summary>
+    private static bool IsIntegerDataType(long dt) => dt is 2 or 3 or 4 or 5 or 6 or 7 or 9 or 12 or 13;
+
+    private static long GetIntAttr(GraphNode node, string name, long dflt)
+        => node.Attributes != null && node.Attributes.TryGetValue(name, out var v)
+           && v.ValueKind == System.Text.Json.JsonValueKind.Number ? v.GetInt64() : dflt;
+
+    private static long[]? GetIntsAttr(GraphNode node, string name)
+        => node.Attributes != null && node.Attributes.TryGetValue(name, out var v)
+           && v.ValueKind == System.Text.Json.JsonValueKind.Array
+            ? v.EnumerateArray().Select(e => e.GetInt64()).ToArray() : null;
+
+    /// <summary>
+    /// The ONNX output shape of an identity-like op (Identity, Dropout, Reshape, Unsqueeze, Squeeze, Flatten) on a
+    /// constant of <paramref name="count"/> elements, or null when it cannot be resolved (then the node is not
+    /// folded). [] = rank 0.
+    /// </summary>
+    private static int[]? FoldedOutputShape(GraphNode node, int count, bool inputIsScalar, int[]? inShape,
+        Dictionary<string, int[]> constantData)
+    {
+        int[] input = inputIsScalar ? Array.Empty<int>() : inShape ?? new[] { count };
+        if (input.Aggregate(1, (a, b) => a * b) != count) return null;
+        switch (node.OpType)
+        {
+            case "Identity":
+            case "Dropout":
+                return input;
+            case "Reshape":
+            {
+                if (node.Inputs.Count < 2 || !constantData.TryGetValue(node.Inputs[1], out var target)) return null;
+                bool allowZero = GetIntAttr(node, "allowzero", 0) != 0;
+                var outShape = new int[target.Length];
+                int infer = -1, known = 1;
+                for (int d = 0; d < target.Length; d++)
+                {
+                    int t = target[d];
+                    if (t == -1) { if (infer >= 0) return null; infer = d; continue; }
+                    if (t == 0 && !allowZero) { if (d >= input.Length) return null; t = input[d]; }
+                    if (t < 0) return null;
+                    outShape[d] = t; known *= t;
+                }
+                if (infer >= 0) { if (known == 0 || count % known != 0) return null; outShape[infer] = count / known; }
+                return outShape.Aggregate(1, (a, b) => a * b) == count ? outShape : null;
+            }
+            case "Unsqueeze":
+            {
+                long[]? axes = GetIntsAttr(node, "axes");
+                if (axes == null && node.Inputs.Count >= 2 && constantData.TryGetValue(node.Inputs[1], out var ax))
+                    axes = ax.Select(a => (long)a).ToArray();
+                if (axes == null) return null;
+                int rank = input.Length + axes.Length;
+                var isNew = new bool[rank];
+                foreach (var a0 in axes) { long a = a0 < 0 ? a0 + rank : a0; if (a < 0 || a >= rank || isNew[a]) return null; isNew[a] = true; }
+                var outShape = new int[rank];
+                for (int d = 0, k = 0; d < rank; d++) outShape[d] = isNew[d] ? 1 : input[k++];
+                return outShape;
+            }
+            case "Squeeze":
+            {
+                long[]? axes = GetIntsAttr(node, "axes");
+                if (axes == null && node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1]))
+                {
+                    if (!constantData.TryGetValue(node.Inputs[1], out var ax)) return null;
+                    axes = ax.Select(a => (long)a).ToArray();
+                }
+                var drop = new bool[input.Length];
+                if (axes == null) { for (int d = 0; d < input.Length; d++) drop[d] = input[d] == 1; }
+                else foreach (var a0 in axes) { long a = a0 < 0 ? a0 + input.Length : a0; if (a < 0 || a >= input.Length || input[a] != 1) return null; drop[a] = true; }
+                return input.Where((_, d) => !drop[d]).ToArray();
+            }
+            case "Flatten":
+            {
+                long axis = GetIntAttr(node, "axis", 1);
+                if (axis < 0) axis += input.Length;
+                if (axis < 0 || axis > input.Length) return null;
+                int lead = 1;
+                for (int d = 0; d < axis; d++) lead *= input[d];
+                return new[] { lead, count / Math.Max(1, lead) };
+            }
+            default:
+                return null;
+        }
+    }
+
     private static int FoldConstants(ModelGraph graph)
     {
         // Set of tensor names that are constants (initializers + Constant node outputs)
@@ -1431,6 +1515,29 @@ public static class GraphOptimizer
                     constants.Add(output);
             }
         }
+
+        // Rank-0 through folds (ModelGraph.ScalarTensorNames): a folded output is STORED [n] like every constant, but
+        // its true rank has to survive the fold or inference downstream keeps a dim ONNX does not have.
+        graph.ScalarTensorNames ??= new HashSet<string>(StringComparer.Ordinal);
+        var scalars = graph.ScalarTensorNames;
+        bool IsScalar(string? name) => !string.IsNullOrEmpty(name) && scalars.Contains(name);
+        // An element-wise fold's output has its input's (storage) shape - never a flattened [n].
+        int[] SameShape(string input, int count) => graph.Initializers.TryGetValue(input, out var s) && s.Length > 0
+            && s.Aggregate(1, (a, b) => a * b) == count ? (int[])s.Clone() : new[] { count };
+
+        // ⚠️ INTEGER-TYPED tensors only. This pass folds SHAPE arithmetic over ConstantData, which is int[] - and
+        // InferenceSession seeds a TRUNCATED int copy of EVERY small (<= 64 element) float constant into it too. A
+        // fold that read it for a float tensor wrote truncated values back as the float result: RaCo-ALIKED's
+        // conv bias Reshape(bias[64], [1,-1,1,1]) folded to integers (-0.622 -> 0, 3.26 -> 3) AND to shape [64]
+        // instead of [1,64,1,1], and Add/Mul/Div of float constants evaluated in int arithmetic (2026-10-01).
+        // Float-valued chains are left to the compiler's own float-aware fold (GraphCompiler), which keeps the nodes.
+        var ints = new HashSet<string>(StringComparer.Ordinal);
+        if (graph.InitializerDataTypes != null)
+            foreach (var (n, dt) in graph.InitializerDataTypes)
+                if (IsIntegerDataType(dt)) ints.Add(n);
+        bool IsInt(string? name) => !string.IsNullOrEmpty(name) && ints.Contains(name);
+        // A value fold's output: 1-D or scalar, by construction of the folds below.
+        bool IsVector(string name) => knownShapes.TryGetValue(name, out var vs) && vs.Length <= 1;
 
         int folded = 0;
         bool changed = true;
@@ -1457,12 +1564,15 @@ public static class GraphOptimizer
                         && knownShapes.TryGetValue(node.Inputs[0], out var inputShape))
                     {
                         var outputName = node.Outputs[0];
-                        var shapeValues = inputShape;
+                        // The opset-15 [start, end) window - the whole shape was folded here too (RaCo's Shape(W, end=1)).
+                        var (shS, shE) = Operators.ShapeOperator.Window(inputShape.Length, node.Attributes);
+                        var shapeValues = inputShape[shS..shE];
                         graph.ConstantData[outputName] = shapeValues;
                         graph.FloatConstantData ??= new Dictionary<string, float[]>();
                         graph.FloatConstantData[outputName] = shapeValues.Select(v => (float)v).ToArray();
                         graph.Initializers[outputName] = new[] { shapeValues.Length };
                         knownShapes[outputName] = new[] { shapeValues.Length };
+                        ints.Add(outputName);
                         constants.Add(outputName);
                         nodesToRemove.Add(i);
                         folded++;
@@ -1472,6 +1582,8 @@ public static class GraphOptimizer
 
                     // Try to evaluate Gather(axis=0) on known constant data
                     if (node.OpType == "Gather" && node.Inputs.Count >= 2
+                        && IsInt(node.Inputs[0]) && IsInt(node.Inputs[1]) && IsVector(node.Inputs[0])
+                        && GetIntAttr(node, "axis", 0) is 0 or -1
                         && graph.ConstantData.TryGetValue(node.Inputs[0], out var gatherData)
                         && graph.ConstantData.TryGetValue(node.Inputs[1], out var gatherIdx)
                         && gatherIdx.Length == 1)
@@ -1486,6 +1598,9 @@ public static class GraphOptimizer
                             graph.FloatConstantData[outputName] = new[] { (float)gatherData[idx] };
                             graph.Initializers[outputName] = new[] { 1 };
                             knownShapes[outputName] = new[] { 1 };
+                            // ONNX: out rank = data.rank - 1 + indices.rank; this fold is the 1-D-data case.
+                            if (IsScalar(node.Inputs[1])) scalars.Add(outputName);
+                            ints.Add(outputName);
                             constants.Add(outputName);
                             nodesToRemove.Add(i);
                             folded++;
@@ -1496,7 +1611,7 @@ public static class GraphOptimizer
 
                     // Try to evaluate Concat on known constant data
                     if (node.OpType == "Concat" && node.Inputs.Count >= 1
-                        && node.Inputs.All(inp => graph.ConstantData.ContainsKey(inp)))
+                        && node.Inputs.All(inp => IsInt(inp) && IsVector(inp) && graph.ConstantData.ContainsKey(inp)))
                     {
                         var outputName = node.Outputs[0];
                         var concatValues = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
@@ -1505,6 +1620,7 @@ public static class GraphOptimizer
                         graph.FloatConstantData[outputName] = concatValues.Select(v => (float)v).ToArray();
                         graph.Initializers[outputName] = new[] { concatValues.Length };
                         knownShapes[outputName] = new[] { concatValues.Length };
+                        ints.Add(outputName);
                         constants.Add(outputName);
                         nodesToRemove.Add(i);
                         folded++;
@@ -1513,16 +1629,23 @@ public static class GraphOptimizer
                     }
 
                     // Try to evaluate Cast on known constant data (identity for shape tensors)
+                    bool castToInt = IsIntegerDataType(GetIntAttr(node, "to", 1));
                     if (node.OpType == "Cast" && node.Inputs.Count >= 1
+                        && (IsInt(node.Inputs[0]) || castToInt)
+                        && graph.FloatConstantData != null
+                        && graph.FloatConstantData.TryGetValue(node.Inputs[0], out var castSrc)
                         && graph.ConstantData.TryGetValue(node.Inputs[0], out var castData))
                     {
                         var outputName = node.Outputs[0];
-                        // Cast preserves values for shape tensors (int→float or float→int is identity for small ints)
-                        graph.ConstantData[outputName] = castData.ToArray();
-                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
-                        graph.FloatConstantData[outputName] = castData.Select(v => (float)v).ToArray();
-                        graph.Initializers[outputName] = new[] { castData.Length };
-                        knownShapes[outputName] = new[] { castData.Length };
+                        // From the FLOAT values: an integer source is exact either way; a float source cast to an
+                        // integer type truncates toward zero, which is what ONNX Cast does.
+                        var castVals = castToInt ? castSrc.Select(v => MathF.Truncate(v)).ToArray() : castSrc.ToArray();
+                        graph.ConstantData[outputName] = castVals.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                        graph.FloatConstantData[outputName] = castVals;
+                        if (castToInt) ints.Add(outputName);
+                        graph.Initializers[outputName] = SameShape(node.Inputs[0], castData.Length);
+                        knownShapes[outputName] = graph.Initializers[outputName];
+                        if (IsScalar(node.Inputs[0])) scalars.Add(outputName);
                         constants.Add(outputName);
                         nodesToRemove.Add(i);
                         folded++;
@@ -1532,15 +1655,16 @@ public static class GraphOptimizer
 
                     // Try to evaluate Sqrt on known constant data
                     if (node.OpType == "Sqrt" && node.Inputs.Count >= 1
-                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var sqrtData))
+                        && graph.FloatConstantData != null
+                        && graph.FloatConstantData.TryGetValue(node.Inputs[0], out var sqrtData))
                     {
                         var outputName = node.Outputs[0];
                         var result = sqrtData.Select(v => (int)MathF.Sqrt(v)).ToArray();
                         graph.ConstantData[outputName] = result;
-                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
                         graph.FloatConstantData[outputName] = sqrtData.Select(v => MathF.Sqrt(v)).ToArray();
-                        graph.Initializers[outputName] = new[] { result.Length };
-                        knownShapes[outputName] = new[] { result.Length };
+                        graph.Initializers[outputName] = SameShape(node.Inputs[0], result.Length);
+                        knownShapes[outputName] = graph.Initializers[outputName];
+                        if (IsScalar(node.Inputs[0])) scalars.Add(outputName);
                         constants.Add(outputName);
                         nodesToRemove.Add(i);
                         folded++;
@@ -1550,6 +1674,7 @@ public static class GraphOptimizer
 
                     // Try to evaluate Slice on known constant data
                     if (node.OpType == "Slice" && node.Inputs.Count >= 3
+                        && IsInt(node.Inputs[0]) && IsVector(node.Inputs[0])
                         && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
                         && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
                         && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
@@ -1579,6 +1704,7 @@ public static class GraphOptimizer
                             graph.FloatConstantData[outputName] = sliced.Select(v => (float)v).ToArray();
                             graph.Initializers[outputName] = new[] { sliced.Count };
                             knownShapes[outputName] = new[] { sliced.Count };
+                            ints.Add(outputName);
                             constants.Add(outputName);
                             nodesToRemove.Add(i);
                             folded++;
@@ -1615,7 +1741,8 @@ public static class GraphOptimizer
                     // generic folding cannot evaluate and would register as shape [1], destroying
                     // downstream shape inference and crashing the NLP models. The guard here is SIZE - only
                     // small (<= 64 element) constant operands, which is a shape scalar, never a mask.
-                    if (TryEvaluateConstantOp(node, graph.ConstantData, out var evalData))
+                    if (node.Inputs.All(inp => string.IsNullOrEmpty(inp) || (IsInt(inp) && IsVector(inp)))
+                        && TryEvaluateConstantOp(node, graph.ConstantData, out var evalData))
                     {
                         var outputName = node.Outputs.Count > 0 ? node.Outputs[0] : null;
                         if (outputName != null)
@@ -1629,6 +1756,10 @@ public static class GraphOptimizer
                                 graph.Initializers[outputName] = new[] { evalData.Length };
                             if (!knownShapes.ContainsKey(outputName))
                                 knownShapes[outputName] = new[] { evalData.Length };
+                            // Arithmetic/comparison on scalars only is a scalar (broadcasting [] with [] is []).
+                            if (node.Inputs.Count > 0 && node.Inputs.All(inp => string.IsNullOrEmpty(inp) || IsScalar(inp)))
+                                scalars.Add(outputName);
+                            ints.Add(outputName);   // integer operands; comparisons give bool
                         }
                         foreach (var output in node.Outputs) constants.Add(output);
                         nodesToRemove.Add(i);
@@ -1644,7 +1775,10 @@ public static class GraphOptimizer
                     bool isIdentityLike = node.OpType is "Unsqueeze" or "Squeeze" or "Reshape"
                         or "Identity" or "Flatten" or "Dropout";
                     if (isIdentityLike && node.Inputs.Count >= 1
-                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var genData))
+                        && IsInt(node.Inputs[0])
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var genData)
+                        && FoldedOutputShape(node, genData.Length, IsScalar(node.Inputs[0]),
+                               knownShapes.TryGetValue(node.Inputs[0], out var genIn) ? genIn : null, graph.ConstantData) is { } genShape)
                     {
                         bool hasLargeInput = genData.Length > 64;
                         if (hasLargeInput) continue; // Don't fold large tensors
@@ -1652,16 +1786,16 @@ public static class GraphOptimizer
                         var outputName = node.Outputs.Count > 0 ? node.Outputs[0] : null;
                         if (outputName != null)
                         {
-                            // Propagate constant data. Preserve existing initializer shapes
-                            // (don't override scalar [] with [1] — breaks Gather index dimensions).
+                            // The op's TRUE output shape (it used to be flattened to [n]); rank-0 is stored [1] and
+                            // recorded in ScalarTensorNames.
                             graph.ConstantData[outputName] = genData.ToArray();
                             graph.FloatConstantData ??= new Dictionary<string, float[]>();
                             graph.FloatConstantData[outputName] = genData.Select(v => (float)v).ToArray();
-                            if (!graph.Initializers.ContainsKey(outputName))
-                                graph.Initializers[outputName] = new[] { genData.Length };
-                            // Don't override known shapes — preserve scalar [] vs [1] distinction
-                            if (!knownShapes.ContainsKey(outputName))
-                                knownShapes[outputName] = new[] { genData.Length };
+                            var genStore = genShape.Length == 0 ? new[] { 1 } : genShape;
+                            graph.Initializers[outputName] = genStore;
+                            knownShapes[outputName] = genStore;
+                            if (genShape.Length == 0) scalars.Add(outputName);
+                            ints.Add(outputName);
                         }
                         foreach (var output in node.Outputs)
                             constants.Add(output);
@@ -1676,6 +1810,15 @@ public static class GraphOptimizer
             foreach (var idx in nodesToRemove.OrderByDescending(i => i))
                 graph.Nodes.RemoveAt(idx);
         }
+
+        // Record the integer dtype of every integer constant this pass CREATED: InitializerDataTypes is what the
+        // executor's integer-semantics analysis (truncating Div, ...) starts from, and a folded constant had no
+        // entry - RaCo-ALIKED's Range(Cast<int64>(0), Cast<int64>(n), Cast<int64>(1)) indices then divided as
+        // FLOATS (195.27 where ONNX's int64 Div gives 195), shifting every keypoint (2026-10-01).
+        graph.InitializerDataTypes ??= new Dictionary<string, int>();
+        foreach (var n in ints)
+            if (graph.Initializers.ContainsKey(n) && !graph.InitializerDataTypes.ContainsKey(n))
+                graph.InitializerDataTypes[n] = 7;   // INT64: ONNX shape arithmetic's integer type
 
         return folded;
     }

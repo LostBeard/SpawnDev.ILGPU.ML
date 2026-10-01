@@ -74,18 +74,18 @@ internal static class LowPWeightDispatch
         ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW, int outC, int kH, int kW,
         int stride, int padTop, int padLeft, int padBottom, int padRight,
-        int dilationH = 1, int dilationW = 1)
+        int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
     {
         switch (weight.DType)
         {
             case TensorDataType.Float16:
-                conv.ForwardPaddedLowPWeight(input, weight.AsView<global::ILGPU.Half>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW); break;
+                conv.ForwardPaddedLowPWeight(input, weight.AsView<global::ILGPU.Half>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batch, strideW); break;
             case TensorDataType.BFloat16:
-                conv.ForwardPaddedLowPWeight(input, weight.AsView<BFloat16>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW); break;
+                conv.ForwardPaddedLowPWeight(input, weight.AsView<BFloat16>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batch, strideW); break;
             case TensorDataType.Float8E4M3:
-                conv.ForwardPaddedLowPWeight(input, weight.AsView<Float8E4M3>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW); break;
+                conv.ForwardPaddedLowPWeight(input, weight.AsView<Float8E4M3>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batch, strideW); break;
             case TensorDataType.Float8E5M2:
-                conv.ForwardPaddedLowPWeight(input, weight.AsView<Float8E5M2>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW); break;
+                conv.ForwardPaddedLowPWeight(input, weight.AsView<Float8E5M2>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batch, strideW); break;
             default: throw Unexpected(weight);
         }
     }
