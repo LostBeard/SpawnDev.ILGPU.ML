@@ -1791,8 +1791,7 @@ internal static class SubgraphRunner
                     if (value is Onnx.OnnxGraphProto) continue;   // handled below via RawAttributes
                     try
                     {
-                        var json = System.Text.Json.JsonSerializer.Serialize(value);
-                        jsonAttrs[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
+                        jsonAttrs[key] = MLJson.ToElement(value);
                     }
                     catch { /* Skip non-serializable attributes */ }
                 }

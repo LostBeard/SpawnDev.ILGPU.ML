@@ -94,8 +94,7 @@ public static class TFGraphDefGraphBuilder
                 graphNode.Attributes = new Dictionary<string, System.Text.Json.JsonElement>();
                 foreach (var (key, value) in attrs)
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize(value);
-                    graphNode.Attributes[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
+                    graphNode.Attributes[key] = MLJson.ToElement(value);
                 }
             }
 

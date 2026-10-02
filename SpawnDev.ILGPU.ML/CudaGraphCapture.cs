@@ -293,10 +293,8 @@ public sealed class CudaGraphCapture : IDisposable
                         {
                             foreach (var wrObj in list)
                             {
-                                var wr = wrObj?.GetType().GetMethod("TryGetTarget");
-                                if (wr == null) continue;
-                                var args = new object?[] { null };
-                                if (wr.Invoke(wrObj, args) is bool ok && ok && args[0] is { } target)
+                                // childObjects is List<WeakReference<AcceleratorObject>>: a type test, not a by-name lookup.
+                                if (wrObj is WeakReference<global::ILGPU.Runtime.AcceleratorObject> wr && wr.TryGetTarget(out var target))
                                 {
                                     var n = target.GetType().Name;
                                     result[n] = result.GetValueOrDefault(n) + 1;

@@ -251,7 +251,7 @@ public static class TFLiteLoader
                     var axisTensor = sg.Tensors[op.Inputs[1]];
                     var axisData = model.GetTensorData(axisTensor);
                     if (axisData != null && axisData.Length > 0)
-                        attrs2["axes"] = System.Text.Json.JsonSerializer.SerializeToElement(new long[] { (long)axisData[0] });
+                        attrs2["axes"] = MLJson.ToElement(new long[] { (long)axisData[0] });
                 }
                 graph.Nodes.Add(new GraphNode { OpType = "Unsqueeze",
                     Inputs = new List<string> { inputs[0] },
@@ -269,7 +269,7 @@ public static class TFLiteLoader
 
             // Extract operator-specific attributes from builtin options
             var attrs = ExtractAttributes(model, op, sg);
-            attrs["_data_format"] = System.Text.Json.JsonSerializer.SerializeToElement("NHWC");
+            attrs["_data_format"] = MLJson.ToElement("NHWC");
             node.Attributes = attrs;
 
             graph.Nodes.Add(node);
@@ -340,7 +340,7 @@ public static class TFLiteLoader
                 // so e.g. BlazeFace's [1,512,1]+[1,384,1] -> [1,896,1] (axis 1) computed the wrong
                 // launch extent and overran the output buffer. fused_activation (field 1) is ignored
                 // (None for these models).
-                attrs["axis"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                attrs["axis"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
                 break;
             case 3: // CONV_2D
             case 4: // DEPTHWISE_CONV_2D
@@ -357,7 +357,7 @@ public static class TFLiteLoader
                     var shapeTensor = sg.Tensors[op.Inputs[1]];
                     var shapeData = model.GetTensorData(shapeTensor);
                     if (shapeData != null)
-                        attrs["shape"] = JsonSerializer.SerializeToElement(shapeData.Select(v => (long)v).ToArray());
+                        attrs["shape"] = MLJson.ToElement(shapeData.Select(v => (long)v).ToArray());
                 }
                 // ...otherwise (single-input reshape — MediaPipe BlazeFace's classificators/regressors
                 // reshapes) the target is in ReshapeOptions.new_shape (field 0, vector of int). Without
@@ -374,40 +374,40 @@ public static class TFLiteLoader
                         {
                             var ns = new long[n];
                             for (int k = 0; k < n; k++) ns[k] = fb.VectorInt32(nsOff, k);
-                            attrs["shape"] = JsonSerializer.SerializeToElement(ns);
+                            attrs["shape"] = MLJson.ToElement(ns);
                         }
                     }
                 }
                 break;
             case 25: // SOFTMAX
-                attrs["axis"] = JsonSerializer.SerializeToElement(-1L);
+                attrs["axis"] = MLJson.ToElement(-1L);
                 break;
             case 45: // STRIDED_SLICE
                 // StridedSlice has begin_mask, end_mask, etc.
-                attrs["begin_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
-                attrs["end_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 1, 0));
-                attrs["ellipsis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 2, 0));
-                attrs["new_axis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 3, 0));
-                attrs["shrink_axis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 4, 0));
+                attrs["begin_mask"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                attrs["end_mask"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 1, 0));
+                attrs["ellipsis_mask"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 2, 0));
+                attrs["new_axis_mask"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 3, 0));
+                attrs["shrink_axis_mask"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 4, 0));
                 break;
             case 49: // SPLIT
-                attrs["num_outputs"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 2));
+                attrs["num_outputs"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 0, 2));
                 break;
             case 36: // GATHER
-                attrs["axis"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                attrs["axis"] = MLJson.ToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
                 break;
             case 56: // ARG_MAX
-                attrs["axis"] = JsonSerializer.SerializeToElement(-1L); // default
-                attrs["keepdims"] = JsonSerializer.SerializeToElement(0L);
+                attrs["axis"] = MLJson.ToElement(-1L); // default
+                attrs["keepdims"] = MLJson.ToElement(0L);
                 break;
             case 53: // CAST
-                attrs["to"] = JsonSerializer.SerializeToElement(1L); // float32
+                attrs["to"] = MLJson.ToElement(1L); // float32
                 break;
             case 23: // RESIZE_BILINEAR
-                attrs["mode"] = JsonSerializer.SerializeToElement("linear");
+                attrs["mode"] = MLJson.ToElement("linear");
                 break;
             case 95: // RESIZE_NEAREST_NEIGHBOR
-                attrs["mode"] = JsonSerializer.SerializeToElement("nearest");
+                attrs["mode"] = MLJson.ToElement("nearest");
                 break;
             case 39: // TRANSPOSE
                 // perm comes from second input tensor
@@ -416,23 +416,23 @@ public static class TFLiteLoader
                     var permTensor = sg.Tensors[op.Inputs[1]];
                     var permData = model.GetTensorData(permTensor);
                     if (permData != null)
-                        attrs["perm"] = JsonSerializer.SerializeToElement(permData.Select(v => (long)v).ToArray());
+                        attrs["perm"] = MLJson.ToElement(permData.Select(v => (long)v).ToArray());
                 }
                 break;
             case 96: // LEAKY_RELU
                 // alpha from builtin options field 0
                 {
                     float alpha = fb.ReadFieldFloat(optOffset, 0, 0.01f);
-                    attrs["alpha"] = JsonSerializer.SerializeToElement((double)alpha);
+                    attrs["alpha"] = MLJson.ToElement((double)alpha);
                 }
                 break;
             case 20: // RELU_N1_TO_1
-                attrs["min"] = JsonSerializer.SerializeToElement(-1.0);
-                attrs["max"] = JsonSerializer.SerializeToElement(1.0);
+                attrs["min"] = MLJson.ToElement(-1.0);
+                attrs["max"] = MLJson.ToElement(1.0);
                 break;
             case 21: // RELU6
-                attrs["min"] = JsonSerializer.SerializeToElement(0.0);
-                attrs["max"] = JsonSerializer.SerializeToElement(6.0);
+                attrs["min"] = MLJson.ToElement(0.0);
+                attrs["max"] = MLJson.ToElement(6.0);
                 break;
         }
 
@@ -451,25 +451,25 @@ public static class TFLiteLoader
         int strideW = fb.ReadFieldInt32(offset, 1, 1);
         int strideH = fb.ReadFieldInt32(offset, 2, 1);
 
-        attrs["strides"] = JsonSerializer.SerializeToElement(new long[] { strideH, strideW });
+        attrs["strides"] = MLJson.ToElement(new long[] { strideH, strideW });
 
         if (padding == 0) // SAME
-            attrs["auto_pad"] = JsonSerializer.SerializeToElement("SAME_UPPER");
+            attrs["auto_pad"] = MLJson.ToElement("SAME_UPPER");
         else // VALID
-            attrs["auto_pad"] = JsonSerializer.SerializeToElement("VALID");
+            attrs["auto_pad"] = MLJson.ToElement("VALID");
 
         int dilWField = builtinCode == 4 ? 5 : 4;
         int dilHField = builtinCode == 4 ? 6 : 5;
         int dilationW = fb.ReadFieldInt32(offset, dilWField, 1);
         int dilationH = fb.ReadFieldInt32(offset, dilHField, 1);
         if (dilationW != 1 || dilationH != 1)
-            attrs["dilations"] = JsonSerializer.SerializeToElement(new long[] { dilationH, dilationW });
+            attrs["dilations"] = MLJson.ToElement(new long[] { dilationH, dilationW });
 
         if (builtinCode == 4) // DEPTHWISE_CONV_2D
         {
             // TFLite depthwise: group = inC (each input channel is its own group)
             // Set group = -1 as sentinel — ConvOperator resolves to inC at execution time
-            attrs["group"] = JsonSerializer.SerializeToElement((long)-1);
+            attrs["group"] = MLJson.ToElement((long)-1);
         }
     }
 
@@ -488,13 +488,13 @@ public static class TFLiteLoader
         int filterW = fb.ReadFieldInt32(offset, 3, 1);
         int filterH = fb.ReadFieldInt32(offset, 4, 1);
 
-        attrs["kernel_shape"] = JsonSerializer.SerializeToElement(new long[] { filterH, filterW });
-        attrs["strides"] = JsonSerializer.SerializeToElement(new long[] { strideH, strideW });
+        attrs["kernel_shape"] = MLJson.ToElement(new long[] { filterH, filterW });
+        attrs["strides"] = MLJson.ToElement(new long[] { strideH, strideW });
 
         if (padding == 0)
-            attrs["auto_pad"] = JsonSerializer.SerializeToElement("SAME_UPPER");
+            attrs["auto_pad"] = MLJson.ToElement("SAME_UPPER");
         else
-            attrs["auto_pad"] = JsonSerializer.SerializeToElement("VALID");
+            attrs["auto_pad"] = MLJson.ToElement("VALID");
     }
 
     /// <summary>
@@ -538,8 +538,8 @@ public static class TFLiteLoader
         {
             actNode.Attributes = new Dictionary<string, JsonElement>
             {
-                ["min"] = JsonSerializer.SerializeToElement(0.0),
-                ["max"] = JsonSerializer.SerializeToElement(6.0)
+                ["min"] = MLJson.ToElement(0.0),
+                ["max"] = MLJson.ToElement(6.0)
             };
         }
 

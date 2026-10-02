@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.1-local.10</Version>
+		<Version>5.3.1-local.11</Version>
 		<PackageReleaseNotes>v5.3.0: on SpawnDev.ILGPU 5.3.0 + SpawnDev.SpawnJS 3.0.0 (one-crossing interop). Includes 5.2.38: the uncaptured WebGPU forward ~10-30x faster (DAv3 Small 518 ~100 ms, DAv2 ~60 ms). Minor bump: an app pinning SpawnJS 2.x directly gets NU1605. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -25,6 +25,10 @@
 		<IsPackable>true</IsPackable>
 		<LangVersion>latest</LangVersion>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<!-- Trim safe, enforced: the trim analyzer runs on every build and any trim (IL2xxx) warning fails it. -->
+		<IsTrimmable>true</IsTrimmable>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
+		<WarningsAsErrors>$(WarningsAsErrors);IL2026;IL2046;IL2057;IL2060;IL2062;IL2065;IL2067;IL2069;IL2070;IL2072;IL2073;IL2074;IL2075;IL2076;IL2077;IL2078;IL2080;IL2087;IL2088;IL2089;IL2090;IL2091;IL2092;IL2093;IL2094;IL2095;IL2106;IL2111;IL2112;IL2113;IL2114</WarningsAsErrors>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -35,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.0" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.1-local.1" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.1-local.11" />
 	</ItemGroup>
 
 	<ItemGroup>

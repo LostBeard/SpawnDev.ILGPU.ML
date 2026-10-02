@@ -82,10 +82,10 @@ public class ModelGraph
     public Dictionary<string, int>? InitializerDataTypes { get; set; }
 
     public static ModelGraph FromJson(string json)
-        => JsonSerializer.Deserialize<ModelGraph>(json) ?? throw new InvalidOperationException("Failed to parse model graph JSON");
+        => MLJson.Deserialize<ModelGraph>(json) ?? throw new InvalidOperationException("Failed to parse model graph JSON");
 
     public string ToJson()
-        => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+        => MLJson.Serialize(this, MLJson.Indented);
 }
 
 /// <summary>Value (tensor) metadata: name and shape.</summary>

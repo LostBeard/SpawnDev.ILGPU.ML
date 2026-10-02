@@ -39,6 +39,7 @@ public class HuggingFaceClient
     {
         PropertyNameCaseInsensitive = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        TypeInfoResolver = MLJsonContext.Default,
     };
 
     /// <summary>HuggingFace Hub base URL.</summary>
@@ -103,7 +104,7 @@ public class HuggingFaceClient
 
         var url = $"{ApiUrl}/models?{string.Join("&", queryParams)}";
         var json = await GetStringAsync(url);
-        return JsonSerializer.Deserialize<HFModelInfo[]>(json, JsonOptions) ?? Array.Empty<HFModelInfo>();
+        return MLJson.Deserialize<HFModelInfo[]>(json, JsonOptions) ?? Array.Empty<HFModelInfo>();
     }
 
     /// <summary>
@@ -115,7 +116,7 @@ public class HuggingFaceClient
     {
         var url = $"{ApiUrl}/models/{repoId}";
         var json = await GetStringAsync(url);
-        return JsonSerializer.Deserialize<HFModelInfo>(json, JsonOptions)
+        return MLJson.Deserialize<HFModelInfo>(json, JsonOptions)
             ?? throw new InvalidOperationException($"Failed to parse model info for '{repoId}'");
     }
 
@@ -130,7 +131,7 @@ public class HuggingFaceClient
         var url = $"{ApiUrl}/models/{repoId}/tree/{revision}";
         if (!string.IsNullOrEmpty(path)) url += $"/{path}";
         var json = await GetStringAsync(url);
-        return JsonSerializer.Deserialize<HFRepoFile[]>(json, JsonOptions) ?? Array.Empty<HFRepoFile>();
+        return MLJson.Deserialize<HFRepoFile[]>(json, JsonOptions) ?? Array.Empty<HFRepoFile>();
     }
 
     // ═══════════════════════════════════════════════════════════

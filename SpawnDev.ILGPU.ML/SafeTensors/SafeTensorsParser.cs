@@ -30,7 +30,7 @@ public static class SafeTensorsParser
 
         // Parse header JSON
         var headerJson = Encoding.UTF8.GetString(data, 8, (int)headerSize);
-        var header = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(headerJson)
+        var header = MLJson.Deserialize<Dictionary<string, JsonElement>>(headerJson)
             ?? throw new InvalidOperationException("Failed to parse SafeTensors header");
 
         long dataStartOffset = 8 + headerSize;

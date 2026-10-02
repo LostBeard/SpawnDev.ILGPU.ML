@@ -1866,10 +1866,6 @@ public class InferenceSession : IDisposable
             // so AllowNamedFloatingPointLiterals is required.
             if (node.Attributes.Count > 0)
             {
-                var nanSafeOptions = new System.Text.Json.JsonSerializerOptions
-                {
-                    NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
-                };
                 var jsonDict = new Dictionary<string, System.Text.Json.JsonElement>();
                 foreach (var (key, value) in node.Attributes)
                 {
@@ -1881,8 +1877,7 @@ public class InferenceSession : IDisposable
                         (graphNode.RawAttributes ??= new Dictionary<string, object>())[key] = value;
                         continue;
                     }
-                    var json = System.Text.Json.JsonSerializer.Serialize(value, nanSafeOptions);
-                    jsonDict[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
+                    jsonDict[key] = MLJson.ToElement(value, MLJson.NanSafe);
                 }
                 graphNode.Attributes = jsonDict;
             }

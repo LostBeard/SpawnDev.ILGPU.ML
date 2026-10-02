@@ -2,7 +2,28 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+
 ## Unreleased (5.3.1-local)
+
+- **SpawnDev.ILGPU.ML and SpawnDev.ILGPU.ML.WebTorrent are `IsTrimmable`; every IL2xxx warning is a build error.**
+  93 trim warnings -> 0 (and 93 dynamic-code IL3050 -> 0), all System.Text.Json reflection serialization:
+  - New `MLJsonContext` (source-generated) + `MLJson` helpers. Node attributes go through TYPED `MLJson.ToElement`
+    overloads (bool/int/long/float/double/string and their arrays), so an unsupported attribute type is a COMPILE error;
+    object-typed ONNX/TF attributes dispatch on the runtime type and name an unsupported one instead of emitting `{}`.
+    The NaN-safe ONNX path keeps `AllowNamedFloatingPointLiterals`; ModelGraph keeps its indented output; the
+    HuggingFace client keeps its options; hub replies keep web defaults (camelCase, case-insensitive).
+  - GLTFExporter builds its glTF JSON with JsonObject/JsonArray instead of anonymous objects (whose getters a trimmed
+    app removes), using the non-generic `JsonArray.Add(JsonNode)`.
+  - CudaGraphCapture: a WeakReference type test instead of a by-name `TryGetTarget` lookup.
+  - PARITY PROVEN against the reflection serializer it replaced: every attribute kind incl. escaped strings and
+    NaN/Infinity, ModelGraph.ToJson + FromJson round trip, hub replies (records, PascalCase key, unknown field), and
+    GLB output byte-identical with and without vertex colors.
+- On SpawnDev.ILGPU 5.3.1-local.11 (was local.1). The Demo publishes TRIMMED (test assemblies rooted), so PMT tests the
+  engine the way consumers ship it.
+- Gate: ML xUnit 43/43; full PMT on the TRIMMED Demo 5577 passed / 1 failed / 117 skipped - the one failure
+  (SystemOne_SnakeTeacher on WebGPU) was a Playwright click timeout on a busy page; all 20 SnakeTeacher variants pass
+  rerun alone on the same trimmed build. Targeted pass (CreateFromStream*, Reduce*, AllOps, optimizer, TFLite) 454/0/3.
+  Packages: SpawnDev.ILGPU.ML 5.3.1-local.11, SpawnDev.ILGPU.ML.WebTorrent 1.0.2-local.1.
 
 - **ReduceL1 / L2 / SumSquare / LogSum / LogSumExp fixed as a family** (Tuvok, 5.3.1-local.10): ReduceL2 squared with
   `Mul(x, x, out)` and finished with `Sqrt(out, out)` (LogSum / LogSumExp: `Log(out, out)`), one buffer in two storage

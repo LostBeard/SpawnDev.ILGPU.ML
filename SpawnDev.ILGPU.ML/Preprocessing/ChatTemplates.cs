@@ -673,7 +673,7 @@ public static class ChatTemplates
             if (key.Length == 0) continue;
             if (!first) sb.Append(',');
             first = false;
-            sb.Append(System.Text.Json.JsonSerializer.Serialize(key)).Append(':').Append(vjson);
+            sb.Append(MLJson.Serialize<string>(key)).Append(':').Append(vjson);
         }
         if (i < t.Length && t[i] == '}') i++;
         sb.Append('}');
@@ -709,7 +709,7 @@ public static class ChatTemplates
             int end = t.IndexOf(Gemma4Quote, start, StringComparison.Ordinal);
             if (end < 0) end = t.Length;
             string raw = t.Substring(start, end - start);
-            return (System.Text.Json.JsonSerializer.Serialize(raw), end < t.Length ? end + q : end);
+            return (MLJson.Serialize<string>(raw), end < t.Length ? end + q : end);
         }
         // bareword: number / true / false / null (else fall back to a JSON string)
         int j = i;
@@ -717,6 +717,6 @@ public static class ChatTemplates
         string w = t.Substring(i, j - i).Trim();
         if (w == "true" || w == "false" || w == "null") return (w, j);
         if (double.TryParse(w, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out _)) return (w, j);
-        return (System.Text.Json.JsonSerializer.Serialize(w), j);
+        return (MLJson.Serialize<string>(w), j);
     }
 }

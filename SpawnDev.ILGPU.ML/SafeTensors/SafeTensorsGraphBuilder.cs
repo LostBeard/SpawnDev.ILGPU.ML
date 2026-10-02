@@ -268,7 +268,7 @@ public static class SafeTensorsGraphBuilder
     }
 
     private static Dictionary<string, JsonElement> Attr(string k, object v)
-        => new() { [k] = JsonSerializer.SerializeToElement(v) };
+        => new() { [k] = MLJson.ToElement(v) };
 
     private static void AddLinear(ModelGraph g, SafeTensorsFile m, string wName, string input, string output)
     {

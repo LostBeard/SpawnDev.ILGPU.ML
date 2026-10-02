@@ -219,11 +219,11 @@ public static class GGUFGraphBuilder
                 string gdnOut = $"{pfx}_gdn_out";
                 var gdnAttrs = new Dictionary<string, JsonElement>
                 {
-                    ["num_k_heads"] = JsonSerializer.SerializeToElement((long)gdnKHeads),
-                    ["head_k_dim"] = JsonSerializer.SerializeToElement((long)gdnHeadDim),
-                    ["num_v_heads"] = JsonSerializer.SerializeToElement((long)gdnVHeads),
-                    ["head_v_dim"] = JsonSerializer.SerializeToElement((long)gdnHeadDim),
-                    ["layer"] = JsonSerializer.SerializeToElement((long)layer),
+                    ["num_k_heads"] = MLJson.ToElement((long)gdnKHeads),
+                    ["head_k_dim"] = MLJson.ToElement((long)gdnHeadDim),
+                    ["num_v_heads"] = MLJson.ToElement((long)gdnVHeads),
+                    ["head_v_dim"] = MLJson.ToElement((long)gdnHeadDim),
+                    ["layer"] = MLJson.ToElement((long)layer),
                 };
                 AddNode(graph, "GatedDeltaNet",
                     new[] { qkv, zGate, aProj, bProj, convWName, ssmAName, ssmDtName, ssmNormName },
@@ -269,8 +269,8 @@ public static class GGUFGraphBuilder
                 AddNode(graph, "Split", new[] { qg4d }, new[] { query4d, gate4d },
                     new Dictionary<string, JsonElement>
                     {
-                        ["axis"] = JsonSerializer.SerializeToElement(3L),
-                        ["split"] = JsonSerializer.SerializeToElement(new long[] { hd, hd }),
+                        ["axis"] = MLJson.ToElement(3L),
+                        ["split"] = MLJson.ToElement(new long[] { hd, hd }),
                     });
                 // Flatten query back to [1,seq,nHeads*hd] (EmitAttnHead reshapes it to [1,-1,heads,hd]).
                 qForAttn = $"{pfx}_q_flat";
@@ -328,28 +328,28 @@ public static class GGUFGraphBuilder
             string attnValues = $"{pfx}_attn_val";
             var faAttrs = new Dictionary<string, JsonElement>
             {
-                ["n_heads"] = JsonSerializer.SerializeToElement((long)nHeads),
-                ["n_kv_heads"] = JsonSerializer.SerializeToElement((long)cfg.NKVHeads),
-                ["head_dim"] = JsonSerializer.SerializeToElement((long)hd),
-                ["causal"] = JsonSerializer.SerializeToElement(1L),
-                ["window"] = JsonSerializer.SerializeToElement((long)cfg.Window),
-                ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+                ["n_heads"] = MLJson.ToElement((long)nHeads),
+                ["n_kv_heads"] = MLJson.ToElement((long)cfg.NKVHeads),
+                ["head_dim"] = MLJson.ToElement((long)hd),
+                ["causal"] = MLJson.ToElement(1L),
+                ["window"] = MLJson.ToElement((long)cfg.Window),
+                ["kv_offset"] = MLJson.ToElement(0L),
                 // layer index: lets the incremental-decode KV-cache (GGUFDecodeKVCache) associate this
                 // FusedAttention node with its per-layer K/V buffer. Unused in the default full-recompute
                 // forward; read only in decode mode. See Plans/gemma4-kvcache-decode-plan-2026-06-12.md.
-                ["layer"] = JsonSerializer.SerializeToElement((long)layer),
+                ["layer"] = MLJson.ToElement((long)layer),
                 // seq_major_out: FusedAttention writes its output directly in seq-major [1,seq,heads,hd] layout
                 // (kernel p[11]) so we can DROP the post-attention Transpose[0,2,1,3] below — the merged Reshape
                 // then consumes the attention output directly. Universal: the group kernels scatter to the
                 // seq-major base, the per-element kernels (WebGL) enumerate idx in seq-major order (own-slot
                 // write, no scatter). Eliminates ~28 transpose dispatches+copies/decode-step. (Tuvok 2026-06-23.)
-                ["seq_major_out"] = JsonSerializer.SerializeToElement(1L),
+                ["seq_major_out"] = MLJson.ToElement(1L),
                 // seq_major_q: Q is fed seq-major (its pre-attention transpose was dropped, step 2) so
                 // FusedAttention reads Q with the seq-major base (p[12]). K/V stay heads-major (step 3 pending).
-                ["seq_major_q"] = JsonSerializer.SerializeToElement(1L),
+                ["seq_major_q"] = MLJson.ToElement(1L),
                 // seq_major_kv: K/V pre-attention transposes dropped (step 3); the decode KV-cache store is seq-major.
                 // FusedAttention reads K/V seq-major (p[13]: kvHead offset hd, per-token stride kvHeads*hd).
-                ["seq_major_kv"] = JsonSerializer.SerializeToElement(1L),
+                ["seq_major_kv"] = MLJson.ToElement(1L),
             };
             if (gemmaAttn)
             {
@@ -360,7 +360,7 @@ public static class GGUFGraphBuilder
                 float gemmaScale = arch.StartsWith("gemma4", StringComparison.Ordinal)
                     ? 1.0f
                     : 1f / MathF.Sqrt(model.GetMetadataFloat($"{model.Architecture}.attention.query_pre_attn_scalar", hd));
-                faAttrs["scale"] = JsonSerializer.SerializeToElement(gemmaScale);
+                faAttrs["scale"] = MLJson.ToElement(gemmaScale);
             }
             // Attention sinks (gpt-oss): a per-head learned logit ([n_head]) added to the softmax
             // denominator (0 value contribution). Presence-based 4th input; absent elsewhere.
@@ -527,10 +527,10 @@ public static class GGUFGraphBuilder
             AddNode(graph, "Slice", new[] { prevOutput }, new[] { "last_token_hidden" },
                 new Dictionary<string, JsonElement>
                 {
-                    ["starts"] = JsonSerializer.SerializeToElement(new long[] { -1 }),
-                    ["ends"] = JsonSerializer.SerializeToElement(new long[] { int.MaxValue }),
-                    ["axes"] = JsonSerializer.SerializeToElement(new long[] { 1 }),
-                    ["steps"] = JsonSerializer.SerializeToElement(new long[] { 1 }),
+                    ["starts"] = MLJson.ToElement(new long[] { -1 }),
+                    ["ends"] = MLJson.ToElement(new long[] { int.MaxValue }),
+                    ["axes"] = MLJson.ToElement(new long[] { 1 }),
+                    ["steps"] = MLJson.ToElement(new long[] { 1 }),
                 });
             headInput = "last_token_hidden";
         }
@@ -846,13 +846,13 @@ public static class GGUFGraphBuilder
             string roped = $"{pfx}_{tag}_roped";
             var ropeAttrs = new Dictionary<string, JsonElement>
             {
-                ["rope_base"] = JsonSerializer.SerializeToElement(cfg.RopeBase),
-                ["rotary_dim"] = JsonSerializer.SerializeToElement((long)cfg.RotaryDim),
-                ["rows_per_position"] = JsonSerializer.SerializeToElement((long)heads),
-                ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+                ["rope_base"] = MLJson.ToElement(cfg.RopeBase),
+                ["rotary_dim"] = MLJson.ToElement((long)cfg.RotaryDim),
+                ["rows_per_position"] = MLJson.ToElement((long)heads),
+                ["kv_offset"] = MLJson.ToElement(0L),
                 // Pairing style: NORM/consecutive (interleaved=1) for the LLaMA lineage, else
                 // NeoX/split-half (0). MUST match how the GGUF weights were permuted - see UsesNormRope.
-                ["interleaved"] = JsonSerializer.SerializeToElement(
+                ["interleaved"] = MLJson.ToElement(
                     UsesNormRope(model.Architecture.ToLowerInvariant()) ? 1L : 0L),
             };
             var ins = freqFactors != null ? new[] { cur, freqFactors } : new[] { cur };
@@ -883,7 +883,7 @@ public static class GGUFGraphBuilder
     }
 
     private static Dictionary<string, JsonElement> Attrs(string key, object value)
-        => new() { [key] = JsonSerializer.SerializeToElement(value) };
+        => new() { [key] = MLJson.ToElement(value) };
 
     private static void AddNorm(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
         string tensorPrefix, string input, string output, int dim, bool useRMSNorm)
@@ -1004,9 +1004,9 @@ public static class GGUFGraphBuilder
         };
         var attrs = new Dictionary<string, JsonElement>
         {
-            ["n_expert"] = JsonSerializer.SerializeToElement((long)nExpert),
-            ["n_expert_used"] = JsonSerializer.SerializeToElement((long)nExpertUsed),
-            ["n_ff"] = JsonSerializer.SerializeToElement((long)nFf),
+            ["n_expert"] = MLJson.ToElement((long)nExpert),
+            ["n_expert_used"] = MLJson.ToElement((long)nExpertUsed),
+            ["n_ff"] = MLJson.ToElement((long)nFf),
         };
         AddNode(graph, "MoE", inputs, new[] { output }, attrs);
     }

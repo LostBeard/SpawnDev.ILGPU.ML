@@ -304,8 +304,8 @@ public static class GraphOptimizer
                 Outputs = new List<string> { biasAdd.Outputs[0] },
                 Attributes = new Dictionary<string, JsonElement>
                 {
-                    ["axis"] = JsonSerializer.SerializeToElement(axis),
-                    ["epsilon"] = JsonSerializer.SerializeToElement(epsilon),
+                    ["axis"] = MLJson.ToElement(axis),
+                    ["epsilon"] = MLJson.ToElement(epsilon),
                 },
             };
             foreach (var idx in new[] { subIdx, sqIdx, varIdx, epsIdx, sqrtIdx, divIdx, mulIdx, biasIdx })
@@ -630,8 +630,8 @@ public static class GraphOptimizer
                 Outputs = new List<string> { biasAdd.Outputs[0] },
                 Attributes = new Dictionary<string, JsonElement>
                 {
-                    ["axis"] = JsonSerializer.SerializeToElement(axis),
-                    ["epsilon"] = JsonSerializer.SerializeToElement(epsilon),
+                    ["axis"] = MLJson.ToElement(axis),
+                    ["epsilon"] = MLJson.ToElement(epsilon),
                 },
             };
 
@@ -774,7 +774,7 @@ public static class GraphOptimizer
                 Outputs = new List<string> { fusedOutput },
                 Attributes = new Dictionary<string, JsonElement>
                 {
-                    ["activation"] = JsonSerializer.SerializeToElement(activationType ?? "none")
+                    ["activation"] = MLJson.ToElement(activationType ?? "none")
                 }
             };
 
@@ -849,7 +849,7 @@ public static class GraphOptimizer
                     Outputs = new List<string> { candidate.Outputs[0] },
                     Attributes = new Dictionary<string, JsonElement>
                     {
-                        ["is_div"] = JsonSerializer.SerializeToElement(candidate.OpType == "Div")
+                        ["is_div"] = MLJson.ToElement(candidate.OpType == "Div")
                     }
                 };
 
@@ -1167,9 +1167,9 @@ public static class GraphOptimizer
                 Outputs = new List<string> { attnOut },
                 Attributes = new Dictionary<string, JsonElement>
                 {
-                    ["causal"] = JsonSerializer.SerializeToElement(0),
-                    ["window"] = JsonSerializer.SerializeToElement(0),
-                    ["scale"] = JsonSerializer.SerializeToElement(scale),
+                    ["causal"] = MLJson.ToElement(0),
+                    ["window"] = MLJson.ToElement(0),
+                    ["scale"] = MLJson.ToElement(scale),
                 }
             };
             remove.Add(si);
@@ -1383,9 +1383,9 @@ public static class GraphOptimizer
                 Outputs = new List<string> { av.Outputs[0] },
                 Attributes = new Dictionary<string, JsonElement>
                 {
-                    ["causal"] = JsonSerializer.SerializeToElement(0),
-                    ["window"] = JsonSerializer.SerializeToElement(0),
-                    ["scale"] = JsonSerializer.SerializeToElement(scale),
+                    ["causal"] = MLJson.ToElement(0),
+                    ["window"] = MLJson.ToElement(0),
+                    ["scale"] = MLJson.ToElement(scale),
                 }
             };
             remove.Add(si);

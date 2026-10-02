@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using SpawnDev.ILGPU.ML.Kernels;
 
 namespace SpawnDev.ILGPU.ML.Formats;
@@ -67,59 +68,55 @@ public static class GLTFExporter
             if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
         }
 
-        // Build JSON chunk
-        var accessors = new List<object>();
-        var bufferViews = new List<object>();
-        var attributes = new Dictionary<string, int>();
+        // Build JSON chunk. JsonObject/JsonArray, not anonymous objects: reflection serialization of an anonymous type
+        // is not trim safe (its getters are removed in a trimmed app). Same keys, same order, same number writer, so
+        // the JSON text is byte-identical to the anonymous-object version it replaces.
+        var accessors = new JsonArray();
+        var bufferViews = new JsonArray();
+        var attributes = new JsonObject();
 
         // BufferView 0: positions
-        bufferViews.Add(new { buffer = 0, byteOffset = positionOffset, byteLength = positionBytes, target = 34962 });
+        bufferViews.Add((JsonNode)new JsonObject { ["buffer"] = 0, ["byteOffset"] = positionOffset, ["byteLength"] = positionBytes, ["target"] = 34962 });
         // Accessor 0: positions
-        accessors.Add(new
+        accessors.Add((JsonNode)new JsonObject
         {
-            bufferView = 0, componentType = 5126, count = vertexCount, type = "VEC3",
-            max = new[] { maxX, maxY, maxZ }, min = new[] { minX, minY, minZ }
+            ["bufferView"] = 0, ["componentType"] = 5126, ["count"] = vertexCount, ["type"] = "VEC3",
+            ["max"] = new JsonArray(maxX, maxY, maxZ), ["min"] = new JsonArray(minX, minY, minZ)
         });
         attributes["POSITION"] = 0;
 
         // BufferView 1: indices
-        bufferViews.Add(new { buffer = 0, byteOffset = indexOffset, byteLength = indexBytes, target = 34963 });
+        bufferViews.Add((JsonNode)new JsonObject { ["buffer"] = 0, ["byteOffset"] = indexOffset, ["byteLength"] = indexBytes, ["target"] = 34963 });
         // Accessor 1: indices
-        accessors.Add(new { bufferView = 1, componentType = 5125, count = triangleCount * 3, type = "SCALAR" });
+        accessors.Add((JsonNode)new JsonObject { ["bufferView"] = 1, ["componentType"] = 5125, ["count"] = triangleCount * 3, ["type"] = "SCALAR" });
 
         int colorAccessorIdx = -1;
         if (vertexColors != null)
         {
             // BufferView 2: colors
-            bufferViews.Add(new { buffer = 0, byteOffset = colorOffset, byteLength = colorBytes, target = 34962 });
+            bufferViews.Add((JsonNode)new JsonObject { ["buffer"] = 0, ["byteOffset"] = colorOffset, ["byteLength"] = colorBytes, ["target"] = 34962 });
             // Accessor 2: colors
             colorAccessorIdx = accessors.Count;
-            accessors.Add(new { bufferView = 2, componentType = 5126, count = vertexCount, type = "VEC3" });
+            accessors.Add((JsonNode)new JsonObject { ["bufferView"] = 2, ["componentType"] = 5126, ["count"] = vertexCount, ["type"] = "VEC3" });
             attributes["COLOR_0"] = colorAccessorIdx;
         }
 
-        var gltf = new
+        var gltf = new JsonObject
         {
-            asset = new { version = "2.0", generator = "SpawnDev.ILGPU.ML" },
-            scene = 0,
-            scenes = new[] { new { nodes = new[] { 0 } } },
-            nodes = new[] { new { mesh = 0 } },
-            meshes = new[]
+            ["asset"] = new JsonObject { ["version"] = "2.0", ["generator"] = "SpawnDev.ILGPU.ML" },
+            ["scene"] = 0,
+            ["scenes"] = new JsonArray(new JsonObject { ["nodes"] = new JsonArray(0) }),
+            ["nodes"] = new JsonArray(new JsonObject { ["mesh"] = 0 }),
+            ["meshes"] = new JsonArray(new JsonObject
             {
-                new
-                {
-                    primitives = new[]
-                    {
-                        new { attributes, indices = 1, mode = 4 } // TRIANGLES
-                    }
-                }
-            },
-            accessors,
-            bufferViews,
-            buffers = new[] { new { byteLength = paddedBinBytes } },
+                ["primitives"] = new JsonArray(new JsonObject { ["attributes"] = attributes, ["indices"] = 1, ["mode"] = 4 }) // TRIANGLES
+            }),
+            ["accessors"] = accessors,
+            ["bufferViews"] = bufferViews,
+            ["buffers"] = new JsonArray(new JsonObject { ["byteLength"] = paddedBinBytes }),
         };
 
-        var jsonStr = JsonSerializer.Serialize(gltf);
+        var jsonStr = gltf.ToJsonString();
         var jsonBytes = Encoding.UTF8.GetBytes(jsonStr);
         // Pad JSON to 4-byte alignment with spaces
         int paddedJsonLen = (jsonBytes.Length + 3) & ~3;

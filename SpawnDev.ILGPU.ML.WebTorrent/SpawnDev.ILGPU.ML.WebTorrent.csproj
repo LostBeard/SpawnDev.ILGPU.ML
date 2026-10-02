@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>1.0.1</Version>
+		<Version>1.0.2-local.1</Version>
 		<PackageReleaseNotes>v1.0.1 - Pins SpawnDev.WebTorrent 4.2.8. 1.0.0 pinned 4.2.7, which is binary-broken against SpawnDev.SpawnJS 2.1.17: 4.2.7 was compiled against SpawnJS 2.1.7, where FileSystemWritableFileStream.Seek and .Truncate took a ulong, and 2.1.17 takes a long. The change is source-compatible, so nothing in a build, restore or publish reports it, but the shipped IL still calls the ulong overloads and NuGet loads 2.1.17 beside them - MissingMethodException at runtime on the createWritable piece-write path. Nothing in THIS package changed; it carried the break transitively, which is the whole reason the pin has to move. Consumers on 1.0.0 should upgrade.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -24,6 +24,10 @@
 		<EnableDefaultCompileItems>true</EnableDefaultCompileItems>
 		<IsPackable>true</IsPackable>
 		<LangVersion>latest</LangVersion>
+		<!-- Trim safe, enforced: the trim analyzer runs on every build and any trim (IL2xxx) warning fails it. -->
+		<IsTrimmable>true</IsTrimmable>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
+		<WarningsAsErrors>$(WarningsAsErrors);IL2026;IL2046;IL2057;IL2060;IL2062;IL2065;IL2067;IL2069;IL2070;IL2072;IL2073;IL2074;IL2075;IL2076;IL2077;IL2078;IL2080;IL2087;IL2088;IL2089;IL2090;IL2091;IL2092;IL2093;IL2094;IL2095;IL2106;IL2111;IL2112;IL2113;IL2114</WarningsAsErrors>
 	</PropertyGroup>
 
 	<ItemGroup>

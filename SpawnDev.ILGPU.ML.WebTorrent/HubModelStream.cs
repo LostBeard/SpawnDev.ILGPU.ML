@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.WebTorrent;
 
@@ -115,7 +117,7 @@ public class HubModelStream : IModelSource
                 using var resp = await _http.GetAsync(url, cts.Token).ConfigureAwait(false);
                 if (resp.IsSuccessStatusCode)
                 {
-                    var result = await resp.Content.ReadFromJsonAsync<HubMagnetResult>(cts.Token).ConfigureAwait(false);
+                    var result = await resp.Content.ReadFromJsonAsync(HubJsonContext.Default.HubMagnetResult, cts.Token).ConfigureAwait(false);
                     if (result == null || string.IsNullOrEmpty(result.MagnetUri))
                         throw new InvalidOperationException($"Hub returned no magnet for '{repoId}/{filePath}' ({url}).");
                     return result.MagnetUri;
@@ -218,7 +220,7 @@ public class HubModelStream : IModelSource
         {
             using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode) return null;
-            return await resp.Content.ReadFromJsonAsync<HubModelResult>(ct).ConfigureAwait(false);
+            return await resp.Content.ReadFromJsonAsync(HubJsonContext.Default.HubModelResult, ct).ConfigureAwait(false);
         }
         catch { return null; }
     }
@@ -271,7 +273,7 @@ public class HubModelStream : IModelSource
     }
 
     /// <summary>JSON shape of the hub's non-blocking /model | /ollama-model status response.</summary>
-    private sealed record HubModelResult(string? Status, string? MagnetUri, string? WebSeed);
+    internal sealed record HubModelResult(string? Status, string? MagnetUri, string? WebSeed);
 
     /// <summary>Ask the hub for the magnet URI of an OLLAMA model layer. The hub's OllamaProxy resolves the
     /// ollama registry manifest, fetches the layer blob, and seeds it as a torrent — same retry-on-prepare
@@ -295,7 +297,7 @@ public class HubModelStream : IModelSource
                 using var resp = await _http.GetAsync(url, cts.Token).ConfigureAwait(false);
                 if (resp.IsSuccessStatusCode)
                 {
-                    var result = await resp.Content.ReadFromJsonAsync<HubOllamaPrep>(cts.Token).ConfigureAwait(false);
+                    var result = await resp.Content.ReadFromJsonAsync(HubJsonContext.Default.HubOllamaPrep, cts.Token).ConfigureAwait(false);
                     if (string.Equals(result?.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(result!.MagnetUri))
                         return result.MagnetUri;
                     // "preparing" — the hub is still fetching/seeding the blob; wait and poll again.
@@ -317,7 +319,7 @@ public class HubModelStream : IModelSource
     }
 
     /// <summary>Shape of the hub's non-blocking <c>/ollama-model</c> response (status + magnet when ready).</summary>
-    private sealed record HubOllamaPrep(string? Status, string? MagnetUri);
+    internal sealed record HubOllamaPrep(string? Status, string? MagnetUri);
 
     /// <summary>Open a seekable read stream over an OLLAMA model layer served by the hub (twin of
     /// <see cref="OpenAsync"/>). The returned file can be re-streamed with <c>HubModel.File.CreateReadStream()</c>
@@ -385,3 +387,13 @@ public class HubModelStream : IModelSource
         }
     }
 }
+
+/// <summary>
+/// Source-generated metadata for the hub's JSON replies (trim / AOT safe). Web defaults - camelCase, case-insensitive -
+/// are exactly what ReadFromJsonAsync&lt;T&gt; used before.
+/// </summary>
+[JsonSourceGenerationOptions(JsonSerializerDefaults.Web)]
+[JsonSerializable(typeof(HubModelStream.HubMagnetResult))]
+[JsonSerializable(typeof(HubModelStream.HubModelResult))]
+[JsonSerializable(typeof(HubModelStream.HubOllamaPrep))]
+internal partial class HubJsonContext : JsonSerializerContext { }

@@ -57,7 +57,7 @@ public class WeightLoader
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Loading manifest...");
         onProgress?.Invoke("manifest", 0);
         var manifestJson = await _http.GetStringAsync($"{basePath}/manifest_fp16.json");
-        var manifest = JsonSerializer.Deserialize<Dictionary<string, TensorInfo>>(manifestJson)!;
+        var manifest = MLJson.Deserialize<Dictionary<string, TensorInfo>>(manifestJson)!;
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Manifest: {manifest.Count} tensors");
         onProgress?.Invoke("manifest", 100);
 
@@ -272,7 +272,7 @@ public class WeightLoader
         return sign == 1 ? -result : result;
     }
 
-    private class TensorInfo
+    internal class TensorInfo
     {
         public int offset { get; set; }
         public int[] shape { get; set; } = [];
