@@ -2057,6 +2057,10 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Slice";
 
+    /// <summary>DIAGNOSTIC: GPU Slices that took the per-run copy fallback (<c>SliceGPU</c>: one dispatch per contiguous run,
+    /// per ELEMENT on a reversed last axis) instead of the fused SliceKernel. Only rank &gt; SliceKernel.MAX_RANK should.</summary>
+    public static int FallbackCalls;
+
     /// <summary>DIAGNOSTIC: when non-null, records every Slice's RESOLVED params + which resolution
     /// path produced them (1=compiler _resolved_*, 2=runtime ConstantValues, 3=attributes/defaults),
     /// keyed by the joined input names. The WebGPU range-deviation hunt uses this to tell a
@@ -2281,16 +2285,19 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         // 2026-05-05 diagnosis (commit `54d3eae`) showed Slice nodes 700-1100ms
         // each on Wasm in DA3-Small RoPE blocks driven by per-dispatch overhead;
         // this path collapses that to one dispatch + small param upload.
-        bool allPositiveSteps = true;
-        for (int d = 0; d < rank; d++) { if (sliceSteps[d] <= 0) { allPositiveSteps = false; break; } }
-        if (allPositiveSteps && rank <= Kernels.SliceKernel.MAX_RANK)
+        // NEGATIVE steps too (2026-10-01): the kernel's input index is start + outCoord * step, which walks a reversed
+        // axis backwards from its clamped start (dim-1 at most) - nothing in it assumes a positive step. Until then a
+        // reversed slice took the per-run fallback below, one dispatch per row and one per ELEMENT when the reversed axis
+        // is the last: LightGlue's rotary "flip" Slices cost ~40 ms each on WebGPU (18 per pair, 30% of the matcher).
+        if (rank <= Kernels.SliceKernel.MAX_RANK)
         {
             reg.Slice.Slice(input.Data, ctx.Outputs[0].Data,
                 sliceStarts, sliceSteps, outShape, inStrides, rank, outCount);
             return;
         }
 
-        // Fallback for negative steps or extreme rank: copy contiguous slices along last axis
+        // Fallback for extreme rank: copy contiguous slices along the last axis.
+        System.Threading.Interlocked.Increment(ref FallbackCalls);
         int outIdx2 = 0;
         SliceGPU(input.Data, ctx.Outputs[0].Data, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx2, reg);
     }

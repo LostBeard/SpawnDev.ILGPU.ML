@@ -105,6 +105,22 @@ public abstract partial class MLTestBase
         });
     }
 
+    /// <summary>
+    /// Reversed slices run as ONE fused SliceKernel dispatch (2026-10-01). They took the per-run copy fallback - one
+    /// dispatch per row, one per element on a reversed last axis - and LightGlue's rotary flip Slices cost ~40 ms each on
+    /// WebGPU (30% of the matcher). Every reverse case must leave SliceOperator.FallbackCalls untouched (and the values
+    /// still match onnxruntime - the four cases above).
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Slice_Reverse_UsesTheFusedKernel()
+    {
+        int before = SpawnDev.ILGPU.ML.Operators.SliceOperator.FallbackCalls;
+        foreach (var name in new[] { "reverse_last_axis", "reverse_long_axis", "reverse_middle_axis", "reverse_step2" })
+            await SliceCaseMatchesOnnxRuntime(name);
+        int used = SpawnDev.ILGPU.ML.Operators.SliceOperator.FallbackCalls - before;
+        if (used != 0) throw new Exception($"{used} reversed Slice(s) took the per-run copy fallback instead of the fused kernel");
+    }
+
     [TestMethod(Timeout = 180000)]
     public async Task Slice_ReverseLastAxis_MatchesOnnxRuntime() => await SliceCaseMatchesOnnxRuntime("reverse_last_axis");
 

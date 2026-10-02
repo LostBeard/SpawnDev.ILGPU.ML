@@ -3,6 +3,17 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased (5.3.2-local)
+
+- **Reversed Slices run as one fused dispatch** (Tuvok, 5.3.2-local.1): a Slice with a NEGATIVE step (`x[..., ::-1]`)
+  skipped `SliceKernel` and took the per-run copy fallback - one dispatch per contiguous row, one per ELEMENT when the
+  reversed axis is the last. The kernel's input index (`start + outCoord * step`) was already correct for a negative step
+  from the clamped start, so the fast path now takes every rank-<=8 slice. MEASURED (SpawnScene, LightGlue+ k1024 on
+  WebGPU, a GPU sync per op): the 18 rotary "flip" Slices per pair cost ~40 ms each, 30% of the matcher. New
+  `SliceOperator.FallbackCalls` diagnostic counter. Test: `Slice_Reverse_UsesTheFusedKernel` (the four reverse cases
+  against onnxruntime, none may take the fallback; red before the fix on CPU and WebGPU); all 22 Slice tests pass on all
+  six backends.
+
 ## 5.3.1 - 2026-10-01 - on SpawnDev.ILGPU 5.3.1; trim safe (enforced), AOT supported with the IL kept; Reduce family fixes; no-readback depth
 
 - **SpawnDev.ILGPU.ML and SpawnDev.ILGPU.ML.WebTorrent are `IsTrimmable`; every IL2xxx warning is a build error.**
