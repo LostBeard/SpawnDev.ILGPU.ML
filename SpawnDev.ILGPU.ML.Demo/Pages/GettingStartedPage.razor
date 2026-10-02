@@ -118,13 +118,17 @@ dotnet add package SpawnDev.SpawnJS</code></pre>
         <h2>Blazor WASM setup</h2>
         <p>
             Register SpawnJS in <code>Program.cs</code> (<code>builder.Services.AddSpawnJSRuntime(...)</code>).
-            ILGPU needs IL reflection at runtime — keep trimming and AOT off:
+            Trimming works out of the box. AOT works too, as long as the IL is kept:
+            ILGPU compiles kernels from IL at runtime, and .NET strips it after AOT by default.
         </p>
         <div class="code-block">
-<pre><code><span class="cm">&lt;!-- In your .csproj — required for ILGPU --&gt;</span>
+<pre><code><span class="cm">&lt;!-- In your .csproj --&gt;</span>
 <span class="tag">&lt;PropertyGroup&gt;</span>
-    <span class="tag">&lt;PublishTrimmed&gt;</span>false<span class="tag">&lt;/PublishTrimmed&gt;</span>
-    <span class="tag">&lt;RunAOTCompilation&gt;</span>false<span class="tag">&lt;/RunAOTCompilation&gt;</span>
+    <span class="cm">&lt;!-- trimming: supported (the Blazor Release default) --&gt;</span>
+    <span class="tag">&lt;PublishTrimmed&gt;</span>true<span class="tag">&lt;/PublishTrimmed&gt;</span>
+    <span class="cm">&lt;!-- AOT (optional, ~2x faster host-side work): keep the IL --&gt;</span>
+    <span class="tag">&lt;RunAOTCompilation&gt;</span>true<span class="tag">&lt;/RunAOTCompilation&gt;</span>
+    <span class="tag">&lt;WasmStripILAfterAOT&gt;</span>false<span class="tag">&lt;/WasmStripILAfterAOT&gt;</span>
 <span class="tag">&lt;/PropertyGroup&gt;</span></code></pre>
         </div>
     </div>

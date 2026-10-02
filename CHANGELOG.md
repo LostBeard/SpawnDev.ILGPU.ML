@@ -3,7 +3,7 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased (5.3.1-local)
+## 5.3.1 - 2026-10-01 - on SpawnDev.ILGPU 5.3.1; trim safe (enforced), AOT supported with the IL kept; Reduce family fixes; no-readback depth
 
 - **SpawnDev.ILGPU.ML and SpawnDev.ILGPU.ML.WebTorrent are `IsTrimmable`; every IL2xxx warning is a build error.**
   93 trim warnings -> 0 (and 93 dynamic-code IL3050 -> 0), all System.Text.Json reflection serialization:
