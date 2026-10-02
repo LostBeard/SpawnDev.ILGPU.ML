@@ -5,6 +5,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **BufferPool hands out the lowest-numbered free buffer, not the last returned** (Geordi, 5.3.2-local.3). With a LIFO
+  stack per size bucket, the free list a forward ENDS with is a permutation of the one it started with, so each forward's
+  nodes got different physical buffers, cycling over many forwards. MEASURED (Anaglyphohol, DAv3 168x98 on WebGPU, AOT):
+  ~55.7k distinct bind groups for ONE input size, and the WebGPU bind-group cache hit ~45%. Each bucket is now a
+  `StableFreeList` (sorted by a per-buffer number assigned on first return, held in a ConditionalWeakTable), so a steady
+  forward binds the same buffers in the same places every time. Results are unaffected. Full ML PMT 5584/0.
+
 - **Less host work per node and per launch** (Geordi, 5.3.2-local.2, on SpawnDev.ILGPU 5.3.2-local.5). From a Blazor
   WASM AOT CPU profile of a DAv3 video forward (Anaglyphohol, 168x98): the executor built a dead `actualInputShapes`
   array (LINQ) for every node; the per-node shape paths (Reshape, Pad, Squeeze/Unsqueeze, ConstantOfShape, Expand,

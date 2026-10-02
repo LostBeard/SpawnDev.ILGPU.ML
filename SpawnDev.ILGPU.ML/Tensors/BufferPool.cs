@@ -19,7 +19,7 @@ namespace SpawnDev.ILGPU.ML.Tensors;
 public class BufferPool : IDisposable
 {
     private readonly Accelerator _accelerator;
-    private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
+    private readonly Dictionary<int, StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
     // CUDA-graph capture: an UNNAMED Rent is never Returned (Return keys on name), so it would allocate a fresh
     // buffer every call → a cuMemAlloc mid-capture (illegal). In capture-mode we hand unnamed Rents a STABLE
@@ -50,7 +50,7 @@ public class BufferPool : IDisposable
     private const long Fp16TempFlushCap = 64L * 1024 * 1024; // 64MB of pending temps → drain + free the batch
     // fp16 ACTIVATION pool (mixed-precision activations): bucketed Half buffers for graph intermediates,
     // the half-bytes counterpart to the fp32 _buckets/_namedBuffers. Returned buffers reuse by size bucket.
-    private readonly Dictionary<int, Stack<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>> _halfBuckets = new();
+    private readonly Dictionary<int, StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>> _halfBuckets = new();
     private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _halfNamedBuffers = new();
 
     /// <summary>Total fp16 (Half) buffers this pool has allocated (weights + activations).</summary>
@@ -418,7 +418,7 @@ public class BufferPool : IDisposable
         int bucketSize = (int)buffer.Length;
         if (!_buckets.TryGetValue(bucketSize, out var stack))
         {
-            stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
+            stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
             _buckets[bucketSize] = stack;
         }
         stack.Push(buffer);
@@ -703,7 +703,7 @@ public class BufferPool : IDisposable
             int bucketSize = (int)buffer.Length;
             if (!_buckets.TryGetValue(bucketSize, out var stack))
             {
-                stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
+                stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
                 _buckets[bucketSize] = stack;
             }
             stack.Push(buffer);
@@ -781,7 +781,7 @@ public class BufferPool : IDisposable
             int bucketSize = (int)buffer.Length;
             if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
             {
-                stack = new Stack<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
+                stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
                 _halfBuckets[bucketSize] = stack;
             }
             stack.Push(buffer);
