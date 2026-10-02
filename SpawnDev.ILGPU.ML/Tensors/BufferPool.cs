@@ -427,6 +427,21 @@ public class BufferPool : IDisposable
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _namedBuffers = new();
 
+    /// <summary>
+    /// Size buckets hand out the LOWEST-NUMBERED free buffer (true, default) instead of the last returned (false, the
+    /// old LIFO stack), so a steady forward binds the same buffers in the same places every time. See
+    /// <see cref="StableFreeList{T}"/>. A switch so the two can be timed against each other in one build.
+    /// </summary>
+    public static bool DeterministicReuse
+    {
+        get => StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>.Sorted;
+        set
+        {
+            StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>.Sorted = value;
+            StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>.Sorted = value;
+        }
+    }
+
     public Tensor Rent(int[] shape, string? name = null)
     {
         int count = TensorHelpers.ElementCount(shape);

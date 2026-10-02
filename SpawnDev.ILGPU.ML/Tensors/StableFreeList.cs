@@ -20,6 +20,9 @@ namespace SpawnDev.ILGPU.ML.Tensors;
 /// </remarks>
 internal sealed class StableFreeList<T> : IEnumerable<T> where T : class
 {
+    /// <summary>False = plain LIFO (the pre-2026-10-02 stack order) - the A/B arm of BufferPool.DeterministicReuse.</summary>
+    internal static volatile bool Sorted = true;
+
     private static readonly ConditionalWeakTable<T, StrongBox<long>> s_sequence = new();
     private static long s_next;
 
@@ -30,6 +33,7 @@ internal sealed class StableFreeList<T> : IEnumerable<T> where T : class
 
     public void Push(T item)
     {
+        if (!Sorted) { _items.Add((0, item)); return; }   // LIFO: Pop takes the last pushed
         long seq = s_sequence.GetValue(item, static _ => new StrongBox<long>(Interlocked.Increment(ref s_next))).Value;
         // First index whose seq is LOWER than this one (descending order) - insert there.
         int lo = 0, hi = _items.Count;
