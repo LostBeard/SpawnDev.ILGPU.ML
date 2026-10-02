@@ -20,6 +20,17 @@ public enum ActivationPrecision { F32, F16 }
 /// </summary>
 public class GraphExecutor : IDisposable
 {
+    // ── Shape-value conversions for the per-node shape path ──
+    // Plain loops, not LINQ: they run for every shape-carrying node of every forward, and under Blazor WASM AOT
+    // LINQ over value types partly runs in the interpreter (SegmentedArrayBuilder<int> showed up interpreted in
+    // the 2026-10-02 DAv3 CPU profile). Same arithmetic as the lambdas they replaced.
+    private static int[] ToIntArray(float[] a) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (int)a[i]; return r; }
+    private static int[] ToIntArray(long[] a) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (int)a[i]; return r; }
+    private static long[] ToLongArray(float[] a) { var r = new long[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (long)a[i]; return r; }
+    private static int[] RoundToIntArray(float[] a) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (int)MathF.Round(a[i]); return r; }
+    private static int[] RoundToAxes(float[] a, int rank) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) { int v = (int)MathF.Round(a[i]); r[i] = v < 0 ? v + rank : v; } return r; }
+    private static int[] ToAxes(long[] a, int rank) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (int)(a[i] < 0 ? a[i] + rank : a[i]); return r; }
+
     private readonly Accelerator _accelerator;
     private readonly CompiledGraph _graph;
     private readonly BufferPool _pool;
@@ -39,6 +50,11 @@ public class GraphExecutor : IDisposable
     /// <remarks>See where this is built: the refcount table cannot see them, so without this they leak.</remarks>
     private HashSet<string>? _deadOutputs;
     private Dictionary<string, float[]>? _cleanConstants;   // _constantValues with non-Constant-node outputs already stripped
+    // The weights as a tensor-map template: RunAsyncCore copies it (a same-comparer Dictionary copy, no rehash) instead
+    // of re-inserting every weight by name each forward. Rebuilt if the weight set ever changes size; the session
+    // only writes weights while loading, and _baseRefCounts already assumes the weight set is fixed after the first run.
+    private Dictionary<string, Tensor>? _baseTensors;
+    private int _baseTensorsWeightCount = -1;
     // CUDA-graph capture: the full runtimeConstants snapshot from the last warm pass (UseCaptureParamSlots &&
     // !SuppressDrains). Seeded into the capture pass so it needs no readbacks yet elides identically to warm.
     private Dictionary<string, float[]>? _captureRuntimeSeed;
@@ -1683,7 +1699,7 @@ public class GraphExecutor : IDisposable
                 && reshapeTarget.Length > 0)
             {
                 int inputElems = nodeInputs[0]?.ElementCount ?? runtimeOutputShapes[0].Aggregate(1, (a, b) => a * b);
-                var resolved = reshapeTarget.Select(v => (int)v).ToArray();
+                var resolved = ToIntArray(reshapeTarget);
                 // Handle 0 dims (copy from input) and -1 dims (infer)
                 for (int j = 0; j < resolved.Length; j++)
                     if (resolved[j] == 0 && j < (nodeInputs[0]?.Shape.Length ?? 0)) resolved[j] = nodeInputs[0]!.Shape[j];
@@ -1817,12 +1833,12 @@ public class GraphExecutor : IDisposable
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var padsTensorRC)
                     && padsTensorRC.Length > 0)
                 {
-                    padsResolved = padsTensorRC.Select(v => (int)v).ToArray();
+                    padsResolved = ToIntArray(padsTensorRC);
                 }
                 // Fallback to attribute (opset < 11)
                 else if (node.Attributes.TryGetValue("pads", out var padsAttrObj) && padsAttrObj is long[] padsAttr)
                 {
-                    padsResolved = padsAttr.Select(v => (int)v).ToArray();
+                    padsResolved = ToIntArray(padsAttr);
                 }
 
                 if (padsResolved != null)
@@ -1887,7 +1903,7 @@ public class GraphExecutor : IDisposable
                 if (node.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] al) axesArr = al;
                 else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var axC) && axC.Length > 0)
-                    axesArr = axC.Select(v => (long)v).ToArray();
+                    axesArr = ToLongArray(axC);
                 if (axesArr != null)
                 {
                     var inShape = nodeInputs[0]!.Shape;
@@ -1911,10 +1927,10 @@ public class GraphExecutor : IDisposable
                 var sqIn = nodeInputs[0]!.Shape;
                 int[]? sqAxes = null;
                 if (node.Attributes.TryGetValue("axes", out var sqAxObj) && sqAxObj is long[] sqal)
-                    sqAxes = sqal.Select(x => (int)x).ToArray();
+                    sqAxes = ToIntArray(sqal);
                 else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var sqAxV))
-                    sqAxes = sqAxV.Select(x => (int)Math.Round(x)).ToArray();
+                    sqAxes = RoundToIntArray(sqAxV);
                 var sqOut = new List<int>();
                 if (sqAxes != null && sqAxes.Length > 0)
                 {
@@ -1970,7 +1986,7 @@ public class GraphExecutor : IDisposable
             if (node.OpType == "ConstantOfShape" && node.InputNames.Length >= 1 && !string.IsNullOrEmpty(node.InputNames[0])
                 && runtimeConstants.TryGetValue(node.InputNames[0], out var cosDims) && cosDims.Length > 0)
             {
-                var resolved = cosDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var resolved = RoundToIntArray(cosDims);
                 if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
             }
 
@@ -2000,7 +2016,7 @@ public class GraphExecutor : IDisposable
                 && !string.IsNullOrEmpty(node.InputNames[1])
                 && runtimeConstants.TryGetValue(node.InputNames[1], out var expDims) && expDims.Length > 0)
             {
-                var tgt = expDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var tgt = RoundToIntArray(expDims);
                 var inS = nodeInputs[0]!.Shape; int rank = Math.Max(tgt.Length, inS.Length);
                 var resolved = new int[rank];
                 for (int dd = 0; dd < rank; dd++)
@@ -2133,7 +2149,7 @@ public class GraphExecutor : IDisposable
                 var tIn = nodeInputs[0]!.Shape;
                 int[] tPerm;
                 if (node.Attributes.TryGetValue("perm", out var tPermObj) && tPermObj is long[] tpl)
-                    tPerm = tpl.Select(x => (int)x).ToArray();
+                    tPerm = ToIntArray(tpl);
                 else { tPerm = new int[tIn.Length]; for (int i = 0; i < tIn.Length; i++) tPerm[i] = tIn.Length - 1 - i; }
                 if (tPerm.Length == tIn.Length && tPerm.All(pp => pp >= 0 && pp < tIn.Length))
                 {
@@ -2207,9 +2223,9 @@ public class GraphExecutor : IDisposable
                 float[]? rAxV = node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
                     ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
                 if (rAxV != null && rAxV.Length > 0)
-                    rAx = rAxV.Select(a => (int)MathF.Round(a)).Select(a => a < 0 ? a + rRank : a).ToArray();
+                    rAx = RoundToAxes(rAxV, rRank);
                 else if (node.Attributes.TryGetValue("axes", out var rAxObj) && rAxObj is long[] rAl && rAl.Length > 0)
-                    rAx = rAl.Select(a => (int)(a < 0 ? a + rRank : a)).ToArray();
+                    rAx = ToAxes(rAl, rRank);
                 else
                 {
                     bool rNoop = node.Attributes.TryGetValue("noop_with_empty_axes", out var rNop) && Convert.ToInt32(rNop) != 0;
@@ -3133,10 +3149,15 @@ public class GraphExecutor : IDisposable
         LastRunPeakPendingReleaseBytes = 0;
         var _runSw = System.Diagnostics.Stopwatch.StartNew();
         var _drainSw = new System.Diagnostics.Stopwatch();
-        var tensors = new Dictionary<string, Tensor>();
         var hostValues = new Dictionary<string, OnnxValue>(StringComparer.Ordinal);
-        foreach (var (name, tensor) in inputs) tensors[name] = tensor;
-        foreach (var (name, tensor) in _weights) tensors[name] = tensor;
+        if (_baseTensors == null || _baseTensorsWeightCount != _weights.Count)
+        {
+            _baseTensors = new Dictionary<string, Tensor>(_weights);
+            _baseTensorsWeightCount = _weights.Count;
+        }
+        var tensors = new Dictionary<string, Tensor>(_baseTensors);
+        // Inputs, then weights, used to be inserted in that order, so a weight won a name clash: keep that.
+        foreach (var (name, tensor) in inputs) tensors.TryAdd(name, tensor);
 
         // Reference counting for buffer recycling + the runtime-constant map. Clone the graph-fixed templates
         // (precomputed once by EnsureRunTemplates) and pin only this call's inputs — instead of re-walking all
@@ -3880,10 +3901,6 @@ public class GraphExecutor : IDisposable
                 nodeInputs[i] = tensor;
             }
 
-            // Runtime shape cascade (same as sync Run — see comments there)
-            var actualInputShapes = nodeInputs
-                .Select(t => t?.Shape ?? Array.Empty<int>())
-                .ToArray();
 
             // Use COMPILED shapes by default (same as sync Run path).
             // Full runtime re-inference caused cascading shape mismatches in attention blocks;
@@ -4076,7 +4093,7 @@ public class GraphExecutor : IDisposable
                 && reshapeTargetAsync.Length > 0)
             {
                 int inputElems = nodeInputs[0]?.ElementCount ?? runtimeOutputShapes[0].Aggregate(1, (a, b) => a * b);
-                var resolved = reshapeTargetAsync.Select(v => (int)v).ToArray();
+                var resolved = ToIntArray(reshapeTargetAsync);
                 for (int j = 0; j < resolved.Length; j++)
                     if (resolved[j] == 0 && j < (nodeInputs[0]?.Shape.Length ?? 0)) resolved[j] = nodeInputs[0]!.Shape[j];
                 int negIdx = Array.IndexOf(resolved, -1);
@@ -4215,12 +4232,12 @@ public class GraphExecutor : IDisposable
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var padsTensorRC)
                     && padsTensorRC.Length > 0)
                 {
-                    padsResolved = padsTensorRC.Select(v => (int)v).ToArray();
+                    padsResolved = ToIntArray(padsTensorRC);
                 }
                 // Fallback to attribute (opset < 11)
                 else if (node.Attributes.TryGetValue("pads", out var padsAttrObj) && padsAttrObj is long[] padsAttr)
                 {
-                    padsResolved = padsAttr.Select(v => (int)v).ToArray();
+                    padsResolved = ToIntArray(padsAttr);
                 }
 
                 if (padsResolved != null)
@@ -4284,7 +4301,7 @@ public class GraphExecutor : IDisposable
                 if (node.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] al) axesArr = al;
                 else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var axC) && axC.Length > 0)
-                    axesArr = axC.Select(v => (long)v).ToArray();
+                    axesArr = ToLongArray(axC);
                 if (axesArr != null)
                 {
                     var inShape = nodeInputs[0]!.Shape;
@@ -4308,10 +4325,10 @@ public class GraphExecutor : IDisposable
                 var sqIn = nodeInputs[0]!.Shape;
                 int[]? sqAxes = null;
                 if (node.Attributes.TryGetValue("axes", out var sqAxObj) && sqAxObj is long[] sqal)
-                    sqAxes = sqal.Select(x => (int)x).ToArray();
+                    sqAxes = ToIntArray(sqal);
                 else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
                     && runtimeConstants.TryGetValue(node.InputNames[1], out var sqAxV))
-                    sqAxes = sqAxV.Select(x => (int)Math.Round(x)).ToArray();
+                    sqAxes = RoundToIntArray(sqAxV);
                 var sqOut = new List<int>();
                 if (sqAxes != null && sqAxes.Length > 0)
                 {
@@ -4352,7 +4369,7 @@ public class GraphExecutor : IDisposable
             if (node.OpType == "ConstantOfShape" && node.InputNames.Length >= 1 && !string.IsNullOrEmpty(node.InputNames[0])
                 && runtimeConstants.TryGetValue(node.InputNames[0], out var cosDims) && cosDims.Length > 0)
             {
-                var resolved = cosDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var resolved = RoundToIntArray(cosDims);
                 if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
             }
 
@@ -4382,7 +4399,7 @@ public class GraphExecutor : IDisposable
                 && !string.IsNullOrEmpty(node.InputNames[1])
                 && runtimeConstants.TryGetValue(node.InputNames[1], out var expDims) && expDims.Length > 0)
             {
-                var tgt = expDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var tgt = RoundToIntArray(expDims);
                 var inS = nodeInputs[0]!.Shape; int rank = Math.Max(tgt.Length, inS.Length);
                 var resolved = new int[rank];
                 for (int dd = 0; dd < rank; dd++)
@@ -4515,7 +4532,7 @@ public class GraphExecutor : IDisposable
                 var tIn = nodeInputs[0]!.Shape;
                 int[] tPerm;
                 if (node.Attributes.TryGetValue("perm", out var tPermObj) && tPermObj is long[] tpl)
-                    tPerm = tpl.Select(x => (int)x).ToArray();
+                    tPerm = ToIntArray(tpl);
                 else { tPerm = new int[tIn.Length]; for (int i = 0; i < tIn.Length; i++) tPerm[i] = tIn.Length - 1 - i; }
                 if (tPerm.Length == tIn.Length && tPerm.All(pp => pp >= 0 && pp < tIn.Length))
                 {
@@ -4589,9 +4606,9 @@ public class GraphExecutor : IDisposable
                 float[]? rAxV = node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
                     ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
                 if (rAxV != null && rAxV.Length > 0)
-                    rAx = rAxV.Select(a => (int)MathF.Round(a)).Select(a => a < 0 ? a + rRank : a).ToArray();
+                    rAx = RoundToAxes(rAxV, rRank);
                 else if (node.Attributes.TryGetValue("axes", out var rAxObj) && rAxObj is long[] rAl && rAl.Length > 0)
-                    rAx = rAl.Select(a => (int)(a < 0 ? a + rRank : a)).ToArray();
+                    rAx = ToAxes(rAl, rRank);
                 else
                 {
                     bool rNoop = node.Attributes.TryGetValue("noop_with_empty_axes", out var rNop) && Convert.ToInt32(rNop) != 0;
@@ -5686,6 +5703,7 @@ public class GraphExecutor : IDisposable
         //
         // Nothing may read an executor after Dispose, so dropping these is safe.
         _cleanConstants = null;
+        _baseTensors = null;
         if (_foldBuffers != null) { foreach (var b in _foldBuffers) b.Dispose(); _foldBuffers = null; }
         if (_foldPendingBuffers != null) { foreach (var b in _foldPendingBuffers) b.Dispose(); _foldPendingBuffers = null; }
         _foldTensors = null; _foldValues = null; _foldInterp = null; _foldReady = false;

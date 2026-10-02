@@ -184,9 +184,21 @@ public class OnnxOpContext
         => Attributes.TryGetValue(name, out var v) ? (long[])v : defaultValue ?? Array.Empty<long>();
 
     public int[] GetInts(string name, int[]? defaultValue = null)
-        => Attributes.TryGetValue(name, out var v) && v is int[] ia ? ia
-         : Attributes.TryGetValue(name, out var v2) && v2 is long[] la ? la.Select(x => (int)x).ToArray()
-         : defaultValue ?? Array.Empty<int>();
+    {
+        // Called per node per forward by many operators: one lookup and a plain loop (LINQ over value types partly
+        // runs in the interpreter under Blazor WASM AOT - 2026-10-02 DAv3 CPU profile).
+        if (Attributes.TryGetValue(name, out var v))
+        {
+            if (v is int[] ia) return ia;
+            if (v is long[] la)
+            {
+                var r = new int[la.Length];
+                for (int i = 0; i < la.Length; i++) r[i] = (int)la[i];
+                return r;
+            }
+        }
+        return defaultValue ?? Array.Empty<int>();
+    }
 
     public string GetString(string name, string defaultValue = "")
         => Attributes.TryGetValue(name, out var v) ? v.ToString()! : defaultValue;

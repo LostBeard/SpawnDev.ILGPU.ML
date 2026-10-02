@@ -1757,6 +1757,7 @@ public class RoundOperator(OperatorRegistry reg) : IOnnxOperator
 
 public class ShrinkOperator(OperatorRegistry reg) : IOnnxOperator
 {
+    private static readonly DelegateSpecialization<Func<float, float>> ShrinkSpec = new(ElementWiseKernels.ShrinkOp);
     public string OpType => "Shrink";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
@@ -1771,7 +1772,7 @@ public class ShrinkOperator(OperatorRegistry reg) : IOnnxOperator
         if (MathF.Abs(lambd - 0.5f) < 1e-7f && MathF.Abs(bias) < 1e-7f)
         {
             reg.ElementWise.UnaryOp(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count,
-                new DelegateSpecialization<Func<float, float>>(ElementWiseKernels.ShrinkOp));
+                ShrinkSpec);
         }
         else
         {

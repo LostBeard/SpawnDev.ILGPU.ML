@@ -5,6 +5,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **Less host work per node and per launch** (Geordi, 5.3.2-local.2, on SpawnDev.ILGPU 5.3.2-local.5). From a Blazor
+  WASM AOT CPU profile of a DAv3 video forward (Anaglyphohol, 168x98): the executor built a dead `actualInputShapes`
+  array (LINQ) for every node; the per-node shape paths (Reshape, Pad, Squeeze/Unsqueeze, ConstantOfShape, Expand,
+  Transpose, Reduce*), `OnnxOpContext.GetInts` and `SliceOperator` converted their params with LINQ - which over value
+  types partly runs in the interpreter under AOT. Now plain loops with the same arithmetic. The `DelegateSpecialization`
+  arguments of the broadcast / unary elementwise kernels are built once instead of per launch (a new delegate each time).
+  The launch itself got cheaper in SpawnDev.ILGPU (no reflection in the specialization router).
+
 - **Reversed Slices run as one fused dispatch** (Tuvok, 5.3.2-local.1): a Slice with a NEGATIVE step (`x[..., ::-1]`)
   skipped `SliceKernel` and took the per-run copy fallback - one dispatch per contiguous row, one per ELEMENT when the
   reversed axis is the last. The kernel's input index (`start + outCoord * step`) was already correct for a negative step

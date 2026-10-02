@@ -14,6 +14,50 @@ public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrE
 /// </summary>
 public class ElementWiseKernels : IDisposable
 {
+    // The DelegateSpecialization arguments, built ONCE. Constructing one per launch allocated a delegate (and made
+    // the launch path resolve that new delegate's Method every time) - MEASURED 2026-10-02, AOT CPU profile.
+    private static class Specs
+    {
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastAddOp = new(ElementWiseKernels.BroadcastAddOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastSubOp = new(ElementWiseKernels.BroadcastSubOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastMulOp = new(ElementWiseKernels.BroadcastMulOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastDivOp = new(ElementWiseKernels.BroadcastDivOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastPowOp = new(ElementWiseKernels.BroadcastPowOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastLessOp = new(ElementWiseKernels.BroadcastLessOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastGreaterOp = new(ElementWiseKernels.BroadcastGreaterOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastEqualOp = new(ElementWiseKernels.BroadcastEqualOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastLessOrEqualOp = new(ElementWiseKernels.BroadcastLessOrEqualOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastGreaterOrEqualOp = new(ElementWiseKernels.BroadcastGreaterOrEqualOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastAndOp = new(ElementWiseKernels.BroadcastAndOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastOrOp = new(ElementWiseKernels.BroadcastOrOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastXorOp = new(ElementWiseKernels.BroadcastXorOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastMinOp = new(ElementWiseKernels.BroadcastMinOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastMaxOp = new(ElementWiseKernels.BroadcastMaxOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastPReluOp = new(ElementWiseKernels.BroadcastPReluOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastModOp = new(ElementWiseKernels.BroadcastModOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastFloorModOp = new(ElementWiseKernels.BroadcastFloorModOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastBitwiseAndOp = new(ElementWiseKernels.BroadcastBitwiseAndOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastBitwiseOrOp = new(ElementWiseKernels.BroadcastBitwiseOrOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastBitwiseXorOp = new(ElementWiseKernels.BroadcastBitwiseXorOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastBitShiftLeftOp = new(ElementWiseKernels.BroadcastBitShiftLeftOp);
+        internal static readonly DelegateSpecialization<Func<float, float, float>> BroadcastBitShiftRightOp = new(ElementWiseKernels.BroadcastBitShiftRightOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AcosOp = new(ElementWiseKernels.AcosOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AcoshOp = new(ElementWiseKernels.AcoshOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AsinOp = new(ElementWiseKernels.AsinOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AsinhOp = new(ElementWiseKernels.AsinhOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AtanOp = new(ElementWiseKernels.AtanOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> AtanhOp = new(ElementWiseKernels.AtanhOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> CoshOp = new(ElementWiseKernels.CoshOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> SinhOp = new(ElementWiseKernels.SinhOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> EluOp = new(ElementWiseKernels.EluOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> CeluOp = new(ElementWiseKernels.CeluOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> SeluOp = new(ElementWiseKernels.SeluOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> SoftplusOp = new(ElementWiseKernels.SoftplusOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> SoftsignOp = new(ElementWiseKernels.SoftsignOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> MishOp = new(ElementWiseKernels.MishOp);
+        internal static readonly DelegateSpecialization<Func<float, float>> IsInfOp = new(ElementWiseKernels.IsInfOp);
+    }
+
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _geluKernel;
@@ -747,29 +791,29 @@ public class ElementWiseKernels : IDisposable
 
         var opSpec = op switch
         {
-            BroadcastOp.Add => new DelegateSpecialization<Func<float, float, float>>(BroadcastAddOp),
-            BroadcastOp.Sub => new DelegateSpecialization<Func<float, float, float>>(BroadcastSubOp),
-            BroadcastOp.Mul => new DelegateSpecialization<Func<float, float, float>>(BroadcastMulOp),
-            BroadcastOp.Div => new DelegateSpecialization<Func<float, float, float>>(BroadcastDivOp),
-            BroadcastOp.Pow => new DelegateSpecialization<Func<float, float, float>>(BroadcastPowOp),
-            BroadcastOp.Less => new DelegateSpecialization<Func<float, float, float>>(BroadcastLessOp),
-            BroadcastOp.Greater => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOp),
-            BroadcastOp.Equal => new DelegateSpecialization<Func<float, float, float>>(BroadcastEqualOp),
-            BroadcastOp.LessOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastLessOrEqualOp),
-            BroadcastOp.GreaterOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOrEqualOp),
-            BroadcastOp.And => new DelegateSpecialization<Func<float, float, float>>(BroadcastAndOp),
-            BroadcastOp.Or => new DelegateSpecialization<Func<float, float, float>>(BroadcastOrOp),
-            BroadcastOp.Xor => new DelegateSpecialization<Func<float, float, float>>(BroadcastXorOp),
-            BroadcastOp.Min => new DelegateSpecialization<Func<float, float, float>>(BroadcastMinOp),
-            BroadcastOp.Max => new DelegateSpecialization<Func<float, float, float>>(BroadcastMaxOp),
-            BroadcastOp.PRelu => new DelegateSpecialization<Func<float, float, float>>(BroadcastPReluOp),
-            BroadcastOp.Mod => new DelegateSpecialization<Func<float, float, float>>(BroadcastModOp),
-            BroadcastOp.FloorMod => new DelegateSpecialization<Func<float, float, float>>(BroadcastFloorModOp),
-            BroadcastOp.BitwiseAnd => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseAndOp),
-            BroadcastOp.BitwiseOr => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseOrOp),
-            BroadcastOp.BitwiseXor => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseXorOp),
-            BroadcastOp.BitShiftLeft => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitShiftLeftOp),
-            BroadcastOp.BitShiftRight => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitShiftRightOp),
+            BroadcastOp.Add => Specs.BroadcastAddOp,
+            BroadcastOp.Sub => Specs.BroadcastSubOp,
+            BroadcastOp.Mul => Specs.BroadcastMulOp,
+            BroadcastOp.Div => Specs.BroadcastDivOp,
+            BroadcastOp.Pow => Specs.BroadcastPowOp,
+            BroadcastOp.Less => Specs.BroadcastLessOp,
+            BroadcastOp.Greater => Specs.BroadcastGreaterOp,
+            BroadcastOp.Equal => Specs.BroadcastEqualOp,
+            BroadcastOp.LessOrEqual => Specs.BroadcastLessOrEqualOp,
+            BroadcastOp.GreaterOrEqual => Specs.BroadcastGreaterOrEqualOp,
+            BroadcastOp.And => Specs.BroadcastAndOp,
+            BroadcastOp.Or => Specs.BroadcastOrOp,
+            BroadcastOp.Xor => Specs.BroadcastXorOp,
+            BroadcastOp.Min => Specs.BroadcastMinOp,
+            BroadcastOp.Max => Specs.BroadcastMaxOp,
+            BroadcastOp.PRelu => Specs.BroadcastPReluOp,
+            BroadcastOp.Mod => Specs.BroadcastModOp,
+            BroadcastOp.FloorMod => Specs.BroadcastFloorModOp,
+            BroadcastOp.BitwiseAnd => Specs.BroadcastBitwiseAndOp,
+            BroadcastOp.BitwiseOr => Specs.BroadcastBitwiseOrOp,
+            BroadcastOp.BitwiseXor => Specs.BroadcastBitwiseXorOp,
+            BroadcastOp.BitShiftLeft => Specs.BroadcastBitShiftLeftOp,
+            BroadcastOp.BitShiftRight => Specs.BroadcastBitShiftRightOp,
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
         _broadcastBinaryKernel!(outCount, a, b, output, paramsView, opSpec);
@@ -2286,35 +2330,35 @@ public class ElementWiseKernels : IDisposable
     private static float IsInfOp(float x) => (x == float.PositiveInfinity || x == float.NegativeInfinity) ? 1f : 0f;
 
     public void Acos(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AcosOp));
+        => UnaryOp(i, o, n, Specs.AcosOp);
     public void Acosh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AcoshOp));
+        => UnaryOp(i, o, n, Specs.AcoshOp);
     public void Asin(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AsinOp));
+        => UnaryOp(i, o, n, Specs.AsinOp);
     public void Asinh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AsinhOp));
+        => UnaryOp(i, o, n, Specs.AsinhOp);
     public void Atan(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AtanOp));
+        => UnaryOp(i, o, n, Specs.AtanOp);
     public void Atanh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AtanhOp));
+        => UnaryOp(i, o, n, Specs.AtanhOp);
     public void Cosh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(CoshOp));
+        => UnaryOp(i, o, n, Specs.CoshOp);
     public void Sinh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SinhOp));
+        => UnaryOp(i, o, n, Specs.SinhOp);
     public void Elu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(EluOp));
+        => UnaryOp(i, o, n, Specs.EluOp);
     public void Celu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(CeluOp));
+        => UnaryOp(i, o, n, Specs.CeluOp);
     public void Selu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SeluOp));
+        => UnaryOp(i, o, n, Specs.SeluOp);
     public void Softplus(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SoftplusOp));
+        => UnaryOp(i, o, n, Specs.SoftplusOp);
     public void Softsign(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SoftsignOp));
+        => UnaryOp(i, o, n, Specs.SoftsignOp);
     public void Mish(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(MishOp));
+        => UnaryOp(i, o, n, Specs.MishOp);
     public void IsInf(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
-        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(IsInfOp));
+        => UnaryOp(i, o, n, Specs.IsInfOp);
 
     /// <summary>Validate GELU against CPU reference.</summary>
     public async Task ValidateGELUAsync(int count = 1000)

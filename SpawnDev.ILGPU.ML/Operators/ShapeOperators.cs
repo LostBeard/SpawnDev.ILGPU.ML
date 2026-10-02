@@ -733,9 +733,10 @@ public class BitwiseNotOperator(OperatorRegistry reg) : IOnnxOperator
     {
         int count = ctx.Inputs[0].ElementCount;
         reg.ElementWise.UnaryOp(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count,
-            new DelegateSpecialization<Func<float, float>>(BitwiseNotImpl));
+            BitwiseNotSpec);
     }
     private static float BitwiseNotImpl(float x) => (float)(~(int)x);
+    private static readonly DelegateSpecialization<Func<float, float>> BitwiseNotSpec = new(BitwiseNotImpl);
 }
 
 public class BitShiftOperator(OperatorRegistry reg) : IOnnxOperator

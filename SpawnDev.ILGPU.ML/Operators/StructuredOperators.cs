@@ -2057,6 +2057,19 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Slice";
 
+    // Param conversions as plain loops: Execute runs per Slice node per forward, and LINQ over value types partly
+    // runs in the interpreter under Blazor WASM AOT (2026-10-02 DAv3 CPU profile). Same arithmetic as before.
+    private static int[] Iota(int n) { var r = new int[n]; for (int i = 0; i < n; i++) r[i] = i; return r; }
+    private static int[] Ones(int n) { var r = new int[n]; System.Array.Fill(r, 1); return r; }
+    private static int[] ToInt(float[] a) { var r = new int[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (int)a[i]; return r; }
+    // ONNX uses INT64_MAX (9.2e18) as the "to the end" sentinel: clamp to the int range.
+    private static int[] SaturateToInt(float[] a)
+    {
+        var r = new int[a.Length];
+        for (int i = 0; i < a.Length; i++) { float v = a[i]; r[i] = v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v; }
+        return r;
+    }
+
     /// <summary>DIAGNOSTIC: GPU Slices that took the per-run copy fallback (<c>SliceGPU</c>: one dispatch per contiguous run,
     /// per ELEMENT on a reversed last axis) instead of the fused SliceKernel. Only rank &gt; SliceKernel.MAX_RANK should.</summary>
     public static int FallbackCalls;
@@ -2162,19 +2175,19 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
                 ends[rax] = resolvedEnds[ri];
                 if (ri < rSteps.Length) steps[rax] = rSteps[ri];
             }
-            axes = Enumerable.Range(0, rank).ToArray();
+            axes = Iota(rank);
         }
         else if (ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
         {
             resolutionPath = 2;
             // Path 2: runtime constant values from tensor inputs
             // Clamp to int range — ONNX uses INT64_MAX (9.2e18) as "to end" sentinel
-            starts = startsF.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-            ends = endsF.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+            starts = SaturateToInt(startsF);
+            ends = SaturateToInt(endsF);
             axes = ctx.Inputs.Length > 3 && ctx.TryGetInputValues(3) is float[] axF
-                ? axF.Select(v => (int)v).ToArray() : Enumerable.Range(0, starts.Length).ToArray();
+                ? ToInt(axF) : Iota(starts.Length);
             steps = ctx.Inputs.Length > 4 && ctx.TryGetInputValues(4) is float[] stF
-                ? stF.Select(v => (int)v).ToArray() : Enumerable.Repeat(1, starts.Length).ToArray();
+                ? ToInt(stF) : Ones(starts.Length);
         }
         else
         {
@@ -2186,8 +2199,8 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             var attrSteps = ctx.GetInts("steps");
             starts = attrStarts.Length > 0 ? attrStarts : new int[rank];
             ends = attrEnds.Length > 0 ? attrEnds : inShape.ToArray();
-            axes = attrAxes.Length > 0 ? attrAxes : Enumerable.Range(0, starts.Length).ToArray();
-            steps = attrSteps.Length > 0 ? attrSteps : Enumerable.Repeat(1, starts.Length).ToArray();
+            axes = attrAxes.Length > 0 ? attrAxes : Iota(starts.Length);
+            steps = attrSteps.Length > 0 ? attrSteps : Ones(starts.Length);
         }
 
         // DIAGNOSTIC (ML_TRACE_SLICE=1): which resolution path produced these params, and what they are,
