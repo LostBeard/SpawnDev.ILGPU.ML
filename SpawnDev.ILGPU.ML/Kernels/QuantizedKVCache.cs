@@ -529,6 +529,7 @@ public class QuantizedKVCache : IDisposable
     public void Dispose()
     {
         foreach (var lc in _layers) lc.Dispose();
+        _quant.Dispose();   // its param caches and FWHT scratch (TurboQuantKernels was not IDisposable before)
         _codebook?.Dispose();
         _vCodebookCopy?.Dispose();
         _signs?.Dispose();

@@ -16,8 +16,18 @@ namespace SpawnDev.ILGPU.ML;
 ///
 /// Future home: SpawnDev.ILGPU.ML
 /// </summary>
-public class WeightLoader
+public class WeightLoader : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _weightBuffer?.Dispose(); _weightBuffer = null;
+    }
+
     private readonly Accelerator _accelerator;
     private readonly HttpClient _http;
 

@@ -8,8 +8,19 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// YOLO box decode, mask application, embedding operations.
 /// Keeps inference output on GPU through postprocessing.
 /// </summary>
-public class PostProcessingKernels
+public class PostProcessingKernels : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _rowScratch0?.Dispose(); _rowScratch0 = null;
+        _rowScratch1?.Dispose(); _rowScratch1 = null;
+    }
+
     private readonly Accelerator _accelerator;
 
     public PostProcessingKernels(Accelerator accelerator) => _accelerator = accelerator;

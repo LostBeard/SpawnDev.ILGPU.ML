@@ -14,9 +14,22 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// One thread per output element (outerSize * innerSize).
 /// Sequential reduction over reduceSize — fine for small-to-medium reduce dims.
 /// </summary>
-public class ReductionKernels
+public class ReductionKernels : IDisposable
 {
     private readonly Accelerator _accelerator;
+
+    /// <summary>Releases the min/max partial-reduction buffers.</summary>
+    /// <remarks>
+    /// ⚠️ Owners dispose kernels as <c>(kernel as IDisposable)?.Dispose()</c>, which is a silent NO-OP for a class that
+    /// does not implement it. Without this the scratch buffers outlived every session that owned this kernel - on
+    /// the desktop the GC finalized them eventually, in a browser it did not: SpawnScene's RaCo-ALIKED extractor
+    /// left ~10 MB of WebGPU storage behind per create/run/dispose cycle, 500 MB over one run (2026-10-03).
+    /// </remarks>
+    public void Dispose()
+    {
+        _maxPartials?.Dispose(); _maxPartials = null;
+        _minPartials?.Dispose(); _minPartials = null;
+    }
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _reduceSumKernel;

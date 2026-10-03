@@ -745,9 +745,11 @@ public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── GatherND ──
 
-public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
+public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
     public string OpType => "GatherND";
+    /// <summary>Releases the last params buffer (the registry disposes operators that implement this).</summary>
+    public void Dispose() { _lastParamsBuf?.Dispose(); _lastParamsBuf = null; }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         // ONNX GatherND output shape per spec:

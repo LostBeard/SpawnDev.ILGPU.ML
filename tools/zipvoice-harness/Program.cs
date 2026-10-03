@@ -35,6 +35,8 @@ return command switch
     "compare" => CompareEngines(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json"),
     "runonnx" => RunOnnx(args.Length > 1 ? args[1] : "", args.Length > 2 ? args[2] : ""),
     "vdastream" => VdaStream.Run(args.Length > 1 ? args[1] : "", args.Length > 2 ? args[2] : ""),
+    "sessioncycle" => SessionCycle.Run(args.Length > 1 ? args[1] : "", args.Length > 2 ? args[2] : "",
+                                       args.Length > 3 ? int.Parse(args[3]) : 4),
     "sensitivity" => RunSensitivity(args.Length > 1 ? args[1] : "fixtures/loaded-classes.json",
                                     args.Length > 2 ? args[2] : null),
     "endtoend" => RunEndToEnd(args.Length > 1 ? args[1] : "fixtures/phase1",

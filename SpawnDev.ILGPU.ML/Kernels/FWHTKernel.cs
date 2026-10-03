@@ -14,8 +14,19 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Complexity: O(d log d) per vector, where d is the head dimension.
 /// Memory: In-place — no additional buffers needed.
 /// </summary>
-public class FWHTKernel
+public class FWHTKernel : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _padBuf?.Dispose(); _padBuf = null;
+        _pingBuf?.Dispose(); _pingBuf = null;
+    }
+
     private readonly Accelerator _accelerator;
 
     // One-store-per-thread out-of-place butterfly (WebGL Transform-Feedback safe; correct on all

@@ -546,7 +546,10 @@ public class InferenceSession : IDisposable
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
         {
-            ModelName = modelGraph.Name
+            ModelName = modelGraph.Name,
+            // The weights are VIEWS into the loader's single buffer: the session owns it now. Nothing disposed it
+            // before, so every session created here left the whole model's weights on the device (2026-10-03 audit).
+            _ownedBuffers = new List<IDisposable> { weightLoader },
         };
     }
 

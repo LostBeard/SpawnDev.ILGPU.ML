@@ -9,11 +9,13 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// These supplement the 63 operators #1 already built.
 /// </summary>
 
-public class DepthToSpaceOperator : IOnnxOperator
+public class DepthToSpaceOperator : IOnnxOperator, IDisposable
 {
     private readonly Kernels.MissingElementWiseKernels _kernels;
     public string OpType => "DepthToSpace";
     public DepthToSpaceOperator(Accelerator accelerator) => _kernels = new(accelerator);
+    /// <summary>The operator OWNS its kernels; the registry disposes operators that implement this.</summary>
+    public void Dispose() => _kernels.Dispose();
 
     public int[][] InferOutputShapes(int[][] inputShapes, Dictionary<string, object> attributes)
     {
@@ -46,11 +48,16 @@ public class DepthToSpaceOperator : IOnnxOperator
 /// index first among equal values - the order ONNX requires when sorted=1 and a valid one when sorted=0. Indices are
 /// stored as float like every integer tensor here (exact to 2^24).
 /// </summary>
-public class TopKOperator : IOnnxOperator
+public class TopKOperator : IOnnxOperator, IDisposable
 {
     private readonly Kernels.MissingElementWiseKernels _kernels;
     public string OpType => "TopK";
     public TopKOperator(Accelerator accelerator) => _kernels = new(accelerator);
+    /// <summary>
+    /// The operator OWNS its kernels, including the sort scratch (11 MB on RaCo-ALIKED k3072). Not being
+    /// IDisposable, the registry could never release it: it outlived every session (2026-10-03, SpawnScene).
+    /// </summary>
+    public void Dispose() => _kernels.Dispose();
 
     static int Axis(int rank, Dictionary<string, object> attributes)
     {
@@ -106,11 +113,13 @@ public class TopKOperator : IOnnxOperator
     }
 }
 
-public class SignOperator : IOnnxOperator
+public class SignOperator : IOnnxOperator, IDisposable
 {
     private readonly Kernels.MissingElementWiseKernels _kernels;
     public string OpType => "Sign";
     public SignOperator(Accelerator accelerator) => _kernels = new(accelerator);
+    /// <summary>The operator OWNS its kernels; the registry disposes operators that implement this.</summary>
+    public void Dispose() => _kernels.Dispose();
     public int[][] InferOutputShapes(int[][] inputShapes, Dictionary<string, object> attributes) => new[] { inputShapes[0] };
     public void Execute(OnnxOpContext ctx) => _kernels.Sign(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
 }

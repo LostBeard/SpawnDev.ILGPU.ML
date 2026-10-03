@@ -14,7 +14,7 @@ namespace SpawnDev.ILGPU.ML;
 ///
 /// Future home: SpawnDev.ILGPU.ML
 /// </summary>
-public class SoftmaxKernel
+public class SoftmaxKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -40,6 +40,20 @@ public class SoftmaxKernel
     private int _rowStatsCapacity;
 
     public SoftmaxKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>Releases the per-row statistics buffers.</summary>
+    /// <remarks>
+    /// ⚠️ Owners dispose kernels as <c>(kernel as IDisposable)?.Dispose()</c>, which is a silent NO-OP for a class that
+    /// does not implement it. Without this the scratch buffers outlived every session that owned this kernel - on
+    /// the desktop the GC finalized them eventually, in a browser it did not: SpawnScene's RaCo-ALIKED extractor
+    /// left ~10 MB of WebGPU storage behind per create/run/dispose cycle, 500 MB over one run (2026-10-03).
+    /// </remarks>
+    public void Dispose()
+    {
+        _rowMaxesBuf?.Dispose(); _rowMaxesBuf = null;
+        _rowSumsBuf?.Dispose(); _rowSumsBuf = null;
+        _rowStatsCapacity = 0;
+    }
 
     /// <summary>
     /// Pass 1: One thread per row. Find max and compute sum(exp(x-max)).

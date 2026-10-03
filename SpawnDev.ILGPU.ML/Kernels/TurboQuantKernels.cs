@@ -11,8 +11,20 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// 4-bit quantization gives 7.9x KV cache compression with zero accuracy loss
 /// and no calibration data needed.
 /// </summary>
-public class TurboQuantKernels
+public class TurboQuantKernels : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _fusedParams.Dispose();
+        _flashParams.Dispose();
+        _fwht.Dispose();
+    }
+
     private readonly Accelerator _accelerator;
     /// <summary>One buffer per distinct param set - see <see cref="ParamBufferCache{T}"/>.</summary>
     /// <remarks>

@@ -9,8 +9,19 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Full pipeline stays on GPU: RGBA → YCbCr split → Y to model →
 /// Cb/Cr resize → merge → RGBA. Zero CPU readback.
 /// </summary>
-public class SuperResGPUPipeline
+public class SuperResGPUPipeline : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _colorKernel.Dispose();
+        _transformKernel.Dispose();
+    }
+
     private readonly Accelerator _accelerator;
     private readonly ColorConversionKernel _colorKernel;
     private readonly ImageTransformKernel _transformKernel;

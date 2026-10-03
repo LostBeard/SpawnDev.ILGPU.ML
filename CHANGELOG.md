@@ -5,6 +5,28 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **Disposing a session releases its operator kernels' scratch** (Geordi, 5.3.2-local.7; reported and measured by
+  Tuvok). Owners dispose kernels as `(x as IDisposable)?.Dispose()`, which silently does nothing for a class that
+  does not implement it. So the scratch buffers of `SoftmaxKernel`, `ReductionKernels`, and the kernels that TopK,
+  Sign and DepthToSpace each own, plus GatherND's params buffer, outlived every session. On the desktop the GC
+  finalized them eventually, which hid it. A browser does not.
+  - MEASURED (SpawnScene, WebGPU in Chrome): each create/run/dispose cycle of the RaCo-ALIKED k3072 extractor left
+    ~10 MB of live storage behind, ~500 MB over one run. TopK's 11 MB sort scratch was most of it.
+  - Desktop repro (`zipvoice-harness sessioncycle`, which keeps the disposed session reachable): +22 MB retained
+    per cycle before, +0.0 MB after.
+  - An audit found the same flaw in 11 more classes: `FWHTKernel`, `TurboQuantKernels` (now disposed by
+    `QuantizedKVCache`), `TrainingKernels` (by `TrainableModel`), `ImageTransformKernel` (by
+    `StyleTransferPipeline`), `PostProcessingKernels`, `TensorLayoutKernel`, `DepthColormapKernel` and
+    `SuperResGPUPipeline`.
+  - The worst of the 11: `InferenceSession.CreateAsync` built its weights as views into a `WeightLoader` buffer
+    that nothing ever disposed, so the whole model's weights outlived every such session. The session now owns
+    the loader.
+  - Test `Session_Dispose_ReleasesKernelScratch`: four create/run/dispose cycles with the disposed sessions kept
+    REFERENCED, so a leak cannot hide behind the GC. The accelerator's live buffers must not grow. Red without
+    the fix: 20 vs 10 on CUDA.
+  - New harness command `zipvoice-harness sessioncycle <model> <input>=<shape> [cycles]`: `CYCLE_STREAM=1` uses
+    the browser-style stream loader, and `CYCLE_WHO=1` prints the reference path to each surviving buffer.
+
 - **An `If` whose output is adopted no longer leaks a buffer per forward** (Geordi, 5.3.2-local.6). torch exports
   `squeeze(dim)` on a dynamic shape as `If(shape[dim] == 1, Squeeze, Identity)`, and its branches declare no static
   shape, so the executed branch's buffer is ADOPTED at run time. Two leaks were hiding there:

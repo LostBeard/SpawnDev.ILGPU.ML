@@ -298,6 +298,7 @@ public class TrainableModel : IDisposable
     {
         foreach (var layer in _layers)
             layer.Dispose();
+        _kernels.Dispose();   // softmax scratch (TrainingKernels was not IDisposable before)
         _inputBuf?.Dispose();
         _targetBuf?.Dispose();
         _probsBuf?.Dispose();

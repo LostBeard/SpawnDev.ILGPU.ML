@@ -201,5 +201,5 @@ public class StyleTransferPipeline : IDisposable
         return (resultBuf, outW, outH);
     }
 
-    public void Dispose() { }
+    public void Dispose() { _resize?.Dispose(); _resize = null; }
 }

@@ -10,8 +10,18 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 ///
 /// Supports: plasma, viridis, inferno, grayscale colormaps via lookup tables.
 /// </summary>
-public class DepthColormapKernel
+public class DepthColormapKernel : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _lutBuffer?.Dispose(); _lutBuffer = null;
+    }
+
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,

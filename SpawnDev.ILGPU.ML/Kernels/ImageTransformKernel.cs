@@ -8,8 +8,18 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Replaces CPU-side ImageOps (resize, crop, flip, pad) with GPU-native execution.
 /// All operations keep data on GPU — no CPU readback.
 /// </summary>
-public class ImageTransformKernel
+public class ImageTransformKernel : IDisposable
 {
+    /// <summary>
+    /// Releases this kernel's device buffers. Owners dispose kernels as <c>(x as IDisposable)?.Dispose()</c>, a silent
+    /// no-op on a class that does not implement it - so before this, these buffers outlived their owner (finalized by a
+    /// desktop GC eventually, never promptly in a browser). Found by the 2026-10-03 session-lifecycle audit.
+    /// </summary>
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose(); _paramsBuf = null;
+    }
+
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _resizeKernel;
