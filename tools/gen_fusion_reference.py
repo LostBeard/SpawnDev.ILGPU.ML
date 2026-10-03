@@ -1,4 +1,4 @@
-# Fixtures for three graph optimizations that change what the engine executes but must not change results.
+# Fixtures for three graph optimizations (+ half_linear, for WeightStorage.Half's browser load) that change what the engine executes but must not change results.
 #
 #   python tools/gen_fusion_reference.py
 #
@@ -100,4 +100,19 @@ tg = helper.make_graph(nodes, "transpose_view",
 tm = helper.make_model(tg, opset_imports=[helper.make_opsetid("", 13)])
 tm.ir_version = 8
 save("transpose_view", tm, {"X": rng.standard_normal((1, 4, 1, 6)).astype(np.float32)})
+# ── half_linear: a Linear whose weight (256x512 fp32 = 512 KB) is far over the browser's 64 KB host-copy guard.
+# WeightStorage.Half must stream it JS->GPU and downcast on the GPU; a managed downcast trips the guard.
+class LinGeluBig(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(256, 512)
+        self.act = torch.nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.fc(x))
+
+
+torch.manual_seed(1)
+xh = rng.standard_normal((4, 256)).astype(np.float32)
+save("half_linear", torch_export(LinGeluBig().eval(), xh, "half_linear"), {"X": xh})
 print("wrote", OUT)

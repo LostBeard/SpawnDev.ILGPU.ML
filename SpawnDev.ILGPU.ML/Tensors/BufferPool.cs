@@ -1314,13 +1314,33 @@ public class BufferPool : IDisposable
         // delegate to CopyFromStreamAsync. It streams in 16 MiB chunks and, on a browser IJSReadStream + browser
         // buffer, goes JS->GPU via CopyFromJS with no managed-heap copy; the WebGPU 4-byte WriteBuffer rule (an
         // odd-count Half tensor = byteLength not a multiple of 4) is handled by its managed padded fallback, so
-        // no element-count guard is needed here. FLOAT32 source (dtype 1) needs an fp32->fp16 downcast, so it
-        // stays on the byte[] path below. DisableJsZeroCopyWeights forces the managed loop (A/B diagnostic).
+        // no element-count guard is needed here. FLOAT32 source (dtype 1) streams to an fp32 temp and is downcast on
+        // the GPU (next branch). DisableJsZeroCopyWeights forces the managed loop (A/B diagnostic).
         if (dataType == 10 && byteLength == count * 2 && !DisableJsZeroCopyWeights)
         {
             await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
             if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
                 ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
+            return new HalfTensor(buffer.View, shape, name);
+        }
+
+        // RAW FLOAT32 stored as fp16 (WeightStorage.Half): the mirror of StreamLowPUpcastAsync. Stream the fp32 bytes
+        // into a TEMP fp32 GPU buffer (JS->GPU on a browser IJSReadStream - the bytes never enter the managed heap) and
+        // downcast ON THE GPU. The byte[] loop below pushed every weight through .NET, and on a browser load the
+        // StrictHostCopyMaxBytes guard rightly refused its 1 MB CopyFromCPU chunks, so Half storage could not load at
+        // all in a browser. The temp is deferred like the upcast temps: freed after ONE drain (FlushPendingFp16ConvertsAsync).
+        if (dataType == 1 && byteLength == (long)count * 4 && !DisableJsZeroCopyWeights)
+        {
+            var tmp = _accelerator.Allocate1D<float>(count);
+            await tmp.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+            (_fp16Convert ??= new SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels(_accelerator))
+                .FloatToHalf(tmp.View, buffer.View, count);
+            _pendingFp16Temps.Add(tmp);
+            _pendingFp16Bytes += (long)count * 4;
+            if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && tmp.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+                ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
+            if (_pendingFp16Bytes >= Fp16TempFlushCap)
+                await FlushPendingFp16ConvertsAsync().ConfigureAwait(false);
             return new HalfTensor(buffer.View, shape, name);
         }
 

@@ -5,6 +5,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **`WeightStorage.Half` loads in a browser: FP32 weights stream JS->GPU and are downcast on the GPU** (Geordi,
+  5.3.2-local.11). `BufferPool.AllocateHalfWeightFromStreamAsync` downcast FP32 sources on the CPU and uploaded them
+  in 1 MB `CopyFromCPU` chunks. On a browser load (an `IJSReadStream`, which arms
+  `BrowserBufferPolicy.StrictHostCopyMaxBytes` = 64 KB), the guard rightly refused that, so Half storage could not
+  load in a browser at all. Video Depth Anything fell back to another model in Anaglyphohol.
+  - Now FP32 bytes stream into a temporary FP32 GPU buffer (JS->GPU, never the .NET heap) and
+    `PrecisionConvertKernels.FloatToHalf` writes the FP16 weight. This mirrors the FP16->FP32 upcast load path.
+  - The temporary buffers are deferred and freed after one drain (`FlushPendingFp16ConvertsAsync`), as the upcast's are.
+  - Test `WeightStorage_Half_BrowserStreamLoad_StaysOffHeap`: a 512 KB weight loaded through OPFS on WebGPU (guard
+    armed) and from a file on desktop. It must count the weight as zero-copy and match onnxruntime (rel 1.7e-4).
+    MUTATION: with the new branch disabled it fails with the guard's error. Fixture `references/fusion/half_linear`.
+    Scoped PMT 6/0 on CUDA/OpenCL/WebGPU.
+
 - **`WeightStorage.Half`: store FP32 weights as FP16 on the device (opt-in)** (Geordi, 5.3.2-local.10).
   `InferenceSession.CreateFromStreamAsync` / `CreateFromOnnxStreamAsync` and
   `DepthEstimationPipeline.CreateFromStreamsAsync` take a new `weightStorage` parameter.
