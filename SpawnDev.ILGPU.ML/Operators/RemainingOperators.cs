@@ -1990,6 +1990,134 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         return true;
     }
 
+    /// <summary>How many If executions took <see cref="TryRunViewBranch"/> (no nested executor). Diagnostic/test counter.</summary>
+    public static int ViewBranchCount;
+
+    private static readonly HashSet<string> _viewOps = new(StringComparer.Ordinal)
+        { "Identity", "Squeeze", "Unsqueeze", "Reshape", "Flatten" };
+
+    /// <summary>
+    /// A branch that is ONE view op (Identity / Squeeze / Unsqueeze / Reshape / Flatten) plus Constants runs here, with
+    /// no <see cref="SubgraphRunner"/>: the output shape is computed on the host and the data is copied once.
+    /// Returns false for anything else, leaving the normal path to run.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This is torch's export of <c>squeeze(dim)</c> / <c>unsqueeze(dim)</c> on a dynamic shape -
+    /// <c>If(shape[dim] == 1, Squeeze, Identity)</c> - which is all over torch-exported models. Through a nested
+    /// executor each such If paid a whole executor run, and that run ENDS WITH A GPU SYNC (its deferred buffer
+    /// releases need one): a full GPU round trip mid-forward. MEASURED on Video Depth Anything in Chrome (WebGPU):
+    /// its two squeeze-Ifs cost 7.3 ms of a ~25 ms frame (3.65 ms each), more than the whole gap to DAv3.
+    /// </remarks>
+    private static bool TryRunViewBranch(OperatorRegistry reg, OnnxOpContext ctx, Onnx.OnnxGraphProto sub)
+    {
+        if (sub.Outputs.Count != 1 || ctx.Outputs.Length < 1 || sub.Initializers.Count > 0) return false;
+        Onnx.OnnxNodeProto? view = null;
+        var consts = new Dictionary<string, long[]>(StringComparer.Ordinal);
+        foreach (var n in sub.Nodes)
+        {
+            if (n.OpType == "Constant" && n.Outputs.Count == 1)
+            {
+                var t = n.Attributes.FirstOrDefault(a => a.Name == "value")?.T;
+                if (t == null) return false;
+                consts[n.Outputs[0]] = t.ToFloatArray().Select(v => (long)v).ToArray();
+            }
+            else if (view == null && _viewOps.Contains(n.OpType)) view = n;
+            else return false;
+        }
+        if (view == null || view.Inputs.Count == 0 || view.Outputs.Count != 1
+            || !string.Equals(view.Outputs[0], sub.Outputs[0].Name, StringComparison.Ordinal)) return false;
+
+        var scope = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        OuterScope.Add(ctx, sub, scope);
+        for (int i = 0; i < ctx.InputNames.Length && i < ctx.Inputs.Length; i++)
+            if (!string.IsNullOrEmpty(ctx.InputNames[i])) scope[ctx.InputNames[i]] = ctx.Inputs[i];
+        if (!scope.TryGetValue(view.Inputs[0], out var data) || data == null) return false;
+
+        var outShape = ViewShape(view, data.Shape, consts);
+        if (outShape == null || TensorHelpers.ElementCount(outShape) != data.ElementCount) return false;
+        System.Threading.Interlocked.Increment(ref ViewBranchCount);
+        SubgraphOutputCopy.CopyOrAdopt(reg, ctx, 0, new Tensor(data.Data, outShape, data.Name), sub.Outputs[0].Name);
+        return true;
+    }
+
+    /// <summary>ONNX output shape of a view op, or null when it cannot be decided here (then the normal path runs).</summary>
+    private static int[]? ViewShape(Onnx.OnnxNodeProto n, int[] inShape, Dictionary<string, long[]> consts)
+    {
+        long[]? FromInputOrAttr(int input, string attr)
+        {
+            if (n.Inputs.Count > input && !string.IsNullOrEmpty(n.Inputs[input]))
+                return consts.TryGetValue(n.Inputs[input], out var v) ? v : null;   // a runtime value: not ours
+            return n.Attributes.FirstOrDefault(a => a.Name == attr)?.Ints;
+        }
+        switch (n.OpType)
+        {
+            case "Identity":
+                return (int[])inShape.Clone();
+            case "Squeeze":
+            {
+                if (n.Inputs.Count > 1 && !string.IsNullOrEmpty(n.Inputs[1]) && !consts.ContainsKey(n.Inputs[1])) return null;
+                var axes = FromInputOrAttr(1, "axes");
+                if (axes == null || axes.Length == 0) return inShape.Where(d => d != 1).ToArray();
+                var drop = new HashSet<int>();
+                foreach (var a in axes)
+                {
+                    int ax = (int)(a < 0 ? a + inShape.Length : a);
+                    if (ax < 0 || ax >= inShape.Length || inShape[ax] != 1) return null;
+                    drop.Add(ax);
+                }
+                return inShape.Where((_, i) => !drop.Contains(i)).ToArray();
+            }
+            case "Unsqueeze":
+            {
+                var axes = FromInputOrAttr(1, "axes");
+                if (axes == null || axes.Length == 0) return null;
+                int outRank = inShape.Length + axes.Length;
+                var ins = new HashSet<int>();
+                foreach (var a in axes)
+                {
+                    int ax = (int)(a < 0 ? a + outRank : a);
+                    if (ax < 0 || ax >= outRank || !ins.Add(ax)) return null;
+                }
+                var res = new int[outRank];
+                for (int i = 0, src = 0; i < outRank; i++) res[i] = ins.Contains(i) ? 1 : inShape[src++];
+                return res;
+            }
+            case "Reshape":
+            {
+                if (n.Inputs.Count < 2 || !consts.TryGetValue(n.Inputs[1], out var target)) return null;
+                bool allowZero = n.Attributes.FirstOrDefault(a => a.Name == "allowzero")?.I == 1;
+                var res = new int[target.Length];
+                int neg = -1; long known = 1;
+                for (int i = 0; i < target.Length; i++)
+                {
+                    long t = target[i];
+                    if (t == -1) { if (neg >= 0) return null; neg = i; continue; }
+                    if (t == 0 && !allowZero) { if (i >= inShape.Length) return null; t = inShape[i]; }
+                    if (t < 0) return null;
+                    res[i] = (int)t; known *= t;
+                }
+                if (neg >= 0)
+                {
+                    long total = TensorHelpers.ElementCount(inShape);
+                    if (known == 0 || total % known != 0) return null;
+                    res[neg] = (int)(total / known);
+                }
+                return res;
+            }
+            case "Flatten":
+            {
+                long axisL = n.Attributes.FirstOrDefault(a => a.Name == "axis")?.I ?? 1;
+                int axis = (int)(axisL < 0 ? axisL + inShape.Length : axisL);
+                if (axis < 0 || axis > inShape.Length) return null;
+                long outer = 1, inner = 1;
+                for (int i = 0; i < axis; i++) outer *= inShape[i];
+                for (int i = axis; i < inShape.Length; i++) inner *= inShape[i];
+                return new[] { (int)outer, (int)inner };
+            }
+        }
+        return null;
+    }
+
     private static void CountBranch(bool condition)
     {
         if (condition) System.Threading.Interlocked.Increment(ref ThenBranchCount);
@@ -2059,6 +2187,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
             // allocates inside a capture window. See TryWriteConstantBranch.
             if (TryWriteConstantBranch(ctx, subgraph)) return;
+            if (TryRunViewBranch(reg, ctx, subgraph)) return;
             // Subgraph inputs reference outer graph tensors — pass all available tensors
             var subInputs = new Dictionary<string, Tensor>();
             OuterScope.Add(ctx, subgraph, subInputs);
@@ -2113,6 +2242,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
             // allocates inside a capture window. See TryWriteConstantBranch.
             if (TryWriteConstantBranch(ctx, subgraph)) return;
+            if (TryRunViewBranch(reg, ctx, subgraph)) return;
             var subInputs = new Dictionary<string, Tensor>();
             OuterScope.Add(ctx, subgraph, subInputs);
             for (int i = 0; i < ctx.InputNames.Length; i++)
@@ -2691,7 +2821,7 @@ internal static class SubgraphOutputCopy
     /// Rented under a stable per-output name, so this is one buffer reused per If output rather than an
     /// allocation per call - a per-call device allocation is what makes a graph uncapturable.
     /// </remarks>
-    private static void CopyOrAdopt(OperatorRegistry reg, OnnxOpContext ctx, int outIdx,
+    internal static void CopyOrAdopt(OperatorRegistry reg, OnnxOpContext ctx, int outIdx,
         Tensor tensor, string name)
     {
         var dst = ctx.Outputs[outIdx];

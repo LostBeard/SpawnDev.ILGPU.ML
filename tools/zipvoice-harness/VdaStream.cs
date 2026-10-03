@@ -70,6 +70,21 @@ static class VdaStream
                 if (f == 6) SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetPoolOwnershipTrace();
             }
             pixBuf.View.CopyFromCPU(pixels.AsSpan(f * px, px).ToArray());
+            if (Environment.GetEnvironmentVariable("VDA_PROFILE") == "1" && f == Math.Min(8, n - 1))
+            {
+                // One warm steady-state frame (31 cached frames) with a sync per node: GPU time by operator.
+                Dictionary<string, Tensor>? po = null;
+                var t = OpProfile.ProfileOne(accel, () =>
+                {
+                    po = stream.RunAsync(new Tensor(pixBuf.View, new[] { 1, 1, 3, h, w })).GetAwaiter().GetResult();
+                    accel.Synchronize();
+                });
+                OpProfile.Report(t);
+                session.ReturnOutputs(po!);
+                stream.Reset();   // the profiled frame advanced the stream; restart so parity below stays meaningful
+                Console.WriteLine("(stream reset after profiling; parity lines after this frame are not comparable)");
+                return 0;
+            }
             var outs = stream.RunAsync(new Tensor(pixBuf.View, new[] { 1, 1, 3, h, w })).GetAwaiter().GetResult();
             hostBuf.View.CopyFrom(outs["depth"].Data.SubView(0, dx));
             accel.Synchronize();
@@ -97,7 +112,8 @@ static class VdaStream
             if (!ok) bad++;
             Console.WriteLine($"  frame {f,3}: relRMS {relRms:E2}  max rel {rel:E2}{(ok ? "" : "  MISMATCH")}  pool buffers {session.LastExecutorBufferCount}");
         }
-        Console.WriteLine($"{n} frames in {sw.ElapsedMilliseconds} ms, worst max rel {worst:E2}");
+        Console.WriteLine($"{n} frames in {sw.ElapsedMilliseconds} ms, worst max rel {worst:E2}; If view-branch fast path taken " +
+                          $"{SpawnDev.ILGPU.ML.Operators.IfOperator.ViewBranchCount}x, If then/else {SpawnDev.ILGPU.ML.Operators.IfOperator.ThenBranchCount}/{SpawnDev.ILGPU.ML.Operators.IfOperator.ElseBranchCount}");
         Console.WriteLine(bad == 0 ? "RESULT   : PASS" : $"RESULT   : FAIL ({bad} frames)");
         return bad;
     }

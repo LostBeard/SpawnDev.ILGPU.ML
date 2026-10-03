@@ -176,8 +176,17 @@ public abstract partial class MLTestBase
     /// checked against onnxruntime, and no fresh device allocation once warm.
     /// </summary>
     [TestMethod(Timeout = 180000)]
-    public async Task ControlFlow_IfSqueeze_NoLeakAcrossForwards() =>
+    public async Task ControlFlow_IfSqueeze_NoLeakAcrossForwards()
+    {
+        // Both Ifs are single-view-op branches (Squeeze / Identity): they must take IfOperator's view-branch fast
+        // path - no nested executor, so no mid-forward GPU sync (MEASURED: 3.65 ms per If per frame in Chrome).
+        int before = SpawnDev.ILGPU.ML.Operators.IfOperator.ViewBranchCount;
         await ControlFlowMatchesOnnxRuntime("if_squeeze_reshape", runs: 6, noWarmAllocations: true);
+        int taken = SpawnDev.ILGPU.ML.Operators.IfOperator.ViewBranchCount - before;
+        if (taken < 12)
+            throw new Exception($"if_squeeze_reshape: the view-branch fast path ran {taken}x over 6 forwards x 2 Ifs on {BackendName} - " +
+                "a squeeze-If went through the nested executor (a GPU sync per If per forward).");
+    }
 
     [TestMethod(Timeout = 180000)]
     public async Task ControlFlow_Loop_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("tiny_loop");

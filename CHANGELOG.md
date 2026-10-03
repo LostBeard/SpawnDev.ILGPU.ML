@@ -5,6 +5,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **A view-op `If` branch runs without a nested executor** (Geordi, 5.3.2-local.8). torch exports
+  `squeeze(dim)` / `unsqueeze(dim)` on a dynamic shape as `If(shape[dim] == 1, Squeeze, Identity)`, and this
+  pattern is all over torch exports. Each If went through `SubgraphRunner`: a whole nested executor run that
+  ENDS WITH A GPU SYNC, because its deferred buffer releases need one. That is a GPU round trip mid-forward.
+  - MEASURED on Video Depth Anything in Chrome (WebGPU, per-op profile): its two squeeze-Ifs cost 7.3 ms of a
+    ~25 ms frame (3.65 ms each). That is more than the whole gap to DAv3.
+  - New `IfOperator.TryRunViewBranch`: a branch of Constants plus ONE Identity / Squeeze / Unsqueeze / Reshape /
+    Flatten gets its output shape on the host (ONNX semantics, incl. Reshape's 0/-1 and allowzero) and copies
+    once through `CopyOrAdopt`. Anything else, or anything it cannot decide (a runtime axes/shape input), falls
+    through to the nested executor as before.
+  - VDA: the fast path ran 96/96 times over 48 frames, parity unchanged (1.26e-5).
+  - `ControlFlow_IfSqueeze_NoLeakAcrossForwards` now also requires the fast path (`IfOperator.ViewBranchCount`).
+  - Scoped PMT: 146/0 on all 6 lanes.
+  - Harness: `zipvoice-harness profile <model> <input>=<shape>` is a per-op GPU-time breakdown (a sync per
+    node); `vdastream` takes `VDA_PROFILE=1`.
+
 - **Disposing a session releases its operator kernels' scratch** (Geordi, 5.3.2-local.7; reported and measured by
   Tuvok). Owners dispose kernels as `(x as IDisposable)?.Dispose()`, which silently does nothing for a class that
   does not implement it. So the scratch buffers of `SoftmaxKernel`, `ReductionKernels`, and the kernels that TopK,
