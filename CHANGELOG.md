@@ -5,6 +5,36 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **Fewer dispatches per forward: GELU and GroupNorm fusion; size-1 Transposes are reshapes** (Geordi,
+  5.3.2-local.9). These are three graph-level passes. MEASURED together on Video Depth Anything streaming
+  (98x168): 547 -> 463 executed nodes, each at least one WebGPU dispatch (~25-30 us in a browser). DAv3 and
+  every DINOv2/ViT export get the GELU part.
+  - `GraphOptimizer.FuseErfGelu` turns torch's exact GELU (`Div(x, sqrt2)`, `Erf`, `Add 1`, `Mul x`,
+    `Mul 0.5`) into ONE `Gelu`, matching all three association orders. It runs before `FuseLinearLayers`, so
+    the Gelu then folds into the preceding Linear's FusedLinear epilogue: DINOv2's 12 MLPs lose 60 nodes
+    outright. The Gelu kernels are the same exact erf (A&S) as the Erf kernel.
+  - `GraphOptimizer.FuseGroupNorm` turns torch's GroupNorm export (`Reshape [0,G,-1]`, `InstanceNormalization`
+    with unit scale/zero bias, `Shape`, `Reshape`, `Mul gamma`, `Add beta`) into ONE `GroupNormalization`. The
+    gamma/beta Mul/Add were slow rank-4 broadcasts.
+  - A Transpose that only moves size-1 axes leaves memory order unchanged
+    (`TransposeOperator.IsOrderPreserving`). The executor hands its input over zero-copy, like Reshape, and
+    otherwise the operator does a native device copy instead of a kernel. VDA: 32 of 89 Transposes per frame.
+  - Tests `Fusion_ErfGelu_MatchesOnnxRuntime`, `Fusion_GroupNorm_MatchesOnnxRuntime` (a real torch export) and
+    `Fusion_TransposeSizeOneAxes_MatchesOnnxRuntime` check against onnxruntime and assert the compiled op set.
+    Fixtures come from `tools/gen_fusion_reference.py`.
+  - Scoped PMT (Fusion, Transpose, Gelu, GroupNorm, InstanceNorm, LayerNorm, Optimizer, Graph, ControlFlow):
+    423/0 on all 6 lanes.
+- **Video Depth Anything: the K/V-cache stream** (`tools/vda-export --kv`). This is an exact rewrite of VDA's
+  temporal attention.
+  - The original caches each frame's input hidden state, then every frame re-projects all 32 frames,
+    `K_j = W_k (x_j + pe_j)`.
+  - The projections are linear and bias-free, so `K_j = W_k x_j + W_k pe_j`. The new stream caches `W_k x`
+    and `W_v x` once per frame and adds a folded `pe @ W_k^T` constant: two 1-frame Linears instead of two
+    32-frame ones per attention block.
+  - Matches the original stream to 1.2e-6 in torch (48 frames). On the engine it matches the ORIGINAL model's
+    reference to 1.24e-5.
+  - `VideoDepthAnythingStream` accepts both layouts (8 or 16 caches).
+
 - **A view-op `If` branch runs without a nested executor** (Geordi, 5.3.2-local.8). torch exports
   `squeeze(dim)` / `unsqueeze(dim)` on a dynamic shape as `If(shape[dim] == 1, Squeeze, Identity)`, and this
   pattern is all over torch exports. Each If went through `SubgraphRunner`: a whole nested executor run that

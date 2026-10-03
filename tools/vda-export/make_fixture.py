@@ -17,6 +17,9 @@ def main():
     weights, model, video, h, w, step_k, out = sys.argv[1:8]
     h, w, step_k = int(h), int(w), int(step_k)
     vda_dynamic_patches.apply()
+    if '--kv' in sys.argv:
+        e.KV = True
+        vda_dynamic_patches.apply_kv()
     m = e.load_model(weights)
     step = e.StreamStep(m).eval()
     import cv2
@@ -34,13 +37,14 @@ def main():
     x = frames[step_k]
     # step 0 = a clip's FIRST frame: zero cached frames (VDA's no-cache path).
     caches = win.inputs() if step_k > 0 else [torch.zeros(t.shape[0], 0, t.shape[2]) for t in c]
+    nc = e.n_caches()
 
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     sess = ort.InferenceSession(model, so, providers=['CPUExecutionProvider'])
     feed = {'pixel_values': x.numpy()}
-    for i in range(8):
+    for i in range(nc):
         feed[f'cache_{i}'] = caches[i].numpy()
     names = [o.name for o in sess.get_outputs()]
     res = dict(zip(names, sess.run(None, feed)))

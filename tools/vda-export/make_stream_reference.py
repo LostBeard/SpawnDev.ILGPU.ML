@@ -19,6 +19,9 @@ def main():
     weights, video, h, w, n, out = sys.argv[1:7]
     h, w, n = int(h), int(w), int(n)
     vda_dynamic_patches.apply()
+    if '--kv' in sys.argv:   # the K/V-cache stream must reproduce the ORIGINAL stream's depths
+        e.KV = True
+        vda_dynamic_patches.apply_kv()
     m = e.load_model(weights)
     step = e.StreamStep(m).eval()
     import cv2

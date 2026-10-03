@@ -4709,7 +4709,11 @@ public class GraphExecutor : IDisposable
             // view (Tensor over the same Data, new shape) + transfer the pool ownership — no Rent, no copy.
             // Single-consumer = provably safe (no aliasing): this op is the buffer's last reader. Falls through to
             // the copy path for shared / graph-IO / fp16 / shape-cached inputs (and tiny / shape-value ones).
-            if ((node.OpType is "Reshape" or "Squeeze" or "Unsqueeze" or "Flatten") && !shapeCacheHit
+            // A Transpose that only moves size-1 axes is a reshape too (Operators.TransposeOperator.IsOrderPreserving).
+            bool viewTranspose = node.OpType == "Transpose" && nodeInputs.Length >= 1 && nodeInputs[0] != null
+                && node.Attributes.TryGetValue("perm", out var vpObj) && vpObj is long[] vp
+                && Operators.TransposeOperator.IsOrderPreserving(nodeInputs[0]!.Shape, Array.ConvertAll(vp, x => (int)x));
+            if ((node.OpType is "Reshape" or "Squeeze" or "Unsqueeze" or "Flatten" || viewTranspose) && !shapeCacheHit
                 && node.OutputNames.Length == 1 && nodeInputs.Length >= 1 && nodeInputs[0] != null)
             {
                 var src = nodeInputs[0];

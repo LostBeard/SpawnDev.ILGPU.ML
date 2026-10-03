@@ -100,6 +100,54 @@ def apply():
     ])
 
 
+def kv_attention_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None,
+                         cached_hidden_states=None):
+    """TemporalAttention for the K/V-CACHE stream (exact rewrite of the original streaming forward).
+
+    The original caches each frame's INPUT hidden state x_j and, every frame, recomputes over the whole window
+        K_j = W_k (x_j + pe_j),  V_j = W_v (x_j + pe_j)        (pe_j = the absolute position of slot j)
+    i.e. two Linears over all 32 frames. The projections are linear and bias-free (CrossAttention bias=False, no
+    group_norm), so K_j = W_k x_j + W_k pe_j: cache W_k x_j and W_v x_j ONCE per frame and add the constant
+    position terms (pe @ W_k^T, a folded initializer). Per frame: two Linears over ONE frame instead of 32.
+    `cached_hidden_states` is (k_cache, v_cache) [P, F, C]; returns (output, (k_new, v_new)) with [P, 1, C].
+    The attention core is q @ k^T * scale -> softmax -> @ v (torch's baddbmm(empty, ...) replaced: it exports an
+    empty buffer that does nothing).
+    """
+    assert encoder_hidden_states is None and attention_mask is None
+    d = hidden_states.shape[1]
+    cur = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)            # [P, 1, C]
+    k_cur = self.to_k(cur)
+    v_cur = self.to_v(cur)
+    if cached_hidden_states is None:
+        f = 0
+        k_all, v_all = k_cur, v_cur
+    else:
+        k_cache, v_cache = cached_hidden_states
+        f = k_cache.shape[1]
+        k_all = torch.cat([k_cache, k_cur], dim=1)
+        v_all = torch.cat([v_cache, v_cur], dim=1)
+    pe = self.pos_encoder.pe                                                 # [1, max_len, C]
+    pe_k = torch.nn.functional.linear(pe, self.to_k.weight)                  # constants: folded at export
+    pe_v = torch.nn.functional.linear(pe, self.to_v.weight)
+    key = k_all + pe_k[:, :f + 1]
+    value = v_all + pe_v[:, :f + 1]
+    query = self.to_q(cur + pe[:, f:f + 1])
+    q = self.reshape_heads_to_batch_dim(query)
+    k = self.reshape_heads_to_batch_dim(key)
+    v = self.reshape_heads_to_batch_dim(value)
+    probs = (torch.matmul(q, k.transpose(-1, -2)) * self.scale).softmax(dim=-1)
+    out = self.reshape_batch_dim_to_heads(torch.matmul(probs, v))
+    out = self.to_out[1](self.to_out[0](out))
+    out = rearrange(out, "(b d) f c -> (b f) d c", d=d)
+    return out, (k_cur, v_cur)
+
+
+def apply_kv():
+    """Switch TemporalAttention to the K/V-cache stream (see kv_attention_forward). Call after apply()."""
+    from video_depth_anything.motion_module import motion_module
+    motion_module.TemporalAttention.forward = kv_attention_forward
+
+
 def _split0(like, b, t):
     """Shape for splitting dim 0 of a [B*T, ...] tensor into (B, T), from TRACED sizes. torch's ONNX symbolic for
     unflatten writes the example's other dims in as constants, which freezes every later shape."""

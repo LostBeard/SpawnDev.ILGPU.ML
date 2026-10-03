@@ -75,6 +75,12 @@ public static class GraphOptimizer
         // the Add/Sub/Mul this pattern is made of.
         int fusedAtan2 = FuseAtan2(optimized);
 
+        // Pass 3b2: torch's exact-GELU chain (Div, Erf, Add, Mul, Mul) -> ONE Gelu. BEFORE FuseLinearLayers, so the
+        // Gelu then folds into the preceding Linear's epilogue. See FuseErfGelu.
+        int fusedGelu = FuseErfGelu(optimized);
+        // Pass 3b3: torch's GroupNorm export (Reshape, InstanceNorm, Shape, Reshape, Mul, Add) -> ONE GroupNormalization.
+        int fusedGroupNorm = FuseGroupNorm(optimized);
+
         int fusedLinear = FuseLinearLayers(optimized);
 
         // Pass 3b: Fuse a full decomposed self-attention subgraph (Q·Kᵀ → scale → [+zero-bias] → Softmax →
@@ -113,7 +119,7 @@ public static class GraphOptimizer
         // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2 + fusedInstNorm;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2 + fusedInstNorm + fusedGelu + fusedGroupNorm;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
             Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {fusedInstNorm} fused-instancenorm, {fusedAtan2} fused-atan2, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
 
@@ -122,6 +128,225 @@ public static class GraphOptimizer
 
     /// <summary>Where FuseInstanceNorm declined, by reason.</summary>
     public static Dictionary<string, int> LastInstanceNormRejects = new();
+
+    /// <summary>How many chains the last FuseGroupNorm run claimed.</summary>
+    public static int LastGroupNormFused;
+
+    /// <summary>
+    /// Fuse torch's GroupNorm export into ONE <c>GroupNormalization</c> node.
+    /// </summary>
+    /// <remarks>
+    /// <code>
+    ///   r = Reshape(x, [0, G, -1])   n = InstanceNormalization(r, ones[G], zeros[G], eps)   s = Shape(x)
+    ///   b = Reshape(n, s)            m = Mul(b, gamma[C,1,..])                              y = Add(m, beta[C,1,..])
+    /// </code>
+    /// ⭐ WHY. MEASURED on Video Depth Anything (4 motion modules, GroupNorm(32) each): 5-6 dispatches per norm, and the
+    /// gamma/beta Mul/Add are rank-4 broadcasts that ran ~4x slower than a plain elementwise op of the same size. The
+    /// GroupNorm kernel takes per-channel weight/bias [C] - exactly torch's affine - so gamma/beta are bound as they are
+    /// (a [C,1,1] initializer is [C] floats). Claimed only when the InstanceNorm's scale/bias are the export's unit
+    /// constants and every intermediate has a single consumer.
+    /// </remarks>
+    private static int FuseGroupNorm(ModelGraph graph)
+    {
+        int fused = 0;
+        var remove = new HashSet<int>();
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp)) consumers[inp] = consumers.GetValueOrDefault(inp, 0) + 1;
+        var graphOutputs = new HashSet<string>(graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+
+        int ProducerOf(string name)
+        {
+            for (int j = 0; j < graph.Nodes.Count; j++)
+                if (!remove.Contains(j) && graph.Nodes[j].Outputs.Count > 0 && graph.Nodes[j].Outputs[0] == name) return j;
+            return -1;
+        }
+        int SoleConsumer(string name, string op)
+        {
+            if (consumers.GetValueOrDefault(name, 0) != 1 || graphOutputs.Contains(name)) return -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+                if (!remove.Contains(j) && graph.Nodes[j].Inputs.Contains(name))
+                    return graph.Nodes[j].OpType == op ? j : -1;
+            return -1;
+        }
+        bool AllEqual(string name, float v, int count)
+            => graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var c)
+               && c.Length == count && c.All(x => x == v);
+        // A per-channel affine initializer: [C] or [C,1,...,1].
+        bool PerChannel(string name, out int channels)
+        {
+            channels = 0;
+            if (!graph.Initializers.TryGetValue(name, out var s) || s.Length == 0) return false;
+            for (int d = 1; d < s.Length; d++) if (s[d] != 1) return false;
+            channels = s[0];
+            return channels > 0;
+        }
+        string? Other(GraphNode n, string known) => n.Inputs.Count == 2 ? (n.Inputs[0] == known ? n.Inputs[1] : n.Inputs[1] == known ? n.Inputs[0] : null) : null;
+
+        for (int k = 0; k < graph.Nodes.Count; k++)
+        {
+            if (remove.Contains(k)) continue;
+            var inorm = graph.Nodes[k];
+            if (inorm.OpType != "InstanceNormalization" || inorm.Inputs.Count < 3 || inorm.Outputs.Count == 0) continue;
+            var r1Out = inorm.Inputs[0];
+            if (consumers.GetValueOrDefault(r1Out, 0) != 1) continue;
+            int r1 = ProducerOf(r1Out);
+            if (r1 < 0 || graph.Nodes[r1].OpType != "Reshape" || graph.Nodes[r1].Inputs.Count < 2) continue;
+            var x = graph.Nodes[r1].Inputs[0];
+            if (graph.ConstantData == null || !graph.ConstantData.TryGetValue(graph.Nodes[r1].Inputs[1], out var tgt)
+                || tgt.Length != 3 || tgt[0] != 0 || tgt[1] <= 0 || tgt[2] != -1) continue;
+            int groups = tgt[1];
+            if (!AllEqual(inorm.Inputs[1], 1f, groups) || !AllEqual(inorm.Inputs[2], 0f, groups)) continue;
+
+            int r2 = SoleConsumer(inorm.Outputs[0], "Reshape");
+            if (r2 < 0 || graph.Nodes[r2].Inputs.Count < 2) continue;
+            int shp = ProducerOf(graph.Nodes[r2].Inputs[1]);
+            if (shp < 0 || graph.Nodes[shp].OpType != "Shape" || graph.Nodes[shp].Inputs.Count < 1 || graph.Nodes[shp].Inputs[0] != x) continue;
+            int mul = SoleConsumer(graph.Nodes[r2].Outputs[0], "Mul");
+            if (mul < 0) continue;
+            var gamma = Other(graph.Nodes[mul], graph.Nodes[r2].Outputs[0]);
+            if (gamma == null || !PerChannel(gamma, out int c1)) continue;
+            int add = SoleConsumer(graph.Nodes[mul].Outputs[0], "Add");
+            if (add < 0) continue;
+            var beta = Other(graph.Nodes[add], graph.Nodes[mul].Outputs[0]);
+            if (beta == null || !PerChannel(beta, out int c2) || c1 != c2 || c1 % groups != 0) continue;
+
+            float eps = 1e-5f;
+            if (inorm.Attributes.TryGetValue("epsilon", out var epsEl) && epsEl.ValueKind == JsonValueKind.Number)
+                eps = epsEl.GetSingle();
+
+            graph.Nodes[r1] = new GraphNode
+            {
+                OpType = "GroupNormalization",
+                Inputs = new List<string> { x, gamma, beta },
+                Outputs = new List<string> { graph.Nodes[add].Outputs[0] },
+                Attributes = new Dictionary<string, JsonElement>
+                {
+                    ["num_groups"] = MLJson.ToElement(groups),
+                    ["epsilon"] = MLJson.ToElement(eps),
+                },
+            };
+            remove.Add(k); remove.Add(r2); remove.Add(mul); remove.Add(add);
+            if (consumers.GetValueOrDefault(graph.Nodes[shp].Outputs[0], 0) == 1) remove.Add(shp);
+            fused++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        LastGroupNormFused = fused;
+        return fused;
+    }
+
+    /// <summary>How many chains the last FuseErfGelu run claimed.</summary>
+    public static int LastErfGeluFused;
+
+    /// <summary>
+    /// Fuse torch's exact-GELU export - <c>x * 0.5 * (1 + erf(x / sqrt2))</c>, five nodes - into ONE <c>Gelu</c>.
+    /// </summary>
+    /// <remarks>
+    /// <code>
+    ///   d = Div(x, 1.41421356)  [or Mul(x, 0.70710678)]     e = Erf(d)     a = Add(e, 1)
+    ///   y = Mul(Mul(x, a), 0.5)  |  Mul(Mul(x, 0.5), a)  |  Mul(x, Mul(a, 0.5))
+    /// </code>
+    /// ⭐ WHY. MEASURED on Video Depth Anything / DAv3 (DINOv2 ViT-S): 12 MLPs x 5 nodes = 60 dispatches per forward,
+    /// at ~25-30 us each in a browser. And because it runs BEFORE <see cref="FuseLinearLayers"/>, the fused Gelu then
+    /// folds into the fc1 FusedLinear's epilogue - the whole activation costs no node at all. The Gelu kernels are
+    /// the exact erf form (same A&amp;S erf as the Erf kernel), so this changes nothing but float rounding.
+    /// Every intermediate must have a single consumer and not be a graph output; constants come from
+    /// FloatConstantData only (ConstantData is int and would read sqrt2 as 1).
+    /// </remarks>
+    private static int FuseErfGelu(ModelGraph graph)
+    {
+        int fused = 0;
+        var remove = new HashSet<int>();
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp)) consumers[inp] = consumers.GetValueOrDefault(inp, 0) + 1;
+        var graphOutputs = new HashSet<string>(graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+
+        bool IsConst(string name, double v)
+            => !string.IsNullOrEmpty(name) && graph.FloatConstantData != null
+               && graph.FloatConstantData.TryGetValue(name, out var c) && c.Length == 1 && Math.Abs(c[0] - v) < 1e-5 * Math.Max(1, Math.Abs(v));
+
+        int SoleConsumer(string name, string op)
+        {
+            if (consumers.GetValueOrDefault(name, 0) != 1 || graphOutputs.Contains(name)) return -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+                if (!remove.Contains(j) && graph.Nodes[j].Inputs.Contains(name))
+                    return graph.Nodes[j].OpType == op ? j : -1;
+            return -1;
+        }
+
+        int ProducerOf(string name)
+        {
+            for (int j = 0; j < graph.Nodes.Count; j++)
+                if (!remove.Contains(j) && graph.Nodes[j].Outputs.Count > 0 && graph.Nodes[j].Outputs[0] == name) return j;
+            return -1;
+        }
+
+        string? Other(GraphNode n, string known) => n.Inputs.Count == 2 ? (n.Inputs[0] == known ? n.Inputs[1] : n.Inputs[1] == known ? n.Inputs[0] : null) : null;
+
+        for (int i = 0; i < graph.Nodes.Count; i++)
+        {
+            if (remove.Contains(i)) continue;
+            var scale = graph.Nodes[i];
+            if (scale.Inputs.Count != 2 || scale.Outputs.Count == 0) continue;
+            string? x = null;
+            if (scale.OpType == "Div" && IsConst(scale.Inputs[1], Math.Sqrt(2))) x = scale.Inputs[0];
+            else if (scale.OpType == "Mul" && IsConst(scale.Inputs[1], 1 / Math.Sqrt(2))) x = scale.Inputs[0];
+            else if (scale.OpType == "Mul" && IsConst(scale.Inputs[0], 1 / Math.Sqrt(2))) x = scale.Inputs[1];
+            if (string.IsNullOrEmpty(x)) continue;
+
+            int erfIdx = SoleConsumer(scale.Outputs[0], "Erf");
+            if (erfIdx < 0) continue;
+            int addIdx = SoleConsumer(graph.Nodes[erfIdx].Outputs[0], "Add");
+            if (addIdx < 0) continue;
+            var a = graph.Nodes[addIdx].Outputs[0];
+            if (!IsConst(Other(graph.Nodes[addIdx], graph.Nodes[erfIdx].Outputs[0]) ?? "", 1.0)) continue;
+
+            int m1 = SoleConsumer(a, "Mul");
+            if (m1 < 0) continue;
+            var other = Other(graph.Nodes[m1], a);
+            if (other == null) continue;
+            int m2 = -1, half = -1;
+            string? y = null;
+            if (other == x || IsConst(other, 0.5))
+            {
+                // x*a then *0.5, or a*0.5 then *x.
+                m2 = SoleConsumer(graph.Nodes[m1].Outputs[0], "Mul");
+                if (m2 < 0) continue;
+                var last = Other(graph.Nodes[m2], graph.Nodes[m1].Outputs[0]);
+                if (other == x ? !IsConst(last ?? "", 0.5) : last != x) continue;
+                y = graph.Nodes[m2].Outputs[0];
+            }
+            else
+            {
+                // (x*0.5) * a
+                half = ProducerOf(other);
+                if (half < 0 || graph.Nodes[half].OpType != "Mul" || consumers.GetValueOrDefault(other, 0) != 1
+                    || graphOutputs.Contains(other)) continue;
+                var hn = graph.Nodes[half];
+                if (!((hn.Inputs[0] == x && IsConst(hn.Inputs[1], 0.5)) || (hn.Inputs[1] == x && IsConst(hn.Inputs[0], 0.5)))) continue;
+                y = graph.Nodes[m1].Outputs[0];
+            }
+
+            graph.Nodes[i] = new GraphNode
+            {
+                OpType = "Gelu",
+                Inputs = new List<string> { x },
+                Outputs = new List<string> { y! },
+                Attributes = new Dictionary<string, JsonElement>(),
+            };
+            foreach (var idx in new[] { erfIdx, addIdx, m1, m2, half })
+                if (idx >= 0) remove.Add(idx);
+            fused++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        LastErfGeluFused = fused;
+        return fused;
+    }
 
     /// <summary>How many chains the last FuseInstanceNorm run claimed. A fusion that stops matching is
     /// silent everywhere else - the graph still computes the right answer, just slowly.</summary>

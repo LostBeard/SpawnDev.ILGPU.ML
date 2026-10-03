@@ -2501,8 +2501,37 @@ public class TransposeOperator(OperatorRegistry reg) : IOnnxOperator
                 Console.WriteLine($"[Transpose] WARN: perm[{perm.Length}] != rank[{ctx.Inputs[0].Rank}], shape=[{string.Join(",", ctx.Inputs[0].Shape)}], attrs={string.Join(",", ctx.Attributes.Select(kv => $"{kv.Key}={kv.Value}"))}");
             perm = Enumerable.Range(0, ctx.Inputs[0].Rank).Reverse().ToArray();
         }
+        if (IsOrderPreserving(ctx.Inputs[0].Shape, perm))
+        {
+            // Only size-1 axes move: the element order is unchanged, so this is a copy, not a permutation - a
+            // native device copy (WebGPU copyBufferToBuffer), no kernel. (The executor usually avoids even this by
+            // handing the input buffer over as a view; see GraphExecutor's zero-copy view-op block.)
+            int count = ctx.Inputs[0].ElementCount;
+            if (count > 0) ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
+            return;
+        }
         reg.Transpose.Transpose(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[0].Shape, perm);
+    }
+
+    /// <summary>
+    /// True when transposing <paramref name="shape"/> by <paramref name="perm"/> leaves the elements in the SAME memory
+    /// order - i.e. only size-1 axes move (the axes larger than 1 keep their relative order). Such a Transpose is a
+    /// reshape. Common in streaming / batch-1 graphs: torch's (b f) d c -> (b d) f c rearrange with f = 1 exports as
+    /// one (MEASURED, Video Depth Anything: many of its 89 Transposes per frame).
+    /// </summary>
+    public static bool IsOrderPreserving(int[] shape, int[] perm)
+    {
+        if (perm.Length != shape.Length) return false;
+        int last = -1;
+        foreach (var p in perm)
+        {
+            if (p < 0 || p >= shape.Length) return false;
+            if (shape[p] == 1) continue;
+            if (p < last) return false;
+            last = p;
+        }
+        return true;
     }
 }
 

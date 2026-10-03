@@ -14,8 +14,9 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// <para>
 /// <b>The model.</b> A streaming step graph: <c>pixel_values [1,1,3,H,W]</c> and <c>cache_i [P_i, F, C_i]</c> in,
 /// <c>depth [1,H,W]</c> (relative DISPARITY: high = near) and <c>new_cache_i [P_i, 1, C_i]</c> out, for every
-/// <c>cache_i</c> the model declares with a matching <c>new_cache_i</c> (8 for VDA: 2 attention blocks in each of 4
-/// motion modules). <c>F</c> is the number of cached frames: 31 in steady state, and 0 for a clip's FIRST frame - with
+/// <c>cache_i</c> the model declares with a matching <c>new_cache_i</c>: 8 for VDA's own streaming (each attention
+/// block's input hidden state - 2 blocks in each of 4 motion modules), or 16 for the K/V-cache export
+/// (tools/vda-export --kv: each block's W_k x and W_v x, so a frame projects only itself instead of all 32). <c>F</c> is the number of cached frames: 31 in steady state, and 0 for a clip's FIRST frame - with
 /// no cached frames the step is exactly VDA's no-cache first-frame forward, so one graph serves both.
 /// </para>
 /// <para>
@@ -155,9 +156,12 @@ public sealed class VideoDepthAnythingStream : IDisposable
         int ph = h / 14, pw = w / 14;
         int g14 = ph * pw, g28 = ((ph + 1) / 2) * ((pw + 1) / 2), g7 = (2 * ph) * (2 * pw);
         var perModule = new[] { g14, g28, g14, g7 };
-        if (_cacheNames.Length != 8)
-            throw new NotSupportedException($"First-frame cache geometry is VDA's 8-cache layout; this model has {_cacheNames.Length} caches.");
-        return Enumerable.Range(0, 8).Select(i => perModule[i / 2]).ToArray();
+        // Caches come module by module: 8 = one hidden state per attention block (2 per module), 16 = the K/V-cache
+        // export's (W_k x, W_v x) per attention block (4 per module). Either way, module = index / (count / 4).
+        int n = _cacheNames.Length;
+        if (n % 4 != 0 || n == 0)
+            throw new NotSupportedException($"First-frame cache geometry expects VDA's 4 motion modules; this model has {n} caches.");
+        return Enumerable.Range(0, n).Select(i => perModule[i / (n / 4)]).ToArray();
     }
 
     async Task EnsureBuffersAsync(Dictionary<string, Tensor> firstOutputs)

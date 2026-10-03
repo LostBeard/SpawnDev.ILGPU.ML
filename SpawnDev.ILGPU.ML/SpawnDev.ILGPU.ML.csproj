@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.2-local.8</Version>
+		<Version>5.3.2-local.9</Version>
 		<PackageReleaseNotes>v5.3.1: on SpawnDev.ILGPU 5.3.1. TRIM SAFE, enforced: IsTrimmable, all JSON source-generated (output parity with the reflection serializer proven); the full test suite passes on a TRIMMED publish; Blazor WASM AOT supported with WasmStripILAfterAOT=false. ReduceL1/L2/SumSquare/LogSum/LogSumExp fixed as a family; stream loads accept optimizer-folded constants; no-readback GPU depth (EstimateGpuRawAsync) for per-frame consumers; warm folded forwards skip folded nodes.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

@@ -32,15 +32,35 @@ import vda_dynamic_patches  # noqa: E402
 CACHE_FRAMES = INFER_LEN - 1   # 31
 
 
+# K/V-cache stream (vda_dynamic_patches.apply_kv): each attention block caches (W_k x, W_v x) - 16 cache tensors in
+# block order k0, v0, k1, v1, ... - instead of its input hidden state (8).
+KV = False
+
+
+def n_caches():
+    return 16 if KV else 8
+
+
+def flatten_cache(items):
+    out = []
+    for it in items:
+        out.extend(it if isinstance(it, tuple) else [it])
+    return out
+
+
+def group_cache(flat):
+    return [(flat[2 * i], flat[2 * i + 1]) for i in range(len(flat) // 2)] if KV else list(flat)
+
+
 class StreamStep(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
 
-    def forward(self, x, c0, c1, c2, c3, c4, c5, c6, c7):
+    def forward(self, x, *caches):
         feats = self.model.forward_features(x)
-        depth, new = self.model.forward_depth(feats, x.shape, cached_hidden_state_list=[c0, c1, c2, c3, c4, c5, c6, c7])
-        return (depth[0],) + tuple(new)
+        depth, new = self.model.forward_depth(feats, x.shape, cached_hidden_state_list=group_cache(caches))
+        return (depth[0],) + tuple(flatten_cache(new))
 
 
 def load_model(weights):
@@ -54,7 +74,7 @@ def first_frame_cache(model, x):
     with torch.no_grad():
         feats = model.forward_features(x)
         depth, cache = model.forward_depth(feats, x.shape)
-    return depth[0], list(cache)
+    return depth[0], flatten_cache(cache)
 
 
 class Window:
@@ -68,7 +88,7 @@ class Window:
     def inputs(self):
         cur = self.frames[0:2] + self.frames[-INFER_LEN + 3:]
         assert len(cur) == CACHE_FRAMES
-        return [torch.cat([f[i] for f in cur], dim=1) for i in range(8)]
+        return [torch.cat([f[i] for f in cur], dim=1) for i in range(n_caches())]
 
     def push(self, new_cache):
         self.id += 1
@@ -96,9 +116,14 @@ def main():
     ap.add_argument('--video', default=None)
     ap.add_argument('--no-fold', action='store_true')
     ap.add_argument('--baked', action='store_true', help='export without the dynamic-shape patches')
+    ap.add_argument('--kv', action='store_true', help='K/V-cache stream: 16 caches of W_k x / W_v x (exact; less work per frame)')
     args = ap.parse_args()
     if not args.baked:
         vda_dynamic_patches.apply()   # dynamic H/W (see vda_dynamic_patches.py)
+    if args.kv:
+        global KV
+        KV = True
+        vda_dynamic_patches.apply_kv()
 
     model = load_model(args.weights)
     step = StreamStep(model).eval()
@@ -136,10 +161,10 @@ def main():
 
     # Export with dynamic H/W (and the cache position dims that follow them).
     x_ex, caches_ex = step_inputs[0]
-    names_in = ['pixel_values'] + [f'cache_{i}' for i in range(8)]
-    names_out = ['depth'] + [f'new_cache_{i}' for i in range(8)]
+    names_in = ['pixel_values'] + [f'cache_{i}' for i in range(n_caches())]
+    names_out = ['depth'] + [f'new_cache_{i}' for i in range(n_caches())]
     dyn = {'pixel_values': {3: 'H', 4: 'W'}, 'depth': {1: 'H', 2: 'W'}}
-    for i in range(8):
+    for i in range(n_caches()):
         dyn[f'cache_{i}'] = {0: f'P{i}', 1: 'F'}   # F = cached frames: 31 in steady state, 0 for the FIRST frame
         dyn[f'new_cache_{i}'] = {0: f'P{i}'}
     torch.onnx.export(step, (x_ex, *caches_ex), args.out, input_names=names_in, output_names=names_out,
@@ -156,7 +181,7 @@ def main():
     worst = 0.0
     for k, (x, caches) in enumerate(step_inputs):
         feed = {'pixel_values': x.numpy()}
-        for i in range(8):
+        for i in range(n_caches()):
             feed[f'cache_{i}'] = caches[i].numpy()
         res = sess.run(None, feed)
         ref = ref_depths[k + 1].numpy()
@@ -168,11 +193,11 @@ def main():
     # First frame through the SAME graph: zero cached frames is VDA's no-cache first-frame path.
     x0 = frames[0]
     feed = {'pixel_values': x0.numpy()}
-    for i in range(8):
+    for i in range(n_caches()):
         feed[f'cache_{i}'] = np.zeros((c0[i].shape[0], 0, c0[i].shape[2]), np.float32)
     res = sess.run(None, feed)
     rel = float(np.abs(res[0] - d0.numpy()).max() / (np.abs(d0.numpy()).max() + 1e-6))
-    crel = max(float(np.abs(res[1 + i] - c0[i].numpy()).max() / (np.abs(c0[i].numpy()).max() + 1e-6)) for i in range(8))
+    crel = max(float(np.abs(res[1 + i] - c0[i].numpy()).max() / (np.abs(c0[i].numpy()).max() + 1e-6)) for i in range(n_caches()))
     print(f'FIRST FRAME (F=0) vs torch no-cache: depth rel {rel:.2e}, caches rel {crel:.2e}')
 
     # Dynamic H/W: run a DIFFERENT size through the same ONNX against torch.
@@ -187,7 +212,7 @@ def main():
                     caches = win2.inputs()
                     out = step(x, *caches)
                     feed = {'pixel_values': x.numpy()}
-                    for i in range(8):
+                    for i in range(n_caches()):
                         feed[f'cache_{i}'] = caches[i].numpy()
                     res = sess.run(None, feed)
                     ref = out[0].numpy()
