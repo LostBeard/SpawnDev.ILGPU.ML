@@ -28,7 +28,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     ONLY under the opt-in, so FP16-source models keep their current path.
   - **MEASURED, Video Depth Anything (98x168, 48 frames):** depth moves by relRMS 2-6e-4 (worst 3.3e-3) vs FP32.
     On OpenCL it is SLOWER: the low-precision FusedLinear/Conv decode each weight in software, 3.7-4x the FP32
-    kernel. The WebGPU timing decides whether it is worth using; until then it stays off by default.
+    kernel. WebGPU too (MEASURED 2026-10-03, Anaglyphohol in Chrome, local.11, 200 frames): depth median 15.3 ms vs
+    13.3 ms FP32. At this size the forward is dispatch-bound, not weight-bandwidth-bound, so halving the weight bytes
+    buys nothing and the per-element decode costs ~2 ms. It stays off by default.
   - Test `WeightStorage_Half_StoresFp16AndStaysClose`: FP16 is really used, outputs stay within FP16 rounding of
     onnxruntime, and the default is exact. Scoped PMT: 395/0 on all 6 lanes.
 
