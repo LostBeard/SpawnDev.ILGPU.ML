@@ -102,6 +102,10 @@ public class InferenceSession : IDisposable
     /// <summary>Number of nodes in the compiled graph.</summary>
     public int NodeCount => _compiled.Nodes.Length;
 
+    /// <summary>Weights held as FP16 on the device (FP16 sources kept native, plus FP32 weights stored as FP16 under
+    /// <see cref="WeightStorage.Half"/>). 0 on load paths that do not keep low-precision weights.</summary>
+    public int HalfWeightCount { get; private init; }
+
     /// <summary>
     /// How many nodes of each op type survive into the COMPILED graph, most numerous first.
     /// </summary>
@@ -699,7 +703,8 @@ public class InferenceSession : IDisposable
         int streamThreshold = 1024 * 1024,
         Stream? externalDataStream = null,
         CancellationToken ct = default,
-        Action<Graph.ModelGraph>? prepareGraph = null)
+        Action<Graph.ModelGraph>? prepareGraph = null,
+        WeightStorage weightStorage = WeightStorage.Source)
     {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
         if (!stream.CanSeek)
@@ -720,7 +725,7 @@ public class InferenceSession : IDisposable
         {
             ModelFormat.ONNX => await CreateFromOnnxStreamAsync(
                 accelerator, stream, onProgress, inputShapes, enableOptimization, streamThreshold,
-                externalDataStream, ct, prepareGraph).ConfigureAwait(false),
+                externalDataStream, ct, prepareGraph, weightStorage).ConfigureAwait(false),
 
             ModelFormat.GGUF => await CreateFromGGUFStreamAsync(
                 accelerator, stream, onProgress, ct).ConfigureAwait(false),
@@ -1444,6 +1449,10 @@ public class InferenceSession : IDisposable
     /// ⚠️ The callback sees the graph BEFORE optimization, so anything it changes is subject to the same
     /// passes as the rest. It must leave the graph valid; nothing here re-validates it.
     /// </remarks>
+    /// <param name="weightStorage"><see cref="WeightStorage.Half"/>: keep every FP32 weight that is consumed ONLY as
+    /// the weight operand of a low-precision-capable op (FusedLinear / MatMul rank-2 / Gemm / Conv group=1) as FP16 on
+    /// the device - half the bytes and half the weight bandwidth; compute stays FP32. Opt-in: FP16 weights round to an
+    /// 11-bit significand. Default <see cref="WeightStorage.Source"/> keeps each weight in its file's precision.</param>
     public static async Task<InferenceSession> CreateFromOnnxStreamAsync(
         Accelerator accelerator, Stream stream,
         Action<string, int>? onProgress = null,
@@ -1452,7 +1461,8 @@ public class InferenceSession : IDisposable
         int streamThreshold = 1024 * 1024,
         Stream? externalDataStream = null,
         CancellationToken ct = default,
-        Action<Graph.ModelGraph>? prepareGraph = null)
+        Action<Graph.ModelGraph>? prepareGraph = null,
+        WeightStorage weightStorage = WeightStorage.Source)
     {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
@@ -1565,7 +1575,15 @@ public class InferenceSession : IDisposable
                 if (string.IsNullOrEmpty(inName)) continue;
                 gpuConsumed.Add(inName);
                 int convGroup = node.OpType == "Conv" && node.Attributes.TryGetValue("group", out var gv) && gv is long gl ? (int)gl : 1;
-                bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || node.OpType == "Gemm" || (node.OpType == "Conv" && convGroup == 1));
+                // FusedLinear [A, W, bias]: W is input 1 and runs on LowPWeightDispatch.FusedLinear - claimed only when the
+                // caller OPTED IN (WeightStorage.Half), so models with FP16-source weights keep today's path by default
+                // (the low-p FusedLinear decodes each weight on load; MEASURED 3.7x slower on OpenCL than fp32).
+                // A MatMul weight must be rank 2 - the broadcast-batched path has no low-precision kernel.
+                bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || node.OpType == "Gemm"
+                    || (node.OpType == "FusedLinear" && weightStorage == WeightStorage.Half)
+                    || (node.OpType == "Conv" && convGroup == 1));
+                if (okAsWeight && node.OpType == "MatMul" && graph.Initializers.TryGetValue(inName, out var mmShape) && mmShape.Length != 2)
+                    okAsWeight = false;
                 if (okAsWeight) halfEligible.Add(inName);
                 else
                 {
@@ -1611,7 +1629,8 @@ public class InferenceSession : IDisposable
             // fp16-source (dtype 10) weight, consumed exclusively by a half-capable op as its weight: keep
             // it fp16 on the GPU (half the bytes). Only fp16 SOURCE — never downcast a fp32 weight to fp16
             // (that would lose precision the model expects). Streaming path only (large weights = the win).
-            if (halfEligible.Contains(name) && tensor.DataType == 10 && tensor.RawDataStreamOffset >= 0)
+            if (halfEligible.Contains(name) && tensor.RawDataStreamOffset >= 0
+                && (tensor.DataType == 10 || (tensor.DataType == 1 && weightStorage == WeightStorage.Half)))
             {
                 _branch = "half-stream";
                 var halfW = await pool.AllocateHalfWeightFromStreamAsync(
@@ -1741,7 +1760,8 @@ public class InferenceSession : IDisposable
 
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
-            ModelName = modelInfo.Name
+            ModelName = modelInfo.Name,
+            HalfWeightCount = halfLoaded,
         };
         // Enable dynamic-shape recompilation: a later Run at a different input shape (e.g. a growing
         // decode sequence) recompiles the graph at that shape rather than mis-sizing buffers.

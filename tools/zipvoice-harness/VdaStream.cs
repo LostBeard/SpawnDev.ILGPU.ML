@@ -40,8 +40,13 @@ static class VdaStream
         Console.WriteLine($"device   : {accel.AcceleratorType} {accel.Name}");
 
         // Bind ONLY pixel_values, the way an app would: the cache inputs' dynamic dims are left to the session.
-        using var session = InferenceSession.CreateFromFile(accel, File.ReadAllBytes(modelPath),
-            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, h, w } });
+        // VDA_HALF=1: FP32 weights stored as FP16 where a low-precision op reads them (WeightStorage.Half).
+        bool half = Environment.GetEnvironmentVariable("VDA_HALF") == "1";
+        using var modelStream = new MemoryStream(File.ReadAllBytes(modelPath));
+        using var session = InferenceSession.CreateFromStreamAsync(accel, modelStream,
+            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, h, w } },
+            weightStorage: half ? WeightStorage.Half : WeightStorage.Source).GetAwaiter().GetResult();
+        Console.WriteLine($"weights  : {(half ? "FP16 storage where eligible" : "source precision")}");
         using var stream = new VideoDepthAnythingStream(session, accel);
         using var pixBuf = accel.Allocate1D<float>(px);
         using var hostBuf = accel.Allocate1D<float>(dx);

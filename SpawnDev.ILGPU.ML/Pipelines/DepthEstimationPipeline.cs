@@ -344,10 +344,11 @@ public class DepthEstimationPipeline : IDisposable
     public static async Task<DepthEstimationPipeline> CreateFromStreamsAsync(
         Accelerator accelerator, System.IO.Stream modelStream, System.IO.Stream? externalDataStream = null,
         Action<string, int>? onProgress = null, Dictionary<string, int[]>? inputShapes = null,
-        int inputSize = 0, CancellationToken ct = default)
+        int inputSize = 0, CancellationToken ct = default, WeightStorage weightStorage = WeightStorage.Source)
     {
         var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelStream,
-            onProgress: onProgress, inputShapes: inputShapes, externalDataStream: externalDataStream, ct: ct)
+            onProgress: onProgress, inputShapes: inputShapes, externalDataStream: externalDataStream, ct: ct,
+            weightStorage: weightStorage)
             .ConfigureAwait(false);
         // The pipeline created this session, so it owns it: disposing the pipeline must free the weights. Before,
         // nobody could - the session was reachable only through Session - and an app that unloaded the model to

@@ -5,6 +5,20 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **`WeightStorage.Half`: store FP32 weights as FP16 on the device (opt-in)** (Geordi, 5.3.2-local.10).
+  `InferenceSession.CreateFromStreamAsync` / `CreateFromOnnxStreamAsync` and
+  `DepthEstimationPipeline.CreateFromStreamsAsync` take a new `weightStorage` parameter.
+  - **What it does:** with `Half`, a weight read only as the weight operand of a low-precision-capable op
+    (FusedLinear, rank-2 MatMul, Gemm, Conv group=1) is kept as FP16. That halves its device memory and
+    bandwidth; compute and activations stay FP32. The new `InferenceSession.HalfWeightCount` reports how many.
+  - **Default unchanged:** `Source` keeps each weight in its file's precision. FusedLinear joins the eligible set
+    ONLY under the opt-in, so FP16-source models keep their current path.
+  - **MEASURED, Video Depth Anything (98x168, 48 frames):** depth moves by relRMS 2-6e-4 (worst 3.3e-3) vs FP32.
+    On OpenCL it is SLOWER: the low-precision FusedLinear/Conv decode each weight in software, 3.7-4x the FP32
+    kernel. The WebGPU timing decides whether it is worth using; until then it stays off by default.
+  - Test `WeightStorage_Half_StoresFp16AndStaysClose`: FP16 is really used, outputs stay within FP16 rounding of
+    onnxruntime, and the default is exact. Scoped PMT: 395/0 on all 6 lanes.
+
 - **Fewer dispatches per forward: GELU and GroupNorm fusion; size-1 Transposes are reshapes** (Geordi,
   5.3.2-local.9). These are three graph-level passes. MEASURED together on Video Depth Anything streaming
   (98x168): 547 -> 463 executed nodes, each at least one WebGPU dispatch (~25-30 us in a browser). DAv3 and
