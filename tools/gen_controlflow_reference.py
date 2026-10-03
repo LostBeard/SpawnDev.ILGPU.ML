@@ -113,6 +113,47 @@ save("tiny_scan", scan_model, {
     "seq": rng.standard_normal((4, 3)).astype(np.float32),
 })
 
+# ── If as torch exports squeeze(dim): If(shape[dim] == 1, Squeeze, Identity), consumed twice ────────
+# Branch outputs carry NO static shape (torch declares them symbolic), so the compiler cannot size the If and
+# the executed branch's buffer is ADOPTED at run time. One If feeds a Reshape (the executor's zero-copy rename
+# of its input's pool record), the other an elementwise op. Gates the 2026-10-03 per-forward leak: the
+# adopted buffer was rented under a private name, so the Reshape returned the WRONG buffer, and the branch
+# executor's own outputs were never returned - Video Depth Anything leaked a buffer per If per frame. The C#
+# test runs this repeatedly and requires ZERO fresh device allocations once warm.
+def squeeze_if(prefix, src):
+    sq_axes = helper.make_node("Constant", [], [f"{prefix}_axes"],
+                               value=helper.make_tensor("a", TensorProto.INT64, [1], [1]))
+    then_g = helper.make_graph(
+        [sq_axes, helper.make_node("Squeeze", [src, f"{prefix}_axes"], [f"{prefix}_sq"])], f"{prefix}_then", [],
+        [helper.make_tensor_value_info(f"{prefix}_sq", TensorProto.FLOAT, None)])
+    else_g = helper.make_graph(
+        [helper.make_node("Identity", [src], [f"{prefix}_id"])], f"{prefix}_else", [],
+        [helper.make_tensor_value_info(f"{prefix}_id", TensorProto.FLOAT, None)])
+    return helper.make_node("If", [f"{prefix}_cond"], [f"{prefix}_out"], then_branch=then_g, else_branch=else_g)
+
+
+sq_nodes = [
+    helper.make_node("Relu", ["X"], ["xr"]),
+    helper.make_node("Shape", ["xr"], ["xs"]),
+    helper.make_node("Constant", [], ["one_i"], value=helper.make_tensor("i1", TensorProto.INT64, [], [1])),
+    helper.make_node("Gather", ["xs", "one_i"], ["dim1"], axis=0),
+    helper.make_node("Equal", ["dim1", "one_i"], ["s1_cond"]),
+    helper.make_node("Equal", ["dim1", "one_i"], ["s2_cond"]),
+    squeeze_if("s1", "xr"),
+    squeeze_if("s2", "xr"),
+    helper.make_node("Constant", [], ["flat_shape"], value=helper.make_tensor("fs", TensorProto.INT64, [2], [4, 6])),
+    helper.make_node("Reshape", ["s1_out", "flat_shape"], ["Y"]),
+    helper.make_node("Neg", ["s2_out"], ["Z"]),
+]
+sq_graph = helper.make_graph(
+    sq_nodes, "if_squeeze_reshape",
+    [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1, 4, 6])],
+    [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 6]),
+     helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1, 4, 6])])
+sq_model = helper.make_model(sq_graph, opset_imports=[helper.make_opsetid("", 14)])
+sq_model.ir_version = 9
+save("if_squeeze_reshape", sq_model, {"X": rng.standard_normal((1, 1, 4, 6)).astype(np.float32)})
+
 print()
 print(f"wrote fixtures to {OUT}")
 print("Each output is larger than inputs[0], so the old inputs[0] inference cannot pass these.")

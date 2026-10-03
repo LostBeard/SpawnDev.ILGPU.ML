@@ -726,6 +726,21 @@ public class BufferPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// Return <paramref name="tensor"/> only if the pool's record for its name IS this tensor's buffer; true if pooled.
+    /// For an operator that drops a buffer the executor rented for it (replacing the output with another one): the
+    /// identity check makes it safe even when the name has been re-bound since, where a plain <see cref="Return"/>
+    /// would pool whatever buffer the name now records - possibly a live one.
+    /// </summary>
+    public bool ReturnIfOwned(Tensor tensor)
+    {
+        if (tensor.Name == null || !_namedBuffers.TryGetValue(tensor.Name, out var buffer)) return false;
+        var own = BufferOf(tensor.Data);
+        if (own == null || !ReferenceEquals(own, buffer.Buffer)) return false;
+        Return(tensor);
+        return true;
+    }
+
     /// <summary>Transfer a live (rented) fp32 buffer's pool ownership from one name to another — the zero-copy
     /// Reshape ownership-handoff (the executor rebinds a single-consumer input's buffer to the reshape output
     /// instead of renting+copying). After this, <see cref="Return"/>(tensor named <paramref name="newName"/>)

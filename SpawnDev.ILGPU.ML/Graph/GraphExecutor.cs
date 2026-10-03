@@ -140,6 +140,21 @@ public class GraphExecutor : IDisposable
     /// cost more than the bookkeeping they try to time. Off by default; never set it outside a measurement.
     /// </summary>
     public static bool DiagSkipOperatorExecute;
+
+    /// <summary>
+    /// DIAGNOSTIC - null (off) by default. When set, every executed node appends one line naming the buffers its input and
+    /// output tensors are bound to (buffer identity, element offset, length): exactly what a WebGPU bind group is keyed on.
+    /// Diff two warm forwards' logs to find the nodes whose bindings change from one forward to the next - each such
+    /// change is a bind-group cache MISS (and a createBindGroup) on WebGPU, every frame.
+    /// </summary>
+    public static List<string>? DiagBindingLog;
+
+    static void LogBindings(int nodeIdx, CompiledNode node, Tensor?[] ins, Tensor?[] outs)
+    {
+        static string B(Tensor? t) => t == null || !t.Data.IsValid ? "-"
+            : $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(((IArrayView)t.Data).Buffer):x}@{((IContiguousArrayView)t.Data.BaseView).IndexInBytes / 4}+{t.Data.Length}";
+        DiagBindingLog!.Add($"{nodeIdx} {node.OpType} {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "")} | in {string.Join(" ", ins.Select(B))} | out {string.Join(" ", outs.Select(B))}");
+    }
     private HashSet<string>? _foldFrontier;                   // folded outputs a non-folded node consumes
     private Dictionary<string, Tensor>? _foldTensors;         // executor-owned copies of the frontier tensors
     private List<MemoryBuffer1D<float, Stride1D.Dense>>? _foldBuffers;   // ...and the buffers behind them
@@ -4940,7 +4955,10 @@ public class GraphExecutor : IDisposable
                 if (CaptureTraceFile != null && !shapeCacheHit) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> DISPATCH\n"); } catch { } }
                 if (opProf != null) PhaseMark(7);
                 if (!shapeCacheHit && !convStateHandled && !AllOutputsEmpty(nodeOutputs) && !DiagSkipOperatorExecute)
+                {
+                    if (DiagBindingLog != null) LogBindings(nodeIdx, node, nodeInputs, nodeOutputs);
                     await node.Operator.ExecuteAsync(ctx);
+                }
                 if (opProf != null) PhaseMark(4);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,

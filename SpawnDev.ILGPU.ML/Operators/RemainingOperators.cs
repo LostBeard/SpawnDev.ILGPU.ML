@@ -1478,6 +1478,33 @@ internal static class SubgraphRunner
         return MergeDeclaredOutputs(subgraph, plan.Executor.Run(subgraphInputs), plan.Constants);
     }
 
+    /// <summary><see cref="Execute"/>, also naming the branch executor whose pool the results came from.</summary>
+    public static (Dictionary<string, Tensor>? Result, Graph.GraphExecutor? Executor) ExecuteWithExecutor(
+        OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor> subgraphInputs)
+    {
+        System.Threading.Interlocked.Increment(ref ExecutionCount);
+        var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
+        if (plan == null) return (null, null);
+        return (MergeDeclaredOutputs(subgraph, plan.Executor.Run(subgraphInputs), plan.Constants), plan.Executor);
+    }
+
+    /// <summary>
+    /// <see cref="ExecuteAsync"/>, also naming the branch executor whose pool the results came from. A caller that
+    /// COPIES the results out (If) hands them back with <c>Executor.ReturnOutputs</c>: a cached plan's executor
+    /// rents its outputs from its own pool on every run and nothing else ever returns them - one leaked buffer per
+    /// output per execution (MEASURED on Video Depth Anything's squeeze-Ifs: two 64 KB buffers per frame).
+    /// ReturnOutputs skips constants (the plan's weights) and is a no-op for outer-scope tensors (not this pool's).
+    /// The copy is only ENQUEUED: a returned buffer is re-rented and written in queue order, after it.
+    /// </summary>
+    public static async Task<(Dictionary<string, Tensor>? Result, Graph.GraphExecutor? Executor)> ExecuteWithExecutorAsync(
+        OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor> subgraphInputs)
+    {
+        System.Threading.Interlocked.Increment(ref ExecutionCount);
+        var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
+        if (plan == null) return (null, null);
+        return (MergeDeclaredOutputs(subgraph, await plan.Executor.RunAsync(subgraphInputs), plan.Constants), plan.Executor);
+    }
+
     /// <summary>
     /// Adds any declared subgraph output that no NODE produces, taking it from the weights.
     /// </summary>
@@ -2041,7 +2068,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
                     subInputs[ctx.InputNames[i]] = ctx.Inputs[i];
             }
 
-            var result = SubgraphRunner.Execute(ctx, subgraph, subInputs);
+            var (result, branchExec) = SubgraphRunner.ExecuteWithExecutor(ctx, subgraph, subInputs);
             if (result != null)
             {
                 // ⚠️ Was a foreach over the result DICTIONARY, assigning outputs by enumeration order. The
@@ -2049,6 +2076,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
                 // multi-output If could map results to the wrong slots. Shares the async path's copy, which
                 // walks subgraph.Outputs and adopts the executed branch's shape.
                 SubgraphOutputCopy.Apply(reg, ctx, subgraph, result);
+                branchExec?.ReturnOutputs(result.Values);   // copied out: see ExecuteWithExecutorAsync
                 return;
             }
         }
@@ -2093,10 +2121,11 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
                     subInputs[ctx.InputNames[i]] = ctx.Inputs[i];
             }
 
-            var result = await SubgraphRunner.ExecuteAsync(ctx, subgraph, subInputs);
+            var (result, branchExec) = await SubgraphRunner.ExecuteWithExecutorAsync(ctx, subgraph, subInputs);
             if (result != null)
             {
                 SubgraphOutputCopy.Apply(reg, ctx, subgraph, result);
+                branchExec?.ReturnOutputs(result.Values);   // copied out: see ExecuteWithExecutorAsync
                 return;
             }
         }
@@ -2670,7 +2699,18 @@ internal static class SubgraphOutputCopy
 
         if (dst == null || !dst.Shape.AsSpan().SequenceEqual(tensor.Shape))
         {
-            var adopted = ctx.Pool.Rent(tensor.Shape, "_branchout_" + name);
+            // 🔴 The adopted buffer takes the NODE'S OUTPUT NAME, after the unused compile-time buffer goes back.
+            // The executor - and its zero-copy handoffs - track ownership BY NAME: a single-consumer Reshape of this
+            // output takes the buffer by renaming the output's pool record. Renting the adoption under a private
+            // name ("_branchout_...") left that record pointing at the dropped compile-time buffer, so the Reshape
+            // handed THAT one back and the adopted buffer was never returned - one buffer leaked per If per forward
+            // (MEASURED, Video Depth Anything: torch's squeeze(dim) exports as If(dim == 1, Squeeze, Identity); the
+            // pool grew by one 64 KB buffer every frame, and every forward's buffers shifted by one, which on WebGPU
+            // missed the bind-group cache on ~240 dispatches per frame). The private name remains the fallback when
+            // the output is not a buffer the pool rented under its name.
+            string? outName = outIdx < ctx.OutputNames.Length ? ctx.OutputNames[outIdx] : null;
+            bool ownName = !string.IsNullOrEmpty(outName) && dst != null && dst.Name == outName && ctx.Pool.ReturnIfOwned(dst);
+            var adopted = ctx.Pool.Rent(tensor.Shape, ownName ? outName : "_branchout_" + name);
             reg.ElementWise.Scale(tensor.Data.SubView(0, tensor.ElementCount),
                                   adopted.Data.SubView(0, tensor.ElementCount), tensor.ElementCount, 1f);
             ctx.Outputs[outIdx] = adopted;   // aliases the executor's nodeOutputs - see OnnxOpContext.Outputs

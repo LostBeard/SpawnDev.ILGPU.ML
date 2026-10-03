@@ -48,7 +48,11 @@ public abstract partial class MLTestBase
         _ => (float)e.GetDouble(),
     };
 
-    private async Task ControlFlowMatchesOnnxRuntime(string name)
+    /// <param name="runs">Forwards to run (outputs checked every time, then handed back to the session).</param>
+    /// <param name="noWarmAllocations">Require ZERO fresh device allocations after the first two forwards - a steady
+    /// forward reuses its pooled buffers, so any allocation there is a buffer some path never handed back. The
+    /// counter is process-wide, so it also covers a control-flow body's own executor pool.</param>
+    private async Task ControlFlowMatchesOnnxRuntime(string name, int runs = 1, bool noWarmAllocations = false)
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -86,6 +90,10 @@ public abstract partial class MLTestBase
                     feeds[p.Name] = new Tensor(buf.View, shape);
                 }
 
+                long warmAllocations = 0;
+                for (int run = 0; run < runs; run++)
+                {
+                long allocsBefore = BufferPool.TotalDeviceAllocations;
                 var outputs = await session.RunAsync(feeds);
 
                 foreach (var p in root.GetProperty("outputs").EnumerateObject())
@@ -121,8 +129,15 @@ public abstract partial class MLTestBase
                         throw new Exception($"{name} {p.Name}: max |d| {worst:E3} at {worstAt} "
                                           + $"(ORT {expected[worstAt]:F6} vs ours {got[worstAt]:F6})");
 
-                    Console.WriteLine($"[ControlFlow] {name} {p.Name}: {expected.Length} values, max |d| {worst:E2}");
+                    if (run == 0) Console.WriteLine($"[ControlFlow] {name} {p.Name}: {expected.Length} values, max |d| {worst:E2}");
                 }
+                session.ReturnOutputs(outputs);
+                if (run >= 2) warmAllocations += BufferPool.TotalDeviceAllocations - allocsBefore;
+                }
+                if (noWarmAllocations && warmAllocations != 0)
+                    throw new Exception($"{name}: {warmAllocations} fresh device allocation(s) across {runs - 2} warm forward(s) "
+                        + $"on {BackendName} - a buffer is not handed back each forward (it leaks, and on WebGPU every "
+                        + "forward then binds different buffers).");
             }
             finally
             {
@@ -152,6 +167,17 @@ public abstract partial class MLTestBase
 
     [TestMethod(Timeout = 180000)]
     public async Task ControlFlow_If_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("tiny_if");
+
+    /// <summary>
+    /// torch's squeeze(dim) as exported - If(shape[dim] == 1, Squeeze, Identity) - with the If's output ADOPTED at
+    /// run time (the branches declare no static shape), consumed by a Reshape (zero-copy ownership rename) and by
+    /// an elementwise op. Gates the 2026-10-03 leak: one buffer per If per forward never came back (Video Depth
+    /// Anything: +1 pooled buffer per frame, ~240 bind-group misses per frame on WebGPU). Six forwards, every output
+    /// checked against onnxruntime, and no fresh device allocation once warm.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task ControlFlow_IfSqueeze_NoLeakAcrossForwards() =>
+        await ControlFlowMatchesOnnxRuntime("if_squeeze_reshape", runs: 6, noWarmAllocations: true);
 
     [TestMethod(Timeout = 180000)]
     public async Task ControlFlow_Loop_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("tiny_loop");

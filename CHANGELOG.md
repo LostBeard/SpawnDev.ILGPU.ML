@@ -5,6 +5,29 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **An `If` whose output is adopted no longer leaks a buffer per forward** (Geordi, 5.3.2-local.6). torch exports
+  `squeeze(dim)` on a dynamic shape as `If(shape[dim] == 1, Squeeze, Identity)`, and its branches declare no static
+  shape, so the executed branch's buffer is ADOPTED at run time. Two leaks were hiding there:
+  - **The adopted buffer.** It was rented under a private name (`_branchout_...`). A single-consumer Reshape takes
+    its input's buffer by renaming that output's pool record, which still pointed at the dropped compile-time
+    buffer. So the Reshape returned that one, and the adopted buffer never came back. Now the unused buffer goes
+    back first (new `BufferPool.ReturnIfOwned`), and the adopted one takes the node's own output name.
+  - **The branch executor's pool.** A cached branch executor rented its outputs from its own pool on every run,
+    and nothing returned them. `If` now returns them once it has copied them out.
+
+  MEASURED on Video Depth Anything, which has two such Ifs:
+  - Before: the session pool grew one 64 KB buffer every frame, unbounded. Every forward's buffers shifted by
+    one, and 232 nodes changed bindings from frame to frame. That is a WebGPU bind-group cache MISS per node per
+    frame: VDA ran ~244 misses per frame against ~0 for DAv3.
+  - After: the pool is flat, there are 0 fresh allocations and 0 binding changes, and depth is unchanged
+    (1.26e-5 vs torch).
+
+  Test `ControlFlow_IfSqueeze_NoLeakAcrossForwards` checks six forwards against onnxruntime and requires ZERO
+  fresh device allocations once warm. It is red without the fix (14 allocations in 4 warm forwards on CUDA).
+  New diagnostic: `GraphExecutor.DiagBindingLog` logs each executed node's buffer bindings; diff two forwards to
+  find bind-group cache misses. Scoped PMT (ControlFlow, PoolOwnership, IfOuterScope, Graph, AllOps_MatMul):
+  140/0 on all 6 lanes.
+
 - **Video Depth Anything streaming: `VideoDepthAnythingStream`, and `DepthEstimationPipeline` drives it** (Geordi,
   5.3.2-local.5). VDA (Apache-2.0, ByteDance) gives temporally consistent video depth at single-frame cost by attending
   to cached hidden states of up to 31 earlier frames. The class runs VDA's streaming step graph one frame per call. The
