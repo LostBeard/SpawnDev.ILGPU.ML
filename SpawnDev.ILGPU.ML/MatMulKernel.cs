@@ -238,6 +238,39 @@ public class MatMulKernel
     }
 
     /// <summary>
+    /// Broadcast-batched matmul, one thread per output element: C[batch] = A[aOff(batch)] × B[bOff(batch)].
+    /// The output batch is up to three dims (d0, d1, d2), row-major; each operand carries a per-dim element
+    /// stride, 0 on a dim it broadcasts over. This is ONNX/numpy MatMul broadcasting - [M,K] × [B,K,N],
+    /// [B,1,M,K] × [1,H,K,N] and so on - which the equal-batch kernels cannot express.
+    /// </summary>
+    private static void BroadcastBatchedMatMulImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N,
+        int d1, int d2,
+        int a0, int a1, int a2,
+        int b0, int b1, int b2)
+    {
+        int mn = M * N;
+        int batch = idx / mn;
+        int local = idx - batch * mn;
+        int row = local / N;
+        int col = local - row * N;
+        int i2 = batch % d2;
+        int t = batch / d2;
+        int i1 = t % d1;
+        int i0 = t / d1;
+        int aOff = i0 * a0 + i1 * a1 + i2 * a2 + row * K;
+        int bOff = i0 * b0 + i1 * b1 + i2 * b2 + col;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[aOff + k] * B[bOff + k * N];
+        C[idx] = sum;
+    }
+
+    /// <summary>
     /// Simple MatMul with fp16 (ILGPU.Half) weights in B: C[fp32] = A[fp32] × B[fp16]. Upconverts each
     /// weight to float and accumulates in fp32 — ORT-style mixed precision: HALF the weight memory, no
     /// accuracy loss vs the all-fp32 kernel. One thread per output element, no shared memory (works on
@@ -316,6 +349,8 @@ public class MatMulKernel
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int, int>? _broadcastBatchedMatMulKernel;
     // One compiled low-p-weight kernel per concrete weight type T (Half / BFloat16 / Float8E*), cached.
     // object-typed because each delegate is T-specific; lazily loaded on first use of that type.
     private readonly Dictionary<Type, object> _simpleMatMulLowPWeightKernels = new();
@@ -514,6 +549,42 @@ public class MatMulKernel
             var groupDim = new Index2D(TILE * TILE, 1);
             _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
         }
+    }
+
+    /// <summary>
+    /// Broadcast-batched matrix multiply (ONNX/numpy MatMul semantics). The output batch is
+    /// <paramref name="outBatch"/> (at most 3 dims after the caller has merged compatible ones); A's and B's
+    /// per-dim strides are in elements and 0 where that operand broadcasts. C is dense [outBatch..., M, N].
+    /// </summary>
+    public void BroadcastBatchedMatMul(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N,
+        ReadOnlySpan<int> outBatch, ReadOnlySpan<int> aStrides, ReadOnlySpan<int> bStrides)
+    {
+        if (outBatch.Length > 3 || aStrides.Length != outBatch.Length || bStrides.Length != outBatch.Length)
+            throw new ArgumentException($"BroadcastBatchedMatMul takes up to 3 batch dims with one stride each " +
+                $"(got {outBatch.Length} dims, {aStrides.Length}/{bStrides.Length} strides).");
+        // Right-align into (d0, d1, d2), padding the front with size-1 dims.
+        Span<int> d = stackalloc int[3] { 1, 1, 1 };
+        Span<int> sa = stackalloc int[3];
+        Span<int> sb = stackalloc int[3];
+        int pad = 3 - outBatch.Length;
+        for (int i = 0; i < outBatch.Length; i++)
+        {
+            d[pad + i] = outBatch[i];
+            sa[pad + i] = aStrides[i];
+            sb[pad + i] = bStrides[i];
+        }
+        long total = (long)d[0] * d[1] * d[2] * M * N;
+        if (total == 0) return;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"BroadcastBatchedMatMul: {total} outputs exceed the 1-D dispatch range.");
+        _broadcastBatchedMatMulKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int, int>(BroadcastBatchedMatMulImpl);
+        _broadcastBatchedMatMulKernel((int)total, A, B, C, M, K, N, d[1], d[2], sa[0], sa[1], sa[2], sb[0], sb[1], sb[2]);
     }
 
     private void EnsureKernelsLoaded(Accelerator accelerator)

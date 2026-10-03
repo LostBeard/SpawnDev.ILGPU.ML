@@ -348,11 +348,16 @@ public class GraphCompiler
                 }
             }
 
-            // Compile-time Concat evaluation on known constants
+            // Compile-time Concat evaluation on known constants.
+            // An input may be a KNOWN-EMPTY constant (its shape has zero elements): torch's flatten(0, 1) builds
+            // its target as Concat(shape[:0], [-1], shape[2:]), and shape[:0] is a perfectly known []. Requiring
+            // every input to be non-empty left that Concat unfolded, and the Reshape fed by it fell back to a
+            // wrong shape that poisoned everything after it (Video Depth Anything: [1,3,98,168] -> [49392,1,1,1]).
             if (node.OpType == "Concat" && node.Inputs.Count >= 1
                 && graph.ConstantData != null
-                && node.Inputs.All(inp => !string.IsNullOrEmpty(inp) && graph.ConstantData.ContainsKey(inp)
-                    && IsValidConstant(graph.ConstantData[inp])))
+                && node.Inputs.All(inp => !string.IsNullOrEmpty(inp) && graph.ConstantData.TryGetValue(inp, out var cv)
+                    && (IsValidConstant(cv)
+                        || (cv.Length == 0 && knownShapes.TryGetValue(inp, out var cs) && cs.Any(d => d == 0)))))
             {
                 var concatVals = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
                 outputShapes = new[] { new[] { concatVals.Length } };

@@ -88,6 +88,73 @@ public abstract partial class MLTestBase
         await a.SynchronizeAsync();
         await AssertCloseGpu(a, oBuf.View, expected, K * 2e-5f, "MatMul batched-A@2D-weight: ");
     });
+    [TestMethod]
+    public async Task AllOps_MatMul_BroadcastBatch() => await RunTest(async a =>
+    {
+        // REGRESSION (Video Depth Anything): numpy batch broadcasting. DINOv2's position-embedding resize is
+        // [7,37] @ [1,384,37,37] -> [1,384,7,37]; the operator took the batch count from A alone (1) and wrote
+        // ONE of the 384 output slices. Shape inference also aligned batch dims from the LEFT. Every case here
+        // is checked against a CPU broadcast reference, including the inferred output shape.
+        var cases = new (int[] A, int[] B)[]
+        {
+            (new[] { 3, 4 },          new[] { 1, 5, 4, 2 }),   // A shared across B's batch (the VDA case)
+            (new[] { 2, 3, 4 },       new[] { 3, 2, 4, 5 }),   // right-aligned: A's batch pairs with B's LAST batch dim
+            (new[] { 2, 1, 3, 4 },    new[] { 1, 3, 4, 2 }),   // both broadcast, on different dims
+            (new[] { 2, 3, 3, 4 },    new[] { 1, 1, 4, 5 }),   // B shared through size-1 batch dims
+            (new[] { 1, 3, 4 },       new[] { 2, 3, 4, 2 }),   // a leading 1 on A
+            (new[] { 2, 3, 2, 1, 3, 4 }, new[] { 1, 3, 1, 4, 4, 2 }),   // 4 independent batch dims: one outer dim walked
+        };
+        int seed = 600;
+        foreach (var (aS, bS) in cases)
+        {
+            int M = aS[^2], K = aS[^1], N = bS[^1];
+            var outS = SpawnDev.ILGPU.ML.Operators.MatMulOperator.BroadcastBatch(aS, bS).Concat(new[] { M, N }).ToArray();
+            var reg = new OperatorRegistry(a);
+            var inferred = new SpawnDev.ILGPU.ML.Operators.MatMulOperator(reg).InferOutputShapes(new[] { aS, bS }, new())[0];
+            var label = $"MatMul [{string.Join(",", aS)}]@[{string.Join(",", bS)}]: ";
+            if (!inferred.SequenceEqual(outS))
+                throw new Exception($"{label}inferred [{string.Join(",", inferred)}], expected [{string.Join(",", outS)}]");
+
+            var aData = RandomFloats(aS.Aggregate(1, (x, y) => x * y), seed: seed++, scale: 0.5f);
+            var bData = RandomFloats(bS.Aggregate(1, (x, y) => x * y), seed: seed++, scale: 0.5f);
+            int outCount = outS.Aggregate(1, (x, y) => x * y);
+            var expected = new float[outCount];
+            int rb = outS.Length - 2;
+            var idx = new int[rb];
+            for (int ob = 0; ob < outCount / (M * N); ob++)
+            {
+                // Batch coordinates of output batch ob, then each operand's own (broadcast) batch offset.
+                for (int t = ob, d = rb - 1; d >= 0; d--) { idx[d] = t % outS[d]; t /= outS[d]; }
+                int Off(int[] s, int mat)
+                {
+                    int r = s.Length - 2, off = 0, stride = mat;
+                    for (int d = r - 1; d >= 0; d--)
+                    {
+                        int od = d + (rb - r);
+                        if (s[d] != 1) off += idx[od] * stride;
+                        stride *= s[d];
+                    }
+                    return off;
+                }
+                int ao = Off(aS, M * K), bo = Off(bS, K * N);
+                for (int m = 0; m < M; m++)
+                    for (int n = 0; n < N; n++)
+                    {
+                        double s = 0;
+                        for (int k = 0; k < K; k++) s += (double)aData[ao + m * K + k] * bData[bo + k * N + n];
+                        expected[ob * M * N + m * N + n] = (float)s;
+                    }
+            }
+            using var aBuf = a.Allocate1D(aData);
+            using var bBuf = a.Allocate1D(bData);
+            using var oBuf = a.Allocate1D<float>(outCount);
+            var ctx = MakeOpCtx(a, new[] { new Tensor(aBuf.View, aS), new Tensor(bBuf.View, bS) },
+                new[] { new Tensor(oBuf.View, outS) });
+            new SpawnDev.ILGPU.ML.Operators.MatMulOperator(reg).Execute(ctx);
+            await a.SynchronizeAsync();
+            await AssertCloseGpu(a, oBuf.View, expected, K * 2e-5f, label);
+        }
+    });
     [TestMethod] public async Task AllOps_Max() => await RunTest(async a => { var e = GetOrCreateEW(a); using var x = a.Allocate1D(new float[]{1,5,3}); using var y = a.Allocate1D(new float[]{4,2,6}); using var o = a.Allocate1D<float>(3); e.Max(x.View,y.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{4,5,6},0f,"Max:"); });
     [TestMethod] public async Task AllOps_Min() => await RunTest(async a => { var e = GetOrCreateEW(a); using var x = a.Allocate1D(new float[]{1,5,3}); using var y = a.Allocate1D(new float[]{4,2,6}); using var o = a.Allocate1D<float>(3); e.Min(x.View,y.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{1,2,3},0f,"Min:"); });
     [TestMethod] public async Task AllOps_Mish() => await RunTest(async a => { var e = GetOrCreateEW(a); using var i = a.Allocate1D(new float[]{0,1,-1}); using var o = a.Allocate1D<float>(3); e.Mish(i.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new[]{0f,MathF.Tanh(MathF.Log(1+MathF.Exp(1))),-MathF.Tanh(MathF.Log(1+MathF.Exp(-1)))},1e-4f,"Mish:"); });

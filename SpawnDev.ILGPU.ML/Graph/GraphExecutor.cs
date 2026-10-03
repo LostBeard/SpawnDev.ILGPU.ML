@@ -622,8 +622,10 @@ public class GraphExecutor : IDisposable
             {
                 var t = nodeOutputs[i];
                 if (t == null) { DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name} = null"); continue; }
-                int take = (int)Math.Min(t.Data.Length, 4096);
-                var host = await t.Data.BaseView.SubView(0, take).CopyToHostAsync();
+                // Stats over the WHOLE tensor: a prefix min/max is not the tensor's, and first_divergence.py
+                // then reports a mismatch on a node that is right (the input Reshape of a [1,3,98,168] image
+                // read 'max 2.449' from its first 4096 values against ORT's true 2.922).
+                var host = await t.Data.BaseView.SubView(0, DumpElementCount(t)).CopyToHostAsync();
                 float mn = float.MaxValue, mx = float.MinValue; double mean = 0; int finite = 0;
                 foreach (var v in host)
                 {
@@ -640,6 +642,12 @@ public class GraphExecutor : IDisposable
         }
     }
 
+    /// <summary>
+    /// Elements a tensor dump reads: the tensor's own element count (its buffer may be a larger pooled one, whose
+    /// tail is another tensor's stale data), capped so a diagnostic never reads gigabytes.
+    /// </summary>
+    private static int DumpElementCount(Tensor t) => (int)Math.Min(Math.Min(t.Data.Length, (long)t.ElementCount), 1L << 24);
+
     /// <summary>Print stats for any of this node's outputs matching <see cref="DumpTensorsMatching"/>.</summary>
     private static void DumpNodeOutputs(int nodeIdx, CompiledNode node, Tensor[] nodeOutputs)
     {
@@ -654,7 +662,7 @@ public class GraphExecutor : IDisposable
             {
                 var t = nodeOutputs[i];
                 if (t == null) { DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name} = null"); continue; }
-                var host = new float[Math.Min(t.Data.Length, 1 << 16)];
+                var host = new float[DumpElementCount(t)];
                 t.Data.BaseView.SubView(0, host.Length).CopyToCPU(host);
                 float mn = float.MaxValue, mx = float.MinValue; double mean = 0; int finite = 0;
                 foreach (var v in host)

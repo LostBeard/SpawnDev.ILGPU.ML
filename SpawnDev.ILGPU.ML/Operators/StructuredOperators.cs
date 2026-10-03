@@ -6,22 +6,16 @@ namespace SpawnDev.ILGPU.ML.Operators;
 
 // ── MatMul ──
 
-public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
+public partial class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "MatMul";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var a = inputs[0]; var b = inputs[1];
         int M = a[^2]; int N = b[^1];
-        // Handle batched: broadcast leading dims
-        var outShape = new List<int>();
-        int maxLeading = Math.Max(a.Length - 2, b.Length - 2);
-        for (int i = 0; i < maxLeading; i++)
-        {
-            int da = i < a.Length - 2 ? a[i] : 1;
-            int db = i < b.Length - 2 ? b[i] : 1;
-            outShape.Add(Math.Max(da, db));
-        }
+        // Batch dims broadcast numpy-style, aligned from the RIGHT: [7,37] x [1,384,37,37] -> [1,384,7,37],
+        // [2,M,K] x [3,2,K,N] -> [3,2,M,N]. (Left alignment paired a's first batch dim with b's first.)
+        var outShape = new List<int>(BroadcastBatch(a, b));
         outShape.Add(M);
         outShape.Add(N);
         return new[] { outShape.ToArray() };
@@ -97,6 +91,16 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         // Native low-p weights: if B is a low-p-backed weight (Half/bf16/FP8, no float buffer), route to the
         // generic low-p-weight kernel (reads the native type, converts in-register, fp32 accumulate, no f32
         // temp). Activations (A) stay fp32. fp32 weights take the all-fp32 path.
+        // Batch dims that differ between A and B (other than B being a plain 2-D weight) broadcast.
+        if (b.Rank > 2 && !SameBatch(a.Shape, b.Shape))
+        {
+            if (LowPWeightDispatch.IsLowP(b))
+                throw new NotSupportedException($"MatMul: broadcast batch with a low-precision B is not implemented " +
+                    $"(a=[{string.Join(",", a.Shape)}], b=[{string.Join(",", b.Shape)}]).");
+            BroadcastMatMul(a, b, ctx.Outputs[0], M, K, N);
+            return;
+        }
+
         if (b.Rank == 2)
         {
             // Shared 2-D weight (a Linear): flatten ALL of a's rows into M — [totalRows, K] @ [K, N]. Covers
@@ -115,6 +119,105 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
                 LowPWeightDispatch.BatchedMatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, batch, M, K, N);
             else
                 reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
+        }
+    }
+}
+
+// ── MatMul broadcasting ──
+
+public partial class MatMulOperator
+{
+    /// <summary>Right-aligned numpy broadcast of the batch dims (all but the last two) of two MatMul operands.</summary>
+    public static int[] BroadcastBatch(int[] a, int[] b)
+    {
+        int ra = Math.Max(a.Length - 2, 0), rb = Math.Max(b.Length - 2, 0), r = Math.Max(ra, rb);
+        var o = new int[r];
+        for (int i = 0; i < r; i++)
+        {
+            int da = i - (r - ra) >= 0 ? a[i - (r - ra)] : 1;
+            int db = i - (r - rb) >= 0 ? b[i - (r - rb)] : 1;
+            if (da != db && da != 1 && db != 1)
+                throw new InvalidOperationException($"MatMul: batch dims do not broadcast " +
+                    $"(a=[{string.Join(",", a)}], b=[{string.Join(",", b)}]).");
+            o[i] = da == 1 ? db : da;
+        }
+        return o;
+    }
+
+    static bool SameBatch(int[] a, int[] b)
+    {
+        int ra = Math.Max(a.Length - 2, 0), rb = Math.Max(b.Length - 2, 0);
+        // Leading 1s do not change the layout: [1,H,M,K] x [H,K,N] is an equal batch.
+        int pa = 0, pb = 0;
+        while (pa < ra && a[pa] == 1) pa++;
+        while (pb < rb && b[pb] == 1) pb++;
+        if (ra - pa != rb - pb) return false;
+        for (int i = 0; i < ra - pa; i++) if (a[pa + i] != b[pb + i]) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// MatMul whose batch dims broadcast. B shared by every batch entry (all of its batch dims 1) is the
+    /// flattened-rows GEMM; anything else goes to the strided broadcast kernel. Batch dims of size 1 in the
+    /// output are dropped and adjacent dims that broadcast the same way are merged; past the kernel's three,
+    /// the outer dims are walked one dispatch each.
+    /// </summary>
+    void BroadcastMatMul(Tensor a, Tensor b, Tensor c, int M, int K, int N)
+    {
+        int[] aS = a.Rank >= 2 ? a.Shape : new[] { 1, a.Shape[0] };
+        int[] bS = b.Shape;
+        var outB = BroadcastBatch(aS, bS);
+        int r = outB.Length, ra = aS.Length - 2, rb = bS.Length - 2;
+
+        // Contiguous per-dim strides of each operand's own batch, right-aligned onto the output batch;
+        // 0 where the operand has size 1 (or no dim) and so broadcasts.
+        var aStr = new long[r]; var bStr = new long[r];
+        long sa = (long)M * K, sb = (long)K * N;
+        for (int i = r - 1; i >= 0; i--)
+        {
+            int ia = i - (r - ra), ib = i - (r - rb);
+            int da = ia >= 0 ? aS[ia] : 1, db = ib >= 0 ? bS[ib] : 1;
+            aStr[i] = da == 1 ? 0 : sa; bStr[i] = db == 1 ? 0 : sb;
+            sa *= da; sb *= db;
+        }
+
+        // Drop size-1 output dims; merge neighbours that broadcast alike (both strides contiguous-adjacent).
+        var dims = new List<int>(); var sA = new List<long>(); var sB = new List<long>();
+        for (int i = 0; i < r; i++)
+        {
+            if (outB[i] == 1) continue;
+            int last = dims.Count - 1;
+            if (last >= 0 && sA[last] == aStr[i] * outB[i] && sB[last] == bStr[i] * outB[i])
+            {
+                dims[last] *= outB[i];
+                sA[last] = aStr[i]; sB[last] = bStr[i];
+            }
+            else { dims.Add(outB[i]); sA.Add(aStr[i]); sB.Add(bStr[i]); }
+        }
+
+        if (sB.All(v => v == 0) && sA.All(v => v != 0))
+        {
+            // B is one shared matrix and A is a dense batch: every row of A multiplies the same B.
+            reg.MatMul.MatMul(a.Data, b.Data, c.Data, a.ElementCount / K, K, N);
+            return;
+        }
+        // The kernel takes the innermost three batch dims; any further outer dims (rare: four or more batch
+        // dims that broadcast differently from their neighbours) are walked here, one dispatch per outer index.
+        int outer = Math.Max(dims.Count - 3, 0);
+        var innerDims = dims.Skip(outer).ToArray();
+        var innerA = sA.Skip(outer).Select(v => checked((int)v)).ToArray();
+        var innerB = sB.Skip(outer).Select(v => checked((int)v)).ToArray();
+        long innerOut = (long)innerDims.Aggregate(1, (x, y) => x * y) * M * N;
+        int outerCount = dims.Take(outer).Aggregate(1, (x, y) => x * y);
+        var oi = new int[outer];
+        for (int o = 0; o < outerCount; o++)
+        {
+            for (int t = o, d = outer - 1; d >= 0; d--) { oi[d] = t % dims[d]; t /= dims[d]; }
+            long aOff = 0, bOff = 0;
+            for (int d = 0; d < outer; d++) { aOff += oi[d] * sA[d]; bOff += oi[d] * sB[d]; }
+            reg.MatMul.BroadcastBatchedMatMul(a.Data.SubView(aOff, a.Data.Length - aOff), b.Data.SubView(bOff, b.Data.Length - bOff),
+                c.Data.SubView(o * innerOut, innerOut),
+                M, K, N, innerDims, innerA, innerB);
         }
     }
 }

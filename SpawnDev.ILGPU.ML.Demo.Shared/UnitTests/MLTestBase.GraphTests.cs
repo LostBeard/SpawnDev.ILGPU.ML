@@ -44,6 +44,67 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Graph_FlattenConcatWithEmptyShapeSlice() => await RunTest(async accelerator =>
+    {
+        // REGRESSION (Video Depth Anything): torch's x.flatten(0, 1) exports as
+        //   Reshape(x, Concat(Shape(x)[0:0], [-1], Shape(x)[2:5]))
+        // and Shape(x)[0:0] is a KNOWN EMPTY constant. The compile-time Concat fold refused any empty input, so
+        // the target shape went unresolved and the Reshape inferred [1,1,3,4,6] -> [72,1,1,1] - silently, with
+        // every later shape built on it. The output must be [1,3,4,6], element for element the input.
+        int[] inShape = { 1, 1, 3, 4, 6 };
+        int count = 72;
+        var graph = new ModelGraph
+        {
+            Name = "flatten01",
+            Inputs = new() { new() { Name = "x", Shape = inShape } },
+            Outputs = new() { new() { Name = "y", Shape = new[] { 1, 3, 4, 6 } } },
+            Initializers = new()
+            {
+                ["s0"] = new[] { 1 }, ["e0"] = new[] { 1 }, ["s2"] = new[] { 1 }, ["e5"] = new[] { 1 },
+                ["ax0"] = new[] { 1 }, ["m1"] = new[] { 1 },
+            },
+            Nodes = new()
+            {
+                new() { OpType = "Shape", Inputs = { "x" }, Outputs = { "shp" } },
+                new() { OpType = "Slice", Inputs = { "shp", "s0", "e0", "ax0" }, Outputs = { "lead" } },   // [0:0] = []
+                new() { OpType = "Slice", Inputs = { "shp", "s2", "e5", "ax0" }, Outputs = { "tail" } },   // [2:5]
+                new() { OpType = "Concat", Inputs = { "lead", "m1", "tail" }, Outputs = { "target" },
+                    Attributes = new() { ["axis"] = System.Text.Json.JsonSerializer.SerializeToElement(0L) } },
+                new() { OpType = "Reshape", Inputs = { "x", "target" }, Outputs = { "flat" } },
+                // An intermediate, so the graph's declared output shape cannot stand in for the Reshape's inference.
+                new() { OpType = "Relu", Inputs = { "flat" }, Outputs = { "y" } },
+            }
+        };
+        graph.ConstantData = new()
+        {
+            ["s0"] = new[] { 0 }, ["e0"] = new[] { 0 }, ["s2"] = new[] { 2 }, ["e5"] = new[] { 5 },
+            ["ax0"] = new[] { 0 }, ["m1"] = new[] { -1 },
+        };
+        graph.FloatConstantData = graph.ConstantData.ToDictionary(kv => kv.Key, kv => kv.Value.Select(v => (float)v).ToArray());
+
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        // The COMPILE-TIME shape is what later shape inference builds on (the runtime path recomputes this
+        // Reshape on its own and would hide the bug): it must already be [1,3,4,6].
+        var reshapeShape = compiled.Nodes.Single(nd => nd.OpType == "Reshape").OutputShapes[0];
+        if (!reshapeShape.SequenceEqual(new[] { 1, 3, 4, 6 }))
+            throw new Exception($"compile-time flatten(0,1) shape [{string.Join(",", reshapeShape)}], expected [1,3,4,6]");
+        using var pool = new BufferPool(accelerator);
+        var weights = graph.ConstantData.ToDictionary(kv => kv.Key,
+            kv => pool.AllocatePermanent(kv.Value.Select(v => (float)v).ToArray(), new[] { kv.Value.Length }));
+        using var ex = new GraphExecutor(accelerator, compiled, weights, graph.FloatConstantData);
+        var data = Enumerable.Range(0, count).Select(i => (float)i).ToArray();
+        var outs = await ex.RunAsync(new Dictionary<string, Tensor> { ["x"] = pool.AllocatePermanent(data, inShape) });
+        var y = outs["y"];
+        if (!y.Shape.SequenceEqual(new[] { 1, 3, 4, 6 }))
+            throw new Exception($"flatten(0,1) gave [{string.Join(",", y.Shape)}], expected [1,3,4,6] on {BackendName}");
+        using var host = accelerator.Allocate1D<float>(count);
+        await host.View.CopyFromAsync(y.Data.SubView(0, count));
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, host.View, data, 0f, "flatten(0,1): ");
+    });
+
+    [TestMethod]
     public async Task Graph_ExecuteSimpleMLP() => await RunTest(async accelerator =>
     {
         var registry = new OperatorRegistry(accelerator);

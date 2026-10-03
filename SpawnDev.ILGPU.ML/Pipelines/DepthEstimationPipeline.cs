@@ -262,6 +262,22 @@ public class DepthEstimationPipeline : IDisposable
     /// <summary>Underlying session — diagnostics (weight presence) and advanced callers.</summary>
     public InferenceSession Session => _session;
 
+    // Streaming video model (Video Depth Anything): its temporal cache, kept on the device between frames.
+    private readonly VideoDepthAnythingStream? _stream;
+
+    /// <summary>
+    /// True when the model is a STREAMING video depth model (<see cref="VideoDepthAnythingStream"/>): every estimate is
+    /// the next frame of one clip, and depth is temporally consistent across calls. Call <see cref="ResetStream"/> at a
+    /// cut, a seek or a new video. A change of model input size restarts the stream by itself.
+    /// </summary>
+    public bool IsStreaming => _stream != null;
+
+    /// <summary>Streaming models: the next estimate starts a new clip. No-op for single-image models.</summary>
+    public void ResetStream() => _stream?.Reset();
+
+    /// <summary>Streaming models: frames run since the stream (re)started; 0 otherwise.</summary>
+    public long StreamFrameIndex => _stream?.FrameIndex ?? 0;
+
     /// <summary>
     /// Give back the GPU memory a forward leaves parked for the next one (the session's free
     /// activation buckets, plus any graph-capture plan, whose bind groups would point at the
@@ -287,12 +303,13 @@ public class DepthEstimationPipeline : IDisposable
         _accelerator = accelerator;
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
         _postprocess = new Kernels.ImagePostprocessKernel(accelerator);
+        if (VideoDepthAnythingStream.IsStreamingModel(session)) _stream = new VideoDepthAnythingStream(session, accelerator);
         // Derive input size from session's compiled input shapes if not specified.
         // Prevents mismatch between preprocessing resolution and compiled graph shapes,
         // which causes silent GPU memory corruption (OOB writes from Conv kernels).
         if (inputSize <= 0)
         {
-            var firstShape = session.InputShapes.Values.FirstOrDefault();
+            var firstShape = session.InputShapes.TryGetValue(session.InputNames[0], out var s0) ? s0 : null;
             // Letterbox / Stretch build a SQUARE input of one side; a non-square binding used to be read as its WIDTH,
             // silently. SpawnScene's "aspect-matched 32x43 grid measured 4 dB worse" (2026-09-20) was in fact a 448x448
             // square with fewer picture patches - the non-square tensor never reached the model. NativeAspect is the
@@ -471,10 +488,12 @@ public class DepthEstimationPipeline : IDisposable
         await PreprocessAsync(rgbaPixels, width, height, preprocessed.View).ConfigureAwait(false);
 
         var inputTensor = new Tensor(preprocessed.View, InputTensorShape(inH, inW));
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
-        {
-            [_session.InputNames[0]] = inputTensor
-        }).ConfigureAwait(false);
+        var outputs = _stream != null
+            ? await _stream.RunAsync(inputTensor).ConfigureAwait(false)
+            : await _session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [_session.InputNames[0]] = inputTensor
+            }).ConfigureAwait(false);
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
 
         var output = outputs[_session.OutputNames[0]];
@@ -722,7 +741,9 @@ public class DepthEstimationPipeline : IDisposable
         // if capture is unavailable (TryCaptureAsync returns null). The non-capture path reuses _directInput: a
         // per-call transient could not be disposed until the GPU is done with it, and the no-readback overload
         // never waits for that (Wasm frees on dispose; WebGPU would pay an extra submit per frame).
-        bool useCapture = UseCapture;
+        // A streaming model's forward feeds its cache window too; it runs uncaptured (the window's F differs on a
+        // clip's first frame, and a plan recorded at one would not serve the other).
+        bool useCapture = UseCapture && _stream == null;
         var (inW, inH) = ModelInputSize(width, height);
         int inElems = 3 * inW * inH;
         ArrayView1D<float, Stride1D.Dense> preInput;
@@ -751,7 +772,12 @@ public class DepthEstimationPipeline : IDisposable
         // capture replay writes into the plan's fixed buffers, which the capture owns.
         Dictionary<string, Tensor> outputs;
         bool ownOutputs;
-        if (useCapture)
+        if (_stream != null)
+        {
+            outputs = await _stream.RunAsync(inputTensor).ConfigureAwait(false);
+            ownOutputs = true;
+        }
+        else if (useCapture)
             (outputs, ownOutputs) = await RunWithSlotAsync(_singleSlot, inputDict, inputTensor.Shape).ConfigureAwait(false);
         else
         {
@@ -886,6 +912,8 @@ public class DepthEstimationPipeline : IDisposable
         for (int i = 0; i < n; i++)
             await PreprocessAsync(frames[i], widths[i], heights[i], stackedView.SubView(i * chw, chw)).ConfigureAwait(false);
 
+        if (_stream != null)
+            throw new NotSupportedException("Multi-view estimation needs a multi-view model; this is a streaming video model (one frame per call).");
         var inputShape = new[] { 1, n, 3, inH, inW };
         var inputTensor = new Tensor(stackedView, inputShape);
         var mvInputs = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
@@ -1178,6 +1206,7 @@ public class DepthEstimationPipeline : IDisposable
     {
         _singleSlot.Dispose();
         _multiSlot.Dispose();
+        _stream?.Dispose();
         _nativeScratch?.Dispose();
         _nativeScratch = null;
         _directInput?.Dispose();

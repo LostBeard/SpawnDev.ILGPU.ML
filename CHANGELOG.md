@@ -5,6 +5,33 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **Video Depth Anything streaming: `VideoDepthAnythingStream`, and `DepthEstimationPipeline` drives it** (Geordi,
+  5.3.2-local.5). VDA (Apache-2.0, ByteDance) gives temporally consistent video depth at single-frame cost by attending
+  to cached hidden states of up to 31 earlier frames. The class runs VDA's streaming step graph one frame per call. The
+  model's temporal window (frame 0, the frame 40 back, and the 29 most recent) is a closed form of the frame count, so
+  one gather kernel per cache assembles it from a GPU ring of frame slots: no host data per frame, nothing read back.
+  A clip's first frame runs the same graph with zero cached frames, which is exactly VDA's no-cache path.
+  `DepthEstimationPipeline` detects a streaming model (every input `X` with an output `new_X`) and adds `IsStreaming`
+  and `ResetStream()`. MEASURED vs the torch reference driven by VDA's own window bookkeeping: 48 frames at 98x168,
+  worst max rel 1.26e-5 (`zipvoice-harness vdastream`). Moving the anchor by one frame fails from frame 41.
+  The export (dynamic H/W, F = 0 or 31) and its parity scripts are in `tools/vda-export`.
+
+- **MatMul broadcasts batch dims the numpy way** (Geordi, 5.3.2-local.5). The operator took the batch count from A
+  alone, so `[7,37] @ [1,384,37,37]` (DINOv2's position-embedding resize as exported) computed ONE of 384 output slices.
+  Shape inference also aligned batch dims from the LEFT. Now batch dims align from the right. A shared B (all batch
+  dims 1) runs as the flattened-rows GEMM. Any other broadcast runs on a new strided `MatMulKernel.BroadcastBatchedMatMul`
+  (three batch dims; outer ones are walked). Test: `AllOps_MatMul_BroadcastBatch` (six cases, the inferred shape too).
+
+- **Compile-time Concat folds a known-EMPTY input** (Geordi, 5.3.2-local.5). torch's `flatten(0, 1)` exports its target
+  as `Concat(shape[:0], [-1], shape[2:])`. Requiring every Concat input to be non-empty left that target unresolved, and
+  the Reshape fell back to `[N,1,1,1]` (VDA: `[1,3,98,168]` became `[49392,1,1,1]`), which broke shape inference
+  downstream and crashed the compile. Test: `Graph_FlattenConcatWithEmptyShapeSlice` asserts the COMPILE-TIME shape;
+  the runtime path recomputes the Reshape and hides the bug.
+
+- **`ML_DUMP_TENSORS` stats cover the whole tensor** (Geordi). The async (browser) path summarized the first 4096 values,
+  and both paths sized the read from the pooled buffer instead of the tensor. `first_divergence.py` then reported a
+  mismatch on a correct node.
+
 - **BufferPool hands out the lowest-numbered free buffer, not the last returned** (Geordi, 5.3.2-local.3). With a LIFO
   stack per size bucket, the free list a forward ENDS with is a permutation of the one it started with, so each forward's
   nodes got different physical buffers, cycling over many forwards. MEASURED (Anaglyphohol, DAv3 168x98 on WebGPU, AOT):
