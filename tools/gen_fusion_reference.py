@@ -114,5 +114,15 @@ class LinGeluBig(torch.nn.Module):
 
 torch.manual_seed(1)
 xh = rng.standard_normal((4, 256)).astype(np.float32)
-save("half_linear", torch_export(LinGeluBig().eval(), xh, "half_linear"), {"X": xh})
+hl = torch_export(LinGeluBig().eval(), xh, "half_linear")
+save("half_linear", hl, {"X": xh})
+
+# ── half_linear_fp16w: the same model with its weights STORED as FP16 (W__fp16 -> Cast(to=FLOAT) -> W; compute stays
+# FP32) by tools/onnx-weights-fp16.py - the engine must fold the Cast at load (no per-run Cast) and match onnxruntime.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("onnx_weights_fp16", os.path.join(os.path.dirname(__file__), "onnx-weights-fp16.py"))
+_fp16 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fp16)
+_fp16.to_fp16_weights(hl, min_elements=1024)
+save("half_linear_fp16w", hl, {"X": xh})
 print("wrote", OUT)

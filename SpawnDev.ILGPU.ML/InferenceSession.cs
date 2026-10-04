@@ -1501,6 +1501,9 @@ public class InferenceSession : IDisposable
         ModelGraph graph;
         try { graph = ConvertToModelGraph(modelInfo); }
         catch (Exception ex) { throw new InvalidOperationException($"ConvertToModelGraph failed: {ex.GetType().Name}: {ex.Message}", ex); }
+        // FP16-stored weights of an FP32 model (W__fp16 -> Cast(to=FLOAT) -> W): load W once, upcast on the GPU, and
+        // drop the Cast - otherwise it runs on every forward (MEASURED: VDA 2.4x slower, 611 vs 383 pool buffers).
+        var upcastWeights = FoldWeightUpcastCasts(graph, parsedModel);
 
         graph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
@@ -1616,8 +1619,10 @@ public class InferenceSession : IDisposable
         if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = 65536;
         try
         {
-        foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
+        foreach (var (sourceName, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
         {
+            // a folded FP16 weight loads under its Cast's output name (FoldWeightUpcastCasts)
+            var name = upcastWeights.TryGetValue(sourceName, out var castOutput) ? castOutput : sourceName;
             if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
             // No compiled kernel consumes this initializer → it is a CPU-only shape/scalar constant (or
             // unreferenced). CPU shape inference already has its value (cpuSmallWeights); a GPU buffer +
@@ -1629,8 +1634,12 @@ public class InferenceSession : IDisposable
             // fp16-source (dtype 10) weight, consumed exclusively by a half-capable op as its weight: keep
             // it fp16 on the GPU (half the bytes). Only fp16 SOURCE — never downcast a fp32 weight to fp16
             // (that would lose precision the model expects). Streaming path only (large weights = the win).
+            // A FOLDED FP16 weight (an FP32 model storing it as FP16) is FP32 in the model's own terms: FP32 unless the
+            // caller opted into WeightStorage.Half, exactly like an FP32 source.
+            bool folded = upcastWeights.ContainsKey(sourceName);
             if (halfEligible.Contains(name) && tensor.RawDataStreamOffset >= 0
-                && (tensor.DataType == 10 || (tensor.DataType == 1 && weightStorage == WeightStorage.Half)))
+                && ((tensor.DataType == 10 && (!folded || weightStorage == WeightStorage.Half))
+                    || (tensor.DataType == 1 && weightStorage == WeightStorage.Half)))
             {
                 _branch = "half-stream";
                 var halfW = await pool.AllocateHalfWeightFromStreamAsync(
@@ -1641,7 +1650,7 @@ public class InferenceSession : IDisposable
             else if (tensor.RawDataStreamOffset >= 0)
             {
                 _branch = "f32-stream";
-                if (tensor.DataType == 10) // a BLOCKED fp16 weight: no native consumer -> downcast to f32 (the unpacking)
+                if (tensor.DataType == 10 && !folded) // a BLOCKED fp16 weight: no native consumer -> downcast to f32 (the unpacking)
                 {
                     blockedFp16Count++; blockedFp16Elems += expectedElems;
                     if (blockingOps.TryGetValue(name, out var bops))
@@ -3253,6 +3262,42 @@ public class InferenceSession : IDisposable
     // (~50ms/Pad on Wasm) just to size the output buffer correctly. Pads are tiny (2*rank ints)
     // so safe to cache once at session creation. Closes StyleMosaic Wasm 2GiB cap by removing
     // per-execute readback allocation pressure. Geordi 2026-05-04 endorsed approach.
+    /// <summary>
+    /// Folds <c>Cast(to=FLOAT)</c> of an FP16 initializer into the weight itself: the pattern of an FP32 model whose
+    /// weights are STORED as FP16 (tools/onnx-weights-fp16.py: <c>W__fp16 -> Cast -> W</c>). The Cast node is removed,
+    /// its output becomes the initializer, and the loader streams the FP16 bytes under that name and upcasts them once
+    /// on the GPU. Without this the Cast runs on every forward. Only a Cast that is the initializer's ONLY consumer and
+    /// does not produce a graph output is folded. Returns source name -> Cast output name.
+    /// </summary>
+    internal static Dictionary<string, string> FoldWeightUpcastCasts(ModelGraph graph, Onnx.OnnxModelProto parsed)
+    {
+        var folded = new Dictionary<string, string>();
+        var fp16 = new HashSet<string>(parsed.Graph.Initializers.Where(t => t.DataType == 10).Select(t => t.Name));
+        if (fp16.Count == 0) return folded;
+        var uses = new Dictionary<string, int>();
+        foreach (var node in graph.Nodes)
+            foreach (var input in node.Inputs)
+                if (!string.IsNullOrEmpty(input)) uses[input] = uses.GetValueOrDefault(input) + 1;
+        var graphOutputs = new HashSet<string>(graph.Outputs.Select(o => o.Name));
+        for (int i = graph.Nodes.Count - 1; i >= 0; i--)
+        {
+            var node = graph.Nodes[i];
+            if (node.OpType != "Cast" || node.Inputs.Count != 1 || node.Outputs.Count != 1) continue;
+            var source = node.Inputs[0];
+            var output = node.Outputs[0];
+            bool toFloat = node.Attributes != null && node.Attributes.TryGetValue("to", out var to)
+                && to.ValueKind == System.Text.Json.JsonValueKind.Number && to.GetInt64() == 1;
+            if (!toFloat || !fp16.Contains(source) || uses.GetValueOrDefault(source) != 1 || graphOutputs.Contains(output)
+                || !graph.Initializers.TryGetValue(source, out var shape) || graph.Initializers.ContainsKey(output))
+                continue;
+            graph.Initializers[output] = shape;
+            graph.Initializers.Remove(source);
+            graph.Nodes.RemoveAt(i);
+            folded[source] = output;
+        }
+        return folded;
+    }
+
     private static void PreExtractPads(
         Onnx.OnnxModelProto parsedModel,
         Dictionary<string, float[]> cpuSmallWeights,

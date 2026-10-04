@@ -5,6 +5,23 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **FP32 models with FP16-STORED weights load at full speed: the weight Cast is folded at load** (Geordi,
+  5.3.2-local.13). The usual way to halve a model file while keeping FP32 compute is to store each weight as FP16
+  behind a `Cast(to=FLOAT)`; `tools/onnx-weights-fp16.py` writes exactly that and stays valid ONNX. The engine ran
+  that Cast on every forward. MEASURED on Video Depth Anything: 2.4x slower, 611 pool buffers against 383.
+  - `InferenceSession.FoldWeightUpcastCasts` (streaming load path) removes such a Cast when it is the FP16
+    initializer's only consumer. The Cast's output becomes the initializer, loaded from the FP16 bytes and upcast once
+    on the GPU. Under the default storage the weight is FP32, like an FP32 source; `WeightStorage.Half` keeps it FP16.
+  - MEASURED, VDA-Small streaming 98x168: file 111 MB -> 56 MB. Executed graph and pool size are identical to the
+    FP32 model (383 buffers). The output equals onnxruntime on the same FP16-weight file (`runonnx` PASS, ~1e-5). It
+    differs from the FP32 model only by the weights' FP16 rounding (relRMS ~8e-4).
+  - Test `WeightStorage_Fp16StoredWeights_CastFoldedAtLoad` (fixture `references/fusion/half_linear_fp16w`): the node
+    count equals the FP32 twin's, no FP16 weights by default, the result matches onnxruntime within 1e-5, and
+    `WeightStorage.Half` keeps the weight FP16. MUTATION (fold disabled) fails it. Scoped PMT 14/0 on CUDA, OpenCL,
+    WebGPU and Wasm.
+  - The Wasm lane exposed a SpawnDev.ILGPU bug: Half -> float flushed subnormals on Wasm/WebGL/emulated WebGPU.
+    Fixed in SpawnDev.ILGPU 5.3.2-local.8, which this package now references.
+
 - **`InferenceSession.SkipCompletionWait`: submit a run instead of awaiting it (opt-in, WebGPU only)** (Geordi,
   5.3.2-local.12). `GraphExecutor.RunAsync` ends every forward with `await SynchronizeAsync()`. MEASURED 2026-10-04:
   Firefox 156 resolves `onSubmittedWorkDone` / `mapAsync` on a ~100 ms poll even for an EMPTY queue, so that one wait
