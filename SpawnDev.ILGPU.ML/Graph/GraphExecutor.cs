@@ -803,6 +803,19 @@ public class GraphExecutor : IDisposable
     public static bool SuppressDrains;
 
     /// <summary>
+    /// WebGPU only, opt-in: <see cref="RunAsync"/> ends with a SUBMIT (<c>Flush</c>) instead of the final
+    /// <c>await SynchronizeAsync()</c>. For callers that only feed the outputs to more GPU work - WebGPU's single
+    /// queue orders that work, and any later readback, after this run. MEASURED 2026-10-04: Firefox 156 resolves
+    /// <c>onSubmittedWorkDone</c> / <c>mapAsync</c> on a ~100 ms poll even for an empty queue, so the final wait set
+    /// Anaglyphohol's video at ~10 FPS there (Chrome ~5 ms). Ignored on every other backend (the Wasm worker pool has
+    /// no queue order) and while <see cref="SuppressDrains"/> is set. Mid-run drains are unchanged.
+    /// </summary>
+    public bool SkipCompletionWait { get; set; }
+
+    /// <summary>True when the most recent <see cref="RunAsync"/> submitted without awaiting completion (see <see cref="SkipCompletionWait"/>).</summary>
+    public bool LastRunCompletionWaitSkipped { get; private set; }
+
+    /// <summary>
     /// CUDA-GRAPH CAPTURE: when true, per-node kernels that upload a small int[] params array route it
     /// through a <see cref="SpawnDev.ILGPU.ML.Kernels.CaptureParamArena"/> instead of a fresh
     /// <c>Allocate1D</c> per call. The arena hands the k-th param-rent of every forward the SAME stable
@@ -5417,19 +5430,34 @@ public class GraphExecutor : IDisposable
         // The consequence was two days of "replay is unfaithful": the replay was faithful all along - it
         // was faithfully replaying a plan recorded from a forward that had been read too early.
         bool cudaCapture = SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        // SkipCompletionWait (opt-in, WebGPU only): SUBMIT the run instead of awaiting its completion. Safe there
+        // because WebGPU has ONE queue: the caller's next dispatch / copy / readback (mapAsync) is ordered after this
+        // run's work, and a deferred buffer returned below and re-rented later is only written by work ordered after
+        // it too - SpawnDev.ILGPU flushes pending work before any immediate host write (FlushBeforeHostWrite), so even
+        // a queue.writeBuffer lands after it. The Flush here is for THROUGHPUT: the GPU starts on this run now, while
+        // the host prepares the next one. NOT the Wasm worker pool (no queue order); never during a capture (SuppressDrains).
+        LastRunCompletionWaitSkipped = SkipCompletionWait && !SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.WebGPU;
         if (!cudaCapture)
         {
             _drainSw.Restart();
-            try { await _accelerator.SynchronizeAsync(); }
-            catch (Exception syncEx)
+            if (LastRunCompletionWaitSkipped)
             {
-                var tailLen = Math.Min(40, _opLog.Count);
-                var tail = OpLogTail(40);
-                throw new Exception(
-                    $"[GE final sync, {_opLog.Count} ops total] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
-                    $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
+                _accelerator.Flush();
             }
-            _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
+            else
+            {
+                try { await _accelerator.SynchronizeAsync(); }
+                catch (Exception syncEx)
+                {
+                    var tailLen = Math.Min(40, _opLog.Count);
+                    var tail = OpLogTail(40);
+                    throw new Exception(
+                        $"[GE final sync, {_opLog.Count} ops total] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
+                        $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
+                }
+                LastRunSyncDrainCount++;
+            }
+            _drainSw.Stop(); LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
             // Release any remaining deferred buffers
             foreach (var t in pendingReleases)
                 _pool.Return(t);

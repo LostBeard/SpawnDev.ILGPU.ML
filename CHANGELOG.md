@@ -5,6 +5,23 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **`InferenceSession.SkipCompletionWait`: submit a run instead of awaiting it (opt-in, WebGPU only)** (Geordi,
+  5.3.2-local.12). `GraphExecutor.RunAsync` ends every forward with `await SynchronizeAsync()`. MEASURED 2026-10-04:
+  Firefox 156 resolves `onSubmittedWorkDone` / `mapAsync` on a ~100 ms poll even for an EMPTY queue, so that one wait
+  held Anaglyphohol's video at ~10 FPS in Firefox. Ablation sweeps were all ~73 ms (plain, no dispatch, no executor),
+  which points at a fixed wait rather than work; Chrome's equivalent wait is ~5 ms.
+  - With the flag set, a run ends with a `Flush` (submit), and its deferred buffers go back to the pool. That's safe on
+    WebGPU's single queue: later dispatches, copies and readbacks are ordered after the run, and SpawnDev.ILGPU submits
+    pending work before any immediate host write (`FlushBeforeHostWrite`).
+  - Ignored on every other backend (the Wasm worker pool has no queue order) and during a capture (`SuppressDrains`).
+    Mid-run drains are unchanged. `LastRunCompletionWaitSkipped` reports it; `GraphExecutor.SkipCompletionWait` is the
+    executor form.
+  - For callers that only feed the outputs to more GPU work. Such a caller should bound its frames in flight itself
+    (Anaglyphohol keeps a GPU-done fence per frame, allowing 3).
+  - Test `Session_SkipCompletionWait_QueueOrderedAndCorrect`: run A is submitted, its input is overwritten at once with
+    an immediate `queue.writeBuffer` of garbage, run B follows, and both outputs must match onnxruntime. It also checks
+    the skip happens on WebGPU only. Scoped PMT 6/0 on CUDA, OpenCL, WebGPU and Wasm.
+
 - **`WeightStorage.Half` loads in a browser: FP32 weights stream JS->GPU and are downcast on the GPU** (Geordi,
   5.3.2-local.11). `BufferPool.AllocateHalfWeightFromStreamAsync` downcast FP32 sources on the CPU and uploaded them
   in 1 MB `CopyFromCPU` chunks. On a browser load (an `IJSReadStream`, which arms

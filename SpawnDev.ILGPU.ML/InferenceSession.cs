@@ -2888,6 +2888,17 @@ public class InferenceSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// WebGPU only, opt-in: <see cref="RunAsync"/> ends with a SUBMIT instead of awaiting GPU completion
+    /// (<see cref="Graph.GraphExecutor.SkipCompletionWait"/>). For callers that only feed the outputs to more GPU work
+    /// (a render pass, another session) - everything stays ordered on the one WebGPU queue. Firefox resolves the
+    /// completion wait on a ~100 ms poll, so this is the difference between ~10 and full-rate video there.
+    /// </summary>
+    public bool SkipCompletionWait { get; set; }
+
+    /// <summary>True when the most recent <see cref="RunAsync"/> submitted without awaiting completion (WebGPU only).</summary>
+    public bool LastRunCompletionWaitSkipped => _lastRunExecutor?.LastRunCompletionWaitSkipped ?? false;
+
     /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm): a synchronous
     /// Synchronize() only flushes (dispatches) the GPU queue and returns without awaiting (it does NOT
     /// deadlock), so you must SynchronizeAsync() to await GPU completion before a readback. Periodically
@@ -2896,6 +2907,7 @@ public class InferenceSession : IDisposable
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
         var exec = ResolveExecutor(inputs);
+        exec.SkipCompletionWait = SkipCompletionWait;
         var result = await exec.RunAsync(inputs);
         LastExecutorBufferCount = exec.AllocatedBufferCount;
         _lastRunExecutor = exec;
