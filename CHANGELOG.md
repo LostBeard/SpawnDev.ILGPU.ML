@@ -3,7 +3,7 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased (5.3.2-local)
+## 5.3.2 - 2026-10-05 - on SpawnDev.ILGPU 5.3.2 + SpawnDev.SpawnJS 3.0.1; Video Depth Anything streaming, FP16-stored weights at full speed, WeightStorage.Half, SkipCompletionWait, fewer dispatches; AOT graph-compile fix
 
 - **Graph compile no longer drops into the interpreter on a shape-inference fallback (Blazor AOT)** (Geordi,
   5.3.2-local.14). In a Mono LLVM-only AOT build a CAUGHT exception resumes the rest of the catching method in the

@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>1.0.2</Version>
-		<PackageReleaseNotes>v1.0.2 - On SpawnDev.ILGPU.ML 5.3.1. Trim safe, enforced (IsTrimmable): hub replies are read with source-generated JSON (web defaults, same as before).</PackageReleaseNotes>
+		<Version>1.0.3</Version>
+		<PackageReleaseNotes>v1.0.3 - On SpawnDev.ILGPU.ML 5.3.2 (SpawnDev.ILGPU 5.3.2, SpawnDev.SpawnJS 3.0.1). No changes in this package.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
