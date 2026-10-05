@@ -37,6 +37,28 @@ public class GraphCompiler
     /// <summary>Enable graph optimization (operator fusion) before compilation.</summary>
     public bool EnableOptimization { get; set; } = true;
 
+    /// <summary>
+    /// One node's shape inference; a failure returns null (and the error) so the caller can fall back. Its own small,
+    /// never-inlined method on purpose: in a Mono LLVM-only AOT build (Blazor WebAssembly AOT) a CAUGHT exception resumes
+    /// the REST of the catching method in the interpreter. With the try/catch inline in <see cref="Compile"/>, DAv3's
+    /// first RoPE node whose data-dependent shape cannot be inferred ([1,6,1297,32] * [32,1], 32 nodes) ran the whole
+    /// remaining compile interpreted - MEASURED 2026-10-04 (Anaglyphohol cold start, CPU profile): ~110 ms.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    static int[][]? TryInferOutputShapes(IOnnxOperator op, int[][] inputShapes, Dictionary<string, object> attrs, out Exception? error)
+    {
+        try
+        {
+            error = null;
+            return op.InferOutputShapes(inputShapes, attrs);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+            return null;
+        }
+    }
+
     public CompiledGraph Compile(ModelGraph graph)
     {
       try
@@ -221,16 +243,12 @@ public class GraphCompiler
             }
 
             // Infer output shapes
-            int[][] outputShapes;
-            try
-            {
-                outputShapes = op.InferOutputShapes(inputShapes, attrs);
-            }
-            catch (Exception shapeEx)
+            int[][]? outputShapes = TryInferOutputShapes(op, inputShapes, attrs, out var shapeEx);
+            if (outputShapes == null)
             {
                 var shapeMsg = $"[GraphCompiler] Shape inference failed at node {nodeCompileIdx} '{node.OpType}' " +
                     $"inputs=[{string.Join("; ", inputShapes.Select(s => $"[{string.Join(",", s)}]"))}] " +
-                    $"inputNames=[{string.Join(",", node.Inputs)}] outputs=[{string.Join(",", node.Outputs)}]: {shapeEx.Message}";
+                    $"inputNames=[{string.Join(",", node.Inputs)}] outputs=[{string.Join(",", node.Outputs)}]: {shapeEx!.Message}";
                 if (InferenceSession.VerboseLogging) Console.WriteLine(shapeMsg);
                 // Log for debugging but allow fallback (many models work despite imperfect shapes)
                 // Fallback: try known output shape (from Initializers), then first input shape

@@ -5,6 +5,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (5.3.2-local)
 
+- **Graph compile no longer drops into the interpreter on a shape-inference fallback (Blazor AOT)** (Geordi,
+  5.3.2-local.14). In a Mono LLVM-only AOT build a CAUGHT exception resumes the rest of the catching method in the
+  interpreter. `GraphCompiler.Compile` caught failed shape inference inline, so the first fallback ran the whole
+  remaining compile interpreted. DAv3 hits that fallback 32 times: its RoPE cos/sin factors have data-dependent shapes
+  (`Range(0, ReduceMax(positions) + 1)`), inferred as `[32,1]` against `[1,6,1297,32]` - the runtime resolves the real
+  shapes, so results were always right. MEASURED (Anaglyphohol cold start, AOT CPU profile): ~110 ms of a ~200 ms
+  compile. Shape inference now runs in its own never-inlined `TryInferOutputShapes`; the fallback is unchanged.
+  The wrong compile-time RoPE shape itself is still open (data-dependent Range).
+
 - **FP32 models with FP16-STORED weights load at full speed: the weight Cast is folded at load** (Geordi,
   5.3.2-local.13). The usual way to halve a model file while keeping FP32 compute is to store each weight as FP16
   behind a `Cast(to=FLOAT)`; `tools/onnx-weights-fp16.py` writes exactly that and stays valid ONNX. The engine ran
