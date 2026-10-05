@@ -3,6 +3,13 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.3 - 2026-10-05 - on SpawnDev.ILGPU 5.3.3
+
+- **Built on SpawnDev.ILGPU 5.3.3** (Tuvok). That release fixes `CreateScan(ScanKind.Exclusive)` on WebGPU and Wasm,
+  which counted the last element of every workgroup-sized chunk twice past the first chunk (found by SpawnScene's GPU
+  densify). ILGPU.ML itself calls neither the scan nor the radix sort, so no ML code changed; the bump keeps an app that
+  references both packages on one SpawnDev.ILGPU. Still on SpawnDev.SpawnJS 3.0.1.
+
 ## 5.3.2 - 2026-10-05 - on SpawnDev.ILGPU 5.3.2 + SpawnDev.SpawnJS 3.0.1; Video Depth Anything streaming, FP16-stored weights at full speed, WeightStorage.Half, SkipCompletionWait, fewer dispatches; AOT graph-compile fix
 
 - **Graph compile no longer drops into the interpreter on a shape-inference fallback (Blazor AOT)** (Geordi,
