@@ -3,6 +3,21 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased
+
+- **`FaceDetectionPipeline` decodes and runs NMS on the GPU** (Data, MiniRover). `DetectAsync` read both BlazeFace
+  output tensors back to managed memory on every call - 896x16 regressors + 896 classificators, 61 KB - to decode the
+  anchors and run weighted NMS in C#; an app following a face at 10 detections/s pulled ~600 KB/s into the WASM heap
+  for one face. Now a per-anchor decode kernel and a single-thread weighted-NMS kernel (same arithmetic, same result:
+  the first maxFaces seeds of the full NMS) leave only `1 + maxFaces x 17` floats to read back (18 for one face).
+  WebGL cannot scatter in a kernel (Transform Feedback = one positional record per thread), so there the confidences
+  (3.5 KB) come back, only the anchors above the threshold are gathered on the GPU, and the same weighted NMS blends
+  them. Kernels on the WebGL path store at constant slots: stores at loop-computed slots landed in the wrong Transform
+  Feedback varyings (a pixel x read back as the confidence). New gate
+  `Pipeline_BlazeFace_GpuDecode_MatchesManagedReference`: GPU path vs the managed reference on the portrait at 0.6/1,
+  0.3/all, 0.05/all and a blank frame, field by field; 20/20 BlazeFace tests on all 6 backends; red-checked on both
+  paths (NMS blending off fails CPU/CUDA/OpenCL/WebGPU/Wasm, a swapped gather slot fails WebGL).
+
 ## 5.3.3 - 2026-10-05 - on SpawnDev.ILGPU 5.3.3
 
 - **Built on SpawnDev.ILGPU 5.3.3** (Tuvok). That release fixes `CreateScan(ScanKind.Exclusive)` on WebGPU and Wasm,

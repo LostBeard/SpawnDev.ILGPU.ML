@@ -61,4 +61,8 @@
     -->
     <ProjectReference Include="..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- FaceDetectionPipeline.DetectBothWaysAsync: GPU decode vs the managed reference, for the parity test only -->
+    <InternalsVisibleTo Include="SpawnDev.ILGPU.ML.Demo.Shared" />
+  </ItemGroup>
 </Project>

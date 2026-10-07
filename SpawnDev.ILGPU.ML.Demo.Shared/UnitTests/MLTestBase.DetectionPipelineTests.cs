@@ -373,4 +373,69 @@ public abstract partial class MLTestBase
         if (my < ny)
             throw new Exception($"mouth y={my} above nose y={ny}");
     });
+
+    /// <summary>
+    /// The GPU anchor decode + weighted NMS (what DetectAsync runs, reading back only the faces) must equal the
+    /// managed reference it replaced (which read the full 896-anchor tensors back) on a real portrait: the app's
+    /// setting (0.6, one face), a looser one with no face limit, and a very loose one where many overlapping
+    /// candidates exercise the blending. A blank frame must give no faces either way.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Pipeline_BlazeFace_GpuDecode_MatchesManagedReference() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] modelBytes;
+        try { modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"BlazeFace model missing: {ex.Message}"); }
+        byte[] bin;
+        try { bin = await http.GetByteArrayAsync("samples/portrait_rgba.bin"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"portrait_rgba.bin missing: {ex.Message}"); }
+        int width = BitConverter.ToInt32(bin, 0), height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+        using var pipeline = new FaceDetectionPipeline(session, accelerator);
+        using var rgba = accelerator.Allocate1D(pixels);
+        using var blank = accelerator.Allocate1D(new int[width * height]);
+
+        var cases = new (string Name, ArrayView1D<int, Stride1D.Dense> Pixels, float Conf, int Max)[]
+        {
+            ("portrait 0.6/1", rgba.View, 0.6f, 1),
+            ("portrait 0.3/all", rgba.View, 0.3f, 0),
+            ("portrait 0.05/all", rgba.View, 0.05f, 0),
+            ("blank 0.5/all", blank.View, 0.5f, 0),
+        };
+        int compared = 0;
+        foreach (var c in cases)
+        {
+            var (gpu, reference) = await pipeline.DetectBothWaysAsync(c.Pixels, width, height, c.Conf, 0.3f, c.Max);
+            Console.WriteLine($"[BlazeFace GPU decode] {c.Name}: gpu {gpu.Length} faces, reference {reference.Length}");
+            if (gpu.Length != reference.Length)
+                throw new Exception($"{c.Name}: GPU decode found {gpu.Length} faces, managed reference {reference.Length}");
+            for (int f = 0; f < gpu.Length; f++)
+            {
+                var g = gpu[f];
+                var r = reference[f];
+                void Check(string what, float a, float b, float tol)
+                {
+                    if (MathF.Abs(a - b) > tol)
+                        throw new Exception($"{c.Name} face {f} {what}: GPU {a} vs reference {b} (tolerance {tol})");
+                }
+                Check("confidence", g.Confidence, r.Confidence, 1e-4f);
+                Check("x", g.X, r.X, 0.05f);
+                Check("y", g.Y, r.Y, 0.05f);
+                Check("width", g.Width, r.Width, 0.05f);
+                Check("height", g.Height, r.Height, 0.05f);
+                for (int k = 0; k < 6; k++)
+                {
+                    Check($"landmark {k} x", g.Landmarks[k].X, r.Landmarks[k].X, 0.05f);
+                    Check($"landmark {k} y", g.Landmarks[k].Y, r.Landmarks[k].Y, 0.05f);
+                }
+                compared++;
+            }
+        }
+        if (compared < 3) throw new Exception($"only {compared} faces compared: the portrait cases did not exercise the decode");
+    });
 }
