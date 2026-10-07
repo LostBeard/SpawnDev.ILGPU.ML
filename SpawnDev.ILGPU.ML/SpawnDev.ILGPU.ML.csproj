@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.3</Version>
+		<Version>5.3.4-local.1</Version>
 		<PackageReleaseNotes>v5.3.3: on SpawnDev.ILGPU 5.3.3 (CreateScan(Exclusive) fixed on WebGPU and Wasm past one workgroup-sized chunk) + SpawnDev.SpawnJS 3.0.1. No ML code change. 5.3.2: Video Depth Anything streaming, FP16-stored weights at full speed, WeightStorage.Half. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
