@@ -916,9 +916,10 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
 
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
         var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
+        var outPad = attrs.ContainsKey("output_padding") ? ((long[])attrs["output_padding"]).Select(o => (int)o).ToArray() : new int[2];
         int kH = w[2]; int kW = w[3];
-        int outH = (x[2] - 1) * strides[0] - pads[0] - pads[2] + kH;
-        int outW = (x[3] - 1) * strides[1] - pads[1] - pads[3] + kW;
+        int outH = (x[2] - 1) * strides[0] - pads[0] - pads[2] + kH + (outPad.Length > 0 ? outPad[0] : 0);
+        int outW = (x[3] - 1) * strides[1] - pads[1] - pads[3] + kW + (outPad.Length > 1 ? outPad[1] : 0);
         return new[] { new[] { x[0], outC, outH, outW } };
     }
     public void Execute(OnnxOpContext ctx)
@@ -994,8 +995,11 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
             zeroBias.Data.MemSetToZero();
             bias = zeroBias.Data;
         }
+        // output_padding extends the far edge (LaMa's stride-2 decoders land on an exact 2x with it).
+        var outPad2 = ctx.GetInts("output_padding");
         reg.ConvTranspose.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-            inC, inH, inW, outC, kH, kW, stride, pad, x.Shape[0]);   // x.Shape[0] = batch (DAv3 multi-view N views)
+            inC, inH, inW, outC, kH, kW, stride, pad, x.Shape[0],   // x.Shape[0] = batch (DAv3 multi-view N views)
+            outPad2.Length > 0 ? outPad2[0] : 0, outPad2.Length > 1 ? outPad2[1] : (outPad2.Length > 0 ? outPad2[0] : 0));
         if (zeroBias != null) ctx.Pool.Return(zeroBias);
     }
 }

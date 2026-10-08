@@ -8,7 +8,9 @@ namespace SpawnDev.ILGPU.ML;
 /// Used for DPT head resize_layers that upsample spatial resolution.
 ///
 /// Weight layout (PyTorch ConvTranspose2d): [inC, outC, kH, kW]
-/// Output size (no output_padding): outH = (inH - 1) * stride - 2 * padding + kH
+/// Output size: outH = (inH - 1) * stride - 2 * padding + kH + output_padding. output_padding only extends the
+/// far edge (the extra rows / columns gather whatever input lands there); stride-2 upsamplers use it to land on an
+/// exact 2x (big-LaMa's three decoders: 64 -> 128 -> 256 -> 512; without it 64 -> 127 -> 253 -> 505).
 ///
 /// Implemented in "gather" direction — one thread per output element, no atomics.
 /// Parameters packed into ArrayView to avoid WebGPU scalar packing issues.
@@ -30,7 +32,7 @@ public class ConvTranspose2DKernel : IDisposable
     public ConvTranspose2DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
-    /// params: [inC, inH, inW, outC, kH, kW, stride, padding]
+    /// params: [inC, inH, inW, outC, kH, kW, stride, padding, outputPaddingH, outputPaddingW]
     /// </summary>
     private static void ConvTranspose2DImpl(
         Index1D idx,
@@ -44,8 +46,8 @@ public class ConvTranspose2DKernel : IDisposable
         int outC = p[3]; int kH = p[4]; int kW = p[5];
         int stride = p[6]; int padding = p[7];
 
-        int outH = (inH - 1) * stride - 2 * padding + kH;
-        int outW = (inW - 1) * stride - 2 * padding + kW;
+        int outH = (inH - 1) * stride - 2 * padding + kH + p[8];
+        int outW = (inW - 1) * stride - 2 * padding + kW + p[9];
 
         // BATCH-aware decode: idx spans (batch * outC * outH * outW). batch=1 → b==0, inBatchBase==0 =
         // byte-identical to the old kernel; only batch>1 (DAv3 multi-view, N views through the DPT resize_layers
@@ -92,14 +94,14 @@ public class ConvTranspose2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW,
         int outC, int kH, int kW,
-        int stride = 1, int padding = 0, int batch = 1)
+        int stride = 1, int padding = 0, int batch = 1, int outputPaddingH = 0, int outputPaddingW = 0)
     {
         EnsureLoaded();
-        int outH = (inH - 1) * stride - 2 * padding + kH;
-        int outW = (inW - 1) * stride - 2 * padding + kW;
+        int outH = (inH - 1) * stride - 2 * padding + kH + outputPaddingH;
+        int outW = (inW - 1) * stride - 2 * padding + kW + outputPaddingW;
         if (batch < 1) batch = 1;
 
-        var packed = new int[] { inC, inH, inW, outC, kH, kW, stride, padding };
+        var packed = new int[] { inC, inH, inW, outC, kH, kW, stride, padding, outputPaddingH, outputPaddingW };
         ArrayView1D<int, Stride1D.Dense> paramsView;
         if (Graph.GraphExecutor.UseCaptureParamSlots)
         {
@@ -109,7 +111,7 @@ public class ConvTranspose2DKernel : IDisposable
         }
         else
         {
-            _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+            _paramsBuf ??= _accelerator.Allocate1D<int>(10);
             _paramsBuf.CopyFromCPU(packed);
             paramsView = _paramsBuf.View;
         }
@@ -118,8 +120,8 @@ public class ConvTranspose2DKernel : IDisposable
         _kernel!(batch * outC * outH * outW, input, weight, bias, output, paramsView);
     }
 
-    public static int OutputSize(int inputSize, int kernelSize, int stride, int padding)
-        => (inputSize - 1) * stride - 2 * padding + kernelSize;
+    public static int OutputSize(int inputSize, int kernelSize, int stride, int padding, int outputPadding = 0)
+        => (inputSize - 1) * stride - 2 * padding + kernelSize + outputPadding;
 
     private void EnsureLoaded()
     {

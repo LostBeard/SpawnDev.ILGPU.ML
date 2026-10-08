@@ -38,6 +38,66 @@ public class GraphCompiler
     public bool EnableOptimization { get; set; } = true;
 
     /// <summary>
+    /// Diagnostic: every compiled node with an output name containing this text prints its op, input / output shapes
+    /// and constant inputs (env <c>ML_SHAPE_TRACE=&lt;substring&gt;</c>; null = off). For finding the first node whose
+    /// inferred shape departs from onnxruntime's - a crash downstream names only the victim.
+    /// </summary>
+    public static string? ShapeTrace { get; set; } = Environment.GetEnvironmentVariable("ML_SHAPE_TRACE") is { Length: > 0 } t ? t : null;
+
+    /// <summary>
+    /// Index maps for folding a binary op on two constants with ONNX (NumPy) broadcasting: the output shape and, per
+    /// output element, the element of A and of B it reads. Null when either shape is unknown or does not match its
+    /// value count (the caller keeps the flat modulo fold, which is right for a scalar or equal shapes), or when the
+    /// shapes do not broadcast, or the result would be large (folding is for shape-sized math).
+    /// </summary>
+    public static (int[] Shape, int[] IdxA, int[] IdxB)? BroadcastFold(int[][] inputShapes, int lenA, int lenB)
+    {
+        if (inputShapes.Length < 2 || inputShapes[0] == null || inputShapes[1] == null) return null;
+        int[] sa = inputShapes[0], sb = inputShapes[1];
+        long pa = 1, pb = 1;
+        foreach (var d in sa) pa *= d;
+        foreach (var d in sb) pb *= d;
+        if (pa != lenA || pb != lenB) return null;
+        int[] shape;
+        try { shape = Tensors.TensorHelpers.BroadcastShape(sa, sb); }
+        catch (ArgumentException) { return null; }
+        long total = 1;
+        foreach (var d in shape) total *= d;
+        if (total > (1 << 22)) return null;
+        int rank = shape.Length;
+        // Strides of A and B in the output's coordinates (0 on a broadcast axis).
+        var strA = new int[rank]; var strB = new int[rank];
+        for (int i = rank - 1, ra = 1, rb = 1; i >= 0; i--)
+        {
+            int ia = i - (rank - sa.Length), ib = i - (rank - sb.Length);
+            int da = ia >= 0 ? sa[ia] : 1, db = ib >= 0 ? sb[ib] : 1;
+            strA[i] = da == 1 ? 0 : ra; strB[i] = db == 1 ? 0 : rb;
+            ra *= da; rb *= db;
+        }
+        var idxA = new int[total]; var idxB = new int[total];
+        var coord = new int[rank];
+        for (int j = 0; j < total; j++)
+        {
+            int oa = 0, ob = 0;
+            for (int i = 0; i < rank; i++) { oa += coord[i] * strA[i]; ob += coord[i] * strB[i]; }
+            idxA[j] = oa; idxB[j] = ob;
+            for (int i = rank - 1; i >= 0; i--) { if (++coord[i] < shape[i]) break; coord[i] = 0; }
+        }
+        return (shape, idxA, idxB);
+    }
+
+    static void TraceShapes(GraphNode node, int[][] inputShapes, int[][] outputShapes, ModelGraph graph)
+    {
+        string Fmt(int[] s) => $"[{string.Join(",", s)}]";
+        var consts = new System.Text.StringBuilder();
+        foreach (var inp in node.Inputs)
+            if (inp != null && graph.ConstantData != null && graph.ConstantData.TryGetValue(inp, out var cv))
+                consts.Append($" {inp}=[{string.Join(",", cv.Take(8))}{(cv.Length > 8 ? ",..." : "")}]");
+        Console.WriteLine($"[ShapeTrace] {node.OpType} {string.Join(",", node.Outputs)} in=({string.Join("; ", inputShapes.Select(Fmt))}) " +
+            $"out=({string.Join("; ", outputShapes.Select(Fmt))}){consts}");
+    }
+
+    /// <summary>
     /// One node's shape inference; a failure returns null (and the error) so the caller can fall back. Its own small,
     /// never-inlined method on purpose: in a Mono LLVM-only AOT build (Blazor WebAssembly AOT) a CAUGHT exception resumes
     /// the REST of the catching method in the interpreter. With the try/catch inline in <see cref="Compile"/>, DAv3's
@@ -770,13 +830,17 @@ public class GraphCompiler
                 && graph.FloatConstantData.TryGetValue(node.Inputs[0], out var fArithA)
                 && graph.FloatConstantData.TryGetValue(node.Inputs[1], out var fArithB))
             {
-                int len = Math.Max(fArithA.Length, fArithB.Length);
+                // N-D broadcast when both shapes are known and match their values ([64,1] x [33] -> [64,33]:
+                // LaMa's DFT matrices). The flat modulo below is right only for a scalar or equal shapes - it made
+                // that product [64,1] and collapsed every FFT to one frequency (2026-10-08).
+                var bcast = BroadcastFold(inputShapes, fArithA.Length, fArithB.Length);
+                int len = bcast?.Shape is { } bs ? bcast.Value.IdxA.Length : Math.Max(fArithA.Length, fArithB.Length);
                 var fResult = new float[len];
                 var iResult = new int[len];
                 for (int j = 0; j < len; j++)
                 {
-                    float a = fArithA[j % fArithA.Length];
-                    float b = fArithB[j % fArithB.Length];
+                    float a = fArithA[bcast != null ? bcast.Value.IdxA[j] : j % fArithA.Length];
+                    float b = fArithB[bcast != null ? bcast.Value.IdxB[j] : j % fArithB.Length];
                     fResult[j] = node.OpType switch
                     {
                         "Mul" => a * b,
@@ -787,7 +851,7 @@ public class GraphCompiler
                     };
                     iResult[j] = (int)fResult[j];
                 }
-                outputShapes = new[] { fArithA.Length >= fArithB.Length ? inputShapes[0] : inputShapes[1] };
+                outputShapes = new[] { bcast?.Shape ?? (fArithA.Length >= fArithB.Length ? inputShapes[0] : inputShapes[1]) };
                 if (node.Outputs.Count > 0)
                 {
                     graph.ConstantData![node.Outputs[0]] = iResult;
@@ -800,13 +864,14 @@ public class GraphCompiler
                 && graph.ConstantData.TryGetValue(node.Inputs[0], out var arithA)
                 && graph.ConstantData.TryGetValue(node.Inputs[1], out var arithB))
             {
-                // Int-only fallback (no float data available)
-                int len = Math.Max(arithA.Length, arithB.Length);
+                // Int-only fallback (no float data available); N-D broadcast as the float path.
+                var bcastI = BroadcastFold(inputShapes, arithA.Length, arithB.Length);
+                int len = bcastI != null ? bcastI.Value.IdxA.Length : Math.Max(arithA.Length, arithB.Length);
                 var result = new int[len];
                 for (int j = 0; j < len; j++)
                 {
-                    int a = arithA[j % arithA.Length];
-                    int b = arithB[j % arithB.Length];
+                    int a = arithA[bcastI != null ? bcastI.Value.IdxA[j] : j % arithA.Length];
+                    int b = arithB[bcastI != null ? bcastI.Value.IdxB[j] : j % arithB.Length];
                     result[j] = node.OpType switch
                     {
                         "Mul" => a * b,
@@ -816,7 +881,7 @@ public class GraphCompiler
                         _ => a
                     };
                 }
-                outputShapes = new[] { arithA.Length >= arithB.Length ? inputShapes[0] : inputShapes[1] };
+                outputShapes = new[] { bcastI?.Shape ?? (arithA.Length >= arithB.Length ? inputShapes[0] : inputShapes[1]) };
                 if (node.Outputs.Count > 0)
                 {
                     graph.ConstantData[node.Outputs[0]] = result;
@@ -1292,6 +1357,8 @@ public class GraphCompiler
                 OutputShapes = outputShapes,
                 CompileTimeInputShapes = inputShapes,
             });
+            if (ShapeTrace != null && node.Outputs.Any(o => o != null && o.Contains(ShapeTrace, StringComparison.Ordinal)))
+                TraceShapes(node, inputShapes, outputShapes, graph);
           }
           catch (Exception nodeEx)
           {
