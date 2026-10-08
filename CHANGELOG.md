@@ -3,7 +3,20 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased
+## 5.3.4 - 2026-10-08 - on SpawnDev.ILGPU 5.3.5; GPU face decode, big-LaMa runs (broadcast folding, ConvTranspose output_padding)
+
+- **Built on SpawnDev.ILGPU 5.3.5** (the Blazor-AOT `Allocate1D(int[])` signature fix). Still on SpawnDev.SpawnJS 3.0.1.
+- **Compile-time folding of a binary op on two constants broadcasts per axis** (Tuvok). Mul/Add/Sub/Div on two constants
+  used a flat modulo and kept the larger input's shape - right for a scalar or equal shapes, wrong for an N-D broadcast:
+  big-LaMa's DFT matrices `[64,1] * [33]` folded to `[64,1]`, every Fourier unit kept one frequency, and a reverse Slice
+  9000 nodes later crashed on a 0-wide axis. `GraphCompiler.BroadcastFold` maps the indices per axis when both shapes
+  are known and match their values (otherwise the old fold, so nothing that worked changes path).
+- **2-D ConvTranspose honours `output_padding`** (shape inference and kernel; Tuvok): stride-2 decoders landed one pixel
+  short (big-LaMa 64 -> 127 -> 253 -> 505 instead of 512). The 1-D path already had it.
+- **`ML_SHAPE_TRACE=<substring>`** (`GraphCompiler.ShapeTrace`): prints each matching compiled node's op, shapes and
+  constant inputs - a compile crash names only the victim; this finds the first wrong node.
+- With both fixes big-LaMa (Carve/LaMa-ONNX lama_fp32.onnx) matches onnxruntime to 0.003 on a 0..255 output (OpenCL).
+  `BroadcastFoldAndConvTransposeTests`.
 
 - **`FaceDetectionPipeline` decodes and runs NMS on the GPU** (Data, MiniRover). `DetectAsync` read both BlazeFace
   output tensors back to managed memory on every call - 896x16 regressors + 896 classificators, 61 KB - to decode the

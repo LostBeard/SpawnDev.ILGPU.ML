@@ -1,11 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk.Razor">
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.4-local.1</Version>
-		<PackageReleaseNotes>v5.3.3: on SpawnDev.ILGPU 5.3.3 (CreateScan(Exclusive) fixed on WebGPU and Wasm past one workgroup-sized chunk) + SpawnDev.SpawnJS 3.0.1. No ML code change. 5.3.2: Video Depth Anything streaming, FP16-stored weights at full speed, WeightStorage.Half. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.4</Version>
+		<PackageReleaseNotes>v5.3.4: on SpawnDev.ILGPU 5.3.5 + SpawnDev.SpawnJS 3.0.1. GPU face decode + weighted NMS (FaceDetectionPipeline reads back 18 floats a face, not 61 KB); compile-time constant folding broadcasts per axis (N-D); 2-D ConvTranspose honours output_padding; ML_SHAPE_TRACE diagnostic - big-LaMa now matches onnxruntime. v5.3.3: on SpawnDev.ILGPU 5.3.3 (CreateScan(Exclusive) fixed on WebGPU and Wasm past one workgroup-sized chunk) + SpawnDev.SpawnJS 3.0.1. No ML code change. 5.3.2: Video Depth Anything streaming, FP16-stored weights at full speed, WeightStorage.Half. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.1" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.3" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.5" />
 	</ItemGroup>
 
 	<ItemGroup>
