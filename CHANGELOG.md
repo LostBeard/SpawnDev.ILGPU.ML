@@ -3,6 +3,16 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.6 - 2026-10-11 - Llama pythonic tool calls
+
+- **`ChatTemplates.ParseToolCalls` reads Llama 3.x's pythonic form**: `come_here(player='Aubri')`, or a list
+  `[collect(block="dirt", count=3), stop()]`, with string, integer, float, True/False and None values. llama3.1:8b
+  emits this as plain text now and then instead of the `<tool_call>` JSON it was asked for (measured in Vertex: the
+  call was spoken aloud and nothing ran). Taken only when the WHOLE reply is such calls, so prose with parentheses
+  ("f(x) = 2x", "on my way (almost there)") is never a call.
+- **`ChatTemplates.IsOnlyPythonicCalls(text)`**: true for such a reply, so a host knows no words remain to show.
+- Tests: `ChatTemplatesToolCallTests` (tagged JSON, pythonic single and list, prose that must stay prose).
+
 ## 5.3.5 - 2026-10-10 - attention fusion correct for BERT-family models
 
 Found by Vertex (LostBeard/Vertex) matching speech to commands with all-MiniLM-L6-v2: unrelated sentences embedded

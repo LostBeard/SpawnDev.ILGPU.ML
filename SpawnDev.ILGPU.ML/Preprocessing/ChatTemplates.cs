@@ -558,7 +558,96 @@ public static class ChatTemplates
             foreach (var obj in ExtractTopLevelJsonObjects(StripCodeFences(text)))
                 TryAddToolCall(obj, calls);
 
+        // Fallback: Llama 3.x's PYTHONIC form, `come_here(player='Aubri')` or `[a(x=1), b()]`, which llama3.1:8b
+        // emits as plain text now and then (measured 2026-10-11 in Vertex: the call was spoken, nothing ran).
+        // Only when the WHOLE reply is nothing but such calls, so prose with parentheses is never taken for one.
+        if (calls.Count == 0)
+            TryParsePythonicCalls(StripCodeFences(text), calls);
+
         return calls;
+    }
+
+    /// <summary>True when the whole text is Llama-style pythonic tool calls (and nothing else) - then a reply has
+    /// no natural-language part to show or speak once the calls are taken out.</summary>
+    public static bool IsOnlyPythonicCalls(string text)
+    {
+        var calls = new List<ParsedToolCall>();
+        TryParsePythonicCalls(StripCodeFences(text), calls);
+        return calls.Count > 0;
+    }
+
+    /// <summary>
+    /// Parse a reply that is ONLY pythonic calls: optional <c>[ ]</c> around comma-separated <c>name(k=v, ...)</c>,
+    /// values being quoted strings, numbers, True/False/true/false or None. Anything else (prose, an unknown value
+    /// form) adds nothing.
+    /// </summary>
+    private static void TryParsePythonicCalls(string text, List<ParsedToolCall> calls)
+    {
+        var s = text.Trim();
+        if (s.StartsWith("<|python_tag|>", StringComparison.Ordinal)) s = s["<|python_tag|>".Length..].Trim();
+        if (s.StartsWith('[') && s.EndsWith(']')) s = s[1..^1].Trim();
+        if (s.Length == 0) return;
+        var found = new List<ParsedToolCall>();
+        int i = 0;
+        while (i < s.Length)
+        {
+            // name
+            int n0 = i;
+            while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] is '_' or '.')) i++;
+            if (i == n0 || !char.IsLetter(s[n0]) && s[n0] != '_') return;
+            string name = s[n0..i];
+            if (i >= s.Length || s[i] != '(') return;
+            i++;
+            var args = new System.Text.Json.Nodes.JsonObject();
+            while (true)
+            {
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                if (i < s.Length && s[i] == ')') { i++; break; }
+                int k0 = i;
+                while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++;
+                if (i == k0) return;
+                string key = s[k0..i];
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                if (i >= s.Length || s[i] != '=') return;
+                i++;
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                if (i >= s.Length) return;
+                System.Text.Json.Nodes.JsonNode? value;
+                if (s[i] is '\'' or '"')
+                {
+                    char q = s[i++];
+                    var sb = new System.Text.StringBuilder();
+                    while (i < s.Length && s[i] != q)
+                    {
+                        if (s[i] == '\\' && i + 1 < s.Length) { sb.Append(s[i + 1]); i += 2; continue; }
+                        sb.Append(s[i++]);
+                    }
+                    if (i >= s.Length) return;
+                    i++;
+                    value = System.Text.Json.Nodes.JsonValue.Create(sb.ToString());
+                }
+                else
+                {
+                    int v0 = i;
+                    while (i < s.Length && s[i] is not (',' or ')') && !char.IsWhiteSpace(s[i])) i++;
+                    var raw = s[v0..i];
+                    if (raw is "True" or "true") value = System.Text.Json.Nodes.JsonValue.Create(true);
+                    else if (raw is "False" or "false") value = System.Text.Json.Nodes.JsonValue.Create(false);
+                    else if (raw is "None" or "null") value = null;
+                    else if (long.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var l)) value = System.Text.Json.Nodes.JsonValue.Create(l);
+                    else if (double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d)) value = System.Text.Json.Nodes.JsonValue.Create(d);
+                    else return;
+                }
+                args[key] = value;
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                if (i < s.Length && s[i] == ',') { i++; continue; }
+                if (i < s.Length && s[i] == ')') { i++; break; }
+                return;
+            }
+            found.Add(new ParsedToolCall(name, args.ToJsonString()));
+            while (i < s.Length && (char.IsWhiteSpace(s[i]) || s[i] is ',' or ';')) i++;
+        }
+        calls.AddRange(found);
     }
 
     /// <summary>Parse one JSON object as a <c>{"name","arguments"}</c> tool call and append it if valid.
