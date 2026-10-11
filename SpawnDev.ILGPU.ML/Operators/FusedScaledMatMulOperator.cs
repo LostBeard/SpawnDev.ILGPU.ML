@@ -47,13 +47,18 @@ public class FusedScaledMatMulOperator : IOnnxOperator
         bool isDiv = ctx.GetString("is_div", "false") == "True" ||
                      ctx.GetString("is_div", "false") == "true";
 
-        // Read scale value — it's a scalar constant, try pre-read values first
-        float scaleValue = 1f;
+        // The scale: the value the optimizer resolved (already inverted for Div), else the executor's pre-read
+        // constant. Never neither - that used to fall through to 1.0 and return UNSCALED scores without a word.
+        float scaleValue;
         var preRead = ctx.TryGetInputValues(2);
-        if (preRead != null && preRead.Length > 0)
-        {
+        if (ctx.Attributes.ContainsKey("scale"))
+            scaleValue = ctx.GetFloat("scale", 1f);
+        else if (preRead != null && preRead.Length > 0)
             scaleValue = isDiv ? (1f / preRead[0]) : preRead[0];
-        }
+        else
+            throw new InvalidOperationException(
+                $"FusedScaledMatMul: the scale input '{(ctx.InputNames.Length > 2 ? ctx.InputNames[2] : "?")}' is neither resolved at optimize time "
+              + "nor a pre-read runtime constant, so its value is unknown here. Refusing to compute unscaled scores.");
 
         // Batch-aware MatMul: handle multi-head attention [batch, heads, M, K]
         if (A.Rank == 2 && B.Rank == 2)

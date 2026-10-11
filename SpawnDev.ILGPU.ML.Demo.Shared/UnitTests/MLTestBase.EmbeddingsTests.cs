@@ -89,6 +89,13 @@ public abstract partial class MLTestBase
             throw new Exception($"Embeddings are not semantic: related {simRelated:F3} must exceed unrelated {simUnrelated:F3} " +
                 "(real WordPiece tokenization should give meaningful similarity).");
 
-        Console.WriteLine("[Embeddings] real-tokenizer embeddings are semantic (related > unrelated, self ≈ 1.0).");
+        // 🔴 THE VALUES, NOT JUST THE ORDER. "related > unrelated" stayed green while the attention fusion
+        // dropped this model's attention mask and swapped K's heads and sequence (2026-10-10): the 128-token
+        // padding then dominated every embedding. Pinned to onnxruntime 1.26 on the same ONNX file, same
+        // WordPiece ids, mean-pooled over the real tokens: related 0.5387, unrelated -0.0206.
+        if (MathF.Abs(simRelated - 0.5387f) > 0.01f || MathF.Abs(simUnrelated - (-0.0206f)) > 0.01f)
+            throw new Exception($"Embeddings differ from onnxruntime: related {simRelated:F4} (ort 0.5387), unrelated {simUnrelated:F4} (ort -0.0206)");
+
+        Console.WriteLine("[Embeddings] real-tokenizer embeddings are semantic (related > unrelated, self ≈ 1.0) and match onnxruntime.");
     });
 }

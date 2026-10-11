@@ -457,4 +457,124 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[AttentionFusion] whisper-form pre-scaled Q fuses with scale=1.0 and matches CPU ref "
                         + $"(worst |Δ|={worst:E3}) on {BackendName}");
     });
+
+    /// <summary>
+    /// The BERT export form (all-MiniLM-L6-v2 and the whole sentence-transformers family): K made by ONE
+    /// Transpose(perm [0,2,3,1]) straight from the [B, S, H, D] reshape, scores Div by sqrt(head_dim), and an
+    /// additive bias that is the ATTENTION MASK (Mul(Sub(1, mask), min) in the export). Builds that graph with a
+    /// real mask and checks the result against a CPU reference that applies it. `withMask` false is the same
+    /// graph with no Add: then attention must still fuse (the K transpose rewritten to [0,2,1,3]).
+    /// Found 2026-10-10: the pass dropped the mask as a "zero bias" (padded tokens attended, unrelated sentences
+    /// embedded at 0.86-0.95 cosine vs onnxruntime's 0.19-0.26) AND fed the [B,S,H,D] tensor as K.
+    /// </summary>
+    private async Task BertFormAttention(Accelerator accelerator, bool withMask)
+    {
+        const int heads = 2, seq = 6, hd = 4;
+        const float scale = 0.5f; // 1/sqrt(4), applied by a Div by 2 like the export
+        var rng = new Random(withMask ? 4242 : 4343);
+        var q = RandFloats(heads * seq * hd, rng);          // [1, H, S, D]
+        var kBshd = RandFloats(seq * heads * hd, rng);      // [1, S, H, D] - the reshape output, before any transpose
+        var v = RandFloats(heads * seq * hd, rng);          // [1, H, S, D]
+        // Last two key positions are padding.
+        var maskBias = new float[seq];
+        for (int j = seq - 2; j < seq; j++) maskBias[j] = -3.4028235e38f;
+
+        var nodes = new List<GraphNode>
+        {
+            N("Transpose", new[] { "Kbshd" }, new[] { "Kt" }, new() { ["perm"] = JsonSerializer.SerializeToElement(new[] { 0, 2, 3, 1 }) }),
+            N("MatMul", new[] { "Q", "Kt" }, new[] { "scores" }),
+            N("Div", new[] { "scores", "c_sqrt" }, new[] { "scaled" }),
+        };
+        if (withMask) nodes.Add(N("Add", new[] { "scaled", "mask_bias" }, new[] { "biased" }));
+        nodes.Add(N("Softmax", new[] { withMask ? "biased" : "scaled" }, new[] { "probs" }, new() { ["axis"] = JsonSerializer.SerializeToElement(-1) }));
+        nodes.Add(N("MatMul", new[] { "probs", "V" }, new[] { "attn_out" }));
+        var inputs = new List<GraphValueInfo>
+        {
+            new() { Name = "Q", Shape = new[] { 1, heads, seq, hd } },
+            new() { Name = "Kbshd", Shape = new[] { 1, seq, heads, hd } },
+            new() { Name = "V", Shape = new[] { 1, heads, seq, hd } },
+        };
+        if (withMask) inputs.Add(new() { Name = "mask_bias", Shape = new[] { 1, 1, 1, seq } });
+        var graph = new ModelGraph
+        {
+            Name = withMask ? "attn_bert_masked" : "attn_bert_unmasked",
+            Inputs = inputs,
+            Outputs = new() { new() { Name = "attn_out", Shape = new[] { 1, heads, seq, hd } } },
+            Initializers = new() { ["c_sqrt"] = new[] { 1 } },
+            Nodes = nodes,
+            FloatConstantData = new() { ["c_sqrt"] = new[] { 2f } },
+            ConstantData = new() { ["c_sqrt"] = new[] { 2 } },
+        };
+
+        var optimized = GraphOptimizer.Optimize(graph);
+        int fused = optimized.Nodes.Count(n => n.OpType == "FusedAttention");
+        if (withMask && fused != 0)
+            throw new Exception($"a REAL mask bias was fused away ({fused} FusedAttention) on {BackendName} - FusedAttention has no mask input");
+        if (!withMask && fused != 1)
+            throw new Exception($"expected the unmasked BERT form to fuse (1 FusedAttention), got {fused} on {BackendName}");
+
+        // CPU reference: K in [H, S, D] from the [S, H, D] input; the mask on the keys.
+        var kHsd = new float[heads * seq * hd];
+        for (int h = 0; h < heads; h++)
+            for (int j = 0; j < seq; j++)
+                for (int d = 0; d < hd; d++)
+                    kHsd[(h * seq + j) * hd + d] = kBshd[(j * heads + h) * hd + d];
+        var expected = new float[heads * seq * hd];
+        for (int h = 0; h < heads; h++)
+            for (int i2 = 0; i2 < seq; i2++)
+            {
+                var sc = new double[seq];
+                double mx = double.NegativeInfinity;
+                for (int j = 0; j < seq; j++)
+                {
+                    double dot = 0;
+                    for (int d = 0; d < hd; d++) dot += q[(h * seq + i2) * hd + d] * (double)kHsd[(h * seq + j) * hd + d];
+                    sc[j] = dot * scale + (withMask ? maskBias[j] : 0);
+                    if (sc[j] > mx) mx = sc[j];
+                }
+                double sum = 0;
+                for (int j = 0; j < seq; j++) { sc[j] = Math.Exp(sc[j] - mx); sum += sc[j]; }
+                for (int d = 0; d < hd; d++)
+                {
+                    double acc = 0;
+                    for (int j = 0; j < seq; j++) acc += sc[j] / sum * v[(h * seq + j) * hd + d];
+                    expected[(h * seq + i2) * hd + d] = (float)acc;
+                }
+            }
+
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        // The unfused (masked) path reads the scale divisor at run time, like a real export's initializer.
+        using var sqrtB = accelerator.Allocate1D(new[] { 2f });
+        using var ex = new GraphExecutor(accelerator, compiled, new Dictionary<string, Tensor> { ["c_sqrt"] = new Tensor(sqrtB.View, new[] { 1 }) });
+        using var qB = accelerator.Allocate1D(q);
+        using var kB = accelerator.Allocate1D(kBshd);
+        using var vB = accelerator.Allocate1D(v);
+        using var mB = accelerator.Allocate1D(maskBias);
+        int n = heads * seq * hd;
+        using var host = accelerator.Allocate1D<float>(n);
+        var feeds = new Dictionary<string, Tensor>
+        {
+            ["Q"] = new Tensor(qB.View, new[] { 1, heads, seq, hd }),
+            ["Kbshd"] = new Tensor(kB.View, new[] { 1, seq, heads, hd }),
+            ["V"] = new Tensor(vB.View, new[] { 1, heads, seq, hd }),
+        };
+        if (withMask) feeds["mask_bias"] = new Tensor(mB.View, new[] { 1, 1, 1, seq });
+        var outs = await ex.RunAsync(feeds);
+        await host.View.CopyFromAsync(outs["attn_out"].Data.SubView(0, n));
+        await accelerator.SynchronizeAsync();
+        var got = await host.CopyToHostAsync<float>(0, n);
+
+        float worst = 0;
+        for (int i2 = 0; i2 < n; i2++) worst = MathF.Max(worst, MathF.Abs(got[i2] - expected[i2]));
+        if (worst > 2e-3f)
+            throw new Exception($"BERT-form attention ({(withMask ? "masked" : "unmasked")}) diverged from CPU ref (worst |Δ|={worst:E3}) on {BackendName}");
+        Console.WriteLine($"[AttentionFusion] BERT form, {(withMask ? "masked: kept unfused" : "unmasked: fused")}, matches CPU ref (worst |Δ|={worst:E3}) on {BackendName}");
+    }
+
+    [TestMethod]
+    public async Task AttentionFusion_BertForm_RealMaskIsNeverFusedAway_AllBackends() => await RunTest(async accelerator => await BertFormAttention(accelerator, withMask: true));
+
+    [TestMethod]
+    public async Task AttentionFusion_BertForm_SeqMajorKTranspose_FusedMatchesCpu_AllBackends() => await RunTest(async accelerator => await BertFormAttention(accelerator, withMask: false));
 }

@@ -1077,6 +1077,16 @@ public static class GraphOptimizer
                         ["is_div"] = MLJson.ToElement(candidate.OpType == "Div")
                     }
                 };
+                // 🔴 Carry the scale VALUE when it is known now. The operator used to read it only from the
+                // executor's pre-read constants and, when the scalar was not among them, skipped the scaling
+                // SILENTLY - Q·Kᵀ unscaled, plausible-looking but wrong attention (found 2026-10-10 by a
+                // BERT-form test whose divisor was a plain initializer: off by 0.2 on every backend).
+                float? scalarValue =
+                    graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(scalarName, out var fsv) && fsv.Length == 1 ? fsv[0]
+                    : graph.ConstantData != null && graph.ConstantData.TryGetValue(scalarName, out var dsv) && dsv.Length == 1 ? dsv[0]
+                    : null;
+                if (scalarValue is float known)
+                    fusedNode.Attributes["scale"] = MLJson.ToElement(candidate.OpType == "Div" ? 1f / known : known);
 
                 graph.Nodes[i] = fusedNode;
                 nodesToRemove.Add(j);
@@ -1250,6 +1260,37 @@ public static class GraphOptimizer
             }
         }
 
+        // TRUE only when `name` is PROVABLY all zeros: the diffusers zero-bias branch (ConstantOfShape -> Mul x 0),
+        // an all-zero constant, or a shape-only op on one of those. Anything unproven (a real attention mask)
+        // returns false and the fusion falls through.
+        bool IsProvablyZero(string name, int depth)
+        {
+            if (depth > 6 || string.IsNullOrEmpty(name)) return false;
+            if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var fz)) return fz.Length > 0 && fz.All(v => v == 0f);
+            if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var dz)) return dz.Length > 0 && dz.All(v => v == 0);
+            int p = Prod(name);
+            if (p < 0) return false;
+            var n = nodes[p];
+            switch (n.OpType)
+            {
+                case "Mul":
+                    return n.Inputs.Count == 2 && (ScalarConst(n.Inputs[0]) == 0f || ScalarConst(n.Inputs[1]) == 0f
+                        || IsProvablyZero(n.Inputs[0], depth + 1) || IsProvablyZero(n.Inputs[1], depth + 1));
+                case "ConstantOfShape":
+                    if (n.Attributes == null || !n.Attributes.TryGetValue("value", out var v)) return true; // ONNX default 0
+                    return v.ValueKind switch
+                    {
+                        JsonValueKind.Number => v.GetDouble() == 0,
+                        JsonValueKind.Array => v.GetArrayLength() > 0 && v.EnumerateArray().All(e => e.ValueKind == JsonValueKind.Number && e.GetDouble() == 0),
+                        _ => false,
+                    };
+                case "Cast": case "Identity": case "Reshape": case "Expand": case "Unsqueeze": case "Squeeze": case "Transpose":
+                    return n.Inputs.Count >= 1 && IsProvablyZero(n.Inputs[0], depth + 1);
+                default:
+                    return false;
+            }
+        }
+
         var remove = new HashSet<int>();
 
         for (int si = 0; si < nodes.Count; si++)
@@ -1263,6 +1304,13 @@ public static class GraphOptimizer
             if (consumerCount.GetValueOrDefault(scoresName, 0) != 1) continue;   // scores feed only softmax
 
             // Optional additive bias: Add(scaledScores, zeroBias). Keep the scores branch, drop the Add.
+            // 🔴 ONLY when the other branch is PROVABLY ZERO (the diffusers export's ConstantOfShape -> Mul x 0).
+            // FusedAttention has no mask input, so dropping a REAL bias silently removes it. BERT-family
+            // exports (all-MiniLM-L6-v2, measured 2026-10-10) put the ATTENTION MASK here -
+            // Mul(Sub(1, Cast(mask)), float.MinValue) - and fusing dropped it: every padded position was
+            // attended, a 3-token command padded to 32 embedded as mostly padding, and unrelated sentences
+            // scored 0.86-0.95 cosine (onnxruntime on the same file: 0.19-0.26). A real bias keeps the
+            // unfused path, which is exact.
             int pAdd = Prod(scoresName);
             if (pAdd >= 0 && nodes[pAdd].OpType == "Add" && nodes[pAdd].Inputs.Count == 2)
             {
@@ -1270,6 +1318,7 @@ public static class GraphOptimizer
                 string br = ReachesScoresMatMul(addN.Inputs[0], 0) ? addN.Inputs[0]
                           : ReachesScoresMatMul(addN.Inputs[1], 0) ? addN.Inputs[1] : null!;
                 if (br == null) continue;
+                if (!IsProvablyZero(br == addN.Inputs[0] ? addN.Inputs[1] : addN.Inputs[0], 0)) continue;
                 if (consumerCount.GetValueOrDefault(br, 0) != 1) continue;
                 between.Add(pAdd);
                 scoresName = br;
@@ -1319,10 +1368,23 @@ public static class GraphOptimizer
             bool kPreScaled = false;
             int retargetMulIdx = -1, retargetSlot = -1, retargetTransposeIdx = -1;
             string retargetNewInput = "";
-            if (nodes[pKT].OpType == "Transpose" && nodes[pKT].Inputs.Count >= 1)
+            int[]? kPermRewrite = null;
+            if (nodes[pKT].OpType == "Transpose" && nodes[pKT].Inputs.Count >= 1 && IsSwapLastTwoPerm(nodes[pKT]))
             {
                 kName = nodes[pKT].Inputs[0];
                 between.Add(pKT);
+            }
+            else if (nodes[pKT].OpType == "Transpose" && nodes[pKT].Inputs.Count >= 1 && TransposePerm(nodes[pKT]) is { Length: >= 2 } kPerm)
+            {
+                // 🔴 Kᵀ made in ONE transpose straight from the [B, S, H, D] reshape: BERT exports use
+                // perm [0,2,3,1], so the Transpose's INPUT is [B,S,H,D], not K. Taking it as K (as the swap form
+                // above does) feeds heads and seq swapped - wrong attention even with no padding at all
+                // (all-MiniLM-L6-v2, 2026-10-10). K itself is that perm with its last two entries swapped
+                // ([0,2,1,3] -> [B,H,S,D]): rewrite the Transpose (deferred until the whole pattern matches)
+                // and keep it as K's producer. Its output had one consumer, the scores MatMul, now fused away.
+                kPermRewrite = (int[])kPerm.Clone();
+                (kPermRewrite[^1], kPermRewrite[^2]) = (kPermRewrite[^2], kPermRewrite[^1]);
+                kName = kTName;
             }
             else if (nodes[pKT].OpType == "Mul" && nodes[pKT].Inputs.Count == 2)
             {
@@ -1373,7 +1435,9 @@ public static class GraphOptimizer
             if (!IsActivation(vName)) continue;
             string attnOut = av.Outputs[0];
 
-            // Full pattern matched - NOW apply the deferred K-side rewrite (pre-scaled form only).
+            // Full pattern matched - NOW apply the deferred K-side rewrites.
+            if (kPermRewrite != null)
+                nodes[pKT].Attributes!["perm"] = MLJson.ToElement(kPermRewrite);
             if (kPreScaled)
             {
                 nodes[retargetMulIdx].Inputs[retargetSlot] = retargetNewInput;
@@ -1409,6 +1473,12 @@ public static class GraphOptimizer
     /// <summary>Transpose whose perm is identity except the LAST TWO axes swapped (any rank >= 2) -
     /// the only transpose shape a scalar multiply is allowed to commute through in FuseAttention's
     /// pre-scaled-K rewrite.</summary>
+    /// <summary>A Transpose node's perm attribute, or null when it has none (the reverse-axes default).</summary>
+    private static int[]? TransposePerm(GraphNode transpose) =>
+        transpose.Attributes != null && transpose.Attributes.TryGetValue("perm", out var permEl) && permEl.ValueKind == JsonValueKind.Array
+            ? permEl.EnumerateArray().Select(e => e.GetInt32()).ToArray()
+            : null;
+
     private static bool IsSwapLastTwoPerm(GraphNode transpose)
     {
         if (transpose.Attributes == null || !transpose.Attributes.TryGetValue("perm", out var permEl)
