@@ -3,6 +3,27 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.5 - 2026-10-10 - attention fusion correct for BERT-family models
+
+Found by Vertex (LostBeard/Vertex) matching speech to commands with all-MiniLM-L6-v2: unrelated sentences embedded
+at 0.86-0.95 cosine where onnxruntime, on the same ONNX file and token ids, gives 0.19-0.26.
+
+- **A real attention mask is never fused away.** `GraphOptimizer.FuseAttention` dropped the `Add` before the Softmax as
+  the diffusers zero bias. In BERT exports that Add is the attention mask (`Mul(Sub(1, mask), min)`), so padded tokens
+  were attended and a short sentence padded to the session length embedded as mostly padding. The Add now fuses only
+  when its other branch is provably zero; a real mask keeps the exact unfused path. SD-Turbo's zero bias
+  (ConstantOfShape x 0) still fuses: all 32 UNet attentions, checked on the real model.
+- **BERT's K transpose.** BERT makes Kᵀ in one Transpose (perm `[0,2,3,1]`) straight from the `[B,S,H,D]` reshape; the
+  pass took that input as K, feeding heads and sequence swapped (wrong even with no padding). The Transpose is now
+  rewritten to K's own perm (`[0,2,1,3]`) and kept.
+- **`FusedScaledMatMul` never skips its scale.** It read the scale only from the executor's pre-read constants and, when
+  the scalar was not among them, returned unscaled Q·Kᵀ without a word. The optimizer now records the value as an
+  attribute; with neither, the operator throws.
+- Tests: `AttentionFusion_BertForm_RealMaskIsNeverFusedAway_AllBackends`,
+  `AttentionFusion_BertForm_SeqMajorKTranspose_FusedMatchesCpu_AllBackends` (CPU reference, 6e-8 on CUDA, OpenCL, CPU);
+  `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` now pins onnxruntime's values (0.5387 / -0.0206) and fails
+  on the old code.
+
 ## 5.3.4 - 2026-10-08 - on SpawnDev.ILGPU 5.3.5; GPU face decode, big-LaMa runs (broadcast folding, ConvTranspose output_padding)
 
 - **Built on SpawnDev.ILGPU 5.3.5** (the Blazor-AOT `Allocate1D(int[])` signature fix). Still on SpawnDev.SpawnJS 3.0.1.
