@@ -321,6 +321,31 @@ public abstract partial class MLTestBase
                     throw new Exception($"[qwen-cancel] the same prompt after a cancelled generation gave a different greedy answer " +
                         $"(reused {pipe.LastReusedPrefix} tokens; diverges at char {at}).\n  first='{first.Trim()}'\n  after='{again.Trim()}'");
                 }
+
+                // Cancelled BEFORE its prefill ran (Vertex: a turn that timed out before generating anything, gen=0): its
+                // rows were never written, so they must not be recorded as cached. D extends A's conversation; its
+                // baseline answer comes from an uncancelled run; then A resets the cache, D is cancelled up front, and D
+                // asked again must match the baseline. The old record claimed all of D, and D again "reused" rows that
+                // held nothing (Vertex: reused 2,847 of 2,949 tokens -> token soup).
+                var d = new[] { ("system", system), ("user", "In two sentences, what is a chicken?"), ("assistant", first), ("user", "And what about a duck?") };
+                var f = new[] { ("system", system), ("user", "In two sentences, what is a chicken?"), ("assistant", first), ("user", "And what about a goose?") };
+                var dBaseline = await pipe.GenerateAsync(d, config: cfg, ct: cts.Token);
+                // F differs from D only at the end: it overwrites D's last rows with OTHER tokens, so a record that claims
+                // D's rows after the cancelled run points at F's context, not at rows that still happen to hold D.
+                await pipe.GenerateAsync(f, config: cfg, ct: cts.Token);
+                using (var already = System.Threading.CancellationTokenSource.CreateLinkedTokenSource(cts.Token))
+                {
+                    already.Cancel();
+                    await pipe.GenerateAsync(d, config: cfg, ct: already.Token);   // cooperative cancel at the loop top
+                }
+                var dAgain = await pipe.GenerateAsync(d, config: cfg, ct: cts.Token);
+                Console.WriteLine($"[qwen-cancel] before-prefill case reusedPrefix={pipe.LastReusedPrefix}");
+                if (dAgain != dBaseline)
+                {
+                    int at = 0; while (at < Math.Min(dBaseline.Length, dAgain.Length) && dBaseline[at] == dAgain[at]) at++;
+                    throw new Exception($"[qwen-cancel] after a generation cancelled before its prefill, the same prompt gave a different " +
+                        $"greedy answer (reused {pipe.LastReusedPrefix} tokens; diverges at char {at}).\n  baseline='{dBaseline.Trim()}'\n  after='{dAgain.Trim()}'");
+                }
             }
         }
         catch (UnsupportedTestException) { throw; }

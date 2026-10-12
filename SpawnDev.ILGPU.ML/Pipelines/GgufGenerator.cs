@@ -62,6 +62,24 @@ public sealed class GgufGenerator : IDisposable
     /// </summary>
     private void ForgetCachedRowsFrom(int p) => _cachedIds = p > 0 && _cachedIds != null ? _cachedIds[..p] : null;
 
+    /// <summary>
+    /// Records the token sequence the K/V cache now holds, so the next request can reuse it as its prefix: the prompt
+    /// then the generated tokens, but only the first <paramref name="written"/> - the rows a step actually wrote. The
+    /// old record assumed prompt + every generated token. Wrong twice: a generation cancelled BEFORE its prefill ran
+    /// (a cooperative cancel at the loop top, gen=0) recorded a whole prompt whose rows were never written, and the
+    /// next request "reused" them (Vertex 2026-10-12: reused 2,847 of 2,949 tokens of nothing -> token soup; also in
+    /// 5.3.6); and the LAST sampled token, never fed back, was always counted as resident.
+    /// </summary>
+    private void RecordResident(int[] promptIds, IReadOnlyList<int> generated, int written)
+    {
+        if (!EnablePrefixCache) { _cachedIds = null; return; }
+        int n = Math.Min(Math.Min(written, promptIds.Length + generated.Count), _maxSeqLen - 1);
+        var resident = new int[n];
+        for (int i = 0; i < n; i++)
+            resident[i] = i < promptIds.Length ? promptIds[i] : generated[i - promptIds.Length];
+        _cachedIds = resident;
+    }
+
     /// <summary>Enable KV-prefix caching: on each request, reuse the cached K/V for the longest common token
     /// prefix shared with the previous request (same tokens at the same absolute positions → bit-identical
     /// K/V), prefilling only the new suffix. The #1 win for agentic clients (Claude CLI) that re-send a near-
@@ -239,6 +257,7 @@ public sealed class GgufGenerator : IDisposable
         }
         LastReusedPrefix = P;
         ForgetCachedRowsFrom(P);
+        int written = P;   // K/V rows that hold real data: the reused prefix, plus each step once it has RUN
         StopReason stop = StopReason.Length;
 
         for (int step = 0; step < maxNew; step++)
@@ -313,6 +332,8 @@ public sealed class GgufGenerator : IDisposable
                     return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
                     { ["input_ids"] = new Tensor(idView, new[] { 1, stepIds.Length }, "input_ids") });
                 }
+
+            written += stepIds.Length;   // this step ran: its tokens are now in the K/V cache
 
             int next;
             if (fastToken is int ft)
@@ -401,23 +422,9 @@ public sealed class GgufGenerator : IDisposable
                 await onDelta(full.ToString(emitted, full.Length - emitted));
         }
 
-        // Record the full sequence now resident in the KV cache (prompt + generated) so the NEXT request can
-        // reuse this turn's prompt+response as its prefix. The generated tokens were written into the cache at
-        // their absolute positions during decode; only the tokens contributing to the cache count (a stop
-        // token ends the turn WITHOUT being written, so it is excluded — `generated` already excludes it).
-        // Cap to the cache's valid region (maxSeqLen-1, matching the prefill/decode bound used above).
-        if (EnablePrefixCache)
-        {
-            int total = promptIds.Length + generated.Count;
-            int cap = _maxSeqLen - 1;
-            var resident = new int[Math.Min(total, cap)];
-            int copyPrompt = Math.Min(promptIds.Length, resident.Length);
-            Array.Copy(promptIds, 0, resident, 0, copyPrompt);
-            for (int i = 0; copyPrompt + i < resident.Length && i < generated.Count; i++)
-                resident[copyPrompt + i] = generated[i];
-            _cachedIds = resident;
-        }
-        else _cachedIds = null;
+        // Record what the KV cache now holds (only rows a step wrote: see RecordResident) so the NEXT request can
+        // reuse this turn's prompt+response as its prefix.
+        RecordResident(promptIds, generated, written);
 
         return new GenerationResult(full.ToString(), promptIds.Length, generated.Count, stop);
     }
@@ -458,6 +465,7 @@ public sealed class GgufGenerator : IDisposable
         else { _session.ResetGGUFDecode(); stepIds = promptIds; }
         LastReusedPrefix = P;
         ForgetCachedRowsFrom(P);
+        int written = P;
 
         var generated = new List<int>();
         double ttftMs = 0;
@@ -467,6 +475,7 @@ public sealed class GgufGenerator : IDisposable
             var sw = step == 0 ? System.Diagnostics.Stopwatch.StartNew() : null;
             var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
             { ["input_ids"] = new Tensor(idView, new[] { 1, stepIds.Length }, "input_ids") });
+            written += stepIds.Length;
 
             var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
             int vocab = logitsT.Shape[^1];
@@ -479,18 +488,7 @@ public sealed class GgufGenerator : IDisposable
             stepIds = new[] { next };
         }
 
-        if (EnablePrefixCache)
-        {
-            int total = promptIds.Length + generated.Count;
-            int cap = _maxSeqLen - 1;
-            var resident = new int[Math.Min(total, cap)];
-            int copyPrompt = Math.Min(promptIds.Length, resident.Length);
-            Array.Copy(promptIds, 0, resident, 0, copyPrompt);
-            for (int i = 0; copyPrompt + i < resident.Length && i < generated.Count; i++)
-                resident[copyPrompt + i] = generated[i];
-            _cachedIds = resident;
-        }
-        else _cachedIds = null;
+        RecordResident(promptIds, generated, written);
 
         return (generated.ToArray(), ttftMs);
     }
