@@ -445,6 +445,46 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     /// <summary>True while a captured graph depends on this pool's free buffers (see <see cref="Pin"/>).</summary>
     public bool IsPinned => Volatile.Read(ref _pinCount) > 0;
 
+    // ── Return by IDENTITY, not only by name ──
+    // A name is re-Rented while its previous tensor is still live in two hot paths: the GGUF decode loop ('logits'
+    // every step) and Whisper's decoder ('present.N.decoder.key/value'). Return(old tensor) used to pool whatever
+    // the NAME recorded - the NEW, still-live buffer - so a live buffer sat in the free bucket. Harmless-looking
+    // until a reclaim freed it under a running kernel: "an illegal memory access was encountered", Vertex
+    // AiSessionTests turn 6, 2026-10-12. So every named rent is tracked by its raw buffer, with the name that
+    // currently records it (null once the name moved on: orphaned but live), and Return frees the right buffer.
+    private sealed class LiveRent<T>(MemoryBuffer1D<T, Stride1D.Dense> buffer, string? name) where T : unmanaged
+    {
+        public MemoryBuffer1D<T, Stride1D.Dense> Buffer { get; } = buffer;
+        public string? Name { get; set; } = name;
+    }
+    private readonly Dictionary<MemoryBuffer, LiveRent<float>> _live = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<MemoryBuffer, LiveRent<global::ILGPU.Half>> _liveHalf = new(ReferenceEqualityComparer.Instance);
+    // Raw buffers this pool allocated for Rent: tells a DOUBLE Return (own buffer is ours and already free) from an
+    // alias (the tensor views memory the pool never rented under any name).
+    private readonly HashSet<MemoryBuffer> _rentable = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>Records <paramref name="buffer"/> as the live rent of <paramref name="name"/>; the buffer it replaces,
+    /// if still live, is orphaned (its own tensor's Return will free it).</summary>
+    private void Record(string name, MemoryBuffer1D<float, Stride1D.Dense> buffer)
+    {
+        NoteRebind(name, buffer);
+        if (_namedBuffers.TryGetValue(name, out var previous) && !ReferenceEquals(previous, buffer)
+            && _live.TryGetValue(previous.Buffer, out var orphan))
+            orphan.Name = null;
+        _namedBuffers[name] = buffer;
+        _live[buffer.Buffer] = new LiveRent<float>(buffer, name);
+    }
+
+    private void RecordHalf(string name, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense> buffer)
+    {
+        NoteRebindHalf(name, buffer);
+        if (_halfNamedBuffers.TryGetValue(name, out var previous) && !ReferenceEquals(previous, buffer)
+            && _liveHalf.TryGetValue(previous.Buffer, out var orphan))
+            orphan.Name = null;
+        _halfNamedBuffers[name] = buffer;
+        _liveHalf[buffer.Buffer] = new LiveRent<global::ILGPU.Half>(buffer, name);
+    }
+
     private void Track(MemoryBuffer1D<float, Stride1D.Dense> buffer) { lock (_sync) _allBuffers.Add(buffer); }
 
     private void TrackHalf(MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense> buffer) { lock (_sync) _allHalfBuffers.Add(buffer); }
@@ -562,7 +602,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             // previous tensor's values, and it is precisely the plausible leftovers that hide an unwritten read.
             if (PoisonRentedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
             var tensor = new Tensor(buffer.View, shape, name);
-            if (name != null) { NoteRebind(name, buffer); _namedBuffers[name] = buffer; }
+            if (name != null) Record(name, buffer);
             else _scratchSink?.Add(buffer);
             if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(buffer)} reuse");
             UpdatePeaks();
@@ -607,6 +647,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             });
         TotalDeviceAllocationMs += _allocSw.Elapsed.TotalMilliseconds;
         _allBuffers.Add(newBuffer);
+        _rentable.Add(newBuffer.Buffer);
         // DIAGNOSTIC (Tuvok 2026-07-11): a NEW (not bucket-reused) large allocation DURING a run. On a warm,
         // resident pipeline these should be ~0 per gen (the working set reuses returned buckets). A buffer that
         // allocates fresh EVERY gen = a not-Returned leak (the +128MiB/gen SD-Turbo 2nd-gen OOM). Logs name+MiB.
@@ -614,7 +655,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             && newBuffer.LengthInBytes >= LargeRunAllocThresholdBytes)
             Console.WriteLine($"[NEW-ALLOC] node {Graph.GraphExecutor.CurrentRunNodeIndex} {newBuffer.LengthInBytes / 1048576.0:F1}MiB name='{name}' bucket={bucketSize}");
         var newTensor = new Tensor(newBuffer.View, shape, name);
-        if (name != null) { NoteRebind(name, newBuffer); _namedBuffers[name] = newBuffer; }
+        if (name != null) Record(name, newBuffer);
         else _scratchSink?.Add(newBuffer);
         if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(newBuffer)} fresh");
         UpdatePeaks();
@@ -691,7 +732,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
                 {
                     var buf = stack.Pop();
                     freed += buf.LengthInBytes; nBuf++;
-                    _allHalfBuffers.Remove(buf);
+                    _allHalfBuffers.Remove(buf); _rentable.Remove(buf.Buffer);
                     buf.Dispose();
                 }
             }
@@ -702,7 +743,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
                 {
                     var buf = stack.Pop();
                     freed += buf.LengthInBytes; nBuf++;
-                    _allBuffers.Remove(buf);
+                    _allBuffers.Remove(buf); _rentable.Remove(buf.Buffer);
                     buf.Dispose();
                 }
             }
@@ -750,7 +791,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             {
                 var buf = stack.Pop();
                 freed += buf.LengthInBytes; nBuf++;
-                _allBuffers.Remove(buf);
+                _allBuffers.Remove(buf); _rentable.Remove(buf.Buffer);
                 buf.Dispose();
             }
         _buckets.Clear();
@@ -760,7 +801,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             {
                 var buf = stack.Pop();
                 freed += buf.LengthInBytes; nBuf++;
-                _allHalfBuffers.Remove(buf);
+                _allHalfBuffers.Remove(buf); _rentable.Remove(buf.Buffer);
                 buf.Dispose();
             }
         _halfBuckets.Clear();
@@ -820,12 +861,36 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     /// </remarks>
     public void Return(Tensor tensor)
     {
+        lock (_sync) ReturnLocked(tensor);
+    }
+
+    private void ReturnLocked(Tensor tensor)
+    {
         var name = tensor.Name;
+        var own = BufferOf(tensor.Data);
+        // STALE RETURN: this tensor's own buffer is still live but its name has been re-Rented since (the GGUF decode
+        // loop's 'logits', Whisper's per-step 'present.*'). Free exactly this buffer; the name's current one is live.
+        if (own != null && _live.TryGetValue(own, out var mine) && mine.Name == null)
+        {
+            _live.Remove(own);
+            ReturnLog?.Add((name ?? "(orphan)", mine.Buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
+            PushFree(mine.Buffer);
+            if (Graph.GraphExecutor.SuppressDrains) CaptureReturnCount++;
+            return;
+        }
         if (name != null && _namedBuffers.TryGetValue(name, out var buffer))
         {
+            // DOUBLE RETURN: this tensor's buffer is one of ours and already free, so the name's record is somebody
+            // else's live tensor now. Pooling it would put a live buffer in the free bucket.
+            if (own != null && !ReferenceEquals(own, buffer.Buffer) && _rentable.Contains(own) && !_live.ContainsKey(own))
+            {
+                if (TracePoolOwnership)
+                    PoolViolation($"DOUBLE-RETURN '{name}': {Bid(own)} is already free; not pooling the live {Bid(buffer.Buffer)} " +
+                                  $"(node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                return;
+            }
             if (StrictReturnIdentity)
             {
-                var own = BufferOf(tensor.Data);
                 if (own != null && !ReferenceEquals(own, buffer.Buffer))
                 {
                     if (TracePoolOwnership)
@@ -856,8 +921,9 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
                                   $"(node {Graph.GraphExecutor.CurrentRunNodeIndex}, ownAlreadyFree={IsBufferFree(actual)})");
             }
             _namedBuffers.Remove(name);
+            _live.Remove(buffer.Buffer);
             ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
-            lock (_sync) PushFree(buffer);
+            PushFree(buffer);
             if (Graph.GraphExecutor.SuppressDrains) CaptureReturnCount++;
         }
     }
@@ -884,10 +950,18 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     public bool Rename(string oldName, string newName)
     {
         if (oldName == newName) return true;
-        if (!_namedBuffers.TryGetValue(oldName, out var buf)) return false;
-        _namedBuffers.Remove(oldName);
-        _namedBuffers[newName] = buf;   // overwrites any prior newName entry (the reshape never pre-rents one)
-        return true;
+        lock (_sync)
+        {
+            if (!_namedBuffers.TryGetValue(oldName, out var buf)) return false;
+            _namedBuffers.Remove(oldName);
+            // Overwrites any prior newName entry (the reshape never pre-rents one); a live one it displaces is orphaned.
+            if (_namedBuffers.TryGetValue(newName, out var displaced) && !ReferenceEquals(displaced, buf)
+                && _live.TryGetValue(displaced.Buffer, out var orphan))
+                orphan.Name = null;
+            _namedBuffers[newName] = buf;
+            if (_live.TryGetValue(buf.Buffer, out var moved)) moved.Name = newName;
+            return true;
+        }
     }
 
     /// <summary>Rent an fp16 (<see cref="ILGPU.Half"/>) ACTIVATION tensor — half the bytes of <see cref="Rent"/>.
@@ -913,7 +987,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         {
             var buffer = stack.Pop();
             Interlocked.Add(ref _freeBucketedBytesCounter, -buffer.LengthInBytes);
-            if (name != null) { NoteRebindHalf(name, buffer); _halfNamedBuffers[name] = buffer; }
+            if (name != null) RecordHalf(name, buffer);
             UpdatePeaks();
             return new HalfTensor(buffer.View, shape, name);
         }
@@ -924,7 +998,8 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             reclaimed => $"GPU out of memory renting fp16 '{name}' (+{bucketSize * 2L / 1048576}MB) after reclaiming " +
                          $"{reclaimed / 1048576}MB of pooled buffers; {_allHalfBuffers.Count} fp16 + {_allBuffers.Count} fp32 live. Exceeds VRAM.");
         _allHalfBuffers.Add(newBuffer);
-        if (name != null) { NoteRebindHalf(name, newBuffer); _halfNamedBuffers[name] = newBuffer; }
+        _rentable.Add(newBuffer.Buffer);
+        if (name != null) RecordHalf(name, newBuffer);
         UpdatePeaks();
         return new HalfTensor(newBuffer.View, shape, name);
     }
@@ -942,29 +1017,43 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     /// <summary>Return an fp16 (Half) tensor's buffer to the pool for reuse by name.</summary>
     public void ReturnHalf(HalfTensor tensor)
     {
-        var name = tensor.Name;
-        if (name != null && _halfNamedBuffers.TryGetValue(name, out var buffer))
+        lock (_sync)
         {
-            if (TracePoolOwnership)
+            var name = tensor.Name;
+            var own = BufferOf(tensor.Data);
+            MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>? free = null;
+            // Same identity rules as Return: a stale tensor frees its own orphaned buffer, a double Return frees nothing.
+            if (own != null && _liveHalf.TryGetValue(own, out var mine) && mine.Name == null)
             {
-                var actual = BufferOf(tensor.Data);
-                if (actual != null && !ReferenceEquals(actual, buffer.Buffer))
-                    PoolViolation($"ALIEN-RETURN (fp16) '{name}': pooling {Bid(buffer.Buffer)} but this tensor views {Bid(actual)} " +
-                                  $"- {Bid(buffer.Buffer)} goes into the free bucket while STILL LIVE (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                _liveHalf.Remove(own);
+                free = mine.Buffer;
             }
-            _halfNamedBuffers.Remove(name);
-            ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
-            int bucketSize = (int)buffer.Length;
-            lock (_sync)
+            else if (name != null && _halfNamedBuffers.TryGetValue(name, out var buffer))
             {
-                if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
+                if (own != null && !ReferenceEquals(own, buffer.Buffer) && _rentable.Contains(own) && !_liveHalf.ContainsKey(own))
                 {
-                    stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
-                    _halfBuckets[bucketSize] = stack;
+                    if (TracePoolOwnership)
+                        PoolViolation($"DOUBLE-RETURN (fp16) '{name}': {Bid(own)} is already free; not pooling the live {Bid(buffer.Buffer)} " +
+                                      $"(node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                    return;
                 }
-                stack.Push(buffer);
-                Interlocked.Add(ref _freeBucketedBytesCounter, buffer.LengthInBytes);
+                if (TracePoolOwnership && own != null && !ReferenceEquals(own, buffer.Buffer))
+                    PoolViolation($"ALIEN-RETURN (fp16) '{name}': pooling {Bid(buffer.Buffer)} but this tensor views {Bid(own)} " +
+                                  $"- the name's record is not this tensor's buffer (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                _halfNamedBuffers.Remove(name);
+                _liveHalf.Remove(buffer.Buffer);
+                free = buffer;
             }
+            if (free == null) return;
+            ReturnLog?.Add((name ?? "(orphan)", free, Graph.GraphExecutor.CurrentRunNodeIndex));
+            int bucketSize = (int)free.Length;
+            if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
+            {
+                stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
+                _halfBuckets[bucketSize] = stack;
+            }
+            stack.Push(free);
+            Interlocked.Add(ref _freeBucketedBytesCounter, free.LengthInBytes);
         }
     }
 
@@ -1632,6 +1721,9 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         _allBuffers.Clear();
         _allHalfBuffers.Clear();
         _buckets.Clear();
+        _rentable.Clear();
+        _live.Clear();
+        _liveHalf.Clear();
         try { _fp16Convert?.Dispose(); } catch { /* kernel cache may already be torn down */ }
         _fp16Convert = null;
         foreach (var t in _pendingFp16Temps) { try { t.Dispose(); } catch { /* may already be gone */ } }

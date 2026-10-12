@@ -66,6 +66,43 @@ public abstract partial class MLTestBase
         }
     });
 
+    /// <summary>
+    /// A name re-Rented while its previous tensor is live (the GGUF decode loop's 'logits', Whisper's per-step
+    /// 'present.*'): returning the OLD tensor must free the old buffer, never the name's new, live one. Before,
+    /// Return pooled whatever the name recorded, so a live buffer sat in the free bucket until a reclaim freed it
+    /// under a running kernel ("an illegal memory access", Vertex 2026-10-12). Also: a second Return of the same
+    /// tensor frees nothing, and a tensor that only VIEWS memory the pool never rented under that name (an alias)
+    /// still frees the buffer rented under the name.
+    /// </summary>
+    [TestMethod]
+    public async Task MemoryPressure_ReturnFreesTheReturnedTensorsBuffer_NotTheNamesNewOne() => await RunTest(async accelerator =>
+    {
+        using var pool = new BufferPool(accelerator);
+        var shape = new[] { 4096 };
+        var first = pool.Rent(shape, "logits");
+        var second = pool.Rent(shape, "logits");   // same name, the first still live
+        pool.Return(first);
+        if (!pool.IsReturnedToPool(first)) throw new Exception("returning the stale tensor did not free its own buffer");
+        if (pool.IsReturnedToPool(second)) throw new Exception("returning the stale tensor freed the name's NEW, live buffer");
+
+        pool.Return(first);                          // a second Return of the same tensor
+        if (pool.IsReturnedToPool(second)) throw new Exception("a double Return freed the name's live buffer");
+
+        var third = pool.Rent(shape, "logits");      // takes the freed first buffer back
+        pool.Return(second);
+        if (!pool.IsReturnedToPool(second)) throw new Exception("the second tensor's own Return did not free it");
+        if (pool.IsReturnedToPool(third)) throw new Exception("returning the second tensor freed the third");
+        pool.Return(third);
+
+        // Alias: a tensor named "out" viewing memory the pool never rented under that name frees the buffer that WAS
+        // rented under "out" (an operator that replaced its output with a view).
+        var rentedOut = pool.Rent(shape, "out");
+        using var external = accelerator.Allocate1D<float>(shape[0]);
+        pool.Return(new Tensor(external.View, shape, "out"));
+        if (!pool.IsReturnedToPool(rentedOut)) throw new Exception("an aliased Return did not free the buffer rented under its name");
+        await Task.CompletedTask;
+    });
+
     /// <summary>A pinned pool (a captured graph replays its free buffers) gives nothing back until unpinned.</summary>
     [TestMethod]
     public async Task MemoryPressure_PinnedPoolKeepsItsFreeBuffers() => await RunTest(async accelerator =>
