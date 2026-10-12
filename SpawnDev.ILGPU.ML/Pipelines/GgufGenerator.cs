@@ -53,6 +53,15 @@ public sealed class GgufGenerator : IDisposable
     /// common prefix on the next request.</summary>
     private int[]? _cachedIds;
 
+    /// <summary>
+    /// A run is about to overwrite the K/V rows from <paramref name="p"/> on: until it finishes and records what it
+    /// left behind, only the first <paramref name="p"/> rows are known to hold <see cref="_cachedIds"/>. Without this a
+    /// run that was CANCELLED (Vertex interrupts a reply when someone speaks) or threw left the record describing
+    /// rows it had overwritten, and the next prompt sharing that prefix decoded from another prompt's context:
+    /// token soup after every interrupted reply (Vertex BrainTests, 2026-10-12).
+    /// </summary>
+    private void ForgetCachedRowsFrom(int p) => _cachedIds = p > 0 && _cachedIds != null ? _cachedIds[..p] : null;
+
     /// <summary>Enable KV-prefix caching: on each request, reuse the cached K/V for the longest common token
     /// prefix shared with the previous request (same tokens at the same absolute positions → bit-identical
     /// K/V), prefilling only the new suffix. The #1 win for agentic clients (Claude CLI) that re-send a near-
@@ -229,6 +238,7 @@ public sealed class GgufGenerator : IDisposable
             stepIds = promptIds;
         }
         LastReusedPrefix = P;
+        ForgetCachedRowsFrom(P);
         StopReason stop = StopReason.Length;
 
         for (int step = 0; step < maxNew; step++)
@@ -447,6 +457,7 @@ public sealed class GgufGenerator : IDisposable
         if (P > 0) { _session.SetGGUFDecodePastLen(P); stepIds = promptIds[P..]; }
         else { _session.ResetGGUFDecode(); stepIds = promptIds; }
         LastReusedPrefix = P;
+        ForgetCachedRowsFrom(P);
 
         var generated = new List<int>();
         double ttftMs = 0;

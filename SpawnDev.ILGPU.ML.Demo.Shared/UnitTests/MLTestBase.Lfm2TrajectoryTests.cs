@@ -271,6 +271,71 @@ public abstract partial class MLTestBase
     public async Task Qwen25_PrefixCacheReuse_SamePromptTwice_IsIdentical()
         => await SamePromptTwiceIsIdentical("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", "qwen2.5");
 
+    /// <summary>
+    /// A generation CANCELLED part way (Vertex interrupts a reply when someone speaks) must not poison the KV-prefix
+    /// cache. The record of which tokens the cache holds (_cachedIds) was only written when a generation FINISHED,
+    /// while a run overwrites the K/V rows from its reuse point on as soon as it starts: after a cancel the record
+    /// still described rows the cancelled run had overwritten, and the next prompt sharing that prefix decoded from
+    /// someone else's context. Seen 2026-10-12 in Vertex BrainTests: every reply after an interrupted one was token
+    /// soup ("What can be put in placeur single. Ited into hou deeds...").
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Qwen25_PrefixCache_ACancelledGenerationDoesNotPoisonTheNext() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        bool prevPrefix = SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache;
+        SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = true;
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+            var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+            {
+                const string system = "You are a friendly assistant who answers briefly and clearly.";
+                var a = new[] { ("system", system), ("user", "In two sentences, what is a chicken?") };
+                var b = new[] { ("system", system), ("user", "Tell me a very long story about a dragon who builds a castle.") };
+                var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" };
+                var first = await pipe.GenerateAsync(a, config: cfg, ct: cts.Token);
+
+                // B shares only the system prompt with what is cached: its prefill overwrites the rows after it. Abort B
+                // at its first token the way a consumer does (Vertex's token callback throws once the turn is
+                // cancelled), after that prefill and before the generator can record what it left in the cache. A
+                // cooperative cancel (the token's IsCancellationRequested) ends the loop cleanly and is not this case.
+                try
+                {
+                    await pipe.GenerateAsync(b, config: cfg, onToken: (n, _) => throw new OperationCanceledException("interrupted"), ct: cts.Token);
+                    throw new Exception("the second generation was not aborted");
+                }
+                catch (OperationCanceledException) when (!cts.IsCancellationRequested) { }
+
+                var again = await pipe.GenerateAsync(a, config: cfg, ct: cts.Token);
+                Console.WriteLine($"[qwen-cancel] reusedPrefix={pipe.LastReusedPrefix}");
+                if (again != first)
+                {
+                    int at = 0; while (at < Math.Min(first.Length, again.Length) && first[at] == again[at]) at++;
+                    throw new Exception($"[qwen-cancel] the same prompt after a cancelled generation gave a different greedy answer " +
+                        $"(reused {pipe.LastReusedPrefix} tokens; diverges at char {at}).\n  first='{first.Trim()}'\n  after='{again.Trim()}'");
+                }
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"[qwen-cancel] hub/network unavailable: {ex.Message}");
+        }
+        finally
+        {
+            SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = prevPrefix;
+            await client.DisposeAsync();
+        }
+    });
+
     private async Task SamePromptTwiceIsIdentical(string repoId, string file, string tag) => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
