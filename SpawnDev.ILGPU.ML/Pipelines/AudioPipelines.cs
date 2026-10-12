@@ -185,6 +185,9 @@ public class SpeechRecognitionPipeline : IDisposable
         _decoderSession = decoderSession;
         _decoderWithPastSession = decoderWithPastSession;
         _accelerator = accelerator;
+        // Each decode step's present.* become the next step's past: outputs live until no run uses them.
+        _decoderSession.OutputsLiveUntilNextRun = true;
+        if (_decoderWithPastSession != null) _decoderWithPastSession.OutputsLiveUntilNextRun = true;
     }
 
     /// <summary>Load tokenizer from HuggingFace tokenizer.json.</summary>

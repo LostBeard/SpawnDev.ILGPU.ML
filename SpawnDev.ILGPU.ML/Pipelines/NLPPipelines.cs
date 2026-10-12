@@ -182,6 +182,7 @@ public class FeatureExtractionPipeline : IDisposable
         int maxLength = 128, int hiddenSize = 768)
     {
         _session = session;
+        _session.OutputsLiveUntilNextRun = true; // one run per text; its outputs go back at the next one
         _accelerator = accelerator;
         _maxLength = maxLength;
         _hiddenSize = hiddenSize;

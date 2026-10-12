@@ -277,6 +277,7 @@ public sealed class KokoroPipeline : IDisposable
         KokoroIstftTail? tail = null, string tailStatus = "not attempted")
     {
         _session = session;
+        _session.OutputsLiveUntilNextRun = true; // one run per line; its outputs go back at the next line
         _accelerator = accelerator;
         _tail = tail;
         TailStatus = tailStatus;

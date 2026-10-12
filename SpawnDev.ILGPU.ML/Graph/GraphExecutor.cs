@@ -1056,6 +1056,10 @@ public class GraphExecutor : IDisposable
     /// the tensors are invalid. Outputs that alias an input or a weight are skipped (not pool-owned),
     /// and a name the pool no longer records is a no-op, so calling this twice is harmless.
     /// </summary>
+    /// <summary>Drops the prior run's outputs from the decode-loop recycling below: the session returns them itself
+    /// (<see cref="InferenceSession.OutputsLiveUntilNextRun"/>), by identity, and never while they are an input.</summary>
+    internal void ForgetPriorRunOutputs() => _priorRunOutputs = null;
+
     public void ReturnOutputs(IEnumerable<Tensor> outputs)
     {
         foreach (var t in outputs)

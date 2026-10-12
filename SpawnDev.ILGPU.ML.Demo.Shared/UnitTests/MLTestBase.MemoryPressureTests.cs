@@ -103,6 +103,63 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    /// <summary>
+    /// <see cref="InferenceSession.OutputsLiveUntilNextRun"/>: a loop that feeds each run's output back in (a decoder's
+    /// present K/V becoming past K/V) and never calls ReturnOutputs. The previous outputs go back to the pool at the
+    /// next run, except the one passed back in, which must survive that run untouched. Without it every run left its
+    /// outputs orphaned (the pool grew by a set per run: 3.4 GB of language-model logits in Vertex, 2026-10-12);
+    /// returned too eagerly, the fed-back input would be recycled under the run reading it and the values corrupt.
+    /// </summary>
+    [TestMethod]
+    public async Task MemoryPressure_OutputsLiveUntilNextRun_FeedbackLoopNeitherLeaksNorCorrupts() => await RunTest(async accelerator =>
+    {
+        const int N = 64 * 1024;
+        // t = x + x is rented FIRST, then y = t - x reads x again: y == x. If the fed-back x had been given back before
+        // this run it would be the only free buffer of its size, t would take it and overwrite it (y = 2x - 2x = 0).
+        // Kept forever instead (no lifetime at all), every run's y would stay allocated: the pool grows.
+        var graph = new ModelGraph
+        {
+            Name = "feedback",
+            Inputs = { new GraphValueInfo { Name = "x", Shape = new[] { N } }, new GraphValueInfo { Name = "one", Shape = new[] { N } } },
+            Outputs = { new GraphValueInfo { Name = "y", Shape = new[] { N } } },
+            Nodes =
+            {
+                new GraphNode { OpType = "Add", Inputs = { "x", "x" }, Outputs = { "t" } },
+                new GraphNode { OpType = "Sub", Inputs = { "t", "x" }, Outputs = { "y" } },
+            },
+        };
+        using var session = InferenceSession.Create(accelerator, graph, new Dictionary<string, Tensor>());
+        session.OutputsLiveUntilNextRun = true;
+        var start = RandomFloats(N, seed: 3);
+        using var xBuf = accelerator.Allocate1D(start);
+        using var oneBuf = accelerator.Allocate1D(Enumerable.Repeat(1f, N).ToArray());
+        var one = new Tensor(oneBuf.View, new[] { N }, "one");
+        var x = new Tensor(xBuf.View, new[] { N }, "x");
+        int settled = -1;
+        const int Runs = 40;
+        for (int run = 0; run < Runs; run++)
+        {
+            var input = x;
+            var outs = await session.RunAsync(new Dictionary<string, Tensor> { ["x"] = input, ["one"] = one });
+            // The run just read `input`; it is only given back at the NEXT run, once nothing passes it in any more.
+            if (run > 0 && session.Executor.Pool.IsReturnedToPool(input))
+                throw new Exception($"run {run}: the fed-back input was given back to the pool before the run that reads it finished");
+            // Given back too early, the input is free when this run rents its output, and the output lands ON the input
+            // (elementwise Sub still computes correctly in place on CPU/CUDA; WebGPU refuses the aliased binding).
+            if (run > 0 && ReferenceEquals(((IArrayView)outs["y"].Data).Buffer, ((IArrayView)input.Data).Buffer))
+                throw new Exception($"run {run}: the output was rented over the fed-back input it was reading");
+            x = outs["y"];
+            await accelerator.SynchronizeAsync();
+            AssertClose(start, await x.Data.SubView(0, N).CopyToHostAsync(), 1e-4f, $"run {run}: ");
+            if (run == 4) settled = session.Executor.AllocatedBufferCount;
+            if (run > 4 && session.Executor.AllocatedBufferCount > settled)
+                throw new Exception($"the pool grew from {settled} to {session.Executor.AllocatedBufferCount} buffers by run {run}: outputs are not given back");
+        }
+        await accelerator.SynchronizeAsync();
+        var got = await x.Data.SubView(0, N).CopyToHostAsync();
+        AssertClose(start, got, 1e-4f, "after the feedback loop: ");
+    });
+
     /// <summary>A pinned pool (a captured graph replays its free buffers) gives nothing back until unpinned.</summary>
     [TestMethod]
     public async Task MemoryPressure_PinnedPoolKeepsItsFreeBuffers() => await RunTest(async accelerator =>

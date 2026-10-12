@@ -2849,9 +2849,11 @@ public class InferenceSession : IDisposable
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
     {
         var exec = ResolveExecutor(inputs);
+        BeforeRun(exec, inputs);
         var result = exec.Run(inputs);
         LastExecutorBufferCount = exec.AllocatedBufferCount;
         _lastRunExecutor = exec;
+        AfterRun(exec, result);
         return result;
     }
 
@@ -2868,7 +2870,13 @@ public class InferenceSession : IDisposable
     /// already-returned names are no-ops.
     /// </summary>
     public void ReturnOutputs(Dictionary<string, Tensor> outputs)
-        => (_lastRunExecutor ?? _executor).ReturnOutputs(outputs.Values);
+    {
+        // Returned now: never again at the next run (by then a buffer may be re-rented under the same name).
+        if (_heldOutputs.Count > 0)
+            _heldOutputs.RemoveAll(h => outputs.Values.Any(t => ReferenceEquals(t, h.Tensor)
+                || (BufferOf(t) is { } b && ReferenceEquals(b, BufferOf(h.Tensor)))));
+        (_lastRunExecutor ?? _executor).ReturnOutputs(outputs.Values);
+    }
 
     /// <summary>
     /// Release the activation arena of every executor this session owns (main and per-shape) and
@@ -2941,10 +2949,61 @@ public class InferenceSession : IDisposable
     {
         var exec = ResolveExecutor(inputs);
         exec.SkipCompletionWait = SkipCompletionWait;
+        BeforeRun(exec, inputs);
         var result = await exec.RunAsync(inputs);
         LastExecutorBufferCount = exec.AllocatedBufferCount;
         _lastRunExecutor = exec;
+        AfterRun(exec, result);
         return result;
+    }
+
+    /// <summary>
+    /// Outputs stay valid until this session's NEXT run, and are given back to the pool then, except any passed back
+    /// in as an input of that run (a decoder's present K/V becoming past K/V), which are kept until no run uses them.
+    /// For callers that run a session in a loop and never call <see cref="ReturnOutputs"/>.
+    /// </summary>
+    /// <remarks>
+    /// Graph outputs are rented like intermediates but never released by the executor (they are the results). A
+    /// loop that runs again rents the same output names, and the previous outputs were left with nothing pointing at
+    /// them. MEASURED 2026-10-12 (Vertex, one process): the language model's full-prompt 'logits' (229 MB each at
+    /// ~450 tokens) leaked once per reply, 3.4 GB after a few minutes, plus Whisper's per-step 'present.*'. Before the
+    /// pool returned by identity, a stale Return of the PREVIOUS 'logits' happened to free the newest one by name,
+    /// which hid the leak and put a live buffer in the free bucket.
+    /// Turning this on also stops the executor's own name-keyed prior-output recycling for this session: that one
+    /// returned a previous output even when it was passed back in as an input of the run about to read it.
+    /// </remarks>
+    public bool OutputsLiveUntilNextRun { get; set; }
+
+    private readonly List<(GraphExecutor Executor, Tensor Tensor)> _heldOutputs = new();
+
+    private void BeforeRun(GraphExecutor exec, Dictionary<string, Tensor> inputs)
+    {
+        if (!OutputsLiveUntilNextRun) return;
+        exec.ForgetPriorRunOutputs();
+        if (_heldOutputs.Count == 0) return;
+        var inUse = new HashSet<global::ILGPU.Runtime.MemoryBuffer>(ReferenceEqualityComparer.Instance);
+        foreach (var t in inputs.Values)
+            if (BufferOf(t) is { } b) inUse.Add(b);
+        for (int i = _heldOutputs.Count - 1; i >= 0; i--)
+        {
+            var (owner, tensor) = _heldOutputs[i];
+            if (BufferOf(tensor) is { } b && inUse.Contains(b)) continue;   // passed back in: keep it for now
+            owner.ReturnOutputs(new[] { tensor });
+            _heldOutputs.RemoveAt(i);
+        }
+    }
+
+    private void AfterRun(GraphExecutor exec, Dictionary<string, Tensor> outputs)
+    {
+        if (!OutputsLiveUntilNextRun) return;
+        foreach (var t in outputs.Values) _heldOutputs.Add((exec, t));
+    }
+
+    private static global::ILGPU.Runtime.MemoryBuffer? BufferOf(Tensor t) => RawBufferOf(t.Data);
+
+    private static global::ILGPU.Runtime.MemoryBuffer? RawBufferOf<TView>(TView view) where TView : struct, global::ILGPU.IArrayView
+    {
+        try { return view.Buffer; } catch { return null; }
     }
 
     // ── GGUF incremental decode (full-precision KV-cache) ──
@@ -3018,7 +3077,9 @@ public class InferenceSession : IDisposable
         exec.DecodePastLen = DecodePastLen;
         try
         {
+            BeforeRun(exec, inputs);
             var result = await exec.RunAsync(inputs);
+            AfterRun(exec, result);
             LastExecutorBufferCount = exec.AllocatedBufferCount;
             // Advance the KV cursor by the step's sequence length. input_ids is [1, seq] (seq = last dim);
             // the multimodal inputs_embeds path is [1, seq, n_embd] (seq = the MIDDLE dim, not n_embd).

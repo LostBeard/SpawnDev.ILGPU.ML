@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.7-local.2</Version>
+		<Version>5.3.7-local.3</Version>
 		<PackageReleaseNotes>v5.3.6: ChatTemplates.ParseToolCalls reads Llama 3.x pythonic tool calls (come_here(player='Aubri'), [a(x=1), b()]) when they are the whole reply; IsOnlyPythonicCalls tells a host there are no words left to show. Prose with parentheses is never taken for a call. On SpawnDev.ILGPU 5.3.5 + SpawnDev.SpawnJS 3.0.1. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

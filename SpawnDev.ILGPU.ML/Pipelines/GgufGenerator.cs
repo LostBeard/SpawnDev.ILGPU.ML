@@ -148,6 +148,7 @@ public sealed class GgufGenerator : IDisposable
         _cache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen);
         _session.EnableGGUFDecode(_cache);
         _session.CacheShapeReadbacks = true; // recycle fixed-shape decode buffers + warm-cache stable readbacks
+        _session.OutputsLiveUntilNextRun = true; // the prefill's full-prompt logits too, not only the decode steps'
         _eosId = _tokenizer.EosId;
         _maxSeqLen = maxSeqLen;
         _argmax = new GpuArgMax(accelerator);
