@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.7-local.5</Version>
-		<PackageReleaseNotes>v5.3.6: ChatTemplates.ParseToolCalls reads Llama 3.x pythonic tool calls (come_here(player='Aubri'), [a(x=1), b()]) when they are the whole reply; IsOnlyPythonicCalls tells a host there are no words left to show. Prose with parentheses is never taken for a call. On SpawnDev.ILGPU 5.3.5 + SpawnDev.SpawnJS 3.0.1. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.7</Version>
+		<PackageReleaseNotes>v5.3.7 - FIX: the node fold reused a data-dependent shape (Kokoro: two sentences of the same token count = CUDA illegal address); Shape/Size fold only when their input shape is fixed. Several models in one process stay inside GPU memory: every BufferPool gives its idle buffers to allocations anywhere on the device (SpawnDev.ILGPU 5.3.6 memory pressure), captured graphs pin their pools, Return frees the returned tensor own buffer (not the name newer one), and InferenceSession.OutputsLiveUntilNextRun stops decode loops leaking their outputs. GgufGenerator: a cancelled or aborted generation no longer poisons the KV-prefix cache. On SpawnDev.ILGPU 5.3.6 + SpawnDev.SpawnJS 3.0.3. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -38,8 +38,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.1" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.6-local.1" />
+		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.3" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.6" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -3,6 +3,58 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.7 - 2026-10-12 - several models in one process stay inside GPU memory; a cancelled reply cannot poison the next
+
+Found running Vertex (a chat model, Whisper, Kokoro and a sentence encoder together on a 12 GB RTX 4070): 14.7 GB of
+live buffers, 7.3 GB of it idle in buffer pools, 1.4 GB spilled into system RAM, and a one-sentence reply took 5.5
+minutes. Each fix below is red-checked.
+
+- **🔴 Node fold no longer reuses a data-dependent shape (a CUDA illegal address in 5.3.x since the fold).** The fold
+  (`GraphExecutor.FoldInputIndependentNodes`, 2026-09-30) treated every `Shape`/`Size` as a function of the executor's
+  input shapes. That is false whenever a VALUE sets a shape (Reshape's target, Expand, Range, ConstantOfShape...) or an
+  op's output size is its data (NonZero): Kokoro's vocoder length comes from the predicted durations, i.e. from the
+  text. Two sentences with the same token count share an executor, and the second one ran with the first one's length
+  (87,000 samples for 87,600): the vocoder's Pad got rank-3 pads on a rank-2 tensor and wrote past its buffer - CUDA
+  "an illegal memory access was encountered", which poisons the context for every model in the process (Vertex, live,
+  after one turn). Shape/Size now fold only when their input's shape is fixed; shapes are tracked as varying through
+  value-driven and data-shaped ops. Test `Pipeline_Kokoro_SameTokenCount_DifferentSentence_MatchesAFreshPipeline`
+  (illegal address before, identical to a fresh pipeline after).
+- **Diagnostics.** `BufferPool.PoisonFreedBuffers` (`ML_POISON_FREE=1`) fills every buffer with NaN as it goes back to
+  a free bucket - a premature release (or, as here, a shape gone wrong) shows up deterministically instead of only when
+  a reclaim happens to run - and reports a disposed or foreign buffer entering a bucket. `ML_TRACE_SHAPES=<substring>`
+  prints every matching node's input shapes, small host values and output shape. Tests
+  `Pool_NoBufferIsReleasedBeforeItsLastReader_Kokoro` / `_KokoroSentences` and
+  `MemoryPressure_KokoroSpeaksLineAfterLine_UnderAReclaimOnEveryAllocation`.
+- **Buffer pools give idle memory to the whole device.** Every `BufferPool` registers with its accelerator as an
+  `IDeviceMemoryReclaimer` (SpawnDev.ILGPU 5.3.6), so an allocation anywhere on the device - another model's pool, a KV
+  cache, a weight upload - takes free-bucket buffers back from the least recently used pool BEFORE the driver spills.
+  Partial reclaim frees the largest free buffers first. A lock guards the buckets against a reclaim arriving from
+  another thread (TryEnter: a busy pool is skipped). Test `MemoryPressure_IdlePoolGivesMemoryToAnotherPool` (CUDA).
+- **Captures pin their session's pools** (`InferenceSession.PinPools`; `CudaGraphCapture`, `WebGPUGraphCapture`,
+  `WebGPUDecodeCapture`). A captured graph replays the intermediates it was recorded with, which sit in the free buckets
+  between replays; without the pin a reclaim freed them and the next replay overwrote a buffer allocated after it - a
+  real use-after-free (`MemoryPressure_ReclaimLeavesACapturedGraphsBuffersAlone`). `ReleaseWorkingMemory` also respects
+  the pin now (`MemoryPressure_PinnedPoolKeepsItsFreeBuffers`, all backends).
+- **`Return` frees the returned tensor's own buffer.** Ownership was keyed on the tensor NAME; a name re-rented while
+  its previous tensor was live (the GGUF decode loop's `logits`, Whisper's per-step `present.*`) made returning the old
+  tensor pool the NEW, live buffer. Once reclaim existed that became "an illegal memory access was encountered". Named
+  rents are tracked by buffer identity; a stale return frees its own orphaned buffer, a double return frees nothing,
+  an output that only views memory rented under another name keeps the old behaviour
+  (`MemoryPressure_ReturnFreesTheReturnedTensorsBuffer_NotTheNamesNewOne`, all backends).
+- **`InferenceSession.OutputsLiveUntilNextRun`**: outputs go back to the pool at the session's next run, except any
+  passed back in as an input (a decoder's present K/V becoming past K/V), which are kept until no run uses them. It
+  also turns off the executor's name-keyed prior-output recycling for that session, which could return a prior output
+  while it was the next run's input. On for `GgufGenerator`, Whisper's decoder sessions, `KokoroPipeline` and
+  `FeatureExtractionPipeline`. MEASURED before: 3.4 GB of orphaned prefill `logits` after a few minutes
+  (`MemoryPressure_OutputsLiveUntilNextRun_FeedbackLoopNeitherLeaksNorCorrupts`, all backends).
+- **GgufGenerator: the KV-prefix record only claims rows a step actually wrote.** A generation cancelled before its
+  prefill ran recorded its whole prompt as cached (also in 5.3.6): the next request sharing that prompt reused rows
+  holding another conversation - token soup in Vertex after every interrupted reply. One aborted by an exception from
+  the token callback kept a record of rows it had overwritten. `written` counts the rows each step wrote and the record
+  is cut to the reuse point as soon as a run starts (`Qwen25_PrefixCache_ACancelledGenerationDoesNotPoisonTheNext`,
+  HeavyModel: red-checked, "A goose is a domesticated bird..." to a question about a duck).
+- On SpawnDev.ILGPU 5.3.6 and SpawnDev.SpawnJS 3.0.3.
+
 ## 5.3.6 - 2026-10-11 - Llama pythonic tool calls
 
 - **`ChatTemplates.ParseToolCalls` reads Llama 3.x's pythonic form**: `come_here(player='Aubri')`, or a list

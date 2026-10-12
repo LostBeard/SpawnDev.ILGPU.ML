@@ -137,4 +137,60 @@ public abstract partial class MLTestBase
                             + $"| capture: {pipeline.CaptureStatus}");
         }
     });
+
+    /// <summary>
+    /// Two DIFFERENT sentences with the SAME token count, one after the other on one pipeline, each identical to the
+    /// same sentence on a fresh pipeline.
+    /// </summary>
+    /// <remarks>
+    /// Kokoro's audio length is not a function of its input SHAPE: the vocoder runs at a length set by the predicted
+    /// durations, i.e. by the input DATA. Two sentences of the same token count share one compiled executor, and the
+    /// executor's fold (<see cref="Graph.GraphExecutor.FoldInputIndependentNodes"/>) treated every Shape/Size as a
+    /// function of the input shapes - so the second sentence reused the first one's lengths (87,000 samples where it
+    /// produced 87,600) for the Reshape in front of the vocoder's Pad, and that Pad ran on a rank-2 tensor with rank-3
+    /// pads. MEASURED 2026-10-12 (Vertex): an illegal address under memory pressure; with the freed memory still mapped,
+    /// a quiet write past the buffer. "The number 1..." and "The number 2..." are both 60 tokens.
+    /// </remarks>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy")]
+    public async Task Pipeline_Kokoro_SameTokenCount_DifferentSentence_MatchesAFreshPipeline() => await RunTest(async accelerator =>
+    {
+        RequireShippableTtsBackend(accelerator);
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] modelBytes, voiceBytes;
+        try
+        {
+            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new UnsupportedTestException($"the hub did not serve Kokoro: {ex.Message}");
+        }
+        var pack = KokoroVoicePack.FromBytes("af_heart", voiceBytes);
+        var phonemizer = SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer();
+        var first = phonemizer.ToSymbols("The number 1 is a placeholder used to show nothing.");
+        var second = phonemizer.ToSymbols("The number 2 is a placeholder used to show nothing.");
+
+        float[] alone;
+        using (var fresh = KokoroPipeline.Create(accelerator, modelBytes))
+            alone = (await fresh.SpeakAsync(second, pack)).Samples;
+
+        using var pipeline = KokoroPipeline.Create(accelerator, modelBytes);
+        var a = await pipeline.SpeakAsync(first, pack);
+        var b = await pipeline.SpeakAsync(second, pack);
+        if (a.Tokens != b.Tokens)
+            throw new Exception($"{BackendName}: the fixture is wrong - {a.Tokens} and {b.Tokens} tokens; the two sentences must "
+                + "share a token count (and so an executor) for this to test anything");
+        if (a.Samples.Length == b.Samples.Length)
+            throw new Exception($"{BackendName}: the fixture is wrong - both sentences are {a.Samples.Length} samples; their "
+                + "durations must differ for this to test anything");
+        if (b.Samples.Length != alone.Length)
+            throw new Exception($"{BackendName}: the second sentence came out {b.Samples.Length} samples after the first, "
+                + $"{alone.Length} on a fresh pipeline - it reused the first sentence's data-dependent lengths");
+        float maxDiff = 0f;
+        for (int i = 0; i < alone.Length; i++) maxDiff = MathF.Max(maxDiff, MathF.Abs(b.Samples[i] - alone[i]));
+        if (maxDiff > 1e-3f)
+            throw new Exception($"{BackendName}: the second sentence differs from a fresh pipeline's by up to {maxDiff:G4}");
+    });
 }

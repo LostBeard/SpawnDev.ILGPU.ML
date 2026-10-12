@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML.Graph;
+using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 
@@ -259,6 +260,181 @@ public abstract partial class MLTestBase
         finally
         {
             foreach (var j in junk) j.Dispose();
+        }
+    });
+
+    /// <summary>
+    /// Kokoro speaking line after line with the device budget so tight that EVERY allocation first reclaims every idle
+    /// pooled buffer. A buffer the pool has in a free bucket while a tensor still uses it is freed under it here, and
+    /// the next kernel touching it is CUDA_ERROR_ILLEGAL_ADDRESS, which poisons the context for every model in the
+    /// process. MEASURED 2026-10-12 in Vertex (llama3.1:8b + Kokoro + Whisper + Silero on a 12 GB card, so reclaims
+    /// were real): the third Kokoro line after a reclaim faulted; Kokoro alone under forced pressure reproduces it.
+    /// The same budget leaves the audio identical to an unpressured run.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy")]
+    public async Task MemoryPressure_KokoroSpeaksLineAfterLine_UnderAReclaimOnEveryAllocation() => await RunTest(async accelerator =>
+    {
+        if (accelerator is not CudaAccelerator)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: the device budget is read from CUDA (cuMemGetInfo)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] modelBytes, voiceBytes;
+        try
+        {
+            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new UnsupportedTestException($"the hub did not serve Kokoro: {ex.Message}");
+        }
+        var pack = KokoroVoicePack.FromBytes("af_heart", voiceBytes);
+        // The STREAMING loader, as SpawnDev.AI loads it: weights uploaded while the file is read.
+        // The reference, from a pipeline of its own with no pressure.
+        float[] reference;
+        using (var clean = await KokoroPipeline.CreateFromStreamAsync(accelerator, new MemoryStream(modelBytes)))
+            reference = (await clean.SpeakTokensAsync(KokoroReferenceTokens, pack)).Samples;
+
+        // As Vertex used it: warmed on a short line, then a sentence length seen for the FIRST time under pressure
+        // (its shape executor built while reclaims fire) and said again and again. Vertex faulted on the third.
+        using var pipeline = await KokoroPipeline.CreateFromStreamAsync(accelerator, new MemoryStream(modelBytes));
+        await pipeline.SpeakTokensAsync(KokoroShorterTokens, pack);
+        var headroom = accelerator.DeviceMemoryHeadroomBytes;
+        var reclaimsBefore = MemoryPressure.ProactiveReclaimCount;
+        accelerator.DeviceMemoryHeadroomBytes = accelerator.MemorySize; // never "enough": every allocation reclaims first
+        try
+        {
+            for (int line = 0; line < 4; line++)
+            {
+                var audio = (await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack)).Samples;
+                await accelerator.SynchronizeAsync();
+                if (audio.Length != reference.Length)
+                    throw new Exception($"line {line}: {audio.Length} samples, {reference.Length} unpressured");
+                float maxDiff = 0f;
+                for (int i = 0; i < audio.Length; i++) maxDiff = MathF.Max(maxDiff, MathF.Abs(audio[i] - reference[i]));
+                if (maxDiff > 1e-3f)
+                    throw new Exception($"line {line}: the audio differs from the unpressured run by up to {maxDiff:G4} - a reclaimed buffer was still in use");
+            }
+        }
+        finally
+        {
+            accelerator.DeviceMemoryHeadroomBytes = headroom;
+        }
+        if (MemoryPressure.ProactiveReclaimCount == reclaimsBefore)
+            throw new Exception("no reclaim fired: the test did not put the budget under pressure");
+    });
+
+    /// <summary>
+    /// No buffer goes back to the pool while a later node still reads it. With <see cref="BufferPool.PoisonFreedBuffers"/>
+    /// every buffer is filled with NaN as it is released, so a premature release turns the audio NaN - deterministically,
+    /// with no dependence on whether a reclaim happens to run between the release and the late read. Kokoro, both a
+    /// first run of a shape and cached runs, against the same lines spoken without the poison.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy")]
+    public async Task Pool_NoBufferIsReleasedBeforeItsLastReader_Kokoro() => await RunTest(async accelerator =>
+    {
+        RequireShippableTtsBackend(accelerator);
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] modelBytes, voiceBytes;
+        try
+        {
+            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new UnsupportedTestException($"the hub did not serve Kokoro: {ex.Message}");
+        }
+        var pack = KokoroVoicePack.FromBytes("af_heart", voiceBytes);
+        long[][] lines = { KokoroReferenceTokens, KokoroShorterTokens, KokoroReferenceTokens, KokoroShorterTokens };
+
+        float[][] clean;
+        using (var pipeline = await KokoroPipeline.CreateFromStreamAsync(accelerator, new MemoryStream(modelBytes)))
+        {
+            clean = new float[lines.Length][];
+            for (int i = 0; i < lines.Length; i++) clean[i] = (await pipeline.SpeakTokensAsync(lines[i], pack)).Samples;
+        }
+
+        var was = BufferPool.PoisonFreedBuffers;
+        BufferPool.PoisonFreedBuffers = true;
+        try
+        {
+            using var pipeline = await KokoroPipeline.CreateFromStreamAsync(accelerator, new MemoryStream(modelBytes));
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var got = (await pipeline.SpeakTokensAsync(lines[i], pack)).Samples;
+                int nan = got.Count(float.IsNaN);
+                if (nan > 0)
+                    throw new Exception($"{BackendName}: line {i} ({lines[i].Length} tokens): {nan} of {got.Length} samples NaN - "
+                        + "a buffer was released to the pool while a later node still read it");
+                if (got.Length != clean[i].Length)
+                    throw new Exception($"{BackendName}: line {i}: {got.Length} samples, {clean[i].Length} without the poison");
+                float maxDiff = 0f;
+                for (int k = 0; k < got.Length; k++) maxDiff = MathF.Max(maxDiff, MathF.Abs(got[k] - clean[i][k]));
+                if (maxDiff > 1e-3f)
+                    throw new Exception($"{BackendName}: line {i}: differs from the unpoisoned run by up to {maxDiff:G4} - "
+                        + "a released buffer was read after its release");
+            }
+        }
+        finally
+        {
+            BufferPool.PoisonFreedBuffers = was;
+        }
+    });
+
+    /// <summary>
+    /// The same check as <see cref="Pool_NoBufferIsReleasedBeforeItsLastReader_Kokoro"/>, on the sentence sequence that
+    /// faulted in Vertex (2026-10-12): two voices, and lines whose lengths change from one to the next, so every line
+    /// may meet a new shape executor. Under <see cref="BufferPool.PoisonFreedBuffers"/> and nothing else, Vertex's third
+    /// "The number N..." line hit CUDA_ERROR_ILLEGAL_ADDRESS in Pad.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy")]
+    public async Task Pool_NoBufferIsReleasedBeforeItsLastReader_KokoroSentences() => await RunTest(async accelerator =>
+    {
+        RequireShippableTtsBackend(accelerator);
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] modelBytes, heart, michael;
+        try
+        {
+            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
+            heart = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+            michael = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/am_michael.bin");
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new UnsupportedTestException($"the hub did not serve Kokoro: {ex.Message}");
+        }
+        var heartPack = KokoroVoicePack.FromBytes("af_heart", heart);
+        var michaelPack = KokoroVoicePack.FromBytes("am_michael", michael);
+        var phonemizer = SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer();
+        var lines = new List<(string Text, KokoroVoicePack Voice)>
+        {
+            ("Hello there.", heartPack),
+            ("Vertex, can you build us a house by the river?", michaelPack),
+        };
+        for (int i = 0; i < 4; i++) lines.Add(($"The number {i} is a placeholder used to show nothing.", heartPack));
+
+        var was = BufferPool.PoisonFreedBuffers;
+        BufferPool.PoisonFreedBuffers = true;
+        try
+        {
+            using var pipeline = await KokoroPipeline.CreateFromStreamAsync(accelerator, new MemoryStream(modelBytes));
+            for (int i = 0; i < lines.Count; i++)
+            {
+                var audio = await pipeline.SpeakAsync(phonemizer.ToSymbols(lines[i].Text), lines[i].Voice);
+                await accelerator.SynchronizeAsync();
+                int nan = audio.Samples.Count(float.IsNaN);
+                Console.WriteLine($"[pool-sentences] line {i} '{lines[i].Text}': {audio.Tokens} tokens, {audio.Samples.Length} samples, {nan} NaN");
+                if (nan > 0)
+                    throw new Exception($"{BackendName}: line {i} ({audio.Tokens} tokens): {nan} NaN samples - "
+                        + "a buffer was released to the pool while a later node still read it");
+            }
+        }
+        finally
+        {
+            BufferPool.PoisonFreedBuffers = was;
         }
     });
 }

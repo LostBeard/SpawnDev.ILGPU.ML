@@ -218,6 +218,20 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         = Environment.GetEnvironmentVariable("ML_POISON_RENT") is "1" or "true";
 
     /// <summary>
+    /// DIAGNOSTIC (<c>ML_POISON_FREE=1</c>): fill a buffer with NaN the moment it goes back into a free bucket.
+    /// </summary>
+    /// <remarks>
+    /// The twin of <see cref="PoisonRentedBuffers"/>, for the opposite defect: a buffer released while a later node
+    /// still reads it. Without memory pressure such a buffer usually still holds its values when the late reader
+    /// runs, so the bug is silent; under pressure a reclaim frees it first and the read is an illegal address
+    /// (MEASURED 2026-10-12, Vertex: Kernel_PadImpl reading freed memory on CUDA). The fill is enqueued after the
+    /// release on the same stream, so a reader enqueued BEFORE the release still sees the real values: only a
+    /// premature release turns an output NaN.
+    /// </remarks>
+    public static bool PoisonFreedBuffers
+        = Environment.GetEnvironmentVariable("ML_POISON_FREE") is "1" or "true";
+
+    /// <summary>
     /// The byte <see cref="PoisonRentedBuffers"/> fills with. Default <c>0xFF</c> = NaN as float32.
     /// </summary>
     /// <remarks>
@@ -491,12 +505,16 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
 
     private void PushFree(MemoryBuffer1D<float, Stride1D.Dense> buffer)
     {
+        if (PoisonFreedBuffers && (buffer.IsDisposed || !_rentable.Contains(buffer.Buffer)))
+            Console.WriteLine($"[POOL] FREE-OF-{(buffer.IsDisposed ? "DISPOSED" : "FOREIGN")} {Bid(buffer)} len={buffer.Length} " +
+                              $"node {Graph.GraphExecutor.CurrentRunNodeIndex}\n{Environment.StackTrace}");
         int bucketSize = (int)buffer.Length;
         if (!_buckets.TryGetValue(bucketSize, out var stack))
         {
             stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
             _buckets[bucketSize] = stack;
         }
+        if (PoisonFreedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
         stack.Push(buffer);
         Interlocked.Add(ref _freeBucketedBytesCounter, buffer.LengthInBytes);
     }
@@ -1052,6 +1070,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
                 stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
                 _halfBuckets[bucketSize] = stack;
             }
+            if (PoisonFreedBuffers) { try { free.View.MemSet(PoisonRentByte); } catch { } }
             stack.Push(free);
             Interlocked.Add(ref _freeBucketedBytesCounter, free.LengthInBytes);
         }

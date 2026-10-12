@@ -195,6 +195,29 @@ public class GraphExecutor : IDisposable
         "OptionalHasElement",
     };
 
+    /// <summary>Ops whose output SIZE is their input's data, whatever the shapes (see <see cref="BuildFoldSet"/>).</summary>
+    private static readonly HashSet<string> DataShapedOps = new(StringComparer.Ordinal)
+    {
+        "NonZero", "NonMaxSuppression", "Unique", "Compress",
+    };
+
+    /// <summary>
+    /// Whether <paramref name="n"/>'s output shape can differ between forwards of one executor (fixed input shapes): it is
+    /// data-shaped, it reads a shape-driving VALUE (a <see cref="HostValueInputSlots"/> slot) that varies, or one of its
+    /// inputs already has a varying shape.
+    /// </summary>
+    private static bool OutputShapeMayVary(CompiledNode n, HashSet<string> varyingValues, HashSet<string> varyingShapes)
+    {
+        if (DataShapedOps.Contains(n.OpType)) return true;
+        foreach (var inp in n.InputNames)
+            if (!string.IsNullOrEmpty(inp) && varyingShapes.Contains(inp)) return true;
+        if (HostValueInputSlots.TryGetValue(n.OpType, out var slots))
+            foreach (var s in slots)
+                if (s < n.InputNames.Length && !string.IsNullOrEmpty(n.InputNames[s]) && varyingValues.Contains(n.InputNames[s]))
+                    return true;
+        return false;
+    }
+
     /// <summary>Builds <see cref="_foldNode"/> and <see cref="_foldFrontier"/> from the input-taint set.</summary>
     private void BuildFoldSet(HashSet<string> tainted, HashSet<string> graphOutputs)
     {
@@ -202,6 +225,15 @@ public class GraphExecutor : IDisposable
         var fold = new bool[nodes.Length];
         // Values that may differ between forwards: input-tainted, or produced by a node that is not folded.
         var varying = new HashSet<string>(tainted, StringComparer.Ordinal);
+        // 🔴 TENSORS WHOSE SHAPE VARIES AT FIXED INPUT SHAPES. "An executor has fixed shapes" holds for the INPUTS only.
+        // An op whose output shape is set by a VALUE (Reshape's target, Expand's shape, Range's limits, ConstantOfShape -
+        // the host-value slots) makes a data-dependent shape when that value varies, and so does an op whose output size
+        // is its data (NonZero). Everything shaped from such a tensor varies too. A Shape/Size of one is NOT fixed, so it
+        // must not fold. MEASURED 2026-10-12, Kokoro: its vocoder length is set by the predicted durations, i.e. by the
+        // text; two sentences of the same token count share an executor, and the fold handed the second one the first
+        // one's length (87,000 for 87,600) - the vocoder's Pad then ran rank-3 pads on a rank-2 tensor, a CUDA illegal
+        // address (Vertex, after one turn). Test: Pipeline_Kokoro_SameTokenCount_DifferentSentence_MatchesAFreshPipeline.
+        var shapeVarying = new HashSet<string>(StringComparer.Ordinal);
         var foldedOutputs = new HashSet<string>(StringComparer.Ordinal);
         int count = 0;
         var consumesVarying = new bool[nodes.Length];
@@ -210,10 +242,19 @@ public class GraphExecutor : IDisposable
             var n = nodes[i];
             foreach (var inp in n.InputNames)
                 if (!string.IsNullOrEmpty(inp) && varying.Contains(inp)) { consumesVarying[i] = true; break; }
+            if (OutputShapeMayVary(n, varying, shapeVarying))
+                foreach (var o in n.OutputNames)
+                    if (!string.IsNullOrEmpty(o)) shapeVarying.Add(o);
             // A Constant always runs (it is free) and its value never varies, so it neither folds nor blocks.
             if (n.OpType == "Constant") continue;
             bool ok = !NeverFoldOps.Contains(n.OpType) && n.OutputNames.Length > 0;
-            if (ok && n.OpType is not ("Shape" or "Size"))   // Shape/Size read the (fixed) shape, never the data
+            if (ok && n.OpType is ("Shape" or "Size"))
+            {
+                // Shape/Size read the shape, never the data: they fold exactly when that shape is fixed.
+                if (n.InputNames.Length > 0 && !string.IsNullOrEmpty(n.InputNames[0]) && shapeVarying.Contains(n.InputNames[0]))
+                    ok = false;
+            }
+            else if (ok)
                 foreach (var inp in n.InputNames)
                     if (!string.IsNullOrEmpty(inp) && varying.Contains(inp)) { ok = false; break; }
             if (ok)
@@ -1008,6 +1049,9 @@ public class GraphExecutor : IDisposable
     /// speaks 8.82 s of confident nonsense that Whisper reads back as "[MUSIC PLAYING]".
     /// </para>
     /// </remarks>
+    /// <summary>DIAGNOSTIC (<c>ML_TRACE_SHAPES=substring</c>): every node whose first output name contains it - input shapes (and small host values), output shape.</summary>
+    public static string? TraceShapesPrefix = Environment.GetEnvironmentVariable("ML_TRACE_SHAPES") is { Length: > 0 } tsp ? tsp : null;
+
     public static bool FindFirstNonFinite { get; set; }
         = Environment.GetEnvironmentVariable("ML_FIND_NAN") is "1" or "true";
 
@@ -4938,6 +4982,11 @@ public class GraphExecutor : IDisposable
                 ScopeTensors = tensors,
                 HostValues = hostValues,
             };
+            if (TraceShapesPrefix != null && node.OutputNames.Length > 0 && node.OutputNames[0].Contains(TraceShapesPrefix, StringComparison.Ordinal))
+                Console.WriteLine($"[shape-trace] {nodeIdx} {node.OpType} {node.OutputNames[0]}: in "
+                    + string.Join(" ", nodeInputs.Select((t, k) => $"{(k < node.InputNames.Length ? node.InputNames[k] : "?")}[{string.Join(",", t?.Shape ?? Array.Empty<int>())}]"
+                        + (k < node.InputNames.Length && runtimeConstants.TryGetValue(node.InputNames[k], out var tsv) && tsv.Length <= 8 ? "=" + string.Join(",", tsv) : "")))
+                    + $" -> [{string.Join(",", nodeOutputs.Length > 0 && nodeOutputs[0] != null ? nodeOutputs[0]!.Shape : Array.Empty<int>())}]");
             // ── LFM2 short-conv decode intercept (conv analogue of the FusedAttention KV intercept above) ──
             // When the conv-state cache is active, run ShortConv THROUGH it so a decode step (pastLen>0) sees
             // the previous L-1 tokens' history instead of zero-padding. Prefill (pastLen==0) runs the plain
