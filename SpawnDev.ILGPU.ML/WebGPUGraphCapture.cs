@@ -63,6 +63,7 @@ public sealed class WebGPUGraphCapture : IDisposable
     private readonly Dictionary<string, Tensor> _inputBuffers;   // stable device inputs the plan reads
     private readonly Dictionary<string, Tensor> _outputs;        // stable device outputs the plan writes
     private readonly CaptureParamArena _arena;                   // kernel-params slots THIS plan binds
+    private readonly IDisposable _poolPins;                      // keeps the replayed intermediates from being reclaimed
 
     /// <summary>The input shapes this plan was captured for. A replay is only valid at the SAME shapes.</summary>
     public IReadOnlyDictionary<string, int[]> InputShapes { get; }
@@ -167,11 +168,12 @@ public sealed class WebGPUGraphCapture : IDisposable
 
     private WebGPUGraphCapture(Accelerator accelerator, WebGPUDispatchPlan plan,
         Dictionary<string, Tensor> inputBuffers, Dictionary<string, Tensor> outputs,
-        Dictionary<string, int[]> inputShapes, CaptureParamArena arena)
+        Dictionary<string, int[]> inputShapes, CaptureParamArena arena, IDisposable poolPins)
     {
         _accelerator = accelerator;
         _plan = plan;
         _arena = arena;
+        _poolPins = poolPins;
         _inputBuffers = inputBuffers;
         _outputs = outputs;
         InputShapes = inputShapes;
@@ -285,6 +287,7 @@ public sealed class WebGPUGraphCapture : IDisposable
         // See CaptureParamArena.BeginCaptureScope. The arena is disposed with this capture, below.
         int overwritesBefore = CaptureParamArena.CrossCaptureSlotOverwrites;
         var arena = CaptureParamArena.BeginCaptureScope(acc);
+        var poolPins = session.PinPools();   // see InferenceSession.PinPools; released below if no plan survives
         bool arenaHandedOff = false;
         try
         {
@@ -429,7 +432,7 @@ public sealed class WebGPUGraphCapture : IDisposable
             var shapes = new Dictionary<string, int[]>();
             foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
             arenaHandedOff = true;
-            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes, arena);
+            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes, arena, poolPins);
         }
         finally
         {
@@ -454,6 +457,7 @@ public sealed class WebGPUGraphCapture : IDisposable
             {
                 try { await acc.SynchronizeAsync(); } catch { }
                 try { arena.Dispose(); } catch { }
+                poolPins.Dispose();
             }
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
@@ -531,5 +535,6 @@ public sealed class WebGPUGraphCapture : IDisposable
         try { _plan.Dispose(); } catch { }
         // Only now: the plan's bind groups read these slots on every replay.
         try { _arena.Dispose(); } catch { }
+        _poolPins.Dispose();
     }
 }

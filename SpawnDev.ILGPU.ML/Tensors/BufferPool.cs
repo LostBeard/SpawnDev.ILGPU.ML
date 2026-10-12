@@ -16,9 +16,22 @@ namespace SpawnDev.ILGPU.ML.Tensors;
 ///   // ... use tensor ...
 ///   pool.Return(tensor);
 /// </summary>
-public class BufferPool : IDisposable
+public class BufferPool : IDisposable, IDeviceMemoryReclaimer
 {
     private readonly Accelerator _accelerator;
+    // Every pool registers with its accelerator as a holder of reclaimable memory (ILGPU MemoryPressure), so an
+    // allocation ANYWHERE on the device - another model's pool, a KV cache, a weight upload - can have this pool's
+    // idle buffers back before the driver runs out. That reclaim arrives on the ALLOCATING thread, usually not
+    // ours: _sync guards the free buckets and the allocation lists against it. The owner's own use stays
+    // single-threaded; the lock is uncontended except during such a reclaim. MEASURED 2026-10-12 (Vertex, four
+    // models in one process on a 12 GB card): 7.3 GB idle across the pools, 1.4 GB spilled into system RAM by a
+    // driver that never fails an allocation, and a one-sentence reply took 5.5 minutes.
+    private readonly object _sync = new();
+    private long _lastUsedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+    // Running total of the free buckets, readable from any thread without the lock (ReclaimableBytes).
+    private long _freeBucketedBytesCounter;
+    // > 0 while a captured graph replays buffers that sit in this pool's free buckets (see Pin).
+    private int _pinCount;
     private readonly Dictionary<int, StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
     // CUDA-graph capture: an UNNAMED Rent is never Returned (Return keys on name), so it would allocate a fresh
@@ -59,7 +72,7 @@ public class BufferPool : IDisposable
     /// <summary>Total number of GPU buffers allocated by this pool.</summary>
     public int AllocatedBufferCount => _allBuffers.Count;
     /// <summary>Number of buffers available for reuse.</summary>
-    public int AvailableBufferCount => _buckets.Values.Sum(s => s.Count);
+    public int AvailableBufferCount { get { lock (_sync) return _buckets.Values.Sum(s => s.Count); } }
 
     /// <summary>
     /// Buffers currently RENTED (recorded in <c>_namedBuffers</c>, not yet Returned). Rising across a pass
@@ -75,11 +88,14 @@ public class BufferPool : IDisposable
     /// </summary>
     public string BucketProfileSummary(int top = 10)
     {
-        var parts = _buckets.Where(kv => kv.Value.Count > 0)
-            .OrderByDescending(kv => kv.Value.Count)
-            .Take(top)
-            .Select(kv => $"{kv.Key}:{kv.Value.Count}");
-        return string.Join(" ", parts);
+        lock (_sync)
+        {
+            var parts = _buckets.Where(kv => kv.Value.Count > 0)
+                .OrderByDescending(kv => kv.Value.Count)
+                .Take(top)
+                .Select(kv => $"{kv.Key}:{kv.Value.Count}");
+            return string.Join(" ", parts);
+        }
     }
 
     /// <summary>Test/diagnostic switch: when true, the browser JS zero-copy weight-upload path is skipped and
@@ -338,10 +354,13 @@ public class BufferPool : IDisposable
     /// <summary>Is this buffer sitting in a free bucket right now? O(free buffers) - diagnostic paths only.</summary>
     private bool IsBufferFree(MemoryBuffer buffer)
     {
-        foreach (var stack in _buckets.Values)
-            foreach (var b in stack)
-                if (ReferenceEquals(b.Buffer, buffer)) return true;   // a view's Buffer is the RAW buffer, not the MemoryBuffer1D wrapper
-        return false;
+        lock (_sync)
+        {
+            foreach (var stack in _buckets.Values)
+                foreach (var b in stack)
+                    if (ReferenceEquals(b.Buffer, buffer)) return true;   // a view's Buffer is the RAW buffer, not the MemoryBuffer1D wrapper
+            return false;
+        }
     }
 
     /// <summary>Report a consuming node reading a tensor whose buffer is already back in the free pool.</summary>
@@ -387,7 +406,60 @@ public class BufferPool : IDisposable
         }
     }
 
-    public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
+    public BufferPool(Accelerator accelerator)
+    {
+        _accelerator = accelerator;
+        accelerator.RegisterReclaimer(this);
+    }
+
+    /// <summary>Bytes a reclaim could take from this pool right now: its free buckets, or 0 while pinned.</summary>
+    public long ReclaimableBytes => Volatile.Read(ref _pinCount) > 0 ? 0 : Interlocked.Read(ref _freeBucketedBytesCounter);
+
+    /// <summary>When this pool last handed out a buffer (<see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>);
+    /// the least recently used pool gives memory back first.</summary>
+    public long LastUsedTimestamp => Interlocked.Read(ref _lastUsedTimestamp);
+
+    /// <summary>
+    /// Called by ILGPU's <see cref="MemoryPressure"/> from whichever thread is allocating: frees free-bucket
+    /// buffers, largest first, until <paramref name="bytesWanted"/> is reached. Returns 0 without waiting when the
+    /// owner is using the pool at this moment, when it is pinned by a captured graph, or during a capture window.
+    /// </summary>
+    public long Reclaim(long bytesWanted)
+    {
+        if (!Monitor.TryEnter(_sync)) return 0;
+        try { return DisposeBucketedBuffers(bytesWanted); }
+        finally { Monitor.Exit(_sync); }
+    }
+
+    /// <summary>
+    /// Keeps this pool's free buffers from being reclaimed while a captured graph is alive. A capture (CUDA graph,
+    /// WebGPU plan) bakes the addresses of the intermediates it was recorded with; those intermediates are Returned
+    /// into the free buckets afterwards and every replay writes them again. Freeing one would leave the graph
+    /// writing memory the pool no longer owns. Undo with <see cref="Unpin"/>.
+    /// </summary>
+    internal void Pin() => Interlocked.Increment(ref _pinCount);
+
+    /// <summary>Undoes one <see cref="Pin"/>.</summary>
+    internal void Unpin() => Interlocked.Decrement(ref _pinCount);
+
+    /// <summary>True while a captured graph depends on this pool's free buffers (see <see cref="Pin"/>).</summary>
+    public bool IsPinned => Volatile.Read(ref _pinCount) > 0;
+
+    private void Track(MemoryBuffer1D<float, Stride1D.Dense> buffer) { lock (_sync) _allBuffers.Add(buffer); }
+
+    private void TrackHalf(MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense> buffer) { lock (_sync) _allHalfBuffers.Add(buffer); }
+
+    private void PushFree(MemoryBuffer1D<float, Stride1D.Dense> buffer)
+    {
+        int bucketSize = (int)buffer.Length;
+        if (!_buckets.TryGetValue(bucketSize, out var stack))
+        {
+            stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
+            _buckets[bucketSize] = stack;
+        }
+        stack.Push(buffer);
+        Interlocked.Add(ref _freeBucketedBytesCounter, buffer.LengthInBytes);
+    }
 
     // ── Node-scoped scratch (unnamed Rents made while a graph run is executing) ──
     //
@@ -415,13 +487,7 @@ public class BufferPool : IDisposable
     internal void ReturnScratch(MemoryBuffer1D<float, Stride1D.Dense> buffer)
     {
         ReturnLog?.Add(("(scratch)", buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
-        int bucketSize = (int)buffer.Length;
-        if (!_buckets.TryGetValue(bucketSize, out var stack))
-        {
-            stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
-            _buckets[bucketSize] = stack;
-        }
-        stack.Push(buffer);
+        lock (_sync) PushFree(buffer);
     }
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
@@ -443,6 +509,15 @@ public class BufferPool : IDisposable
     }
 
     public Tensor Rent(int[] shape, string? name = null)
+    {
+        lock (_sync)
+        {
+            Interlocked.Exchange(ref _lastUsedTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+            return RentCore(shape, name);
+        }
+    }
+
+    private Tensor RentCore(int[] shape, string? name)
     {
         int count = TensorHelpers.ElementCount(shape);
         int bucketSize = NextPowerOf2(count);
@@ -482,6 +557,7 @@ public class BufferPool : IDisposable
         if (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
+            Interlocked.Add(ref _freeBucketedBytesCounter, -buffer.LengthInBytes);
             // 0xFF bytes = NaN as float32. Only the REUSED path needs this: a fresh allocation holds no
             // previous tensor's values, and it is precisely the plausible leftovers that hide an unwritten read.
             if (PoisonRentedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
@@ -519,7 +595,7 @@ public class BufferPool : IDisposable
         var _allocSw = System.Diagnostics.Stopwatch.StartNew();
         MemoryBuffer1D<float, Stride1D.Dense> newBuffer = _accelerator.AllocateWithReclaim(
             () => _accelerator.Allocate1D<float>(bucketSize),   // allocate
-            DisposeBucketedBuffers,                             // reclaim (dispose Returned-not-live), returns bytes freed
+            () => DisposeBucketedBuffers(),                     // reclaim (dispose Returned-not-live), returns bytes freed
             reclaimed =>
             {
                 long live = 0; foreach (var b in _allBuffers) live += b.LengthInBytes;
@@ -551,10 +627,13 @@ public class BufferPool : IDisposable
     {
         get
         {
-            long total = 0;
-            foreach (var stack in _buckets.Values) foreach (var b in stack) total += b.LengthInBytes;
-            foreach (var stack in _halfBuckets.Values) foreach (var b in stack) total += b.LengthInBytes;
-            return total;
+            lock (_sync)
+            {
+                long total = 0;
+                foreach (var stack in _buckets.Values) foreach (var b in stack) total += b.LengthInBytes;
+                foreach (var stack in _halfBuckets.Values) foreach (var b in stack) total += b.LengthInBytes;
+                return total;
+            }
         }
     }
 
@@ -576,7 +655,69 @@ public class BufferPool : IDisposable
     /// GPU memory pressure (see Rent's catch). The pool re-allocates these sizes on demand afterward, so the
     /// only cost is lost reuse, never correctness. Returns bytes freed.
     /// </summary>
-    private long DisposeBucketedBuffers()
+    /// <param name="target">Free at least this many bytes, largest buffers first, then stop; the default frees
+    /// everything free. A partial reclaim keeps the small, frequently reused buckets warm.</param>
+    private long DisposeBucketedBuffers(long target = long.MaxValue)
+    {
+        lock (_sync)
+        {
+            // A captured graph writes these buffers on every replay (see Pin): freeing one corrupts it.
+            if (Volatile.Read(ref _pinCount) > 0) return 0;
+            return target == long.MaxValue ? DisposeAllBucketedLocked() : DisposeLargestBucketedLocked(target);
+        }
+    }
+
+    /// <summary>Partial reclaim under <see cref="_sync"/>: largest free buffers first until
+    /// <paramref name="target"/> bytes are freed.</summary>
+    private long DisposeLargestBucketedLocked(long target)
+    {
+        if (Graph.GraphExecutor.SuppressDrains) return 0;   // capture window: see DisposeAllBucketedLocked
+        var sizes = new List<(long Bytes, bool Half, int Key)>();
+        // A bucket's key is its buffers' element count (Rent allocates exactly bucketSize elements).
+        foreach (var kv in _buckets) if (kv.Value.Count > 0) sizes.Add((kv.Key * 4L, false, kv.Key));
+        foreach (var kv in _halfBuckets) if (kv.Value.Count > 0) sizes.Add((kv.Key * 2L, true, kv.Key));
+        if (sizes.Count == 0) return 0;
+        sizes.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
+        // Submit pending work first: see the encoder-safety note in DisposeAllBucketedLocked.
+        try { _accelerator.Flush(); } catch { /* desktop: no-op; browser: already-flushed is harmless */ }
+
+        long freed = 0; int nBuf = 0;
+        foreach (var (_, half, key) in sizes)
+        {
+            if (half)
+            {
+                var stack = _halfBuckets[key];
+                while (stack.Count > 0 && freed < target)
+                {
+                    var buf = stack.Pop();
+                    freed += buf.LengthInBytes; nBuf++;
+                    _allHalfBuffers.Remove(buf);
+                    buf.Dispose();
+                }
+            }
+            else
+            {
+                var stack = _buckets[key];
+                while (stack.Count > 0 && freed < target)
+                {
+                    var buf = stack.Pop();
+                    freed += buf.LengthInBytes; nBuf++;
+                    _allBuffers.Remove(buf);
+                    buf.Dispose();
+                }
+            }
+            if (freed >= target) break;
+        }
+        Interlocked.Add(ref _freeBucketedBytesCounter, -freed);
+        ReclaimFireCount++; ReclaimFreedBytes += freed;
+        if (TraceReclaim)
+            Console.WriteLine($"[RECLAIM #{ReclaimFireCount}] partial at node {Graph.GraphExecutor.CurrentRunNodeIndex}: " +
+                $"disposed {nBuf} bucketed buffers, {freed / 1048576.0:F1} MiB of {target / 1048576.0:F1} MiB wanted");
+        return freed;
+    }
+
+    /// <summary>Full reclaim under <see cref="_sync"/>: every free buffer.</summary>
+    private long DisposeAllBucketedLocked()
     {
         // NEVER free during a graph-capture window: cuMemFree while CUDA stream capture is active
         // corrupts the context (native 0xC0000005 at the NEXT free - SD-Turbo UNet capture under
@@ -623,6 +764,7 @@ public class BufferPool : IDisposable
                 buf.Dispose();
             }
         _halfBuckets.Clear();
+        Interlocked.Exchange(ref _freeBucketedBytesCounter, 0);
         // DIAGNOSTIC: a reclaim FIRING mid-forward is the prime suspect for the WebGPU VAE-decode
         // "external Instance reference no longer exists" crash — the pre-reclaim flush is a sync
         // Synchronize() (flush, not drain), so a bucketed buffer whose last dispatch is still in-flight
@@ -715,13 +857,7 @@ public class BufferPool : IDisposable
             }
             _namedBuffers.Remove(name);
             ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
-            int bucketSize = (int)buffer.Length;
-            if (!_buckets.TryGetValue(bucketSize, out var stack))
-            {
-                stack = new StableFreeList<MemoryBuffer1D<float, Stride1D.Dense>>();
-                _buckets[bucketSize] = stack;
-            }
-            stack.Push(buffer);
+            lock (_sync) PushFree(buffer);
             if (Graph.GraphExecutor.SuppressDrains) CaptureReturnCount++;
         }
     }
@@ -761,12 +897,22 @@ public class BufferPool : IDisposable
     /// (Plans/fp16-bf16-mixed-precision-activations-2026-06-16.md).</summary>
     public HalfTensor RentHalf(int[] shape, string? name = null)
     {
+        lock (_sync)
+        {
+            Interlocked.Exchange(ref _lastUsedTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+            return RentHalfCore(shape, name);
+        }
+    }
+
+    private HalfTensor RentHalfCore(int[] shape, string? name)
+    {
         int count = TensorHelpers.ElementCount(shape);
         int bucketSize = NextPowerOf2(count);
 
         if (_halfBuckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
+            Interlocked.Add(ref _freeBucketedBytesCounter, -buffer.LengthInBytes);
             if (name != null) { NoteRebindHalf(name, buffer); _halfNamedBuffers[name] = buffer; }
             UpdatePeaks();
             return new HalfTensor(buffer.View, shape, name);
@@ -774,7 +920,7 @@ public class BufferPool : IDisposable
 
         var newBuffer = _accelerator.AllocateWithReclaim(
             () => _accelerator.Allocate1D<global::ILGPU.Half>(bucketSize),
-            DisposeBucketedBuffers,
+            () => DisposeBucketedBuffers(),
             reclaimed => $"GPU out of memory renting fp16 '{name}' (+{bucketSize * 2L / 1048576}MB) after reclaiming " +
                          $"{reclaimed / 1048576}MB of pooled buffers; {_allHalfBuffers.Count} fp16 + {_allBuffers.Count} fp32 live. Exceeds VRAM.");
         _allHalfBuffers.Add(newBuffer);
@@ -809,12 +955,16 @@ public class BufferPool : IDisposable
             _halfNamedBuffers.Remove(name);
             ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
             int bucketSize = (int)buffer.Length;
-            if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
+            lock (_sync)
             {
-                stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
-                _halfBuckets[bucketSize] = stack;
+                if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
+                {
+                    stack = new StableFreeList<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
+                    _halfBuckets[bucketSize] = stack;
+                }
+                stack.Push(buffer);
+                Interlocked.Add(ref _freeBucketedBytesCounter, buffer.LengthInBytes);
             }
-            stack.Push(buffer);
         }
     }
 
@@ -822,7 +972,7 @@ public class BufferPool : IDisposable
     public Tensor AllocatePermanent(float[] data, int[] shape, string? name = null)
     {
         var buffer = _accelerator.Allocate1D(data);
-        _allBuffers.Add(buffer);
+        Track(buffer);
         return new Tensor(buffer.View, shape, name);
     }
 
@@ -867,7 +1017,7 @@ public class BufferPool : IDisposable
                 SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(maskBytes, maskRows, maskCols, out var triMode))
             {
                 var maskBuf = _accelerator.Allocate1D<float>(count);
-                _allBuffers.Add(maskBuf);
+                Track(maskBuf);
                 (_maskKernels ??= new SpawnDev.ILGPU.ML.Kernels.MaskKernels(_accelerator))
                     .FillTriangular(maskBuf.View, maskRows, maskCols, triMode);
                 if (LogProtoResidentTensors)
@@ -908,7 +1058,7 @@ public class BufferPool : IDisposable
 
         // Large tensor: allocate empty GPU buffer, then fill in chunks
         var buffer = _accelerator.Allocate1D<float>(count);
-        _allBuffers.Add(buffer);
+        Track(buffer);
 
         // Use a fixed-size chunk buffer (reusable across calls)
         const int CHUNK = 262144; // 256K floats = 1MB
@@ -1043,7 +1193,7 @@ public class BufferPool : IDisposable
     {
         int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
         var buffer = _accelerator.Allocate1D<float>(count);
-        _allBuffers.Add(buffer);
+        Track(buffer);
         if (count == 0) return new Tensor(buffer.View, shape, name);
 
         // Every float format ILGPU has a type for streams the same way: raw bytes -> a GPU buffer of that
@@ -1300,7 +1450,7 @@ public class BufferPool : IDisposable
     {
         int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
         var buffer = _accelerator.Allocate1D<global::ILGPU.Half>(count);
-        _allHalfBuffers.Add(buffer);
+        TrackHalf(buffer);
         if (count == 0) return new HalfTensor(buffer.View, shape, name);
 
         int srcElemBytes = dataType switch { 1 => 4, 10 => 2, _ => 0 };
@@ -1431,7 +1581,7 @@ public class BufferPool : IDisposable
     {
         int count = TensorHelpers.ElementCount(shape);
         var buffer = _accelerator.Allocate1D<float>(count);
-        _allBuffers.Add(buffer);
+        Track(buffer);
         return new Tensor(buffer.View, shape, name);
     }
 
@@ -1451,7 +1601,14 @@ public class BufferPool : IDisposable
 
     public void Dispose()
     {
+        _accelerator.UnregisterReclaimer(this);
+        lock (_sync) DisposeLocked();
+    }
+
+    private void DisposeLocked()
+    {
         IsDisposed = true;
+        Interlocked.Exchange(ref _freeBucketedBytesCounter, 0);
         foreach (var buffer in _allBuffers)
         {
             try { buffer.Dispose(); }

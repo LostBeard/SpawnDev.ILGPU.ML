@@ -39,6 +39,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _inputBuf;
     /// <summary>Kernel-params slots THIS plan binds and patches. Disposed with the capture, never before.</summary>
     private CaptureParamArena? _arena;
+    // Keeps the plan's replayed intermediates (in the session pools' free buckets) from being reclaimed.
+    private IDisposable? _poolPins;
     private readonly Dictionary<string, Tensor> _inputDict;
     private readonly Dictionary<string, Tensor> _outputs;
     private readonly int _p0;
@@ -155,6 +157,7 @@ public sealed class WebGPUDecodeCapture : IDisposable
         // (or this class's own patches) wrote over parameters another live plan reads.
         // See CaptureParamArena.BeginCaptureScope.
         var arena = CaptureParamArena.BeginCaptureScope(acc);
+        var poolPins = session.PinPools();   // see InferenceSession.PinPools; released below if no plan survives
         bool arenaHandedOff = false;
 
         var inputBuf = acc.Allocate1D(new[] { tokenId });
@@ -366,6 +369,7 @@ public sealed class WebGPUDecodeCapture : IDisposable
             var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
             cap._arena = arena;
+            cap._poolPins = poolPins;
             arenaHandedOff = true;
             cap._argmax = argmax;
             var (lastView, lastVocab) = LastLogits(capOut);
@@ -387,6 +391,7 @@ public sealed class WebGPUDecodeCapture : IDisposable
             {
                 try { await acc.SynchronizeAsync(); } catch { }
                 try { arena.Dispose(); } catch { }
+                poolPins.Dispose();
             }
             SlotProbe.Detach();
             FusedAttentionKernel.UseStableCaptureSlots = false;
@@ -547,5 +552,6 @@ public sealed class WebGPUDecodeCapture : IDisposable
         try { _inputBuf.Dispose(); } catch { }
         // Only now: the plan's bind groups read these slots on every replay.
         try { _arena?.Dispose(); } catch { }
+        _poolPins?.Dispose();
     }
 }

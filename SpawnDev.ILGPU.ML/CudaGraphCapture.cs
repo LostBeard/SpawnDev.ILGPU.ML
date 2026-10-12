@@ -35,15 +35,17 @@ public sealed class CudaGraphCapture : IDisposable
     private readonly Dictionary<string, Tensor> _inputBuffers;   // stable device inputs the graph reads
     private readonly Dictionary<string, Tensor> _outputs;        // stable device outputs the graph writes
     private readonly Kernels.CaptureParamArena _arena;           // kernel-params slots THIS graph binds
+    private readonly IDisposable _poolPins;                      // keeps the replayed intermediates from being reclaimed
 
     /// <summary>The input shapes this graph was captured for. A replay is only valid at the SAME shapes.</summary>
     public IReadOnlyDictionary<string, int[]> InputShapes { get; }
 
     private CudaGraphCapture(Accelerator accelerator, CudaStream stream, CudaGraphExec exec,
         Dictionary<string, Tensor> inputBuffers, Dictionary<string, Tensor> outputs,
-        Dictionary<string, int[]> inputShapes, Kernels.CaptureParamArena arena)
+        Dictionary<string, int[]> inputShapes, Kernels.CaptureParamArena arena, IDisposable poolPins)
     {
         _accelerator = accelerator;
+        _poolPins = poolPins;
         _stream = stream;
         _exec = exec;
         _arena = arena;
@@ -176,6 +178,10 @@ public sealed class CudaGraphCapture : IDisposable
         // arena's slots and reads them at every replay, so a later capture's warm passes must not upload
         // their own params into those same buffers. See CaptureParamArena.BeginCaptureScope.
         var arena = Kernels.CaptureParamArena.BeginCaptureScope(acc);
+        // The graph will replay the intermediates the capture pass rents; they go back to the session's free
+        // buckets between replays. Pinned from the warm passes on (a reclaim there would leave the capture
+        // under-primed) until the capture is disposed; released below if no graph is produced.
+        var poolPins = session.PinPools();
         bool arenaHandedOff = false;
         try
         {
@@ -420,6 +426,7 @@ public sealed class CudaGraphCapture : IDisposable
             {
                 try { await acc.SynchronizeAsync(); } catch { }
                 try { arena.Dispose(); } catch { }
+                poolPins.Dispose();
             }
             session.CacheShapeReadbacks = prevCacheReadbacks;
             FusedAttentionKernel.UseStableCaptureSlots = false;
@@ -432,11 +439,23 @@ public sealed class CudaGraphCapture : IDisposable
         }
 
         CudaGraphExec exec;
-        using (graph) { exec = graph.Instantiate(); exec.Upload(capStream); }
+        try
+        {
+            using (graph) { exec = graph.Instantiate(); exec.Upload(capStream); }
+        }
+        catch
+        {
+            // No replayable graph after all: nothing binds the arena's slots or the pinned intermediates.
+            try { await acc.SynchronizeAsync(); } catch { }
+            try { arena.Dispose(); } catch { }
+            poolPins.Dispose();
+            try { capStream.Dispose(); } catch { }
+            throw;
+        }
 
         var shapes = new Dictionary<string, int[]>();
         foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
-        return new CudaGraphCapture(acc, capStream, exec, inputs, capOut, shapes, arena);
+        return new CudaGraphCapture(acc, capStream, exec, inputs, capOut, shapes, arena, poolPins);
     }
 
     /// <summary>
@@ -467,5 +486,7 @@ public sealed class CudaGraphCapture : IDisposable
         try { _stream.Dispose(); } catch { }
         // Only now: the baked graph reads these slots on every replay.
         try { _arena.Dispose(); } catch { }
+        // The graph is gone: its intermediates are ordinary free buffers again.
+        _poolPins.Dispose();
     }
 }

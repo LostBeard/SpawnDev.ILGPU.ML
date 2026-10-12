@@ -2877,6 +2877,30 @@ public class InferenceSession : IDisposable
     /// finished while training starts on the same GPU - this is the difference between 3.9 GB and 0
     /// left behind (MEASURED 2026-09-23, DAv3 multi-view N=6, see <see cref="GraphExecutor.ReleaseWorkingMemory"/>).
     /// </summary>
+    /// <summary>
+    /// Pins every pool this session's executors draw from (<see cref="BufferPool.Pin"/>) until the returned handle
+    /// is disposed. A captured graph (CUDA graph, WebGPU plan) holds this for its whole life: it replays the
+    /// intermediates it was recorded with, which sit in these pools' free buckets between replays, so neither
+    /// <see cref="ReleaseWorkingMemory"/> nor a memory-pressure reclaim from another model may free them.
+    /// </summary>
+    internal IDisposable PinPools()
+    {
+        var pools = new HashSet<BufferPool> { _executor.Pool, _pool };
+        foreach (var exec in _shapeExecutors.Values) pools.Add(exec.Pool);
+        foreach (var p in pools) p.Pin();
+        return new PoolPins(pools);
+    }
+
+    private sealed class PoolPins(HashSet<BufferPool> pools) : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            foreach (var p in pools) p.Unpin();
+        }
+    }
+
     public long ReleaseWorkingMemory()
     {
         long freed = _executor.ReleaseWorkingMemory();
