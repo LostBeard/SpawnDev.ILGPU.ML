@@ -3,7 +3,7 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## 5.3.9 (UNRELEASED, built as 5.3.9-local.2) - speech: Parakeet TDT speech to text, speaker embeddings, and seven library fixes found building them
+## 5.3.9 (UNRELEASED, built as 5.3.9-local.3) - speech: Parakeet TDT speech to text, speaker embeddings, and seven library fixes found building them
 
 Two new pipelines, each held to onnxruntime on the same audio, and the seven defects the work exposed. Every fix is covered by a test that
 fails on all affected backends with the bug reintroduced (red-checked) and passes without it. Scoped PMT sweep of the touched areas: 916 passed, 0 failed.
@@ -47,6 +47,7 @@ fails on all affected backends with the bug reintroduced (red-checked) and passe
 - **Fix: the Whisper log-mel used a SYMMETRIC Hann window** (CPU `AudioPreprocessor.ComputeLogMelSpectrogram` and GPU `WhisperMelPreprocessor`). openai-whisper
   (`torch.hann_window`) and transformers' `WhisperFeatureExtractor` use the PERIODIC one. MEASURED against the HF extractor on three clips: periodic 1.5e-7 (numpy replica),
   symmetric 1.8e-2 to 4.0e-2 in the final features. Whisper WER on the 60 utterances did not move (11.53% / 7.51% / 7.51%), so this is a correctness fix, not an accuracy win.
+- **New: `SmartTurnPipeline`** (`PredictAsync` over managed / `Float32Array` / device PCM: P(turn complete) for the last 8 s) on the 8 s mel below.
 - **New: `WhisperMelPreprocessor(accelerator, windowSamples, alignToEnd, normalizeWaveform)`** - any window that is a multiple of the 160-sample hop (8 s = `[80, 800]`),
   keep-the-last-N-seconds / start-padding, and the waveform zero-mean / unit-variance step of HF `do_normalize=True`. This is the input of **Smart Turn v3.2** (pipecat-ai,
   BSD-2; "has the speaker finished their turn?", 8 s of audio, Whisper-tiny encoder). Fixture from the model authors' own extractor: mel within 1.4e-3 to 1.6e-3 on CUDA, and

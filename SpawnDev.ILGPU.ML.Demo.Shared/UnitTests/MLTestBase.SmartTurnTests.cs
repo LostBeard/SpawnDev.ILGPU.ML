@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
@@ -101,26 +103,23 @@ public abstract partial class MLTestBase
         using var modelHttp = new System.Net.Http.HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         var source = new HttpClientModelSource(modelHttp);
         await using var graph = await source.OpenAsync(SmartTurnRepo, SmartTurnFile);
-        using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, graph,
-            inputShapes: new Dictionary<string, int[]> { ["input_features"] = new[] { 1, 80, 800 } });
-        using var mel = new WhisperMelPreprocessor(accelerator, 8 * 16000, alignToEnd: true, normalizeWaveform: true);
+        using var pipeline = new SmartTurnPipeline(await InferenceSession.CreateFromOnnxStreamAsync(accelerator, graph,
+            inputShapes: SmartTurnPipeline.InputShapes.ToDictionary(kv => kv.Key, kv => kv.Value)), accelerator);
 
         var report = new System.Text.StringBuilder();
         bool failed = false;
         foreach (var c in await LoadSmartTurnFixture(assets))
         {
-            using var pcm = accelerator.Allocate1D(c.Pcm);
-            using var melBuf = accelerator.Allocate1D<float>(mel.MelElements);
-            mel.ComputeLogMelSpectrogram(pcm.View, c.Pcm.Length, melBuf.View);
-            var outs = await session.RunAsync(new Dictionary<string, Tensor> { ["input_features"] = new Tensor(melBuf.View, new[] { 1, 80, 800 }) });
-            using var host = accelerator.Allocate1D<float>(1);
-            await host.View.CopyFromAsync(outs["logits"].Data.SubView(0, 1));
-            await accelerator.SynchronizeAsync();
-            float p = (await host.CopyToHostAsync<float>(0, 1))[0];
-            Console.WriteLine($"[SmartTurn] {c.Name}: p(complete) {p:F4} vs onnxruntime {c.Probability:F4} on {BackendName}");
-            session.ReturnOutputs(outs);
+            float p = await pipeline.PredictAsync(c.Pcm);
             report.Append($"{c.Name}: {p:F5} vs {c.Probability:F5}; ");
             if (Math.Abs(p - c.Probability) > 0.02) failed = true;
+        }
+        // The device-resident entry and a 48 kHz upload give the same answer as the managed one.
+        var first = (await LoadSmartTurnFixture(assets))[1];
+        using (var dev = accelerator.Allocate1D(first.Pcm))
+        {
+            float viaDevice = await pipeline.PredictAsync(dev.View, first.Pcm.Length);
+            if (Math.Abs(viaDevice - first.Probability) > 0.02) { failed = true; report.Append($"device overload {viaDevice:F5}; "); }
         }
         if (failed)
             throw new Exception($"probabilities differ from onnxruntime on {BackendName}: {report}");
