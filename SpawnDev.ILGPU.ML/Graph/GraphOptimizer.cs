@@ -906,7 +906,13 @@ public static class GraphOptimizer
         // N from the weight when it is a constant ([K,N]; transB Gemm never gets here). When the weight is an
         // activation its width is unknown at this point, so require a real vector (a 1-wide Add is a scalar).
         if (matmul.Inputs.Count >= 2 && graph.Initializers.TryGetValue(matmul.Inputs[1], out var w) && w.Length >= 2)
-            return n == w[^1];
+        {
+            // [K, N] (ONNX MatMul) - or [N, K] for a weight a TFLite FullyConnected was converted with: FusedLinear detects either layout at
+            // execute time, and EfficientNet-Lite0's dense layer ([1000, 1280] weight, [1000] bias) is exactly that. Accepting only [K, N] here
+            // broke it (the plain MatMul then read the transposed weight: "no usable F32 data ... needs K*N=1638400"); caught by the full sweep.
+            // A scalar bias (width 1) still matches neither dimension, so the nemo128 case stays unfused.
+            return w.Length == 2 ? (n == w[0] || n == w[1]) : n == w[^1];
+        }
         return n > 1;
     }
 
