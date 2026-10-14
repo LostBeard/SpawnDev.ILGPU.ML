@@ -3,6 +3,42 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.9 (UNRELEASED, built as 5.3.9-local.1) - speech: Parakeet TDT speech to text, speaker embeddings, and seven library fixes found building them
+
+Two new pipelines, each held to onnxruntime on the same audio, and the seven defects the work exposed. Every fix is covered by a test that
+fails on all affected backends with the bug reintroduced (red-checked) and passes without it. Scoped PMT sweep of the touched areas: 916 passed, 0 failed.
+
+- **`ParakeetTdtPipeline`** (NVIDIA Parakeet TDT 0.6B v3, FastConformer encoder + token-and-duration transducer; the `istupakov/parakeet-tdt-0.6b-v3-onnx` export).
+  GPU-resident, managed / `Float32Array` / device-view entry points, the prediction network's state kept in device buffers, two argmax indices per step crossing
+  to the host. Transcript identical to onnxruntime's. MEASURED on LibriSpeech test-clean, 60 utterances, RTX 4070, idle (`tools/stt-bench`):
+
+  | model | WER | median / p95 |
+  |---|---|---|
+  | Parakeet TDT 0.6B v3 | 3.75% | 168 / 298 ms |
+  | Whisper tiny | 11.53% | 177 / 390 ms |
+  | Whisper base.en | 7.51% | 260 / 527 ms |
+  | Whisper small.en | 7.51% | 633 / 1207 ms |
+
+  `WeightStorage.Half` gives the same 3.75% at 162 ms with half the memory. The int8 export currently crashes the encoder (CUDA illegal memory access): open.
+- **`SpeakerEmbeddingPipeline`** (ReDimNet2-B6, MIT; `soniqo/ReDimNet2-B6-ONNX-FP32`). Fits any clip to the model's fixed 6 s window on the device, returns the
+  192-d unit embedding. MEASURED (40 speakers, 240 clips, `tools/speaker-bench`): cosine 1.000000 vs onnxruntime, closed-set identification 99.2%, EER 1.33%, and at
+  a threshold that lets 1% of strangers in, 98.9% of enrolled speakers recognised and 0.0% named as someone else. 64 ms per embedding.
+- **Fix: `DetectModelFormat` was case-sensitive** on the producer string. onnxscript writes "OnnxScript"; such files fell through to the 0x08 fallback and were parsed as
+  CoreML ("Unknown wire type: 7").
+- **Fix: `MatMul + Add(scalar)` was fused into `FusedLinear`** with a one-element "bias" for N columns ("bounds mismatch"). The fused bias must be `[1,..,N]`.
+- **Fix: STFT inferred every frame count with hop 128.** The `frame_step` / `frame_length` folds ran after shape inference (64,000 samples gave 501 frames, not 401).
+- **Fix: STFT silently dropped windows over 64 elements** (host-value limit), falling back to frame_length = hop: right shape, 97% wrong values. The window is now read
+  from its device buffer.
+- **Fix: `Tile` of a computed tensor threw** ("input values are not available on the CPU"); the general N-D tile is a GPU kernel now.
+- **Fix: `FusedAttention` register path was wrong for head dimension 48 / 80 / 96 / 112** (lanes per query = headDim/16 must be a power of two for the xor-butterfly):
+  67% wrong attention output, no error. The old tests used head dimension 4 and 8.
+- **Performance: `GroupNormalization` was O(elements x group size)** (every output element's thread recomputed its group's statistics): 144 ms per node on a 2.7M-element
+  group. Now the cooperative InstanceNorm stat pass plus an elementwise apply: 7 nodes 1010 ms -> 0.9 ms. Benefits every diffusion / U-Net model.
+- **Performance: a binary op with a small CONSTANT operand** (a per-channel bias) expanded it to the full output size on the host and uploaded it on every call
+  (26 ms for a `[64,1,1]` bias on a `[1,64,72,596]` activation). It is uploaded as is and broadcast by strides (4 ms).
+- Tools: `onnx-bisect-audio.mjs` (cut a graph at any tensor, run it in onnxruntime, find the first stage that disagrees; `parakeet-harness --probe-dir` runs the same cuts
+  through this engine), `onnx-stage-boundaries.mjs`, `onnx-nodes-between.mjs`, `onnx-io.mjs`, `onnx-init-encoding.mjs`, fixture generators `gen_*_reference.mjs`.
+
 ## 5.3.8 - 2026-10-13 - on SpawnDev.ILGPU 5.3.7 (Blazor WASM AOT: wide kernels no longer kill the runtime)
 
 - **On SpawnDev.ILGPU 5.3.7 (forks 2.3.12).** Under Blazor WebAssembly AOT, loading a kernel with 6 or more parameters
