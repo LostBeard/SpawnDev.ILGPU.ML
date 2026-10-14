@@ -363,7 +363,9 @@ public abstract partial class MLTestBase
         int hopSize = 160)
     {
         samples = AudioPreprocessor.PadOrTrim(samples, AudioPreprocessor.WhisperMaxSamples);
-        var stft = AudioPreprocessor.ComputeSTFT(samples, fftSize, hopSize, center: true);
+        // The same PERIODIC window production uses (Whisper's is torch.hann_window; the symmetric one was a defect until 2026-10-14): this test is about the SPARSE BOUNDS, so the oracle
+        // must differ from production only in the filterbank loop.
+        var stft = AudioPreprocessor.ComputeSTFT(samples, fftSize, hopSize, center: true, periodicWindow: true);
         int numFrames = Math.Max(0, stft.GetLength(0) - 1);
         int freqBins = stft.GetLength(1);
 

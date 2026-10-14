@@ -5,8 +5,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## 5.3.9 - 2026-10-14 - speech: Parakeet TDT speech to text, speaker embeddings, Smart Turn end-of-turn detection, and the library fixes found building them
 
-Two new pipelines, each held to onnxruntime on the same audio, and the seven defects the work exposed. Every fix is covered by a test that
-fails on all affected backends with the bug reintroduced (red-checked) and passes without it. Scoped PMT sweep of the touched areas: 916 passed, 0 failed.
+Three new pipelines (Parakeet TDT, speaker embeddings, Smart Turn), each held to onnxruntime on the same audio, and the defects the work exposed. Every fix is covered by a test that
+fails on all affected backends with the bug reintroduced (red-checked) and passes without it.
+
+**Gate (2026-10-14):** full PlaywrightMultiTest, default categories, all six lanes: 5,863 tests in 46 min 55 s - 5,728 passed, 129 skipped (backend-unsupported, as before), 6 failed. The six
+were one test, `Mel_SparseFilterbank_MatchesDenseExactly` on every lane: its dense oracle still used the symmetric Hann window that the fix below retired. The oracle now uses the periodic
+window; re-run, the six rows pass (8 of 8 counting the build rows, none skipped). Speech heavy-model tests (Parakeet, speaker embedding, Smart Turn, fp16 external-data weights, ConvInteger) on CUDA +
+OpenCL: 18 of 18. The xunit CPU project: 55 of 55.
 
 - **`ParakeetTdtPipeline`** (NVIDIA Parakeet TDT 0.6B v3, FastConformer encoder + token-and-duration transducer; the `istupakov/parakeet-tdt-0.6b-v3-onnx` export).
   GPU-resident, managed / `Float32Array` / device-view entry points, the prediction network's state kept in device buffers, two argmax indices per step crossing
