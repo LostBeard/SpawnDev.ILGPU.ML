@@ -13,6 +13,7 @@ using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Tensors;
 
+if (args.Contains("--sync")) SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true;   // device sync after every node: an async fault is reported at ITS node
 if (args.Contains("--no-reg-attn")) SpawnDev.ILGPU.ML.Kernels.FusedAttentionKernel.EnableRegisterAttention = false;   // A/B switch
 var positional = args.Where(a => !a.StartsWith("--")).ToArray();
 if (positional.Length < 2) { Console.Error.WriteLine("usage: <modelDir> <wav> [oracleDir] [--half] [--int8] [--runs N]"); return 2; }
@@ -129,6 +130,14 @@ if (args.Contains("--pre-only"))
 var enc = await Load(encoderFile, half);
 var dec = await Load("decoder_joint-model.onnx", false);
 Console.WriteLine($"inputs   : pre[{string.Join(",", pre.InputNames)}] enc[{string.Join(",", enc.InputNames)}] dec[{string.Join(",", dec.InputNames)}]");
+if (args.Contains("--hold"))
+{
+    // Load only: park here so the loaded footprint can be read from nvidia-smi before any transcription grows the pools.
+    await accelerator.SynchronizeAsync();
+    Console.WriteLine("held: sessions loaded, nothing run");
+    await Task.Delay(9000);
+    return 0;
+}
 var vocab = ParakeetTdtPipeline.ParseVocabulary(File.ReadAllText(Path.Combine(modelDir, "vocab.txt")));
 var pipeline = new ParakeetTdtPipeline(pre, enc, dec, accelerator, vocab);
 

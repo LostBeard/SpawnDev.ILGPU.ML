@@ -1,4 +1,4 @@
-﻿using ILGPU;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -468,65 +468,74 @@ public class ConvIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         // Same shape as regular Conv
         return new ConvOperator(reg).InferOutputShapes(inputs, attrs);
     }
+
+    /// <summary>
+    /// ConvInteger: y = conv(x - x_zero_point, w - w_zero_point), the zero points subtracted ON THE DEVICE, then the ordinary
+    /// float <see cref="ConvOperator"/> runs on the adjusted copies (so groups, depthwise, dilations, asymmetric pads, strides
+    /// per axis and 1-D all behave exactly as for Conv). Inputs: x, w, [x_zero_point (scalar)], [w_zero_point (scalar or one
+    /// per output channel)]. The integers travel as floats, as everywhere in this engine (exact below 2^24).
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE OLD EXECUTE READ THE ACTIVATION ON THE HOST. TryGetInputValues only has values for constants of at most 64
+    /// elements, so for any real activation it returned null and the fallback ran `Conv2D.Forward(x, w, bias: default, ...)`:
+    /// an EMPTY bias view the kernel reads (CUDA "illegal memory access", poisoning the context for every model in the
+    /// process - Parakeet's int8 encoder, node 180, its first convolution) AND zero points ignored, so even where it did not
+    /// crash the answer was unshifted. Rank 3 returned all zeros. It also used strides[0] / pads[0] for both axes and dropped
+    /// group and dilation.
+    /// </remarks>
     public void Execute(OnnxOpContext ctx)
     {
-        // ConvInteger: y = conv(x - x_zero_point, w - w_zero_point)
-        // Inputs: x, w, [x_zero_point], [w_zero_point]
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
-        var xShape = x.Shape; var wShape = w.Shape;
-        if (xShape.Length < 4 || wShape.Length < 4)
+
+        Tensor xAdj = x, wAdj = w;
+        var rented = new List<Tensor>();
+        var xZp = ctx.Inputs.Length > 2 ? ctx.Inputs[2] : null;
+        var wZp = ctx.Inputs.Length > 3 ? ctx.Inputs[3] : null;
+
+        if (xZp != null && xZp.ElementCount > 0)
         {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
+            // x_zero_point is a scalar (ONNX: per-tensor only).
+            if (xZp.ElementCount != 1)
+                throw new NotSupportedException($"ConvInteger x_zero_point has {xZp.ElementCount} values; ONNX allows one (per-tensor).");
+            xAdj = ctx.Pool.Rent(x.Shape, "_convint_x");
+            xAdj.Data.SubView(0, x.ElementCount).CopyFrom(x.Data.SubView(0, x.ElementCount));
+            var neg = ctx.Pool.Rent(xZp.Shape, "_convint_xzp");
+            reg.ElementWise.Scale(xZp.Data, neg.Data, 1, -1f);
+            reg.ElementWise.AddBias(xAdj.Data, neg.Data, x.ElementCount, 1);
+            rented.Add(xAdj); rented.Add(neg);
+        }
+        if (wZp != null && wZp.ElementCount > 0)
+        {
+            wAdj = ctx.Pool.Rent(w.Shape, "_convint_w");
+            wAdj.Data.SubView(0, w.ElementCount).CopyFrom(w.Data.SubView(0, w.ElementCount));
+            var neg = ctx.Pool.Rent(wZp.Shape, "_convint_wzp");
+            reg.ElementWise.Scale(wZp.Data, neg.Data, wZp.ElementCount, -1f);
+            int outChannels = w.Shape[0];
+            if (wZp.ElementCount == 1)
+                reg.ElementWise.AddBias(wAdj.Data, neg.Data, w.ElementCount, 1);
+            else if (wZp.ElementCount == outChannels && outChannels > 0)
+                // One zero point per OUTPUT channel (the weight's first axis): row-major element i belongs to channel
+                // i / (elements per channel), which is AddRowBias's shape, not AddBias's i % C.
+                reg.ElementWise.AddRowBias(wAdj.Data, neg.Data, w.ElementCount, w.ElementCount / outChannels);
+            else
+                throw new NotSupportedException(
+                    $"ConvInteger w_zero_point has {wZp.ElementCount} values; expected 1 (per-tensor) or {outChannels} (per output channel).");
+            rented.Add(wAdj); rented.Add(neg);
         }
 
-        // CPU-side zero-point subtraction for correctness
-        var xVals = ctx.TryGetInputValues(0);
-        var wVals = ctx.TryGetInputValues(1);
-        if (xVals == null || wVals == null)
+        // The float convolution of the adjusted operands: same attributes, no bias.
+        var conv = new OnnxOpContext
         {
-            // Can't read values — fall back to direct conv (ignoring zero points)
-            int st = ctx.GetInts("strides", new[] { 1, 1 })[0];
-            int pd = ctx.GetInts("pads", new int[4])[0];
-            reg.Conv2D.Forward(x.Data, w.Data, default, ctx.Outputs[0].Data,
-                xShape[1], xShape[2], xShape[3], wShape[0], wShape[2], wShape[3], st, pd);
-            return;
-        }
-
-        var xAdj = (float[])xVals.Clone();
-        var wAdj = (float[])wVals.Clone();
-
-        // Subtract zero points
-        float xZp = 0f, wZp = 0f;
-        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
-        {
-            var zpVals = ctx.TryGetInputValues(2);
-            if (zpVals != null && zpVals.Length > 0) xZp = zpVals[0];
-        }
-        if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
-        {
-            var zpVals = ctx.TryGetInputValues(3);
-            if (zpVals != null && zpVals.Length > 0) wZp = zpVals[0];
-        }
-        for (int i = 0; i < xAdj.Length; i++) xAdj[i] -= xZp;
-        for (int i = 0; i < wAdj.Length; i++) wAdj[i] -= wZp;
-
-        // Upload adjusted data via Pool.Rent — buffers stay alive past the WebGPU command encoder flush
-        var xBufMem = ctx.Pool.Rent(new[] { xAdj.Length });
-        xBufMem.Data.SubView(0, xAdj.Length).CopyFromCPU(xAdj);
-        var wBufMem = ctx.Pool.Rent(new[] { wAdj.Length });
-        wBufMem.Data.SubView(0, wAdj.Length).CopyFromCPU(wAdj);
-        var zeroBias = ctx.Pool.Rent(new[] { wShape[0] }); // Conv2D always reads bias — must provide zero-filled buffer
-        zeroBias.Data.SubView(0, wShape[0]).CopyFromCPU(new float[wShape[0]]);
-        int stride = ctx.GetInts("strides", new[] { 1, 1 })[0];
-        int pad = ctx.GetInts("pads", new int[4])[0];
-        int oH = (xShape[2] + 2 * pad - wShape[2]) / stride + 1;
-        int oW = (xShape[3] + 2 * pad - wShape[3]) / stride + 1;
-        var outBufMem = ctx.Pool.Rent(new[] { xShape[0] * wShape[0] * oH * oW });
-        reg.Conv2D.Forward(xBufMem.Data, wBufMem.Data, zeroBias.Data, outBufMem.Data,
-            xShape[1], xShape[2], xShape[3], wShape[0], wShape[2], wShape[3], stride, pad);
-        int copyLen = Math.Min(outBufMem.ElementCount, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(outBufMem.Data.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+            Inputs = new[] { xAdj, wAdj },
+            Outputs = ctx.Outputs,
+            Attributes = ctx.Attributes,
+            Pool = ctx.Pool,
+            Format = ctx.Format,
+            Registry = ctx.Registry,
+            ConstantValues = ctx.ConstantValues,
+        };
+        new ConvOperator(reg).Execute(conv);
+        foreach (var t in rented) ctx.Pool.Return(t);
     }
 }
 

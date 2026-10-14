@@ -19,7 +19,9 @@ fails on all affected backends with the bug reintroduced (red-checked) and passe
   | Whisper base.en | 7.51% | 260 / 527 ms |
   | Whisper small.en | 7.51% | 633 / 1207 ms |
 
-  `WeightStorage.Half` gives the same 3.75% at 162 ms with half the memory. The int8 export currently crashes the encoder (CUDA illegal memory access): open.
+  Variants, same 60 utterances: fp32 3.75% / 163 ms / 3,012 MiB loaded; `WeightStorage.Half` 3.75% / 197 ms / 2,012 MiB (one GB less, 20% slower: the low-precision
+  FusedLinear decodes its weights on load); the int8 export 3.75% / 222 ms / 3.6 GB loaded (integers travel as floats here) but a 652 MB download instead of 2.4 GB.
+  (An earlier note claimed "fp16 = half the memory": false until the external-data fix below - the opt-in did nothing for this model.)
 - **`SpeakerEmbeddingPipeline`** (ReDimNet2-B6, MIT; `soniqo/ReDimNet2-B6-ONNX-FP32`). Fits any clip to the model's fixed 6 s window on the device, returns the
   192-d unit embedding. MEASURED (40 speakers, 240 clips, `tools/speaker-bench`): cosine 1.000000 vs onnxruntime, closed-set identification 99.2%, EER 1.33%, and at
   a threshold that lets 1% of strangers in, 98.9% of enrolled speakers recognised and 0.0% named as someone else. 64 ms per embedding.
@@ -32,6 +34,12 @@ fails on all affected backends with the bug reintroduced (red-checked) and passe
 - **Fix: `Tile` of a computed tensor threw** ("input values are not available on the CPU"); the general N-D tile is a GPU kernel now.
 - **Fix: `FusedAttention` register path was wrong for head dimension 48 / 80 / 96 / 112** (lanes per query = headDim/16 must be a power of two for the xor-butterfly):
   67% wrong attention output, no error. The old tests used head dimension 4 and 8.
+- **Fix: `WeightStorage.Half` was ignored for external-data weights** (a `.onnx_data` file: Parakeet TDT, Depth Anything V3, most onnx-community exports): the external loop never
+  reached the half branch. MEASURED, the "fp16" Parakeet encoder sat at 3,011 MiB like the fp32 one; honoured, 2,012 MiB.
+- **Fix: the half-weight eligibility rule admitted rank-3 (1-D) `Conv` weights**, but the half Conv path is 2-D only: Parakeet's pointwise convs threw "reached an unsupported path".
+- **Fix: `ConvInteger` read the activation on the host** (possible only for constants of at most 64 elements), fell back to `Conv2D.Forward` with an EMPTY bias view (a CUDA
+  illegal memory access that poisons the context for every model in the process; Parakeet's int8 encoder crashed on its first convolution), ignored both zero points, returned
+  zeros for rank 3 and used strides[0]/pads[0] for both axes. The zero points are now subtracted on the device and the float `Conv` runs (groups, dilations, asymmetric pads, 1-D).
 - **Performance: `GroupNormalization` was O(elements x group size)** (every output element's thread recomputed its group's statistics): 144 ms per node on a 2.7M-element
   group. Now the cooperative InstanceNorm stat pass plus an elementwise apply: 7 nodes 1010 ms -> 0.9 ms. Benefits every diffusion / U-Net model.
 - **Performance: a binary op with a small CONSTANT operand** (a per-channel bias) expanded it to the full output size on the host and uploaded it on every call

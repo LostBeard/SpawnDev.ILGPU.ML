@@ -1591,6 +1591,11 @@ public class InferenceSession : IDisposable
                     || (node.OpType == "Conv" && convGroup == 1));
                 if (okAsWeight && node.OpType == "MatMul" && graph.Initializers.TryGetValue(inName, out var mmShape) && mmShape.Length != 2)
                     okAsWeight = false;
+                // A half Conv weight runs only on the standard 2-D path (NCHW, rank-4 weight). A 1-D convolution (rank-3 weight: a conformer's
+                // pointwise convs) has no low-precision kernel and would throw at execute time ("reached an unsupported path ... rank=3"):
+                // it stays fp32. Found loading Parakeet's encoder with WeightStorage.Half.
+                if (okAsWeight && node.OpType == "Conv" && graph.Initializers.TryGetValue(inName, out var cvShape) && cvShape.Length != 4)
+                    okAsWeight = false;
                 if (okAsWeight) halfEligible.Add(inName);
                 else
                 {
@@ -1721,6 +1726,20 @@ public class InferenceSession : IDisposable
                 long extOffset = init.ExternalData.TryGetValue("offset", out var eo) && long.TryParse(eo, out var eov) ? eov : 0;
                 long extLen = init.ExternalData.TryGetValue("length", out var el) && long.TryParse(el, out var elv)
                     ? elv : (long)elems * (init.DataType == 10 ? 2 : 4);
+                // 🔴 THE SAME HALF-STORAGE RULE AS THE MAIN LOOP ABOVE. This loop used to load every external-data weight as fp32 and
+                // never reach WeightStorage.Half, so for ANY model whose weights live in a .onnx_data file (Parakeet, Depth Anything V3,
+                // most onnx-community exports) the opt-in silently did nothing: MEASURED, Parakeet TDT's fp32 and "fp16-stored" encoders
+                // both sat at 3,011 MiB on the card. A weight consumed ONLY as the weight operand of a half-capable op is stored as fp16
+                // (an fp32 one only when the caller opted in; an fp16-source one always, as in the main loop).
+                if (halfEligible.Contains(init.Name) && !upcastWeights.ContainsKey(init.Name)
+                    && ((init.DataType == 10) || (init.DataType == 1 && weightStorage == WeightStorage.Half)))
+                {
+                    var halfW = await pool.AllocateHalfWeightFromStreamAsync(
+                        externalDataStream, extOffset, (int)extLen, init.DataType, shape, init.Name, ct).ConfigureAwait(false);
+                    gpuWeights[init.Name] = Tensor.FromHalf(halfW);
+                    halfLoaded++; loaded++; extLoaded++;
+                    continue;
+                }
                 gpuWeights[init.Name] = await pool.AllocatePermanentFromStreamAsync(
                     externalDataStream, extOffset, (int)extLen, init.DataType, shape, init.Name, ct).ConfigureAwait(false);
                 loaded++; extLoaded++;
