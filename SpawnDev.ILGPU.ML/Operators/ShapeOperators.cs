@@ -260,11 +260,11 @@ public class MinOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Min";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
+        => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
             reg.ElementWise.Min(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
             BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Min(x, y), BroadcastOp.Min);
@@ -275,11 +275,11 @@ public class MaxOnnxOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Max";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
+        => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
             reg.ElementWise.Max(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
             BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Max(x, y), BroadcastOp.Max);

@@ -117,4 +117,13 @@ public abstract partial class MLTestBase
     /// </summary>
     [TestMethod(Timeout = 180000)]
     public async Task Fusion_TransposeSizeOneAxes_MatchesOnnxRuntime() => await FusionFixture("transpose_view", _ => null);
+
+    /// <summary>
+    /// Two operands with the SAME element count but different shapes ([8,1] and [1,8]) broadcast to [8,8] in Add, Sub, Mul, Div, Min and Max,
+    /// matching onnxruntime. Sub treated equal counts as equal shapes and subtracted element by element: the Nemotron streaming encoder's
+    /// attention mask (Sub of [72,1] and [1,72]) came out wrong, so the model attended where it must not and the word error rate rose from
+    /// 5.6% to 7.2% without any error.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Operator_BinaryOps_BroadcastOuterPairsOfEqualSize_MatchOnnxRuntime() => await FusionFixture("outer_broadcast", _ => null);
 }

@@ -4,6 +4,9 @@
 //
 //   dotnet run --project tools/stt-bench -c Release -- <corpusDir> parakeet <modelDir> [--half|--int8] [--limit N]
 //   dotnet run --project tools/stt-bench -c Release -- <corpusDir> whisper  <modelDir> [--limit N]
+//   dotnet run --project tools/stt-bench -c Release -- <corpusDir> streaming <modelDir> [--half] [--limit N]    (Nemotron Speech Streaming 160 ms export: encoder.onnx + encoder.data,
+//                                                          decoder.onnx, joiner.onnx, tokens.txt; audio is fed in 100 ms pieces as a microphone delivers it; "latency" is then the
+//                                                          time from the LAST sample to the final text)
 //
 // WER = (substitutions + deletions + insertions) / reference words over the whole set, after lower-casing and
 // dropping everything except letters, digits and apostrophes. Latency is the engine's own time for one utterance
@@ -49,6 +52,7 @@ async Task<InferenceSession> Load(string path, bool lowPrecision = false)
 }
 
 Func<float[], Task<(string Text, double Ms)>> transcribe;
+var streamChunkMs = new List<double>(); var streamFirstWordAudioMs = new List<double>();
 var loadClock = Stopwatch.StartNew();
 if (engine == "parakeet")
 {
@@ -67,6 +71,38 @@ else if (engine == "whisper")
     var pipeline = new SpeechRecognitionPipeline(enc, dec, accelerator, past);
     pipeline.LoadTokenizer(File.ReadAllText(Path.Combine(modelDir, "tokenizer.json")));
     transcribe = async s => { var r = await pipeline.TranscribeAsync(s, 16000); return (r.Text, r.InferenceTimeMs); };
+}
+else if (engine == "streaming")
+{
+    var (encShapes, decShapes, joiShapes) = StreamingTranscriber.InputShapes();
+    async Task<InferenceSession> LoadStreaming(string file, string? dataFile, Dictionary<string, int[]> shapes, bool lowPrecision)
+    {
+        var graph = new FileStream(Path.Combine(modelDir, file), FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.Asynchronous | FileOptions.RandomAccess);
+        var external = dataFile == null ? null : new FileStream(Path.Combine(modelDir, dataFile), FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.Asynchronous | FileOptions.RandomAccess);
+        return await InferenceSession.CreateFromOnnxStreamAsync(accelerator, graph, inputShapes: shapes, externalDataStream: external,
+            weightStorage: lowPrecision ? WeightStorage.Half : WeightStorage.Source);
+    }
+    var enc = await LoadStreaming("encoder.onnx", "encoder.data", encShapes, half);
+    var dec = await LoadStreaming("decoder.onnx", null, decShapes, false);
+    var joi = await LoadStreaming("joiner.onnx", null, joiShapes, false);
+    var stream = new StreamingTranscriber(enc, dec, joi, accelerator, ParakeetTdtPipeline.ParseVocabulary(File.ReadAllText(Path.Combine(modelDir, "tokens.txt"))));
+    transcribe = async s =>
+    {
+        stream.Reset();
+        long fed = 0; double firstAt = -1;
+        for (int i = 0; i < s.Length; i += 1600)
+        {
+            var piece = s[i..Math.Min(s.Length, i + 1600)];
+            var u = await stream.AcceptAudioAsync(piece);
+            fed += piece.Length;
+            if (u.ChunksRun > 0) streamChunkMs.Add(u.ProcessingMs / u.ChunksRun);
+            if (firstAt < 0 && u.NewTokens.Count > 0) firstAt = fed / 16.0;
+        }
+        var clock = Stopwatch.StartNew();
+        var fin = await stream.FinishAsync();
+        if (firstAt >= 0) streamFirstWordAudioMs.Add(firstAt);
+        return (fin.Text, clock.Elapsed.TotalMilliseconds);
+    };
 }
 else { Console.Error.WriteLine($"unknown engine '{engine}'"); return 2; }
 Console.WriteLine($"loaded   : {engine} {Path.GetFileName(modelDir.TrimEnd('/', '\\'))}{(half ? " (fp16 weights)" : "")}{(int8 ? " (int8)" : "")} in {loadClock.Elapsed.TotalSeconds:F1} s");
@@ -112,6 +148,15 @@ double Pct(List<double> v, double p) => v[Math.Min(v.Count - 1, (int)(v.Count * 
 Console.WriteLine($"WER      : {100.0 * errors / refWords:F2}%  ({errors} errors / {refWords} reference words, {items.Count} utterances)");
 Console.WriteLine($"latency  : median {Pct(latencies, 0.5):F0} ms, p95 {Pct(latencies, 0.95):F0} ms, max {latencies[^1]:F0} ms");
 Console.WriteLine($"RTF      : median {Pct(rtfs, 0.5):F3}, p95 {Pct(rtfs, 0.95):F3}  (1.0 = real time)");
+if (streamChunkMs.Count > 0)
+{
+    streamChunkMs.Sort(); streamFirstWordAudioMs.Sort();
+    Console.WriteLine($"streaming: a 160 ms chunk takes median {Pct(streamChunkMs, 0.5):F1} ms, p95 {Pct(streamChunkMs, 0.95):F1} ms, max {streamChunkMs[^1]:F1} ms of the 160 ms it covers");
+    if (streamFirstWordAudioMs.Count > 0) Console.WriteLine($"streaming: the first word appears after a median {Pct(streamFirstWordAudioMs, 0.5):F0} ms of audio (p95 {Pct(streamFirstWordAudioMs, 0.95):F0} ms)");
+}
+var dumpAt = Array.IndexOf(args, "--dump");
+if (dumpAt >= 0)
+    File.WriteAllText(args[dumpAt + 1], System.Text.Json.JsonSerializer.Serialize(rows.Select(r => new[] { r.Id, r.Ref, r.Got })));
 Console.WriteLine("worst utterances:");
 foreach (var w in rows.OrderByDescending(r => r.Wer).Take(5))
     Console.WriteLine($"  {w.Wer:P0} {w.Id}\n    ref: {w.Ref}\n    got: {w.Got}");

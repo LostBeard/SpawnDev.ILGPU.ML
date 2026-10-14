@@ -535,13 +535,6 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
             reg.ElementWise.Sub(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
             if (rented != null) ctx.Pool.Return(rented);
         }
-        else if (a.ElementCount == b.ElementCount)
-        {
-            // Size mismatch with output — use min count
-            int count = Math.Min(a.ElementCount, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Sub(a.Data.SubView(0, count), b.Data.SubView(0, count),
-                ctx.Outputs[0].Data.SubView(0, count), count);
-        }
         else if (b.ElementCount == 1)
         {
             // Scalar subtract: output = a - scalar → use BroadcastMul(a, -1→b) + BroadcastAdd

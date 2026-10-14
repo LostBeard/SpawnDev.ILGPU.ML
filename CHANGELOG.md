@@ -3,6 +3,19 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased - streaming speech to text, and a broadcast bug it found
+
+- **`StreamingTranscriber`** (NVIDIA Nemotron Speech Streaming 0.6B, cache-aware FastConformer + RNN-T, the 160 ms sherpa-onnx export): words as the audio arrives, one
+  160 ms chunk at a time, encoder caches kept in device buffers. `AcceptAudioAsync` returns the new tokens and the text so far; `FinishAsync` flushes the tail. **`NemoStreamingFeatures`**
+  computes NeMo's log-mel frames as samples arrive (double precision, identical for any chunking). MEASURED on LibriSpeech test-clean, 60 utterances, RTX 4070 (`tools/stt-bench ... streaming`):
+  WER 5.63% (fp32 and `WeightStorage.Half` alike; sherpa-onnx on CPU 6.17%), a 160 ms chunk takes a median 67 ms, the first word appears after a median 900 ms of audio, the final text
+  420 ms after the last sample (this includes the one second of silence fed to flush the tail).
+- **FIXED: `Sub`, `Min` and `Max` of operands with the SAME element count but different shapes** (`[N,1]` and `[1,N]`, the outer-product shape). `Sub` subtracted element by element and left the
+  rest of the `[N,N]` output unwritten; `Min` / `Max` also inferred the output shape from the first operand only. The streaming encoder builds its attention mask from `Sub([72,1],[1,72])`,
+  so it attended where it must not: WER 7.24% instead of 5.63%, with no error anywhere. Found by cutting the ONNX graph at tensors and comparing each cut with onnxruntime
+  (`tools/onnx-bisect-encoder.mjs`, `tools/streaming-diff`). Test `Operator_BinaryOps_BroadcastOuterPairsOfEqualSize_MatchOnnxRuntime` (Add, Sub, Mul, Div, Min, Max against onnxruntime);
+  red before the fix on CPU and CUDA.
+
 ## 5.3.9 - 2026-10-14 - speech: Parakeet TDT speech to text, speaker embeddings, Smart Turn end-of-turn detection, and the library fixes found building them
 
 Three new pipelines (Parakeet TDT, speaker embeddings, Smart Turn), each held to onnxruntime on the same audio, and the defects the work exposed. Every fix is covered by a test that
