@@ -236,7 +236,7 @@ public class OperatorRegistry : IDisposable
         Register(new GemmOperator(this));
         Register(new MoEOperator(this));
         Register(new InstanceNormOperator(this));
-        Register(new GroupNormOperator(_accelerator));
+        Register(new GroupNormOperator(this));
         Register(new ConstantOperator());
         Register(new CeilOperator(this));
         Register(new LogOperator(this));

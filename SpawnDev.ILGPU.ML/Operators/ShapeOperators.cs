@@ -494,24 +494,13 @@ public class TileOperator(OperatorRegistry reg) : IOnnxOperator
             return;
         }
 
-        // General N-D tile: map each output coordinate back to the input by modulo per dimension.
-        var inVals = ctx.TryGetInputValues(0);
-        if (inVals != null && inShape.Length > 0 && outShape.Length == inShape.Length)
+        // General N-D tile on the DEVICE: every output coordinate maps back to the input by modulo per axis. This
+        // used to need the input's values on the host (TryGetInputValues, which only exists for small constants), so
+        // a tile of a COMPUTED tensor - Parakeet's relative-position index, [1,1,T] tiled by [1,T,1] - threw
+        // "input values are not available on the CPU". The input is already where the kernel reads it.
+        if (inShape.Length > 0 && outShape.Length == inShape.Length)
         {
-            var result = new float[outCount];
-            var inStrides = BroadcastHelper.ComputeStrides(inShape, inShape);
-            for (int i = 0; i < outCount; i++)
-            {
-                int remaining = i, inIdx = 0;
-                for (int d = outShape.Length - 1; d >= 0; d--)
-                {
-                    int coord = remaining % outShape[d];
-                    remaining /= outShape[d];
-                    inIdx += (coord % inShape[d]) * inStrides[d];
-                }
-                result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
-            }
-            output.Data.SubView(0, outCount).CopyFromCPU(result);
+            reg.MissingElementWise.Tile(input.Data, output.Data, inShape, outShape);
             return;
         }
 

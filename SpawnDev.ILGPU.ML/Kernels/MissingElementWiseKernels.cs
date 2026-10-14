@@ -28,6 +28,7 @@ public class MissingElementWiseKernels : IDisposable
 
     // Expand (broadcast copy)
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _expandKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _tileKernel;
 
     // TopK (indices stored as float to avoid Wasm Int32Array alignment issues)
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _topKKernel;
@@ -264,6 +265,67 @@ public class MissingElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ExpandImpl);
         _expandKernel(totalOutput, input, output, paramsView);
+    }
+
+    // ──────────────────────────────────────────────
+    //  Tile (repeat along each axis)
+    // ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Tile: output coordinate c along axis d reads input coordinate (c % inputShape[d]).
+    /// params: [rank, inputShape..., outputShape..., inputStrides...]. One thread per output element.
+    /// </summary>
+    private static void TileImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int rank = p[0];
+        int remaining = idx;
+        int inputIdx = 0;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            int outDim = p[1 + rank + d];
+            int inDim = p[1 + d];
+            int inStride = p[1 + 2 * rank + d];
+            int coord = remaining % outDim;
+            remaining /= outDim;
+            inputIdx += (coord % inDim) * inStride;
+        }
+        output[idx] = input[inputIdx];
+    }
+
+    /// <summary>Tile on the device: any rank, any repeats, no host values needed.</summary>
+    public void Tile(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int[] inputShape, int[] outputShape)
+    {
+        int rank = outputShape.Length;
+        if (inputShape.Length != rank)
+            throw new ArgumentException($"Tile: input rank {inputShape.Length} != output rank {rank}");
+        int totalOutput = 1;
+        for (int i = 0; i < rank; i++) totalOutput *= outputShape[i];
+
+        var paramsData = new int[1 + 3 * rank];
+        paramsData[0] = rank;
+        int stride = 1;
+        for (int i = rank - 1; i >= 0; i--)
+        {
+            paramsData[1 + i] = inputShape[i];
+            paramsData[1 + rank + i] = outputShape[i];
+            paramsData[1 + 2 * rank + i] = stride;
+            stride *= inputShape[i];
+        }
+        ArrayView1D<int, Stride1D.Dense> paramsView = Graph.GraphExecutor.UseCaptureParamSlots
+            ? CaptureParamArena.Shared(_accelerator).RentStableSlot(paramsData)
+            : _params.Get(_accelerator, paramsData);
+
+        _tileKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(TileImpl);
+        _tileKernel(totalOutput, input, output, paramsView);
     }
 
     // ──────────────────────────────────────────────

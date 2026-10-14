@@ -106,9 +106,16 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int frameStep = 128;
         var frameStepVals = ctx.TryGetInputValues(1);
         if (frameStepVals != null && frameStepVals.Length > 0) frameStep = (int)frameStepVals[0];
-        float[]? windowVals = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
+        // 🔴 THE WINDOW IS READ FROM ITS DEVICE BUFFER, NOT FROM HOST VALUES. TryGetInputValues only sees
+        // initializers of at most 64 elements, so a 512-sample Hann window (Parakeet's nemo128 log-mel) came back
+        // null: the window was silently dropped and frame_length fell back to frame_step (160), which disagrees with
+        // shape inference (512 -> 257 bins), so the kernel wrote a [frames, 81, 2] layout into a [frames, 257, 2]
+        // buffer - wrong values with the right shape. Kokoro's 20-sample window never exceeded the limit. The
+        // tensor is already on the device and its length is its shape, so no host copy and no size limit.
+        var windowInput = ctx.Inputs.Length > 2 ? ctx.Inputs[2] : null;
+        bool hasWindowInput = windowInput != null && windowInput.ElementCount > 0;
         // ONNX spec: frame_length defaults to frame_step when not provided
-        int frameLength = windowVals?.Length ?? frameStep;
+        int frameLength = hasWindowInput ? windowInput!.ElementCount : frameStep;
         if (ctx.Inputs.Length > 3)
         {
             var flVals = ctx.TryGetInputValues(3);
@@ -119,11 +126,14 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int fftOutputLen = onesided != 0 ? frameLength / 2 + 1 : frameLength;
         int totalBins = batch * numFrames * fftOutputLen;
 
+        // The kernel applies the window to n < frameLength; a window shorter than the frame would read past it.
+        if (hasWindowInput && windowInput!.ElementCount < frameLength)
+            throw new InvalidOperationException(
+                $"STFT: window has {windowInput.ElementCount} samples but frame_length is {frameLength}");
+
         // Use pool for all temp buffers: avoids inline Synchronize-then-dispose which races on Wasm
-        int hasWindow = windowVals != null ? 1 : 0;
-        var windowBuf = ctx.Pool.Rent(new[] { windowVals?.Length ?? 1 });
-        if (windowVals != null)
-            windowBuf.Data.SubView(0, windowVals.Length).CopyFromCPU(windowVals);
+        int hasWindow = hasWindowInput ? 1 : 0;
+        var windowData = hasWindowInput ? windowInput!.Data : ctx.Pool.Rent(new[] { 1 }).Data;
 
         // Params as float (STFTImpl casts to int) — avoids Wasm Int32Array alignment issues
         var paramsData = new float[] { signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow };
@@ -131,7 +141,7 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
 
         // One thread per scalar output (real + imag interleaved) — gather, WebGL TF compatible
-        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.Data, ctx.Outputs[0].Data, paramsBuf.Data, totalBins * 2);
+        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowData, ctx.Outputs[0].Data, paramsBuf.Data, totalBins * 2);
     }
 }
 

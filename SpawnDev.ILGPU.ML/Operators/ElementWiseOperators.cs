@@ -109,36 +109,36 @@ internal static class BroadcastHelper
         }
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
-            // b is a small runtime constant, a is a large GPU tensor.
-            // Expand b to full output shape on CPU, upload, then GPU element-wise op.
-            // Uses Rent (not AllocatePermanent) to avoid buffer leaks through 748-node models.
-            var bExpanded = new float[outCount];
-            var bStrides = ComputeStrides(b.Shape, outShape);
-            var outStrides = ComputeStrides(outShape, outShape);
-            for (int i = 0; i < outCount; i++)
-            {
-                int bIdx = MapIndex(i, outStrides, bStrides, outShape.Length);
-                bExpanded[i] = bIdx < bVals.Length ? bVals[bIdx] : 0f;
-            }
-            Tensor bExpandedTensor;
+            // b is a small runtime constant (a per-channel bias or scale), a is a large GPU tensor.
+            //
+            // 🔴 UPLOAD THE CONSTANT AS IT IS, never expanded to the output's size. This branch used to build a
+            // float[outCount] on the host (a MapIndex loop over every output element) and push it across the bus on
+            // EVERY call: a [64,1,1] bias added to a [1,64,72,596] activation (2.7M elements) took 26 ms of a 97 ms
+            // speaker-model forward - one node, 27% of the GPU time - for work the GPU does in microseconds.
+            // BroadcastBinaryOpND already broadcasts from stride maps, so the operand only has to BE on the device.
+            //
+            // ⚠️ RANK-MATCHED to the output (leading 1s), for the reason the scalar branch above records: a rank-1
+            // operand against a rank-3 output hung WebGPU (a D3D12 TDR) while CUDA/OpenCL were fine.
+            var bShape = new int[outShape.Length];
+            int bOffset = outShape.Length - b.Shape.Length;
+            for (int d = 0; d < bShape.Length; d++) bShape[d] = d < bOffset ? 1 : b.Shape[d - bOffset];
+            Tensor bTensor;
             if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
             {
-                // CUDA-graph capture: "_broadcast_b_expanded" is a transient reused pool buffer, so skipping its
-                // H2D would leave stale data. The expanded constant is deterministic — use a stable arena slot
-                // (written in warm, skip-write in capture). Not pool-registered → Pool.Return is a safe no-op.
-                var bView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(bExpanded);
-                bExpandedTensor = new Tensor(bView, outShape, "_broadcast_b_expanded");
+                // CUDA-graph capture: a pooled transient's H2D is skipped during replay, so a deterministic constant
+                // needs a stable arena slot (written in warm, skip-write in capture).
+                var bView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(bVals);
+                bTensor = new Tensor(bView, bShape, "_broadcast_b_const");
             }
             else
             {
-                bExpandedTensor = ctx.Pool.Rent(outShape, "_broadcast_b_expanded");
-                bExpandedTensor.Data.SubView(0, outCount).CopyFromCPU(bExpanded);
+                bTensor = ctx.Pool.Rent(bShape, "_broadcast_b_const");
+                bTensor.Data.SubView(0, bVals.Length).CopyFromCPU(bVals);
             }
-            // Use GPU N-D broadcast kernel (a and bExpanded are same shape → element-wise)
             reg.ElementWise.BroadcastBinaryOpND(
-                a.Data, bExpandedTensor.Data, ctx.Outputs[0].Data,
-                a.Shape, outShape, outShape, gpuOp);
-            ctx.Pool.Return(bExpandedTensor);
+                a.Data, bTensor.Data, ctx.Outputs[0].Data,
+                a.Shape, bShape, outShape, gpuOp);
+            ctx.Pool.Return(bTensor);
         }
         else
         {

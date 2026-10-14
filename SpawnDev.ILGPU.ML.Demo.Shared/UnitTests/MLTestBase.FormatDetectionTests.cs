@@ -7,6 +7,31 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public abstract partial class MLTestBase
 {
+    /// <summary>
+    /// An ONNX file is recognised by its producer string, and exporters spell it however they like. Parakeet's
+    /// log-mel preprocessor (istupakov/parakeet-tdt-0.6b-v3-onnx, nemo128.onnx) is written by onnxscript as
+    /// "OnnxScript" and was parsed as CoreML ("Unknown wire type: 7"). The first rows are REAL file headers:
+    /// ir_version 8 (08 08), producer_name (12 len ...), then producer_version.
+    /// </summary>
+    [TestMethod]
+    public void FormatDetection_OnnxProducerStrings_AreOnnxInAnyCase()
+    {
+        static byte[] Header(string producer)
+        {
+            var name = System.Text.Encoding.ASCII.GetBytes(producer);
+            var h = new List<byte> { 0x08, 0x08, 0x12, (byte)name.Length };
+            h.AddRange(name);
+            h.AddRange(new byte[] { 0x1A, 0x05, (byte)'2', (byte)'.', (byte)'8', (byte)'.', (byte)'0', 0x3A, 0xD7, 0xBE, 0xF5, 0x13 });
+            return h.ToArray();
+        }
+        foreach (var producer in new[] { "OnnxScript", "onnx", "ONNX", "tf2onnx", "skl2onnx", "pytorch", "PyTorch" })
+        {
+            var detected = InferenceSession.DetectModelFormat(Header(producer));
+            if (detected != ModelFormat.ONNX)
+                throw new Exception($"an ONNX header with producer \"{producer}\" was detected as {detected}");
+        }
+    }
+
     [TestMethod]
     public async Task FormatDetection_AllFormats_Detected()
     {

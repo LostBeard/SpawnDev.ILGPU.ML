@@ -16,7 +16,7 @@ public abstract partial class MLTestBase
     /// Runs a fixture from references/fusion against its onnxruntime outputs, then checks the compiled operator set.
     /// The three passes these gate change WHAT the engine executes (fewer dispatches) and must not change results.
     /// </summary>
-    private async Task FusionFixture(string name, Func<HashSet<string>, string?> checkOps)
+    private async Task FusionFixture(string name, Func<HashSet<string>, string?> checkOps, double tolerance = 1e-5)
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -58,7 +58,7 @@ public abstract partial class MLTestBase
                     var g = await host.CopyToHostAsync<float>(0, expected.Length);
                     double worst = 0;
                     for (int i = 0; i < expected.Length; i++) worst = Math.Max(worst, Math.Abs(g[i] - expected[i]) / Math.Max(1.0, Math.Abs(expected[i])));
-                    if (worst > 1e-5)
+                    if (worst > tolerance)
                         throw new Exception($"{name} {p.Name}: max rel {worst:E2} vs onnxruntime on {BackendName}");
                 }
                 session.ReturnOutputs(outs);
@@ -80,6 +80,36 @@ public abstract partial class MLTestBase
     public async Task Fusion_GroupNorm_MatchesOnnxRuntime() => await FusionFixture("group_norm",
         ops => ops.Contains("InstanceNormalization") || !ops.Contains("GroupNormalization")
             ? "the GroupNorm chain was not fused into GroupNormalization" : null);
+
+    /// <summary>
+    /// MatMul + Add(SCALAR) is not a bias (Parakeet's log-mel ends in `MatMul -> Add(0)`): it must stay two nodes and
+    /// match onnxruntime, while MatMul + Add(b[N]) in the same graph still fuses into FusedLinear. Before the fix the
+    /// scalar path fused and threw "FusedLinear bounds mismatch ... bias=[] buf=1".
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Fusion_MatMulPlusScalarAdd_IsNotABias_MatchesOnnxRuntime() => await FusionFixture("matmul_scalar_add",
+        ops => !ops.Contains("FusedLinear") ? "the real per-column bias no longer fuses into FusedLinear"
+             : !ops.Contains("MatMul") || !ops.Contains("Add") ? "the scalar Add was fused into a FusedLinear as if it were a bias" : null);
+
+    /// <summary>
+    /// STFT with a 512-sample Hann window, hop 160, on a rank-2 signal (NeMo's log-mel preprocessor): 23 frames x 257 bins,
+    /// matching onnxruntime. Before the fixes the window (over the 64-element host-value limit) was dropped and frame_length
+    /// fell back to the hop - right shape, 97% wrong values - and the hop folded AFTER shape inference gave a 128-hop frame count.
+    /// Tolerance 2e-3, MEASURED not chosen: this kernel is a direct float32 DFT whose twiddle angle reaches ~1,600 rad
+    /// (2*pi*k*n/L, k up to 256, n up to 511). CPU, OpenCL and Wasm land under 5e-4; CUDA, WebGPU and WebGL use fast
+    /// sin/cos, which lose accuracy at large arguments, and all three measure 8.1e-4 (the kernel's own comment records
+    /// why the angle is deliberately not reduced: Kokoro's Nyquist-bin phase). The defects this test exists for are three
+    /// orders of magnitude larger: a dropped window was 97% wrong, a 128-hop frame count changes the output SHAPE.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Operator_Stft_LongWindow_MatchesOnnxRuntime() => await FusionFixture("stft_long_window", _ => null, tolerance: 2e-3);
+
+    /// <summary>
+    /// Tile of a COMPUTED tensor ([1,1,T] repeated [1,T,1], a conformer's relative-position index) matches onnxruntime.
+    /// The general N-D Tile used to require the input's values on the host and threw for anything computed.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Operator_Tile_OfAComputedTensor_MatchesOnnxRuntime() => await FusionFixture("tile_computed", _ => null);
 
     /// <summary>
     /// A Transpose that only moves size-1 axes is a reshape: the single-consumer one is handed off zero-copy, the one

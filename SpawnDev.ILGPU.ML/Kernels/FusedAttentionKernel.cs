@@ -172,6 +172,7 @@ public class FusedAttentionKernel : IDisposable
     // Warp.Shuffle, D%16==0) — other backends keep the shared-slice per-query. GGUF_ATTN_REG=0 forces OFF (A/B).
     public static bool EnableRegisterAttention =
         Environment.GetEnvironmentVariable("GGUF_ATTN_REG") != "0";
+    private static bool IsPowerOfTwo(int n) => n > 0 && (n & (n - 1)) == 0;
     private const int RegTileD = 16; // per-lane register tile width (≤16 scalar-replaces; divides 64/128/256)
 
     private readonly Dictionary<Type, object> _groupedStridedKernels = new();
@@ -325,7 +326,12 @@ public class FusedAttentionKernel : IDisposable
         // the adapter exposes subgroups (WarpSize reports 32 → ShuffleXor lowers to subgroupShuffleXor; needs ILGPU
         // 4.16.2+ which emits the subgroup_uniformity diagnostic so the storage-bound kv-loop shuffle compiles).
         // OpenCL EXCLUDED (NVIDIA OpenCL lacks cl_khr_subgroup_shuffle); CPU/Wasm/WebGL keep the shared-slice.
-        if (EnableRegisterAttention && headDim % RegTileD == 0 && _accelerator.WarpSize == 32
+        // 🔴 headDim/RegTileD (the lanes that share one query) must be a POWER OF TWO: the Q.K dot is reduced across those
+        // lanes with Warp.ShuffleXor (a butterfly over xor 1,2,4..), and 32 lanes are packed into 32/T queries. At T=3
+        // (headDim 48: ReDimNet2's attention) the butterfly mixes lanes of DIFFERENT queries and 2 lanes idle: the output
+        // was 67% wrong with no error. MEASURED on ReDimNet2-B6 against onnxruntime; flipping only this switch fixed it.
+        // Heads of 80 (T=5), 96 (T=6), 112 (T=7) were wrong the same way; 16/32/64/128/256 are unaffected.
+        if (EnableRegisterAttention && headDim % RegTileD == 0 && IsPowerOfTwo(headDim / RegTileD) && _accelerator.WarpSize == 32
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU))
         {

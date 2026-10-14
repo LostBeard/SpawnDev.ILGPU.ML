@@ -80,6 +80,11 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _instanceNormApplyKernel;
+    // GroupNorm apply: (x - mean[n,group]) * invStd[n,group] * weight[c] + bias[c], stats from the InstanceNorm stat passes.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int>? _groupNormApplyKernel;
 
     // MeanVarianceNormalization — contiguous [groups, red] and NCHW keep-channel paths.
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -399,6 +404,24 @@ public class NormalizationKernels : IDisposable
         output[idx] = scale[c] * (input[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
     }
 
+    /// <summary>GroupNorm pass 2: element idx is channel c of batch n; its group is c / channelsPerGroup and its stats are
+    /// the (n, group) entries of <paramref name="means"/>/<paramref name="invStds"/>. Affine is per CHANNEL.</summary>
+    private static void GroupNormApplyImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int C, int spatial, int channelsPerGroup, int groups)
+    {
+        int nc = idx / spatial;              // n * C + c
+        int c = nc % C;
+        int n = nc / C;
+        int stat = n * groups + c / channelsPerGroup;
+        output[idx] = weight[c] * (input[idx] - means[stat]) * invStds[stat] + bias[c];
+    }
+
     /// <summary>InstanceNorm Pass 2, IN PLACE: one read_write buffer (<paramref name="data"/>). Identical math
     /// to <see cref="InstanceNormApplyImpl"/> but reads and writes the same element of one buffer — a single
     /// binding (WebGPU-legal). Each thread reads data[idx] then writes it; stats were already computed in pass 1.</summary>
@@ -697,6 +720,37 @@ public class NormalizationKernels : IDisposable
         _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
+    /// <summary>
+    /// Group normalisation of an NCHW-contiguous tensor [N, C, spatial] with <paramref name="numGroups"/> groups of
+    /// consecutive channels, per-channel <paramref name="weight"/> and <paramref name="bias"/>.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 TWO PASSES, NOT ONE THREAD PER ELEMENT. <c>GroupNormKernel</c> makes every output element's thread recompute its
+    /// whole group's mean and variance: O(elements x group size) work - 144 ms for ONE GroupNorm over a 2.7M-element group
+    /// (ReDimNet2, 7 of them = 91% of a 1.2 s speaker embedding, MEASURED per-op on an RTX 4070). A group is a CONTIGUOUS run
+    /// of channelsPerGroup x spatial elements, i.e. exactly an InstanceNorm slice, so the statistics reuse InstanceNorm's
+    /// cooperative stat pass (a workgroup per (n, group), shared-memory reduction; the serial per-slice kernel on
+    /// WebGL/CPU/Wasm, where cooperative is slower) and a second elementwise pass applies them.
+    /// </remarks>
+    public void GroupNorm(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        int N, int C, int spatial, int numGroups, float epsilon = 1e-5f)
+    {
+        if (numGroups <= 0 || C % numGroups != 0)
+            throw new ArgumentException($"GroupNorm: {C} channels do not divide into {numGroups} groups");
+        EnsureLoaded();
+        int channelsPerGroup = C / numGroups;
+        int slices = N * numGroups;
+        int sliceLength = channelsPerGroup * spatial;
+        var (means, invStds) = GetStatsScratch(slices);
+        if (!TryCoopInstanceNormStats(input, means.View, invStds.View, slices, sliceLength, epsilon))
+            _instanceNormMeanVarKernel!(slices, input, means.View, invStds.View, sliceLength, epsilon);
+        _groupNormApplyKernel!(N * C * spatial, input, output, weight, bias, means.View, invStds.View,
+            C, spatial, channelsPerGroup, numGroups);
+    }
+
     /// <summary>InstanceNorm IN PLACE: normalize <paramref name="data"/> over each (N,C) slice, writing back into
     /// the SAME buffer (no separate output). Saves the output buffer (a 256 MiB feature map in the SD VAE). Pass-1
     /// reads data for the per-slice mean/invStd; pass-2 reads+writes data in place via a single read_write binding
@@ -985,6 +1039,11 @@ public class NormalizationKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int>(InstanceNormApplyImpl);
+        _groupNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(GroupNormApplyImpl);
         _instanceNormApplyInPlaceKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

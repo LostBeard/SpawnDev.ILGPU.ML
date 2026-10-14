@@ -868,11 +868,15 @@ public class InferenceSession : IDisposable
         // The old "- 4" bound skipped that final window, so an "onnx" string sitting exactly at
         // offset 4 of a minimal 8-byte buffer was never scanned and the bytes fell through to the
         // 0x08 protobuf fallback (mis-detected as CoreML version 7).
+        // CASE-INSENSITIVE: the producer string is whatever the exporter wrote. Microsoft's own onnxscript writes
+        // "OnnxScript" (capital O), which the old exact-case match missed, so every onnxscript export (the Parakeet
+        // log-mel preprocessor, nemo128.onnx) fell through to the 0x08 fallback and was parsed as CoreML.
+        // (data[i] | 0x20) lower-cases an ASCII letter.
         for (int i = 0; i < Math.Min(64, data.Length - 3); i++)
         {
-            if (data[i] == 'o' && data[i + 1] == 'n' && data[i + 2] == 'n' && data[i + 3] == 'x')
+            if ((data[i] | 0x20) == 'o' && (data[i + 1] | 0x20) == 'n' && (data[i + 2] | 0x20) == 'n' && (data[i + 3] | 0x20) == 'x')
                 return ModelFormat.ONNX;
-            if (data[i] == 'p' && data[i + 1] == 'y' && data[i + 2] == 't' && data[i + 3] == 'o')
+            if ((data[i] | 0x20) == 'p' && (data[i + 1] | 0x20) == 'y' && (data[i + 2] | 0x20) == 't' && (data[i + 3] | 0x20) == 'o')
                 return ModelFormat.ONNX; // pytorch producer
         }
 

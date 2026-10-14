@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 
 namespace SpawnDev.ILGPU.ML.Graph;
 
@@ -894,6 +894,23 @@ public static class GraphOptimizer
     }
 
     /// <summary>
+    /// True when adding a constant of <paramref name="biasShape"/> to this MatMul/Gemm's output is a per-column bias:
+    /// every leading dimension is 1 and the last equals N. A scalar (or any other broadcast) is NOT a bias.
+    /// </summary>
+    private static bool IsPerColumnBias(ModelGraph graph, GraphNode matmul, int[] biasShape)
+    {
+        if (biasShape.Length == 0) return false;                                  // scalar
+        for (int d = 0; d < biasShape.Length - 1; d++)
+            if (biasShape[d] != 1) return false;
+        int n = biasShape[^1];
+        // N from the weight when it is a constant ([K,N]; transB Gemm never gets here). When the weight is an
+        // activation its width is unknown at this point, so require a real vector (a 1-wide Add is a scalar).
+        if (matmul.Inputs.Count >= 2 && graph.Initializers.TryGetValue(matmul.Inputs[1], out var w) && w.Length >= 2)
+            return n == w[^1];
+        return n > 1;
+    }
+
+    /// <summary>
     /// Detect and fuse MatMul → Add → Activation patterns.
     /// Returns the number of fused sequences found.
     /// </summary>
@@ -965,8 +982,11 @@ public static class GraphOptimizer
             // The bias is the other input to Add (not the MatMul output)
             string biasName = addNode.Inputs[0] == matmulOutput ? addNode.Inputs[1] : addNode.Inputs[0];
 
-            // Check if bias is a 1D weight (initializer)
-            if (!graph.Initializers.ContainsKey(biasName)) continue;
+            // The bias must be a constant that adds ONE value per output column: shape [1,...,1,N] with N the
+            // weight's last dimension. An initializer alone is not enough - nemo128's `mel + log_zero_guard_value`
+            // adds a SCALAR 0 after a [257,128] MatMul, and fusing it made FusedLinear read a 1-element "bias" for
+            // 128 columns (bounds mismatch, then wrong values on any build that skipped the check).
+            if (!graph.Initializers.TryGetValue(biasName, out var biasShape) || !IsPerColumnBias(graph, matmulNode, biasShape)) continue;
 
             // Look for optional activation consuming Add output
             string? activationType = null;

@@ -302,6 +302,32 @@ public class GraphCompiler
                 attrs["axes"] = axesLongs;
             }
 
+            // 🔴 STFT's FRAME STEP IS AN INPUT VALUE, and shape inference only sees SHAPES - so it fell back to a
+            // default hop of 128 and produced a frame count that had nothing to do with the model.
+            // MEASURED on Kokoro: a 620-sample source with a 20-sample window and a real hop of 5 should give
+            // (620-20)/5+1 = 121 frames; inference predicted (620-20)/128+1 = 5, sized the output buffer for 5, and
+            // every downstream shape carried the 5 (it surfaced 539 nodes later as a broadcast failure). MEASURED
+            // on Parakeet's log-mel (hop 160): 64,000 samples gave 501 frames instead of 401.
+            //
+            // ⚠️ It must happen BEFORE the inference call below. The earlier version of this fold ran after it,
+            // where setting an attr cannot change a shape that has already been inferred; Kokoro only worked
+            // because its frame count was fixed up elsewhere. Anything that changes an output SHAPE and arrives
+            // as an input value must be folded before InferOutputShapes sees the node.
+            if (node.OpType == "STFT" && graph.ConstantData != null)
+            {
+                if (node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1])
+                    && graph.ConstantData.TryGetValue(node.Inputs[1], out var stepVals)
+                    && stepVals.Length > 0)
+                    attrs["_resolved_frame_step"] = (long)stepVals[0];
+
+                // frame_length is input[3] when present; otherwise the WINDOW (input[2]) gives it by length,
+                // which inference can already see as a shape.
+                if (node.Inputs.Count >= 4 && !string.IsNullOrEmpty(node.Inputs[3])
+                    && graph.ConstantData.TryGetValue(node.Inputs[3], out var lenVals)
+                    && lenVals.Length > 0)
+                    attrs["_resolved_frame_length"] = (long)lenVals[0];
+            }
+
             // Infer output shapes
             int[][]? outputShapes = TryInferOutputShapes(op, inputShapes, attrs, out var shapeEx);
             if (outputShapes == null)
@@ -625,20 +651,9 @@ public class GraphCompiler
             //
             // ⚠️ Same fix as Pad above, and for the same reason: fold the value at compile time and hand it
             // to inference. Anything that changes an output SHAPE and arrives as an input needs this.
-            if (node.OpType == "STFT" && graph.ConstantData != null)
-            {
-                if (node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1])
-                    && graph.ConstantData.TryGetValue(node.Inputs[1], out var stepVals)
-                    && stepVals.Length > 0)
-                    attrs["_resolved_frame_step"] = (long)stepVals[0];
-
-                // frame_length is input[3] when present; otherwise the WINDOW (input[2]) gives it by length,
-                // which inference can already see as a shape.
-                if (node.Inputs.Count >= 4 && !string.IsNullOrEmpty(node.Inputs[3])
-                    && graph.ConstantData.TryGetValue(node.Inputs[3], out var lenVals)
-                    && lenVals.Length > 0)
-                    attrs["_resolved_frame_length"] = (long)lenVals[0];
-            }
+            // (The STFT fold lives BEFORE shape inference, next to ConstantOfShape's - see "STFT's FRAME STEP"
+            // above the "Infer output shapes" call. It used to sit here, AFTER inference, where setting an attr
+            // changes nothing: every STFT was inferred with hop 128.)
 
             // Compile-time Slice on known constants: Slice(data, starts, ends[, axes, steps])
             // Handles both opset >= 11 (starts/ends as tensor inputs) and opset < 11 (as attributes)

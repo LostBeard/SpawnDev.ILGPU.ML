@@ -1606,10 +1606,8 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── GroupNormalization ──
 
-public class GroupNormOperator : IOnnxOperator
+public class GroupNormOperator(OperatorRegistry reg) : IOnnxOperator
 {
-    private readonly Kernels.GroupNormKernel _kernel;
-    public GroupNormOperator(Accelerator accelerator) => _kernel = new Kernels.GroupNormKernel(accelerator);
     public string OpType => "GroupNormalization";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[0] };
@@ -1620,7 +1618,9 @@ public class GroupNormOperator : IOnnxOperator
         int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
         int numGroups = ctx.GetInt("num_groups", 32);
         float eps = ctx.GetFloat("epsilon", 1e-5f);
-        _kernel.Forward(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+        // Two passes (stats per (n, group) with a cooperative reduction, then an elementwise apply). The one-thread-per-
+        // element GroupNormKernel recomputed the group's statistics in EVERY element's thread: O(elements x group size).
+        reg.Normalization.GroupNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data,
             N, C, spatial, numGroups, eps);
     }
