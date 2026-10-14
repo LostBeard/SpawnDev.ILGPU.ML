@@ -32,7 +32,7 @@
 		     current AsyncFileSystem: the WebTorrent download store needs a Uint8Array-capable FS for its
 		     zero-copy path. 2.2.0 also pins SpawnJS 2.1.17, matching the rest of the chain - an older
 		     AsyncFileSystem would reach a stale SpawnJS transitively. -->
-		<PackageReference Include="SpawnDev.AsyncFileSystem" Version="2.2.0" />
+		<PackageReference Include="SpawnDev.AsyncFileSystem" Version="2.3.0" />
 		<!-- Force the whole graph (incl. SpawnDev.ILGPU's transitive version) up to the current SpawnJS. The
 		     original reason for pinning this directly was JSRef.Get<long?> (INumberNullableMarshaller) - WebGPU
 		     adapter/device limits are long?, so without it maxStorageBufferBindingSize read null and the device

@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.7</Version>
-		<PackageReleaseNotes>v5.3.7 - FIX: the node fold reused a data-dependent shape (Kokoro: two sentences of the same token count = CUDA illegal address); Shape/Size fold only when their input shape is fixed. Several models in one process stay inside GPU memory: every BufferPool gives its idle buffers to allocations anywhere on the device (SpawnDev.ILGPU 5.3.6 memory pressure), captured graphs pin their pools, Return frees the returned tensor own buffer (not the name newer one), and InferenceSession.OutputsLiveUntilNextRun stops decode loops leaking their outputs. GgufGenerator: a cancelled or aborted generation no longer poisons the KV-prefix cache. On SpawnDev.ILGPU 5.3.6 + SpawnDev.SpawnJS 3.0.3. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.8</Version>
+		<PackageReleaseNotes>v5.3.8 - On SpawnDev.ILGPU 5.3.7: under Blazor WebAssembly AOT, kernels with 6 or more parameters loaded through the stream loaders on WebGPU, WebGL or Wasm no longer kill the .NET runtime (they launch with boxed arguments). No ML code changes. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.3" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.6" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.7" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -3,6 +3,14 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.8 - 2026-10-13 - on SpawnDev.ILGPU 5.3.7 (Blazor WASM AOT: wide kernels no longer kill the runtime)
+
+- **On SpawnDev.ILGPU 5.3.7 (forks 2.3.12).** Under Blazor WebAssembly AOT, loading a kernel with 6 or more parameters
+  through the stream loaders on WebGPU, WebGL or Wasm could kill the .NET runtime (a Mono assertion when creating the
+  launcher delegate for a signature no compiled code invokes). 5.3.7 launches those kernels with boxed arguments
+  instead. ML AOT apps (e.g. Anaglyphohol) pick the fix up through this package; no ML code changed.
+- Demo: SpawnDev.AsyncFileSystem 2.3.0.
+
 ## 5.3.7 - 2026-10-12 - several models in one process stay inside GPU memory; a cancelled reply cannot poison the next
 
 Found running Vertex (a chat model, Whisper, Kokoro and a sentence encoder together on a 12 GB RTX 4070): 14.7 GB of
