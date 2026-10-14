@@ -1840,7 +1840,8 @@ namespace PlaywrightMultiTest
             blazor.Page = newPage;
             if (oldPage != null)
             {
-                try { await oldPage.CloseAsync().ConfigureAwait(false); } catch { }
+                // Bounded: closing a page whose JS thread is wedged can hang too.
+                try { await oldPage.CloseAsync().WaitAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false); } catch { }
             }
 
             await newPage.GotoAsync(testPageUrl).ConfigureAwait(false);
@@ -1945,6 +1946,16 @@ namespace PlaywrightMultiTest
         private bool _pageRuntimeDied;
 
         /// <summary>
+        /// The longest one browser test may run before its page is declared hung: PMT_BROWSER_TEST_TIMEOUT_SEC, or by
+        /// default the done-wait (PMT_BROWSER_DONE_TIMEOUT_MS, 600 s) plus 120 s, so raising the done-wait for a heavy
+        /// model run raises this with it.
+        /// </summary>
+        private static TimeSpan BrowserTestHardTimeout() =>
+            int.TryParse(Environment.GetEnvironmentVariable("PMT_BROWSER_TEST_TIMEOUT_SEC"), out var sec) && sec > 0
+                ? TimeSpan.FromSeconds(sec)
+                : TimeSpan.FromMilliseconds(ProjectTest.DoneTimeoutMs) + TimeSpan.FromSeconds(120);
+
+        /// <summary>
         /// Every lane funnels through here, so this is the one place a global heavy gate can cover
         /// browser, CPU, CUDA and OpenCL at once. See <see cref="_heavyGate"/>.
         /// </summary>
@@ -1979,7 +1990,28 @@ namespace PlaywrightMultiTest
             var sw = Stopwatch.StartNew();
             try
             {
-                await test.TestFunc(page!).ConfigureAwait(false);
+                var run = test.TestFunc(page!);
+                // Hard cap per BROWSER test. A page whose JS thread is wedged never answers a Playwright evaluate,
+                // and the done-wait's own timeout is only checked BETWEEN polls, so one wedged page stalled a whole
+                // run (SpawnDev.ILGPU 2026-10-13: 90 minutes, after a Mono assertion under AOT). The cap sits
+                // above the done-wait so a slow test still finishes; it is enforced HERE, inside the heavy gate's
+                // try/finally, so an abandoned test never keeps the gate.
+                if (page != null)
+                {
+                    var hardTimeout = BrowserTestHardTimeout();
+                    if (await Task.WhenAny(run, Task.Delay(hardTimeout)).ConfigureAwait(false) != run)
+                    {
+                        _ = run.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                        sw.Stop();
+                        _outcomes[test.Name] = new ScheduledOutcome("Fail",
+                            $"Test {test.Name} failed with error: no response from the page after "
+                            + $"{hardTimeout.TotalSeconds:0}s (page hung) - the lane replaces the page.",
+                            sw.Elapsed.TotalMilliseconds);
+                        _pageRuntimeDied = true;
+                        return;
+                    }
+                }
+                await run.ConfigureAwait(false);
                 sw.Stop();
                 var status = test.Result == TestResult.Unsupported ? "Skip" : "Pass";
                 _outcomes[test.Name] = new ScheduledOutcome(status, test.ResultMessage, sw.Elapsed.TotalMilliseconds);

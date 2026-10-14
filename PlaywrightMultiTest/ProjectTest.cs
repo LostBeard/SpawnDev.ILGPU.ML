@@ -65,8 +65,16 @@ public class ProjectTest
         "Garbage collector could not allocate",      // managed heap exhausted - the real first line
         "ExitStatus",                                // dotnet.native.js when the runtime calls exit()
         "MONO_WASM: Assert failed",                  // any mono-level assert takes the runtime with it
+        "[MONO] * Assertion",                        // the runtime's own assert line (2026-10-13, Blazor AOT:
+                                                     // interp.c:3420) - the FIRST fatal line, before the above
         "Aborted(",                                  // emscripten abort
     };
+
+    /// <summary>
+    /// How long a browser test may take to reach Done: PMT_BROWSER_DONE_TIMEOUT_MS, default 600 s.
+    /// </summary>
+    public static int DoneTimeoutMs =>
+        int.TryParse(Environment.GetEnvironmentVariable("PMT_BROWSER_DONE_TIMEOUT_MS"), out var dt) && dt > 0 ? dt : 600_000;
 
     private static bool IsRuntimeDeadMessage(string? text) =>
         text != null && Array.Exists(RuntimeDeadMarkers,
@@ -223,10 +231,11 @@ public class ProjectTest
             // find the button within THIS specific row
             var runButton = row.GetByRole(AriaRole.Button, new() { Name = "Run" });
 
-            // wait for test button to be enabled
+            // wait for test button to be enabled. A dead runtime never enables it, so stop as soon as the console
+            // says so (the done-wait below then records the death) instead of sitting out the 600 s default.
             await page.WaitForConditionAsync(async () =>
             {
-                return await runButton.IsEnabledAsync();
+                return PageRuntimeDied || await runButton.IsEnabledAsync();
             });
 
             // click the button to start the process for this row (button will be disabled)
@@ -253,7 +262,7 @@ public class ProjectTest
             // cold download alone exceeds 10 min) declares a larger [TestMethod(Timeout)] that this hard 600s
             // silently overrode. Allow raising it for a run via PMT_BROWSER_DONE_TIMEOUT_MS (parallel to the
             // console lane's PMT_CONSOLE_TIMEOUT_MS). Default unchanged so routine runs behave identically.
-            int doneTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("PMT_BROWSER_DONE_TIMEOUT_MS"), out var dt) && dt > 0 ? dt : 600_000;
+            int doneTimeoutMs = DoneTimeoutMs;
             await page.WaitForConditionAsync(async () =>
             {
                 // A dead runtime can never reach Done, so stop waiting the moment it says so. Without this
@@ -320,6 +329,11 @@ public class ProjectTest
             //  check for error  class
             var unsupported = await row.EvaluateAsync<bool>("el => el.classList.contains('test-unsupported')");
 
+            // A pass needs POSITIVE evidence: the row's test-success class. Ported from SpawnDev.ILGPU's runner
+            // (2026-10-13), where a page whose runtime had died marked every later test passed because a row with
+            // no result class read as success.
+            var succeeded = await row.EvaluateAsync<bool>("el => el.classList.contains('test-success')");
+
             // Log console errors/warnings to stderr for diagnostics
             if (consoleErrors.Count > 0 || consoleWarnings.Count > 0 || consoleLogs.Count > 0)
             {
@@ -356,6 +370,12 @@ public class ProjectTest
                     stateMessage = "Failed";
                 }
                 throw new Exception(stateMessage);
+            }
+            else if (!succeeded)
+            {
+                Result = TestResult.Error;
+                var consoleHint = consoleErrors.Count > 0 ? $" Console: {consoleErrors[0]}" : "";
+                throw new Exception($"Test row reached Done with no result (not success, error or unsupported).{consoleHint}");
             }
             else
             {
