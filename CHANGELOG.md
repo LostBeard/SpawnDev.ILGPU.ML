@@ -3,7 +3,7 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## 5.3.9 (UNRELEASED, built as 5.3.9-local.1) - speech: Parakeet TDT speech to text, speaker embeddings, and seven library fixes found building them
+## 5.3.9 (UNRELEASED, built as 5.3.9-local.2) - speech: Parakeet TDT speech to text, speaker embeddings, and seven library fixes found building them
 
 Two new pipelines, each held to onnxruntime on the same audio, and the seven defects the work exposed. Every fix is covered by a test that
 fails on all affected backends with the bug reintroduced (red-checked) and passes without it. Scoped PMT sweep of the touched areas: 916 passed, 0 failed.
