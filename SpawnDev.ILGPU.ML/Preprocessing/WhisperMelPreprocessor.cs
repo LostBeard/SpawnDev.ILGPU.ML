@@ -5,8 +5,10 @@ using SpawnDev.ILGPU.ML.Kernels;
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
 /// <summary>
-/// GPU Whisper log-mel: PCM at 16 kHz → <c>[80 × 3000]</c> encoder input, oracle-matched to
-/// <see cref="AudioPreprocessor.ComputeLogMelSpectrogram"/>.
+/// GPU Whisper log-mel: PCM at 16 kHz → <c>[80 × 3000]</c> encoder input (30 s window, the default), oracle-matched to
+/// <see cref="AudioPreprocessor.ComputeLogMelSpectrogram"/>. A shorter window (Smart Turn: 8 s → <c>[80 × 800]</c>)
+/// and the two things that model's feature extractor adds are options: keep the END of the audio (zero-pad the start)
+/// and normalise the waveform to zero mean / unit variance before the STFT.
 /// </summary>
 /// <remarks>
 /// ⚠️ WHY THIS EXISTS. The browser Whisper path already lands PCM as a JS <c>Float32Array</c>, but
@@ -31,14 +33,34 @@ public sealed class WhisperMelPreprocessor : IDisposable
     /// <summary>Onesided bins: <c>FftSize/2 + 1</c>.</summary>
     public const int FreqBins = FftSize / 2 + 1;
 
-    /// <summary>Encoder time axis after dropping the final centred frame.</summary>
+    /// <summary>Encoder time axis of the default 30 s window, after dropping the final centred frame.</summary>
     public const int NumFrames = 3000;
 
     /// <summary>Mel filter count (Whisper).</summary>
     public const int NMels = AudioPreprocessor.WhisperMelBins;
 
-    /// <summary>Flat mel length: <c>NMels * NumFrames</c>.</summary>
+    /// <summary>Flat mel length of the default 30 s window: <c>NMels * NumFrames</c>.</summary>
     public const int MelLength = NMels * NumFrames;
+
+    /// <summary>Window length in samples (480000 for Whisper's 30 s).</summary>
+    public int WindowSamples { get; }
+
+    /// <summary>Time axis of this instance: <c>WindowSamples / HopSize</c> (3000 for 30 s, 800 for 8 s).</summary>
+    public int Frames { get; }
+
+    /// <summary>Flat mel length of this instance: <c>NMels * Frames</c>.</summary>
+    public int MelElements => NMels * Frames;
+
+    private readonly bool _alignToEnd;
+    private readonly bool _normalizeWaveform;
+    private const int MomentPartials = 256;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _moments;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _stats;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _partialSum;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _partialSqDev;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _finishStats;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _applyNormalize;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _padOrTrimEnd;
 
     private readonly Accelerator _accelerator;
     private readonly AudioKernels _audio;
@@ -56,16 +78,29 @@ public sealed class WhisperMelPreprocessor : IDisposable
 
     private bool _disposed;
 
-    public WhisperMelPreprocessor(Accelerator accelerator)
+    /// <param name="accelerator">The application's accelerator (never disposed here).</param>
+    /// <param name="windowSamples">Samples in the window; a multiple of <see cref="HopSize"/>. Default 480000 (Whisper, 30 s).</param>
+    /// <param name="alignToEnd">Audio longer than the window keeps its LAST <paramref name="windowSamples"/>; shorter audio is zero-padded at the START
+    /// (Smart Turn's <c>truncate_audio_to_last_n_seconds</c>). Off: keep the start, pad the end (Whisper).</param>
+    /// <param name="normalizeWaveform">Zero mean / unit variance over the whole padded window before the STFT
+    /// (<c>(x - mean) / sqrt(var + 1e-7)</c>, HuggingFace <c>do_normalize=True</c>). Off for Whisper.</param>
+    public WhisperMelPreprocessor(Accelerator accelerator, int windowSamples = AudioPreprocessor.WhisperMaxSamples,
+        bool alignToEnd = false, bool normalizeWaveform = false)
     {
         _accelerator = accelerator ?? throw new ArgumentNullException(nameof(accelerator));
+        if (windowSamples <= 0 || windowSamples % HopSize != 0)
+            throw new ArgumentOutOfRangeException(nameof(windowSamples), windowSamples, $"must be a positive multiple of {HopSize}");
+        WindowSamples = windowSamples;
+        Frames = windowSamples / HopSize;
+        _alignToEnd = alignToEnd;
+        _normalizeWaveform = normalizeWaveform;
         _audio = new AudioKernels(accelerator);
         _reduce = new ReductionKernels(accelerator);
     }
 
     /// <summary>
-    /// PCM at 16 kHz (any length ≤ <see cref="AudioPreprocessor.WhisperMaxSamples"/>, or longer — trimmed)
-    /// → log-mel into <paramref name="melOut"/> (<see cref="MelLength"/> floats, layout <c>[nMels, frames]</c>).
+    /// PCM at 16 kHz (any length; longer is trimmed to the window)
+    /// → log-mel into <paramref name="melOut"/> (<see cref="MelElements"/> floats, layout <c>[nMels, frames]</c>).
     /// </summary>
     public void ComputeLogMelSpectrogram(
         ArrayView1D<float, Stride1D.Dense> pcm,
@@ -76,32 +111,51 @@ public sealed class WhisperMelPreprocessor : IDisposable
         if (pcmLength < 0) throw new ArgumentOutOfRangeException(nameof(pcmLength));
         if (pcm.Length < pcmLength)
             throw new ArgumentException($"pcm view length {pcm.Length} < pcmLength {pcmLength}", nameof(pcm));
-        if (melOut.Length < MelLength)
-            throw new ArgumentException($"melOut needs ≥ {MelLength} floats, got {melOut.Length}", nameof(melOut));
+        int melLength = MelElements;
+        if (melOut.Length < melLength)
+            throw new ArgumentException($"melOut needs ≥ {melLength} floats, got {melOut.Length}", nameof(melOut));
 
         EnsureLoaded();
 
-        int target = AudioPreprocessor.WhisperMaxSamples;
-        var pcmPad = _pcmPad!.View;
-        int copyLen = pcmLength < target ? pcmLength : target;
-        _padOrTrim!((Index1D)target, pcm, pcmPad, copyLen, target);
+        var pcmPad = PadWindow(pcm, pcmLength);
 
         var power = _power!.View;
-        _stftPower!((Index1D)(NumFrames * FreqBins), pcmPad, power, _stftParams!.View);
+        _stftPower!((Index1D)(Frames * FreqBins), pcmPad, power, _stftParams!.View);
 
-        _audio.ApplyMelFilterbank(power, _filters!.View, melOut.SubView(0, MelLength),
-            NumFrames, FreqBins, NMels);
+        _audio.ApplyMelFilterbank(power, _filters!.View, melOut.SubView(0, melLength),
+            Frames, FreqBins, NMels);
 
-        _audio.LogScale(melOut.SubView(0, MelLength), MelLength);
+        _audio.LogScale(melOut.SubView(0, melLength), melLength);
 
         var maxBuf = _maxBuf!.View;
-        _reduce.ReduceMax(melOut.SubView(0, MelLength), maxBuf, 1, MelLength, 1);
+        _reduce.ReduceMax(melOut.SubView(0, melLength), maxBuf, 1, melLength, 1);
 
-        _normalizeFromMax!((Index1D)MelLength, melOut.SubView(0, MelLength), maxBuf);
+        _normalizeFromMax!((Index1D)melLength, melOut.SubView(0, melLength), maxBuf);
+    }
+
+    /// <summary>Pad/trim into the window buffer (start- or end-aligned) and, if asked, normalise the waveform.</summary>
+    private ArrayView1D<float, Stride1D.Dense> PadWindow(ArrayView1D<float, Stride1D.Dense> pcm, int pcmLength)
+    {
+        int target = WindowSamples;
+        var pcmPad = _pcmPad!.View;
+        if (_alignToEnd) _padOrTrimEnd!((Index1D)target, pcm, pcmPad, pcmLength, target);
+        else _padOrTrim!((Index1D)target, pcm, pcmPad, pcmLength < target ? pcmLength : target, target);
+
+        if (_normalizeWaveform)
+        {
+            var moments = _moments!.View;
+            var stats = _stats!.View;
+            _partialSum!((Index1D)MomentPartials, pcmPad, moments, target);
+            _finishStats!((Index1D)1, moments, stats, target, 0);
+            _partialSqDev!((Index1D)MomentPartials, pcmPad, stats, moments, target);
+            _finishStats!((Index1D)1, moments, stats, target, 1);
+            _applyNormalize!((Index1D)target, pcmPad, stats);
+        }
+        return pcmPad;
     }
 
     /// <summary>
-    /// Debug/oracle: pad PCM and write centred STFT power <c>[NumFrames × FreqBins]</c> into
+    /// Debug/oracle: pad PCM and write centred STFT power <c>[Frames × FreqBins]</c> into
     /// <paramref name="powerOut"/>. Same first stages as <see cref="ComputeLogMelSpectrogram"/>.
     /// </summary>
     public void ComputeStftPower(
@@ -110,13 +164,11 @@ public sealed class WhisperMelPreprocessor : IDisposable
         ArrayView1D<float, Stride1D.Dense> powerOut)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (powerOut.Length < NumFrames * FreqBins)
-            throw new ArgumentException($"powerOut needs ≥ {NumFrames * FreqBins}", nameof(powerOut));
+        if (powerOut.Length < Frames * FreqBins)
+            throw new ArgumentException($"powerOut needs ≥ {Frames * FreqBins}", nameof(powerOut));
         EnsureLoaded();
-        int target = AudioPreprocessor.WhisperMaxSamples;
-        int copyLen = pcmLength < target ? pcmLength : target;
-        _padOrTrim!((Index1D)target, pcm, _pcmPad!.View, copyLen, target);
-        _stftPower!((Index1D)(NumFrames * FreqBins), _pcmPad.View, powerOut.SubView(0, NumFrames * FreqBins),
+        var pcmPad = PadWindow(pcm, pcmLength);
+        _stftPower!((Index1D)(Frames * FreqBins), pcmPad, powerOut.SubView(0, Frames * FreqBins),
             _stftParams!.View);
     }
 
@@ -126,7 +178,7 @@ public sealed class WhisperMelPreprocessor : IDisposable
         ArgumentNullException.ThrowIfNull(pcm);
         EnsureLoaded();
         using var pcmBuf = _accelerator.Allocate1D(pcm.Length == 0 ? new float[1] : pcm);
-        var mel = _accelerator.Allocate1D<float>(MelLength);
+        var mel = _accelerator.Allocate1D<float>(MelElements);
         try
         {
             ComputeLogMelSpectrogram(pcmBuf.View, pcm.Length, mel.View);
@@ -145,8 +197,8 @@ public sealed class WhisperMelPreprocessor : IDisposable
     {
         if (_pcmPad != null) return;
 
-        _pcmPad = _accelerator.Allocate1D<float>(AudioPreprocessor.WhisperMaxSamples);
-        _power = _accelerator.Allocate1D<float>(NumFrames * FreqBins);
+        _pcmPad = _accelerator.Allocate1D<float>(WindowSamples);
+        _power = _accelerator.Allocate1D<float>(Frames * FreqBins);
         _maxBuf = _accelerator.Allocate1D<float>(1);
 
         // Slaney filters once per accelerator lifetime — same coefficients as the CPU oracle.
@@ -160,11 +212,11 @@ public sealed class WhisperMelPreprocessor : IDisposable
         // params: [pcmLength, fftSize, hop, freqBins, numFrames, pad]
         _stftParams = _accelerator.Allocate1D(new float[]
         {
-            AudioPreprocessor.WhisperMaxSamples,
+            WindowSamples,
             FftSize,
             HopSize,
             FreqBins,
-            NumFrames,
+            Frames,
             FftSize / 2
         });
 
@@ -177,6 +229,100 @@ public sealed class WhisperMelPreprocessor : IDisposable
 
         _normalizeFromMax = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(NormalizeWhisperFromMaxImpl);
+
+        if (_alignToEnd)
+            _padOrTrimEnd = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(PadOrTrimEndImpl);
+
+        if (_normalizeWaveform)
+        {
+            _moments = _accelerator.Allocate1D<float>(MomentPartials);
+            _stats = _accelerator.Allocate1D<float>(2); // [mean, 1 / sqrt(var + 1e-7)]
+            _partialSum = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(PartialSumImpl);
+            _partialSqDev = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(PartialSqDevImpl);
+            _finishStats = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(FinishStatsImpl);
+            _applyNormalize = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ApplyNormalizeImpl);
+        }
+    }
+
+    /// <summary>
+    /// End-aligned window: the LAST <paramref name="dstLength"/> samples of the audio, zero-padded at the START when the audio
+    /// is shorter. One thread per output sample.
+    /// </summary>
+    private static void PadOrTrimEndImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> src,
+        ArrayView1D<float, Stride1D.Dense> dst,
+        int srcLength,
+        int dstLength)
+    {
+        if (idx >= dstLength) return;
+        int s = srcLength - dstLength + idx;
+        dst[idx] = s >= 0 ? src[s] : 0f;
+    }
+
+    /// <summary>Partial sums over contiguous chunks of the window: one thread per chunk.</summary>
+    private static void PartialSumImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        int n)
+    {
+        int chunk = (n + MomentPartials - 1) / MomentPartials;
+        int start = idx * chunk;
+        int end = start + chunk;
+        if (end > n) end = n;
+        float sum = 0f;
+        for (int i = start; i < end; i++) sum += data[i];
+        partials[idx] = sum;
+    }
+
+    /// <summary>Partial sums of squared deviation from the mean in <c>stats[0]</c> (two-pass: no catastrophic cancellation).</summary>
+    private static void PartialSqDevImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> stats,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        int n)
+    {
+        float mean = stats[0];
+        int chunk = (n + MomentPartials - 1) / MomentPartials;
+        int start = idx * chunk;
+        int end = start + chunk;
+        if (end > n) end = n;
+        float sum = 0f;
+        for (int i = start; i < end; i++)
+        {
+            float d = data[i] - mean;
+            sum += d * d;
+        }
+        partials[idx] = sum;
+    }
+
+    /// <summary>One thread. pass 0: <c>stats[0] = mean</c>; pass 1: <c>stats[1] = 1 / sqrt(variance + 1e-7)</c>.</summary>
+    private static void FinishStatsImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        ArrayView1D<float, Stride1D.Dense> stats,
+        int n,
+        int pass)
+    {
+        float total = 0f;
+        for (int i = 0; i < MomentPartials; i++) total += partials[i];
+        if (pass == 0) stats[0] = total / n;
+        else stats[1] = 1f / MathF.Sqrt(total / n + 1e-7f);
+    }
+
+    private static void ApplyNormalizeImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> stats)
+    {
+        data[idx] = (data[idx] - stats[0]) * stats[1];
     }
 
     /// <summary>Zero-pad or truncate into a fixed-length buffer. One thread per output sample.</summary>
@@ -214,9 +360,10 @@ public sealed class WhisperMelPreprocessor : IDisposable
         int k = idx % freqBins;
         if (f >= numFrames) return;
 
-        // Symmetric Hann, matching AudioPreprocessor.GenerateHannWindow(periodic: false).
+        // PERIODIC Hann (denominator N), matching AudioPreprocessor.GenerateHannWindow(periodic: true): torch.hann_window and the
+        // HuggingFace Whisper feature extractor. (Symmetric, denominator N-1, was used before 2026-10-14 and was off by up to 4e-2.)
         float sumRe = 0f, sumIm = 0f;
-        float denom = fftSize - 1;
+        float denom = fftSize;
         for (int n = 0; n < fftSize; n++)
         {
             int g = f * hop + n; // index in reflect-padded space
@@ -284,11 +431,15 @@ public sealed class WhisperMelPreprocessor : IDisposable
         _filters?.Dispose();
         _maxBuf?.Dispose();
         _stftParams?.Dispose();
+        _moments?.Dispose();
+        _stats?.Dispose();
         _pcmPad = null;
         _power = null;
         _filters = null;
         _maxBuf = null;
         _stftParams = null;
+        _moments = null;
+        _stats = null;
         // Accelerator is application-owned — never dispose it here.
     }
 }

@@ -267,9 +267,9 @@ public static partial class AudioPreprocessor
     /// Left off by default so a plain STFT keeps its existing framing.
     /// </param>
     /// <param name="periodicWindow">
-    /// Use a PERIODIC Hann window (torch/librosa default) instead of the symmetric one. Whisper wants
-    /// symmetric, so this stays off by default; the vocoder models need periodic for analysis and
-    /// synthesis to be inverses of each other.
+    /// Use a PERIODIC Hann window (torch/librosa default) instead of the symmetric one. Off by default so
+    /// a plain STFT keeps its framing; Whisper's log-mel (<see cref="ComputeLogMelSpectrogram"/>) and the vocoder models
+    /// need periodic.
     /// </param>
     public static float[,] ComputeSTFT(float[] samples, int fftSize, int hopSize, bool center = false, bool periodicWindow = false)
     {
@@ -362,7 +362,10 @@ public static partial class AudioPreprocessor
         // is what makes 30 seconds come out as exactly 3000 frames - the length the model's input shape is
         // fixed at. Framed uncentred this produced 2998, and the pipeline threw building a [1,80,3000]
         // tensor over 239,840 values.
-        var stft = ComputeSTFT(samples, fftSize, hopSize, center: true);
+        // PERIODIC Hann: openai-whisper's torch.hann_window(400) and transformers' WhisperFeatureExtractor both use it. This call used
+        // the symmetric window until 2026-10-14, which differs from the reference by up to 4e-2 in the final features (MEASURED against
+        // the HF extractor in the Smart Turn fixture: periodic 1.5e-7, symmetric 1.8e-2 to 4.0e-2).
+        var stft = ComputeSTFT(samples, fftSize, hopSize, center: true, periodicWindow: true);
         int numFrames = Math.Max(0, stft.GetLength(0) - 1);
         int freqBins = stft.GetLength(1);
 

@@ -44,6 +44,13 @@ fails on all affected backends with the bug reintroduced (red-checked) and passe
   group. Now the cooperative InstanceNorm stat pass plus an elementwise apply: 7 nodes 1010 ms -> 0.9 ms. Benefits every diffusion / U-Net model.
 - **Performance: a binary op with a small CONSTANT operand** (a per-channel bias) expanded it to the full output size on the host and uploaded it on every call
   (26 ms for a `[64,1,1]` bias on a `[1,64,72,596]` activation). It is uploaded as is and broadcast by strides (4 ms).
+- **Fix: the Whisper log-mel used a SYMMETRIC Hann window** (CPU `AudioPreprocessor.ComputeLogMelSpectrogram` and GPU `WhisperMelPreprocessor`). openai-whisper
+  (`torch.hann_window`) and transformers' `WhisperFeatureExtractor` use the PERIODIC one. MEASURED against the HF extractor on three clips: periodic 1.5e-7 (numpy replica),
+  symmetric 1.8e-2 to 4.0e-2 in the final features. Whisper WER on the 60 utterances did not move (11.53% / 7.51% / 7.51%), so this is a correctness fix, not an accuracy win.
+- **New: `WhisperMelPreprocessor(accelerator, windowSamples, alignToEnd, normalizeWaveform)`** - any window that is a multiple of the 160-sample hop (8 s = `[80, 800]`),
+  keep-the-last-N-seconds / start-padding, and the waveform zero-mean / unit-variance step of HF `do_normalize=True`. This is the input of **Smart Turn v3.2** (pipecat-ai,
+  BSD-2; "has the speaker finished their turn?", 8 s of audio, Whisper-tiny encoder). Fixture from the model authors' own extractor: mel within 1.4e-3 to 1.6e-3 on CUDA, and
+  the model's probability on our engine within 3e-5 of onnxruntime's (`Pipeline_SmartTurn_MatchesOnnxRuntimeProbability`, HeavyModel).
 - Tools: `onnx-bisect-audio.mjs` (cut a graph at any tensor, run it in onnxruntime, find the first stage that disagrees; `parakeet-harness --probe-dir` runs the same cuts
   through this engine), `onnx-stage-boundaries.mjs`, `onnx-nodes-between.mjs`, `onnx-io.mjs`, `onnx-init-encoding.mjs`, fixture generators `gen_*_reference.mjs`.
 
