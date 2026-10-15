@@ -3,6 +3,15 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased - face detection and recognition
+
+- **`YuNetFaceDetector` + `SFaceRecognizer`** (`Pipelines/FaceRecognitionPipelines.cs`): YuNet (MIT, `opencv/face_detection_yunet`, 75 k parameters, finds faces from ~10 px, five landmarks) and SFace (Apache-2.0,
+  `opencv/face_recognition_sface`, MobileFaceNet, 128-number embeddings), the pair OpenCV's `FaceDetectorYN` / `FaceRecognizerSF` run. Host pre/post-processing (letterbox, anchor decode, NMS, the five-point
+  similarity warp to the 112 x 112 template), the convolutions on the accelerator. MEASURED against OpenCV 5.0 on six public-domain portraits at 360 px (`tools/face-bench`, CPU accelerator): the aligned crop is OpenCV's
+  to the grey level (mean |d| 0.00), SFace on OpenCV's crop gives its embedding to cosine 1.00000, YuNet's boxes agree with IoU 0.90-0.96 and landmarks within 2-5% of the box, and identities separate: two
+  photographs of the same person score 0.738 and 0.607, any two different people at most 0.257 (OpenCV's recommended threshold is 0.363). Tests `FaceAlign_MatchesOpenCvAlignCrop` and
+  `Pipeline_FaceRecognition_MatchesOpenCvAndSeparatesPeople`.
+
 ## 5.3.10 - 2026-10-14 - streaming speech to text, and a broadcast bug it found
 
 **Gate (2026-10-14):** full PlaywrightMultiTest, default categories, all six lanes: 5,875 tests - 5,746 passed, 129 skipped (backend-unsupported, as before), 0 failed. Speech heavy-model tests (Parakeet, speaker embedding, Smart Turn, fp16 external-data weights, ConvInteger, StreamingTranscriber) on CUDA + OpenCL: 20 of 20.
