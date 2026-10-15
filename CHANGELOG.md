@@ -3,7 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased - streaming speech to text, and a broadcast bug it found
+## 5.3.10 - 2026-10-14 - streaming speech to text, and a broadcast bug it found
+
+**Gate (2026-10-14):** full PlaywrightMultiTest, default categories, all six lanes: 5,875 tests - 5,746 passed, 129 skipped (backend-unsupported, as before), 0 failed. Speech heavy-model tests (Parakeet, speaker embedding, Smart Turn, fp16 external-data weights, ConvInteger, StreamingTranscriber) on CUDA + OpenCL: 20 of 20.
 
 - **`StreamingTranscriber`** (NVIDIA Nemotron Speech Streaming 0.6B, cache-aware FastConformer + RNN-T, the 160 ms sherpa-onnx export): words as the audio arrives, one
   160 ms chunk at a time, encoder caches kept in device buffers. `AcceptAudioAsync` returns the new tokens and the text so far; `FinishAsync` flushes the tail. **`NemoStreamingFeatures`**
