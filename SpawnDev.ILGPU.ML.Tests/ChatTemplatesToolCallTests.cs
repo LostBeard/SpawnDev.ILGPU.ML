@@ -14,6 +14,32 @@ public class ChatTemplatesToolCallTests
         Assert.Equal("{\"player\": \"Aubri\"}", calls[0].ArgumentsJson);
     }
 
+    /// <summary>ministral-3:8b, measured 2026-10-16 (Vertex): the closing brace of the call was left out before the closing tag, and the whole call was thrown away.</summary>
+    [Fact]
+    public void TaggedJson_WithAMissingClosingBrace_IsParsed()
+    {
+        var calls = ChatTemplates.ParseToolCalls("<tool_call> {\"name\": \"build_shape\", \"arguments\": {\"shape\": \"castle\"} </tool_call>");
+        Assert.Single(calls);
+        Assert.Equal("build_shape", calls[0].Name);
+        Assert.Equal("{\"shape\": \"castle\"}", calls[0].ArgumentsJson);
+    }
+
+    /// <summary>llama3.1:8b, measured 2026-10-16 (Vertex): an optional argument written as an empty string, then a comma, then the closing braces.</summary>
+    [Fact]
+    public void TaggedJson_WithATrailingComma_IsParsed()
+    {
+        var calls = ChatTemplates.ParseToolCalls("<tool_call>" + (char)10 + "{\"name\": \"build_shape\", \"arguments\": {\"shape\": \"house\", \"size\": 5, \"material\": \"\", }}" + (char)10 + "</tool_call>");
+        Assert.Single(calls);
+        Assert.Equal("build_shape", calls[0].Name);
+    }
+
+    [Theory]
+    [InlineData("{\"a\": [1, 2", "{\"a\": [1, 2]}")]
+    [InlineData("{\"a\": \"x", "{\"a\": \"x\"}")]
+    [InlineData("{\"a\": \"brace } inside\"", "{\"a\": \"brace } inside\"}")]
+    [InlineData("{\"a\": 1}", "{\"a\": 1}")]
+    public void CloseOpenJson_ClosesWhatIsOpen(string json, string expected) => Assert.Equal(expected, ChatTemplates.CloseOpenJson(json));
+
     /// <summary>llama3.1:8b, measured 2026-10-11 (Vertex): the whole reply was this line, and nothing ran.</summary>
     [Fact]
     public void LlamaPythonicCall_IsParsed()

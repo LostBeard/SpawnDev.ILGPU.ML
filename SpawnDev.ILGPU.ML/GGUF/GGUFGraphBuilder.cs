@@ -97,7 +97,7 @@ public static class GGUFGraphBuilder
         // by prefix so a new Qwen arch doesn't silently fall through to the 2-input LayerNorm path (which reads
         // an absent bias -> IndexOutOfRange). qwen3 (arch "qwen3") hit exactly that before this.
         bool useRMSNorm = isGemma || arch.StartsWith("qwen", StringComparison.Ordinal)
-            || arch is "llama" or "mistral" or "gptoss" or "lfm2";
+            || arch is "llama" or "mistral" or "mistral3" or "gptoss" or "lfm2";
         bool useSiLU = !isGemma
             && arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
 
@@ -681,7 +681,7 @@ public static class GGUFGraphBuilder
     public static bool UsesNormRope(string arch) => arch switch
     {
         // llama.cpp LLAMA_ROPE_TYPE_NORM group ("operating on pairs of consecutive head values")
-        "llama" or "llama4" or "mistral" or "deci" or "baichuan" or "internlm2" or "minicpm"
+        "llama" or "llama4" or "mistral" or "mistral3" or "deci" or "baichuan" or "internlm2" or "minicpm"
             or "minicpm3" or "xverse" or "olmo" or "olmo2" or "olmoe" or "cohere" or "command-r"
             or "arctic" or "granite" or "granitemoe" or "exaone" or "refact" or "plamo" => true,
         // Everything else we build (qwen, qwen2, gemma*, gptoss, ...) is NeoX / split-half.

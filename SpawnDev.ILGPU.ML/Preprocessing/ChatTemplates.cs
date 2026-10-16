@@ -657,7 +657,8 @@ public static class ChatTemplates
     {
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            using var doc = ParseLenient(json);
+            if (doc == null) return;
             var root = doc.RootElement;
             if (root.ValueKind != System.Text.Json.JsonValueKind.Object) return;
             string name = root.TryGetProperty("name", out var n) && n.ValueKind == System.Text.Json.JsonValueKind.String
@@ -668,6 +669,50 @@ public static class ChatTemplates
             calls.Add(new ParsedToolCall(name, args));
         }
         catch { /* skip a malformed block rather than fail the whole response */ }
+    }
+
+    /// <summary>
+    /// Parses a tool call's JSON the way small models write it: a trailing comma before a closing brace (<c>"material": "", }}</c>, llama3.1:8b) is allowed, and a call cut short by its own
+    /// closing tag with braces left open (<c>{"name": "build_shape", "arguments": {"shape": "castle"} &lt;/tool_call&gt;</c>, ministral-3:8b) is closed first. Null when it still is not JSON.
+    /// </summary>
+    internal static System.Text.Json.JsonDocument? ParseLenient(string json)
+    {
+        var options = new System.Text.Json.JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = System.Text.Json.JsonCommentHandling.Skip };
+        try { return System.Text.Json.JsonDocument.Parse(json, options); }
+        catch (System.Text.Json.JsonException) { }
+        var repaired = CloseOpenJson(json);
+        if (repaired == json) return null;
+        try { return System.Text.Json.JsonDocument.Parse(repaired, options); }
+        catch (System.Text.Json.JsonException) { return null; }
+    }
+
+    /// <summary>Adds the closing quote, brackets and braces a JSON text left open (string-aware); the text unchanged when nothing is open.</summary>
+    public static string CloseOpenJson(string json)
+    {
+        var stack = new Stack<char>();
+        bool inStr = false, esc = false;
+        foreach (var ch in json)
+        {
+            if (inStr)
+            {
+                if (esc) esc = false;
+                else if (ch == '\\') esc = true;
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            switch (ch)
+            {
+                case '"': inStr = true; break;
+                case '{': stack.Push('}'); break;
+                case '[': stack.Push(']'); break;
+                case '}' or ']': if (stack.Count > 0) stack.Pop(); break;
+            }
+        }
+        if (!inStr && stack.Count == 0) return json;
+        var sb = new System.Text.StringBuilder(json);
+        if (inStr) sb.Append('"');
+        while (stack.Count > 0) sb.Append(stack.Pop());
+        return sb.ToString();
     }
 
     /// <summary>Remove markdown code fences (<c>```json … ```</c> / <c>``` … ```</c>), keeping inner content, so a
