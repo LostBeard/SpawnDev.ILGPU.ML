@@ -175,6 +175,34 @@ public class FusedAttentionKernel : IDisposable
     private static bool IsPowerOfTwo(int n) => n > 0 && (n & (n - 1)) == 0;
     private const int RegTileD = 16; // per-lane register tile width (≤16 scalar-replaces; divides 64/128/256)
 
+    // ---- Split-KV decode attention (flash-decoding) ------------------------------------------------------------------------------------------
+    // A decode step has ONE query per head. The grouped kernel gives each head a single 64-thread block that walks the whole context, so a 3,165-token context used 32 blocks
+    // and took 0.53 ms per layer where the bandwidth floor is ~0.03 ms (MEASURED 2026-10-16, RTX 4070, bfloat16 KV). Here the keys are cut into chunks of SkChunk: one block per (kv head,
+    // chunk) scores its 128 keys (one key per thread, every query row of the kv group at once), softmaxes them, accumulates V (one dim per thread) and writes (max, sum, accumulator);
+    // a second small kernel merges the chunks of each query with the usual log-sum-exp rescale. CUDA, head dim 128, no sinks, at most SkMaxRows query rows (queries x group) over at least
+    // SkMinKeys keys. GGUF_ATTN_SPLITKV=0 turns it off (the A/B).
+    public static bool EnableSplitKvDecode = Environment.GetEnvironmentVariable("GGUF_ATTN_SPLITKV") != "0";
+    private const int SkChunk = 128;   // keys per block (= SkGroup: one key per thread)
+    private const int SkGroup = 128;
+    private const int SkD = 128;       // the head dim served (one dim per thread in the V pass)
+    private const int SkMaxRows = 16;  // query rows per block: queries x heads per kv group
+    private const int SkMinKeys = 512;
+    private readonly Dictionary<Type, object> _splitKernels = new();
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _splitCombine;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _splitScratch;
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _retiredSplitScratch = new();
+
+    /// <summary>The partial results of the split-KV kernel: kept between calls and grown when needed (a replaced buffer is kept until Dispose: a launch may still reference it).</summary>
+    private ArrayView1D<float, Stride1D.Dense> SplitScratch(int floats)
+    {
+        if (_splitScratch == null || _splitScratch.Length < floats)
+        {
+            if (_splitScratch != null) _retiredSplitScratch.Add(_splitScratch);
+            _splitScratch = _accelerator.Allocate1D<float>(Math.Max(floats, 1 << 16));
+        }
+        return _splitScratch.View;
+    }
+
     private readonly Dictionary<Type, object> _groupedStridedKernels = new();
     private readonly Dictionary<Type, object> _tiledStridedKernels = new();
 
@@ -244,8 +272,14 @@ public class FusedAttentionKernel : IDisposable
     /// per-thread owned-dim unroll (≤ AttnHeadDimMax). SKV is unbounded (the kernel KV-tiles into shared blocks).
     /// Otherwise the per-element kernel runs.
     /// </summary>
-    private bool UseGrouped(int seqKV, int headDim) =>
+    // Grouped-per-query is a DECODE kernel in practice: one block per (head, query) reads the whole K/V, which is fine for a single query (the key positions are spread across the
+    // block's threads) and wasteful for a tile of queries. MEASURED 2026-10-16 (RTX 4070, 32 heads / 8 kv heads, 300 queries over 3,165 keys, bfloat16 KV): grouped 39 ms per layer against
+    // the register per-query kernel's 18, and a llama3.1:8b turn's real prefill spent 65 ms per layer in it. So it serves queries ≤ GroupedMaxQueries; more go to the register kernel.
+    private const int GroupedMaxQueries = 4;
+
+    private bool UseGrouped(int seqKV, int headDim, int seqQ) =>
         EnableGroupedAttention
+        && seqQ <= GroupedMaxQueries
         && _accelerator.AcceleratorType != AcceleratorType.WebGL
         && _accelerator.AcceleratorType != AcceleratorType.WebGPU
         && headDim <= AttnHeadDimMax;
@@ -290,6 +324,7 @@ public class FusedAttentionKernel : IDisposable
                                  // PRE-attention Transpose[0,2,1,3] (step 2).
             seqMajorKV ? 1 : 0,  // p[13]: read K/V SEQ-major (kBase=(kv*kvHeads+kvHead)*D) — drops the K/V PRE-attention
                                  // transposes (step 3). For the strided decode store, the store itself is seq-major.
+            (Math.Min(seqKV, causal ? kvOffset + seqQ : seqKV) + SkChunk - 1) / SkChunk, // p[14]: key chunks the split-KV decode kernel uses (the keys any query here can see)
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -297,9 +332,27 @@ public class FusedAttentionKernel : IDisposable
         _dummySinks ??= _accelerator.Allocate1D(new float[1]);
         var sinksView = sinks ?? _dummySinks.View;
 
+        // Split-KV decode attention (flash-decoding): a few queries over a long context, spread across many blocks (see FusedAttentionSplitKvPartialImpl).
+        if (EnableSplitKvDecode && _accelerator.AcceleratorType == AcceleratorType.Cuda && headDim == SkD && sinkCount == 0
+            && seqKV >= SkMinKeys && seqQ * (nHeads / kvHeads) <= SkMaxRows)
+        {
+            int rows = seqQ * (nHeads / kvHeads), nSplits = paramsData[14];
+            var scratch = SplitScratch(kvHeads * nSplits * rows * (SkD + 2));
+            if (!_splitKernels.TryGetValue(typeof(T), out var sk))
+                _splitKernels[typeof(T)] = sk = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionSplitKvPartialImpl<T>);
+            _splitCombine ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(SplitKvCombineImpl);
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)sk)(
+                new KernelConfig(kvHeads * nSplits, SkGroup), Q, K, V, scratch, paramsView);
+            _splitCombine(new KernelConfig(nHeads * seqQ, SkGroup), scratch, output, paramsView);
+            return;
+        }
+
         // Grouped-per-query path (bit-identical, opt-in, non-browser-GPU) — this is the prefill hotpath (the
         // KV-cache strided bf16 read). SKV ≤ cap = fast single-pass kernel; larger SKV = KV-tiled (unbounded).
-        if (UseGrouped(seqKV, headDim))
+        if (UseGrouped(seqKV, headDim, seqQ))
         {
             var dict = seqKV <= AttnSharedSkvMax ? _groupedStridedKernels : _tiledStridedKernels;
             if (!dict.TryGetValue(typeof(T), out var gk))
@@ -1066,6 +1119,172 @@ public class FusedAttentionKernel : IDisposable
     }
 
     /// <summary>
+    /// Split-KV decode, pass 1 (see <see cref="EnableSplitKvDecode"/>). Block = (kv head, chunk of 128 keys); the rows are (query, head of this kv group) pairs, at most 16. Writes per
+    /// row: the chunk's max score, the sum of exp(score - max), and the accumulator sum exp(score - max) * V, to <c>partials[((kvHead * nSplits + chunk) * rows + row) * (128 + 2)]</c>.
+    /// </summary>
+    private static void FusedAttentionSplitKvPartialImpl<T>(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        ArrayView1D<int, Stride1D.Dense> p)
+        where T : unmanaged, INumber<T>
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int kvStride = p[10];
+        int nSplits = p[14];
+
+        int kvHeads = BH / gqaGroup;
+        int rows = SQ * gqaGroup;
+        int g = Grid.IdxX;
+        int kvHead = g / nSplits;
+        int split = g % nSplits;
+        int tid = Group.IdxX;
+        int kvHeadStride = p[13] == 1 ? SkD : kvStride;
+        int kvTokenStride = p[13] == 1 ? kvHeads * SkD : SkD;
+
+        var qs = SharedMemory.Allocate<float>(SkMaxRows * SkD);
+        var sc = SharedMemory.Allocate<float>(SkMaxRows * SkChunk);
+        var rowM = SharedMemory.Allocate<float>(SkMaxRows);
+        var rowL = SharedMemory.Allocate<float>(SkMaxRows);
+
+        for (int i = tid; i < rows * SkD; i += SkGroup)
+        {
+            int r = i / SkD, d = i % SkD;
+            int sq = r / gqaGroup;
+            int bh = kvHead * gqaGroup + r % gqaGroup;
+            int qBase = p[12] == 1 ? (sq * BH + bh) * SkD : (bh * SQ + sq) * SkD;
+            qs[i] = Q[qBase + d] * scale;
+        }
+        Group.Barrier();
+
+        // Scores. A warp takes one key at a time and its 32 lanes read the key's 128 dims together (4 each: one coalesced 256-byte row), dot them with the query rows they
+        // hold in registers, and add the lanes up with butterfly shuffles; lane r then keeps row r's score. 4 warps x 32 keys = the chunk's 128 keys.
+        int lane = tid % 32, warp = tid / 32;
+        var qr = new float[SkMaxRows * 4];
+        for (int r = 0; r < SkMaxRows; r++)
+            for (int i = 0; i < 4; i++) qr[r * 4 + i] = qs[r * SkD + lane * 4 + i];
+        for (int jj = 0; jj < 32; jj++)
+        {
+            int j = warp * 32 + jj;
+            int kv = split * SkChunk + j;
+            var red = new float[SkMaxRows];
+            if (kv < SKV)
+            {
+                int kBase = kvHead * kvHeadStride + kv * kvTokenStride + lane * 4;
+                float k0 = PrecisionConvert.ConvertToSingle(K[kBase]);
+                float k1 = PrecisionConvert.ConvertToSingle(K[kBase + 1]);
+                float k2 = PrecisionConvert.ConvertToSingle(K[kBase + 2]);
+                float k3 = PrecisionConvert.ConvertToSingle(K[kBase + 3]);
+                for (int r = 0; r < SkMaxRows; r++)
+                    if (r < rows) red[r] = qr[r * 4] * k0 + qr[r * 4 + 1] * k1 + qr[r * 4 + 2] * k2 + qr[r * 4 + 3] * k3;
+            }
+            else
+                for (int r = 0; r < SkMaxRows; r++) red[r] = 0f;
+            for (int r = 0; r < SkMaxRows; r++)
+            {
+                if (r < rows)       // uniform across the block, so every lane of a warp takes the shuffles together
+                {
+                    float x = red[r];
+                    x += Warp.ShuffleXor(x, 16);
+                    x += Warp.ShuffleXor(x, 8);
+                    x += Warp.ShuffleXor(x, 4);
+                    x += Warp.ShuffleXor(x, 2);
+                    x += Warp.ShuffleXor(x, 1);
+                    red[r] = x;
+                }
+            }
+            for (int r = 0; r < SkMaxRows; r++)
+            {
+                if (lane == r && r < rows)
+                {
+                    int qPos = kvOffset + r / gqaGroup;
+                    bool valid = kv < SKV && (causal == 0 || kv <= qPos) && kv > qPos - window;
+                    sc[r * SkChunk + j] = valid ? red[r] : -1e30f;
+                }
+            }
+        }
+        Group.Barrier();
+
+        // Per row: the chunk's max, then the weights exp(score - max) and their sum.
+        if (tid < SkMaxRows)
+        {
+            float m = -1e30f;
+            for (int j = 0; j < SkChunk; j++) m = MathF.Max(m, sc[tid * SkChunk + j]);
+            float l = 0f;
+            for (int j = 0; j < SkChunk; j++)
+            {
+                float w = m > -1e29f ? MathF.Exp(sc[tid * SkChunk + j] - m) : 0f;
+                sc[tid * SkChunk + j] = w;
+                l += w;
+            }
+            rowM[tid] = m;
+            rowL[tid] = l;
+        }
+        Group.Barrier();
+
+        // V: this thread's dim, summed over the chunk's keys for every row.
+        var acc = new float[SkMaxRows];
+        for (int r = 0; r < SkMaxRows; r++) acc[r] = 0f;
+        for (int j = 0; j < SkChunk; j++)
+        {
+            int kvj = split * SkChunk + j;
+            if (kvj < SKV)
+            {
+                float vv = PrecisionConvert.ConvertToSingle(V[kvHead * kvHeadStride + kvj * kvTokenStride + tid]);
+                for (int r = 0; r < SkMaxRows; r++)
+                    if (r < rows) acc[r] += sc[r * SkChunk + j] * vv;
+            }
+        }
+        for (int r = 0; r < SkMaxRows; r++)
+            if (r < rows) partials[((kvHead * nSplits + split) * rows + r) * (SkD + 2) + tid] = acc[r];
+        if (tid < rows)
+        {
+            int b = ((kvHead * nSplits + split) * rows + tid) * (SkD + 2) + SkD;
+            partials[b] = rowM[tid];
+            partials[b + 1] = rowL[tid];
+        }
+    }
+
+    /// <summary>Split-KV decode, pass 2: one block per (head, query); merges the key chunks with a log-sum-exp rescale and writes the output (layout flags as the other kernels).</summary>
+    private static void SplitKvCombineImpl(
+        ArrayView1D<float, Stride1D.Dense> partials,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int BH = p[0], SQ = p[1];
+        int gqaGroup = p[8];
+        int nSplits = p[14];
+        int rows = SQ * gqaGroup;
+        int g = Grid.IdxX;
+        int bh = g / SQ;
+        int sq = g % SQ;
+        int kvHead = bh / gqaGroup;
+        int r = sq * gqaGroup + bh % gqaGroup;
+        int d = Group.IdxX;
+
+        float maxM = -1e30f;
+        for (int sp = 0; sp < nSplits; sp++)
+            maxM = MathF.Max(maxM, partials[((kvHead * nSplits + sp) * rows + r) * (SkD + 2) + SkD]);
+        float L = 0f, A = 0f;
+        for (int sp = 0; sp < nSplits; sp++)
+        {
+            int b = ((kvHead * nSplits + sp) * rows + r) * (SkD + 2);
+            float m = partials[b + SkD];
+            float w = m > -1e29f ? MathF.Exp(m - maxM) : 0f;
+            L += partials[b + SkD + 1] * w;
+            A += partials[b + d] * w;
+        }
+        int oBase = p[11] == 1 ? (sq * BH + bh) * SkD : (bh * SQ + sq) * SkD;
+        output[oBase + d] = A / (L + 1e-10f);
+    }
+
+    /// <summary>
     /// KV-TILED grouped attention (contiguous f32 K/V) — the unbounded-SKV path (SKV &gt; AttnSharedSkvMax).
     /// One thread GROUP per (bh, sq); KV is processed one <see cref="AttnKvBlock"/> at a time so only a single
     /// block of scores is resident, making SKV unbounded. Each thread keeps ONE online softmax shared across its
@@ -1293,5 +1512,9 @@ public class FusedAttentionKernel : IDisposable
         _retiredCaptureSlots.Clear();
         _dummySinks?.Dispose();
         _dummySinks = null;
+        _splitScratch?.Dispose();
+        _splitScratch = null;
+        foreach (var buf in _retiredSplitScratch) { try { buf.Dispose(); } catch { } }
+        _retiredSplitScratch.Clear();
     }
 }
