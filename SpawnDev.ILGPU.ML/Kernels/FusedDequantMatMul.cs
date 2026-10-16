@@ -125,6 +125,13 @@ public class FusedDequantMatMul : IDisposable
     // types' M>1 still use the per-element kernel; browser GPU keeps per-element by design (see dispatch).
     public static bool EnableMultiRowGemm =
         Environment.GetEnvironmentVariable("GGUF_GEMM_MR") != "0";
+
+    // 128 x 128 tile dequant GEMM for Q4_K prefill (CUDA): 256 threads each hold an 8 x 8 register tile (64 FMAs per 16 shared loads, against the 64 x 64 / 4 x 4 kernel's 16 per 8), a K-tile of
+    // 32 (one Q4_K sub-block: one scale and one min per column) so there are two barriers per 32 k instead of three per 16, and the B tile is dequantised from whole 32-bit words.
+    // MEASURED 2026-10-16 (RTX 4070): the 64 x 64 kernel ran a llama3.1:8b prefill's matrix multiplies at ~1.4 TFLOPS of the 29 the card does. GGUF_GEMM_FAST=0 turns it off (the A/B).
+    public static bool EnableFastGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_FAST") != "0";
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _fastQ4_K;
+    private const int FgBm = 128, FgBn = 128, FgBk = 32, FgThreads = 256, FgPer = 8;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K, _gemmMRQ6_K, _rbQ4_K, _rbQ6_K;
@@ -301,6 +308,13 @@ public class FusedDequantMatMul : IDisposable
             // accelerator caps a group dimension at 64 (same reason GemvGroupSize=64), so on any backend whose
             // max group-X is below 256 (CPU) we fall through to the multi-row kernel (group 64) — which handles
             // any M correctly, just less FLOP-efficiently. CUDA/OpenCL/Wasm allow >=256 and take the fast path.
+            if (M >= RB_TILE && EnableFastGemm && type == GGMLType.Q4_K && _accelerator.AcceleratorType == AcceleratorType.Cuda && K % FgBk == 0)
+            {
+                _fastQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FastGemmQ4_KImpl);
+                _fastQ4_K(new KernelConfig(((M + FgBm - 1) / FgBm) * ((N + FgBn - 1) / FgBn), FgThreads), input, intView, output, paramsBuf.View);
+                return;
+            }
             if (M >= RB_TILE && _accelerator.MaxGroupSize.X >= RB_BLOCK * RB_BLOCK)
             {
                 var rbConfig = new KernelConfig(
@@ -1167,6 +1181,239 @@ public class FusedDequantMatMul : IDisposable
             int m = mBase + mi;
             if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
             Group.Barrier();
+        }
+    }
+
+    /// <summary>
+    /// 128 x 128 tile dequant GEMM for Q4_K (see <see cref="EnableFastGemm"/>): C[M,N] = A[M,K] x W^T, W stored [N rows][K] in Q4_K blocks. Block = one output tile; thread (ty, tx) of a
+    /// 16 x 16 grid owns rows ty + 16 i and columns tx + 16 j (i, j = 0..7), so a warp's shared loads are broadcasts or consecutive words (no bank conflicts). Each K-tile of 32 is one Q4_K
+    /// sub-block: the A tile (stored k-major) is loaded from global, the B tile is dequantised from the weights' 32-bit words with the column's folded d*sc and dmin*mn.
+    /// </summary>
+    private static void FastGemmQ4_KImpl(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> C,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int numTilesN = (N + FgBn - 1) / FgBn;
+        int bytesPerRow = K / 256 * 144;
+        int tileRow = Grid.IdxX / numTilesN;
+        int tileCol = Grid.IdxX % numTilesN;
+        int tid = Group.IdxX;
+        int ty = tid / 16, tx = tid % 16;
+
+        var aS = SharedMemory.Allocate<float>(FgBk * FgBm);
+        var bS = SharedMemory.Allocate<float>(FgBk * FgBn);
+        // The 64 accumulators and the A/B fragments are plain locals, not arrays: ILGPU's array lowering fails (a NullReferenceException in LowerArrays) on a local array this large
+        // indexed inside the K loop, and plain scalars are what the register tile wants anyway.
+        float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c04 = 0f, c05 = 0f, c06 = 0f, c07 = 0f;
+        float c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f, c14 = 0f, c15 = 0f, c16 = 0f, c17 = 0f;
+        float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c24 = 0f, c25 = 0f, c26 = 0f, c27 = 0f;
+        float c30 = 0f, c31 = 0f, c32 = 0f, c33 = 0f, c34 = 0f, c35 = 0f, c36 = 0f, c37 = 0f;
+        float c40 = 0f, c41 = 0f, c42 = 0f, c43 = 0f, c44 = 0f, c45 = 0f, c46 = 0f, c47 = 0f;
+        float c50 = 0f, c51 = 0f, c52 = 0f, c53 = 0f, c54 = 0f, c55 = 0f, c56 = 0f, c57 = 0f;
+        float c60 = 0f, c61 = 0f, c62 = 0f, c63 = 0f, c64 = 0f, c65 = 0f, c66 = 0f, c67 = 0f;
+        float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
+
+        // This thread's A-tile load: row m, 16 consecutive k starting at kHalf * 16.
+        int aM = tid / 2, aK0 = (tid % 2) * 16;
+        int aRow = tileRow * FgBm + aM;
+        // This thread's B-tile load: column n, 16 consecutive k starting at kHalf * 16.
+        int bN = tid % 128, bK0 = (tid / 128) * 16;
+        int bCol = tileCol * FgBn + bN;
+
+        int numKTiles = K / FgBk;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            int k0 = t * FgBk;
+
+            // A: 16 floats of row aRow, stored k-major.
+            for (int i = 0; i < 16; i++)
+                aS[(aK0 + i) * FgBm + aM] = aRow < M ? A[aRow * K + k0 + aK0 + i] : 0f;
+
+            // B: this column's sub-block metadata (one d*sc and dmin*mn for all 32 k), then 16 nibbles from 4 words.
+            float dsc = 0f, dminmn = 0f;
+            int w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            int hi = 0;
+            if (bCol < N)
+            {
+                int sbOff = bCol * bytesPerRow + (k0 >> 8) * 144;
+                int r0 = k0 & 255;
+                int tt = r0 >> 6;
+                hi = (r0 >> 5) & 1;
+                float md = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+                float mdmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                int scOff = sbOff + 4;
+                int j = 2 * tt + hi;
+                int lowBit = ((j - 4) >> 31) & 1;
+                int hiBit = 1 - lowBit;
+                int bj = ReadByte(w, scOff + j);
+                int bj4 = ReadByte(w, scOff + j + 4);
+                int bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+                float msc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+                float mmn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+                dsc = md * msc;
+                dminmn = mdmin * mmn;
+                int wordBase = (sbOff + 16 + 32 * tt + bK0) >> 2;      // 16-byte aligned: 144-byte blocks, 16 + 32 tt + 16 kHalf
+                w0 = w[wordBase];
+                w1 = w[wordBase + 1];
+                w2 = w[wordBase + 2];
+                w3 = w[wordBase + 3];
+            }
+            int sh = 4 * hi;
+            float live = bCol < N ? 1f : 0f;
+            for (int by = 0; by < 4; by++)
+            {
+                int s8 = 8 * by + sh;
+                bS[(bK0 + by) * FgBn + bN] = live * (dsc * ((w0 >> s8) & 0xF) - dminmn);
+                bS[(bK0 + 4 + by) * FgBn + bN] = live * (dsc * ((w1 >> s8) & 0xF) - dminmn);
+                bS[(bK0 + 8 + by) * FgBn + bN] = live * (dsc * ((w2 >> s8) & 0xF) - dminmn);
+                bS[(bK0 + 12 + by) * FgBn + bN] = live * (dsc * ((w3 >> s8) & 0xF) - dminmn);
+            }
+            Group.Barrier();
+
+            for (int k = 0; k < FgBk; k++)
+            {
+                float a0 = aS[k * FgBm + ty + 0];
+                float a1 = aS[k * FgBm + ty + 16];
+                float a2 = aS[k * FgBm + ty + 32];
+                float a3 = aS[k * FgBm + ty + 48];
+                float a4 = aS[k * FgBm + ty + 64];
+                float a5 = aS[k * FgBm + ty + 80];
+                float a6 = aS[k * FgBm + ty + 96];
+                float a7 = aS[k * FgBm + ty + 112];
+                float b0 = bS[k * FgBn + tx + 0];
+                float b1 = bS[k * FgBn + tx + 16];
+                float b2 = bS[k * FgBn + tx + 32];
+                float b3 = bS[k * FgBn + tx + 48];
+                float b4 = bS[k * FgBn + tx + 64];
+                float b5 = bS[k * FgBn + tx + 80];
+                float b6 = bS[k * FgBn + tx + 96];
+                float b7 = bS[k * FgBn + tx + 112];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3; c04 += a0 * b4; c05 += a0 * b5; c06 += a0 * b6; c07 += a0 * b7;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3; c14 += a1 * b4; c15 += a1 * b5; c16 += a1 * b6; c17 += a1 * b7;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3; c24 += a2 * b4; c25 += a2 * b5; c26 += a2 * b6; c27 += a2 * b7;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3; c34 += a3 * b4; c35 += a3 * b5; c36 += a3 * b6; c37 += a3 * b7;
+                c40 += a4 * b0; c41 += a4 * b1; c42 += a4 * b2; c43 += a4 * b3; c44 += a4 * b4; c45 += a4 * b5; c46 += a4 * b6; c47 += a4 * b7;
+                c50 += a5 * b0; c51 += a5 * b1; c52 += a5 * b2; c53 += a5 * b3; c54 += a5 * b4; c55 += a5 * b5; c56 += a5 * b6; c57 += a5 * b7;
+                c60 += a6 * b0; c61 += a6 * b1; c62 += a6 * b2; c63 += a6 * b3; c64 += a6 * b4; c65 += a6 * b5; c66 += a6 * b6; c67 += a6 * b7;
+                c70 += a7 * b0; c71 += a7 * b1; c72 += a7 * b2; c73 += a7 * b3; c74 += a7 * b4; c75 += a7 * b5; c76 += a7 * b6; c77 += a7 * b7;
+            }
+            Group.Barrier();
+        }
+
+        {
+            int m = tileRow * FgBm + ty + 0;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c00; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c01; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c02; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c03; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c04; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c05; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c06; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c07; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 16;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c10; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c11; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c12; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c13; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c14; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c15; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c16; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c17; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 32;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c20; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c21; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c22; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c23; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c24; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c25; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c26; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c27; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 48;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c30; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c31; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c32; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c33; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c34; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c35; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c36; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c37; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 64;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c40; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c41; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c42; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c43; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c44; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c45; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c46; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c47; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 80;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c50; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c51; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c52; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c53; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c54; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c55; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c56; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c57; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 96;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c60; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c61; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c62; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c63; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c64; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c65; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c66; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c67; }
+            }
+        }
+        {
+            int m = tileRow * FgBm + ty + 112;
+            if (m < M)
+            {
+                { int n = tileCol * FgBn + tx + 0; if (n < N) C[m * N + n] = c70; }
+                { int n = tileCol * FgBn + tx + 16; if (n < N) C[m * N + n] = c71; }
+                { int n = tileCol * FgBn + tx + 32; if (n < N) C[m * N + n] = c72; }
+                { int n = tileCol * FgBn + tx + 48; if (n < N) C[m * N + n] = c73; }
+                { int n = tileCol * FgBn + tx + 64; if (n < N) C[m * N + n] = c74; }
+                { int n = tileCol * FgBn + tx + 80; if (n < N) C[m * N + n] = c75; }
+                { int n = tileCol * FgBn + tx + 96; if (n < N) C[m * N + n] = c76; }
+                { int n = tileCol * FgBn + tx + 112; if (n < N) C[m * N + n] = c77; }
+            }
         }
     }
 
