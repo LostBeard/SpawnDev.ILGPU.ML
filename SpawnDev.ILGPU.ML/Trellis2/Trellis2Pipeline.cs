@@ -106,17 +106,39 @@ public sealed class Trellis2Pipeline : IDisposable
             int cells = flow.Resolution * flow.Resolution * flow.Resolution, count = flow.InChannels * cells;
             using var x = _acc.Allocate1D<float>(count);
             _sampler.Randn(x.View, count, (ulong)seed * 7919UL + 1);
+            string dumpDir = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_SS") ?? "";
+            if (dumpDir.Length > 0)
+            {   // debug: noise, condition and the sampled latent, to rerun the same stage in the reference
+                Directory.CreateDirectory(dumpDir);
+                void Dump(string name, FV v, int n) { var a = v.SubView(0, n).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, name), b); }
+                Dump("noise.f32", x.View, count); Dump("cond.f32", cond, condTokens * 1024);
+            }
             Stage("ss flow load", sw);
             _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), x.View, count, _ssOpts);
             Stage("ss flow sample", sw);
+            if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
             w.Dispose();
             using var dw = GpuWeights.Load(_acc, _ssDecoderBase);
             using var dec = new SparseStructureDecoder(_acc, _sk, _dk, dw);
             using var logits = dec.Decode(x.View, flow.Resolution);
             coords32 = _sk.Occupancy(logits.View, flow.Resolution * 4, 32, out n0);
-            Stage("ss decode", sw);
+            Stage($"ss decode ({n0} cells of 32^3)", sw);
         }
         if (n0 == 0) throw new InvalidOperationException("the sparse structure is empty");
+        if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SS") == "1")
+        {
+            // debug: the occupied 32^3 cells as ASCII layers along z (the sparse structure BEFORE the shape stage)
+            var c = coords32.View.SubView(0, (long)n0 * 3).GetAsArray1D();
+            var grid = new bool[32, 32, 32];
+            for (int i = 0; i < n0; i++) grid[c[i * 3], c[i * 3 + 1], c[i * 3 + 2]] = true;
+            for (int z = 0; z < 32; z++)
+            {
+                int cnt = 0; for (int x = 0; x < 32; x++) for (int y = 0; y < 32; y++) if (grid[x, y, z]) cnt++;
+                Console.WriteLine($"z={z,2} cells={cnt}");
+                if (cnt > 0 && z % 3 == 0)
+                    for (int y = 0; y < 32; y++) { var sb = new System.Text.StringBuilder(); for (int x = 0; x < 32; x++) sb.Append(grid[x, y, z] ? '#' : '.'); Console.WriteLine("   " + sb); }
+            }
+        }
 
         // ---- 2. shape latent ---------------------------------------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> shapeSlat;       // the sampler output (normalised space): conditions the texture flow
@@ -144,7 +166,7 @@ public sealed class Trellis2Pipeline : IDisposable
             Stage("shape decoder load", sw);
             shapeDec = dec.Decode(lat.View, coords32.View, n0, 32, keepSubdivisions: true);
             result.Mesh = _mesher.Extract(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
-            Stage("shape decode + mesh", sw);
+            Stage($"shape decode + mesh ({shapeDec.Count} voxels, {result.Mesh.FaceCount} triangles)", sw);
         }
 
         // ---- 4. texture latent (conditioned on the shape latent) ------------------------------------------

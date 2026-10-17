@@ -133,20 +133,24 @@ public static class UvAtlas
 
     private static int[] BuildAdjacency(int[] faces, int F)
     {
+        // Sort the (edge key, face-edge) pairs and pair neighbours in the sorted order: O(n log n) with no hash. (A Dictionary keyed by the
+        // packed edge hashes a ^ b, which collides massively for nearby vertex indices: it never finished on a 5M-triangle mesh.)
         var adj = new int[F * 3]; Array.Fill(adj, -1);
-        var first = new Dictionary<ulong, int>(F * 3 / 2 + 16);
+        var keys = new ulong[F * 3]; var slot = new int[F * 3];
         for (int f = 0; f < F; f++)
             for (int e = 0; e < 3; e++)
             {
                 int a = faces[f * 3 + e], b = faces[f * 3 + (e + 1) % 3];
-                ulong key = a < b ? ((ulong)(uint)a << 32) | (uint)b : ((ulong)(uint)b << 32) | (uint)a;
-                if (first.TryGetValue(key, out int other))
-                {
-                    int of = other / 3;
-                    if (adj[f * 3 + e] < 0 && adj[other] < 0) { adj[f * 3 + e] = of; adj[other] = f; }   // a third face on the edge is ignored
-                }
-                else first[key] = f * 3 + e;
+                keys[f * 3 + e] = a < b ? ((ulong)(uint)a << 32) | (uint)b : ((ulong)(uint)b << 32) | (uint)a;
+                slot[f * 3 + e] = f * 3 + e;
             }
+        Array.Sort(keys, slot);
+        for (int i = 0; i + 1 < keys.Length; i++)
+        {
+            if (keys[i] != keys[i + 1]) continue;
+            int s0 = slot[i], s1 = slot[i + 1];
+            if (adj[s0] < 0 && adj[s1] < 0) { adj[s0] = s1 / 3; adj[s1] = s0 / 3; i++; }       // a third face on the same edge is left unlinked
+        }
         return adj;
     }
 
@@ -154,7 +158,6 @@ public static class UvAtlas
     private static List<List<int>> Grow(List<int> set, int[] adj, Vector3[] normal, double[] area, int[] inSet, int stamp, double cosThreshold)
     {
         var charts = new List<List<int>>();
-        var chartId = new Dictionary<int, int>();   // only used for faces of this set
         var done = new HashSet<int>();
         var queue = new Queue<int>();
         foreach (int seed in set)

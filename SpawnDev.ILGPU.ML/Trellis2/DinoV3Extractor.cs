@@ -23,6 +23,7 @@ public sealed class DinoV3Extractor : IDisposable
     private GpuWeights? _raw;
     private readonly List<IDisposable> _owned = new();
     private readonly string _prefix;
+    private readonly bool _timm;
 
     private sealed class LayerWeights
     {
@@ -80,13 +81,14 @@ public sealed class DinoV3Extractor : IDisposable
     public DinoV3Extractor(Accelerator accelerator, SparseKernels sparse, DiTKernels dit, GpuWeights weights)
     {
         _acc = accelerator; _sk = sparse; _dk = dit; _raw = weights;
+        _timm = weights.Has("patch_embed.proj.weight");          // timm layout (blocks.N.attn.qkv, gamma_1, mlp.fc1) vs transformers layout
         _prefix = weights.Has("model.layer.0.norm1.weight") ? "model.layer." : "layer.";
         _toHalf = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV>(ToHalfImpl);
         Convert();
         _raw!.Dispose(); _raw = null;   // the fp32 originals are no longer needed
     }
 
-    private HV Half(long n) { var b = _acc.Allocate1D<global::ILGPU.Half>(n); _owned.Add(b); return b.View; }
+    private HV Half(long n) { var b = _acc.Allocate1D<global::ILGPU.Half>(n); b.MemSetToZero(); _owned.Add(b); return b.View; }
     private FV Float(long n) { var b = _acc.Allocate1D<float>(n); _owned.Add(b); return b.View; }
     private void ToHalf(FV src, HV dst, long count) => _toHalf!((int)count, src, dst);
     private FV F32Copy(string name)
@@ -97,30 +99,54 @@ public sealed class DinoV3Extractor : IDisposable
     private void Convert()
     {
         var w = _raw!;
-        _cls = F32Copy("embeddings.cls_token"); _reg = F32Copy("embeddings.register_tokens");
+        _cls = F32Copy(_timm ? "cls_token" : "embeddings.cls_token");
+        _reg = F32Copy(_timm ? "reg_token" : "embeddings.register_tokens");
         // patch embedding: Conv2d [1024, 3, 16, 16] == Linear [1024, 768] on the flattened (c, ky, kx) patch
-        _patchW = Half(C * 3 * Patch * Patch); ToHalf(w.F32("embeddings.patch_embeddings.weight"), _patchW, C * 3 * Patch * Patch);
-        _patchB = Half(C); ToHalf(w.F32("embeddings.patch_embeddings.bias"), _patchB, C);
+        string patchName = _timm ? "patch_embed.proj" : "embeddings.patch_embeddings";
+        _patchW = Half(C * 3 * Patch * Patch); ToHalf(w.F32(patchName + ".weight"), _patchW, C * 3 * Patch * Patch);
+        _patchB = Half(C); ToHalf(w.F32(patchName + ".bias"), _patchB, C);
         for (int i = 0; i < Layers; i++)
         {
-            string p = $"{_prefix}{i}.";
             var l = new LayerWeights();
-            l.Qkv = Half(3L * C * C); l.QkvBias = Half(3L * C);
-            ToHalf(w.F32(p + "attention.q_proj.weight"), l.Qkv.SubView(0, (long)C * C), (long)C * C);
-            ToHalf(w.F32(p + "attention.k_proj.weight"), l.Qkv.SubView((long)C * C, (long)C * C), (long)C * C);
-            ToHalf(w.F32(p + "attention.v_proj.weight"), l.Qkv.SubView(2L * C * C, (long)C * C), (long)C * C);
-            ToHalf(w.F32(p + "attention.q_proj.bias"), l.QkvBias.SubView(0, C), C);
-            // k has no bias (key_bias=False): its slice of the fused bias stays zero (a fresh buffer is zeroed below)
-            ToHalf(w.F32(p + "attention.v_proj.bias"), l.QkvBias.SubView(2L * C, C), C);
-            l.O = Half((long)C * C); ToHalf(w.F32(p + "attention.o_proj.weight"), l.O, (long)C * C);
-            l.OBias = Half(C); ToHalf(w.F32(p + "attention.o_proj.bias"), l.OBias, C);
-            l.Up = Half((long)Mlp * C); ToHalf(w.F32(p + "mlp.up_proj.weight"), l.Up, (long)Mlp * C);
-            l.UpBias = Half(Mlp); ToHalf(w.F32(p + "mlp.up_proj.bias"), l.UpBias, Mlp);
-            l.Down = Half((long)C * Mlp); ToHalf(w.F32(p + "mlp.down_proj.weight"), l.Down, (long)C * Mlp);
-            l.DownBias = Half(C); ToHalf(w.F32(p + "mlp.down_proj.bias"), l.DownBias, C);
-            l.Norm1W = F32Copy(p + "norm1.weight"); l.Norm1B = F32Copy(p + "norm1.bias");
-            l.Norm2W = F32Copy(p + "norm2.weight"); l.Norm2B = F32Copy(p + "norm2.bias");
-            l.Scale1 = F32Copy(p + "layer_scale1.lambda1"); l.Scale2 = F32Copy(p + "layer_scale2.lambda1");
+            l.Qkv = Half(3L * C * C); l.QkvBias = Half(3L * C);                      // zero-initialised: the key projection has no bias
+            if (_timm)
+            {
+                string p = $"blocks.{i}.";
+                ToHalf(w.F32(p + "attn.qkv.weight"), l.Qkv, 3L * C * C);             // fused [q; k; v] rows
+                if (w.Has(p + "attn.qkv.bias")) ToHalf(w.F32(p + "attn.qkv.bias"), l.QkvBias, 3L * C);
+                else
+                {
+                    if (w.Has(p + "attn.q_bias")) ToHalf(w.F32(p + "attn.q_bias"), l.QkvBias.SubView(0, C), C);
+                    if (w.Has(p + "attn.v_bias")) ToHalf(w.F32(p + "attn.v_bias"), l.QkvBias.SubView(2L * C, C), C);
+                }
+                l.O = Half((long)C * C); ToHalf(w.F32(p + "attn.proj.weight"), l.O, (long)C * C);
+                l.OBias = Half(C); ToHalf(w.F32(p + "attn.proj.bias"), l.OBias, C);
+                l.Up = Half((long)Mlp * C); ToHalf(w.F32(p + "mlp.fc1.weight"), l.Up, (long)Mlp * C);
+                l.UpBias = Half(Mlp); ToHalf(w.F32(p + "mlp.fc1.bias"), l.UpBias, Mlp);
+                l.Down = Half((long)C * Mlp); ToHalf(w.F32(p + "mlp.fc2.weight"), l.Down, (long)C * Mlp);
+                l.DownBias = Half(C); ToHalf(w.F32(p + "mlp.fc2.bias"), l.DownBias, C);
+                l.Norm1W = F32Copy(p + "norm1.weight"); l.Norm1B = F32Copy(p + "norm1.bias");
+                l.Norm2W = F32Copy(p + "norm2.weight"); l.Norm2B = F32Copy(p + "norm2.bias");
+                l.Scale1 = F32Copy(p + "gamma_1"); l.Scale2 = F32Copy(p + "gamma_2");
+            }
+            else
+            {
+                string p = $"{_prefix}{i}.";
+                ToHalf(w.F32(p + "attention.q_proj.weight"), l.Qkv.SubView(0, (long)C * C), (long)C * C);
+                ToHalf(w.F32(p + "attention.k_proj.weight"), l.Qkv.SubView((long)C * C, (long)C * C), (long)C * C);
+                ToHalf(w.F32(p + "attention.v_proj.weight"), l.Qkv.SubView(2L * C * C, (long)C * C), (long)C * C);
+                ToHalf(w.F32(p + "attention.q_proj.bias"), l.QkvBias.SubView(0, C), C);
+                ToHalf(w.F32(p + "attention.v_proj.bias"), l.QkvBias.SubView(2L * C, C), C);
+                l.O = Half((long)C * C); ToHalf(w.F32(p + "attention.o_proj.weight"), l.O, (long)C * C);
+                l.OBias = Half(C); ToHalf(w.F32(p + "attention.o_proj.bias"), l.OBias, C);
+                l.Up = Half((long)Mlp * C); ToHalf(w.F32(p + "mlp.up_proj.weight"), l.Up, (long)Mlp * C);
+                l.UpBias = Half(Mlp); ToHalf(w.F32(p + "mlp.up_proj.bias"), l.UpBias, Mlp);
+                l.Down = Half((long)C * Mlp); ToHalf(w.F32(p + "mlp.down_proj.weight"), l.Down, (long)C * Mlp);
+                l.DownBias = Half(C); ToHalf(w.F32(p + "mlp.down_proj.bias"), l.DownBias, C);
+                l.Norm1W = F32Copy(p + "norm1.weight"); l.Norm1B = F32Copy(p + "norm1.bias");
+                l.Norm2W = F32Copy(p + "norm2.weight"); l.Norm2B = F32Copy(p + "norm2.bias");
+                l.Scale1 = F32Copy(p + "layer_scale1.lambda1"); l.Scale2 = F32Copy(p + "layer_scale2.lambda1");
+            }
             _layers[i] = l;
         }
         _acc.Synchronize();

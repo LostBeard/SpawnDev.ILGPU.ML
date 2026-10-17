@@ -296,9 +296,9 @@ internal static class Golden
     }
 
     /// <summary>DINOv3 ViT-L/16 extractor against the transformers model with random weights of the real architecture (reference/golden_dino.py).</summary>
-    public static int Dino()
+    public static int Dino(bool real = false)
     {
-        string dir = Path.Combine(Gpu.WeightDir, "golden", "dino");
+        string dir = Path.Combine(Gpu.WeightDir, "golden", real ? "dino_real" : "dino");
         if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_dino.py"); return 2; }
         var (ctx, accel) = Gpu.Create();
         using var _c = ctx; using var _a = accel;
@@ -306,7 +306,7 @@ internal static class Golden
         // the checkpoint weights are converted to fp16 at load in BOTH modes (fp16 rounding of the weights alone gives ~5e-4 relRMS), so the fp32-kernel gate is 1e-3
         double tol = mma ? 1e-2 : 1e-3;
         var dk = new DiTKernels(accel); var sk = new SparseKernels(accel);
-        using var w = GpuWeights.LoadFile(accel, Path.Combine(dir, "dino_random.safetensors"));
+        using var w = GpuWeights.LoadFile(accel, real ? Path.Combine(Gpu.WeightDir, "dinov3-timm-qkvb", "model.safetensors") : Path.Combine(dir, "dino_random.safetensors"));
         using var dino = new DinoV3Extractor(accel, sk, dk, w);
         var img = ReadF32(Path.Combine(dir, "image.f32"));
         int size = (int)Math.Round(Math.Sqrt(img.Length / 3.0));
@@ -345,7 +345,7 @@ internal static class Golden
 
     public static int SsFlow()
     {
-        string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");
+        string dir = Path.Combine(Gpu.WeightDir, "golden", Environment.GetEnvironmentVariable("TRELLIS2_GOLDEN") ?? "ss_flow");
         if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run scratchpad golden_ss_flow.py"); return 2; }
         var (ctx, accel) = Gpu.Create();
         using var _c = ctx; using var _a = accel;
