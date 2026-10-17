@@ -22,8 +22,92 @@ QPG = TH // P      # 64 queries per group
 out = []
 w = out.append
 
+import os
+# Shuffle variant shape: SP lanes share a query, each thread owns SQT queries (every shared K/V load is reused SQT times; a query costs
+# log2(SP) shuffles per key). ATT_CFG="P,QT,BKT128,BKT64" overrides for experiments.
+_cfg = [int(v) for v in os.environ.get("ATT_CFG", "8,4,8,16").split(",")]
+SP, SQT, SBKT128, SBKT64 = _cfg
+
+def kernel_shuffle(D, self_attn):
+    P_, QT = SP, SQT
+    BKT = SBKT128 if D == 128 else SBKT64
+    DT = D // P_
+    LANES = TH // P_
+    QG = LANES * QT                  # queries per group
+    lg = P_.bit_length() - 1
+    name = f"{'Self' if self_attn else 'Cross'}D{D}"
+    if self_attn:
+        w(f"    /// <summary>D = {D}, Q and K/V in one buffer. grid = ceil(Nq / {QG}) * H, group = {TH}.</summary>")
+        w(f"    public static void {name}(FV S, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        Q = KV = "S"
+    else:
+        w(f"    /// <summary>D = {D}, Q and K/V in separate buffers. grid = ceil(Nq / {QG}) * H, group = {TH}.</summary>")
+        w(f"    public static void {name}(FV Q, FV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        Q, KV = "Q", "KV"
+    w("    {")
+    w("        int qTile = Grid.IdxX / H, h = Grid.IdxX - qTile * H;")
+    w(f"        int tid = Group.IdxX, p = tid & {P_ - 1}, ql = tid >> {lg};")
+    w(f"        var ks = SharedMemory.Allocate<float>({BKT * D});")
+    w(f"        var vs = SharedMemory.Allocate<float>({BKT * D});")
+    w(f"        const float scale = {1.0 / (D ** 0.5)!r}f;")
+    for r in range(QT):
+        w(f"        int row{r} = qTile * {QG} + ql + {r * LANES};")
+        w(f"        bool ok{r} = row{r} < Nq;")
+        w(f"        int qb{r} = row{r} * qStride + qOff + h * {D} + p;")
+        for t in range(DT):
+            w(f"        float q{r}_{t} = ok{r} ? {Q}[qb{r} + {P_ * t}] * scale : 0f;")
+        w("        " + " ".join(f"float o{r}_{t} = 0f;" for t in range(DT)))
+        w(f"        float m{r} = -1e30f, l{r} = 0f;")
+    loads = BKT * D // TH
+    w(f"        for (int kb = 0; kb < Nk; kb += {BKT})")
+    w("        {")
+    for r in range(loads):
+        w(f"            {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
+        w(f"              int kvb = gk * kvStride + h * {D} + d;")
+        w(f"              ks[idx] = gk < Nk ? {KV}[kvb + kOff] : 0f; vs[idx] = gk < Nk ? {KV}[kvb + vOff] : 0f; }}")
+    w("            Group.Barrier();")
+    for r in range(QT):
+        w("            float " + ", ".join(f"s{r}_{j}" for j in range(BKT)) + ";")
+    for j in range(BKT):
+        w("            { " + " ".join(f"float k{t} = ks[{j * D + P_ * t} + p];" for t in range(DT)))
+        for r in range(QT):
+            w(f"              s{r}_{j} = " + " + ".join(f"q{r}_{t} * k{t}" for t in range(DT)) + ";")
+            for st in range(lg):
+                w(f"              s{r}_{j} += Warp.ShuffleXor(s{r}_{j}, {1 << st});")
+            w(f"              if (kb + {j} >= Nk) s{r}_{j} = -1e30f;")
+        w("            }")
+    for r in range(QT):
+        mx = f"s{r}_0"
+        for j in range(1, BKT):
+            mx = f"MathF.Max({mx}, s{r}_{j})"
+        w(f"            float mn{r} = MathF.Max(m{r}, {mx});")
+        w(f"            float corr{r} = MathF.Exp(m{r} - mn{r});")
+        w(f"            m{r} = mn{r};")
+        for j in range(BKT):
+            w(f"            float p{r}_{j} = MathF.Exp(s{r}_{j} - mn{r});")
+        w(f"            l{r} = l{r} * corr{r} + (" + " + ".join(f"p{r}_{j}" for j in range(BKT)) + ");")
+        w("            " + " ".join(f"o{r}_{t} *= corr{r};" for t in range(DT)))
+    for j in range(BKT):
+        w("            { " + " ".join(f"float v{t} = vs[{j * D + P_ * t} + p];" for t in range(DT)))
+        for r in range(QT):
+            w("              " + " ".join(f"o{r}_{t} += p{r}_{j} * v{t};" for t in range(DT)))
+        w("            }")
+    w("            Group.Barrier();")
+    w("        }")
+    for r in range(QT):
+        w(f"        if (ok{r})")
+        w("        {")
+        w(f"            float inv = 1f / l{r};")
+        w(f"            int ob = row{r} * H * {D} + h * {D} + p;")
+        w("            " + " ".join(f"O[ob + {P_ * t}] = o{r}_{t} * inv;" for t in range(DT)))
+        w("        }")
+    w("    }")
+    w("")
+
 def kernel(D, self_attn, shuffle):
-    BKT = (16 if D == 128 else 32) if shuffle else 8
+    if shuffle:
+        return kernel_shuffle(D, self_attn)
+    BKT = 8
     DT = D // P                 # dims per lane
     name = f"{'Self' if self_attn else 'Cross'}D{D}{'' if shuffle else 'Smem'}"
     if self_attn:
@@ -107,7 +191,8 @@ w("")
 w("/// <summary>Portable flash attention for every backend (see the generator for the layout).</summary>")
 w("internal static class TiledAttention")
 w("{")
-w(f"    public const int QueriesPerGroup = {QPG}, Threads = {TH};")
+w(f"    /// <summary>Queries per group: shuffle kernels ({SP} lanes x {SQT} queries per thread), *Smem kernels.</summary>")
+w(f"    public const int QueriesPerGroup = {(TH // SP) * SQT}, QueriesPerGroupSmem = {QPG}, Threads = {TH}, LanesPerQuery = {SP};")
 w("")
 for D in (128, 64):
     for sh in (True, False):

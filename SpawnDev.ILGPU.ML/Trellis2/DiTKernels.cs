@@ -426,10 +426,26 @@ public sealed class DiTKernels
     /// <summary>Null until the first attention: whether this backend compiles warp shuffles (NVIDIA's OpenCL does not; browsers need the subgroups feature).</summary>
     private bool? _shuffleOk;
 
-    // The shuffle kernel is tried first; a backend that cannot compile Warp.ShuffleXor gets the shared-memory reduction variant.
+    /// <summary>Which portable attention kernel this backend runs (after the first attention): for benchmarks and logs.</summary>
+    public string TiledAttentionKind => _shuffleOk switch
+    {
+        true => $"shuffle {TiledAttention.LanesPerQuery} lanes x {TiledAttention.QueriesPerGroup * TiledAttention.LanesPerQuery / TiledAttention.Threads} queries",
+        false => "shared-memory reduction",
+        null => "not resolved",
+    };
+
+    private KernelConfig Cfg(int Nq, int H)
+    {
+        int qpg = _shuffleOk == true ? TiledAttention.QueriesPerGroup : TiledAttention.QueriesPerGroupSmem;
+        return new KernelConfig(((Nq + qpg - 1) / qpg) * H, TiledAttention.Threads);
+    }
+
+    // The shuffle kernel is tried first; a backend that cannot compile Warp.ShuffleXor (or whose warps are narrower than the lanes a query
+    // spans) gets the shared-memory reduction variant.
     private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int> CrossKernel(int key)
     {
         if (_tiledCross[key] != null) return _tiledCross[key]!;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
         if (_shuffleOk != false)
         {
             try { _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.CrossD128 : TiledAttention.CrossD64); _shuffleOk = true; return _tiledCross[key]!; }
@@ -440,6 +456,7 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int> SelfKernel(int key)
     {
         if (_tiledSelf[key] != null) return _tiledSelf[key]!;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
         if (_shuffleOk != false)
         {
             try { _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.SelfD128 : TiledAttention.SelfD64); _shuffleOk = true; return _tiledSelf[key]!; }
@@ -457,13 +474,20 @@ public sealed class DiTKernels
     {
         if (!UsesMmaAttention(D) && UsesTiledAttention(D))
         {
-            var cfg = new KernelConfig(((Nq + TiledAttention.QueriesPerGroup - 1) / TiledAttention.QueriesPerGroup) * H, TiledAttention.Threads);
             IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;
             bool self = qv.Buffer == kvv.Buffer;
             if (self && qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
             int key = (D == 128 ? 0 : 2) + (self ? 1 : 0);
-            if (self) SelfKernel(key)(cfg, q, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);   // q and k/v are slices of one buffer: one binding
-            else CrossKernel(key)(cfg, q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+            if (self)
+            {
+                var k = SelfKernel(key);                                    // resolves _shuffleOk, which sets the queries per group
+                k(Cfg(Nq, H), q, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);   // q and k/v are slices of one buffer: one binding
+            }
+            else
+            {
+                var k = CrossKernel(key);
+                k(Cfg(Nq, H), q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+            }
             return;
         }
         if (UsesMmaAttention(D))

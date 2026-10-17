@@ -251,7 +251,7 @@ public abstract partial class MLTestBase
             using var qkv = accelerator.Allocate1D(Enumerable.Range(0, T * 3 * C).Select(i => (float)Math.Cos(i * 0.11) * 0.5f).ToArray());
             double s = await Time(() => dk.Attention(qkv.View, 3 * C, 0, qkv.View, 3 * C, C, 2 * C, default, o.View.SubView(0, (long)T * C), T, T, H, D));
             double tf = 4.0 * T * T * H * D / s / 1e12;
-            report.Add($"self-attention {s * 1000:F1} ms {tf:F2} TFLOPS");
+            report.Add($"self-attention {s * 1000:F1} ms {tf:F2} TFLOPS ({dk.TiledAttentionKind})");
         }
         var line = $"[Benchmark] Trellis2 DiT kernels [{accelerator.AcceleratorType}] " + string.Join(" | ", report);
         Console.WriteLine(line);
