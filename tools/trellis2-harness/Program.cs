@@ -22,12 +22,13 @@ return command switch
     "ssflow" => Golden.SsFlow(),
     "mma" => MmaProbe.Run(),
     "attn" => Golden.Attention(),
+    "slat" => Golden.SlatFlow(args.Length > 1 ? args[1] : "shape"),
     _ => Usage(command),
 };
 
 static int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: header <file> | upload <file> [tensor] | ssflow | attn | mma");
+    Console.WriteLine($"unknown command '{bad}'. commands: header <file> | upload <file> [tensor] | ssflow | attn | slat shape|tex | mma");
     return 2;
 }
 

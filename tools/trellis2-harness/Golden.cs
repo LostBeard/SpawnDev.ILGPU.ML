@@ -74,6 +74,69 @@ internal static class Golden
         return ok ? 0 : 1;
     }
 
+    internal static int[] ReadI32(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        var a = new int[bytes.Length / 4];
+        Buffer.BlockCopy(bytes, 0, a, 0, bytes.Length);
+        return a;
+    }
+
+    /// <summary>The shape / texture SLat flow DiT on a sparse token set (voxel coordinates drive the RoPE).</summary>
+    public static int SlatFlow(string kind)
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "slat_" + kind);
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_slat_flow.py {kind}"); return 2; }
+        string ckpt = kind == "shape" ? "slat_flow_img2shape_dit_1_3B_512_bf16" : "slat_flow_imgshape2tex_dit_1_3B_512_bf16";
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        using var weights = GpuWeights.Load(accel, Path.Combine(Gpu.WeightDir, "TRELLIS.2-4B", "ckpts", ckpt));
+        var feats = ReadF32(Path.Combine(dir, "feats.bin"));
+        var coords = ReadI32(Path.Combine(dir, "coords.bin"));
+        var cond = ReadF32(Path.Combine(dir, "cond.bin"));
+        float t = 700f;
+        int n = coords.Length / 3, condTokens = cond.Length / 1024;
+        bool mma = DiTKernels.EnableTensorCores && accel.AcceleratorType == AcceleratorType.Cuda;
+        double tol = mma ? 1e-2 : 2e-3;   // block taps: residual-stream relRMS
+        // The output gate for the bf16 tensor-core path is the reference's OWN bf16 run: ours must not deviate from the fp32
+        // golden by more than the released bf16 pipeline does (measured 2.8% shape / 4.2% tex on this input).
+        double yTol = 2e-3;
+        string bf16Path = Path.Combine(dir, "y_bf16.bin");
+        if (mma)
+        {
+            if (!File.Exists(bf16Path)) { Console.WriteLine($"missing {bf16Path}; run reference/golden_slat_flow.py {kind} with DTYPE=bf16"); return 2; }
+            var refBf16 = ReadF32(bf16Path); var refFp32 = ReadF32(Path.Combine(dir, "y.bin"));
+            double se = 0, sw0 = 0;
+            for (int i = 0; i < refFp32.Length; i++) { double d = refBf16[i] - refFp32[i]; se += d * d; sw0 += (double)refFp32[i] * refFp32[i]; }
+            yTol = Math.Sqrt(se / sw0);
+        }
+        Console.WriteLine($"slat {kind}: {n} tokens, {condTokens} cond tokens, tap tolerance {tol:E1}, output tolerance relRMS {yTol:E2} ({(mma ? "the reference's own bf16 deviation" : "fp32 kernels")})");
+        var kernels = new DiTKernels(accel);
+        using var dit = new FlowDiT(accel, kernels, weights);
+        bool ok = true;
+        dit.Tap = (name, view, cnt) =>
+        {
+            string golden = Path.Combine(dir, name + ".bin");
+            if (!File.Exists(golden)) return;      // this golden set did not dump that stage
+            accel.Synchronize();
+            ok &= Compare(name, ReadF32(golden), view.SubView(0, cnt).GetAsArray1D(), name == "t_emb" ? 1e-5 : tol);
+        };
+        using var cb = accel.Allocate1D(coords);
+        dit.SetTokens(cb.View, n);
+        using var fb = accel.Allocate1D(feats);
+        using var cdb = accel.Allocate1D(cond);
+        using var ob = accel.Allocate1D<float>((long)n * dit.OutChannels);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dit.Forward(fb.View, t, cdb.View, condTokens, ob.View);
+        Console.WriteLine($"forward {sw.Elapsed.TotalSeconds:F2}s");
+        sw.Restart();
+        dit.Forward(fb.View, t, cdb.View, condTokens, ob.View);
+        Console.WriteLine($"forward (warm) {sw.Elapsed.TotalSeconds:F2}s");
+        ok &= Compare("y", ReadF32(Path.Combine(dir, "y.bin")), ob.GetAsArray1D(), yTol);
+        Console.WriteLine(ok ? $"SLAT {kind.ToUpperInvariant()} PASS" : $"SLAT {kind.ToUpperInvariant()} FAIL");
+        return ok ? 0 : 1;
+    }
+
     public static int SsFlow()
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");
