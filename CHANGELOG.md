@@ -3,7 +3,13 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased - face detection and recognition
+## Unreleased - image to 3D (TRELLIS.2), face detection and recognition
+
+- **`Trellis2ImageTo3D`** (`Trellis2/`): a cut-out photo (RGBA, alpha = foreground) to a PBR GLB (positions, normals, UVs, base colour and metallic-roughness PNGs) on a 12 GB card: MIT-licensed
+  TRELLIS.2-4B 512 path (DINOv3 ViT-L/16 features, sparse-structure flow + decoder, shape and texture SLat flows, sparse SC-VAE decoders, FlexiDualGrid mesh), QEM simplification (`MeshSimplifier`, default 300k
+  faces), UV atlas (`UvAtlas`), GPU texture bake (`TextureBaker`), `PbrGlbWriter`. About 45-65 s and 3.1 GB peak on an RTX 4070. Every network stage is gated against the REAL reference classes (CPU torch
+  goldens in `tools/trellis2-harness`); the tensor-core GEMM and flash-attention kernels are CUDA inline PTX (`CudaAsm.Emit`, needs SpawnDev.ILGPU 5.3.8-local.5+). Weights are not shipped: DINOv3 carries Meta's
+  licence ("Built with DINOv3"); the IS-Net `ForegroundMask` is a development convenience (weights licence unstated). Tests `Trellis2_*`.
 
 - **`YuNetFaceDetector` + `SFaceRecognizer`** (`Pipelines/FaceRecognitionPipelines.cs`): YuNet (MIT, `opencv/face_detection_yunet`, 75 k parameters, finds faces from ~10 px, five landmarks) and SFace (Apache-2.0,
   `opencv/face_recognition_sface`, MobileFaceNet, 128-number embeddings), the pair OpenCV's `FaceDetectorYN` / `FaceRecognizerSF` run. Host pre/post-processing (letterbox, anchor decode, NMS, the five-point
