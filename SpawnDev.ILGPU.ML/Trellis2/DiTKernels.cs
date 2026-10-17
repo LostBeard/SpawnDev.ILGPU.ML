@@ -65,11 +65,11 @@ public sealed class DiTKernels
         }
         if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
-            _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.Bf16Dense);
+            _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
             EnsureDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
             _tiledBf16(new KernelConfig(tiles, TiledGemm.Threads), x, w.Cast<BFloat16, uint>(), bias.HasValue ? bias.Value.Cast<BFloat16, uint>() : _dummyU!.View,
-                o, _dummyF!.View, _noNbr!.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
+                o, _dummyF!.View, _noNbr!.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0, TiledGemm.ModeBf16);
             return;
         }
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
@@ -82,7 +82,7 @@ public sealed class DiTKernels
     /// </summary>
     public static bool EnableTiled = Environment.GetEnvironmentVariable("TRELLIS2_TILED") != "0";
     internal bool UseTiled(int K) => EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;   // WebGL has no shared memory
-    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledBf16;
+    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledBf16;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _dummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyF;
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _dummyB, _dummyB2;
@@ -439,7 +439,7 @@ public sealed class DiTKernels
         if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web) return;
         var g = new Index3D(TiledGemm.Threads, 1, 1);
         var tasks = new List<Task>();
-        if (UseTiled(TiledGemm.BK)) tasks.Add(Timed("Bf16Dense", () => web.PrecompileAsync(TiledGemm.Bf16Dense, g)));
+        if (UseTiled(TiledGemm.BK)) tasks.Add(Timed("Gemm", () => web.PrecompileAsync(TiledGemm.Gemm, g)));   // one kernel for all GEMM variants (SparseKernels uses it too)
         await Task.Yield();                                  // let I/O continuations run between the (synchronous) IL compiles
         foreach (var (key, self) in new[] { (1, true), (0, false), (3, true) })
         {

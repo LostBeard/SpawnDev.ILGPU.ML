@@ -25,9 +25,12 @@ out = []
 w = out.append
 
 def kernel(name, wtype, gather):
-    w(f"    /// <summary>{wtype} weights, {'gathered rows (sparse conv)' if gather else 'dense rows'}. grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
-    w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)")
+    # ONE kernel for all three variants (bf16 / f16 weights, dense / gathered rows), chosen by the uniform `mode` argument: on WebGPU each
+    # kernel costs ~7 s of IL -> WGSL compile in the browser's interpreted .NET runtime plus a shader compile, MEASURED per variant.
+    w(f"    /// <summary>mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
+    w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)")
     w("    {")
+    w("        bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;")
     w(f"        int tilesN = (N + {BN - 1}) / {BN};")
     w("        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX - tm * tilesN;")
     w("        int tid = Group.IdxX, tx = tid & 15, ty = tid >> 4;")
@@ -42,57 +45,69 @@ def kernel(name, wtype, gather):
         w(f"        int bRow{r} = ({r * TH} + tid) >> 2, bW{r} = ({r * TH} + tid) & 3, bN{r} = nBase + bRow{r};")
     # Row bases hoisted out of the k loop, in int: the host guarantees M*K, M*N, N*K < 2^31 (TiledGemm.Fits). (long) index math is
     # EMULATED on WebGPU (vec2<u32>): a 64-bit multiply + adds on every global load of every k step.
-    if not gather:
-        for r in range(4):
-            w(f"        int aOff{r} = aM{r} * K + aK{r};")
+    for r in range(4):
+        w(f"        int aOff{r} = aM{r} * K + aK{r};")
     for r in range(2):
         w(f"        int bOff{r} = ((bN{r} * K) >> 1) + bW{r};")
     for i in range(8):
         w("        float " + ", ".join(f"c{i}{j} = 0f" for j in range(8)) + ";")
-    def loadA(r, k0):
-        if gather:
-            return (f"aM{r} < M ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f")
-        return f"aM{r} < M ? A[aOff{r} + {k0}] : 0f"
-    def loadB(r, k0):
-        return f"bN{r} < N ? W[bOff{r} + ({k0} >> 1)] : 0u"
-    # prefetch registers for k0 = 0
-    for r in range(4):
-        w(f"        float pa{r} = {loadA(r, '0')};")
-    for r in range(2):
-        w(f"        uint pb{r} = {loadB(r, '0')};")
-    w(f"        for (int k0 = 0; k0 < K; k0 += {BK})")
+    # The k loop is emitted once per variant actually used (bf16 dense, f16 dense, f16 gathered), each free of mode branches; the epilogue
+    # is shared. MEASURED on WebGPU: mode branches inside one shared loop cost ~7% of GEMM throughput.
+    def kloop(f16v, gatherv, indent):
+        sp = " " * indent
+        lo, hi = ("F16Lo", "F16Hi") if f16v else ("Bf16Lo", "Bf16Hi")
+        def loadA(r, k0):
+            if gatherv:
+                return f"aM{r} < M ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f"
+            return f"aM{r} < M ? A[aOff{r} + {k0}] : 0f"
+        def loadB(r, k0):
+            return f"bN{r} < N ? W[bOff{r} + ({k0} >> 1)] : 0u"
+        for r in range(4):
+            w(f"{sp}float pa{r} = {loadA(r, '0')};")
+        for r in range(2):
+            w(f"{sp}uint pb{r} = {loadB(r, '0')};")
+        w(f"{sp}for (int k0 = 0; k0 < K; k0 += {BK})")
+        w(f"{sp}{{")
+        for r in range(4):
+            w(f"{sp}    As[aK{r} * {LD} + aRow{r}] = pa{r};")
+        for r in range(2):
+            w(f"{sp}    Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r});")
+        w(f"{sp}    Group.Barrier();")
+        w(f"{sp}    int kn = k0 + {BK};")
+        w(f"{sp}    if (kn < K)")
+        w(f"{sp}    {{")
+        for r in range(4):
+            w(f"{sp}        pa{r} = {loadA(r, 'kn')};")
+        for r in range(2):
+            w(f"{sp}        pb{r} = {loadB(r, 'kn')};")
+        w(f"{sp}    }}")
+        w(f"{sp}    for (int kk = 0; kk < {BK}; kk++)")
+        w(f"{sp}    {{")
+        w(f"{sp}        int ab = kk * {LD} + ty, bb = kk * {LD} + tx;")
+        for i in range(8):
+            w(f"{sp}        float a{i} = As[ab + {16 * i}];")
+        for j in range(8):
+            w(f"{sp}        float b{j} = Bs[bb + {16 * j}];")
+        for i in range(8):
+            w(f"{sp}        " + " ".join(f"c{i}{j} += a{i} * b{j};" for j in range(8)))
+        w(f"{sp}    }}")
+        w(f"{sp}    Group.Barrier();")
+        w(f"{sp}}}")
+    w("        if (gather)")
     w("        {")
-    for r in range(4):
-        w(f"            As[aK{r} * {LD} + aRow{r}] = pa{r};")
-    for r in range(2):
-        lo, hi = ("Bf16Lo", "Bf16Hi") if wtype == "bf16" else ("F16Lo", "F16Hi")
-        w(f"            Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r});")
-    w("            Group.Barrier();")
-    w(f"            int kn = k0 + {BK};")
-    w("            if (kn < K)")
-    w("            {")
-    for r in range(4):
-        w(f"                pa{r} = {loadA(r, 'kn')};")
-    for r in range(2):
-        w(f"                pb{r} = {loadB(r, 'kn')};")
-    w("            }")
-    w(f"            for (int kk = 0; kk < {BK}; kk++)")
-    w("            {")
-    w(f"                int ab = kk * {LD} + ty, bb = kk * {LD} + tx;")
-    for i in range(8):
-        w(f"                float a{i} = As[ab + {16 * i}];")
-    for j in range(8):
-        w(f"                float b{j} = Bs[bb + {16 * j}];")
-    for i in range(8):
-        w("                " + " ".join(f"c{i}{j} += a{i} * b{j};" for j in range(8)))
-    w("            }")
-    w("            Group.Barrier();")
+    kloop(True, True, 12)
     w("        }")
-    lo = "Bf16Lo" if wtype == "bf16" else "F16Lo"
-    hi = "Bf16Hi" if wtype == "bf16" else "F16Hi"
+    w("        else if (f16)")
+    w("        {")
+    kloop(True, False, 12)
+    w("        }")
+    w("        else")
+    w("        {")
+    kloop(False, False, 12)
+    w("        }")
     for j in range(8):
         w(f"        int n{j} = nBase + tx + {16 * j};")
-        w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? {lo}(Bias[n{j} >> 1]) : {hi}(Bias[n{j} >> 1])) : 0f;")
+        w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? Lo(Bias[n{j} >> 1], f16) : Hi(Bias[n{j} >> 1], f16)) : 0f;")
     for i in range(8):
         w(f"        int m{i} = mBase + ty + {16 * i};")
         w(f"        if (m{i} < M)")
@@ -133,6 +148,10 @@ w("        return Interop.IntAsFloat(sign | ((e + 112u) << 23) | (m << 13));")
 w("    }")
 w("    private static float F16Lo(uint u) => HalfBits(u & 0xFFFFu);")
 w("    private static float F16Hi(uint u) => HalfBits(u >> 16);")
+w("    private static float Lo(uint u, bool f16) => f16 ? F16Lo(u) : Bf16Lo(u);")
+w("    private static float Hi(uint u, bool f16) => f16 ? F16Hi(u) : Bf16Hi(u);")
+w("    /// <summary>The mode argument of <see cref=\"Gemm\"/>.</summary>")
+w("    public const int ModeBf16 = 0, ModeF16 = 1, ModeGather = 2;")
 w("    private static float GatherA(FV A, IV nbr, int m, int k, int cin)")
 w("    {")
 w("        int tap = k / cin, ci = k - tap * cin;")
@@ -140,9 +159,7 @@ w("        int src = nbr[m * 27 + tap];")
 w("        return src >= 0 ? A[src * cin + ci] : 0f;")
 w("    }")
 w("")
-kernel("Bf16Dense", "bf16", False)
-kernel("F16Dense", "f16", False)
-kernel("F16Gather", "f16", True)
+kernel("Gemm", "any", None)
 w("}")
 
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")

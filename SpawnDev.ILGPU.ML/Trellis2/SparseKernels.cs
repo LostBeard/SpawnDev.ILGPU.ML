@@ -100,15 +100,11 @@ public sealed class SparseKernels
         _acc.Fence();   // the hash is freed on return
     }
 
-    /// <summary>WebGPU: build the pipelines of the f16 tiled GEMMs (dense linear, gathered sparse convolution) in the background (see <see cref="DiTKernels.PrecompileAsync"/>).</summary>
-    public async Task PrecompileAsync()
+    /// <summary>WebGPU: build the tiled GEMM's pipeline in the background (one kernel serves every variant; see <see cref="DiTKernels.PrecompileAsync"/>).</summary>
+    public Task PrecompileAsync()
     {
-        if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web || !UseTiled(TiledGemm.BK)) return;
-        var g = new Index3D(TiledGemm.Threads, 1, 1);
-        var dense = DiTKernels.Timed("F16Dense", () => web.PrecompileAsync(TiledGemm.F16Dense, g));
-        await Task.Yield();
-        var gather = DiTKernels.Timed("F16Gather", () => web.PrecompileAsync(TiledGemm.F16Gather, g));
-        await Task.WhenAll(dense, gather);
+        if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web || !UseTiled(TiledGemm.BK)) return Task.CompletedTask;
+        return web.PrecompileAsync(TiledGemm.Gemm, new Index3D(TiledGemm.Threads, 1, 1));   // already started by DiTKernels: deduplicated
     }
 
     // single lookup, for kernels that probe the hash themselves
@@ -158,11 +154,11 @@ public sealed class SparseKernels
         }
         if (UseTiled(27 * cin) && TiledGemm.Fits(M, 27 * cin, cout, x.Length / cin))
         {
-            _tiledGather ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Gather);
+            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
-            _tiledGather(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
-                M, 27 * cin, cout, cin, 1, 0, 0);
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
+                M, 27 * cin, cout, cin, 1, 0, 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
             return;
         }
         _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvImpl);
@@ -349,13 +345,13 @@ public sealed class SparseKernels
         }
         if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
-            _tiledLinear ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Dense);
+            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
             // a residual that IS the output is added in place (hasRes 2): WebGPU forbids binding one buffer to two slots
             bool inPlace = res.HasValue && SameView(res.Value, o);
-            _tiledLinear(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View,
-                o, res.HasValue && !inPlace ? res.Value : _tiledDummyF!.View, _tiledDummyI!.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, !res.HasValue ? 0 : inPlace ? 2 : 1);
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View,
+                o, res.HasValue && !inPlace ? res.Value : _tiledDummyF!.View, _tiledDummyI!.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, !res.HasValue ? 0 : inPlace ? 2 : 1, TiledGemm.ModeF16);
             return;
         }
         _naiveLinear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>(NaiveLinearImpl);
@@ -371,7 +367,7 @@ public sealed class SparseKernels
     // Portable register-tiled path for every backend without the tensor-core kernels (see DiTKernels.UseTiled).
     private MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>? _normDummyG, _normDummyB;
     private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;
-    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledLinear, _tiledGather;
+    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledGemm;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _tiledDummyF;
     private MemoryBuffer1D<int, Stride1D.Dense>? _tiledDummyI;

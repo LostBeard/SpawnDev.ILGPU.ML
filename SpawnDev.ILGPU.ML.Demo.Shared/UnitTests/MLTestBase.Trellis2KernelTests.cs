@@ -236,12 +236,12 @@ public abstract partial class MLTestBase
             global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = (name, src, e) => { prevHook?.Invoke(name, src, e); sizes[name] = src.Length; };
         try {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var gemm = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>(TiledGemm.Bf16Dense);
+        var gemm = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
         double load = sw.Elapsed.TotalMilliseconds; sw.Restart();
         var cfg = new KernelConfig(4, TiledGemm.Threads);
-        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0); await accelerator.SynchronizeAsync();
+        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0, TiledGemm.ModeBf16); await accelerator.SynchronizeAsync();
         double first = sw.Elapsed.TotalMilliseconds; sw.Restart();
-        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0); await accelerator.SynchronizeAsync();
+        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0, TiledGemm.ModeBf16); await accelerator.SynchronizeAsync();
         double warm = sw.Elapsed.TotalMilliseconds;
         report.Add($"gemm load {load:F0} ms, first launch {first - warm:F0} ms");
 
