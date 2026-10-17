@@ -295,6 +295,31 @@ internal static class Golden
         return ok ? 0 : 1;
     }
 
+    /// <summary>DINOv3 ViT-L/16 extractor against the transformers model with random weights of the real architecture (reference/golden_dino.py).</summary>
+    public static int Dino()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "dino");
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_dino.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        bool mma = DiTKernels.EnableTensorCores && accel.AcceleratorType == AcceleratorType.Cuda;
+        // the checkpoint weights are converted to fp16 at load in BOTH modes (fp16 rounding of the weights alone gives ~5e-4 relRMS), so the fp32-kernel gate is 1e-3
+        double tol = mma ? 1e-2 : 1e-3;
+        var dk = new DiTKernels(accel); var sk = new SparseKernels(accel);
+        using var w = GpuWeights.LoadFile(accel, Path.Combine(dir, "dino_random.safetensors"));
+        using var dino = new DinoV3Extractor(accel, sk, dk, w);
+        var img = ReadF32(Path.Combine(dir, "image.f32"));
+        int size = (int)Math.Round(Math.Sqrt(img.Length / 3.0));
+        int tokens = 1 + 4 + (size / 16) * (size / 16);
+        using var ib = accel.Allocate1D(img); using var ob = accel.Allocate1D<float>((long)tokens * 1024);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dino.Extract(ib.View, size, ob.View);
+        Console.WriteLine($"dino extract {sw.Elapsed.TotalSeconds:F2}s ({tokens} tokens, {(mma ? "fp16 tensor cores" : "fp32 reference kernels")}), tolerance relRMS {tol:E1}");
+        bool ok = Compare("dino features", ReadF32(Path.Combine(dir, "features.f32")), ob.GetAsArray1D(), tol);
+        Console.WriteLine(ok ? "DINO PASS" : "DINO FAIL");
+        return ok ? 0 : 1;
+    }
+
     public static int SsFlow()
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");

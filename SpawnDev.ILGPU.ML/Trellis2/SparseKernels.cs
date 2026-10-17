@@ -294,6 +294,14 @@ public sealed class SparseKernels
         long xb = (long)m * K, wb = (long)n * K;
         for (int k = 0; k < K; k++) acc += x[xb + k] * PrecisionConvert.ConvertToSingle(w[wb + k]);
         if (act == 1) acc = acc / (1f + MathF.Exp(-acc));
+        if (act == 3)                                                              // exact GELU (erf), Abramowitz-Stegun 7.1.26
+        {
+            float z = acc * 0.7071067811865476f, az = MathF.Abs(z);
+            float t = 1f / (1f + 0.3275911f * az);
+            float poly = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+            float erfAbs = 1f - poly * MathF.Exp(-az * az);
+            acc = 0.5f * acc * (1f + (z < 0f ? -erfAbs : erfAbs));
+        }
         if (hasRes != 0) acc += res[idx];
         o[idx] = acc;
     }

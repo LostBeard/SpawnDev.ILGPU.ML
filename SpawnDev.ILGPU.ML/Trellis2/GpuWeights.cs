@@ -29,10 +29,22 @@ public sealed class GpuWeights : IDisposable
     public static GpuWeights Load(Accelerator accelerator, string basePath, Func<string, bool>? filter = null)
     {
         using var json = JsonDocument.Parse(File.ReadAllText(basePath + ".json"));
-        var w = new GpuWeights(json.RootElement.GetProperty("args").Clone());
+        return LoadCore(accelerator, basePath + ".safetensors", json.RootElement.GetProperty("args").Clone(), filter);
+    }
+
+    /// <summary>Load a bare .safetensors file (a Hugging Face checkpoint has no TRELLIS-style sibling args json); <see cref="Args"/> is empty.</summary>
+    public static GpuWeights LoadFile(Accelerator accelerator, string safetensorsPath, Func<string, bool>? filter = null)
+    {
+        using var empty = JsonDocument.Parse("{}");
+        return LoadCore(accelerator, safetensorsPath, empty.RootElement.Clone(), filter);
+    }
+
+    private static GpuWeights LoadCore(Accelerator accelerator, string safetensorsPath, JsonElement args, Func<string, bool>? filter)
+    {
+        var w = new GpuWeights(args);
         try
         {
-            using var reader = SafeTensorsFileReader.Open(basePath + ".safetensors");
+            using var reader = SafeTensorsFileReader.Open(safetensorsPath);
             foreach (var t in reader.Tensors)
             {
                 if (filter != null && !filter(t.Name)) continue;
@@ -46,7 +58,7 @@ public sealed class GpuWeights : IDisposable
                     case "F32":
                         { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; reader.Upload(t, b.View); break; }
                     default:
-                        throw new NotSupportedException($"'{basePath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
+                        throw new NotSupportedException($"'{safetensorsPath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
                 }
                 w._shapes[t.Name] = t.Shape;
             }

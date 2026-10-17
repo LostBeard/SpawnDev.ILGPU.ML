@@ -21,7 +21,7 @@ public sealed class DiTKernels
     public DiTKernels(Accelerator accelerator) => _acc = accelerator;
 
     /// <summary>Epilogue of <see cref="Linear"/>.</summary>
-    public enum Act { None = 0, Silu = 1, GeluTanh = 2 }
+    public enum Act { None = 0, Silu = 1, GeluTanh = 2, GeluErf = 3 }
 
     // ---------------------------------------------------------------------------------------------------
     // Linear: out[m,n] = act( bias[n] + sum_k x[m,k] * w[n,k] )        (nn.Linear, w stored [N,K])
@@ -74,6 +74,14 @@ public sealed class DiTKernels
             z = MathF.Max(-20f, MathF.Min(20f, z));
             float e = MathF.Exp(2f * z);
             return 0.5f * v * (1f + (e - 1f) / (e + 1f));
+        }
+        if (act == 3)                                                              // exact GELU (erf), Abramowitz-Stegun 7.1.26
+        {
+            float z = v * 0.7071067811865476f, az = MathF.Abs(z);
+            float t = 1f / (1f + 0.3275911f * az);
+            float poly = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+            float erfAbs = 1f - poly * MathF.Exp(-az * az);
+            return 0.5f * v * (1f + (z < 0f ? -erfAbs : erfAbs));
         }
         return v;
     }
