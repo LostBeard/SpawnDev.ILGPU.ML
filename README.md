@@ -2,7 +2,11 @@
 
 [![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
 
-[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
+[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
+
+> **New in 5.3.11: [Text & Image to 3D in your browser](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d).** Type a prompt or drop a photo and get a textured PBR 3D model (GLB) built entirely on your own GPU over WebGPU: SD Turbo draws the object, RMBG-1.4 cuts it out, and [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft, MIT, 4B parameters) generates the mesh and textures. To our knowledge this is the first fully client-side TRELLIS.2 on the web — no server, no upload. About 2-3 minutes on a desktop GPU once the weights are cached (~10 GB, opt-in). [How it works →](Docs/trellis2.md)
+>
+> ![Text to 3D in the browser — "a wooden treasure chest with iron bands"](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-17-16-55_TextTo3D-Chest.jpg)
 
 **Hardware-agnostic neural network inference + training for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
 
@@ -17,8 +21,8 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 > **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
 
 - **System One decision heads** *(5.2.22+; Snake factory removed from package in 5.2.23)* — typed choice / score / noul over a float state vector (Jev/Laya-inspired category, not a weight port). Tiny GPU MLP via `TrainableModel`, legal-action masks, FP32 weight export/import. Classic Snake at `/snake` is a **demo** (dims/teacher in `Demo.Shared`, not NuGet). [**Docs/system-one.md**](Docs/system-one.md)
-- **Demos** - **15 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, face, CLIP, background-removal, super-res, text-gen, embeddings, sentiment, inspector, benchmark, speech-to-text, System One Snake, **and SD-Turbo image-gen**), plus a few PARTIAL/WIP (see status doc). On-device LLM chat lives at `/ai-chat`.
-- **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
+- **Demos** - **VERIFIED end-to-end** demos (most matched numerically against ONNX Runtime: classification, style, depth, pose, CLIP, background-removal, super-res, text-gen, embeddings, sentiment, inspector, benchmark, speech-to-text, System One Snake, SD-Turbo image-gen, **and text & image to 3D (TRELLIS.2)**), plus a few PARTIAL/WIP (see status doc for the exact list). On-device LLM chat lives at `/ai-chat`.
+- **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), plus TRELLIS.2 image/text to 3D (`Trellis2ImageTo3D`, `Trellis2TextTo3D`)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Softmax-CE MLP training powers System One heads. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **Local GGUF LLM inference + Ollama-compatible server** *(new in preview.5)* — run quantized LLMs (Qwen, Gemma, Llama) fully on your GPU with KV-cache decode; the Example 06 server is a drop-in Ollama replacement (OpenAI, Ollama, and Anthropic-Messages APIs) that works with the Claude CLI. ~51 tok/s decode on qwen2.5-coder:7b Q4_K_M (RTX 4070) via dp4a int8 GEMV + warp-cooperative register/flash attention (CUDA + WebGPU).
@@ -31,7 +35,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
 - **Streaming weight loader** — Large models (GPT-2 652MB) load one tensor at a time. Minimal CPU peak memory. FP16 on GPU supported.
 - **122+ numpy-verified operator tests** — every operator validated against known-correct reference data, CPU reference comparison minimum bar
-- **Single image to 3D** — TripoSR for exportable meshes (glTF/OBJ), LGM for Gaussian splats (SPZ/PLY)
+- **Text & image to 3D (TRELLIS.2)** *(5.3.11)* — a prompt or a photo becomes a textured PBR GLB: `Trellis2ImageTo3D` / `Trellis2TextTo3D` run the full TRELLIS.2-4B pipeline (DINOv3 features, three 1.3B flow transformers, sparse VAE decoders, dual-grid mesh, UV atlas, GPU texture bake). ~40 s on CUDA (tensor cores), and in the browser on WebGPU (~2-3 min cached) — to our knowledge the first fully client-side TRELLIS.2 on the web. [**Docs/trellis2.md**](Docs/trellis2.md). (TripoSR / LGM single-image 3D remain planned.)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 - **P2P Model Delivery + Shared Compute** — OPTIONAL, via the separate `SpawnDev.ILGPU.ML.WebTorrent` package: [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) decentralized model delivery over BitTorrent. The core library delivers models over plain HTTP through the hub and does NOT depend on WebTorrent; `HubModelStream` implements the same `IModelSource`, so P2P is a one-line swap. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
 
@@ -41,6 +45,7 @@ End-to-end demos on WebGPU (and the other backends) — fully native C# kernels,
 
 | Demo | Model | Pipeline |
 |------|-------|----------|
+| ![Text to 3D — treasure chest](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-17-16-55_TextTo3D-Chest.jpg) | **Text & image to 3D** — TRELLIS.2-4B (+ SD Turbo for text, RMBG-1.4 cut-out): prompt or photo → textured PBR GLB, fully in the browser on WebGPU | `Trellis2ImageTo3D` / `Trellis2TextTo3D` + `/text-to-3d` demo |
 | ![Classification — Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_Classification-Cat.jpg) | **Image classification** — SqueezeNet 1.1 | `ClassificationPipeline` |
 | ![Depth Anything V2 — House](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_DepthAnythingV2-House.jpg) | **Monocular depth estimation** — Depth Anything V2 Small (95MB) | `DepthEstimationPipeline` |
 | ![Style Transfer — Mosaic Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_StyleTransfer-CatMosaic.jpg) | **Neural style transfer** — Mosaic ONNX Model Zoo | `StyleTransferPipeline` |
@@ -50,6 +55,8 @@ End-to-end demos on WebGPU (and the other backends) — fully native C# kernels,
 | ![System One Snake — score 72](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-09-26-13-24_SystemOneSnake-2.jpg) | **System One Snake** — local decision head (choice probs, no text); on-device BC from a safe teacher; legal-action mask. Snake helpers are demo-only | `SystemOneDecisionHead` + `/snake` demo |
 
 Vision results above are rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
+
+**Text & image to 3D** runs TRELLIS.2's whole pipeline on the visitor's GPU: ~10 GB of checkpoints stream from the hub into browser storage (OPFS, cached per file as the quota allows; the rest streams with range requests straight to the GPU), portable register-tiled GEMM and flash-attention kernels carry the three 1.3B flow transformers on WebGPU, the 3M-triangle mesh is clustered on the device before simplification, and the large kernels' pipelines build in the background before their first launch. MEASURED on an RTX 4070 in Chrome (AOT build, weights cached): photo → GLB 134-148 s, prompt → GLB 180 s. Details: [**Docs/trellis2.md**](Docs/trellis2.md).
 
 The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes. System One Snake trains and plays entirely on-device (~15 ms/decision on WebGPU); see [**Docs/system-one.md**](Docs/system-one.md).
 
@@ -397,6 +404,8 @@ Registered op-types live in `OperatorRegistry.BuiltinOpTypes` (live count on the
 | **TextGenerationPipeline** | Prompt text | Generated text (autoregressive, DistilGPT-2) |
 | **SpeechRecognitionPipeline** | Audio samples | Transcribed text (Whisper encoder+decoder) |
 | **AsyncDepthPipeline** | RGBA frames | Real-time depth with fast/slow path blending |
+| **Trellis2ImageTo3D** | RGBA image (alpha = foreground) | Textured PBR GLB (TRELLIS.2-4B, 512 or 1024 pipeline) |
+| **Trellis2TextTo3D** | Prompt text | Textured PBR GLB (SD Turbo → cut-out → TRELLIS.2) |
 
 ## Demo App
 
@@ -444,8 +453,9 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does |
 |------|-------------|
+| **Text & Image to 3D (TRELLIS.2)** | `/text-to-3d` and `/image-to-3d`: a prompt (SD Turbo draws it) or a photo, cut out with RMBG-1.4, turned into a textured PBR GLB by TRELLIS.2-4B on your GPU. Live stage timings, rotating 3D preview, GLB download. ~10 GB of weights, opt-in, cached in browser storage. |
 | **Image Generation** | SD-Turbo text→image on your GPU (single-step, ~2.5 GB opt-in download). Same `ImageGenerationPipeline` as SpawnDev.AI. |
-| **Image to 3D (TripoSR)** | **Coming soon.** Generate/download/open are no-ops. Format helpers exist; the reconstruction model path is not wired. |
+| **Image to 3D (TripoSR)** | Planned. The TripoSR reconstruction path is not wired; use Text & Image to 3D (TRELLIS.2) for working image-to-3D. |
 | **Image to Gaussian Splats (LGM)** | Planned — single image → splats → [SpawnScene](https://github.com/LostBeard/SpawnScene). Not a working demo page yet. |
 | **Depth Voxel** | Route mounts; depth colormap can run. The promised 3D voxel/splat viewer was never built (STATUS: PARTIAL; hidden from nav). |
 

@@ -8,6 +8,7 @@ Native GPU neural-network inference for .NET / Blazor WebAssembly, built on Spaw
 |-----|----------------|
 | [**DEMO_AND_MODEL_STATUS.md**](DEMO_AND_MODEL_STATUS.md) | **Source of truth for what actually works.** Per-demo VERIFIED / PARTIAL / WIP status with the test that proves each one. Read this before trusting any "it works" claim elsewhere. |
 | [**operators.md**](operators.md) | **Source of truth for ONNX op support.** Points at `OperatorRegistry.BuiltinOpTypes` — never hardcode counts or paste the op list elsewhere. |
+| [**trellis2.md**](trellis2.md) | **TRELLIS.2 image & text to 3D** — the pipeline, measured desktop/browser performance, how the in-browser version fits (portable kernels, weight streaming + OPFS caching, background shader builds, AOT), API, tests, licences |
 | [**system-one.md**](system-one.md) | **System One decision heads** — package API (choice/score/noul, masks, weights) + Classic Snake **demo** reference (`SnakeSystemOneSpec` is not NuGet) |
 | [`../README.md`](../README.md) | Project overview, quick start, API, supported backends |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | Release-accurate fixes per version (often the most candid record) |

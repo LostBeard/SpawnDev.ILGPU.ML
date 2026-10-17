@@ -40,7 +40,7 @@
 | `/depth-voxel` | Depth → 3D voxels | 🟡 **PARTIAL** | Depth pipeline runs (see `/depth`); the 3D voxel/gaussian-splat scene was never built (nav-hidden 2026-06-30). Route still mounts; shows 2D depth colormap |
 | `/explain` | Model explainability | 🟡 **PARTIAL** | Intercepts the executor; works on a limited set of models |
 | `/train` | On-device training (Draw to Learn) | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` |
-| `/image-to-3d` | Image → 3D model | 🚧 **WIP** | Coming-soon banner honest. `GenerateModel()` is a **no-op**; download/open empty |
+| `/text-to-3d`, `/image-to-3d` | Text & image → 3D (TRELLIS.2) | ✅ **VERIFIED** | **Confirmed live 2026-10-17** (Chrome, WebGPU, RTX 4070, AOT build): crown photo → GLB 148 s fresh page / 134 s warm; prompt "a wooden treasure chest with iron bands" → GLB 180 s cached (246 s with SD Turbo's first download). Kernel gates on WebGPU/CUDA/OpenCL/CPU: `Trellis2_TiledLinear_MatchesHostReference`, `Trellis2_TiledSparseConv_MatchesHostReference`, `Trellis2_FlashAttention_MatchesHostReference`, `Trellis2_MeshClusterer_SphereStaysOnSurface`; host stages `Trellis2_UvAtlas_*`, `Trellis2_MeshSimplifier_*`, `Trellis2_PbrGlb_*`; model `Trellis2_ImageToGlb_EndToEnd` (HeavyModel). Opt-in ~10 GB weights. [trellis2.md](trellis2.md). (The old TripoSR page this route used to hold was a no-op.) |
 | `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — see [operators.md](operators.md)) |
 | `/pipelines` | Pipeline catalog | Meta | Status badges must match this doc |
 | `/getting-started` | Getting started | Doc | Install + first-run walkthrough |
@@ -69,6 +69,7 @@
 | ZipVoice (TTS clone) | ✅ | ✅ browser speak | `Pipeline_ZipVoice_SpeaksInTheBrowser`; demo `/tts` clone tab + OPFS voice save |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; superseded for demo by Kokoro/ZipVoice |
 | SD-Turbo | ✅ | ✅ E2E | `SDTurbo_Generate_E2E` + WebGPU multi-gen gates; `/generate` wired |
+| TRELLIS.2-4B (+ DINOv3 ViT-L/16) | ✅ (SafeTensors, streamed per stage) | ✅ E2E | Every network stage gated against the reference classes (CPU torch goldens, `tools/trellis2-harness`); `Trellis2_ImageToGlb_EndToEnd`; live in the browser `/text-to-3d` 2026-10-17. [trellis2.md](trellis2.md) |
 | GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | Autoregressive KV-cache decode verified on desktop; browser `/ai-chat` streams GGUF (manual confirm for full file-pick→generate) |
 
 ## Keeping this honest
