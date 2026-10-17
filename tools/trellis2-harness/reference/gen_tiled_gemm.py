@@ -24,10 +24,15 @@ LD = 132          # shared row stride (floats): 132 % 32 = 4 -> the transposed s
 out = []
 w = out.append
 
-def kernel(name, wtype, gather):
+def kernel(name, BK):
     # ONE kernel for all three variants (bf16 / f16 weights, dense / gathered rows), chosen by the uniform `mode` argument: on WebGPU each
     # kernel costs ~7 s of IL -> WGSL compile in the browser's interpreted .NET runtime plus a shader compile, MEASURED per variant.
-    w(f"    /// <summary>mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
+    NA = BM * BK // TH              # A floats per thread per k step
+    NB = BN * (BK // 2) // TH       # B words per thread per k step
+    sa = BK.bit_length() - 1
+    sb = (BK // 2).bit_length() - 1
+    tail = BK > 8                   # K is a multiple of 8, not necessarily of BK: the last step is masked
+    w(f"    /// <summary>k step {BK}. mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = {TH}, shared {2 * BK * LD * 4} bytes.</summary>")
     w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)")
     w("    {")
     w("        bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;")
@@ -37,17 +42,17 @@ def kernel(name, wtype, gather):
     w(f"        var As = SharedMemory.Allocate<float>({BK * LD});")
     w(f"        var Bs = SharedMemory.Allocate<float>({BK * LD});")
     w(f"        int mBase = tm * {BM}, nBase = tn * {BN};")
-    # A loads: 128 rows x 8 k = 1024 floats, 4 per thread; idx = tid + 256 r -> row = idx >> 3, kk = idx & 7
-    for r in range(4):
-        w(f"        int aRow{r} = ({r * TH} + tid) >> 3, aK{r} = ({r * TH} + tid) & 7, aM{r} = mBase + aRow{r};")
-    # B loads: 128 n x 4 words, 2 per thread; idx = tid + 256 r -> nrow = idx >> 2, kw = idx & 3
-    for r in range(2):
-        w(f"        int bRow{r} = ({r * TH} + tid) >> 2, bW{r} = ({r * TH} + tid) & 3, bN{r} = nBase + bRow{r};")
+    # A loads: 128 rows x BK k; idx = tid + 256 r -> row = idx >> log2(BK), kk = idx & (BK-1)
+    for r in range(NA):
+        w(f"        int aRow{r} = ({r * TH} + tid) >> {sa}, aK{r} = ({r * TH} + tid) & {BK - 1}, aM{r} = mBase + aRow{r};")
+    # B loads: 128 n x BK/2 words; idx = tid + 256 r -> nrow = idx >> log2(BK/2), kw = idx & (BK/2-1)
+    for r in range(NB):
+        w(f"        int bRow{r} = ({r * TH} + tid) >> {sb}, bW{r} = ({r * TH} + tid) & {BK // 2 - 1}, bN{r} = nBase + bRow{r};")
     # Row bases hoisted out of the k loop, in int: the host guarantees M*K, M*N, N*K < 2^31 (TiledGemm.Fits). (long) index math is
     # EMULATED on WebGPU (vec2<u32>): a 64-bit multiply + adds on every global load of every k step.
-    for r in range(4):
+    for r in range(NA):
         w(f"        int aOff{r} = aM{r} * K + aK{r};")
-    for r in range(2):
+    for r in range(NB):
         w(f"        int bOff{r} = ((bN{r} * K) >> 1) + bW{r};")
     for i in range(8):
         w("        float " + ", ".join(f"c{i}{j} = 0f" for j in range(8)) + ";")
@@ -57,28 +62,30 @@ def kernel(name, wtype, gather):
         sp = " " * indent
         lo, hi = ("F16Lo", "F16Hi") if f16v else ("Bf16Lo", "Bf16Hi")
         def loadA(r, k0):
+            kOk = f" && {k0} + aK{r} < K" if tail else ""
             if gatherv:
-                return f"aM{r} < M ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f"
-            return f"aM{r} < M ? A[aOff{r} + {k0}] : 0f"
+                return f"aM{r} < M{kOk} ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f"
+            return f"aM{r} < M{kOk} ? A[aOff{r} + {k0}] : 0f"
         def loadB(r, k0):
-            return f"bN{r} < N ? W[bOff{r} + ({k0} >> 1)] : 0u"
-        for r in range(4):
+            kOk = f" && {k0} + 2 * bW{r} < K" if tail else ""
+            return f"bN{r} < N{kOk} ? W[bOff{r} + ({k0} >> 1)] : 0u"
+        for r in range(NA):
             w(f"{sp}float pa{r} = {loadA(r, '0')};")
-        for r in range(2):
+        for r in range(NB):
             w(f"{sp}uint pb{r} = {loadB(r, '0')};")
         w(f"{sp}for (int k0 = 0; k0 < K; k0 += {BK})")
         w(f"{sp}{{")
-        for r in range(4):
+        for r in range(NA):
             w(f"{sp}    As[aK{r} * {LD} + aRow{r}] = pa{r};")
-        for r in range(2):
+        for r in range(NB):
             w(f"{sp}    Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r});")
         w(f"{sp}    Group.Barrier();")
         w(f"{sp}    int kn = k0 + {BK};")
         w(f"{sp}    if (kn < K)")
         w(f"{sp}    {{")
-        for r in range(4):
+        for r in range(NA):
             w(f"{sp}        pa{r} = {loadA(r, 'kn')};")
-        for r in range(2):
+        for r in range(NB):
             w(f"{sp}        pb{r} = {loadB(r, 'kn')};")
         w(f"{sp}    }}")
         w(f"{sp}    for (int kk = 0; kk < {BK}; kk++)")
@@ -132,7 +139,12 @@ w("")
 w("/// <summary>Portable register-tiled GEMM for every backend (see the generator for the layout).</summary>")
 w("internal static class TiledGemm")
 w("{")
+w(f"    /// <summary>BK: the k step and the multiple K must be.</summary>")
 w(f"    public const int BM = {BM}, BN = {BN}, BK = {BK}, Threads = {TH};")
+w("")
+w("    /// <summary>The GEMM kernel every caller loads (one place to choose a variant per accelerator). MEASURED: a k step of 16 (generator")
+w("    /// kernel(name, 16), 17 KB shared, masked k tail) was SLOWER than 8 on WebGPU (7.0-7.4 vs 7.6-8.2 TFLOPS) and on OpenCL.</summary>")
+w("    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> For(Accelerator accelerator) => Gemm;")
 w("")
 w("    /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>")
 w("    public static bool Fits(long M, long K, long N, long rowsA = -1) => M * K < int.MaxValue && M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue);")
@@ -159,7 +171,7 @@ w("        int src = nbr[m * 27 + tap];")
 w("        return src >= 0 ? A[src * cin + ci] : 0f;")
 w("    }")
 w("")
-kernel("Gemm", "any", None)
+kernel("Gemm", BK)
 w("}")
 
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")

@@ -104,7 +104,7 @@ public sealed class SparseKernels
     public Task PrecompileAsync()
     {
         if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web || !UseTiled(TiledGemm.BK)) return Task.CompletedTask;
-        return web.PrecompileAsync(TiledGemm.Gemm, new Index3D(TiledGemm.Threads, 1, 1));   // already started by DiTKernels: deduplicated
+        return web.PrecompileAsync(TiledGemm.For(_acc), new Index3D(TiledGemm.Threads, 1, 1));   // already started by DiTKernels: deduplicated
     }
 
     // single lookup, for kernels that probe the hash themselves
@@ -154,7 +154,7 @@ public sealed class SparseKernels
         }
         if (UseTiled(27 * cin) && TiledGemm.Fits(M, 27 * cin, cout, x.Length / cin))
         {
-            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
+            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
             _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
@@ -345,7 +345,7 @@ public sealed class SparseKernels
         }
         if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
-            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
+            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
             // a residual that IS the output is added in place (hasRes 2): WebGPU forbids binding one buffer to two slots

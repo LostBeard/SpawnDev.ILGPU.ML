@@ -65,7 +65,7 @@ public sealed class DiTKernels
         }
         if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
-            _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
+            _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
             _tiledBf16(new KernelConfig(tiles, TiledGemm.Threads), x, w.Cast<BFloat16, uint>(), bias.HasValue ? bias.Value.Cast<BFloat16, uint>() : _dummyU!.View,
@@ -439,7 +439,7 @@ public sealed class DiTKernels
         if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web) return;
         var g = new Index3D(TiledGemm.Threads, 1, 1);
         var tasks = new List<Task>();
-        if (UseTiled(TiledGemm.BK)) tasks.Add(Timed("Gemm", () => web.PrecompileAsync(TiledGemm.Gemm, g)));   // one kernel for all GEMM variants (SparseKernels uses it too)
+        if (UseTiled(TiledGemm.BK)) tasks.Add(Timed("Gemm", () => web.PrecompileAsync(TiledGemm.For(_acc), g)));   // one kernel for all GEMM variants (SparseKernels uses it too)
         await Task.Yield();                                  // let I/O continuations run between the (synchronous) IL compiles
         foreach (var (key, self) in new[] { (1, true), (0, false), (3, true) })
         {

@@ -11,7 +11,12 @@ using IV = ArrayView1D<int, Stride1D.Dense>;
 /// <summary>Portable register-tiled GEMM for every backend (see the generator for the layout).</summary>
 internal static class TiledGemm
 {
+    /// <summary>BK: the k step and the multiple K must be.</summary>
     public const int BM = 128, BN = 128, BK = 8, Threads = 256;
+
+    /// <summary>The GEMM kernel every caller loads (one place to choose a variant per accelerator). MEASURED: a k step of 16 (generator
+    /// kernel(name, 16), 17 KB shared, masked k tail) was SLOWER than 8 on WebGPU (7.0-7.4 vs 7.6-8.2 TFLOPS) and on OpenCL.</summary>
+    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> For(Accelerator accelerator) => Gemm;
 
     /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>
     public static bool Fits(long M, long K, long N, long rowsA = -1) => M * K < int.MaxValue && M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue);
@@ -38,7 +43,7 @@ internal static class TiledGemm
         return src >= 0 ? A[src * cin + ci] : 0f;
     }
 
-    /// <summary>mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = 256.</summary>
+    /// <summary>k step 8. mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = 256, shared 8448 bytes.</summary>
     public static void Gemm(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)
     {
         bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;

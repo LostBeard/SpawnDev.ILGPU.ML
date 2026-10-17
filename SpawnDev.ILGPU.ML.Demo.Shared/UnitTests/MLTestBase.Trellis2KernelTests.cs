@@ -236,7 +236,7 @@ public abstract partial class MLTestBase
             global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = (name, src, e) => { prevHook?.Invoke(name, src, e); sizes[name] = src.Length; };
         try {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var gemm = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int, int>(TiledGemm.Gemm);
+        var gemm = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int, int>(TiledGemm.For(accelerator));
         double load = sw.Elapsed.TotalMilliseconds; sw.Restart();
         var cfg = new KernelConfig(4, TiledGemm.Threads);
         gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0, TiledGemm.ModeBf16); await accelerator.SynchronizeAsync();
