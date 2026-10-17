@@ -24,6 +24,8 @@ return command switch
     "attn" => Golden.Attention(),
     "sampler" => Golden.Sampler(),
     "decoders" => Golden.Decoders(),
+    "dualgrid" => Golden.DualGrid(),
+    "ssdec" => Golden.SsDecoder(),
     "slat" => Golden.SlatFlow(args.Length > 1 ? args[1] : "shape"),
     _ => Usage(command),
 };

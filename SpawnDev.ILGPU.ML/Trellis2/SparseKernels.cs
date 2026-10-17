@@ -65,24 +65,53 @@ public sealed class SparseKernels
     private Action<Index1D, IV>? _fillMinus1;
     private static void FillMinus1Impl(Index1D i, IV v) => v[i] = -1;
 
+    /// <summary>An open-addressing voxel hash (key = (x*grid + y)*grid + z, value = voxel index) living on the device.</summary>
+    public sealed class VoxelHash : IDisposable
+    {
+        internal MemoryBuffer1D<int, Stride1D.Dense> Keys = null!, Vals = null!;
+        internal int Grid, Mask, Shift;
+        public void Dispose() { Keys?.Dispose(); Vals?.Dispose(); }
+    }
+
+    /// <summary>Build the hash of <paramref name="n"/> voxels on a <paramref name="grid"/>^3 lattice (grid^3 must fit an int).</summary>
+    public VoxelHash BuildHash(IV coords, int n, int grid)
+    {
+        _hashInsert ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int, int, int>(HashInsertImpl);
+        _fillMinus1 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV>(FillMinus1Impl);
+        if ((long)grid * grid * grid >= int.MaxValue) throw new ArgumentOutOfRangeException(nameof(grid), "grid^3 must fit an int key");
+        int cap = 64, bits = 6;
+        while (cap < 2L * n) { cap <<= 1; bits++; }
+        var h = new VoxelHash { Keys = _acc.Allocate1D<int>(cap), Vals = _acc.Allocate1D<int>(cap), Grid = grid, Mask = cap - 1, Shift = 32 - bits };
+        _fillMinus1(cap, h.Keys.View);
+        _hashInsert(n, coords, h.Keys.View, h.Vals.View, grid, h.Mask, h.Shift);
+        return h;
+    }
+
     /// <summary>
     /// Build the 27-neighbour table for <paramref name="n"/> voxels on a <paramref name="grid"/>^3 lattice
     /// (grid^3 must fit an int: grid &lt;= 1290). <paramref name="nbr"/> holds n*27 ints.
     /// </summary>
     public void BuildNeighbors(IV coords, int n, int grid, IV nbr)
     {
-        _hashInsert ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int, int, int>(HashInsertImpl);
         _hashNeighbors ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV, int, int, int>(HashNeighborsImpl);
-        _fillMinus1 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV>(FillMinus1Impl);
-        if ((long)grid * grid * grid >= int.MaxValue) throw new ArgumentOutOfRangeException(nameof(grid), "grid^3 must fit an int key");
-        int cap = 64, bits = 6;
-        while (cap < 2L * n) { cap <<= 1; bits++; }
-        using var keys = _acc.Allocate1D<int>(cap);
-        using var vals = _acc.Allocate1D<int>(cap);
-        _fillMinus1(cap, keys.View);
-        _hashInsert(n, coords, keys.View, vals.View, grid, cap - 1, 32 - bits);
-        _hashNeighbors(n * 27, coords, keys.View, vals.View, nbr, grid, cap - 1, 32 - bits);
-        _acc.Synchronize();   // keys / vals are freed on return
+        using var h = BuildHash(coords, n, grid);
+        _hashNeighbors(n * 27, coords, h.Keys.View, h.Vals.View, nbr, grid, h.Mask, h.Shift);
+        _acc.Synchronize();   // the hash is freed on return
+    }
+
+    // single lookup, for kernels that probe the hash themselves
+    internal static int Lookup(IV keys, IV vals, int x, int y, int z, int grid, int mask, int shift)
+    {
+        if (x < 0 || x >= grid || y < 0 || y >= grid || z < 0 || z >= grid) return -1;
+        int key = (x * grid + y) * grid + z;
+        int slot = (int)(((uint)key * 2654435761u) >> shift);
+        while (true)
+        {
+            int k = keys[slot];
+            if (k == key) return vals[slot];
+            if (k == -1) return -1;
+            slot = (slot + 1) & mask;
+        }
     }
 
     // =====================================================================================================
@@ -117,6 +146,140 @@ public sealed class SparseKernels
         }
         _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvImpl);
         _naiveConv(M * cout, x, weight, bias, o, nbr, M, cin, cout, 1);
+    }
+
+    // fp32-weight convolution (naive): the few convolutions whose checkpoint tensors are fp32 and tiny (SS decoder input / output)
+    private Action<Index1D, FV, FV, FV, FV, IV, int, int, int>? _naiveConvF32;
+    private static void NaiveConvF32Impl(Index1D idx, FV x, FV w, FV bias, FV o, IV nbr, int M, int cin, int cout)
+    {
+        int m = idx / cout, n = idx % cout;
+        float acc = bias[n];
+        for (int kk = 0; kk < 27; kk++)
+        {
+            int src = nbr[m * 27 + kk];
+            if (src < 0) continue;
+            long xb = (long)src * cin, wb = ((long)n * 27 + kk) * cin;
+            for (int c = 0; c < cin; c++) acc += x[xb + c] * w[wb + c];
+        }
+        o[idx] = acc;
+    }
+    /// <summary>x [M, cin] -> o [M, cout] with fp32 weight [cout][27][cin] and fp32 bias.</summary>
+    public void Conv3F32(FV x, IV nbr, FV weight, FV bias, FV o, int M, int cin, int cout)
+    {
+        _naiveConvF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, int, int, int>(NaiveConvF32Impl);
+        _naiveConvF32(M * cout, x, weight, bias, o, nbr, M, cin, cout);
+    }
+
+    // torch Conv3d weight [Co][Ci][27] (kernel index a0*9 + a1*3 + a2) -> the gather layout [Co][27][Ci]
+    private Action<Index1D, HV, HV, int, int>? _permuteF16;
+    private static void PermuteF16Impl(Index1D idx, HV src, HV dst, int cin, int cout)
+    {
+        int ci = idx % cin, kk = idx / cin % 27, co = idx / (cin * 27);
+        dst[idx] = src[((long)co * cin + ci) * 27 + kk];
+    }
+    private Action<Index1D, FV, FV, int, int>? _permuteF32;
+    private static void PermuteF32Impl(Index1D idx, FV src, FV dst, int cin, int cout)
+    {
+        int ci = idx % cin, kk = idx / cin % 27, co = idx / (cin * 27);
+        dst[idx] = src[((long)co * cin + ci) * 27 + kk];
+    }
+    public void PermuteConvWeight(HV src, HV dst, int cin, int cout)
+    {
+        _permuteF16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, int, int>(PermuteF16Impl);
+        _permuteF16(cout * 27 * cin, src, dst, cin, cout);
+    }
+    public void PermuteConvWeight(FV src, FV dst, int cin, int cout)
+    {
+        _permuteF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(PermuteF32Impl);
+        _permuteF32(cout * 27 * cin, src, dst, cin, cout);
+    }
+
+    // LayerNorm with fp32 affine parameters
+    private Action<Index1D, FV, FV, FV, FV, int, float>? _layerNormF32;
+    private static void LayerNormF32Impl(Index1D m, FV x, FV o, FV gamma, FV beta, int C, float eps)
+    {
+        long b = (long)(int)m * C;
+        float mean = 0f;
+        for (int c = 0; c < C; c++) mean += x[b + c];
+        mean /= C;
+        float var = 0f;
+        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var += d * d; }
+        float rstd = 1f / MathF.Sqrt(var / C + eps);
+        for (int c = 0; c < C; c++) o[b + c] = (x[b + c] - mean) * rstd * gamma[c] + beta[c];
+    }
+    public void LayerNormF32(FV x, FV o, FV gamma, FV beta, int rows, int C, float eps)
+    {
+        _layerNormF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, float>(LayerNormF32Impl);
+        _layerNormF32(rows, x, o, gamma, beta, C, eps);
+    }
+
+    // pixel_shuffle_3d on tokens: src [G^3, 8*cc] (channel c*8 + i*4 + j*2 + k) -> dst [(2G)^3, cc], cell (2x+i, 2y+j, 2z+k)
+    private Action<Index1D, FV, FV, int, int>? _pixelShuffle;
+    private static void PixelShuffleImpl(Index1D idx, FV src, FV dst, int g, int cc)
+    {
+        int c = idx % cc, t = idx / cc;
+        int g2 = g * 2;
+        int z2 = t % g2, y2 = t / g2 % g2, x2 = t / (g2 * g2);
+        int n = ((x2 >> 1) * g + (y2 >> 1)) * g + (z2 >> 1);
+        int sub = (x2 & 1) * 4 + (y2 & 1) * 2 + (z2 & 1);
+        dst[idx] = src[(long)n * 8 * cc + c * 8 + sub];
+    }
+    public void PixelShuffle3d(FV src, FV dst, int g, int cc)
+    {
+        _pixelShuffle ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(PixelShuffleImpl);
+        _pixelShuffle(8 * g * g * g * cc, src, dst, g, cc);
+    }
+
+    // occupancy: logits > 0, optional 2x max-pool, argwhere (x slowest)
+    private Action<Index1D, FV, IV>? _flag;
+    private static void FlagImpl(Index1D i, FV logits, IV flag) => flag[i] = logits[i] > 0f ? 1 : 0;
+    private Action<Index1D, IV, IV, int>? _maxPool2;
+    private static void MaxPool2Impl(Index1D i, IV src, IV dst, int g)
+    {
+        int h = g / 2;
+        int z = i % h, y = i / h % h, x = i / (h * h);
+        int any = 0;
+        for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) for (int c = 0; c < 2; c++)
+            any |= src[((2 * x + a) * g + 2 * y + b) * g + 2 * z + c];
+        dst[i] = any;
+    }
+    private Action<Index1D, IV, IV, IV, int>? _argwhere;
+    private static void ArgwhereImpl(Index1D i, IV flag, IV offsets, IV coords, int g)
+    {
+        if (flag[i] == 0) return;
+        int o = offsets[i];
+        coords[o * 3] = i / (g * g); coords[o * 3 + 1] = i / g % g; coords[o * 3 + 2] = i % g;
+    }
+
+    /// <summary>
+    /// Occupied cells of <paramref name="logits"/> (a [grid^3] volume, 1 channel): logit &gt; 0; when <paramref name="outGrid"/> is half of
+    /// <paramref name="grid"/> the volume is first max-pooled 2x (any child set). Returns the coordinates [count, 3] in x-slowest order
+    /// (torch.argwhere); the caller disposes the buffer.
+    /// </summary>
+    public MemoryBuffer1D<int, Stride1D.Dense> Occupancy(FV logits, int grid, int outGrid, out int count)
+    {
+        _flag ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV>(FlagImpl);
+        _maxPool2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(MaxPool2Impl);
+        _argwhere ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int>(ArgwhereImpl);
+        if (outGrid != grid && outGrid * 2 != grid) throw new ArgumentException("outGrid must equal grid or grid / 2");
+        using var flag = _acc.Allocate1D<int>((long)grid * grid * grid);
+        _flag(grid * grid * grid, logits, flag.View);
+        MemoryBuffer1D<int, Stride1D.Dense>? pooled = null;
+        var cells = flag.View;
+        if (outGrid != grid)
+        {
+            pooled = _acc.Allocate1D<int>((long)outGrid * outGrid * outGrid);
+            _maxPool2(outGrid * outGrid * outGrid, flag.View, pooled.View, grid);
+            cells = pooled.View;
+        }
+        int n = outGrid * outGrid * outGrid;
+        using var offsets = _acc.Allocate1D<int>(n + 1);
+        count = ExclusiveScan(cells, n, offsets.View);
+        var coords = _acc.Allocate1D<int>(Math.Max(1L, (long)count * 3));
+        _argwhere(n, cells, offsets.View, coords.View, outGrid);
+        _acc.Synchronize();
+        pooled?.Dispose();
+        return coords;
     }
 
     // =====================================================================================================
@@ -222,6 +385,17 @@ public sealed class SparseKernels
                 o++;
             }
         }
+    }
+
+    /// <summary>Exclusive prefix sum of <paramref name="counts"/> (n ints) into <paramref name="offsets"/> (n+1 ints); returns the total.</summary>
+    public int ExclusiveScan(IV counts, int n, IV offsets)
+    {
+        _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
+        _serialScan(1, counts, offsets, n);
+        _acc.Synchronize();
+        var total = new int[1];
+        offsets.SubView(n, 1).CopyToCPU(total);        // one scalar: sizes the output buffers
+        return total[0];
     }
 
     /// <summary>Per-voxel child offsets (n+1 entries; the last is the total) from the subdivision logits.</summary>

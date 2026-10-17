@@ -14,6 +14,7 @@ public sealed class GpuWeights : IDisposable
 {
     private readonly Dictionary<string, MemoryBuffer1D<BFloat16, Stride1D.Dense>> _bf16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _f16 = new();
+    private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _f32 = new();
     private readonly Dictionary<string, int[]> _shapes = new();
 
     /// <summary>The model's JSON config (<c>args</c> object of the checkpoint's sibling .json).</summary>
@@ -42,8 +43,10 @@ public sealed class GpuWeights : IDisposable
                         { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; reader.Upload(t, b.View); break; }
                     case "F16":
                         { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; reader.Upload(t, b.View); break; }
+                    case "F32":
+                        { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; reader.Upload(t, b.View); break; }
                     default:
-                        throw new NotSupportedException($"'{basePath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16 native only");
+                        throw new NotSupportedException($"'{basePath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
                 }
                 w._shapes[t.Name] = t.Shape;
             }
@@ -67,13 +70,21 @@ public sealed class GpuWeights : IDisposable
     public ArrayView1D<global::ILGPU.Half, Stride1D.Dense> F16(string name)
         => _f16.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"fp16 weight '{name}' not loaded");
 
+    public ArrayView1D<float, Stride1D.Dense> F32(string name)
+        => _f32.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"fp32 weight '{name}' not loaded");
+
+    /// <summary>True when the tensor was stored (and is held) as fp32.</summary>
+    public bool IsF32(string name) => _f32.ContainsKey(name);
+    public bool IsF16(string name) => _f16.ContainsKey(name);
+
     /// <summary>Total device bytes held.</summary>
-    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L);
+    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L);
 
     public void Dispose()
     {
         foreach (var b in _bf16.Values) b.Dispose();
         foreach (var b in _f16.Values) b.Dispose();
-        _bf16.Clear(); _f16.Clear(); _shapes.Clear();
+        foreach (var b in _f32.Values) b.Dispose();
+        _bf16.Clear(); _f16.Clear(); _f32.Clear(); _shapes.Clear();
     }
 }

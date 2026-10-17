@@ -239,6 +239,54 @@ internal static class Golden
         return ok ? 0 : 1;
     }
 
+    /// <summary>Dual-grid mesh extraction on the GOLDEN shape decoder output vs the reference's own algorithm (reference/golden_dualgrid.py).</summary>
+    public static int DualGrid()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "decoders"), outDir = Path.Combine(Gpu.WeightDir, "golden", "dualgrid");
+        if (!Directory.Exists(outDir)) { Console.WriteLine($"no golden at {outDir}; run reference/golden_dualgrid.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        var h = ReadF32(Path.Combine(dir, "shape_out.f32"));
+        var coords = ReadI32(Path.Combine(dir, "shape_out_coords.i32"));
+        int n = coords.Length / 3;
+        using var hb = accel.Allocate1D(h); using var cb = accel.Allocate1D(coords);
+        var mesher = new DualGridMesher(accel, new SparseKernels(accel));
+        using var mesh = mesher.Extract(hb.View, cb.View, n, 512);
+        Console.WriteLine($"mesh: {mesh.VertexCount} vertices, {mesh.FaceCount} triangles");
+        bool ok = Compare("vertices", ReadF32(Path.Combine(outDir, "vertices.f32")), mesh.Vertices.GetAsArray1D(), 1e-6);
+        ok &= CompareInts("faces", ReadI32(Path.Combine(outDir, "faces.i32")), mesh.Faces.View.SubView(0, (long)mesh.FaceCount * 3).GetAsArray1D());
+        Console.WriteLine(ok ? "DUALGRID PASS" : "DUALGRID FAIL");
+        return ok ? 0 : 1;
+    }
+
+    /// <summary>The dense sparse-structure decoder + occupancy extraction against the real SparseStructureDecoder (reference/golden_ssdec.py).</summary>
+    public static int SsDecoder()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "ssdec");
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_ssdec.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        bool mma = DiTKernels.EnableTensorCores && accel.AcceleratorType == AcceleratorType.Cuda;
+        double tol = mma ? 1e-2 : 1e-4;
+        using var weights = GpuWeights.Load(accel, Path.Combine(Gpu.WeightDir, "TRELLIS-image-large", "ckpts", "ss_dec_conv3d_16l8_fp16"));
+        var dk = new DiTKernels(accel); var sk = new SparseKernels(accel);
+        using var dec = new SparseStructureDecoder(accel, sk, dk, weights);
+        var z = ReadF32(Path.Combine(dir, "latent.f32"));
+        using var zb = accel.Allocate1D(z);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var logits = dec.Decode(zb.View, 16);
+        Console.WriteLine($"decode {sw.Elapsed.TotalSeconds:F2}s ({(mma ? "fp16 tensor cores" : "fp32 kernels")}), tolerance relRMS {tol:E1}");
+        var want = ReadF32(Path.Combine(dir, "logits.f32"));
+        bool ok = Compare("ss logits", want, logits.GetAsArray1D(), tol);
+        using var coords = sk.Occupancy(logits.View, 64, 32, out int count);
+        var wantCoords = ReadI32(Path.Combine(dir, "coords32.i32"));
+        Console.WriteLine($"occupancy: {count} voxels at 32^3 (reference {wantCoords.Length / 3})");
+        if (!mma) ok &= CompareInts("occupancy coords", wantCoords, coords.View.SubView(0, (long)count * 3).GetAsArray1D());
+        else ok &= Math.Abs(count - wantCoords.Length / 3) <= Math.Max(2, wantCoords.Length / 3 / 50);
+        Console.WriteLine(ok ? "SSDEC PASS" : "SSDEC FAIL");
+        return ok ? 0 : 1;
+    }
+
     public static int SsFlow()
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");
