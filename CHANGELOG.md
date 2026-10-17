@@ -3,6 +3,21 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.12 - 2026-10-17 - SentencePiece add_space_prefix (Gemma multi-turn chat fixed)
+
+Requires SpawnDev.ILGPU 5.3.8.
+
+- **`SentencePieceTokenizer.AddSpacePrefix`**, set from the GGUF key `tokenizer.ggml.add_space_prefix` (absent = true, the llama
+  default). The tokenizer always prepended the dummy "▁"; Gemma 2/3 declare false. Chat templates encode each segment separately,
+  so the prefix put a stray space token before every "\n" after `<end_of_turn>` and turned "user"/"model" into "▁user"/"▁model":
+  the first reply looked fine, later turns ignored the question. MEASURED (gemma-3-270m-it Q8_0, CUDA, greedy): two-turn prompt
+  40 -> 37 tokens; turn 2 "What is the capital of France?" went from "Hello! I'm happy to help. What would you like me to do?"
+  to "The capital of France is Paris."; both turns now match Ollama 0.34.4 `gemma3:270m` exactly. Test
+  `SentencePiece_AddSpacePrefix_FollowsTheModel`.
+- Demo `/ai-chat`: the Gemma 3 270M entry is the instruction-tuned build (`ggml-org/gemma-3-270m-it-GGUF`); it pointed at the base
+  model, which continues a chat as plain text.
+
+
 ## 5.3.11 - 2026-10-17 - image and text to 3D (TRELLIS.2) on the desktop and in the browser, face detection and recognition
 
 Requires SpawnDev.ILGPU 5.3.8.
