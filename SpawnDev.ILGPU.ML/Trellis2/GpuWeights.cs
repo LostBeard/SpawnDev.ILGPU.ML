@@ -45,8 +45,10 @@ public sealed class GpuWeights : IDisposable
         try
         {
             using var reader = SafeTensorsFileReader.Open(safetensorsPath);
+            var prof = Environment.GetEnvironmentVariable("TRELLIS2_PROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew(); double tAlloc = 0, tUp = 0;
             foreach (var t in reader.Tensors)
             {
+                if (prof) psw.Restart();
                 if (filter != null && !filter(t.Name)) continue;
                 long n = SafeTensorsFileReader.ElementCount(t);
                 switch (t.DType)
@@ -61,7 +63,9 @@ public sealed class GpuWeights : IDisposable
                         throw new NotSupportedException($"'{safetensorsPath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
                 }
                 w._shapes[t.Name] = t.Shape;
+                if (prof) tUp += psw.Elapsed.TotalSeconds;
             }
+            if (prof) Console.WriteLine($"  [weights] {Path.GetFileName(safetensorsPath)} alloc+upload {tUp:F2}s (read {SafeTensorsFileReader.ReadTicks / (double)System.Diagnostics.Stopwatch.Frequency:F2}s, copy {SafeTensorsFileReader.CopyTicks / (double)System.Diagnostics.Stopwatch.Frequency:F2}s cumulative)");
             accelerator.Synchronize();
             return w;
         }

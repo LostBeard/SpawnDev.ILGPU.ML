@@ -127,6 +127,9 @@ public sealed class SafeTensorsFileReader : IDisposable
     /// type must have the same byte width as the stored dtype; this is a byte-exact upload (bf16 stays bf16),
     /// never a conversion, so a bf16 weight lands as <c>ILGPU.BFloat16</c> and an fp16 one as <c>ILGPU.Half</c>.
     /// </summary>
+    /// <summary>Profiling: cumulative stopwatch ticks spent reading the file and copying to the device.</summary>
+    public static long ReadTicks, CopyTicks;
+
     public void Upload<T>(SafeTensorInfo t, ArrayView1D<T, Stride1D.Dense> destination,
         int chunkBytes = 32 * 1024 * 1024, CancellationToken cancellationToken = default)
         where T : unmanaged
@@ -143,9 +146,12 @@ public sealed class SafeTensorsFileReader : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             int n = (int)Math.Min(staging.Length, count - done);
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             ReadBytes(t, done * elemBytes, System.Runtime.InteropServices.MemoryMarshal.AsBytes(staging.AsSpan(0, n)));
+            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
             // CopyFromCPU is an immediate write (no pending-dispatch dependency), see CLAUDE.md batching rules.
             destination.SubView(done, n).CopyFromCPU(n == staging.Length ? staging : staging[..n]);
+            ReadTicks += t1 - t0; CopyTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
         }
     }
 

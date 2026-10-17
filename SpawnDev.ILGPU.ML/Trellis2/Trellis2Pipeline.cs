@@ -65,6 +65,42 @@ public sealed class Trellis2Pipeline : IDisposable
         _texMean = Arr("tex_slat_normalization", "mean"); _texStd = Arr("tex_slat_normalization", "std");
     }
 
+    private Task _prefetch = Task.CompletedTask;
+
+    private string Ckpt(string name) => Path.Combine(_ckpts, name + ".safetensors");
+    private string SsFlowFile => Ckpt("ss_flow_img_dit_1_3B_64_bf16");
+    private string SsDecFile => _ssDecoderBase + ".safetensors";
+
+    /// <summary>
+    /// Read checkpoint files on a background thread, queued behind earlier requests, so they are in the operating system's file cache by the time
+    /// a stage uploads them (measured: a cold read of the 2.4 GB flow checkpoint is ~2.5 s, a cached one ~0.3 s). Host file reads only: no device
+    /// work, no memory kept. The pipeline asks for each stage's files one stage ahead, not all at once: the checkpoints add up to more than the
+    /// free RAM of a small machine, and files read too early are evicted before they are used. <see cref="Run512"/> asks for the first stage itself;
+    /// a caller with time before it (the image features) can call this with the first file earlier.
+    /// </summary>
+    public void PrefetchWeights(params string[] files)
+    {
+        var list = files.Length > 0 ? files : new[] { SsFlowFile };
+        var previous = _prefetch;
+        _prefetch = Task.Run(() =>
+        {
+            try { previous.Wait(); } catch { }
+            var buf = new byte[8 << 20]; var psw = Stopwatch.StartNew();
+            foreach (var f in list)
+            {
+                if (Environment.GetEnvironmentVariable("TRELLIS2_PREFETCH_LOG") == "1") Console.WriteLine($"  [prefetch] {Path.GetFileName(f)} at {psw.Elapsed.TotalSeconds:F1}s");
+                try
+                {
+                    // not SequentialScan: Windows drops those pages from the cache right behind the read pointer
+                    using var fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
+                    while (fs.Read(buf, 0, buf.Length) > 0) { }
+                }
+                catch (IOException) { }                      // a missing file surfaces with its real error when the stage opens it
+                catch (UnauthorizedAccessException) { }
+            }
+        });
+    }
+
     // ---- small kernels ----------------------------------------------------------------------------------
     private Action<Index1D, FV, FV, FV, FV, int>? _affine;
     private static void AffineImpl(Index1D i, FV x, FV mean, FV std, FV o, int c) => o[i] = x[i] * std[i % c] + mean[i % c];
@@ -102,6 +138,7 @@ public sealed class Trellis2Pipeline : IDisposable
         int n0;
         {
             using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "ss_flow_img_dit_1_3B_64_bf16"));
+            Stage("ss flow weights", sw);
             using var flow = new SparseStructureFlow(_acc, _dk, w);
             int cells = flow.Resolution * flow.Resolution * flow.Resolution, count = flow.InChannels * cells;
             using var x = _acc.Allocate1D<float>(count);
@@ -114,6 +151,7 @@ public sealed class Trellis2Pipeline : IDisposable
                 Dump("noise.f32", x.View, count); Dump("cond.f32", cond, condTokens * 1024);
             }
             Stage("ss flow load", sw);
+            PrefetchWeights(SsDecFile, Ckpt("slat_flow_img2shape_dit_1_3B_512_bf16"), Ckpt("shape_dec_next_dc_f16c32_fp16"));
             _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), x.View, count, _ssOpts);
             Stage("ss flow sample", sw);
             if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
@@ -144,12 +182,14 @@ public sealed class Trellis2Pipeline : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> shapeSlat;       // the sampler output (normalised space): conditions the texture flow
         {
             using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_img2shape_dit_1_3B_512_bf16"));
+            Stage("shape flow weights", sw);
             using var dit = new FlowDiT(_acc, _dk, w);
             dit.SetTokens(coords32.View, n0);
             int ch = dit.OutChannels, count = n0 * ch;
             shapeSlat = _acc.Allocate1D<float>(count);
             _sampler.Randn(shapeSlat.View, count, (ulong)seed * 7919UL + 2);
             Stage("shape flow load", sw);
+            PrefetchWeights(Ckpt("slat_flow_imgshape2tex_dit_1_3B_512_bf16"), Ckpt("tex_dec_next_dc_f16c32_fp16"));
             _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
             Stage("shape flow sample", sw);
         }

@@ -34,7 +34,8 @@ internal static class GenerateRun
         using var _c = ctx; using var _a = accel;
         long baseline = Used(), peak = baseline;
         using var cts = new CancellationTokenSource();
-        var poll = Task.Run(async () => { while (!cts.IsCancellationRequested) { peak = Math.Max(peak, Used()); try { await Task.Delay(500, cts.Token); } catch { } } });
+        bool noPoll = Environment.GetEnvironmentVariable("TRELLIS2_NOPEAK") == "1";   // the nvidia-smi polling itself slows the driver calls it measures
+        var poll = Task.Run(async () => { while (!noPoll && !cts.IsCancellationRequested) { peak = Math.Max(peak, Used()); try { await Task.Delay(500, cts.Token); } catch { } } });
 
         var total = Stopwatch.StartNew();
         bool opaque = px.All(v => ((v >> 24) & 255) == 255);

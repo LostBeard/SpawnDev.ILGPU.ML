@@ -31,11 +31,12 @@ internal static class LoadBench
             double secCopy = sw.Elapsed.TotalSeconds;
             Console.WriteLine($"rep {rep}: read {read / 1048576.0 / secRead:F0} MiB/s ({secRead:F2}s)   copy pageable {total / 1048576.0 / secCopy:F0} MiB/s ({secCopy:F2}s)");
         }
+        for (int rep = 0; rep < 3; rep++)
         {
             var sw = Stopwatch.StartNew();
             using var w = GpuWeights.LoadFile(accel, path);
             accel.Synchronize();
-            Console.WriteLine($"GpuWeights.LoadFile {sw.Elapsed.TotalSeconds:F2}s");
+            Console.WriteLine($"GpuWeights.LoadFile #{rep} {sw.Elapsed.TotalSeconds:F2}s");
         }
         return 0;
     }

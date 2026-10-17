@@ -67,6 +67,9 @@ public sealed class Trellis2ImageTo3D : IDisposable
     {
         options ??= new Trellis2Options();
         var sw = Stopwatch.StartNew();
+        pipeline = new Trellis2Pipeline(_acc, _paths.ModelDir, _paths.SparseStructureDecoder) { StageDone = StageDone };
+        pipeline.PrefetchWeights(_paths.DinoWeights);       // the disk reads overlap the image preparation and the feature extraction
+        pipeline.PrefetchWeights();                          // then the first flow checkpoint
         using var image = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 512);
         StageDone?.Invoke("image prep", sw.Elapsed.TotalSeconds); sw.Restart();
 
@@ -79,7 +82,6 @@ public sealed class Trellis2ImageTo3D : IDisposable
         }
         StageDone?.Invoke("dinov3 features", sw.Elapsed.TotalSeconds);
 
-        pipeline = new Trellis2Pipeline(_acc, _paths.ModelDir, _paths.SparseStructureDecoder) { StageDone = StageDone };
         return pipeline.Run512(cond.View, tokens, options.Seed);
     }
 
