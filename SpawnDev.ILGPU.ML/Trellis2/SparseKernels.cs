@@ -334,8 +334,42 @@ public sealed class SparseKernels
             o[b + c] = v;
         }
     }
+    // group-per-row form (256 threads, two block reductions); the thread-per-row kernel above remains for the CPU accelerator
+    private const int NormGroup = 256;
+    private Action<KernelConfig, FV, FV, HV, HV, int, int, float>? _layerNormGroup;
+    private static void LayerNormGroupImpl(FV x, FV o, HV gamma, HV beta, int C, int affine, float eps)
+    {
+        int row = Grid.IdxX, t = Group.IdxX;
+        long b = (long)row * C;
+        var sh = SharedMemory.Allocate<float>(NormGroup);
+        float s = 0f;
+        for (int c = t; c < C; c += NormGroup) s += x[b + c];
+        sh[t] = s;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float mean = sh[0] / C;
+        Group.Barrier();
+        float q = 0f;
+        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q += d * d; }
+        sh[t] = q;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float rstd = 1f / MathF.Sqrt(sh[0] / C + eps);
+        for (int c = t; c < C; c += NormGroup)
+        {
+            float v = (x[b + c] - mean) * rstd;
+            if (affine != 0) v = v * PrecisionConvert.ConvertToSingle(gamma[c]) + PrecisionConvert.ConvertToSingle(beta[c]);
+            o[b + c] = v;
+        }
+    }
     public void LayerNorm(FV x, FV o, HV? gamma, HV? beta, int rows, int C, float eps)
     {
+        if (_acc.MaxGroupSize.X >= NormGroup)
+        {
+            _layerNormGroup ??= _acc.LoadStreamKernel<FV, FV, HV, HV, int, int, float>(LayerNormGroupImpl);
+            _layerNormGroup(new KernelConfig(rows, NormGroup), x, o, gamma ?? default, beta ?? default, C, gamma.HasValue ? 1 : 0, eps);
+            return;
+        }
         _layerNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, HV, HV, int, int, float>(LayerNormImpl);
         _layerNorm(rows, x, o, gamma ?? default, beta ?? default, C, gamma.HasValue ? 1 : 0, eps);
     }

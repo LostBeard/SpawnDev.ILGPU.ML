@@ -125,8 +125,45 @@ public sealed class DiTKernels
         }
     }
 
+    // One 256-thread group per row (rows are 1536 wide): two block reductions (mean, then variance of the centred values), then the
+    // elementwise part. The one-thread-per-row form above is kept for backends whose groups cannot be 256 wide (the CPU accelerator).
+    private const int NormGroup = 256;
+    private Action<KernelConfig, FV, FV, FV, BV, BV, int, int, int, int, float>? _layerNormGroup;
+    private static void LayerNormGroupImpl(FV x, FV o, FV mod, BV gamma, BV beta, int C, int mode, int shiftOff, int scaleOff, float eps)
+    {
+        int row = Grid.IdxX, t = Group.IdxX;
+        long b = (long)row * C;
+        var sh = SharedMemory.Allocate<float>(NormGroup);
+        float s = 0f;
+        for (int c = t; c < C; c += NormGroup) s += x[b + c];
+        sh[t] = s;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float mean = sh[0] / C;
+        Group.Barrier();
+        float q = 0f;
+        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q += d * d; }
+        sh[t] = q;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float rstd = 1f / MathF.Sqrt(sh[0] / C + eps);
+        for (int c = t; c < C; c += NormGroup)
+        {
+            float v = (x[b + c] - mean) * rstd;
+            if (mode == 1) v = v * (1f + mod[scaleOff + c]) + mod[shiftOff + c];
+            else if (mode == 2) v = v * PrecisionConvert.ConvertToSingle(gamma[c]) + PrecisionConvert.ConvertToSingle(beta[c]);
+            o[b + c] = v;
+        }
+    }
+
     private void LayerNormCore(FV x, FV o, FV mod, BV gamma, BV beta, int rows, int C, int mode, int shiftOff, int scaleOff, float eps)
     {
+        if (_acc.MaxGroupSize.X >= NormGroup)
+        {
+            _layerNormGroup ??= _acc.LoadStreamKernel<FV, FV, FV, BV, BV, int, int, int, int, float>(LayerNormGroupImpl);
+            _layerNormGroup(new KernelConfig(rows, NormGroup), x, o, mod, gamma, beta, C, mode, shiftOff, scaleOff, eps);
+            return;
+        }
         _layerNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, BV, BV, int, int, int, int, float>(LayerNormImpl);
         _layerNorm(rows, x, o, mod, gamma, beta, C, mode, shiftOff, scaleOff, eps);
     }
@@ -189,8 +226,47 @@ public sealed class DiTKernels
             buf[b + 2 * p + 1] = x1;
         }
     }
+    // One 32-lane warp per (token, head) vector: the lanes split the D/2 pairs, the sum of squares is a shuffle reduction.
+    private Action<KernelConfig, FV, BV, FV, int, int, int, int, int>? _headNormWarp;
+    private static void HeadNormWarpImpl(FV buf, BV gamma, FV phases, int stride, int off, int H, int D, int useRope)
+    {
+        int vec = Grid.IdxX, lane = Group.IdxX;
+        int h = vec % H, n = vec / H;
+        long b = (long)n * stride + off + h * D;
+        int pairs = D / 2;
+        float ss = 0f;
+        for (int p = lane; p < pairs; p += 32)
+        {
+            float x0 = buf[b + 2 * p], x1 = buf[b + 2 * p + 1];
+            ss += x0 * x0 + x1 * x1;
+        }
+        for (int m = 16; m > 0; m >>= 1) ss += Warp.ShuffleXor(ss, m);
+        float inv = 1f / MathF.Max(MathF.Sqrt(ss), 1e-12f);
+        float scale = MathF.Sqrt((float)D);
+        for (int p = lane; p < pairs; p += 32)
+        {
+            float x0 = buf[b + 2 * p] * inv * PrecisionConvert.ConvertToSingle(gamma[h * D + 2 * p]) * scale;
+            float x1 = buf[b + 2 * p + 1] * inv * PrecisionConvert.ConvertToSingle(gamma[h * D + 2 * p + 1]) * scale;
+            if (useRope != 0)
+            {
+                long pi = ((long)n * pairs + p) * 2;
+                float c = phases[pi], sn = phases[pi + 1];
+                float r0 = x0 * c - x1 * sn;
+                float r1 = x0 * sn + x1 * c;
+                x0 = r0; x1 = r1;
+            }
+            buf[b + 2 * p] = x0;
+            buf[b + 2 * p + 1] = x1;
+        }
+    }
     public void HeadNorm(FV buf, BV gamma, FV? phases, int N, int stride, int off, int H, int D)
     {
+        if (_acc.AcceleratorType == AcceleratorType.Cuda)
+        {
+            _headNormWarp ??= _acc.LoadStreamKernel<FV, BV, FV, int, int, int, int, int>(HeadNormWarpImpl);
+            _headNormWarp(new KernelConfig(N * H, 32), buf, gamma, phases ?? buf, stride, off, H, D, phases.HasValue ? 1 : 0);
+            return;
+        }
         _headNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, FV, int, int, int, int, int>(HeadNormImpl);
         _headNorm(N * H, buf, gamma, phases ?? buf, stride, off, H, D, phases.HasValue ? 1 : 0);
     }
