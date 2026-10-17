@@ -23,6 +23,12 @@ internal static class AtlasMeshRun
             PaddingTexels = (s = Environment.GetEnvironmentVariable("ATLAS_PAD")) != null ? int.Parse(s) : o.PaddingTexels,
             Resolution = (s = Environment.GetEnvironmentVariable("ATLAS_RES")) != null ? int.Parse(s) : o.Resolution,
         };
+        if (int.TryParse(Environment.GetEnvironmentVariable("ATLAS_SIMPLIFY"), out var target) && target < nf)
+        {   // the pipeline's edge collapse first (e.g. the UI's "300k" option on a clustered mesh)
+            (v, f) = MeshSimplifier.Simplify(v, f, target);
+            nv = v.Length / 3; nf = f.Length / 3;
+            Console.WriteLine($"simplified to {nf} faces");
+        }
         if (Environment.GetEnvironmentVariable("ATLAS_DIAG") == "1") Diagnose(v, f, nf);
         var sw = Stopwatch.StartNew();
         var r = UvAtlas.Unwrap(v, f, opts);
@@ -61,6 +67,20 @@ internal static class AtlasMeshRun
             else if (l.Count == 2) { manifold++; int p = l[0], q = l[1]; double d = n[p * 3] * n[q * 3] + n[p * 3 + 1] * n[q * 3 + 1] + n[p * 3 + 2] * n[q * 3 + 2]; ang.Add(Math.Acos(Math.Clamp(d, -1, 1)) * 180 / Math.PI); }
             else nonManifold++;
         }
+        // connected components: over manifold edges only (what the atlas can grow across) vs over every shared edge
+        int Components(bool all)
+        {
+            var parent = Enumerable.Range(0, nf).ToArray();
+            int Find(int x) { while (parent[x] != x) x = parent[x] = parent[parent[x]]; return x; }
+            foreach (var l in edges.Values)
+            {
+                if (l.Count < 2 || (!all && l.Count != 2)) continue;
+                for (int i = 1; i < l.Count; i++) { int a = Find(l[0]), b = Find(l[i]); if (a != b) parent[a] = b; }
+            }
+            int n = 0; for (int i = 0; i < nf; i++) if (Find(i) == i) n++;
+            return n;
+        }
+        Console.WriteLine($"components: {Components(false)} over manifold edges, {Components(true)} over all shared edges");
         ang.Sort();
         string P(double q) => $"p{q * 100:F0}={ang[(int)(q * (ang.Count - 1))]:F1}";
         Console.WriteLine($"edges: {manifold} manifold, {boundary} boundary, {nonManifold} non-manifold; dihedral {P(0.25)} {P(0.5)} {P(0.75)} {P(0.9)} {P(0.99)} deg");

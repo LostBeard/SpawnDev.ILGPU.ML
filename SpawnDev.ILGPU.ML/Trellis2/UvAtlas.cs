@@ -109,21 +109,32 @@ public static class UvAtlas
         double totalArea = 0;
         foreach (var f in area) totalArea += f;
         int pad = options.PaddingTexels;
-        double density;
+        double density = 0;
         var byHeight = charts.ToArray();                    // shelf order (tallest first) is the same for every padding: sort once
         Array.Sort(byHeight.Select(c => -c.Height).ToArray(), byHeight);
-        if (pad > 0) density = Pack(byHeight, options.Resolution, pad, options.MinChartTexels);
-        else
+        // Too many charts for the atlas at the minimum chart size (each chart takes at least minTexels + 2 * padding on a side): relax the
+        // minimum size, then the padding, instead of packing nothing. MEASURED: a clustered crown mesh at 560k faces makes 189k charts, which a
+        // 2048 atlas cannot hold at 3 texels + 1 of padding (the packer used to return its 1e-6 placeholder density with most charts unplaced).
+        for (int minTexels = options.MinChartTexels; density <= 0 && minTexels >= 1; minTexels--)
         {
+            if (options.PaddingTexels > 0)
+            {
+                density = Pack(byHeight, options.Resolution, pad, minTexels);
+                continue;
+            }
             // The widest padding that costs at most 20% of the best texel density. (Stopping at the first padding that reached ~1 texel per
             // mean edge took 4 texels around each of 32k charts on a generated chest: 5% of the atlas held texture, the rest was padding.)
-            int[] candidates = { 4, 3, 2, 1 };
-            var dens = candidates.Select(c => Pack(byHeight, options.Resolution, c, options.MinChartTexels)).ToArray();
+            // padding 0 (no bleed room between charts) only when nothing else fits: it is never in the 20% comparison
+            int[] candidates = minTexels == 1 ? new[] { 0 } : new[] { 4, 3, 2, 1 };
+            var dens = candidates.Select(c => Pack(byHeight, options.Resolution, c, minTexels)).ToArray();
             double best = dens.Max();
-            int pick = Array.FindIndex(dens, d => d >= 0.8 * best);
+            if (best <= 0) continue;
+            int pick = Array.FindIndex(dens, d => d > 0 && d >= 0.8 * best);
             pad = candidates[pick];
-            density = Pack(byHeight, options.Resolution, pad, options.MinChartTexels);   // commit the chosen layout
+            density = Pack(byHeight, options.Resolution, pad, minTexels);   // commit the chosen layout
         }
+        if (density <= 0)
+            throw new InvalidOperationException($"UV atlas: {charts.Count} charts do not fit a {options.Resolution} texture even at 1 texel each; simplify the mesh further or use a larger texture.");
         double used = 0;
         foreach (var c in charts) used += c.Width * density * c.Scale * c.Height * density * c.Scale;
 
@@ -331,7 +342,7 @@ public static class UvAtlas
             if (mid <= 0) break;
             if (Fits(mid, false)) lo = mid; else hi = mid;
         }
-        if (lo <= 0) lo = 1e-6;
+        if (lo <= 0) return 0;                              // nothing fits at any density (every chart is at least minTexels + padding): caller relaxes
         Fits(lo, true);
         return lo;
     }
