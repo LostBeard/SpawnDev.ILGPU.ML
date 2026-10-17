@@ -320,6 +320,29 @@ internal static class Golden
         return ok ? 0 : 1;
     }
 
+    /// <summary>Image preparation (alpha crop, premultiply, Lanczos, normalise) against Pillow running the reference steps (reference/golden_prep.py).</summary>
+    public static int Prep()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "prep");
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_prep.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        var prep = new Trellis2ImagePrep(accel);
+        using var man = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(dir, "manifest.json")));
+        bool ok = true;
+        foreach (var kv in man.RootElement.EnumerateObject())
+        {
+            int w = kv.Value.GetProperty("width").GetInt32(), h = kv.Value.GetProperty("height").GetInt32();
+            var bytes = File.ReadAllBytes(Path.Combine(dir, kv.Name + ".rgba.u32"));
+            var px = new int[w * h]; Buffer.BlockCopy(bytes, 0, px, 0, bytes.Length);
+            using var got = prep.Prepare(px, w, h, 512);
+            // 8-bit rounding differences between Pillow's fixed-point resampler and ours move single values by one level (0.017 in normalised units)
+            ok &= Compare("prep " + kv.Name, ReadF32(Path.Combine(dir, kv.Name + ".tensor.f32")), got.GetAsArray1D(), 8e-3);
+        }
+        Console.WriteLine(ok ? "PREP PASS" : "PREP FAIL");
+        return ok ? 0 : 1;
+    }
+
     public static int SsFlow()
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");
