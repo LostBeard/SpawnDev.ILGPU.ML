@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.11-local.8</Version>
+		<Version>5.3.11-local.9</Version>
 		<PackageReleaseNotes>v5.3.8 - On SpawnDev.ILGPU 5.3.7: under Blazor WebAssembly AOT, kernels with 6 or more parameters loaded through the stream loaders on WebGPU, WebGL or Wasm no longer kill the .NET runtime (they launch with boxed arguments). No ML code changes. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
