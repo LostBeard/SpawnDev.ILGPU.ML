@@ -49,6 +49,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
     private readonly Trellis2Weights _weights;
     private readonly DiTKernels _dk;
     private readonly SparseKernels _sk;
+    private Task? _precompile;
 
     /// <summary>Per-stage progress: (stage, seconds).</summary>
     public Action<string, double>? StageDone { get; set; }
@@ -92,6 +93,8 @@ public sealed class Trellis2ImageTo3D : IDisposable
         options ??= new Trellis2Options();
         if (options.Resolution != 512 && options.Resolution != 1024) throw new ArgumentException("Resolution must be 512 or 1024");
         var sw = Stopwatch.StartNew();
+        // WebGPU: the large kernels' pipelines build in the background, in parallel, while the image is prepared and DINOv3 loads
+        _precompile ??= Task.WhenAll(_dk.PrecompileAsync(), _sk.PrecompileAsync());
         var pipeline = await Trellis2Pipeline.CreateAsync(_acc, _weights, ct);
         pipeline.StageDone = StageDone;
         pipeline.PrefetchFirstStage(includeDino: true);      // the reads overlap the image preparation and the feature extraction
@@ -106,6 +109,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
         {
             {   // the feature extractor's weights are released before the flows load
                 using var w = await _weights.LoadDinoAsync(_acc, ct);
+                await _precompile;                           // a launch while its pipeline is still building would compile it a second time
                 using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
                 dino.Extract(image.View, 512, cond.View);
                 if (options.Resolution == 1024)

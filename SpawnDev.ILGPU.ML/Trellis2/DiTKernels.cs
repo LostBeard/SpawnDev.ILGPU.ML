@@ -429,6 +429,45 @@ public sealed class DiTKernels
     /// <summary>Null until the first attention: whether this backend compiles warp shuffles (NVIDIA's OpenCL does not; browsers need the subgroups feature).</summary>
     private bool? _shuffleOk;
 
+    /// <summary>
+    /// WebGPU: build the pipelines of the large generated kernels (bf16 tiled GEMM; flash attention self/cross at D 128 and self at D 64, in
+    /// the variant this backend runs) in the background, in parallel, before their first launch. Their first launches otherwise compile one
+    /// at a time, each blocking the queue for seconds (MEASURED: the tiled GEMM 3.8 s). No-op on other backends.
+    /// </summary>
+    public async Task PrecompileAsync()
+    {
+        if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web) return;
+        var g = new Index3D(TiledGemm.Threads, 1, 1);
+        var tasks = new List<Task>();
+        if (UseTiled(TiledGemm.BK)) tasks.Add(Timed("Bf16Dense", () => web.PrecompileAsync(TiledGemm.Bf16Dense, g)));
+        await Task.Yield();                                  // let I/O continuations run between the (synchronous) IL compiles
+        foreach (var (key, self) in new[] { (1, true), (0, false), (3, true) })
+        {
+            if (!UsesTiledAttention(key < 2 ? 128 : 64)) continue;
+            if (self) SelfKernel(key); else CrossKernel(key);   // resolves the variant (shuffle or shared-memory) the launches will use
+            var a = new Index3D(TiledAttention.Threads, 1, 1);
+            Delegate m = (key, self, _shuffleOk == true) switch
+            {
+                (1, true, true) => (Delegate)TiledAttention.SelfD128, (1, true, false) => (Delegate)TiledAttention.SelfD128Smem,
+                (0, false, true) => (Delegate)TiledAttention.CrossD128, (0, false, false) => (Delegate)TiledAttention.CrossD128Smem,
+                (3, true, true) => (Delegate)TiledAttention.SelfD64, _ => (Delegate)TiledAttention.SelfD64Smem,
+            };
+            tasks.Add(Timed(m.Method.Name, () => web.PrecompileAsync(m, a)));
+            await Task.Yield();
+        }
+        await Task.WhenAll(tasks);
+    }
+
+    /// <summary>TRELLIS2_PRECOMPILE_LOG-style timing in the console: the synchronous IL compile, then the pipeline build until it lands.</summary>
+    internal static async Task Timed(string name, Func<Task> start)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var t = start();
+        double il = sw.Elapsed.TotalMilliseconds;
+        await t;
+        Console.WriteLine($"[Trellis2] precompile {name}: IL {il:F0} ms, pipeline ready at +{sw.Elapsed.TotalMilliseconds:F0} ms");
+    }
+
     /// <summary>Which portable attention kernel this backend runs (after the first attention): for benchmarks and logs.</summary>
     public string TiledAttentionKind => _shuffleOk switch
     {

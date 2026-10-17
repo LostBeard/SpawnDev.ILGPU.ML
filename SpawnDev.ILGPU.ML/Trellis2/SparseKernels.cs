@@ -100,6 +100,17 @@ public sealed class SparseKernels
         _acc.Fence();   // the hash is freed on return
     }
 
+    /// <summary>WebGPU: build the pipelines of the f16 tiled GEMMs (dense linear, gathered sparse convolution) in the background (see <see cref="DiTKernels.PrecompileAsync"/>).</summary>
+    public async Task PrecompileAsync()
+    {
+        if (_acc is not global::SpawnDev.ILGPU.WebGPU.WebGPUAccelerator web || !UseTiled(TiledGemm.BK)) return;
+        var g = new Index3D(TiledGemm.Threads, 1, 1);
+        var dense = DiTKernels.Timed("F16Dense", () => web.PrecompileAsync(TiledGemm.F16Dense, g));
+        await Task.Yield();
+        var gather = DiTKernels.Timed("F16Gather", () => web.PrecompileAsync(TiledGemm.F16Gather, g));
+        await Task.WhenAll(dense, gather);
+    }
+
     // single lookup, for kernels that probe the hash themselves
     internal static int Lookup(IV keys, IV vals, int x, int y, int z, int grid, int mask, int shift)
     {
