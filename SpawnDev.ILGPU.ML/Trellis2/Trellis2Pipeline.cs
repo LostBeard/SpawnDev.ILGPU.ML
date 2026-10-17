@@ -162,7 +162,7 @@ public sealed class Trellis2Pipeline : IDisposable
             await StageAsync("ss flow load", sw);
             _weights.Prefetch(new[] { "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16", "shape_dec_next_dc_f16c32_fp16" }, includeSsDecoder: true);
             _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts);
-            await StageAsync("ss flow sample", sw);
+            await StageAsync($"ss flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
             if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
             w.Dispose();
             using var dw = await _weights.LoadSsDecoderAsync(_acc, ct);
@@ -200,7 +200,7 @@ public sealed class Trellis2Pipeline : IDisposable
             await StageAsync("shape flow load", sw);
             _weights.Prefetch(new[] { "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16", "tex_dec_next_dc_f16c32_fp16" });
             _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
-            await StageAsync("shape flow sample", sw);
+            await StageAsync($"shape flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] shape: {Moments(shapeSlat.View, count)}");
         }
 
@@ -246,7 +246,7 @@ public sealed class Trellis2Pipeline : IDisposable
                 _concat(n0 * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
                 dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);
             }, texSlat.View, count, _texOpts);
-            await StageAsync("tex flow sample", sw);
+            await StageAsync($"tex flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] tex: {Moments(texSlat.View, count)}");
             { var dt = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_TEX") ?? ""; if (dt.Length > 0) { _acc.Synchronize(); var a = texSlat.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dt, "tex_slat.f32"), b); } }
         }

@@ -30,6 +30,26 @@ public abstract class Trellis2Weights
         string ssDecoderRepo = "microsoft/TRELLIS-image-large", string dinoRepo = "timm/vit_large_patch16_dinov3_qkvb.lvd1689m")
         => new SourceWeights(source, trellisRepo, ssDecoderRepo, dinoRepo);
 
+    /// <summary>
+    /// The weight files a <see cref="FromModelSource"/> run reads at <paramref name="resolution"/> (512 or 1024), as (repo, path): for storage
+    /// planning (<see cref="RangeStreamModelSource.PlanCacheAsync"/>). The small .json files beside them are not listed.
+    /// </summary>
+    public static IReadOnlyList<(string Repo, string Path)> HubWeightFiles(int resolution = 512, string trellisRepo = "microsoft/TRELLIS.2-4B",
+        string ssDecoderRepo = "microsoft/TRELLIS-image-large", string dinoRepo = "timm/vit_large_patch16_dinov3_qkvb.lvd1689m")
+    {
+        string s = resolution == 1024 ? "1024" : "512";
+        return new[]
+        {
+            (dinoRepo, "model.safetensors"),
+            (trellisRepo, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors"),
+            (ssDecoderRepo, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors"),
+            (trellisRepo, $"ckpts/slat_flow_img2shape_dit_1_3B_{s}_bf16.safetensors"),
+            (trellisRepo, "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors"),
+            (trellisRepo, $"ckpts/slat_flow_imgshape2tex_dit_1_3B_{s}_bf16.safetensors"),
+            (trellisRepo, "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"),
+        };
+    }
+
     internal static JsonElement Args(string json)
     {
         using var doc = JsonDocument.Parse(json);

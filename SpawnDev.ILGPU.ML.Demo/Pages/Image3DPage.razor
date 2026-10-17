@@ -207,10 +207,10 @@
             _error = "This demo needs WebGPU (Chrome or Edge on a desktop GPU).";
             return false;
         }
-        // Cache the TRELLIS.2 checkpoints in OPFS when the browser grants this site room for them; otherwise stream them from the hub with range
-        // requests on every run (Chrome gives an origin a share of the FREE disk: 10 GB on a machine with 80 GB free, less than the 11 GB needed).
-        bool cached = await ModelSource.Store.ExistsAsync(ModelSource.CacheKey(TrellisRepo, LastTrellisFile));
-        long free = long.MaxValue;
+        // Per file: cache the TRELLIS.2 checkpoints in OPFS as far as the browser grants this site room, stream the rest from the hub with range
+        // requests on every run (Chrome gives an origin a share of the FREE disk: 11 GB on a machine with 80 GB free, against 11 GB of weights;
+        // caching all-or-nothing streamed everything there, the plan caches all but ~1 GB).
+        long free = long.MaxValue / 2;
         try
         {
             using var navigator = JS.Get<SpawnDev.SpawnJS.JSObjects.Navigator>("navigator");
@@ -219,22 +219,33 @@
             free = est.Quota - est.Usage;
         }
         catch { }
-        _streamWeights = !cached && free < TrellisBytes + 600_000_000L;
-        SpawnDev.ILGPU.ML.Hub.IModelSource source = ModelSource;
+        var ranged = new SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource(ModelSource);
+        ranged.OnProgress += OnDownloadProgress;
+        var (cachedBytes, streamedBytes) = await ranged.PlanCacheAsync(Trellis2Weights.HubWeightFiles(), free - 300_000_000L);
+        _streamWeights = streamedBytes > 0;
+        _downloadBytes = streamedBytes + await UncachedBytesAsync(ranged);   // what the next run transfers
+        _streamedBytes = streamedBytes;
         if (_streamWeights)
-        {
-            var ranged = new SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource(ModelSource);
-            ranged.OnProgress += OnDownloadProgress;
-            source = ranged;
-            _storageNote = $"This site may store {free / 1073741824.0:F1} GB in your browser, less than the {TrellisBytes / 1073741824.0:F1} GB of TRELLIS.2 weights: they stream from the hub on every run instead of being cached.";
-        }
-        _trellis = new Trellis2ImageTo3D(_accelerator, Trellis2Weights.FromModelSource(source)) { StageDone = OnStageDone };
+            _storageNote = $"This site may store {free / 1073741824.0:F1} GB in your browser: {cachedBytes / 1073741824.0:F1} GB of the TRELLIS.2 weights are cached, "
+                + $"the other {streamedBytes / 1073741824.0:F1} GB stream from the hub on every run.";
+        _trellis = new Trellis2ImageTo3D(_accelerator, Trellis2Weights.FromModelSource(ranged)) { StageDone = OnStageDone };
         return true;
     }
 
-    private const string TrellisRepo = "microsoft/TRELLIS.2-4B";
-    private const string LastTrellisFile = "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors";
-    private const long TrellisBytes = 10_900_000_000L;
+    // bytes of the planned-for-cache files that are not in OPFS yet (they download once, on the next run)
+    private async Task<long> UncachedBytesAsync(SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource ranged)
+    {
+        long sum = 0;
+        foreach (var (repo, path) in Trellis2Weights.HubWeightFiles())
+        {
+            if (!ranged.CacheFiles.Contains(repo + "/" + path) || await ModelSource.Store.ExistsAsync(ModelSource.CacheKey(repo, path))) continue;
+            using var probe = await ModelSource.OpenForInspectionAsync(repo, path);
+            sum += probe.Length;
+        }
+        return sum;
+    }
+
+    private long _downloadBytes, _streamedBytes;
     private bool _streamWeights;
     private string? _storageNote;
     private DateTime _lastProgressRender;
@@ -242,15 +253,17 @@
     // header progress while TRELLIS.2 loads: bytes of the finished files + the file in flight, over all TRELLIS.2 files
     private bool _trellisPhase;
     private long _finishedBytes, _lastDone, _lastTotal;
-    private double _modelSizeMb = TrellisBytes / 1048576.0;
+    private double _modelSizeMb = 11_010_000_000L / 1048576.0;
 
     private void OnDownloadProgress(long done, long total)
     {
         if (_trellisPhase && total > 0)
         {
+            bool newFile = done < _lastDone || _lastDone >= _lastTotal;
+            if (newFile && done >= total) return;                     // one complete report on open = a file already in OPFS: nothing transferred
             if (done < _lastDone) _finishedBytes += _lastTotal;      // a new file started
             _lastDone = done; _lastTotal = total;
-            _modelProgress = Math.Min(100, 100.0 * (_finishedBytes + done) / TrellisBytes);
+            _modelProgress = Math.Min(100, 100.0 * (_finishedBytes + done) / Math.Max(_downloadBytes, 1));
         }
         if (total <= 0 || (DateTime.UtcNow - _lastProgressRender).TotalMilliseconds < 250 && done < total) return;
         _lastProgressRender = DateTime.UtcNow;
@@ -264,7 +277,7 @@
         _downloadText = null;
         _stages.Add((name, seconds));
         _currentStage = NextStageHint(name);
-        if (_streamWeights) _currentStage = _currentStage?.Replace("first run: ", "streaming ");   // streamed weights download on every run
+        if (_streamWeights) _currentStage = _currentStage?.Replace("first run: ", "");   // part of the weights streams on every run: no "first run" promise
         _ = InvokeAsync(StateHasChanged);
     }
 
@@ -389,13 +402,15 @@
 
     private async Task RunTrellisAsync(int[] px, int w, int h, System.Diagnostics.Stopwatch total, string label)
     {
-        _isLoading = !_ready || _streamWeights;                   // streamed weights load again on every run
-        _modelSizeMb = TrellisBytes / 1048576.0; _modelProgress = 0;
+        _isLoading = _downloadBytes > 0;                          // the first run downloads; streamed weights load again on every run
+        _modelSizeMb = _downloadBytes / 1048576.0; _modelProgress = 0;
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
-        _currentStage = "image prep"; _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : "TRELLIS.2"; StateHasChanged();
+        _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : _downloadBytes == 0 && !_ready ? "TRELLIS.2 (loading from browser storage)" : "TRELLIS.2";
+        _currentStage = "image prep"; StateHasChanged();
         try { _glb = await _trellis!.GenerateGlbAsync(px, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize }); }
         finally { _trellisPhase = false; }
         _ready = true; _isLoading = false;
+        _downloadBytes = _streamedBytes;                          // the planned files are in OPFS now
         _inferenceMs = total.Elapsed.TotalMilliseconds;
         StateHasChanged();
         await Task.Yield();
