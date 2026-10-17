@@ -33,7 +33,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("TRELLIS.2 runs on WebGPU and the desktop backends (not WebGL / Wasm)");
     }
 
-    [TestMethod]
+    [TestMethod(Timeout = 120000)]
     public async Task Trellis2_TiledLinear_MatchesHostReference() => await RunTest(async accelerator =>
     {
         RequireTrellisBackend(accelerator);
@@ -62,7 +62,7 @@ public abstract partial class MLTestBase
         return $"tiled linear {M}x{K}x{N} max |err| {maxErr:E2}";
     });
 
-    [TestMethod]
+    [TestMethod(Timeout = 120000)]
     public async Task Trellis2_TiledSparseConv_MatchesHostReference() => await RunTest(async accelerator =>
     {
         RequireTrellisBackend(accelerator);
@@ -161,7 +161,7 @@ public abstract partial class MLTestBase
         return $"sphere {nf} -> {outF} faces, {outV} vertices, max deviation {maxDev:F3} voxels, area {area / want:P2}";
     });
 
-    [TestMethod]
+    [TestMethod(Timeout = 120000)]
     public async Task Trellis2_FlashAttention_MatchesHostReference() => await RunTest(async accelerator =>
     {
         RequireTrellisBackend(accelerator);
@@ -218,10 +218,12 @@ public abstract partial class MLTestBase
     /// browser this runs in the interpreted .NET runtime) versus the first launch (WebGPU: shader module + pipeline creation) minus a warm launch.
     /// Prints "[Benchmark] Trellis2 compile ..." (PMT_CONSOLE_LOG=Trellis2).
     /// </summary>
-    [TestMethod]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]   // a measurement, not a correctness gate
     public async Task Trellis2_KernelCompile_Benchmark() => await RunTest(async accelerator =>
     {
         RequireTrellisBackend(accelerator);
+        if (accelerator.MaxNumThreadsPerGroup < TiledGemm.Threads)
+            throw new UnsupportedTestException($"the tiled kernels need {TiledGemm.Threads}-thread groups (this accelerator: {accelerator.MaxNumThreadsPerGroup})");
         const int M = 256, K = 256, N = 256;
         using var x = accelerator.Allocate1D<float>(M * K);
         using var w = accelerator.Allocate1D<uint>(N * K / 2);
@@ -269,7 +271,7 @@ public abstract partial class MLTestBase
     /// Throughput of the DiT's kernels at the real 1.3B shapes (width 1536, 12 heads x 128, MLP 6144, 4096 tokens = the sparse-structure
     /// flow): how far each backend is from the silicon. Prints "[Benchmark] Trellis2 ..." lines (PMT_CONSOLE_LOG=Trellis2 shows them for browser lanes).
     /// </summary>
-    [TestMethod]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]   // a measurement, not a correctness gate
     public async Task Trellis2_DiTKernels_Benchmark() => await RunTest(async accelerator =>
     {
         RequireTrellisBackend(accelerator);

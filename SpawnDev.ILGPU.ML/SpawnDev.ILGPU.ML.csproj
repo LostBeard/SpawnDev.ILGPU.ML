@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.11-local.10</Version>
-		<PackageReleaseNotes>v5.3.8 - On SpawnDev.ILGPU 5.3.7: under Blazor WebAssembly AOT, kernels with 6 or more parameters loaded through the stream loaders on WebGPU, WebGL or Wasm no longer kill the .NET runtime (they launch with boxed arguments). No ML code changes. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.11</Version>
+		<PackageReleaseNotes>v5.3.11 - Image and text to 3D (TRELLIS.2: photo or prompt -> PBR GLB) on CUDA (tensor cores), OpenCL, CPU and in the browser on WebGPU (portable tiled GEMM + flash attention, device mesh clustering, checkpoint streaming / per-file OPFS caching, background pipeline builds). Face detection and recognition (YuNet + SFace, matched against OpenCV). Requires SpawnDev.ILGPU 5.3.8. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.3" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.8-local.7" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.8" />
 	</ItemGroup>
 
 	<ItemGroup>

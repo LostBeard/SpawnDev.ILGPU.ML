@@ -3,7 +3,18 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased - image to 3D (TRELLIS.2), face detection and recognition
+## 5.3.11 - 2026-10-17 - image and text to 3D (TRELLIS.2) on the desktop and in the browser, face detection and recognition
+
+Requires SpawnDev.ILGPU 5.3.8.
+
+- **TRELLIS.2 in the browser (WebGPU), demo page `/text-to-3d` + `/image-to-3d`.** The portable kernels (register-tiled GEMM, one kernel
+  for every weight/row variant; flash attention with 8 lanes x 4 queries per thread) run every network stage on WebGPU, OpenCL and CPU;
+  `MeshClusterer` (adaptive octree quadric clustering on the device) takes the 3M-face dual-grid mesh to ~0.5M before the edge collapse;
+  `Trellis2Weights.FromModelSource` streams checkpoints from any `IModelSource`; `RangeStreamModelSource` + `FetchRangeStream` stream what
+  does not fit the browser's storage (4 range requests in flight, JS -> GPU without the .NET heap) and `PlanCacheAsync` caches the rest
+  per file; the large kernels' pipelines build in the background before their first launch (`WebGPUAccelerator.PrecompileAsync`).
+  MEASURED, Chrome on an RTX 4070, crown, weights cached, AOT build: 148 s from a fresh page, 134 s for the next generation (from 712 s
+  for the first working version that morning); text to 3D (SD Turbo -> RMBG-1.4 -> TRELLIS.2) 246 s including SD Turbo's first download.
 
 - **`Trellis2ImageTo3D`** (`Trellis2/`): a cut-out photo (RGBA, alpha = foreground) to a PBR GLB (positions, normals, UVs, base colour and metallic-roughness PNGs) on a 12 GB card: MIT-licensed
   TRELLIS.2-4B 512 path (DINOv3 ViT-L/16 features, sparse-structure flow + decoder, shape and texture SLat flows, sparse SC-VAE decoders, FlexiDualGrid mesh), QEM simplification (`MeshSimplifier`, default 150k
