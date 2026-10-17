@@ -35,6 +35,14 @@ public class SentencePieceTokenizer : ITokenizer
     /// (space→Ġ, newline→Ċ, …) rather than SentencePiece's ▁ + &lt;0xHH&gt; scheme — decoding must reverse it.</summary>
     public bool ByteLevelBpe => _byteLevelBpe;
 
+    /// <summary>
+    /// SentencePiece "dummy prefix": prepend ▁ to every encoded string (GGUF <c>tokenizer.ggml.add_space_prefix</c>; true for llama-style
+    /// vocabs, FALSE for gemma 2/3). Chat templates encode each segment separately, so a dummy prefix that the model does not use puts a
+    /// stray space token before every "\n" after a turn marker. MEASURED on gemma-3-270m-it: three such tokens in a two-turn prompt, and
+    /// the second answer ignored the question ("What is the capital of France?" -> "Hello! I'm happy to help..."; Ollama: "Paris").
+    /// </summary>
+    public bool AddSpacePrefix { get; set; } = true;
+
     // GPT-2 byte-level maps (the standard bytes_to_unicode), built once. Forward: raw byte → vocab-string char
     // (for ENCODE); reverse: char → raw byte (for DECODE).
     private static readonly char[] Gpt2ByteToChar = new char[256];
@@ -141,7 +149,7 @@ public class SentencePieceTokenizer : ITokenizer
         }
         else
         {
-            normalized = "\u2581" + text.Replace(" ", "\u2581");
+            normalized = (AddSpacePrefix ? "\u2581" : "") + text.Replace(" ", "\u2581");
         }
 
         // Greedy forward tokenization with longest match
@@ -337,7 +345,10 @@ public class SentencePieceTokenizer : ITokenizer
         // Byte-level BPE vocabs carry the rank-ordered merge list — required to tokenize the way the model was
         // trained (greedy longest-match diverges on multi-token words and breaks sensitive models).
         var merges = byteLevelBpe ? model.GetMetadataStringArray("tokenizer.ggml.merges") : null;
-        return new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe, merges);
+        var tok = new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe, merges);
+        if (model.Metadata.TryGetValue("tokenizer.ggml.add_space_prefix", out var asp) && asp is bool addSpace)
+            tok.AddSpacePrefix = addSpace;                  // absent = the llama SentencePiece default (true)
+        return tok;
     }
 
     /// <summary>

@@ -388,6 +388,26 @@ public abstract partial class MLTestBase
     // ═══════════════════════════════════════════════════════════
 
     [TestMethod]
+    public async Task SentencePiece_AddSpacePrefix_FollowsTheModel() => await RunTest(async accelerator =>
+    {
+        // Gemma 2/3 GGUFs declare tokenizer.ggml.add_space_prefix = false. Chat templates encode each segment ("\n", "user\n...")
+        // separately, so a dummy prefix the model does not use puts a stray "▁" token before every newline after a turn marker
+        // (gemma-3-270m-it then ignored the second question of a conversation). Vocab: "▁" (3), "\n" (4), "user" (5), "▁user" (6).
+        var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\n", "user", "\u2581user" };
+        var scores = new float[] { 0, 0, 0, -1, -1, -1, -1 };
+        var types = new int[] { 1, 2, 2, 0, 0, 0, 0 };
+        var llama = new SentencePieceTokenizer(tokens, scores, types);              // default: the llama dummy prefix
+        var gemma = new SentencePieceTokenizer(tokens, scores, types) { AddSpacePrefix = false };
+        string Ids(int[] a) => string.Join(",", a);
+        if (Ids(llama.Encode("\n")) != "3,4") throw new Exception($"with the dummy prefix \"\\n\" should be ▁ + \\n (3,4), got {Ids(llama.Encode("\n"))}");
+        if (Ids(llama.Encode("user")) != "6") throw new Exception($"with the dummy prefix \"user\" should be ▁user (6), got {Ids(llama.Encode("user"))}");
+        if (Ids(gemma.Encode("\n")) != "4") throw new Exception($"without the dummy prefix \"\\n\" should be \\n alone (4), got {Ids(gemma.Encode("\n"))}");
+        if (Ids(gemma.Encode("user")) != "5") throw new Exception($"without the dummy prefix \"user\" should be user (5), got {Ids(gemma.Encode("user"))}");
+        await Task.CompletedTask;
+        return "add_space_prefix: llama ▁-prefixed, gemma not";
+    });
+
+    [TestMethod]
     public async Task SentencePiece_EncodeAndDecode_RoundTrip() => await RunTest(async accelerator =>
     {
         // Minimal SentencePiece vocab: special tokens + a few words

@@ -120,7 +120,9 @@
             "~0.5 GB", "qwen2", "ok", "✅ verified — coherent on WebGPU"),
         new("SmolLM2 360M Instruct (Q8_0)", "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF", "smollm2-360m-instruct-q8_0.gguf",
             "~0.4 GB", "llama", "ok", "✅ verified — coherent (BPE tokenizer + RoPE NORM-style fix)"),
-        new("Gemma 3 270M (Q8_0)", "ggml-org/gemma-3-270m-GGUF", "gemma-3-270m-Q8_0.gguf",
+        // the INSTRUCTION-TUNED build: ggml-org/gemma-3-270m-GGUF is the BASE model (google/gemma-3-270m), which treats a chat as text
+        // to continue (it rambled, switched language, never stopped); Ollama's gemma3:270m, which this was verified against, is -it
+        new("Gemma 3 270M IT (Q8_0)", "ggml-org/gemma-3-270m-it-GGUF", "gemma-3-270m-it-Q8_0.gguf",
             "~0.3 GB", "gemma3", "ok", "✅ coherent — forward-pass fixed (CUDA-verified vs Ollama; WebGPU graph PMT-green)"),
     };
 
