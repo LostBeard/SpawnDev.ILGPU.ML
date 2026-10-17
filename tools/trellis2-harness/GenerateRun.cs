@@ -62,7 +62,8 @@ internal static class GenerateRun
         gen.StageDone = (name, sec) => Console.WriteLine($"  {name,-32} {sec,7:F2}s   (peak so far {peak - baseline} MiB over baseline)");
         byte[] glb;
         var mf = Environment.GetEnvironmentVariable("TRELLIS2_MAXFACES");
-        var options = new Trellis2Options { MaxFaces = mf != null ? int.Parse(mf) : new Trellis2Options().MaxFaces };
+        var rs = Environment.GetEnvironmentVariable("TRELLIS2_RES");
+        var options = new Trellis2Options { MaxFaces = mf != null ? int.Parse(mf) : new Trellis2Options().MaxFaces, Resolution = rs != null ? int.Parse(rs) : 512 };
         if (Environment.GetEnvironmentVariable("TRELLIS2_DUMP") == "1")
         {
             // debug preview data: voxel centres + PBR attributes (read by reference/preview_voxels.py)

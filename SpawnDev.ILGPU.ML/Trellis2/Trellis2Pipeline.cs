@@ -120,11 +120,22 @@ public sealed class Trellis2Pipeline : IDisposable
     private void Stage(string name, Stopwatch sw) { _acc.Synchronize(); StageDone?.Invoke(name, sw.Elapsed.TotalSeconds); sw.Restart(); }
 
     /// <summary>
-    /// Generate from image features. <paramref name="cond"/> is [condTokens, 1024] on the device (DINOv3 tokens of the preprocessed
+    /// Generate from image features, 512 pipeline. <paramref name="cond"/> is [condTokens, 1024] on the device (DINOv3 tokens of the preprocessed
     /// image at 512 px = 1029 tokens). Deterministic for a given <paramref name="seed"/> (own counter-based Gaussian, not torch's).
     /// </summary>
-    public Output Run512(FV cond, int condTokens, int seed = 42)
+    public Output Run512(FV cond, int condTokens, int seed = 42) => RunCore(512, cond, condTokens, cond, condTokens, seed);
+
+    /// <summary>
+    /// The 1024 pipeline of TRELLIS.2: the sparse structure at 64^3 from the 512 px features, then the shape and texture flows of the 1024 checkpoints
+    /// on the features of the image at 1024 px (<paramref name="cond1024"/>, 4096 + 5 tokens), decoders up to 1024^3 voxels. About 4x the voxels and
+    /// tokens of <see cref="Run512"/> (the whole run is minutes, not seconds) and a mesh of several million triangles.
+    /// </summary>
+    public Output Run1024(FV cond512, int tokens512, FV cond1024, int tokens1024, int seed = 42) => RunCore(1024, cond512, tokens512, cond1024, tokens1024, seed);
+
+    private Output RunCore(int res, FV ssCond, int ssTokens, FV cond, int condTokens, int seed)
     {
+        int slatGrid = res / 16;                            // the sparse tensors live on a res/16 grid (32^3 for 512, 64^3 for 1024)
+        string suffix = res == 512 ? "512" : "1024";
         _affine ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int>(AffineImpl);
         _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
         _halfShift ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(HalfShiftImpl);
@@ -132,6 +143,8 @@ public sealed class Trellis2Pipeline : IDisposable
         var sw = Stopwatch.StartNew();
         using var neg = _acc.Allocate1D<float>((long)condTokens * 1024);
         _zero((int)neg.Length, neg.View);
+        using var ssNeg = _acc.Allocate1D<float>((long)ssTokens * 1024);
+        _zero((int)ssNeg.Length, ssNeg.View);
 
         // ---- 1. sparse structure ------------------------------------------------------------------------
         MemoryBuffer1D<int, Stride1D.Dense> coords32;
@@ -148,40 +161,40 @@ public sealed class Trellis2Pipeline : IDisposable
             {   // debug: noise, condition and the sampled latent, to rerun the same stage in the reference
                 Directory.CreateDirectory(dumpDir);
                 void Dump(string name, FV v, int n) { var a = v.SubView(0, n).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, name), b); }
-                Dump("noise.f32", x.View, count); Dump("cond.f32", cond, condTokens * 1024);
+                Dump("noise.f32", x.View, count); Dump("cond.f32", ssCond, ssTokens * 1024);
             }
             Stage("ss flow load", sw);
-            PrefetchWeights(SsDecFile, Ckpt("slat_flow_img2shape_dit_1_3B_512_bf16"), Ckpt("shape_dec_next_dc_f16c32_fp16"));
-            _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), x.View, count, _ssOpts);
+            PrefetchWeights(SsDecFile, Ckpt("slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16"), Ckpt("shape_dec_next_dc_f16c32_fp16"));
+            _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts);
             Stage("ss flow sample", sw);
             if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
             w.Dispose();
             using var dw = GpuWeights.Load(_acc, _ssDecoderBase);
             using var dec = new SparseStructureDecoder(_acc, _sk, _dk, dw);
             using var logits = dec.Decode(x.View, flow.Resolution);
-            coords32 = _sk.Occupancy(logits.View, flow.Resolution * 4, 32, out n0);
-            Stage($"ss decode ({n0} cells of 32^3)", sw);
+            coords32 = _sk.Occupancy(logits.View, flow.Resolution * 4, slatGrid, out n0);
+            Stage($"ss decode ({n0} cells of {slatGrid}^3)", sw);
         }
         if (n0 == 0) throw new InvalidOperationException("the sparse structure is empty");
         if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SS") == "1")
         {
             // debug: the occupied 32^3 cells as ASCII layers along z (the sparse structure BEFORE the shape stage)
             var c = coords32.View.SubView(0, (long)n0 * 3).GetAsArray1D();
-            var grid = new bool[32, 32, 32];
+            var grid = new bool[slatGrid, slatGrid, slatGrid];
             for (int i = 0; i < n0; i++) grid[c[i * 3], c[i * 3 + 1], c[i * 3 + 2]] = true;
-            for (int z = 0; z < 32; z++)
+            for (int z = 0; z < slatGrid; z++)
             {
-                int cnt = 0; for (int x = 0; x < 32; x++) for (int y = 0; y < 32; y++) if (grid[x, y, z]) cnt++;
+                int cnt = 0; for (int x = 0; x < slatGrid; x++) for (int y = 0; y < slatGrid; y++) if (grid[x, y, z]) cnt++;
                 Console.WriteLine($"z={z,2} cells={cnt}");
                 if (cnt > 0 && z % 3 == 0)
-                    for (int y = 0; y < 32; y++) { var sb = new System.Text.StringBuilder(); for (int x = 0; x < 32; x++) sb.Append(grid[x, y, z] ? '#' : '.'); Console.WriteLine("   " + sb); }
+                    for (int y = 0; y < slatGrid; y++) { var sb = new System.Text.StringBuilder(); for (int x = 0; x < slatGrid; x++) sb.Append(grid[x, y, z] ? '#' : '.'); Console.WriteLine("   " + sb); }
             }
         }
 
         // ---- 2. shape latent ---------------------------------------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> shapeSlat;       // the sampler output (normalised space): conditions the texture flow
         {
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_img2shape_dit_1_3B_512_bf16"));
+            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16"));
             Stage("shape flow weights", sw);
             using var dit = new FlowDiT(_acc, _dk, w);
             dit.SetTokens(coords32.View, n0);
@@ -189,13 +202,13 @@ public sealed class Trellis2Pipeline : IDisposable
             shapeSlat = _acc.Allocate1D<float>(count);
             _sampler.Randn(shapeSlat.View, count, (ulong)seed * 7919UL + 2);
             Stage("shape flow load", sw);
-            PrefetchWeights(Ckpt("slat_flow_imgshape2tex_dit_1_3B_512_bf16"), Ckpt("tex_dec_next_dc_f16c32_fp16"));
+            PrefetchWeights(Ckpt("slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16"), Ckpt("tex_dec_next_dc_f16c32_fp16"));
             _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
             Stage("shape flow sample", sw);
         }
 
         // ---- 3. shape decoder -> mesh -------------------------------------------------------------------
-        var result = new Output { Grid = 512 };
+        var result = new Output { Grid = res };
         SparseVaeDecoder.Result shapeDec;
         {
             using var sm = Upload(_shapeMean); using var ss = Upload(_shapeStd);
@@ -204,7 +217,7 @@ public sealed class Trellis2Pipeline : IDisposable
             using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "shape_dec_next_dc_f16c32_fp16"));
             var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
             Stage("shape decoder load", sw);
-            shapeDec = dec.Decode(lat.View, coords32.View, n0, 32, keepSubdivisions: true);
+            shapeDec = dec.Decode(lat.View, coords32.View, n0, slatGrid, keepSubdivisions: true);
             result.Mesh = _mesher.Extract(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
             Stage($"shape decode + mesh ({shapeDec.Count} voxels, {result.Mesh.FaceCount} triangles)", sw);
         }
@@ -212,7 +225,7 @@ public sealed class Trellis2Pipeline : IDisposable
         // ---- 4. texture latent (conditioned on the shape latent) ------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> texSlat;
         {
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_imgshape2tex_dit_1_3B_512_bf16"));
+            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16"));
             using var dit = new FlowDiT(_acc, _dk, w);
             dit.SetTokens(coords32.View, n0);
             int ch = dit.OutChannels, count = n0 * ch;
@@ -239,7 +252,7 @@ public sealed class Trellis2Pipeline : IDisposable
             texSlat.Dispose();
             using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "tex_dec_next_dc_f16c32_fp16"));
             var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
-            using var tex = dec.Decode(lat.View, coords32.View, n0, 32, guide: shapeDec.Subdivisions);
+            using var tex = dec.Decode(lat.View, coords32.View, n0, slatGrid, guide: shapeDec.Subdivisions);
             result.Attributes = _acc.Allocate1D<float>(tex.Feats.Length);
             _halfShift((int)tex.Feats.Length, tex.Feats.View, result.Attributes.View);
             result.Coords = _acc.Allocate1D<int>((long)tex.Count * 3);

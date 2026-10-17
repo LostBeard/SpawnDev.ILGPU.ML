@@ -40,9 +40,16 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Trellis2_MeshSimplifier_KeepsTheTorusClosedAndOnSurface() => await RunPureTest(async () =>
     {
-        var (v, f) = TrellisTorus(120, 60);
-        const int target = 3000;
-        var (sv, sf) = MeshSimplifier.Simplify(v, f, target);
+        TorusSimplifyChecks(TrellisTorus(120, 60), 3000, parallel: false);
+        // the slab-parallel path (frozen seam vertices, stitched, one global pass) must hold the same properties
+        TorusSimplifyChecks(TrellisTorus(400, 200), 12000, parallel: true);
+        await Task.CompletedTask;
+    });
+
+    private static void TorusSimplifyChecks((float[] V, int[] F) torus, int target, bool parallel)
+    {
+        var (v, f) = torus;
+        var (sv, sf) = parallel ? MeshSimplifier.SimplifyParallel(v, f, target) : MeshSimplifier.Simplify(v, f, target);
         int nf = sf.Length / 3, nv = sv.Length / 3;
         if (nf > target + 8 || nf < target * 0.9) throw new Exception($"face count {nf} for target {target}");
         var edges = new Dictionary<long, int>();
@@ -64,8 +71,7 @@ public abstract partial class MLTestBase
             maxDev = Math.Max(maxDev, Math.Abs(Math.Sqrt(Math.Pow(Math.Sqrt(x * x + z * z) - 0.5, 2) + y * y) - 0.2));
         }
         if (maxDev > 0.01) throw new Exception($"vertices drifted {maxDev:F4} off the torus");
-        await Task.CompletedTask;
-    });
+    }
 
     /// <summary>The atlas must keep every face, put every UV in [0,1], and never cover one texel with two triangles.</summary>
     [TestMethod]

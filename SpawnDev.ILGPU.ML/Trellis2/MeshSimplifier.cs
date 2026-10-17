@@ -10,11 +10,103 @@ public static class MeshSimplifier
 {
     private readonly record struct Edge(int A, int B, int VerA, int VerB);
 
+    /// <summary>Meshes above this many faces are simplified in parallel slabs (see <see cref="SimplifyParallel"/>).</summary>
+    public const int ParallelThreshold = 1_500_000;
+
     /// <summary>Reduce <paramref name="faces"/> to about <paramref name="targetFaces"/>; returns compacted positions and faces.</summary>
     public static (float[] Positions, int[] Faces) Simplify(float[] positions, int[] faces, int targetFaces)
     {
+        if (faces.Length / 3 > ParallelThreshold && faces.Length / 3 > targetFaces * 2 && Environment.ProcessorCount > 1)
+            return SimplifyParallel(positions, faces, targetFaces);
+        var r = SimplifyCore(positions, faces, targetFaces, null);
+        return (r.Positions, r.Faces);
+    }
+
+    /// <summary>
+    /// The mesh is cut into slabs of equal face count along its longest axis; each slab is simplified on its own thread with the vertices it
+    /// shares with other slabs frozen (they can absorb a neighbour but never move or merge with each other); the slabs are stitched back
+    /// together and one global pass finishes the job (the frozen seams, and the reduction from the interim size to the target).
+    /// </summary>
+    public static (float[] Positions, int[] Faces) SimplifyParallel(float[] positions, int[] faces, int targetFaces)
+    {
         int nv = positions.Length / 3, nf = faces.Length / 3;
-        if (nf <= targetFaces) return (positions, faces);
+        var prof = Environment.GetEnvironmentVariable("TRELLIS2_MESHPROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew();
+        int parts = Math.Min(Environment.ProcessorCount, 16);
+
+        // slab assignment: histogram of face centroids along the longest axis
+        float[] lo = { float.MaxValue, float.MaxValue, float.MaxValue }, hi = { float.MinValue, float.MinValue, float.MinValue };
+        for (int v = 0; v < nv; v++) for (int k = 0; k < 3; k++) { float c = positions[v * 3 + k]; if (c < lo[k]) lo[k] = c; if (c > hi[k]) hi[k] = c; }
+        int axis = 0; for (int k = 1; k < 3; k++) if (hi[k] - lo[k] > hi[axis] - lo[axis]) axis = k;
+        const int bins = 4096; var hist = new int[bins]; var faceBin = new int[nf];
+        float scale = bins / Math.Max(hi[axis] - lo[axis], 1e-12f);
+        for (int t = 0; t < nf; t++)
+        {
+            float c = (positions[faces[t * 3] * 3 + axis] + positions[faces[t * 3 + 1] * 3 + axis] + positions[faces[t * 3 + 2] * 3 + axis]) / 3f;
+            int bin = Math.Clamp((int)((c - lo[axis]) * scale), 0, bins - 1);
+            faceBin[t] = bin; hist[bin]++;
+        }
+        var binPart = new int[bins]; { long acc = 0; for (int b = 0; b < bins; b++) { binPart[b] = (int)Math.Min(parts - 1, acc * parts / nf); acc += hist[b]; } }
+        var facePart = new int[nf]; var partCount = new int[parts];
+        for (int t = 0; t < nf; t++) { facePart[t] = binPart[faceBin[t]]; partCount[facePart[t]]++; }
+
+        // vertices used by faces of more than one slab are frozen
+        var vpart = new int[nv]; Array.Fill(vpart, -1); var frozen = new bool[nv];
+        for (int t = 0; t < nf; t++)
+            for (int k = 0; k < 3; k++)
+            {
+                int v = faces[t * 3 + k], pt = facePart[t];
+                if (vpart[v] < 0) vpart[v] = pt; else if (vpart[v] != pt) frozen[v] = true;
+            }
+        var partFaces = new int[parts][]; { var fill = new int[parts]; for (int p = 0; p < parts; p++) partFaces[p] = new int[partCount[p]]; for (int t = 0; t < nf; t++) partFaces[facePart[t]][fill[facePart[t]]++] = t; }
+        if (prof) { Console.WriteLine($"  [simplify] split into {parts} slabs {psw.Elapsed.TotalSeconds:F2}s"); psw.Restart(); }
+
+        double interim = Math.Min(1.0, targetFaces * 1.3 / nf);
+        var outPos = new float[parts][]; var outFaces = new int[parts][]; var outSrc = new int[parts][]; var outGlobal = new int[parts][];
+        Parallel.For(0, parts, new ParallelOptions { MaxDegreeOfParallelism = parts }, p =>
+        {
+            var fl = partFaces[p];
+            var ids = new int[fl.Length * 3];
+            for (int i = 0; i < fl.Length; i++) for (int k = 0; k < 3; k++) ids[i * 3 + k] = faces[fl[i] * 3 + k];
+            var uniq = (int[])ids.Clone(); Array.Sort(uniq);
+            int u = 0; for (int i = 0; i < uniq.Length; i++) if (i == 0 || uniq[i] != uniq[i - 1]) uniq[u++] = uniq[i];
+            Array.Resize(ref uniq, u);
+            var lp = new float[u * 3]; var frozenLocal = new bool[u];
+            for (int i = 0; i < u; i++) { int g = uniq[i]; lp[i * 3] = positions[g * 3]; lp[i * 3 + 1] = positions[g * 3 + 1]; lp[i * 3 + 2] = positions[g * 3 + 2]; frozenLocal[i] = frozen[g]; }
+            var lf = new int[ids.Length]; for (int i = 0; i < ids.Length; i++) lf[i] = Array.BinarySearch(uniq, ids[i]);
+            var r = SimplifyCore(lp, lf, (int)(fl.Length * interim), frozenLocal);
+            outPos[p] = r.Positions; outFaces[p] = r.Faces; outSrc[p] = r.Source; outGlobal[p] = uniq;
+        });
+        if (prof) { Console.WriteLine($"  [simplify] slabs done {psw.Elapsed.TotalSeconds:F2}s"); psw.Restart(); }
+
+        // stitch: frozen vertices keep one shared id, everything else is private to its slab
+        var gmap = new int[nv]; Array.Fill(gmap, -1);
+        int nvOut = 0, nfOut = 0;
+        for (int p = 0; p < parts; p++) nfOut += outFaces[p].Length / 3;
+        var mergedPos = new List<float>(); var mergedFaces = new int[nfOut * 3]; int fo = 0;
+        for (int p = 0; p < parts; p++)
+        {
+            var map = new int[outPos[p].Length / 3];
+            for (int i = 0; i < map.Length; i++)
+            {
+                int g = outGlobal[p][outSrc[p][i]];
+                if (frozen[g])
+                {
+                    if (gmap[g] < 0) { gmap[g] = nvOut++; mergedPos.Add(outPos[p][i * 3]); mergedPos.Add(outPos[p][i * 3 + 1]); mergedPos.Add(outPos[p][i * 3 + 2]); }
+                    map[i] = gmap[g];
+                }
+                else { map[i] = nvOut++; mergedPos.Add(outPos[p][i * 3]); mergedPos.Add(outPos[p][i * 3 + 1]); mergedPos.Add(outPos[p][i * 3 + 2]); }
+            }
+            foreach (int v in outFaces[p]) mergedFaces[fo++] = map[v];
+        }
+        if (prof) { Console.WriteLine($"  [simplify] stitched {nfOut} faces {psw.Elapsed.TotalSeconds:F2}s"); psw.Restart(); }
+        var final = SimplifyCore(mergedPos.ToArray(), mergedFaces, targetFaces, null);
+        return (final.Positions, final.Faces);
+    }
+
+    private static (float[] Positions, int[] Faces, int[] Source) SimplifyCore(float[] positions, int[] faces, int targetFaces, bool[]? locked)
+    {
+        int nv = positions.Length / 3, nf = faces.Length / 3;
+        if (nf <= targetFaces) { var identity = new int[nv]; for (int i = 0; i < nv; i++) identity[i] = i; return (positions, faces, identity); }
         var prof = Environment.GetEnvironmentVariable("TRELLIS2_MESHPROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew();
 
         var pos = new double[nv * 3];
@@ -72,7 +164,8 @@ public static class MeshSimplifier
                 int a = f[t * 3 + k], b = f[t * 3 + (k + 1) % 3];
                 if (a > b) (a, b) = (b, a);
                 if (a == b || !IsFirstFace(vf, vfn, f, alive, a, b, t)) continue;
-                heap.Enqueue(new Edge(a, b, 0, 0), Cost(Q, pos, a, b, qs, out _, out _, out _));
+                double c0 = Cost(Q, pos, a, b, qs, locked, out _, out _, out _);
+                if (!double.IsPositiveInfinity(c0)) heap.Enqueue(new Edge(a, b, 0, 0), c0);
             }
 
         if (prof) { Console.WriteLine($"  [simplify] setup {psw.Elapsed.TotalSeconds:F2}s, {heap.Count} edges"); psw.Restart(); }
@@ -82,11 +175,12 @@ public static class MeshSimplifier
         {
             popped++;
             if (dead[e.A] || dead[e.B] || ver[e.A] != e.VerA || ver[e.B] != e.VerB) { stale++; continue; }
-            Cost(Q, pos, e.A, e.B, qs, out double px, out double py, out double pz);
+            if (double.IsPositiveInfinity(Cost(Q, pos, e.A, e.B, qs, locked, out double px, out double py, out double pz))) continue;
             if (!CanCollapse(pos, f, vf, vfn, alive, e.A, e.B, px, py, pz, na, nb)) { rejected++; continue; }
 
             // collapse B into A
             int a = e.A, b = e.B;
+            if (locked != null && locked[b] && !locked[a]) (a, b) = (b, a);      // a frozen vertex always survives
             pos[a * 3] = px; pos[a * 3 + 1] = py; pos[a * 3 + 2] = pz;
             for (int k = 0; k < 10; k++) Q[a * 10 + k] += Q[b * 10 + k];
             for (int i = 0; i < vfn[b]; i++)
@@ -107,7 +201,8 @@ public static class MeshSimplifier
             foreach (int n in nbr)                         // ver[a] was bumped: every queued edge touching a is stale, these replace them
             {
                 int lo = Math.Min(a, n), hi = Math.Max(a, n);
-                heap.Enqueue(new Edge(lo, hi, ver[lo], ver[hi]), Cost(Q, pos, lo, hi, qs, out _, out _, out _));
+                double c1 = Cost(Q, pos, lo, hi, qs, locked, out _, out _, out _);
+                if (!double.IsPositiveInfinity(c1)) heap.Enqueue(new Edge(lo, hi, ver[lo], ver[hi]), c1);
             }
         }
 
@@ -120,10 +215,10 @@ public static class MeshSimplifier
             if (!alive[t]) continue;
             for (int k = 0; k < 3; k++) { int v = f[t * 3 + k]; if (map[v] < 0) map[v] = used++; outFaces[fi++] = map[v]; }
         }
-        var outPos = new float[used * 3];
+        var outPos = new float[used * 3]; var source = new int[used];
         for (int v = 0; v < nv; v++)
-            if (map[v] >= 0) { outPos[map[v] * 3] = (float)pos[v * 3]; outPos[map[v] * 3 + 1] = (float)pos[v * 3 + 1]; outPos[map[v] * 3 + 2] = (float)pos[v * 3 + 2]; }
-        return (outPos, outFaces);
+            if (map[v] >= 0) { source[map[v]] = v; outPos[map[v] * 3] = (float)pos[v * 3]; outPos[map[v] * 3 + 1] = (float)pos[v * 3 + 1]; outPos[map[v] * 3 + 2] = (float)pos[v * 3 + 2]; }
+        return (outPos, outFaces, source);
     }
 
     private static bool Has(int[] f, int t, int v) => f[t * 3] == v || f[t * 3 + 1] == v || f[t * 3 + 2] == v;
@@ -151,11 +246,18 @@ public static class MeshSimplifier
          + q[o + 7] * z * z + 2 * q[o + 8] * z + q[o + 9];
 
     /// <summary>Cost of collapsing a-b and the position to collapse to: the quadric minimiser when the system is well conditioned, else the best of the ends and midpoint.</summary>
-    private static double Cost(double[] Q, double[] pos, int a, int b, double[] q, out double x, out double y, out double z)
+    private static double Cost(double[] Q, double[] pos, int a, int b, double[] q, bool[]? locked, out double x, out double y, out double z)
     {
+        bool la = locked != null && locked[a], lb = locked != null && locked[b];
+        if (la && lb) { x = y = z = 0; return double.PositiveInfinity; }
         for (int k = 0; k < 10; k++) q[k] = Q[a * 10 + k] + Q[b * 10 + k];
         double ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2], bx = pos[b * 3], by = pos[b * 3 + 1], bz = pos[b * 3 + 2];
         double best = Err(q, 0, ax, ay, az); x = ax; y = ay; z = az;
+        if (la || lb)
+        {   // one end is frozen: the collapse lands exactly on it
+            if (lb) { x = bx; y = by; z = bz; best = Err(q, 0, bx, by, bz); }
+            return Math.Max(best, 0) + 1e-12 * (Math.Abs(ax - bx) + Math.Abs(ay - by) + Math.Abs(az - bz));
+        }
         double eb = Err(q, 0, bx, by, bz); if (eb < best) { best = eb; x = bx; y = by; z = bz; }
         double mx = (ax + bx) * 0.5, my = (ay + by) * 0.5, mz = (az + bz) * 0.5;
         double em = Err(q, 0, mx, my, mz); if (em < best) { best = em; x = mx; y = my; z = mz; }

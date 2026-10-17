@@ -25,6 +25,11 @@ public sealed class Trellis2Options
     public int Seed { get; init; } = 42;
     /// <summary>Side of the baked textures in texels.</summary>
     public int TextureSize { get; init; } = 2048;
+    /// <summary>
+    /// 512 (default, ~40 s on an RTX 4070, 3 GB) or 1024 (the 1024 pipeline of TRELLIS.2: four times the voxels, finer detail; minutes, several GB, needs the two
+    /// 1024 flow checkpoints next to the 512 ones). The sparse structure comes from the 512 px features either way.
+    /// </summary>
+    public int Resolution { get; init; } = 512;
     /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh, 1-2.5M triangles). Measured on the official crown: 120k looks the same as 300k; at 40-50k thin sheets shred and texels go missing.</summary>
     public int MaxFaces { get; init; } = 150_000;
 }
@@ -73,16 +78,32 @@ public sealed class Trellis2ImageTo3D : IDisposable
         using var image = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 512);
         StageDone?.Invoke("image prep", sw.Elapsed.TotalSeconds); sw.Restart();
 
+        if (options.Resolution != 512 && options.Resolution != 1024) throw new ArgumentException("Resolution must be 512 or 1024");
         const int tokens = 1 + 4 + 32 * 32;
         using var cond = _acc.Allocate1D<float>((long)tokens * 1024);
+        MemoryBuffer1D<float, Stride1D.Dense>? cond1024 = null;
+        const int tokens1024 = 1 + 4 + 64 * 64;
+        try
         {
-            using var w = GpuWeights.LoadFile(_acc, _paths.DinoWeights);
-            using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
-            dino.Extract(image.View, 512, cond.View);
-        }
-        StageDone?.Invoke("dinov3 features", sw.Elapsed.TotalSeconds);
+            {   // the feature extractor's weights are released before the flows load
+                using var w = GpuWeights.LoadFile(_acc, _paths.DinoWeights);
+                using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
+                dino.Extract(image.View, 512, cond.View);
+                if (options.Resolution == 1024)
+                {
+                    // the same preprocessed image resampled to 1024 px for the shape / texture flows
+                    using var image1024 = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 1024);
+                    cond1024 = _acc.Allocate1D<float>((long)tokens1024 * 1024);
+                    dino.Extract(image1024.View, 1024, cond1024.View);
+                }
+            }
+            StageDone?.Invoke("dinov3 features", sw.Elapsed.TotalSeconds);
 
-        return pipeline.Run512(cond.View, tokens, options.Seed);
+            return options.Resolution == 512
+                ? pipeline.Run512(cond.View, tokens, options.Seed)
+                : pipeline.Run1024(cond.View, tokens, cond1024!.View, tokens1024, options.Seed);
+        }
+        finally { cond1024?.Dispose(); }
     }
 
     /// <summary>Managed pixels (desktop / oracle path).</summary>

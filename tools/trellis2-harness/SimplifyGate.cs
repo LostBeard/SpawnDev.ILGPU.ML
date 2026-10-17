@@ -34,7 +34,7 @@ internal static class SimplifyGate
         int failures = 0;
         void Check(bool ok, string what) { Console.WriteLine($"{(ok ? "PASS" : "FAIL")}  {what}"); if (!ok) failures++; }
 
-        foreach (var (major, minor, target) in new[] { (200, 100, 8000), (1200, 600, 300_000) })
+        foreach (var (major, minor, target) in new[] { (200, 100, 8000), (1200, 600, 300_000), (2000, 1000, 300_000) })
         {
             var (v, f) = Torus(major, minor);
             int f0 = f.Length / 3;
