@@ -80,7 +80,7 @@ public sealed class DiTKernels
     /// TRELLIS2_MMA=0. TRELLIS2_TILED=0 forces the one-thread-per-output reference kernel.
     /// </summary>
     public static bool EnableTiled = Environment.GetEnvironmentVariable("TRELLIS2_TILED") != "0";
-    internal bool UseTiled(int K) => EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads;
+    internal bool UseTiled(int K) => EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;   // WebGL has no shared memory
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledBf16;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _dummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyF;
@@ -410,7 +410,7 @@ public sealed class DiTKernels
         => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && headDim == MmaAttention.HeadDim;
     /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
     private bool UsesTiledAttention(int headDim)
-        => EnableTiled && (headDim == 128 || headDim == 64) && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4;
+        => EnableTiled && (headDim == 128 || headDim == 64) && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4 && _acc.AcceleratorType != AcceleratorType.WebGL;
     private readonly Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledCross = new Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[4];
     private readonly Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledSelf = new Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[4];
     /// <summary>Null until the first attention: whether this backend compiles warp shuffles (NVIDIA's OpenCL does not; browsers need the subgroups feature).</summary>

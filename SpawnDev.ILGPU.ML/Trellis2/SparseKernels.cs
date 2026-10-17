@@ -357,7 +357,7 @@ public sealed class SparseKernels
     }
 
     // Portable register-tiled path for every backend without the tensor-core kernels (see DiTKernels.UseTiled).
-    private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads;
+    private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledLinear, _tiledGather;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _tiledDummyF;
