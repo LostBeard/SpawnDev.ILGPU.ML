@@ -108,7 +108,9 @@ public sealed class Trellis2ImageTo3D : IDisposable
 
             return options.Resolution == 512
                 ? pipeline.Run512(cond.View, tokens, options.Seed)
-                : pipeline.Run1024(cond.View, tokens, cond1024!.View, tokens1024, options.Seed);
+                : (Environment.GetEnvironmentVariable("TRELLIS2_EXP_COND512") == "1"
+                    ? pipeline.Run1024(cond.View, tokens, cond.View, tokens, options.Seed)
+                    : pipeline.Run1024(cond.View, tokens, cond1024!.View, tokens1024, options.Seed));
         }
         finally { cond1024?.Dispose(); }
     }

@@ -244,6 +244,15 @@ public sealed class Trellis2Pipeline : IDisposable
             using var modelIn = _acc.Allocate1D<float>((long)n0 * dit.InChannels);
             using var vOut = _acc.Allocate1D<float>(count);
             Stage("tex flow load", sw);
+            string dumpTex = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_TEX") ?? "";
+            if (dumpTex.Length > 0)
+            {   // debug: everything the texture stage consumes, to rerun it in the reference (reference/golden_tex_stage.py)
+                Directory.CreateDirectory(dumpTex); _acc.Synchronize();
+                void DumpF(string name, FV v, long n) { var a = v.SubView(0, n).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpTex, name), b); }
+                var cc = coords32.View.SubView(0, (long)n0 * 3).GetAsArray1D(); var cb = new byte[cc.Length * 4]; Buffer.BlockCopy(cc, 0, cb, 0, cb.Length);
+                File.WriteAllBytes(Path.Combine(dumpTex, "coords.i32"), cb);
+                DumpF("noise.f32", texSlat.View, count); DumpF("shape_slat.f32", shapeSlat.View, (long)n0 * 32); DumpF("cond.f32", cond, (long)condTokens * 1024);
+            }
             // the model sees [x_t | shape slat] (sparse_cat([x, concat_cond])); only the first 32 channels are integrated
             _sampler.Sample((xv, t1000, useCond, v) =>
             {
@@ -252,6 +261,7 @@ public sealed class Trellis2Pipeline : IDisposable
             }, texSlat.View, count, _texOpts);
             Stage("tex flow sample", sw);
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] tex: {Moments(texSlat.View, count)}");
+            { var dt = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_TEX") ?? ""; if (dt.Length > 0) { _acc.Synchronize(); var a = texSlat.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dt, "tex_slat.f32"), b); } }
         }
         shapeSlat.Dispose();
 

@@ -63,7 +63,7 @@ internal static class GenerateRun
         byte[] glb;
         var mf = Environment.GetEnvironmentVariable("TRELLIS2_MAXFACES");
         var rs = Environment.GetEnvironmentVariable("TRELLIS2_RES");
-        var options = new Trellis2Options { MaxFaces = mf != null ? int.Parse(mf) : new Trellis2Options().MaxFaces, Resolution = rs != null ? int.Parse(rs) : 512 };
+        var options = new Trellis2Options { MaxFaces = mf != null ? int.Parse(mf) : new Trellis2Options().MaxFaces, Resolution = rs != null ? int.Parse(rs) : 512, Seed = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_SEED"), out var sd) ? sd : 42 };
         if (Environment.GetEnvironmentVariable("TRELLIS2_DUMP") == "1")
         {
             // debug preview data: voxel centres + PBR attributes (read by reference/preview_voxels.py)
