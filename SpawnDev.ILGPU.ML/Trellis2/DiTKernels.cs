@@ -38,11 +38,28 @@ public sealed class DiTKernels
         o[i] = Activate(acc, act);
     }
 
+    /// <summary>
+    /// Tensor-core path for <see cref="Linear"/> (CUDA, bf16 mma.sync, activations rounded to bf16 as the
+    /// reference does). TRELLIS2_MMA=0 forces the fp32 reference kernel: the A/B for any numerical question.
+    /// </summary>
+    public static bool EnableTensorCores = Environment.GetEnvironmentVariable("TRELLIS2_MMA") != "0";
+    private Action<KernelConfig, FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int, int, int, int>? _mmaLinear;
+
+    private bool UseMma(int M, int K, int N)
+        => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16;
+
     /// <summary>nn.Linear with a bf16 weight [N,K] and optional bf16 bias [N]; x is [M,K] fp32.</summary>
     public void Linear(FV x, BV w, BV? bias, FV o, int M, int K, int N, Act act = Act.None)
     {
-        _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         var b = bias ?? w.SubView(0, 1);   // never read when hasBias == 0
+        if (UseMma(M, K, N))
+        {
+            _mmaLinear ??= _acc.LoadStreamKernel<FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int, int, int, int>(MmaGemm.Kernel);
+            int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
+            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x, w.Cast<BFloat16, uint>(), b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
+            return;
+        }
+        _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
     }
 
@@ -264,6 +281,29 @@ public sealed class DiTKernels
         float acc = 0f;
         for (int j = 0; j < Nk; j++) acc += p[pb + j] * v[(long)j * vStride + vOff + h * D + d];
         o[idx] = acc;
+    }
+
+    private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>? _flash;
+
+    /// <summary>True when <see cref="Attention"/> runs the flash kernel (no score matrix, <c>scores</c> may be default).</summary>
+    public bool UsesFlashAttention(int headDim)
+        => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && headDim == MmaAttention.HeadDim;
+
+    /// <summary>
+    /// Multi-head attention, no mask. q at q[i*qStride + qOff + h*D], k at kv[j*kvStride + kOff + h*D], v at
+    /// kv[j*kvStride + vOff + h*D]; o is [Nq, H*D]. Flash kernel on CUDA (bf16 tensor cores, O(1) extra memory);
+    /// otherwise the reference kernels, which need <paramref name="scores"/> to hold H*Nq*Nk floats.
+    /// </summary>
+    public void Attention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
+    {
+        if (UsesFlashAttention(D))
+        {
+            _flash ??= _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(MmaAttention.Kernel);
+            _flash(new KernelConfig(((Nq + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
+                q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+            return;
+        }
+        ReferenceAttention(q, qStride, qOff, kv, kvStride, kOff, vOff, scores, o, Nq, Nk, H, D);
     }
 
     /// <summary>scores must hold H*Nq*Nk floats. o is [Nq, H*D].</summary>

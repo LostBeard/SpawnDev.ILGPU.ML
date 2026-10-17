@@ -92,7 +92,7 @@ public sealed class SparseStructureFlow : IDisposable
         using var attn = Alloc((long)N * C);
         using var proj = Alloc((long)N * C);
         using var mlp = Alloc((long)N * _hidden);
-        using var scores = Alloc((long)H * N * Math.Max(N, condTokens));
+        using var scores = Alloc(_k.UsesFlashAttention(D) ? 1 : (long)H * N * Math.Max(N, condTokens));
 
         for (int b = 0; b < _blocks; b++)
         {
@@ -104,7 +104,7 @@ public sealed class SparseStructureFlow : IDisposable
             _k.Linear(hn.View, _w.BF16(p + "self_attn.to_qkv.weight"), _w.BF16(p + "self_attn.to_qkv.bias"), qkv.View, N, C, 3 * C);
             _k.HeadNorm(qkv.View, _w.BF16(p + "self_attn.q_rms_norm.gamma"), _phases.View, N, 3 * C, 0 * C, H, D);
             _k.HeadNorm(qkv.View, _w.BF16(p + "self_attn.k_rms_norm.gamma"), _phases.View, N, 3 * C, 1 * C, H, D);
-            _k.ReferenceAttention(qkv.View, 3 * C, 0, qkv.View, 3 * C, 1 * C, 2 * C, scores.View, attn.View, N, N, H, D);
+            _k.Attention(qkv.View, 3 * C, 0, qkv.View, 3 * C, 1 * C, 2 * C, scores.View, attn.View, N, N, H, D);
             _k.Linear(attn.View, _w.BF16(p + "self_attn.to_out.weight"), _w.BF16(p + "self_attn.to_out.bias"), proj.View, N, C, C);
             _k.GateResidual(h.View, proj.View, modv.View, 2 * C, N * C, C);
 
@@ -114,7 +114,7 @@ public sealed class SparseStructureFlow : IDisposable
             _k.Linear(cond, _w.BF16(p + "cross_attn.to_kv.weight"), _w.BF16(p + "cross_attn.to_kv.bias"), kv.View, condTokens, _condCh, 2 * C);
             _k.HeadNorm(q.View, _w.BF16(p + "cross_attn.q_rms_norm.gamma"), null, N, C, 0, H, D);
             _k.HeadNorm(kv.View, _w.BF16(p + "cross_attn.k_rms_norm.gamma"), null, condTokens, 2 * C, 0, H, D);
-            _k.ReferenceAttention(q.View, C, 0, kv.View, 2 * C, 0, C, scores.View, attn.View, N, condTokens, H, D);
+            _k.Attention(q.View, C, 0, kv.View, 2 * C, 0, C, scores.View, attn.View, N, condTokens, H, D);
             _k.Linear(attn.View, _w.BF16(p + "cross_attn.to_out.weight"), _w.BF16(p + "cross_attn.to_out.bias"), proj.View, N, C, C);
             _k.GateResidual(h.View, proj.View, modv.View, -1, N * C, C);
 
