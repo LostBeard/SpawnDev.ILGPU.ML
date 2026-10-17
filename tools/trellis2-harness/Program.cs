@@ -31,6 +31,7 @@ return command switch
     "simplify" => SimplifyGate.Run(),
     "loadbench" => LoadBench.Run(args[1]),
     "atlasmesh" => AtlasMeshRun.Run(args[1]),
+    "cluster" => ClusterProbe.Run(args[1]),
     "generate" => GenerateRun.Run(args[1], args[2]),
     "text2glb" => GenerateRun.Text(args[1], args[2]),
     "prep" => Golden.Prep(),

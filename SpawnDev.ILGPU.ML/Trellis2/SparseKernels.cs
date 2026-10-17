@@ -481,11 +481,45 @@ public sealed class SparseKernels
     /// <summary><see cref="ExclusiveScan"/> with an awaited readback of the total (browser-safe).</summary>
     public async Task<int> ExclusiveScanAsync(IV counts, int n, IV offsets)
     {
-        _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
-        _serialScan(1, counts, offsets, n);
+        using var temp = ScanDevice(counts, n, offsets);
         var total = await offsets.SubView(n, 1).CopyToHostAsync();   // one scalar: sizes the output buffers (waits for the scan)
         return total[0];
     }
+
+    // Blocked scan: one thread sums each block of ScanBlock, one thread scans the block sums, one thread per block writes its offsets.
+    // (A single-thread scan of the dual-grid edge flags, ~4M ints, is a latency-bound serial loop on the device.)
+    private const int ScanBlock = 1024;
+    private Action<Index1D, IV, IV, int>? _blockSum;
+    private static void BlockSumImpl(Index1D b, IV counts, IV sums, int n)
+    {
+        int start = b * ScanBlock, end = Math.Min(start + ScanBlock, n), s = 0;
+        for (int i = start; i < end; i++) s += counts[i];
+        sums[b] = s;
+    }
+    private Action<Index1D, IV, IV, IV, int>? _blockWrite;
+    private static void BlockWriteImpl(Index1D b, IV counts, IV blockOffsets, IV offsets, int n)
+    {
+        int start = b * ScanBlock, end = Math.Min(start + ScanBlock, n), run = blockOffsets[b];
+        for (int i = start; i < end; i++) { offsets[i] = run; run += counts[i]; }
+        if (end == n) offsets[n] = run;
+    }
+
+    /// <summary>Queue the scan; the returned temporaries must outlive the dispatches (dispose after the next awaited readback).</summary>
+    private IDisposable? ScanDevice(IV counts, int n, IV offsets)
+    {
+        _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
+        if (n <= ScanBlock * 4) { _serialScan(1, counts, offsets, n); return null; }
+        _blockSum ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(BlockSumImpl);
+        _blockWrite ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int>(BlockWriteImpl);
+        int nb = (n + ScanBlock - 1) / ScanBlock;
+        var sums = _acc.Allocate1D<int>(nb);                   // two buffers: WebGPU forbids binding one buffer twice in a dispatch
+        var blockOffsets = _acc.Allocate1D<int>(nb + 1L);
+        _blockSum(nb, counts, sums.View, n);
+        _serialScan(1, sums.View, blockOffsets.View, nb);
+        _blockWrite(nb, counts, blockOffsets.View, offsets, n);
+        return new ScanTemp(sums, blockOffsets);
+    }
+    private sealed class ScanTemp(IDisposable a, IDisposable b) : IDisposable { public void Dispose() { a.Dispose(); b.Dispose(); } }
 
     /// <summary>Per-voxel child offsets (n+1 entries; the last is the total) from the subdivision logits.</summary>
     public int CountChildren(FV logits, int n, IV offsets) => Task.Run(() => CountChildrenAsync(logits, n, offsets)).GetAwaiter().GetResult();
@@ -497,7 +531,7 @@ public sealed class SparseKernels
         _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
         using var counts = _acc.Allocate1D<int>(n);
         _subCount(n, logits, counts.View);
-        _serialScan(1, counts.View, offsets, n);
+        using var temp = ScanDevice(counts.View, n, offsets);
         var total = await offsets.SubView(n, 1).CopyToHostAsync();   // one scalar: sizes the output buffers (waits for both kernels)
         return total[0];
     }

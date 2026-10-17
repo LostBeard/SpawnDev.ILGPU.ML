@@ -107,6 +107,60 @@ public abstract partial class MLTestBase
         return $"tiled sparse conv {n} voxels {cin}->{cout} max |err| {maxErr:E2}";
     });
 
+    /// <summary>
+    /// Device mesh clustering (float atomics are CAS loops on WebGPU) on a finely tessellated sphere: the mesh must shrink a lot, every
+    /// output vertex must stay on the surface (curvature makes the coarse levels fail the error test, so this also proves cells are refused),
+    /// the area must survive and every face must be valid and non-degenerate.
+    /// </summary>
+    [TestMethod]
+    public async Task Trellis2_MeshClusterer_SphereStaysOnSurface() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        const int grid = 128, seg = 240, rings = 120;
+        const double R = 0.4;                                   // 51.2 voxels
+        var pos = new List<float>(); var tri = new List<int>();
+        pos.AddRange(new[] { 0f, (float)R, 0f });
+        for (int r = 1; r < rings; r++)
+        {
+            double th = Math.PI * r / rings;
+            for (int s = 0; s < seg; s++) { double ph = 2 * Math.PI * s / seg; pos.AddRange(new[] { (float)(R * Math.Sin(th) * Math.Cos(ph)), (float)(R * Math.Cos(th)), (float)(R * Math.Sin(th) * Math.Sin(ph)) }); }
+        }
+        pos.AddRange(new[] { 0f, (float)-R, 0f });
+        int south = pos.Count / 3 - 1;
+        int V(int r, int s) => 1 + (r - 1) * seg + (s % seg);
+        for (int s = 0; s < seg; s++) tri.AddRange(new[] { 0, V(1, s + 1), V(1, s) });
+        for (int r = 1; r < rings - 1; r++)
+            for (int s = 0; s < seg; s++) { tri.AddRange(new[] { V(r, s), V(r, s + 1), V(r + 1, s) }); tri.AddRange(new[] { V(r, s + 1), V(r + 1, s + 1), V(r + 1, s) }); }
+        for (int s = 0; s < seg; s++) tri.AddRange(new[] { south, V(rings - 1, s), V(rings - 1, s + 1) });
+        int nv = pos.Count / 3, nf = tri.Count / 3;
+        using var vb = accelerator.Allocate1D(pos.ToArray());
+        using var fb = accelerator.Allocate1D(tri.ToArray());
+        var (p, f) = await new MeshClusterer(accelerator, new SparseKernels(accelerator)).ClusterAsync(vb.View, nv, fb.View, nf, grid);
+        int outV = p.Length / 3, outF = f.Length / 3;
+        if (outF == 0 || outF > nf / 4) throw new Exception($"{nf} -> {outF} faces: expected at least a 4x reduction on {accelerator.AcceleratorType}");
+        double maxDev = 0;
+        for (int v = 0; v < outV; v++)
+        {
+            double r = Math.Sqrt(p[v * 3] * p[v * 3] + p[v * 3 + 1] * p[v * 3 + 1] + p[v * 3 + 2] * p[v * 3 + 2]);
+            if (double.IsNaN(r)) throw new Exception($"vertex {v} is NaN");
+            maxDev = Math.Max(maxDev, Math.Abs(r - R) * grid);
+        }
+        if (maxDev > 1.0) throw new Exception($"a clustered vertex is {maxDev:F2} voxels off the sphere on {accelerator.AcceleratorType}");
+        double area = 0;
+        for (int t = 0; t < outF; t++)
+        {
+            int a = f[t * 3], b = f[t * 3 + 1], c = f[t * 3 + 2];
+            if (a < 0 || b < 0 || c < 0 || a >= outV || b >= outV || c >= outV || a == b || b == c || a == c) throw new Exception($"face {t} invalid ({a},{b},{c})");
+            double ux = p[b * 3] - p[a * 3], uy = p[b * 3 + 1] - p[a * 3 + 1], uz = p[b * 3 + 2] - p[a * 3 + 2];
+            double wx = p[c * 3] - p[a * 3], wy = p[c * 3 + 1] - p[a * 3 + 1], wz = p[c * 3 + 2] - p[a * 3 + 2];
+            double cx = uy * wz - uz * wy, cy = uz * wx - ux * wz, cz = ux * wy - uy * wx;
+            area += 0.5 * Math.Sqrt(cx * cx + cy * cy + cz * cz);
+        }
+        double want = 4 * Math.PI * R * R;
+        if (Math.Abs(area - want) / want > 0.03) throw new Exception($"area {area:F5} vs sphere {want:F5} on {accelerator.AcceleratorType}");
+        return $"sphere {nf} -> {outF} faces, {outV} vertices, max deviation {maxDev:F3} voxels, area {area / want:P2}";
+    });
+
     [TestMethod]
     public async Task Trellis2_FlashAttention_MatchesHostReference() => await RunTest(async accelerator =>
     {

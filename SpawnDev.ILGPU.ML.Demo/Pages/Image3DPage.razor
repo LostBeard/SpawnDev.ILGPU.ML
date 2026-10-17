@@ -187,7 +187,13 @@
     private SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline? _rmbg;
     private Trellis2ImageTo3D? _trellis;
 
-    protected override void OnInitialized() => ModelSource.OnProgress += OnDownloadProgress;
+    [Inject] NavigationManager Nav { get; set; } = default!;
+
+    protected override void OnInitialized()
+    {
+        ModelSource.OnProgress += OnDownloadProgress;
+        if (Nav.Uri.Contains("/image-to-3d", StringComparison.OrdinalIgnoreCase)) _mode = "image";   // each route opens its own mode
+    }
 
     private async Task<bool> EnsureAcceleratorAsync()
     {

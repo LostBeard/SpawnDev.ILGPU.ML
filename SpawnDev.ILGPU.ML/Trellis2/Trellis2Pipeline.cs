@@ -279,6 +279,16 @@ public sealed class Trellis2Pipeline : IDisposable
     public async Task<byte[]> ToGlbAsync(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 150_000)
     {
         var sw = Stopwatch.StartNew();
+        if (maxFaces > 0 && PreCluster && output.Mesh.FaceCount > maxFaces * 2 && Environment.GetEnvironmentVariable("TRELLIS2_NOCLUSTER") != "1")
+        {
+            // coarsen on the device first (O(n)); the host's edge collapse then finishes from a fraction of the faces
+            int before = output.Mesh.FaceCount;
+            _clusterer ??= new MeshClusterer(_acc, _sk);
+            var (cp, cf) = await _clusterer.ClusterAsync(output.Mesh.Vertices.View, output.Mesh.VertexCount,
+                output.Mesh.Faces.View.SubView(0, (long)before * 3), before, output.Grid, ClusterOptions);
+            StageDone?.Invoke($"cluster {before} -> {cf.Length / 3} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+            return await FinishGlbAsync(output, cp, cf, textureSize, dilation, maxFaces, sw);
+        }
         var verts = await output.Mesh.Vertices.View.CopyToHostAsync();
         var faces0 = await output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).CopyToHostAsync();
         // keep only referenced vertices
@@ -290,6 +300,17 @@ public sealed class Trellis2Pipeline : IDisposable
             if (remap[v] >= 0) { positions[remap[v] * 3] = verts[v * 3]; positions[remap[v] * 3 + 1] = verts[v * 3 + 1]; positions[remap[v] * 3 + 2] = verts[v * 3 + 2]; }
         var faces = new int[faces0.Length];
         for (int i = 0; i < faces.Length; i++) faces[i] = remap[faces0[i]];
+        return await FinishGlbAsync(output, positions, faces, textureSize, dilation, maxFaces, sw);
+    }
+
+    /// <summary>Coarsen the dual-grid mesh on the device (<see cref="MeshClusterer"/>) before the host edge collapse. Default on.</summary>
+    public bool PreCluster { get; set; } = true;
+    /// <summary>Thresholds of the device pre-pass (null = defaults).</summary>
+    public MeshClusterer.Options? ClusterOptions { get; set; }
+    private MeshClusterer? _clusterer;
+
+    private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw)
+    {
         if (maxFaces > 0 && faces.Length / 3 > maxFaces)
         {
             int before = faces.Length / 3;
