@@ -27,7 +27,9 @@ public sealed class Trellis2Options
     public int TextureSize { get; init; } = 2048;
     /// <summary>
     /// 512 (default, ~40 s on an RTX 4070, 3 GB) or 1024 (the 1024 pipeline of TRELLIS.2: four times the voxels, finer detail; minutes, several GB, needs the two
-    /// 1024 flow checkpoints next to the 512 ones). The sparse structure comes from the 512 px features either way.
+    /// 1024 flow checkpoints next to the 512 ones). The sparse structure comes from the 512 px features either way. The 1024 path matches the reference
+    /// sampler on identical inputs (texture latent relRMS 0.9%) but its texture latent is less spread than the 512 one (std 0.68 vs 0.85), so colours come
+    /// out paler: use 512 for colour fidelity, 1024 for fine geometry.
     /// </summary>
     public int Resolution { get; init; } = 512;
     /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh, 1-2.5M triangles). Measured on the official crown: 120k looks the same as 300k; at 40-50k thin sheets shred and texels go missing.</summary>
