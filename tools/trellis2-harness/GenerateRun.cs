@@ -90,12 +90,9 @@ internal static class GenerateRun
             var prevPx = new uint[m.Length]; Buffer.BlockCopy(m, 0, prevPx, 0, m.Length * 4);
             File.WriteAllBytes(Path.ChangeExtension(outGlb, ".masked.png"), PngEncoder.EncodeRgba8(prevPx, w, h));
         }
-        using var gen = new Trellis2ImageTo3D(accel, new Trellis2Paths
-        {
-            ModelDir = Path.Combine(Gpu.WeightDir, "TRELLIS.2-4B"),
-            SparseStructureDecoder = Path.Combine(Gpu.WeightDir, "TRELLIS-image-large", "ckpts", "ss_dec_conv3d_16l8_fp16"),
-            DinoWeights = Path.Combine(Gpu.WeightDir, "dinov3-timm-qkvb", "model.safetensors"),
-        });
+        // TRELLIS2_SOURCE=stream: load through Trellis2Weights.FromModelSource (the browser path: streamed, non-seekable reads)
+        var weights = Environment.GetEnvironmentVariable("TRELLIS2_SOURCE") == "stream" ? Trellis2Weights.FromModelSource(new LocalFolderSource()) : Trellis2Weights.FromFiles(Paths());
+        using var gen = new Trellis2ImageTo3D(accel, weights);
         gen.StageDone = (name, sec) => Console.WriteLine($"  {name,-32} {sec,7:F2}s   (peak so far {peak - baseline} MiB over baseline)");
         byte[] glb;
         var mf = Environment.GetEnvironmentVariable("TRELLIS2_MAXFACES");

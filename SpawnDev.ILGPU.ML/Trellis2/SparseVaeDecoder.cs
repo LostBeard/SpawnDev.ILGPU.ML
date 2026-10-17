@@ -72,6 +72,10 @@ public sealed class SparseVaeDecoder : IDisposable
     /// texture decoder follows that structure; otherwise the subdivisions are predicted, and kept when <paramref name="keepSubdivisions"/>.
     /// </summary>
     public Result Decode(FV latent, IV coords0, int n0, int grid0, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide = null, bool keepSubdivisions = false, bool forceGuide = false)
+        => Task.Run(() => DecodeAsync(latent, coords0, n0, grid0, guide, keepSubdivisions, forceGuide)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="Decode"/>, browser-safe (the child counts are awaited readbacks).</summary>
+    public async Task<Result> DecodeAsync(FV latent, IV coords0, int n0, int grid0, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide = null, bool keepSubdivisions = false, bool forceGuide = false)
     {
         // forceGuide (tests): a pred_subdiv decoder still computes its own logits (tapped as "level{i}_subdiv") but takes the
         // STRUCTURE from the guide, so a low-precision run cannot diverge from the reference voxel sets by one flipped logit.
@@ -135,7 +139,7 @@ public sealed class SparseVaeDecoder : IDisposable
             xn.Dispose();
 
             using var offsets = I(n + 1);
-            int m = _sk.CountChildren(subdiv.View, n, offsets.View);
+            int m = await _sk.CountChildrenAsync(subdiv.View, n, offsets.View);
             var newCoords = I((long)m * 3); using var parent = I(m); using var slot = I(m);
             _sk.WriteChildren(subdiv.View, offsets.View, coords.View, n, newCoords.View, parent.View, slot.View);
             var h2 = F((long)m * outC);
@@ -172,7 +176,7 @@ public sealed class SparseVaeDecoder : IDisposable
         var outF = F((long)n * _outCh);
         _sk.Linear(ln.View, _w.F16("output_layer.weight"), _w.F16("output_layer.bias"), outF.View, n, last, _outCh);
         ln.Dispose();
-        _acc.Synchronize();
+        _acc.Fence();
         result.Feats = outF; result.Coords = coords; result.Count = n; result.Channels = _outCh; result.Grid = grid;
         Tap?.Invoke("out", outF.View, coords.View, n, _outCh);
         return result;

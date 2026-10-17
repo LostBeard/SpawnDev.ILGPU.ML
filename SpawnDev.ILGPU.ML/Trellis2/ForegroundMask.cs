@@ -105,7 +105,10 @@ public sealed class ForegroundMask : IDisposable
     /// <summary>
     /// Returns a copy of <paramref name="rgba"/> [w*h] whose alpha is the predicted foreground mask (caller disposes).
     /// </summary>
-    public MemoryBuffer1D<int, Stride1D.Dense> Apply(IV rgba, int w, int h)
+    public MemoryBuffer1D<int, Stride1D.Dense> Apply(IV rgba, int w, int h) => Task.Run(() => ApplyAsync(rgba, w, h)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="Apply"/>, browser-safe.</summary>
+    public async Task<MemoryBuffer1D<int, Stride1D.Dense>> ApplyAsync(IV rgba, int w, int h)
     {
         _resizeRgb ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, int, int>(ResizeRgbImpl);
         _maxBits ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, int>(MaxBitsImpl);
@@ -118,17 +121,17 @@ public sealed class ForegroundMask : IDisposable
         _maxBits(Size * Size * 3, hwc.View, maxBits.View, 0);
         using var chw = _acc.Allocate1D<float>((long)3 * Size * Size);
         _normalize(3 * Size * Size, hwc.View, chw.View, maxBits.View);
-        var outputs = _session.RunAsync(new Dictionary<string, Tensor>
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = new Tensor(chw.View, new[] { 1, 3, Size, Size }),
-        }).GetAwaiter().GetResult();
+        });
         var mask = outputs[_session.OutputNames[0]];
         int n = Size * Size;
         using var mm = _acc.Allocate1D(new[] { int.MaxValue, int.MinValue });
         _minMaxBits(n, mask.Data.SubView(0, n), mm.View, n);
         var result = _acc.Allocate1D<int>((long)w * h);
         _apply(w * h, rgba, mask.Data.SubView(0, n), mm.View, result.View, w, h, Size);
-        _acc.Synchronize();
+        _acc.Fence();
         return result;
     }
 

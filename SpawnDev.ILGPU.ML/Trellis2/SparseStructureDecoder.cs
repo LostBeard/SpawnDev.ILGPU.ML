@@ -140,7 +140,7 @@ public sealed class SparseStructureDecoder : IDisposable
         _sk.SiluInPlace(t1.View, n * c);
         var logits = F(n);
         ConvLayer(t1.View, nbr.View, "out_layer.2.weight", "out_layer.2.bias", logits.View, n, c, 1);
-        _acc.Synchronize();
+        _acc.Fence();
         x.Dispose(); t1.Dispose(); t2.Dispose(); nbr.Dispose();
         return logits;
     }

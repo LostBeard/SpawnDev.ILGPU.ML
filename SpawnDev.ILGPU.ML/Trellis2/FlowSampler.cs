@@ -160,7 +160,7 @@ public sealed class FlowSampler
                 }
             }
             _axpy(count, x, pred.View, (float)(t - tPrev));
-            _acc.Synchronize();
+            _acc.Fence();
             progress?.Invoke(step + 1, steps.Length);
         }
     }

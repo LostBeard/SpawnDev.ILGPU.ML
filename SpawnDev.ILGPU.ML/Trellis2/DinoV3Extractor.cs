@@ -149,7 +149,7 @@ public sealed class DinoV3Extractor : IDisposable
             }
             _layers[i] = l;
         }
-        _acc.Synchronize();
+        _acc.Fence();
     }
 
     /// <summary>
@@ -195,7 +195,7 @@ public sealed class DinoV3Extractor : IDisposable
             _dk.GateResidual(h.View, proj.View, l.Scale2, 0, N * C, C);
         }
         _dk.LayerNormPlain(h.View, o, N, C, 1e-5f);                                  // F.layer_norm(hidden_states, hidden_states.shape[-1:])
-        _acc.Synchronize();
+        _acc.Fence();
     }
 
     public void Dispose()

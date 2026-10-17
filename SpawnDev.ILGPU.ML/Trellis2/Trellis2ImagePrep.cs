@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
@@ -116,6 +117,10 @@ public sealed class Trellis2ImagePrep
     /// Throws when the image has no transparency (no foreground mask).
     /// </summary>
     public MemoryBuffer1D<float, Stride1D.Dense> Prepare(IV rgba, int width, int height, int outSize = 512)
+        => Task.Run(() => PrepareAsync(rgba, width, height, outSize)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="Prepare"/>, browser-safe (the crop box is an awaited readback).</summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> PrepareAsync(IV rgba, int width, int height, int outSize = 512)
     {
         _box ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(BoxImpl);
         _cropPremul ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, int, int, int, int, int>(CropPremulImpl);
@@ -124,9 +129,7 @@ public sealed class Trellis2ImagePrep
         _normalize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(NormalizeImpl);
         using var box = _acc.Allocate1D(new[] { int.MaxValue, int.MaxValue, -1, -1, 0 });
         _box(width * height, rgba, box.View, width);
-        _acc.Synchronize();
-        var b = new int[5];
-        box.View.CopyToCPU(b);                                  // five scalars decide the crop
+        var b = await box.View.CopyToHostAsync();               // five scalars decide the crop
         if (b[4] == 0) throw new NotSupportedException("the image is fully opaque: it has no foreground mask (run background removal first)");
         if (b[2] < 0) throw new InvalidOperationException("no pixel has alpha > 0.8: the mask is empty");
         // bbox from the pixels, then the square crop exactly as the reference computes it (Pillow rounds the float box half to even)
@@ -144,7 +147,7 @@ public sealed class Trellis2ImagePrep
         _resizeV(outSize * outSize, horiz.View, vert.View, ch, outSize, outSize);
         var result = _acc.Allocate1D<float>(3L * outSize * outSize);
         _normalize(3 * outSize * outSize, vert.View, result.View, outSize);
-        _acc.Synchronize();
+        _acc.Fence();
         return result;
     }
 

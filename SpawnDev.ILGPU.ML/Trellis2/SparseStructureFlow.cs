@@ -50,7 +50,7 @@ public sealed class SparseStructureFlow : IDisposable
         _k.Transpose(x, _tokIn!.View, _dit.InChannels, n);                  // [C, N] -> [N, C]
         _dit.Forward(_tokIn.View, t, cond, condTokens, _tokOut!.View);
         _k.Transpose(_tokOut.View, o, n, _dit.OutChannels);                 // [N, C] -> [C, N]
-        _acc.Synchronize();
+        _acc.Fence();
     }
 
     public void Dispose()

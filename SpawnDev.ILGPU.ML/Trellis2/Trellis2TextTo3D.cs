@@ -65,7 +65,7 @@ public sealed class Trellis2TextTo3D : IDisposable
                 Buffer.BlockCopy(candidate.ImageRGBA, 0, px, 0, px.Length * 4);
                 for (int i = 0; i < px.Length; i++) px[i] |= unchecked((int)0xFF000000);   // opaque: the mask decides the cut-out
                 using var rgba = RgbaUpload.FromManaged(_acc, px, candidate.Width, candidate.Height);
-                var c = mask.Apply(rgba.View, candidate.Width, candidate.Height);
+                var c = await mask.ApplyAsync(rgba.View, candidate.Width, candidate.Height);
                 double touch = await BorderTouch(c, candidate.Width, candidate.Height);
                 StageDone?.Invoke($"image seed {imageSeed + attempt} (cut-out on the border {touch:P1})", sw.Elapsed.TotalSeconds); sw.Restart();
                 if (touch < bestTouch) { cut?.Dispose(); cut = c; img = candidate; bestTouch = touch; LastImageSeed = imageSeed + attempt; }
@@ -76,7 +76,7 @@ public sealed class Trellis2TextTo3D : IDisposable
         LastImage = img;
         if (!KeepImageModelLoaded) { await _acc.SynchronizeAsync(); _image.Dispose(); _image = null; }
         using (cut!)
-            return _to3D.GenerateGlb(cut!.View, img!.Width, img.Height, options);
+            return await _to3D.GenerateGlbAsync(cut!.View, img!.Width, img.Height, options);
     }
 
     /// <summary>Fraction of the outermost 2-pixel ring of the image that the cut-out covers (alpha above half).</summary>

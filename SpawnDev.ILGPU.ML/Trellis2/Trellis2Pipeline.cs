@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU;
 
 namespace SpawnDev.ILGPU.ML.Trellis2;
 
@@ -34,7 +35,7 @@ public sealed class Trellis2Pipeline : IDisposable
     public Action<string, double>? StageDone { get; set; }
 
     private readonly Accelerator _acc;
-    private readonly string _ckpts, _ssDecoderBase;
+    private readonly Trellis2Weights _weights;
     private readonly DiTKernels _dk;
     private readonly SparseKernels _sk;
     private readonly FlowSampler _sampler;
@@ -45,11 +46,19 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <param name="modelDir">The TRELLIS.2-4B folder (pipeline.json, ckpts/).</param>
     /// <param name="ssDecoderBase">Path without extension of the TRELLIS-image-large ss_dec_conv3d_16l8_fp16 checkpoint.</param>
     public Trellis2Pipeline(Accelerator accelerator, string modelDir, string ssDecoderBase)
+        : this(accelerator, Trellis2Weights.FromFiles(new Trellis2Paths { ModelDir = modelDir, SparseStructureDecoder = ssDecoderBase }),
+               File.ReadAllText(Path.Combine(modelDir, "pipeline.json"))) { }
+
+    /// <summary>Create from any weight source (files, or the hub / OPFS in the browser): reads pipeline.json first.</summary>
+    public static async Task<Trellis2Pipeline> CreateAsync(Accelerator accelerator, Trellis2Weights weights, CancellationToken ct = default)
+        => new Trellis2Pipeline(accelerator, weights, await weights.ReadPipelineJsonAsync(ct));
+
+    private Trellis2Pipeline(Accelerator accelerator, Trellis2Weights weights, string pipelineJson)
     {
-        _acc = accelerator; _ckpts = Path.Combine(modelDir, "ckpts"); _ssDecoderBase = ssDecoderBase;
+        _acc = accelerator; _weights = weights;
         _dk = new DiTKernels(accelerator); _sk = new SparseKernels(accelerator);
         _sampler = new FlowSampler(accelerator); _mesher = new DualGridMesher(accelerator, _sk);
-        using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(modelDir, "pipeline.json")));
+        using var json = JsonDocument.Parse(pipelineJson);
         var a = json.RootElement.GetProperty("args");
         FlowSampler.Options Sampler(string name)
         {
@@ -74,41 +83,8 @@ public sealed class Trellis2Pipeline : IDisposable
         double mean = s / a.Length; return $"mean {mean:F3} std {Math.Sqrt(s2 / a.Length - mean * mean):F3} max {mx:F2}";
     }
 
-    private Task _prefetch = Task.CompletedTask;
-
-    private string Ckpt(string name) => Path.Combine(_ckpts, name + ".safetensors");
-    private string SsFlowFile => Ckpt("ss_flow_img_dit_1_3B_64_bf16");
-    private string SsDecFile => _ssDecoderBase + ".safetensors";
-
-    /// <summary>
-    /// Read checkpoint files on a background thread, queued behind earlier requests, so they are in the operating system's file cache by the time
-    /// a stage uploads them (measured: a cold read of the 2.4 GB flow checkpoint is ~2.5 s, a cached one ~0.3 s). Host file reads only: no device
-    /// work, no memory kept. The pipeline asks for each stage's files one stage ahead, not all at once: the checkpoints add up to more than the
-    /// free RAM of a small machine, and files read too early are evicted before they are used. <see cref="Run512"/> asks for the first stage itself;
-    /// a caller with time before it (the image features) can call this with the first file earlier.
-    /// </summary>
-    public void PrefetchWeights(params string[] files)
-    {
-        var list = files.Length > 0 ? files : new[] { SsFlowFile };
-        var previous = _prefetch;
-        _prefetch = Task.Run(() =>
-        {
-            try { previous.Wait(); } catch { }
-            var buf = new byte[8 << 20]; var psw = Stopwatch.StartNew();
-            foreach (var f in list)
-            {
-                if (Environment.GetEnvironmentVariable("TRELLIS2_PREFETCH_LOG") == "1") Console.WriteLine($"  [prefetch] {Path.GetFileName(f)} at {psw.Elapsed.TotalSeconds:F1}s");
-                try
-                {
-                    // not SequentialScan: Windows drops those pages from the cache right behind the read pointer
-                    using var fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
-                    while (fs.Read(buf, 0, buf.Length) > 0) { }
-                }
-                catch (IOException) { }                      // a missing file surfaces with its real error when the stage opens it
-                catch (UnauthorizedAccessException) { }
-            }
-        });
-    }
+    /// <summary>Read ahead the first flow checkpoint (and optionally the feature extractor) while the caller prepares the image.</summary>
+    public void PrefetchFirstStage(bool includeDino = false) => _weights.Prefetch(new[] { "ss_flow_img_dit_1_3B_64_bf16" }, includeDino);
 
     // ---- small kernels ----------------------------------------------------------------------------------
     private Action<Index1D, FV, FV, FV, FV, int>? _affine;
@@ -126,22 +102,27 @@ public sealed class Trellis2Pipeline : IDisposable
 
     private MemoryBuffer1D<float, Stride1D.Dense> Upload(float[] data) => _acc.Allocate1D(data);
 
-    private void Stage(string name, Stopwatch sw) { _acc.Synchronize(); StageDone?.Invoke(name, sw.Elapsed.TotalSeconds); sw.Restart(); }
+    private void Stage(string name, Stopwatch sw) { _acc.Fence(); StageDone?.Invoke(name, sw.Elapsed.TotalSeconds); sw.Restart(); }
 
     /// <summary>
     /// Generate from image features, 512 pipeline. <paramref name="cond"/> is [condTokens, 1024] on the device (DINOv3 tokens of the preprocessed
     /// image at 512 px = 1029 tokens). Deterministic for a given <paramref name="seed"/> (own counter-based Gaussian, not torch's).
     /// </summary>
-    public Output Run512(FV cond, int condTokens, int seed = 42) => RunCore(512, cond, condTokens, cond, condTokens, seed);
+    public Output Run512(FV cond, int condTokens, int seed = 42) => Task.Run(() => Run512Async(cond, condTokens, seed)).GetAwaiter().GetResult();
+    /// <summary><see cref="Run512"/>, browser-safe.</summary>
+    public Task<Output> Run512Async(FV cond, int condTokens, int seed = 42, CancellationToken ct = default) => RunCoreAsync(512, cond, condTokens, cond, condTokens, seed, ct);
 
     /// <summary>
     /// The 1024 pipeline of TRELLIS.2: the sparse structure at 64^3 from the 512 px features, then the shape and texture flows of the 1024 checkpoints
     /// on the features of the image at 1024 px (<paramref name="cond1024"/>, 4096 + 5 tokens), decoders up to 1024^3 voxels. About 4x the voxels and
     /// tokens of <see cref="Run512"/> (the whole run is minutes, not seconds) and a mesh of several million triangles.
     /// </summary>
-    public Output Run1024(FV cond512, int tokens512, FV cond1024, int tokens1024, int seed = 42) => RunCore(1024, cond512, tokens512, cond1024, tokens1024, seed);
+    public Output Run1024(FV cond512, int tokens512, FV cond1024, int tokens1024, int seed = 42) => Task.Run(() => Run1024Async(cond512, tokens512, cond1024, tokens1024, seed)).GetAwaiter().GetResult();
+    /// <summary><see cref="Run1024"/>, browser-safe.</summary>
+    public Task<Output> Run1024Async(FV cond512, int tokens512, FV cond1024, int tokens1024, int seed = 42, CancellationToken ct = default)
+        => RunCoreAsync(1024, cond512, tokens512, cond1024, tokens1024, seed, ct);
 
-    private Output RunCore(int res, FV ssCond, int ssTokens, FV cond, int condTokens, int seed)
+    private async Task<Output> RunCoreAsync(int res, FV ssCond, int ssTokens, FV cond, int condTokens, int seed, CancellationToken ct)
     {
         int slatGrid = res / 16;                            // the sparse tensors live on a res/16 grid (32^3 for 512, 64^3 for 1024)
         string suffix = res == 512 ? "512" : "1024";
@@ -159,7 +140,7 @@ public sealed class Trellis2Pipeline : IDisposable
         MemoryBuffer1D<int, Stride1D.Dense> coords32;
         int n0;
         {
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "ss_flow_img_dit_1_3B_64_bf16"));
+            using var w = await _weights.LoadCheckpointAsync(_acc, "ss_flow_img_dit_1_3B_64_bf16", ct);
             Stage("ss flow weights", sw);
             using var flow = new SparseStructureFlow(_acc, _dk, w);
             int cells = flow.Resolution * flow.Resolution * flow.Resolution, count = flow.InChannels * cells;
@@ -173,15 +154,15 @@ public sealed class Trellis2Pipeline : IDisposable
                 Dump("noise.f32", x.View, count); Dump("cond.f32", ssCond, ssTokens * 1024);
             }
             Stage("ss flow load", sw);
-            PrefetchWeights(SsDecFile, Ckpt("slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16"), Ckpt("shape_dec_next_dc_f16c32_fp16"));
+            _weights.Prefetch(new[] { "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16", "shape_dec_next_dc_f16c32_fp16" }, includeSsDecoder: true);
             _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts);
             Stage("ss flow sample", sw);
             if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
             w.Dispose();
-            using var dw = GpuWeights.Load(_acc, _ssDecoderBase);
+            using var dw = await _weights.LoadSsDecoderAsync(_acc, ct);
             using var dec = new SparseStructureDecoder(_acc, _sk, _dk, dw);
             using var logits = dec.Decode(x.View, flow.Resolution);
-            coords32 = _sk.Occupancy(logits.View, flow.Resolution * 4, slatGrid, out n0);
+            (coords32, n0) = await _sk.OccupancyAsync(logits.View, flow.Resolution * 4, slatGrid);
             Stage($"ss decode ({n0} cells of {slatGrid}^3)", sw);
         }
         if (n0 == 0) throw new InvalidOperationException("the sparse structure is empty");
@@ -203,7 +184,7 @@ public sealed class Trellis2Pipeline : IDisposable
         // ---- 2. shape latent ---------------------------------------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> shapeSlat;       // the sampler output (normalised space): conditions the texture flow
         {
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16"));
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16", ct);
             Stage("shape flow weights", sw);
             using var dit = new FlowDiT(_acc, _dk, w);
             dit.SetTokens(coords32.View, n0);
@@ -211,7 +192,7 @@ public sealed class Trellis2Pipeline : IDisposable
             shapeSlat = _acc.Allocate1D<float>(count);
             _sampler.Randn(shapeSlat.View, count, (ulong)seed * 7919UL + 2);
             Stage("shape flow load", sw);
-            PrefetchWeights(Ckpt("slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16"), Ckpt("tex_dec_next_dc_f16c32_fp16"));
+            _weights.Prefetch(new[] { "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16", "tex_dec_next_dc_f16c32_fp16" });
             _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
             Stage("shape flow sample", sw);
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] shape: {Moments(shapeSlat.View, count)}");
@@ -224,18 +205,18 @@ public sealed class Trellis2Pipeline : IDisposable
             using var sm = Upload(_shapeMean); using var ss = Upload(_shapeStd);
             using var lat = _acc.Allocate1D<float>(shapeSlat.Length);
             _affine((int)shapeSlat.Length, shapeSlat.View, sm.View, ss.View, lat.View, 32);
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "shape_dec_next_dc_f16c32_fp16"));
+            using var w = await _weights.LoadCheckpointAsync(_acc, "shape_dec_next_dc_f16c32_fp16", ct);
             var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
             Stage("shape decoder load", sw);
-            shapeDec = dec.Decode(lat.View, coords32.View, n0, slatGrid, keepSubdivisions: true);
-            result.Mesh = _mesher.Extract(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
+            shapeDec = await dec.DecodeAsync(lat.View, coords32.View, n0, slatGrid, keepSubdivisions: true);
+            result.Mesh = await _mesher.ExtractAsync(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
             Stage($"shape decode + mesh ({shapeDec.Count} voxels, {result.Mesh.FaceCount} triangles)", sw);
         }
 
         // ---- 4. texture latent (conditioned on the shape latent) ------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> texSlat;
         {
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16"));
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16", ct);
             using var dit = new FlowDiT(_acc, _dk, w);
             dit.SetTokens(coords32.View, n0);
             int ch = dit.OutChannels, count = n0 * ch;
@@ -271,9 +252,9 @@ public sealed class Trellis2Pipeline : IDisposable
             using var lat = _acc.Allocate1D<float>(texSlat.Length);
             _affine((int)texSlat.Length, texSlat.View, tm.View, ts.View, lat.View, 32);
             texSlat.Dispose();
-            using var w = GpuWeights.Load(_acc, Path.Combine(_ckpts, "tex_dec_next_dc_f16c32_fp16"));
+            using var w = await _weights.LoadCheckpointAsync(_acc, "tex_dec_next_dc_f16c32_fp16", ct);
             var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
-            using var tex = dec.Decode(lat.View, coords32.View, n0, slatGrid, guide: shapeDec.Subdivisions);
+            using var tex = await dec.DecodeAsync(lat.View, coords32.View, n0, slatGrid, guide: shapeDec.Subdivisions);
             result.Attributes = _acc.Allocate1D<float>(tex.Feats.Length);
             _halfShift((int)tex.Feats.Length, tex.Feats.View, result.Attributes.View);
             result.Coords = _acc.Allocate1D<int>((long)tex.Count * 3);
@@ -292,11 +273,14 @@ public sealed class Trellis2Pipeline : IDisposable
     /// and write the binary glTF (positions, normals, UVs, indices, base colour + metallic-roughness PNGs).
     /// </summary>
     public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 150_000)
+        => Task.Run(() => ToGlbAsync(output, textureSize, dilation, maxFaces)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="ToGlb"/>, browser-safe (the mesh and textures are awaited readbacks).</summary>
+    public async Task<byte[]> ToGlbAsync(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 150_000)
     {
         var sw = Stopwatch.StartNew();
-        _acc.Synchronize();
-        var verts = output.Mesh.Vertices.GetAsArray1D();
-        var faces0 = output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).GetAsArray1D();
+        var verts = await output.Mesh.Vertices.View.CopyToHostAsync();
+        var faces0 = await output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).CopyToHostAsync();
         // keep only referenced vertices
         var remap = new int[verts.Length / 3]; Array.Fill(remap, -1);
         int used = 0;
@@ -322,7 +306,7 @@ public sealed class Trellis2Pipeline : IDisposable
         using (var pos = _acc.Allocate1D(atlas.Positions))
         using (var uv = _acc.Allocate1D(atlas.Uvs))
         using (var fb = _acc.Allocate1D(atlas.Faces))
-            tex = new TextureBaker(_acc, _sk).Bake(pos.View, uv.View, fb.View, atlas.Faces.Length / 3, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation);
+            tex = await new TextureBaker(_acc, _sk).BakeAsync(pos.View, uv.View, fb.View, atlas.Faces.Length / 3, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation);
         StageDone?.Invoke("texture bake", sw.Elapsed.TotalSeconds); sw.Restart();
 
         var splitNormals = new float[atlas.Positions.Length];

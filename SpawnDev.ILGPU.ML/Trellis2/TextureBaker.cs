@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU;
 
 namespace SpawnDev.ILGPU.ML.Trellis2;
 
@@ -198,6 +199,10 @@ public sealed class TextureBaker
     /// unwrapped mesh; <paramref name="voxelCoords"/> [N,3] / <paramref name="voxelAttrs"/> [N,6] the attribute volume on a <paramref name="grid"/>^3 lattice.
     /// </summary>
     public Textures Bake(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8)
+        => Task.Run(() => BakeAsync(positions, uvs, faces, faceCount, voxelCoords, voxelAttrs, voxelCount, grid, size, dilation)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="Bake"/>, browser-safe (the textures are awaited readbacks).</summary>
+    public async Task<Textures> BakeAsync(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8)
     {
         _raster ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterImpl);
         _rasterNear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterNearImpl);
@@ -211,8 +216,7 @@ public sealed class TextureBaker
         using var idMap = _acc.Allocate1D<int>(texels);
         using var bary = _acc.Allocate1D<float>((long)texels * 2);
         _zeroInt(texels, idMap.View);
-        _raster(faceCount, uvs, faces, idMap.View, bary.View, size, faceCount);
-        _acc.Synchronize();                                                 // the near pass must see every centre-covered texel
+        _raster(faceCount, uvs, faces, idMap.View, bary.View, size, faceCount);   // (dispatches run in order: the near pass sees every centre-covered texel)
         _rasterNear(faceCount, uvs, faces, idMap.View, bary.View, size, faceCount);
         using var hash = _sk.BuildHash(voxelCoords, voxelCount, grid);
         var a = _acc.Allocate1D<float>((long)texels * 6);
@@ -223,7 +227,6 @@ public sealed class TextureBaker
         var covB = _acc.Allocate1D<int>(texels);
         _coverFlag(texels, idMap.View, covA.View);
         var tex = new Textures { Size = size };
-        _acc.Synchronize();
         for (int pass = 0; pass < dilation; pass++)
         {
             _dilate(texels, a.View, covA.View, b.View, covB.View, size);
@@ -232,11 +235,10 @@ public sealed class TextureBaker
         using var bc = _acc.Allocate1D<int>(texels);
         using var mr = _acc.Allocate1D<int>(texels);
         _pack(texels, a.View, bc.View, mr.View);
-        _acc.Synchronize();
-        tex.BaseColorAlpha = ToUInt(bc.GetAsArray1D());
-        tex.MetallicRoughness = ToUInt(mr.GetAsArray1D());
+        tex.BaseColorAlpha = ToUInt(await bc.View.CopyToHostAsync());
+        tex.MetallicRoughness = ToUInt(await mr.View.CopyToHostAsync());
         // covered texels (before dilation) for reporting
-        var ids = idMap.GetAsArray1D(); long covered = 0; foreach (var v in ids) if (v != 0) covered++;
+        var ids = await idMap.View.CopyToHostAsync(); long covered = 0; foreach (var v in ids) if (v != 0) covered++;
         tex.CoveredTexels = covered;
         a.Dispose(); b.Dispose(); covA.Dispose(); covB.Dispose();
         return tex;

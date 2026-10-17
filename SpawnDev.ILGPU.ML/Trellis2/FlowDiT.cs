@@ -171,7 +171,7 @@ public sealed class FlowDiT : IDisposable
         // out: F.layer_norm (torch default eps 1e-5, no affine), then out_layer
         _k.LayerNormPlain(_h, _hn, N, C, 1e-5f);
         _k.Linear(_hn, _w.BF16("out_layer.weight"), _w.BF16("out_layer.bias"), o, N, C, _outCh);
-        _acc.Synchronize();
+        _acc.Fence();
     }
 
     /// <summary>TimestepEmbedder.timestep_embedding: [cos(t*f), sin(t*f)], f = exp(-ln(10000) * i / half). Host scalar math (256 floats).</summary>

@@ -66,13 +66,79 @@ public sealed class GpuWeights : IDisposable
                 if (prof) tUp += psw.Elapsed.TotalSeconds;
             }
             if (prof) Console.WriteLine($"  [weights] {Path.GetFileName(safetensorsPath)} alloc+upload {tUp:F2}s (read {SafeTensorsFileReader.ReadTicks / (double)System.Diagnostics.Stopwatch.Frequency:F2}s, copy {SafeTensorsFileReader.CopyTicks / (double)System.Diagnostics.Stopwatch.Frequency:F2}s cumulative)");
-            accelerator.Synchronize();
+            accelerator.Fence();
             return w;
         }
         catch
         {
             w.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Load a checkpoint from a STREAM (browser OPFS / HTTP, or any file): the header, then every tensor in file order with no seeking
+    /// (gaps are read through when the stream cannot seek), each uploaded in bounded chunks. <paramref name="args"/> becomes <see cref="Args"/>.
+    /// </summary>
+    public static async Task<GpuWeights> LoadAsync(Accelerator accelerator, Stream stream, JsonElement args, string name = "checkpoint",
+        Func<string, bool>? filter = null, CancellationToken cancellationToken = default)
+    {
+        var w = new GpuWeights(args.Clone());
+        try
+        {
+            var lenBytes = new byte[8];
+            await stream.ReadExactlyAsync(lenBytes, cancellationToken);
+            long headerSize = BitConverter.ToInt64(lenBytes);
+            if (headerSize <= 0 || headerSize > 100_000_000) throw new InvalidDataException($"'{name}': invalid SafeTensors header size {headerSize}");
+            var headerBytes = new byte[headerSize];
+            await stream.ReadExactlyAsync(headerBytes, cancellationToken);
+            long pos = 8 + headerSize;
+            long length = -1;
+            try { if (stream.CanSeek) length = stream.Length - pos; } catch (NotSupportedException) { }
+            var (tensors, _) = SafeTensorsFileReader.ParseHeader(name, headerBytes, pos, length);
+            var buf = new byte[16 << 20];
+            foreach (var t in tensors)
+            {
+                if (filter != null && !filter(t.Name)) continue;
+                if (t.DataOffset > pos)
+                {
+                    long gap = t.DataOffset - pos;
+                    if (stream.CanSeek) stream.Seek(gap, SeekOrigin.Current);
+                    else while (gap > 0) { int r = await stream.ReadAsync(buf.AsMemory(0, (int)Math.Min(buf.Length, gap)), cancellationToken); if (r <= 0) throw new EndOfStreamException(name); gap -= r; }
+                    pos = t.DataOffset;
+                }
+                long n = SafeTensorsFileReader.ElementCount(t);
+                switch (t.DType)
+                {
+                    case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
+                    case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
+                    case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
+                    default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
+                }
+                pos += t.DataLength;
+                w._shapes[t.Name] = t.Shape;
+            }
+            accelerator.Fence();
+            return w;
+        }
+        catch
+        {
+            w.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task UploadAsync<T>(Stream stream, ArrayView1D<T, Stride1D.Dense> dst, long count, byte[] buf, CancellationToken ct) where T : unmanaged
+    {
+        int es = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        var staging = new T[Math.Min(count, buf.Length / es)];
+        for (long done = 0; done < count;)
+        {
+            int n = (int)Math.Min(staging.Length, count - done);
+            await stream.ReadExactlyAsync(buf.AsMemory(0, n * es), ct);
+            System.Runtime.InteropServices.MemoryMarshal.Cast<byte, T>(buf.AsSpan(0, n * es)).CopyTo(staging);
+            dst.SubView(done, n).CopyFromCPU(n == staging.Length ? staging : staging[..n]);   // an immediate write on every backend
+            done += n;
         }
     }
 

@@ -50,37 +50,8 @@ public sealed class SafeTensorsFileReader : IDisposable
 
             var headerBytes = new byte[headerSize];
             ReadExactly(file, 8, headerBytes);
-            var header = MLJson.Deserialize<Dictionary<string, JsonElement>>(Encoding.UTF8.GetString(headerBytes))
-                ?? throw new InvalidDataException($"'{path}': SafeTensors header is not a JSON object");
-
             long dataStart = 8 + headerSize;
-            long dataLength = file.Length - dataStart;
-            var tensors = new List<SafeTensorInfo>(header.Count);
-            var metadata = new Dictionary<string, string>();
-            foreach (var (key, value) in header)
-            {
-                if (key == "__metadata__")
-                {
-                    if (value.ValueKind == JsonValueKind.Object)
-                        foreach (var prop in value.EnumerateObject())
-                            metadata[prop.Name] = prop.Value.GetString() ?? "";
-                    continue;
-                }
-                var shape = value.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
-                var offsets = value.GetProperty("data_offsets").EnumerateArray().Select(e => e.GetInt64()).ToArray();
-                if (offsets[0] < 0 || offsets[1] < offsets[0] || offsets[1] > dataLength)
-                    throw new InvalidDataException($"'{path}': tensor '{key}' data_offsets [{offsets[0]}, {offsets[1]}) fall outside the {dataLength} byte data section (truncated download?)");
-                tensors.Add(new SafeTensorInfo
-                {
-                    Name = key,
-                    DType = value.GetProperty("dtype").GetString() ?? "F32",
-                    Shape = shape,
-                    DataOffset = dataStart + offsets[0],
-                    DataLength = offsets[1] - offsets[0],
-                });
-            }
-            // header order is a dictionary order; sort by file offset so sequential reads stay sequential
-            tensors.Sort((a, b) => a.DataOffset.CompareTo(b.DataOffset));
+            var (tensors, metadata) = ParseHeader(path, headerBytes, dataStart, file.Length - dataStart);
             return new SafeTensorsFileReader(path, file, tensors, metadata);
         }
         catch
@@ -88,6 +59,45 @@ public sealed class SafeTensorsFileReader : IDisposable
             file.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Parse a SafeTensors JSON header. <paramref name="dataStart"/> = 8 + header size (offsets become absolute);
+    /// <paramref name="dataLength"/> bounds the tensors (-1 when the stream length is unknown). Tensors come back sorted by offset,
+    /// so a reader can stream them in file order without seeking.
+    /// </summary>
+    public static (List<SafeTensorInfo> Tensors, Dictionary<string, string> Metadata) ParseHeader(string name, byte[] headerBytes, long dataStart, long dataLength)
+    {
+        var header = MLJson.Deserialize<Dictionary<string, JsonElement>>(Encoding.UTF8.GetString(headerBytes))
+            ?? throw new InvalidDataException($"'{name}': SafeTensors header is not a JSON object");
+
+        var tensors = new List<SafeTensorInfo>(header.Count);
+        var metadata = new Dictionary<string, string>();
+        foreach (var (key, value) in header)
+        {
+            if (key == "__metadata__")
+            {
+                if (value.ValueKind == JsonValueKind.Object)
+                    foreach (var prop in value.EnumerateObject())
+                        metadata[prop.Name] = prop.Value.GetString() ?? "";
+                continue;
+            }
+            var shape = value.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var offsets = value.GetProperty("data_offsets").EnumerateArray().Select(e => e.GetInt64()).ToArray();
+            if (offsets[0] < 0 || offsets[1] < offsets[0] || (dataLength >= 0 && offsets[1] > dataLength))
+                throw new InvalidDataException($"'{name}': tensor '{key}' data_offsets [{offsets[0]}, {offsets[1]}) fall outside the {dataLength} byte data section (truncated download?)");
+            tensors.Add(new SafeTensorInfo
+            {
+                Name = key,
+                DType = value.GetProperty("dtype").GetString() ?? "F32",
+                Shape = shape,
+                DataOffset = dataStart + offsets[0],
+                DataLength = offsets[1] - offsets[0],
+            });
+        }
+        // header order is a dictionary order; sort by file offset so sequential reads stay sequential
+        tensors.Sort((a, b) => a.DataOffset.CompareTo(b.DataOffset));
+        return (tensors, metadata);
     }
 
     /// <summary>True when the file holds a tensor named <paramref name="name"/>.</summary>

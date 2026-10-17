@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU;
 
 namespace SpawnDev.ILGPU.ML.Trellis2;
 
@@ -96,7 +97,7 @@ public sealed class SparseKernels
         _hashNeighbors ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV, int, int, int>(HashNeighborsImpl);
         using var h = BuildHash(coords, n, grid);
         _hashNeighbors(n * 27, coords, h.Keys.View, h.Vals.View, nbr, grid, h.Mask, h.Shift);
-        _acc.Synchronize();   // the hash is freed on return
+        _acc.Fence();   // the hash is freed on return
     }
 
     // single lookup, for kernels that probe the hash themselves
@@ -267,6 +268,13 @@ public sealed class SparseKernels
     /// </summary>
     public MemoryBuffer1D<int, Stride1D.Dense> Occupancy(FV logits, int grid, int outGrid, out int count)
     {
+        var (coords, c) = Task.Run(() => OccupancyAsync(logits, grid, outGrid)).GetAwaiter().GetResult();
+        count = c;
+        return coords;
+    }
+
+    public async Task<(MemoryBuffer1D<int, Stride1D.Dense> Coords, int Count)> OccupancyAsync(FV logits, int grid, int outGrid)
+    {
         _flag ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV>(FlagImpl);
         _maxPool2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(MaxPool2Impl);
         _argwhere ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int>(ArgwhereImpl);
@@ -283,12 +291,12 @@ public sealed class SparseKernels
         }
         int n = outGrid * outGrid * outGrid;
         using var offsets = _acc.Allocate1D<int>(n + 1);
-        count = ExclusiveScan(cells, n, offsets.View);
+        int count = await ExclusiveScanAsync(cells, n, offsets.View);
         var coords = _acc.Allocate1D<int>(Math.Max(1L, (long)count * 3));
         _argwhere(n, cells, offsets.View, coords.View, outGrid);
-        _acc.Synchronize();
+        _acc.Fence();
         pooled?.Dispose();
-        return coords;
+        return (coords, count);
     }
 
     // =====================================================================================================
@@ -464,27 +472,29 @@ public sealed class SparseKernels
     }
 
     /// <summary>Exclusive prefix sum of <paramref name="counts"/> (n ints) into <paramref name="offsets"/> (n+1 ints); returns the total.</summary>
-    public int ExclusiveScan(IV counts, int n, IV offsets)
+    public int ExclusiveScan(IV counts, int n, IV offsets) => Task.Run(() => ExclusiveScanAsync(counts, n, offsets)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="ExclusiveScan"/> with an awaited readback of the total (browser-safe).</summary>
+    public async Task<int> ExclusiveScanAsync(IV counts, int n, IV offsets)
     {
         _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
         _serialScan(1, counts, offsets, n);
-        _acc.Synchronize();
-        var total = new int[1];
-        offsets.SubView(n, 1).CopyToCPU(total);        // one scalar: sizes the output buffers
+        var total = await offsets.SubView(n, 1).CopyToHostAsync();   // one scalar: sizes the output buffers (waits for the scan)
         return total[0];
     }
 
     /// <summary>Per-voxel child offsets (n+1 entries; the last is the total) from the subdivision logits.</summary>
-    public int CountChildren(FV logits, int n, IV offsets)
+    public int CountChildren(FV logits, int n, IV offsets) => Task.Run(() => CountChildrenAsync(logits, n, offsets)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="CountChildren"/> with an awaited readback of the total (browser-safe).</summary>
+    public async Task<int> CountChildrenAsync(FV logits, int n, IV offsets)
     {
         _subCount ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV>(SubCountImpl);
         _serialScan ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, int>(SerialScanImpl);
         using var counts = _acc.Allocate1D<int>(n);
         _subCount(n, logits, counts.View);
         _serialScan(1, counts.View, offsets, n);
-        _acc.Synchronize();
-        var total = new int[1];
-        offsets.SubView(n, 1).CopyToCPU(total);        // one scalar: sizes the output buffers
+        var total = await offsets.SubView(n, 1).CopyToHostAsync();   // one scalar: sizes the output buffers (waits for both kernels)
         return total[0];
     }
 

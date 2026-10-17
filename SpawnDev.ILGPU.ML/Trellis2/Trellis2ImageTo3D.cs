@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
@@ -45,42 +46,58 @@ public sealed class Trellis2Options
 public sealed class Trellis2ImageTo3D : IDisposable
 {
     private readonly Accelerator _acc;
-    private readonly Trellis2Paths _paths;
+    private readonly Trellis2Weights _weights;
     private readonly DiTKernels _dk;
     private readonly SparseKernels _sk;
 
     /// <summary>Per-stage progress: (stage, seconds).</summary>
     public Action<string, double>? StageDone { get; set; }
 
-    public Trellis2ImageTo3D(Accelerator accelerator, Trellis2Paths paths)
+    /// <summary>Checkpoints from local files (desktop).</summary>
+    public Trellis2ImageTo3D(Accelerator accelerator, Trellis2Paths paths) : this(accelerator, Trellis2Weights.FromFiles(paths)) { }
+
+    /// <summary>Checkpoints from any source: <see cref="Trellis2Weights.FromModelSource"/> streams them from the hub (OPFS cache in the browser).</summary>
+    public Trellis2ImageTo3D(Accelerator accelerator, Trellis2Weights weights)
     {
-        _acc = accelerator; _paths = paths;
+        _acc = accelerator; _weights = weights;
         _dk = new DiTKernels(accelerator); _sk = new SparseKernels(accelerator);
     }
 
-    /// <summary>Generate from a device image. <paramref name="rgba"/> [width*height] packed RGBA.</summary>
+    /// <summary>Generate from a device image. <paramref name="rgba"/> [width*height] packed RGBA. Desktop only (blocks); browsers use <see cref="GenerateGlbAsync(IV, int, int, Trellis2Options?, CancellationToken)"/>.</summary>
     public byte[] GenerateGlb(IV rgba, int width, int height, Trellis2Options? options = null)
+        => Task.Run(() => GenerateGlbAsync(rgba, width, height, options)).GetAwaiter().GetResult();
+
+    /// <summary>Generate from a device image, browser-safe. <paramref name="rgba"/> [width*height] packed RGBA (alpha = foreground).</summary>
+    public async Task<byte[]> GenerateGlbAsync(IV rgba, int width, int height, Trellis2Options? options = null, CancellationToken ct = default)
     {
         options ??= new Trellis2Options();
-        using var output = Generate(rgba, width, height, options, out var pipe);
-        return pipe.ToGlb(output, options.TextureSize, maxFaces: options.MaxFaces);
+        var (output, pipe) = await GenerateAsync(rgba, width, height, options, ct);
+        using (output) return await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
+    }
+
+    /// <summary>Desktop wrapper of <see cref="GenerateAsync"/> (blocks).</summary>
+    public Trellis2Pipeline.Output Generate(IV rgba, int width, int height, Trellis2Options? options, out Trellis2Pipeline pipeline)
+    {
+        var (o, p) = Task.Run(() => GenerateAsync(rgba, width, height, options)).GetAwaiter().GetResult();
+        pipeline = p;
+        return o;
     }
 
     /// <summary>
     /// Run the networks and return the device-resident result (mesh + per-voxel PBR attributes) without building the GLB; the caller disposes it.
-    /// <paramref name="pipeline"/> is the pipeline instance to call <see cref="Trellis2Pipeline.ToGlb"/> on.
+    /// <c>Pipeline</c> is the instance to call <see cref="Trellis2Pipeline.ToGlbAsync"/> on.
     /// </summary>
-    public Trellis2Pipeline.Output Generate(IV rgba, int width, int height, Trellis2Options? options, out Trellis2Pipeline pipeline)
+    public async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> GenerateAsync(IV rgba, int width, int height, Trellis2Options? options, CancellationToken ct = default)
     {
         options ??= new Trellis2Options();
+        if (options.Resolution != 512 && options.Resolution != 1024) throw new ArgumentException("Resolution must be 512 or 1024");
         var sw = Stopwatch.StartNew();
-        pipeline = new Trellis2Pipeline(_acc, _paths.ModelDir, _paths.SparseStructureDecoder) { StageDone = StageDone };
-        pipeline.PrefetchWeights(_paths.DinoWeights);       // the disk reads overlap the image preparation and the feature extraction
-        pipeline.PrefetchWeights();                          // then the first flow checkpoint
-        using var image = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 512);
+        var pipeline = await Trellis2Pipeline.CreateAsync(_acc, _weights, ct);
+        pipeline.StageDone = StageDone;
+        pipeline.PrefetchFirstStage(includeDino: true);      // the reads overlap the image preparation and the feature extraction
+        using var image = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 512);
         StageDone?.Invoke("image prep", sw.Elapsed.TotalSeconds); sw.Restart();
 
-        if (options.Resolution != 512 && options.Resolution != 1024) throw new ArgumentException("Resolution must be 512 or 1024");
         const int tokens = 1 + 4 + 32 * 32;
         using var cond = _acc.Allocate1D<float>((long)tokens * 1024);
         MemoryBuffer1D<float, Stride1D.Dense>? cond1024 = null;
@@ -88,31 +105,32 @@ public sealed class Trellis2ImageTo3D : IDisposable
         try
         {
             {   // the feature extractor's weights are released before the flows load
-                using var w = GpuWeights.LoadFile(_acc, _paths.DinoWeights);
+                using var w = await _weights.LoadDinoAsync(_acc, ct);
                 using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
                 dino.Extract(image.View, 512, cond.View);
                 if (options.Resolution == 1024)
                 {
                     // the same preprocessed image resampled to 1024 px for the shape / texture flows
-                    using var image1024 = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 1024);
+                    using var image1024 = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 1024);
                     cond1024 = _acc.Allocate1D<float>((long)tokens1024 * 1024);
                     dino.Extract(image1024.View, 1024, cond1024.View);
                     var dumpCond = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_COND") ?? "";
                     if (dumpCond.Length > 0)
-                    {   // debug: the normalised 1024 px image and its features, to compare against timm on the same tensor (reference/golden_dino_timm.py)
-                        Directory.CreateDirectory(dumpCond); _acc.Synchronize();
-                        void Dump(string name, ArrayView1D<float, Stride1D.Dense> v) { var a = v.GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpCond, name), b); }
-                        Dump("image1024.f32", image1024.View); Dump("cond1024.f32", cond1024.View);
+                    {   // debug: the normalised 1024 px image and its features, to compare against timm on the same tensor (reference/golden_dino_dump.py)
+                        Directory.CreateDirectory(dumpCond);
+                        async Task Dump(string name, ArrayView1D<float, Stride1D.Dense> v) { var a = await v.CopyToHostAsync(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpCond, name), b); }
+                        await Dump("image1024.f32", image1024.View); await Dump("cond1024.f32", cond1024.View);
                     }
                 }
             }
             StageDone?.Invoke("dinov3 features", sw.Elapsed.TotalSeconds);
 
-            return options.Resolution == 512
-                ? pipeline.Run512(cond.View, tokens, options.Seed)
+            var output = options.Resolution == 512
+                ? await pipeline.Run512Async(cond.View, tokens, options.Seed, ct)
                 : (Environment.GetEnvironmentVariable("TRELLIS2_EXP_COND512") == "1"
-                    ? pipeline.Run1024(cond.View, tokens, cond.View, tokens, options.Seed)
-                    : pipeline.Run1024(cond.View, tokens, cond1024!.View, tokens1024, options.Seed));
+                    ? await pipeline.Run1024Async(cond.View, tokens, cond.View, tokens, options.Seed, ct)
+                    : await pipeline.Run1024Async(cond.View, tokens, cond1024!.View, tokens1024, options.Seed, ct));
+            return (output, pipeline);
         }
         finally { cond1024?.Dispose(); }
     }
@@ -124,16 +142,19 @@ public sealed class Trellis2ImageTo3D : IDisposable
         return GenerateGlb(buf.View, width, height, options);
     }
 
-    /// <summary>Browser path: RGBA bytes still in a JS typed array; they never enter the .NET heap.</summary>
-    public byte[] GenerateGlb(TypedArray rgbaBytes, int width, int height, Trellis2Options? options = null)
+    /// <summary>Managed pixels, browser-safe.</summary>
+    public async Task<byte[]> GenerateGlbAsync(int[] rgbaPixels, int width, int height, Trellis2Options? options = null, CancellationToken ct = default)
     {
-        using var buf = RgbaUpload.FromTypedArray(_acc, rgbaBytes, width, height);
-        return GenerateGlb(buf.View, width, height, options);
+        using var buf = RgbaUpload.FromManaged(_acc, rgbaPixels, width, height);
+        return await GenerateGlbAsync(buf.View, width, height, options, ct);
     }
 
-    /// <summary>Asynchronous wrapper for UI callers (desktop backends run the work on a pool thread).</summary>
-    public Task<byte[]> GenerateGlbAsync(int[] rgbaPixels, int width, int height, Trellis2Options? options = null)
-        => Task.Run(() => GenerateGlb(rgbaPixels, width, height, options));
+    /// <summary>Browser path: RGBA bytes still in a JS typed array; they never enter the .NET heap.</summary>
+    public async Task<byte[]> GenerateGlbAsync(TypedArray rgbaBytes, int width, int height, Trellis2Options? options = null, CancellationToken ct = default)
+    {
+        using var buf = RgbaUpload.FromTypedArray(_acc, rgbaBytes, width, height);
+        return await GenerateGlbAsync(buf.View, width, height, options, ct);
+    }
 
     public void Dispose() { }
 }

@@ -81,7 +81,10 @@ public sealed class DualGridMesher
     /// <paramref name="h"/> is the decoder output [n, 7]; <paramref name="coords"/> [n, 3] voxel coordinates on a
     /// <paramref name="grid"/>^3 lattice covering [-0.5, 0.5]^3. Caller disposes the returned mesh.
     /// </summary>
-    public Mesh Extract(FV h, IV coords, int n, int grid)
+    public Mesh Extract(FV h, IV coords, int n, int grid) => Task.Run(() => ExtractAsync(h, coords, n, grid)).GetAwaiter().GetResult();
+
+    /// <summary><see cref="Extract"/>, browser-safe (the quad count is an awaited readback).</summary>
+    public async Task<Mesh> ExtractAsync(FV h, IV coords, int n, int grid)
     {
         _vertices ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, int>(VerticesImpl);
         _quads ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, IV, IV, IV, int, int, int>(QuadsImpl);
@@ -94,11 +97,11 @@ public sealed class DualGridMesher
         using var flag = _acc.Allocate1D<int>((long)n * 3);
         _quads(n * 3, h, coords, hash.Keys.View, hash.Vals.View, quad.View, flag.View, grid, hash.Mask, hash.Shift);
         using var offsets = _acc.Allocate1D<int>((long)n * 3 + 1);
-        int quads = _sk.ExclusiveScan(flag.View, n * 3, offsets.View);
+        int quads = await _sk.ExclusiveScanAsync(flag.View, n * 3, offsets.View);
         mesh.FaceCount = quads * 2;
         mesh.Faces = _acc.Allocate1D<int>(Math.Max(1L, (long)quads * 6));
         _tris(n * 3, h, quad.View, flag.View, offsets.View, mesh.Faces.View);
-        _acc.Synchronize();
+        _acc.Fence();
         return mesh;
     }
 }
