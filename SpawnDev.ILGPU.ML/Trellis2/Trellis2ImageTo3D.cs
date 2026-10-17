@@ -25,8 +25,8 @@ public sealed class Trellis2Options
     public int Seed { get; init; } = 42;
     /// <summary>Side of the baked textures in texels.</summary>
     public int TextureSize { get; init; } = 2048;
-    /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh).</summary>
-    public int MaxFaces { get; init; } = 300_000;
+    /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh, 1-2.5M triangles). Measured on the official crown: 120k looks the same as 300k; at 40-50k thin sheets shred and texels go missing.</summary>
+    public int MaxFaces { get; init; } = 150_000;
 }
 
 /// <summary>

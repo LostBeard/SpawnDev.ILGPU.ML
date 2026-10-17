@@ -60,6 +60,44 @@ public sealed class TextureBaker
             }
     }
 
+    /// <summary>
+    /// Second raster pass, for texels no triangle covered at the texel centre: a sliver or a tiny triangle can sit between texel centres and
+    /// would leave a hole (black speck) in its own chart. A still-empty texel whose centre lies within 0.75 texel of a triangle takes that
+    /// triangle, sampled at the nearest point of it (barycentrics clamped into the triangle). Runs after the centre pass (separate dispatch),
+    /// so it never overrides a properly covered texel.
+    /// </summary>
+    private Action<Index1D, FV, IV, IV, FV, int, int>? _rasterNear;
+    private static void RasterNearImpl(Index1D tri, FV uv, IV faces, IV idMap, FV bary, int size, int numFaces)
+    {
+        int i0 = faces[tri * 3], i1 = faces[tri * 3 + 1], i2 = faces[tri * 3 + 2];
+        float ax = uv[i0 * 2] * size, ay = uv[i0 * 2 + 1] * size;
+        float bx = uv[i1 * 2] * size, by = uv[i1 * 2 + 1] * size;
+        float cx = uv[i2 * 2] * size, cy = uv[i2 * 2 + 1] * size;
+        float det = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+        if (MathF.Abs(det) < 1e-12f) return;
+        int x0 = (int)MathF.Max(0f, MathF.Floor(MathF.Min(ax, MathF.Min(bx, cx)) - 0.75f));
+        int x1 = (int)MathF.Min(size - 1f, MathF.Ceiling(MathF.Max(ax, MathF.Max(bx, cx)) + 0.75f));
+        int y0 = (int)MathF.Max(0f, MathF.Floor(MathF.Min(ay, MathF.Min(by, cy)) - 0.75f));
+        int y1 = (int)MathF.Min(size - 1f, MathF.Ceiling(MathF.Max(ay, MathF.Max(by, cy)) + 0.75f));
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+            {
+                int t = y * size + x;
+                if (idMap[t] != 0) continue;
+                float px = x + 0.5f, py = y + 0.5f;
+                float w0 = ((bx - px) * (cy - py) - (cx - px) * (by - py)) / det;
+                float w1 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) / det;
+                float w2 = 1f - w0 - w1;
+                w0 = MathF.Max(w0, 0f); w1 = MathF.Max(w1, 0f); w2 = MathF.Max(w2, 0f);
+                float ws = w0 + w1 + w2; if (ws <= 1e-12f) continue;
+                w0 /= ws; w1 /= ws; w2 /= ws;
+                float qx = ax * w0 + bx * w1 + cx * w2 - px, qy = ay * w0 + by * w1 + cy * w2 - py;   // offset of the nearest point of the triangle from the texel centre
+                if (qx * qx + qy * qy > 0.5625f) continue;
+                idMap[t] = tri + 1;
+                bary[t * 2] = w0; bary[t * 2 + 1] = w1;
+            }
+    }
+
     private Action<Index1D, IV, FV, IV, FV, IV, IV, FV, FV, int, int, int>? _bake;
     private static void BakeImpl(Index1D texel, IV idMap, FV bary, IV faces, FV positions, IV keys, IV vals, FV attrs, FV outAttrs,
         int grid, int mask, int shift)
@@ -85,6 +123,23 @@ public sealed class TextureBaker
             a0 += w * attrs[v * 6]; a1 += w * attrs[v * 6 + 1]; a2 += w * attrs[v * 6 + 2];
             a3 += w * attrs[v * 6 + 3]; a4 += w * attrs[v * 6 + 4]; a5 += w * attrs[v * 6 + 5];
             wsum += w;
+        }
+        if (wsum < 1e-6f)
+        {
+            // no voxel within a voxel of the sample (a simplified mesh can sit a few voxels off the surface): take the nearest voxel within 3 instead of black
+            float best = 1e30f;
+            int cx = (int)MathF.Floor(px), cy = (int)MathF.Floor(py), cz = (int)MathF.Floor(pz);
+            for (int dz = -3; dz <= 3; dz++)
+                for (int dy = -3; dy <= 3; dy++)
+                    for (int dx = -3; dx <= 3; dx++)
+                    {
+                        int v = SparseKernels.Lookup(keys, vals, cx + dx, cy + dy, cz + dz, grid, mask, shift);
+                        if (v < 0) continue;
+                        float ddx = cx + dx + 0.5f - px, ddy = cy + dy + 0.5f - py, ddz = cz + dz + 0.5f - pz;
+                        float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                        if (d2 >= best) continue;
+                        best = d2; a0 = attrs[v * 6]; a1 = attrs[v * 6 + 1]; a2 = attrs[v * 6 + 2]; a3 = attrs[v * 6 + 3]; a4 = attrs[v * 6 + 4]; a5 = attrs[v * 6 + 5]; wsum = 1f;
+                    }
         }
         float inv = 1f / MathF.Max(wsum, 1e-12f);
         outAttrs[texel * 6] = a0 * inv; outAttrs[texel * 6 + 1] = a1 * inv; outAttrs[texel * 6 + 2] = a2 * inv;
@@ -145,6 +200,7 @@ public sealed class TextureBaker
     public Textures Bake(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8)
     {
         _raster ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterImpl);
+        _rasterNear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterNearImpl);
         _bake ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, FV, IV, IV, FV, FV, int, int, int>(BakeImpl);
         _dilate ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int>(DilateImpl);
         _coverFlag ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(CoverFlagImpl);
@@ -156,6 +212,8 @@ public sealed class TextureBaker
         using var bary = _acc.Allocate1D<float>((long)texels * 2);
         _zeroInt(texels, idMap.View);
         _raster(faceCount, uvs, faces, idMap.View, bary.View, size, faceCount);
+        _acc.Synchronize();                                                 // the near pass must see every centre-covered texel
+        _rasterNear(faceCount, uvs, faces, idMap.View, bary.View, size, faceCount);
         using var hash = _sk.BuildHash(voxelCoords, voxelCount, grid);
         var a = _acc.Allocate1D<float>((long)texels * 6);
         var b = _acc.Allocate1D<float>((long)texels * 6);

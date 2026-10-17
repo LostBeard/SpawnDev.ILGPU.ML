@@ -257,7 +257,7 @@ public sealed class Trellis2Pipeline : IDisposable
     /// weld away unreferenced vertices, compute normals, unwrap a UV atlas, bake the PBR attributes into two textures on the device,
     /// and write the binary glTF (positions, normals, UVs, indices, base colour + metallic-roughness PNGs).
     /// </summary>
-    public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 300_000)
+    public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 150_000)
     {
         var sw = Stopwatch.StartNew();
         _acc.Synchronize();

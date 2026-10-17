@@ -78,7 +78,17 @@ internal static class GenerateRun
             }
             glb = pipe.ToGlb(o, options.TextureSize, maxFaces: options.MaxFaces);
         }
-        else glb = gen.GenerateGlb(input, w, h, options);
+        else
+        {
+            glb = gen.GenerateGlb(input, w, h, options);
+            // TRELLIS2_REPEAT=n: n more runs in the same process (a server's steady state: kernels already compiled, caches warm)
+            for (int r = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_REPEAT"), out var rep) ? rep : 0; r > 0; r--)
+            {
+                var rsw = Stopwatch.StartNew();
+                glb = gen.GenerateGlb(input, w, h, new Trellis2Options { MaxFaces = options.MaxFaces, Seed = 42 + r });
+                Console.WriteLine($"  repeat run: {rsw.Elapsed.TotalSeconds:F1}s");
+            }
+        }
         cts.Cancel(); poll.Wait();
         peak = Math.Max(peak, Used());
         File.WriteAllBytes(outGlb, glb);
