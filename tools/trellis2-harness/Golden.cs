@@ -137,6 +137,39 @@ internal static class Golden
         return ok ? 0 : 1;
     }
 
+    private static void MockVelocity(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> v, float t, float c)
+        => v[i] = 0.5f * MathF.Sin(x[i]) + 0.0003f * t + c * 0.2f * x[i];
+
+    /// <summary>The Euler / CFG / guidance-interval / rescale sampler against the real reference sampler with a shared mock model.</summary>
+    public static int Sampler()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "sampler");
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_sampler.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        var mock = accel.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(MockVelocity);
+        var noise = ReadF32(Path.Combine(dir, "noise.bin"));
+        var sampler = new FlowSampler(accel);
+        var cases = new (string Name, FlowSampler.Options O)[]
+        {
+            ("ss",    new(12, 7.5f, 0.7f, 0.6, 1.0, 5.0)),
+            ("shape", new(12, 7.5f, 0.5f, 0.6, 1.0, 3.0)),
+            ("tex",   new(12, 1.0f, 0.0f, 0.6, 0.9, 3.0)),
+        };
+        bool ok = true;
+        foreach (var (name, o) in cases)
+        {
+            using var x = accel.Allocate1D(noise);
+            int calls = 0;
+            sampler.Sample((xv, t1000, useCond, v) => { calls++; mock(noise.Length, xv, v, t1000, useCond ? 1f : 0f); }, x.View, noise.Length, o);
+            Console.WriteLine($"{name}: {calls} model calls (expected {FlowSampler.ModelCalls(o)})");
+            ok &= calls == FlowSampler.ModelCalls(o);
+            ok &= Compare($"sampler {name}", ReadF32(Path.Combine(dir, name + ".bin")), x.GetAsArray1D(), 2e-5);
+        }
+        Console.WriteLine(ok ? "SAMPLER PASS" : "SAMPLER FAIL");
+        return ok ? 0 : 1;
+    }
+
     public static int SsFlow()
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "ss_flow");
