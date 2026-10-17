@@ -19,12 +19,13 @@ return command switch
 {
     "header" => Commands.Header(args.Length > 1 ? args[1] : ""),
     "upload" => Commands.Upload(args.Length > 1 ? args[1] : "", args.Length > 2 ? args[2] : null),
+    "ssflow" => Golden.SsFlow(),
     _ => Usage(command),
 };
 
 static int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: header <file> | upload <file> [tensor]");
+    Console.WriteLine($"unknown command '{bad}'. commands: header <file> | upload <file> [tensor] | ssflow");
     return 2;
 }
 

@@ -1,0 +1,280 @@
+using ILGPU;
+using ILGPU.Runtime;
+
+namespace SpawnDev.ILGPU.ML.Trellis2;
+
+using FV = ArrayView1D<float, Stride1D.Dense>;
+using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
+using IV = ArrayView1D<int, Stride1D.Dense>;
+
+/// <summary>
+/// The kernels of the TRELLIS.2 flow transformers (sparse-structure DiT and the two SLat DiTs): bf16 weights,
+/// fp32 activations, fp32 accumulate. Every kernel here is the straightforward one-thread-per-output form: it
+/// is the CORRECTNESS lane, checked element-for-element against tensors dumped from the real reference
+/// (tools/trellis2-harness golden). The fast kernels (tiled / tensor-core GEMM, flash attention) are added
+/// beside them and held to THESE as their oracle, never the other way round.
+/// All entry points take the reference's own tensor layout, so a block reads like trellis2/modules/transformer.
+/// </summary>
+public sealed class DiTKernels
+{
+    private readonly Accelerator _acc;
+    public DiTKernels(Accelerator accelerator) => _acc = accelerator;
+
+    /// <summary>Epilogue of <see cref="Linear"/>.</summary>
+    public enum Act { None = 0, Silu = 1, GeluTanh = 2 }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Linear: out[m,n] = act( bias[n] + sum_k x[m,k] * w[n,k] )        (nn.Linear, w stored [N,K])
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, BV, BV, FV, int, int, int, int, int>? _linear;
+    private static void LinearImpl(Index1D i, FV x, BV w, BV bias, FV o, int M, int K, int N, int hasBias, int act)
+    {
+        int m = i / N, n = i % N;
+        long xo = (long)m * K, wo = (long)n * K;
+        float acc = 0f;
+        for (int k = 0; k < K; k++)
+            acc += x[xo + k] * PrecisionConvert.ConvertToSingle(w[wo + k]);
+        if (hasBias != 0) acc += PrecisionConvert.ConvertToSingle(bias[n]);
+        o[i] = Activate(acc, act);
+    }
+
+    /// <summary>nn.Linear with a bf16 weight [N,K] and optional bf16 bias [N]; x is [M,K] fp32.</summary>
+    public void Linear(FV x, BV w, BV? bias, FV o, int M, int K, int N, Act act = Act.None)
+    {
+        _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
+        var b = bias ?? w.SubView(0, 1);   // never read when hasBias == 0
+        _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
+    }
+
+    private static float Activate(float v, int act)
+    {
+        if (act == 1) return v / (1f + MathF.Exp(-v));                              // SiLU
+        if (act == 2)                                                              // GELU, tanh approximation
+        {
+            float z = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+            z = MathF.Max(-20f, MathF.Min(20f, z));
+            float e = MathF.Exp(2f * z);
+            return 0.5f * v * (1f + (e - 1f) / (e + 1f));
+        }
+        return v;
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // SiLU on a vector (adaLN_modulation = SiLU -> Linear)
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV>? _silu;
+    private static void SiluImpl(Index1D i, FV x, FV o) => o[i] = Activate(x[i], 1);
+    public void Silu(FV x, FV o, int count)
+    {
+        _silu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SiluImpl);
+        _silu(count, x, o);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // modv = bf16 per-block modulation parameter + fp32 shared modulation   ((self.modulation + mod))
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, BV, FV, FV>? _addBf16;
+    private static void AddBf16Impl(Index1D i, BV a, FV b, FV o) => o[i] = PrecisionConvert.ConvertToSingle(a[i]) + b[i];
+    public void AddBf16(BV a, FV b, FV o, int count)
+    {
+        _addBf16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, FV, FV>(AddBf16Impl);
+        _addBf16(count, a, b, o);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // LayerNorm over the last dim. modulate: out = LN(x) * (1 + mod[scaleOff+c]) + mod[shiftOff+c]
+    //                              affine:   out = LN(x) * gamma[c] + beta[c]     (bf16)
+    //                              plain:    out = LN(x)
+    // eps is the reference's: 1e-6 inside the blocks, torch's default 1e-5 for the final F.layer_norm.
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, FV, BV, BV, int, int, int, int, float>? _layerNorm;
+    private static void LayerNormImpl(Index1D m, FV x, FV o, FV mod, BV gamma, BV beta, int C, int mode, int shiftOff, int scaleOff, float eps)
+    {
+        long b = (long)(int)m * C;
+        float mean = 0f;
+        for (int c = 0; c < C; c++) mean += x[b + c];
+        mean /= C;
+        float var = 0f;
+        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var += d * d; }
+        float rstd = 1f / MathF.Sqrt(var / C + eps);
+        for (int c = 0; c < C; c++)
+        {
+            float v = (x[b + c] - mean) * rstd;
+            if (mode == 1) v = v * (1f + mod[scaleOff + c]) + mod[shiftOff + c];
+            else if (mode == 2) v = v * PrecisionConvert.ConvertToSingle(gamma[c]) + PrecisionConvert.ConvertToSingle(beta[c]);
+            o[b + c] = v;
+        }
+    }
+
+    private void LayerNormCore(FV x, FV o, FV mod, BV gamma, BV beta, int rows, int C, int mode, int shiftOff, int scaleOff, float eps)
+    {
+        _layerNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, BV, BV, int, int, int, int, float>(LayerNormImpl);
+        _layerNorm(rows, x, o, mod, gamma, beta, C, mode, shiftOff, scaleOff, eps);
+    }
+
+    /// <summary>norm(x) * (1 + scale) + shift with shift/scale read from <paramref name="mod"/> (adaLN, share_mod).</summary>
+    public void LayerNormModulate(FV x, FV o, FV mod, int shiftOff, int scaleOff, int rows, int C, float eps)
+        => LayerNormCore(x, o, mod, default, default, rows, C, 1, shiftOff, scaleOff, eps);
+
+    /// <summary>norm(x) * gamma + beta (elementwise_affine=True), bf16 parameters.</summary>
+    public void LayerNormAffine(FV x, FV o, BV gamma, BV beta, int rows, int C, float eps)
+        => LayerNormCore(x, o, default, gamma, beta, rows, C, 2, 0, 0, eps);
+
+    /// <summary>norm(x) with no parameters (F.layer_norm(h, h.shape[-1:])).</summary>
+    public void LayerNormPlain(FV x, FV o, int rows, int C, float eps)
+        => LayerNormCore(x, o, default, default, default, rows, C, 0, 0, 0, eps);
+
+    // ---------------------------------------------------------------------------------------------------
+    // x[m,c] += gate[c] * h[m,c]     (gateOff < 0: plain residual add)
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, FV, int, int>? _gateResidual;
+    private static void GateResidualImpl(Index1D i, FV x, FV h, FV mod, int gateOff, int C)
+    {
+        float g = gateOff < 0 ? 1f : mod[gateOff + i % C];
+        x[i] = x[i] + g * h[i];
+    }
+    public void GateResidual(FV x, FV h, FV mod, int gateOff, int count, int C)
+    {
+        _gateResidual ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(GateResidualImpl);
+        _gateResidual(count, x, h, mod, gateOff, C);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Per-head RMS norm (F.normalize(x, dim=-1) * gamma[h,:] * sqrt(D)), optional 3-D RoPE, IN PLACE.
+    // Vector (n, h) lives at buf[n*stride + off + h*D .. + D). phases = [N, D/2, 2] (cos, sin).
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, BV, FV, int, int, int, int, int>? _headNorm;
+    private static void HeadNormImpl(Index1D i, FV buf, BV gamma, FV phases, int stride, int off, int H, int D, int useRope)
+    {
+        int h = i % H, n = i / H;
+        long b = (long)n * stride + off + h * D;
+        float ss = 0f;
+        for (int d = 0; d < D; d++) { float v = buf[b + d]; ss += v * v; }
+        // torch F.normalize: x / max(||x||, 1e-12)
+        float inv = 1f / MathF.Max(MathF.Sqrt(ss), 1e-12f);
+        float scale = MathF.Sqrt((float)D);
+        int pairs = D / 2;
+        for (int p = 0; p < pairs; p++)
+        {
+            float x0 = buf[b + 2 * p] * inv * PrecisionConvert.ConvertToSingle(gamma[h * D + 2 * p]) * scale;
+            float x1 = buf[b + 2 * p + 1] * inv * PrecisionConvert.ConvertToSingle(gamma[h * D + 2 * p + 1]) * scale;
+            if (useRope != 0)
+            {
+                long pi = ((long)n * pairs + p) * 2;
+                float c = phases[pi], s = phases[pi + 1];
+                float r0 = x0 * c - x1 * s;
+                float r1 = x0 * s + x1 * c;
+                x0 = r0; x1 = r1;
+            }
+            buf[b + 2 * p] = x0;
+            buf[b + 2 * p + 1] = x1;
+        }
+    }
+    public void HeadNorm(FV buf, BV gamma, FV? phases, int N, int stride, int off, int H, int D)
+    {
+        _headNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, FV, int, int, int, int, int>(HeadNormImpl);
+        _headNorm(N * H, buf, gamma, phases ?? buf, stride, off, H, D, phases.HasValue ? 1 : 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // 3-D RoPE phase table from integer token coordinates. coords = [N,3]. Layout of the pair index p:
+    // axis-major (axis = p / freqDim, j = p % freqDim), padded with angle 0 up to D/2 (RotaryPositionEmbedder).
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, IV, FV, int, int, float, float>? _ropePhases;
+    private static void RopePhasesImpl(Index1D i, IV coords, FV phases, int pairs, int freqDim, float freqLo, float freqHi)
+    {
+        int n = i / pairs, p = i % pairs;
+        float angle = 0f;
+        if (p < 3 * freqDim)
+        {
+            int axis = p / freqDim, j = p % freqDim;
+            float freq = freqLo / MathF.Pow(freqHi, (float)j / freqDim);
+            angle = coords[n * 3 + axis] * freq;
+        }
+        phases[2 * i] = MathF.Cos(angle);
+        phases[2 * i + 1] = MathF.Sin(angle);
+    }
+    public void RopePhases(IV coords, FV phases, int N, int headDim, float freqLo = 1f, float freqHi = 10000f)
+    {
+        _ropePhases ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, int, int, float, float>(RopePhasesImpl);
+        int pairs = headDim / 2;
+        _ropePhases(N * pairs, coords, phases, pairs, pairs / 3, freqLo, freqHi);
+    }
+
+    // dense res^3 grid, 'ij' order (x slowest)
+    private Action<Index1D, IV, int>? _gridCoords;
+    private static void GridCoordsImpl(Index1D n, IV coords, int res)
+    {
+        coords[n * 3] = n / (res * res);
+        coords[n * 3 + 1] = n / res % res;
+        coords[n * 3 + 2] = n % res;
+    }
+    public void GridCoords(IV coords, int res)
+    {
+        _gridCoords ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int>(GridCoordsImpl);
+        _gridCoords(res * res * res, coords, res);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Layout moves for the dense latent: [C, N] <-> [N, C]
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, int, int>? _transpose;
+    private static void TransposeImpl(Index1D i, FV src, FV dst, int rows, int cols)
+    {
+        // dst[c,r] = src[r,c]   (src is rows x cols)
+        int r = i / cols, c = i % cols;
+        dst[c * rows + r] = src[i];
+    }
+    public void Transpose(FV src, FV dst, int rows, int cols)
+    {
+        _transpose ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(TransposeImpl);
+        _transpose(rows * cols, src, dst, rows, cols);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // REFERENCE attention (materialises the scores): the oracle the flash kernel is held to. Fine up to the
+    // dense 4096-token sparse-structure stage; NOT the production path for the SLat stages.
+    // q at q[i*qStride + qOff + h*D], k at k[j*kStride + kOff + h*D], v at v[j*kStride + vOff + h*D].
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>? _scores;
+    private static void ScoresImpl(Index1D idx, FV q, FV k, FV s, int Nq, int Nk, int H, int D, int qStride, int qOff, int kStride, int kOff, float scale)
+    {
+        long jj = idx % Nk; long rest = idx / Nk; int i = (int)(rest % Nq); int h = (int)(rest / Nq);
+        long qb = (long)i * qStride + qOff + h * D, kb = jj * kStride + kOff + h * D;
+        float acc = 0f;
+        for (int d = 0; d < D; d++) acc += q[qb + d] * k[kb + d];
+        s[idx] = acc * scale;
+    }
+    private Action<Index1D, FV, int>? _softmaxRows;
+    private static void SoftmaxRowsImpl(Index1D row, FV s, int Nk)
+    {
+        long b = (long)(int)row * Nk;
+        float mx = float.NegativeInfinity;
+        for (int j = 0; j < Nk; j++) mx = MathF.Max(mx, s[b + j]);
+        float sum = 0f;
+        for (int j = 0; j < Nk; j++) { float e = MathF.Exp(s[b + j] - mx); s[b + j] = e; sum += e; }
+        float inv = 1f / sum;
+        for (int j = 0; j < Nk; j++) s[b + j] *= inv;
+    }
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int>? _pv;
+    private static void PvImpl(Index1D idx, FV p, FV v, FV o, int Nq, int Nk, int H, int D, int vStride, int vOff)
+    {
+        int d = idx % D; int rest = idx / D; int h = rest % H; int i = rest / H;
+        long pb = ((long)h * Nq + i) * Nk;
+        float acc = 0f;
+        for (int j = 0; j < Nk; j++) acc += p[pb + j] * v[(long)j * vStride + vOff + h * D + d];
+        o[idx] = acc;
+    }
+
+    /// <summary>scores must hold H*Nq*Nk floats. o is [Nq, H*D].</summary>
+    public void ReferenceAttention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
+    {
+        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
+        _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
+        _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);
+        float scale = 1f / MathF.Sqrt(D);
+        _scores((int)((long)H * Nq * Nk), q, kv, scores, Nq, Nk, H, D, qStride, qOff, kvStride, kOff, scale);
+        _softmaxRows(H * Nq, scores, Nk);
+        _pv(Nq * H * D, scores, kv, o, Nq, Nk, H, D, kvStride, vOff);
+    }
+}
