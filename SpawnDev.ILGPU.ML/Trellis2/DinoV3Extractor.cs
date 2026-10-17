@@ -171,7 +171,7 @@ public sealed class DinoV3Extractor : IDisposable
         using var attn = _acc.Allocate1D<float>((long)N * C);
         using var proj = _acc.Allocate1D<float>((long)N * C);
         using var mlp = _acc.Allocate1D<float>((long)N * Mlp);
-        using var scores = _acc.Allocate1D<float>((long)Heads * N * N);
+        using var scores = _acc.Allocate1D<float>(_dk.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * N * N);   // flash kernels need no score matrix
         using var cosT = _acc.Allocate1D<float>((long)P * HeadDim);
         using var sinT = _acc.Allocate1D<float>((long)P * HeadDim);
 

@@ -62,11 +62,34 @@ public sealed class DiTKernels
             _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), w.Cast<BFloat16, U4>(), b, o, o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
             return;
         }
+        if (UseTiled(K))
+        {
+            _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.Bf16Dense);
+            EnsureDummies();
+            int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
+            _tiledBf16(new KernelConfig(tiles, TiledGemm.Threads), x, w.Cast<BFloat16, uint>(), bias.HasValue ? bias.Value.Cast<BFloat16, uint>() : _dummyU!.View,
+                o, _dummyF!.View, _noNbr!.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
+            return;
+        }
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
     }
 
-    private static float Activate(float v, int act)
+    /// <summary>
+    /// Portable register-tiled path (<see cref="TiledGemm"/>) for every backend without the tensor-core kernels: WebGPU, OpenCL, CPU, and CUDA with
+    /// TRELLIS2_MMA=0. TRELLIS2_TILED=0 forces the one-thread-per-output reference kernel.
+    /// </summary>
+    public static bool EnableTiled = Environment.GetEnvironmentVariable("TRELLIS2_TILED") != "0";
+    internal bool UseTiled(int K) => EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads;
+    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledBf16;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _dummyU;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dummyF;
+    private void EnsureDummies()
+    {   // bound in place of absent operands: WebGPU forbids binding one buffer to two slots, so no operand may stand in for another
+        _dummyU ??= _acc.Allocate1D<uint>(1); _dummyF ??= _acc.Allocate1D<float>(1); _noNbr ??= _acc.Allocate1D<int>(1);
+    }
+
+    internal static float Activate(float v, int act)
     {
         if (act == 1) return v / (1f + MathF.Exp(-v));                              // SiLU
         if (act == 2)                                                              // GELU, tanh approximation
@@ -381,9 +404,39 @@ public sealed class DiTKernels
     }
     private static void ToBf16PairsImpl(Index1D i, FV src, UV dst) => dst[i] = Bf16Bits(src[2 * i]) | (Bf16Bits(src[2 * i + 1]) << 16);
 
-    /// <summary>True when <see cref="Attention"/> runs the flash kernel (no score matrix, <c>scores</c> may be default).</summary>
-    public bool UsesFlashAttention(int headDim)
+    /// <summary>True when <see cref="Attention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core one or the portable one.</summary>
+    public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesTiledAttention(headDim);
+    private bool UsesMmaAttention(int headDim)
         => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && headDim == MmaAttention.HeadDim;
+    /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
+    private bool UsesTiledAttention(int headDim)
+        => EnableTiled && (headDim == 128 || headDim == 64) && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4;
+    private readonly Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledCross = new Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[4];
+    private readonly Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledSelf = new Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[4];
+    /// <summary>Null until the first attention: whether this backend compiles warp shuffles (NVIDIA's OpenCL does not; browsers need the subgroups feature).</summary>
+    private bool? _shuffleOk;
+
+    // The shuffle kernel is tried first; a backend that cannot compile Warp.ShuffleXor gets the shared-memory reduction variant.
+    private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int> CrossKernel(int key)
+    {
+        if (_tiledCross[key] != null) return _tiledCross[key]!;
+        if (_shuffleOk != false)
+        {
+            try { _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.CrossD128 : TiledAttention.CrossD64); _shuffleOk = true; return _tiledCross[key]!; }
+            catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
+        }
+        return _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.CrossD128Smem : TiledAttention.CrossD64Smem);
+    }
+    private Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int> SelfKernel(int key)
+    {
+        if (_tiledSelf[key] != null) return _tiledSelf[key]!;
+        if (_shuffleOk != false)
+        {
+            try { _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.SelfD128 : TiledAttention.SelfD64); _shuffleOk = true; return _tiledSelf[key]!; }
+            catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
+        }
+        return _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.SelfD128Smem : TiledAttention.SelfD64Smem);
+    }
 
     /// <summary>
     /// Multi-head attention, no mask. q at q[i*qStride + qOff + h*D], k at kv[j*kvStride + kOff + h*D], v at
@@ -392,7 +445,18 @@ public sealed class DiTKernels
     /// </summary>
     public void Attention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
     {
-        if (UsesFlashAttention(D))
+        if (!UsesMmaAttention(D) && UsesTiledAttention(D))
+        {
+            var cfg = new KernelConfig(((Nq + TiledAttention.QueriesPerGroup - 1) / TiledAttention.QueriesPerGroup) * H, TiledAttention.Threads);
+            IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;
+            bool self = qv.Buffer == kvv.Buffer;
+            if (self && qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
+            int key = (D == 128 ? 0 : 2) + (self ? 1 : 0);
+            if (self) SelfKernel(key)(cfg, q, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);   // q and k/v are slices of one buffer: one binding
+            else CrossKernel(key)(cfg, q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+            return;
+        }
+        if (UsesMmaAttention(D))
         {
             // K and V go to the kernel as bf16 pairs (one rounding pass here instead of one conversion per query tile inside the kernel)
             _flash ??= _acc.LoadStreamKernel<FV, UV, FV, int, int, int, int, int, int, int, int>(MmaAttention.Kernel);

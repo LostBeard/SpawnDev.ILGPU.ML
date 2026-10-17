@@ -144,6 +144,15 @@ public sealed class SparseKernels
             _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, 27 * cin, cout, cin, 1, 0, 0);
             return;
         }
+        if (UseTiled(27 * cin))
+        {
+            _tiledGather ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Gather);
+            EnsureTiledDummies();
+            int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
+            _tiledGather(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
+                M, 27 * cin, cout, cin, 1, 0, 0);
+            return;
+        }
         _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvImpl);
         _naiveConv(M * cout, x, weight, bias, o, nbr, M, cin, cout, 1);
     }
@@ -318,9 +327,34 @@ public sealed class SparseKernels
             _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), b, o, res ?? o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
             return;
         }
+        if (UseTiled(K))
+        {
+            _tiledLinear ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Dense);
+            EnsureTiledDummies();
+            int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
+            // a residual that IS the output is added in place (hasRes 2): WebGPU forbids binding one buffer to two slots
+            bool inPlace = res.HasValue && SameView(res.Value, o);
+            _tiledLinear(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View,
+                o, res.HasValue && !inPlace ? res.Value : _tiledDummyF!.View, _tiledDummyI!.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, !res.HasValue ? 0 : inPlace ? 2 : 1);
+            return;
+        }
         _naiveLinear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>(NaiveLinearImpl);
         _naiveLinear(M * N, x, weight, b, o, res ?? o, M, K, N, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
     }
+
+    private static bool SameView(FV a, FV b)
+    {
+        IContiguousArrayView va = a.BaseView, vb = b.BaseView;
+        return va.Buffer == vb.Buffer && va.Index == vb.Index;
+    }
+
+    // Portable register-tiled path for every backend without the tensor-core kernels (see DiTKernels.UseTiled).
+    private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads;
+    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledLinear, _tiledGather;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _tiledDummyF;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _tiledDummyI;
+    private void EnsureTiledDummies() { _tiledDummyU ??= _acc.Allocate1D<uint>(1); _tiledDummyF ??= _acc.Allocate1D<float>(1); _tiledDummyI ??= _acc.Allocate1D<int>(1); }
 
     // =====================================================================================================
     // LayerNorm over channels. gamma/beta fp16 (affine) or none; eps per call (1e-6 in the blocks, 1e-5 for the final).
