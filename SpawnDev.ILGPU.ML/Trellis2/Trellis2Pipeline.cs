@@ -65,6 +65,15 @@ public sealed class Trellis2Pipeline : IDisposable
         _texMean = Arr("tex_slat_normalization", "mean"); _texStd = Arr("tex_slat_normalization", "std");
     }
 
+    /// <summary>Debug: mean, std and max |x| of the first <paramref name="n"/> values.</summary>
+    private string Moments(FV v, int n)
+    {
+        _acc.Synchronize();
+        var a = v.SubView(0, n).GetAsArray1D(); double s = 0, s2 = 0, mx = 0;
+        foreach (var x in a) { s += x; s2 += (double)x * x; mx = Math.Max(mx, Math.Abs(x)); }
+        double mean = s / a.Length; return $"mean {mean:F3} std {Math.Sqrt(s2 / a.Length - mean * mean):F3} max {mx:F2}";
+    }
+
     private Task _prefetch = Task.CompletedTask;
 
     private string Ckpt(string name) => Path.Combine(_ckpts, name + ".safetensors");
@@ -205,6 +214,7 @@ public sealed class Trellis2Pipeline : IDisposable
             PrefetchWeights(Ckpt("slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16"), Ckpt("tex_dec_next_dc_f16c32_fp16"));
             _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
             Stage("shape flow sample", sw);
+            if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] shape: {Moments(shapeSlat.View, count)}");
         }
 
         // ---- 3. shape decoder -> mesh -------------------------------------------------------------------
@@ -241,6 +251,7 @@ public sealed class Trellis2Pipeline : IDisposable
                 dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);
             }, texSlat.View, count, _texOpts);
             Stage("tex flow sample", sw);
+            if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] tex: {Moments(texSlat.View, count)}");
         }
         shapeSlat.Dispose();
 

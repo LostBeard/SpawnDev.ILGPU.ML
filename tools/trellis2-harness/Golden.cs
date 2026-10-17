@@ -49,10 +49,11 @@ internal static class Golden
         using var _c = ctx; using var _a = accel;
         var k = new DiTKernels(accel);
         if (!k.UsesFlashAttention(128)) { Console.WriteLine("flash attention needs CUDA with tensor cores enabled"); return 2; }
-        const int H = 12, D = 128, C = H * D;
+        const int D = 128;
         bool ok = true;
-        foreach (var (nq, nk, packed) in new[] { (1000, 1029, false), (4096, 4096, true), (300, 37, false), (65, 64, true), (1, 5, false), (777, 1500, true) })
+        foreach (var (nq, nk, packed, H) in new[] { (1000, 1029, false, 12), (4096, 4096, true, 12), (300, 37, false, 12), (65, 64, true, 12), (1, 5, false, 12), (777, 1500, true, 12), (15000, 15000, true, 1), (15000, 4101, false, 2) })
         {
+            int C = H * D;
             int qStride = packed ? 3 * C : C, kvStride = packed ? 3 * C : 2 * C;
             int kOff = packed ? C : 0, vOff = packed ? 2 * C : C;
             int tokens = packed ? Math.Max(nq, nk) : 0;
@@ -98,7 +99,7 @@ internal static class Golden
     {
         string dir = Path.Combine(Gpu.WeightDir, "golden", "slat_" + kind);
         if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_slat_flow.py {kind}"); return 2; }
-        string ckpt = kind == "shape" ? "slat_flow_img2shape_dit_1_3B_512_bf16" : "slat_flow_imgshape2tex_dit_1_3B_512_bf16";
+        string ckpt = kind switch { "shape" => "slat_flow_img2shape_dit_1_3B_512_bf16", "tex" => "slat_flow_imgshape2tex_dit_1_3B_512_bf16", "shape1024" => "slat_flow_img2shape_dit_1_3B_1024_bf16", _ => "slat_flow_imgshape2tex_dit_1_3B_1024_bf16" };
         var (ctx, accel) = Gpu.Create();
         using var _c = ctx; using var _a = accel;
         using var weights = GpuWeights.Load(accel, Path.Combine(Gpu.WeightDir, "TRELLIS.2-4B", "ckpts", ckpt));

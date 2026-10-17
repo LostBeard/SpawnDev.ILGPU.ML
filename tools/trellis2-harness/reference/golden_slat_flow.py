@@ -5,7 +5,7 @@ needs flash_attn / xformers varlen for sparse attention, which have no CPU build
 them is replaced by torch scaled_dot_product_attention (identical maths for a single sequence). Everything else,
 including SparseRotaryPositionEmbedder, SparseMultiHeadRMSNorm and the sparse block, is the reference's own code.
 
-  python golden_slat_flow.py shape|tex [N_TOKENS] [N_COND]
+  python golden_slat_flow.py shape|tex|shape1024|tex1024 [N_TOKENS] [N_COND]
 """
 import os, sys, json, types, time
 REF = os.environ["TRELLIS2_REF"]
@@ -13,7 +13,8 @@ W = os.environ["TRELLIS2_DIR"]
 kind = sys.argv[1] if len(sys.argv) > 1 else "shape"
 n_tok = int(sys.argv[2]) if len(sys.argv) > 2 else 3000
 n_cond = int(sys.argv[3]) if len(sys.argv) > 3 else 1029
-ckpt = {"shape": "slat_flow_img2shape_dit_1_3B_512_bf16", "tex": "slat_flow_imgshape2tex_dit_1_3B_512_bf16"}[kind]
+ckpt = {"shape": "slat_flow_img2shape_dit_1_3B_512_bf16", "tex": "slat_flow_imgshape2tex_dit_1_3B_512_bf16",
+        "shape1024": "slat_flow_img2shape_dit_1_3B_1024_bf16", "tex1024": "slat_flow_imgshape2tex_dit_1_3B_1024_bf16"}[kind]
 OUT = os.path.join(W, "golden", "slat_" + kind)
 os.makedirs(OUT, exist_ok=True)
 
