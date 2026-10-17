@@ -95,6 +95,13 @@ public sealed class Trellis2ImageTo3D : IDisposable
                     using var image1024 = new Trellis2ImagePrep(_acc).Prepare(rgba, width, height, 1024);
                     cond1024 = _acc.Allocate1D<float>((long)tokens1024 * 1024);
                     dino.Extract(image1024.View, 1024, cond1024.View);
+                    var dumpCond = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_COND") ?? "";
+                    if (dumpCond.Length > 0)
+                    {   // debug: the normalised 1024 px image and its features, to compare against timm on the same tensor (reference/golden_dino_timm.py)
+                        Directory.CreateDirectory(dumpCond); _acc.Synchronize();
+                        void Dump(string name, ArrayView1D<float, Stride1D.Dense> v) { var a = v.GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpCond, name), b); }
+                        Dump("image1024.f32", image1024.View); Dump("cond1024.f32", cond1024.View);
+                    }
                 }
             }
             StageDone?.Invoke("dinov3 features", sw.Elapsed.TotalSeconds);
