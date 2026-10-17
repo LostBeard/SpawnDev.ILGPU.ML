@@ -8,9 +8,15 @@
 		<!-- Publish TRIMMED, as consumers ship: SpawnDev.ILGPU.ML and SpawnDev.ILGPU are IsTrimmable, so the Blazor
 		     default TrimMode=partial trims them and PMT tests them that way. Test assemblies are rooted below. -->
 		<PublishTrimmed>true</PublishTrimmed>
-		<!-- AOT is SUPPORTED (RunAOTCompilation=true + WasmStripILAfterAOT=false keeps the IL ILGPU compiles from);
-		     the test Demo stays on the interpreter only because an AOT build of it takes over an hour. -->
-		<RunAOTCompilation>false</RunAOTCompilation>
+		<!-- AOT: publish with -p:DemoAot=true (the GitHub Pages workflow does). RunAOTCompilation + WasmStripILAfterAOT=false keeps
+		     the IL ILGPU compiles kernels from; WasmDedup=false compiles the generic instantiations per assembly in parallel (minutes,
+		     not an hour; larger dotnet.native.wasm). Off by default because PlaywrightMultiTest publishes this project for every run.
+		     Host code is the interpreter's otherwise: TRELLIS.2's mesh simplify / UV atlas and kernel IL compiles run 30-45x slower
+		     than desktop .NET there. -->
+		<DemoAot Condition="'$(DemoAot)' == ''">false</DemoAot>
+		<RunAOTCompilation>$(DemoAot)</RunAOTCompilation>
+		<WasmStripILAfterAOT>false</WasmStripILAfterAOT>
+		<WasmDedup>false</WasmDedup>
 		<!-- mark as testable by PlaywrightMultiTest -->
 		<PlaywrightMultiTest>
 
