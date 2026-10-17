@@ -67,12 +67,15 @@ public static class UvAtlas
             area[f] = 0.5 * len;
             normal[f] = len > 1e-20 ? cross / (float)len : new Vector3(0, 0, 1);
         }
+        var prof = Environment.GetEnvironmentVariable("TRELLIS2_MESHPROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew();
         var adj = BuildAdjacency(faces, F);
+        if (prof) { Console.WriteLine($"  [atlas] normals+adjacency {psw.Elapsed.TotalSeconds:F2}s"); psw.Restart(); }
 
         // ---- charts ----
         var charts = new List<Chart>();
         var all = new List<int>(F);
         for (int f = 0; f < F; f++) all.Add(f);
+        long tg = 0, tp = 0, to = 0;
         var stack = new Stack<(List<int> faces, double deg, int depth)>();
         stack.Push((all, options.MaxNormalDeviationDegrees, 0));
         var assigned = new int[F]; Array.Fill(assigned, -1);
@@ -82,10 +85,17 @@ public static class UvAtlas
             var (set, deg, depth) = stack.Pop();
             stamp++;
             foreach (int f in set) inSet[f] = stamp;
-            foreach (var faceList in Grow(set, adj, normal, area, inSet, stamp, Math.Cos(deg * Math.PI / 180)))
+            long g0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var grown = Grow(set, adj, normal, area, inSet, stamp, Math.Cos(deg * Math.PI / 180));
+            tg += System.Diagnostics.Stopwatch.GetTimestamp() - g0;
+            foreach (var faceList in grown)
             {
+                long p0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 var chart = Project(faceList, positions, faces, normal, area);
-                if (faceList.Count > 1 && depth < options.MaxSplitDepth && Overlaps(chart))
+                long p1 = System.Diagnostics.Stopwatch.GetTimestamp(); tp += p1 - p0;
+                bool ov = faceList.Count > 1 && depth < options.MaxSplitDepth && Overlaps(chart);
+                to += System.Diagnostics.Stopwatch.GetTimestamp() - p1;
+                if (ov)
                 {
                     stack.Push((faceList, Math.Max(deg * 0.6, 3.0), depth + 1));
                     continue;
@@ -94,6 +104,7 @@ public static class UvAtlas
             }
         }
 
+        if (prof) { double fq = System.Diagnostics.Stopwatch.Frequency; Console.WriteLine($"  [atlas] charts {psw.Elapsed.TotalSeconds:F2}s ({charts.Count}): grow {tg / fq:F2}s project {tp / fq:F2}s overlap {to / fq:F2}s"); psw.Restart(); }
         // ---- pack ----
         double totalArea = 0;
         foreach (var f in area) totalArea += f;
@@ -114,6 +125,7 @@ public static class UvAtlas
         double used = 0;
         foreach (var c in charts) used += c.Width * density * c.Scale * c.Height * density * c.Scale;
 
+        if (prof) { Console.WriteLine($"  [atlas] pack {psw.Elapsed.TotalSeconds:F2}s"); psw.Restart(); }
         // ---- emit ----
         var outPos = new List<float>(positions.Length);
         var outUv = new List<float>(positions.Length / 3 * 2);
@@ -255,7 +267,8 @@ public static class UvAtlas
     private static bool Overlaps(Chart chart)
     {
         int n = chart.Faces.Count;
-        const int G = 96;
+        // grid side scales with the chart: a 3-triangle chart needs 8 x 8 cells, not 96 x 96 (121k such charts took 4.8 s at a fixed 96)
+        int G = Math.Clamp(4 * (int)Math.Sqrt(n) + 4, 8, 96);
         double sx = G / chart.Width, sy = G / chart.Height;
         var cover = new byte[G * G];
         int overlap = 0, covered = 0;

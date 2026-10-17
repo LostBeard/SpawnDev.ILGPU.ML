@@ -15,6 +15,7 @@ public static class MeshSimplifier
     {
         int nv = positions.Length / 3, nf = faces.Length / 3;
         if (nf <= targetFaces) return (positions, faces);
+        var prof = Environment.GetEnvironmentVariable("TRELLIS2_MESHPROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew();
 
         var pos = new double[nv * 3];
         for (int i = 0; i < pos.Length; i++) pos[i] = positions[i];
@@ -61,6 +62,7 @@ public static class MeshSimplifier
                 AddPlane(Q, a, px, py, pz, d, 100.0 * el2); AddPlane(Q, b, px, py, pz, d, 100.0 * el2);
             }
 
+        var qs = new double[10];                       // scratch for Cost (no allocation per edge)
         var ver = new int[nv];
         var dead = new bool[nv];
         var heap = new PriorityQueue<Edge, double>(nf * 2);
@@ -70,16 +72,18 @@ public static class MeshSimplifier
                 int a = f[t * 3 + k], b = f[t * 3 + (k + 1) % 3];
                 if (a > b) (a, b) = (b, a);
                 if (a == b || !IsFirstFace(vf, vfn, f, alive, a, b, t)) continue;
-                heap.Enqueue(new Edge(a, b, 0, 0), Cost(Q, pos, a, b, out _, out _, out _));
+                heap.Enqueue(new Edge(a, b, 0, 0), Cost(Q, pos, a, b, qs, out _, out _, out _));
             }
 
-        int aliveFaces = nf;
-        var nbr = new List<int>(32);
+        if (prof) { Console.WriteLine($"  [simplify] setup {psw.Elapsed.TotalSeconds:F2}s, {heap.Count} edges"); psw.Restart(); }
+        int aliveFaces = nf; long popped = 0, rejected = 0, stale = 0;
+        var nbr = new List<int>(32); var na = new List<int>(32); var nb = new List<int>(32);
         while (aliveFaces > targetFaces && heap.TryDequeue(out var e, out double cost))
         {
-            if (dead[e.A] || dead[e.B] || ver[e.A] != e.VerA || ver[e.B] != e.VerB) continue;
-            Cost(Q, pos, e.A, e.B, out double px, out double py, out double pz);
-            if (!CanCollapse(pos, f, vf, vfn, alive, e.A, e.B, px, py, pz)) continue;
+            popped++;
+            if (dead[e.A] || dead[e.B] || ver[e.A] != e.VerA || ver[e.B] != e.VerB) { stale++; continue; }
+            Cost(Q, pos, e.A, e.B, qs, out double px, out double py, out double pz);
+            if (!CanCollapse(pos, f, vf, vfn, alive, e.A, e.B, px, py, pz, na, nb)) { rejected++; continue; }
 
             // collapse B into A
             int a = e.A, b = e.B;
@@ -103,10 +107,11 @@ public static class MeshSimplifier
             foreach (int n in nbr)                         // ver[a] was bumped: every queued edge touching a is stale, these replace them
             {
                 int lo = Math.Min(a, n), hi = Math.Max(a, n);
-                heap.Enqueue(new Edge(lo, hi, ver[lo], ver[hi]), Cost(Q, pos, lo, hi, out _, out _, out _));
+                heap.Enqueue(new Edge(lo, hi, ver[lo], ver[hi]), Cost(Q, pos, lo, hi, qs, out _, out _, out _));
             }
         }
 
+        if (prof) Console.WriteLine($"  [simplify] collapse loop {psw.Elapsed.TotalSeconds:F2}s: popped {popped}, stale {stale}, rejected {rejected}");
         // compact
         var map = new int[nv]; Array.Fill(map, -1);
         int used = 0; var outFaces = new int[aliveFaces * 3]; int fi = 0;
@@ -146,9 +151,8 @@ public static class MeshSimplifier
          + q[o + 7] * z * z + 2 * q[o + 8] * z + q[o + 9];
 
     /// <summary>Cost of collapsing a-b and the position to collapse to: the quadric minimiser when the system is well conditioned, else the best of the ends and midpoint.</summary>
-    private static double Cost(double[] Q, double[] pos, int a, int b, out double x, out double y, out double z)
+    private static double Cost(double[] Q, double[] pos, int a, int b, double[] q, out double x, out double y, out double z)
     {
-        var q = new double[10];
         for (int k = 0; k < 10; k++) q[k] = Q[a * 10 + k] + Q[b * 10 + k];
         double ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2], bx = pos[b * 3], by = pos[b * 3 + 1], bz = pos[b * 3 + 2];
         double best = Err(q, 0, ax, ay, az); x = ax; y = ay; z = az;
@@ -213,9 +217,8 @@ public static class MeshSimplifier
     }
 
     /// <summary>Link condition (the two ends share exactly the vertices opposite the shared faces) + no face flips or collapses to a sliver.</summary>
-    private static bool CanCollapse(double[] pos, int[] f, int[][] vf, int[] vfn, bool[] alive, int a, int b, double px, double py, double pz)
+    private static bool CanCollapse(double[] pos, int[] f, int[][] vf, int[] vfn, bool[] alive, int a, int b, double px, double py, double pz, List<int> na, List<int> nb)
     {
-        var na = new List<int>(16); var nb = new List<int>(16);
         Neighbours(f, vf, vfn, alive, a, na); Neighbours(f, vf, vfn, alive, b, nb);
         int common = 0;
         foreach (int n in na) if (n != b && nb.Contains(n)) common++;
