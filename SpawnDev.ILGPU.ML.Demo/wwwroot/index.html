@@ -46,7 +46,27 @@
          5.2.27: unregister-all + arrayBuffer wrap (5.2.26 bypass alone left old SW controlling). -->
     <script src="blazor-coi-serviceworker.js?v=5.2.31"></script>
     <script src="js/glb-viewer.js"></script>
-    <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
+    <script src="_framework/blazor.webassembly#[.{fingerprint}].js" autostart="false"></script>
+    <script>
+        // GitHub Pages serves files exactly as stored and its branch refuses files over 100 MB: the AOT runtime (dotnet.native.wasm, ~130 MB)
+        // ships there only as its precompressed .gz copy (~37 MB). Off localhost, every boot resource except the JS modules is fetched as .gz
+        // and inflated by the browser's own DecompressionStream (native, streaming), which is also ~3.5x less to download than the raw files.
+        // (standalone blazor.webassembly.js takes loadBootResource at the top level; the webAssembly: {} nesting is blazor.web.js)
+        Blazor.start({
+            loadBootResource: function (type, name, defaultUri, integrity) {
+                if (type === 'dotnetjs' || type === 'configuration' || type === 'manifest' || location.hostname === 'localhost' || typeof DecompressionStream === 'undefined')
+                    return null;
+                return (async function () {
+                    const r = await fetch(defaultUri + '.gz');
+                    if (!r.ok) return fetch(defaultUri);                       // no compressed copy: the original
+                    const contentType = type === 'dotnetwasm' ? 'application/wasm' : 'application/octet-stream';
+                    // a server that already sent it with Content-Encoding: gzip had the browser inflate it
+                    const body = r.headers.get('content-encoding') ? r.body : r.body.pipeThrough(new DecompressionStream('gzip'));
+                    return new Response(body, { headers: { 'content-type': contentType } });
+                })();
+            }
+        });
+    </script>
 </body>
 
 </html>

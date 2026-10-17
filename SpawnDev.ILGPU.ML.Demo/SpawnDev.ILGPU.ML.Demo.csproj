@@ -9,14 +9,14 @@
 		     default TrimMode=partial trims them and PMT tests them that way. Test assemblies are rooted below. -->
 		<PublishTrimmed>true</PublishTrimmed>
 		<!-- AOT: publish with -p:DemoAot=true (the GitHub Pages workflow does). RunAOTCompilation + WasmStripILAfterAOT=false keeps
-		     the IL ILGPU compiles kernels from; WasmDedup=false compiles the generic instantiations per assembly in parallel (minutes,
-		     not an hour; larger dotnet.native.wasm). Off by default because PlaywrightMultiTest publishes this project for every run.
-		     Host code is the interpreter's otherwise: TRELLIS.2's mesh simplify / UV atlas and kernel IL compiles run 30-45x slower
-		     than desktop .NET there. -->
+		     the IL ILGPU compiles kernels from. WasmDedup stays at its default (true): the smallest dotnet.native.wasm, but one
+		     single-threaded module for the generic instantiations (an hour+). For a quick local AOT build add -p:WasmDedup=false
+		     (MEASURED: 25 min here, dotnet.native.wasm 131 MB raw / 37 MB .gz). Off by default because PlaywrightMultiTest publishes this
+		     project for every run. Host code is the interpreter's otherwise: TRELLIS.2's mesh simplify / UV atlas and kernel IL compiles
+		     run 30-45x slower than desktop .NET there. -->
 		<DemoAot Condition="'$(DemoAot)' == ''">false</DemoAot>
 		<RunAOTCompilation>$(DemoAot)</RunAOTCompilation>
 		<WasmStripILAfterAOT>false</WasmStripILAfterAOT>
-		<WasmDedup>false</WasmDedup>
 		<!-- mark as testable by PlaywrightMultiTest -->
 		<PlaywrightMultiTest>
 

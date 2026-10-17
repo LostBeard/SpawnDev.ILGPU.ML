@@ -27,6 +27,11 @@ jobs:
     - name: Publish .NET Core Project
       run: dotnet publish ./SpawnDev.ILGPU.ML.Demo/ --nologo -c:Release -p:DemoAot=true --output publish
       
+    # The pushed branch refuses files over 100 MB: the AOT runtime (dotnet.native.wasm, ~130 MB) ships as its .gz copy only;
+    # index.html's loadBootResource fetches the .gz copies off localhost
+    - name: Drop raw files the gh-pages branch cannot hold
+      run: find publish/wwwroot -type f -size +95M -print -delete
+
     # copy index.html to 404.html to serve the same file when a file is not found
     - name: copy index.html to 404.html
       run: cp publish/wwwroot/index.html publish/wwwroot/404.html
