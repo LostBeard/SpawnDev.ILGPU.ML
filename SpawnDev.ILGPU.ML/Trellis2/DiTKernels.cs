@@ -6,6 +6,7 @@ namespace SpawnDev.ILGPU.ML.Trellis2;
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 using IV = ArrayView1D<int, Stride1D.Dense>;
+using UV = ArrayView1D<uint, Stride1D.Dense>;
 
 /// <summary>
 /// The kernels of the TRELLIS.2 flow transformers (sparse-structure DiT and the two SLat DiTs): bf16 weights,
@@ -369,7 +370,16 @@ public sealed class DiTKernels
         o[idx] = acc;
     }
 
-    private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>? _flash;
+    private Action<KernelConfig, FV, UV, FV, int, int, int, int, int, int, int, int>? _flash;
+    private Action<Index1D, FV, UV>? _toBf16Pairs;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _kv16;
+
+    private static uint Bf16Bits(float f)
+    {
+        uint bits = (uint)Interop.FloatAsInt(f);
+        return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
+    }
+    private static void ToBf16PairsImpl(Index1D i, FV src, UV dst) => dst[i] = Bf16Bits(src[2 * i]) | (Bf16Bits(src[2 * i + 1]) << 16);
 
     /// <summary>True when <see cref="Attention"/> runs the flash kernel (no score matrix, <c>scores</c> may be default).</summary>
     public bool UsesFlashAttention(int headDim)
@@ -384,9 +394,14 @@ public sealed class DiTKernels
     {
         if (UsesFlashAttention(D))
         {
-            _flash ??= _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(MmaAttention.Kernel);
+            // K and V go to the kernel as bf16 pairs (one rounding pass here instead of one conversion per query tile inside the kernel)
+            _flash ??= _acc.LoadStreamKernel<FV, UV, FV, int, int, int, int, int, int, int, int>(MmaAttention.Kernel);
+            _toBf16Pairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV>(ToBf16PairsImpl);
+            long pairs = ((long)(Nk - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
+            if (_kv16 == null || _kv16.Length < pairs) { _kv16?.Dispose(); _kv16 = _acc.Allocate1D<uint>(pairs); }
+            _toBf16Pairs((int)pairs, kv, _kv16.View);
             _flash(new KernelConfig(((Nq + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
-                q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+                q, _kv16.View, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
             return;
         }
         ReferenceAttention(q, qStride, qOff, kv, kvStride, kOff, vOff, scores, o, Nq, Nk, H, D);

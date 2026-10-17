@@ -70,6 +70,16 @@ internal static class Golden
             k.Attention(qb.View, qStride, 0, kvb.View, kvStride, kOff, vOff, default, got.View, nq, nk, H, D);
             accel.Synchronize();
             ok &= Compare($"attn {nq}x{nk}{(packed ? " packed" : "")}", want.GetAsArray1D(), got.GetAsArray1D(), 8e-3);
+            if (nq >= 1000)
+            {
+                for (int w = 0; w < 3; w++) k.Attention(qb.View, qStride, 0, kvb.View, kvStride, kOff, vOff, default, got.View, nq, nk, H, D);
+                accel.Synchronize();
+                var sw = System.Diagnostics.Stopwatch.StartNew(); const int reps = 20;
+                for (int r = 0; r < reps; r++) k.Attention(qb.View, qStride, 0, kvb.View, kvStride, kOff, vOff, default, got.View, nq, nk, H, D);
+                accel.Synchronize();
+                double ms = sw.Elapsed.TotalMilliseconds / reps;
+                Console.WriteLine($"   {nq}x{nk}: {ms:F2} ms, {4.0 * nq * nk * D * H / (ms * 1e-3) / 1e12:F1} TFLOPS");
+            }
         }
         Console.WriteLine(ok ? "ATTENTION PASS" : "ATTENTION FAIL");
         return ok ? 0 : 1;

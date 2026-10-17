@@ -18,6 +18,9 @@ import sys
 
 D = 128
 KT = 64            # keys per tile
+NW = int(__import__('os').environ.get('ATTN_WARPS', '8'))   # warps per group; the group owns 16*NW queries
+TH = 32 * NW
+QT = 16 * NW
 SC = 1.4426950408889634 / (D ** 0.5)   # log2(e) / sqrt(D): scores are kept in the log2 domain
 KS_STRIDE, VT_STRIDE = 68, 36
 
@@ -41,10 +44,11 @@ w("")
 w("namespace SpawnDev.ILGPU.ML.Trellis2;")
 w("")
 w("using FV = ArrayView1D<float, Stride1D.Dense>;")
+w("using UV = ArrayView1D<uint, Stride1D.Dense>;")
 w("")
 w("internal static class MmaAttention")
 w("{")
-w(f"    public const int QTile = 64, KTile = {KT}, Threads = 128, HeadDim = {D};")
+w(f"    public const int QTile = {QT}, KTile = {KT}, Threads = {TH}, HeadDim = {D};")
 w("")
 w("    private static uint Bf16Bits(float f)")
 w("    {")
@@ -53,15 +57,15 @@ w("        return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;")
 w("    }")
 w("    private static uint Pack(float lo, float hi) => Bf16Bits(lo) | (Bf16Bits(hi) << 16);")
 w("")
-w("    /// <summary>grid = ceil(Nq / 64) * H, group = 128.</summary>")
-w("    public static void Kernel(FV Q, FV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+w(f"    /// <summary>grid = ceil(Nq / {QT}) * H, group = {TH}.</summary>")
+w("    public static void Kernel(FV Q, UV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
 w("    {")
 w("        int qTile = Grid.IdxX / H, h = Grid.IdxX % H;")
 w("        int tid = Group.IdxX, warp = tid >> 5, lane = tid & 31;")
 w("        int g = lane >> 2, t = lane & 3;")
 w(f"        var ks = SharedMemory.Allocate<uint>({KT} * {KS_STRIDE});")
 w(f"        var vt = SharedMemory.Allocate<uint>({D} * {VT_STRIDE});")
-w("        int row0 = qTile * 64 + warp * 16 + g, row1 = row0 + 8;")
+w(f"        int row0 = qTile * {QT} + warp * 16 + g, row1 = row0 + 8;")
 w("        long qb0 = (long)row0 * qStride + qOff + h * 128, qb1 = (long)row1 * qStride + qOff + h * 128;")
 w("        bool r0ok = row0 < Nq, r1ok = row1 < Nq;")
 w("")
@@ -77,24 +81,31 @@ for j in range(D // 8):
     w(f"        float o{j}0 = 0f, o{j}1 = 0f, o{j}2 = 0f, o{j}3 = 0f;")
 w("        float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;")
 w("")
+NKI = KT * D // 2 // TH
+NVI = KT * D // 4 // TH
+w("        // the next tile's K / V words are fetched into registers while this tile computes (the global latency hides behind the MMAs)")
+for i in range(NKI): w(f"        uint kr{i} = 0u;")
+for i in range(NVI): w(f"        uint nxa{i} = 0u, nxb{i} = 0u;")
+def loads(kbexpr, ind):
+    for i in range(NKI):
+        w(f"{ind}{{ int idx = {i * TH} + tid; int gk = {kbexpr} + (idx >> 6); kr{i} = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }}")
+    for i in range(NVI):
+        w(f"{ind}{{ int idx = {i * TH} + tid; int gv0 = {kbexpr} + 2 * (idx & 31), dp = idx >> 5;")
+        w(f"{ind}  nxa{i} = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;")
+        w(f"{ind}  nxb{i} = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }}")
+loads("0", "        ")
+w("")
 w(f"        for (int kb = 0; kb < Nk; kb += {KT})")
 w("        {")
-w("            // stage K (row-major dim pairs) and V (transposed key pairs) for this tile")
-w(f"            for (int it = 0; it < {KT * D // 2 // 128}; it++)")
-w("            {")
-w("                int idx = it * 128 + tid;")
-w(f"                int key = idx >> 6, wd = idx & 63;           // K: key row, dim pair")
-w("                int gk = kb + key;")
-w("                float k0 = gk < Nk ? KV[(long)gk * kvStride + kOff + h * 128 + 2 * wd] : 0f;")
-w("                float k1 = gk < Nk ? KV[(long)gk * kvStride + kOff + h * 128 + 2 * wd + 1] : 0f;")
-w(f"                ks[key * {KS_STRIDE} + wd] = Pack(k0, k1);")
-w(f"                int pair = idx >> 7, d = idx & 127;          // V: key pair, dim")
-w("                int gv0 = kb + 2 * pair;")
-w("                float v0 = gv0 < Nk ? KV[(long)gv0 * kvStride + vOff + h * 128 + d] : 0f;")
-w("                float v1 = gv0 + 1 < Nk ? KV[(long)(gv0 + 1) * kvStride + vOff + h * 128 + d] : 0f;")
-w(f"                vt[d * {VT_STRIDE} + pair] = Pack(v0, v1);")
-w("            }")
+w("            // registers -> shared: K row-major dim pairs, V transposed key pairs (key pair on the fast lane axis: conflict-free store)")
+for i in range(NKI):
+    w(f"            {{ int idx = {i * TH} + tid; ks[(idx >> 6) * {KS_STRIDE} + (idx & 63)] = kr{i}; }}")
+for i in range(NVI):
+    w(f"            {{ int idx = {i * TH} + tid; int pair = idx & 31, dp = idx >> 5;")
+    w(f"              vt[(2 * dp) * {VT_STRIDE} + pair] = (nxa{i} & 0xFFFFu) | (nxb{i} << 16);")
+    w(f"              vt[(2 * dp + 1) * {VT_STRIDE} + pair] = (nxa{i} >> 16) | (nxb{i} & 0xFFFF0000u); }}")
 w("            Group.Barrier();")
+loads(f"kb + {KT}", "            ")
 w("")
 for j in range(KT // 8):
     w(f"            float s{j}0 = 0f, s{j}1 = 0f, s{j}2 = 0f, s{j}3 = 0f;")

@@ -6,10 +6,11 @@ using ILGPU.Runtime.Cuda;
 namespace SpawnDev.ILGPU.ML.Trellis2;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
+using UV = ArrayView1D<uint, Stride1D.Dense>;
 
 internal static class MmaAttention
 {
-    public const int QTile = 64, KTile = 64, Threads = 128, HeadDim = 128;
+    public const int QTile = 128, KTile = 64, Threads = 256, HeadDim = 128;
 
     private static uint Bf16Bits(float f)
     {
@@ -18,15 +19,15 @@ internal static class MmaAttention
     }
     private static uint Pack(float lo, float hi) => Bf16Bits(lo) | (Bf16Bits(hi) << 16);
 
-    /// <summary>grid = ceil(Nq / 64) * H, group = 128.</summary>
-    public static void Kernel(FV Q, FV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)
+    /// <summary>grid = ceil(Nq / 128) * H, group = 256.</summary>
+    public static void Kernel(FV Q, UV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)
     {
         int qTile = Grid.IdxX / H, h = Grid.IdxX % H;
         int tid = Group.IdxX, warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
         var ks = SharedMemory.Allocate<uint>(64 * 68);
         var vt = SharedMemory.Allocate<uint>(128 * 36);
-        int row0 = qTile * 64 + warp * 16 + g, row1 = row0 + 8;
+        int row0 = qTile * 128 + warp * 16 + g, row1 = row0 + 8;
         long qb0 = (long)row0 * qStride + qOff + h * 128, qb1 = (long)row1 * qStride + qOff + h * 128;
         bool r0ok = row0 < Nq, r1ok = row1 < Nq;
 
@@ -82,24 +83,156 @@ internal static class MmaAttention
         float o150 = 0f, o151 = 0f, o152 = 0f, o153 = 0f;
         float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;
 
+        // the next tile's K / V words are fetched into registers while this tile computes (the global latency hides behind the MMAs)
+        uint kr0 = 0u;
+        uint kr1 = 0u;
+        uint kr2 = 0u;
+        uint kr3 = 0u;
+        uint kr4 = 0u;
+        uint kr5 = 0u;
+        uint kr6 = 0u;
+        uint kr7 = 0u;
+        uint kr8 = 0u;
+        uint kr9 = 0u;
+        uint kr10 = 0u;
+        uint kr11 = 0u;
+        uint kr12 = 0u;
+        uint kr13 = 0u;
+        uint kr14 = 0u;
+        uint kr15 = 0u;
+        uint nxa0 = 0u, nxb0 = 0u;
+        uint nxa1 = 0u, nxb1 = 0u;
+        uint nxa2 = 0u, nxb2 = 0u;
+        uint nxa3 = 0u, nxb3 = 0u;
+        uint nxa4 = 0u, nxb4 = 0u;
+        uint nxa5 = 0u, nxb5 = 0u;
+        uint nxa6 = 0u, nxb6 = 0u;
+        uint nxa7 = 0u, nxb7 = 0u;
+        { int idx = 0 + tid; int gk = 0 + (idx >> 6); kr0 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 256 + tid; int gk = 0 + (idx >> 6); kr1 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 512 + tid; int gk = 0 + (idx >> 6); kr2 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 768 + tid; int gk = 0 + (idx >> 6); kr3 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 1024 + tid; int gk = 0 + (idx >> 6); kr4 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 1280 + tid; int gk = 0 + (idx >> 6); kr5 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 1536 + tid; int gk = 0 + (idx >> 6); kr6 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 1792 + tid; int gk = 0 + (idx >> 6); kr7 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 2048 + tid; int gk = 0 + (idx >> 6); kr8 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 2304 + tid; int gk = 0 + (idx >> 6); kr9 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 2560 + tid; int gk = 0 + (idx >> 6); kr10 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 2816 + tid; int gk = 0 + (idx >> 6); kr11 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 3072 + tid; int gk = 0 + (idx >> 6); kr12 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 3328 + tid; int gk = 0 + (idx >> 6); kr13 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 3584 + tid; int gk = 0 + (idx >> 6); kr14 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 3840 + tid; int gk = 0 + (idx >> 6); kr15 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+        { int idx = 0 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa0 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb0 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 256 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa1 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb1 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 512 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa2 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb2 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 768 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa3 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb3 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 1024 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa4 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb4 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 1280 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa5 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb5 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 1536 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa6 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb6 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+        { int idx = 1792 + tid; int gv0 = 0 + 2 * (idx & 31), dp = idx >> 5;
+          nxa7 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+          nxb7 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+
         for (int kb = 0; kb < Nk; kb += 64)
         {
-            // stage K (row-major dim pairs) and V (transposed key pairs) for this tile
-            for (int it = 0; it < 32; it++)
-            {
-                int idx = it * 128 + tid;
-                int key = idx >> 6, wd = idx & 63;           // K: key row, dim pair
-                int gk = kb + key;
-                float k0 = gk < Nk ? KV[(long)gk * kvStride + kOff + h * 128 + 2 * wd] : 0f;
-                float k1 = gk < Nk ? KV[(long)gk * kvStride + kOff + h * 128 + 2 * wd + 1] : 0f;
-                ks[key * 68 + wd] = Pack(k0, k1);
-                int pair = idx >> 7, d = idx & 127;          // V: key pair, dim
-                int gv0 = kb + 2 * pair;
-                float v0 = gv0 < Nk ? KV[(long)gv0 * kvStride + vOff + h * 128 + d] : 0f;
-                float v1 = gv0 + 1 < Nk ? KV[(long)(gv0 + 1) * kvStride + vOff + h * 128 + d] : 0f;
-                vt[d * 36 + pair] = Pack(v0, v1);
-            }
+            // registers -> shared: K row-major dim pairs, V transposed key pairs (key pair on the fast lane axis: conflict-free store)
+            { int idx = 0 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr0; }
+            { int idx = 256 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr1; }
+            { int idx = 512 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr2; }
+            { int idx = 768 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr3; }
+            { int idx = 1024 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr4; }
+            { int idx = 1280 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr5; }
+            { int idx = 1536 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr6; }
+            { int idx = 1792 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr7; }
+            { int idx = 2048 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr8; }
+            { int idx = 2304 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr9; }
+            { int idx = 2560 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr10; }
+            { int idx = 2816 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr11; }
+            { int idx = 3072 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr12; }
+            { int idx = 3328 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr13; }
+            { int idx = 3584 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr14; }
+            { int idx = 3840 + tid; ks[(idx >> 6) * 68 + (idx & 63)] = kr15; }
+            { int idx = 0 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa0 & 0xFFFFu) | (nxb0 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa0 >> 16) | (nxb0 & 0xFFFF0000u); }
+            { int idx = 256 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa1 & 0xFFFFu) | (nxb1 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa1 >> 16) | (nxb1 & 0xFFFF0000u); }
+            { int idx = 512 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa2 & 0xFFFFu) | (nxb2 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa2 >> 16) | (nxb2 & 0xFFFF0000u); }
+            { int idx = 768 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa3 & 0xFFFFu) | (nxb3 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa3 >> 16) | (nxb3 & 0xFFFF0000u); }
+            { int idx = 1024 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa4 & 0xFFFFu) | (nxb4 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa4 >> 16) | (nxb4 & 0xFFFF0000u); }
+            { int idx = 1280 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa5 & 0xFFFFu) | (nxb5 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa5 >> 16) | (nxb5 & 0xFFFF0000u); }
+            { int idx = 1536 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa6 & 0xFFFFu) | (nxb6 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa6 >> 16) | (nxb6 & 0xFFFF0000u); }
+            { int idx = 1792 + tid; int pair = idx & 31, dp = idx >> 5;
+              vt[(2 * dp) * 36 + pair] = (nxa7 & 0xFFFFu) | (nxb7 << 16);
+              vt[(2 * dp + 1) * 36 + pair] = (nxa7 >> 16) | (nxb7 & 0xFFFF0000u); }
             Group.Barrier();
+            { int idx = 0 + tid; int gk = kb + 64 + (idx >> 6); kr0 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 256 + tid; int gk = kb + 64 + (idx >> 6); kr1 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 512 + tid; int gk = kb + 64 + (idx >> 6); kr2 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 768 + tid; int gk = kb + 64 + (idx >> 6); kr3 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 1024 + tid; int gk = kb + 64 + (idx >> 6); kr4 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 1280 + tid; int gk = kb + 64 + (idx >> 6); kr5 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 1536 + tid; int gk = kb + 64 + (idx >> 6); kr6 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 1792 + tid; int gk = kb + 64 + (idx >> 6); kr7 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 2048 + tid; int gk = kb + 64 + (idx >> 6); kr8 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 2304 + tid; int gk = kb + 64 + (idx >> 6); kr9 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 2560 + tid; int gk = kb + 64 + (idx >> 6); kr10 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 2816 + tid; int gk = kb + 64 + (idx >> 6); kr11 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 3072 + tid; int gk = kb + 64 + (idx >> 6); kr12 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 3328 + tid; int gk = kb + 64 + (idx >> 6); kr13 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 3584 + tid; int gk = kb + 64 + (idx >> 6); kr14 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 3840 + tid; int gk = kb + 64 + (idx >> 6); kr15 = gk < Nk ? KV[(((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63)] : 0u; }
+            { int idx = 0 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa0 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb0 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 256 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa1 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb1 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 512 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa2 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb2 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 768 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa3 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb3 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 1024 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa4 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb4 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 1280 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa5 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb5 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 1536 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa6 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb6 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
+            { int idx = 1792 + tid; int gv0 = kb + 64 + 2 * (idx & 31), dp = idx >> 5;
+              nxa7 = gv0 < Nk ? KV[(((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp] : 0u;
+              nxb7 = gv0 + 1 < Nk ? KV[(((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp] : 0u; }
 
             float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
             float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
