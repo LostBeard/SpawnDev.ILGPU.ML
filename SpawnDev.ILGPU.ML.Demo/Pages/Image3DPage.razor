@@ -17,7 +17,7 @@
             ShowModelProgress="true"
             ModelName="@_modelStatusText"
             IsModelLoading="@_isLoading"
-            IsModelLoaded="@_ready"
+            IsModelLoaded="@(_ready && !_isLoading)"
             ModelProgressPercent="@_modelProgress"
             ModelSizeMB="@_modelSizeMb">
 
@@ -62,7 +62,7 @@
         </label>
     </div>
 
-    @if (_stages.Count > 0)
+    @if (_stages.Count > 0 || (_isRunning && _currentStage != null))
     {
         <div class="t3d-stages">
             @foreach (var s in _stages)
@@ -166,7 +166,7 @@
     private byte[]? _glb;
     private readonly List<(string Name, double Seconds)> _stages = new();
 
-    private string ButtonLabel => _isRunning ? "Generating…" : _ready ? "Generate 3D" : "Download & Generate";
+    private string ButtonLabel => _isRunning ? "Generating…" : _ready && (_mode == "image" || _sd != null) ? "Generate 3D" : "Download & Generate";
 
     private List<BackendSelector.BackendInfo> _backends = new() { new() { Id = "WebGPU", DisplayName = "WebGPU" } };
     private List<ImageDropZone.SampleImage> _samples = new()
