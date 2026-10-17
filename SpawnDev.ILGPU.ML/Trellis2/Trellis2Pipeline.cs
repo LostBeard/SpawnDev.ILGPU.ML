@@ -190,5 +190,51 @@ public sealed class Trellis2Pipeline : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Turn a generation into a GLB: read the mesh back (the topology work that follows is sequential and ends in a file),
+    /// weld away unreferenced vertices, compute normals, unwrap a UV atlas, bake the PBR attributes into two textures on the device,
+    /// and write the binary glTF (positions, normals, UVs, indices, base colour + metallic-roughness PNGs).
+    /// </summary>
+    public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8)
+    {
+        var sw = Stopwatch.StartNew();
+        _acc.Synchronize();
+        var verts = output.Mesh.Vertices.GetAsArray1D();
+        var faces0 = output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).GetAsArray1D();
+        // keep only referenced vertices
+        var remap = new int[verts.Length / 3]; Array.Fill(remap, -1);
+        int used = 0;
+        foreach (int v in faces0) if (remap[v] < 0) remap[v] = used++;
+        var positions = new float[used * 3];
+        for (int v = 0; v < remap.Length; v++)
+            if (remap[v] >= 0) { positions[remap[v] * 3] = verts[v * 3]; positions[remap[v] * 3 + 1] = verts[v * 3 + 1]; positions[remap[v] * 3 + 2] = verts[v * 3 + 2]; }
+        var faces = new int[faces0.Length];
+        for (int i = 0; i < faces.Length; i++) faces[i] = remap[faces0[i]];
+        var normals = PbrGlbWriter.VertexNormals(positions, faces);
+        StageDone?.Invoke("mesh read + normals", sw.Elapsed.TotalSeconds); sw.Restart();
+
+        var atlas = UvAtlas.Unwrap(positions, faces, new UvAtlas.Options { Resolution = textureSize });
+        StageDone?.Invoke($"uv atlas ({atlas.ChartCount} charts, {atlas.Utilization:P0})", sw.Elapsed.TotalSeconds); sw.Restart();
+
+        TextureBaker.Textures tex;
+        using (var pos = _acc.Allocate1D(atlas.Positions))
+        using (var uv = _acc.Allocate1D(atlas.Uvs))
+        using (var fb = _acc.Allocate1D(atlas.Faces))
+            tex = new TextureBaker(_acc, _sk).Bake(pos.View, uv.View, fb.View, atlas.Faces.Length / 3, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation);
+        StageDone?.Invoke("texture bake", sw.Elapsed.TotalSeconds); sw.Restart();
+
+        var splitNormals = new float[atlas.Positions.Length];
+        for (int i = 0; i < atlas.SourceVertex.Length; i++)
+        {
+            int s = atlas.SourceVertex[i];
+            splitNormals[i * 3] = normals[s * 3]; splitNormals[i * 3 + 1] = normals[s * 3 + 1]; splitNormals[i * 3 + 2] = normals[s * 3 + 2];
+        }
+        var bc = PngEncoder.EncodeRgba8(tex.BaseColorAlpha, textureSize, textureSize);
+        var mr = PngEncoder.EncodeRgba8(tex.MetallicRoughness, textureSize, textureSize);
+        var glb = PbrGlbWriter.Write(atlas.Positions, splitNormals, atlas.Uvs, atlas.Faces, bc, mr);
+        StageDone?.Invoke("png + glb", sw.Elapsed.TotalSeconds);
+        return glb;
+    }
+
     public void Dispose() { }
 }

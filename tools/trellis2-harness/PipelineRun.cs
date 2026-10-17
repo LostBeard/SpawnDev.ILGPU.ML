@@ -26,7 +26,7 @@ internal static class PipelineRun
         catch { return -1; }
     }
 
-    public static int Run512(int seed)
+    public static int Run512(int seed, string? glbPath = null)
     {
         var (ctx, accel) = Gpu.Create();
         using var _c = ctx; using var _a = accel;
@@ -60,6 +60,12 @@ internal static class PipelineRun
             double sum = 0, mn = double.MaxValue, mx = double.MinValue;
             for (int i = c; i < attrs.Length; i += 6) { sum += attrs[i]; mn = Math.Min(mn, attrs[i]); mx = Math.Max(mx, attrs[i]); }
             Console.WriteLine($"  {names[c],-9} mean {sum / output.VoxelCount:F3}  min {mn:F3}  max {mx:F3}");
+        }
+        if (glbPath != null)
+        {
+            var glb = pipe.ToGlb(output);
+            File.WriteAllBytes(glbPath, glb);
+            Console.WriteLine($"wrote {glbPath} ({glb.Length / 1024} KiB)");
         }
         bool finite = attrs.All(float.IsFinite);
         Console.WriteLine(finite ? "PIPELINE512 RAN (outputs finite)" : "PIPELINE512 FAIL: NaN/Inf in the attributes");

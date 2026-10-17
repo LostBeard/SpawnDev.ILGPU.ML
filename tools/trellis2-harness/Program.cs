@@ -27,8 +27,10 @@ return command switch
     "dualgrid" => Golden.DualGrid(),
     "ssdec" => Golden.SsDecoder(),
     "bench" => GemmBench.Run(),
+    "atlas" => AtlasGate.Run(),
+    "bake" => BakeGate.Run(args.Length > 1 ? args[1] : null),
     "ptx" => PtxDump.Run(args[1], args[2], args[3]),
-    "run512" => PipelineRun.Run512(args.Length > 1 ? int.Parse(args[1]) : 42),
+    "run512" => PipelineRun.Run512(args.Length > 1 ? int.Parse(args[1]) : 42, args.Length > 2 ? args[2] : null),
     "slat" => Golden.SlatFlow(args.Length > 1 ? args[1] : "shape"),
     _ => Usage(command),
 };
