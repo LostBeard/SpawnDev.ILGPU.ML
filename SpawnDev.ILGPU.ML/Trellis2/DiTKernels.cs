@@ -53,7 +53,8 @@ public sealed class DiTKernels
     /// <summary>nn.Linear with a bf16 weight [N,K] and optional bf16 bias [N]; x is [M,K] fp32.</summary>
     public void Linear(FV x, BV w, BV? bias, FV o, int M, int K, int N, Act act = Act.None)
     {
-        var b = bias ?? w.SubView(0, 1);   // never read when hasBias == 0
+        EnsureDummies();
+        var b = bias ?? _dummyB!.View;   // never read when hasBias == 0 (a separate buffer: WebGPU forbids binding w twice)
         if (UseMma(M, K, N))
         {
             _mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelBf16Dense);
@@ -84,9 +85,11 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledBf16;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _dummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyF;
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _dummyB, _dummyB2;
     private void EnsureDummies()
     {   // bound in place of absent operands: WebGPU forbids binding one buffer to two slots, so no operand may stand in for another
         _dummyU ??= _acc.Allocate1D<uint>(1); _dummyF ??= _acc.Allocate1D<float>(1); _noNbr ??= _acc.Allocate1D<int>(1);
+        _dummyB ??= _acc.Allocate1D<BFloat16>(2); _dummyB2 ??= _acc.Allocate1D<BFloat16>(2);
     }
 
     internal static float Activate(float v, int act)
@@ -190,6 +193,10 @@ public sealed class DiTKernels
 
     private void LayerNormCore(FV x, FV o, FV mod, BV gamma, BV beta, int rows, int C, int mode, int shiftOff, int scaleOff, float eps)
     {
+        // operands the mode does not read are bound to 1-element placeholders: WebGPU cannot bind an empty (default) view
+        EnsureDummies();
+        if (mode != 1) mod = _dummyF!.View;
+        if (mode != 2) { gamma = _dummyB!.View; beta = _dummyB2!.View; }
         if (_acc.MaxGroupSize.X >= NormGroup)
         {
             _layerNormGroup ??= _acc.LoadStreamKernel<FV, FV, FV, BV, BV, int, int, int, int, float>(LayerNormGroupImpl);
@@ -224,6 +231,7 @@ public sealed class DiTKernels
     public void GateResidual(FV x, FV h, FV mod, int gateOff, int count, int C)
     {
         _gateResidual ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(GateResidualImpl);
+        if (gateOff < 0) { EnsureDummies(); mod = _dummyF!.View; }   // plain residual: the unread gate binds a placeholder (WebGPU cannot bind an empty view)
         _gateResidual(count, x, h, mod, gateOff, C);
     }
 
@@ -296,11 +304,13 @@ public sealed class DiTKernels
         if (_acc.AcceleratorType == AcceleratorType.Cuda)
         {
             _headNormWarp ??= _acc.LoadStreamKernel<FV, BV, FV, int, int, int, int, int>(HeadNormWarpImpl);
-            _headNormWarp(new KernelConfig(N * H, 32), buf, gamma, phases ?? buf, stride, off, H, D, phases.HasValue ? 1 : 0);
+            EnsureDummies();
+            _headNormWarp(new KernelConfig(N * H, 32), buf, gamma, phases ?? _dummyF!.View, stride, off, H, D, phases.HasValue ? 1 : 0);
             return;
         }
         _headNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, FV, int, int, int, int, int>(HeadNormImpl);
-        _headNorm(N * H, buf, gamma, phases ?? buf, stride, off, H, D, phases.HasValue ? 1 : 0);
+        EnsureDummies();   // an absent RoPE table binds a placeholder: WebGPU forbids binding buf twice
+        _headNorm(N * H, buf, gamma, phases ?? _dummyF!.View, stride, off, H, D, phases.HasValue ? 1 : 0);
     }
 
     // ---------------------------------------------------------------------------------------------------

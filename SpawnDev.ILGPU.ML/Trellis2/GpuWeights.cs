@@ -110,9 +110,9 @@ public sealed class GpuWeights : IDisposable
                 long n = SafeTensorsFileReader.ElementCount(t);
                 switch (t.DType)
                 {
-                    case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
-                    case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
-                    case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b.View, n, buf, cancellationToken); break; }
+                    case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
+                    case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
+                    case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
                     default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
                 }
                 pos += t.DataLength;
@@ -128,16 +128,25 @@ public sealed class GpuWeights : IDisposable
         }
     }
 
-    private static async Task UploadAsync<T>(Stream stream, ArrayView1D<T, Stride1D.Dense> dst, long count, byte[] buf, CancellationToken ct) where T : unmanaged
+    private static async Task UploadAsync<T>(Stream stream, MemoryBuffer1D<T, Stride1D.Dense> dst, long count, byte[] buf, CancellationToken ct) where T : unmanaged
     {
         int es = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        long bytes = count * es;
+        // SpawnDev.ILGPU's stream copy: on a browser buffer fed by a JS-backed stream (OPFS cache, fetch ranges) each chunk goes JS -> GPU
+        // (queue.writeBuffer) and never through the .NET heap; elsewhere it is a chunked host copy. writeBuffer needs 4-byte multiples, so a
+        // tensor whose byte size is not one takes the managed loop below.
+        if (bytes % 4 == 0)
+        {
+            await dst.View.CopyFromStreamAsync(stream, cancellationToken: ct);
+            return;
+        }
         var staging = new T[Math.Min(count, buf.Length / es)];
         for (long done = 0; done < count;)
         {
             int n = (int)Math.Min(staging.Length, count - done);
             await stream.ReadExactlyAsync(buf.AsMemory(0, n * es), ct);
             System.Runtime.InteropServices.MemoryMarshal.Cast<byte, T>(buf.AsSpan(0, n * es)).CopyTo(staging);
-            dst.SubView(done, n).CopyFromCPU(n == staging.Length ? staging : staging[..n]);   // an immediate write on every backend
+            dst.View.SubView(done, n).CopyFromCPU(n == staging.Length ? staging : staging[..n]);   // an immediate write on every backend
             done += n;
         }
     }

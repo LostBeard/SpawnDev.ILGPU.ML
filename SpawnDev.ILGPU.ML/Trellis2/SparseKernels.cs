@@ -326,7 +326,8 @@ public sealed class SparseKernels
     /// <summary>x [M,K] fp32; weight [N,K] fp16; act: 0 none, 1 SiLU; res (optional) [M,N] is added after the activation.</summary>
     public void Linear(FV x, HV weight, HV? bias, FV o, int M, int K, int N, int act = 0, FV? res = null)
     {
-        var b = bias ?? weight.SubView(0, 1);
+        _normDummyG ??= _acc.Allocate1D<global::ILGPU.Half>(2); _normDummyB ??= _acc.Allocate1D<global::ILGPU.Half>(2); EnsureTiledDummies();
+        var b = bias ?? _normDummyG.View;   // separate placeholder: WebGPU forbids binding the weight twice
         if (Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16)
         {
             _mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
@@ -347,7 +348,7 @@ public sealed class SparseKernels
             return;
         }
         _naiveLinear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>(NaiveLinearImpl);
-        _naiveLinear(M * N, x, weight, b, o, res ?? o, M, K, N, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
+        _naiveLinear(M * N, x, weight, b, o, res ?? _tiledDummyF!.View, M, K, N, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
     }
 
     private static bool SameView(FV a, FV b)
@@ -357,6 +358,7 @@ public sealed class SparseKernels
     }
 
     // Portable register-tiled path for every backend without the tensor-core kernels (see DiTKernels.UseTiled).
+    private MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>? _normDummyG, _normDummyB;
     private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>? _tiledLinear, _tiledGather;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU;
@@ -414,14 +416,16 @@ public sealed class SparseKernels
     }
     public void LayerNorm(FV x, FV o, HV? gamma, HV? beta, int rows, int C, float eps)
     {
+        // absent parameters are bound to 1-element placeholders: WebGPU cannot bind an empty (default) view
+        _normDummyG ??= _acc.Allocate1D<global::ILGPU.Half>(2); _normDummyB ??= _acc.Allocate1D<global::ILGPU.Half>(2);
         if (_acc.MaxGroupSize.X >= NormGroup)
         {
             _layerNormGroup ??= _acc.LoadStreamKernel<FV, FV, HV, HV, int, int, float>(LayerNormGroupImpl);
-            _layerNormGroup(new KernelConfig(rows, NormGroup), x, o, gamma ?? default, beta ?? default, C, gamma.HasValue ? 1 : 0, eps);
+            _layerNormGroup(new KernelConfig(rows, NormGroup), x, o, gamma ?? _normDummyG.View, beta ?? _normDummyB.View, C, gamma.HasValue ? 1 : 0, eps);
             return;
         }
         _layerNorm ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, HV, HV, int, int, float>(LayerNormImpl);
-        _layerNorm(rows, x, o, gamma ?? default, beta ?? default, C, gamma.HasValue ? 1 : 0, eps);
+        _layerNorm(rows, x, o, gamma ?? _normDummyG.View, beta ?? _normDummyB.View, C, gamma.HasValue ? 1 : 0, eps);
     }
 
     // =====================================================================================================

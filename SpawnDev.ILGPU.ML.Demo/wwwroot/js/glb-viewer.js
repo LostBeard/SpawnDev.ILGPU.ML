@@ -77,6 +77,7 @@
     function translate(x, y, z) { return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]); }
 
     async function show(canvas, glbBytes) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
         dispose(canvas);
         const mesh = parseGlb(glbBytes instanceof Uint8Array ? glbBytes : new Uint8Array(glbBytes));
         const gl = canvas.getContext("webgl2", { antialias: true });
@@ -135,6 +136,8 @@
     }
 
     function dispose(canvas) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        if (!canvas) return;
         const s = viewers.get(canvas);
         if (!s) return;
         cancelAnimationFrame(s.raf); s.cleanup && s.cleanup();

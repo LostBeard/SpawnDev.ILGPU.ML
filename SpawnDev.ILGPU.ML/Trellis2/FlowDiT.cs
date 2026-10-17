@@ -91,7 +91,7 @@ public sealed class FlowDiT : IDisposable
         _n = n; _condTokens = -1;
         _phases = _acc.Allocate1D<float>((long)n * (_headDim / 2) * 2);
         _k.RopePhases(coords, _phases.View, n, _headDim);
-        _acc.Synchronize();   // the caller may free `coords` right after this returns
+        _acc.Fence();   // the caller may free `coords` right after this returns
     }
 
     private void EnsureWorkspace(int condTokens)
