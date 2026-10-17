@@ -113,14 +113,14 @@ public static class UvAtlas
         if (pad > 0) density = Pack(charts, options.Resolution, pad, options.MinChartTexels);
         else
         {
-            double wantDensity = 1.0 / Math.Sqrt(2.0 * totalArea / Math.Max(F, 1));       // about one texel per mean triangle edge
-            pad = 1; density = 0;
-            foreach (int candidate in new[] { 4, 3, 2, 1 })
-            {
-                density = Pack(charts, options.Resolution, candidate, options.MinChartTexels);
-                pad = candidate;
-                if (density >= wantDensity) break;
-            }
+            // The widest padding that costs at most 20% of the best texel density. (Stopping at the first padding that reached ~1 texel per
+            // mean edge took 4 texels around each of 32k charts on a generated chest: 5% of the atlas held texture, the rest was padding.)
+            int[] candidates = { 4, 3, 2, 1 };
+            var dens = candidates.Select(c => Pack(charts, options.Resolution, c, options.MinChartTexels)).ToArray();
+            double best = dens.Max();
+            int pick = Array.FindIndex(dens, d => d >= 0.8 * best);
+            pad = candidates[pick];
+            density = Pack(charts, options.Resolution, pad, options.MinChartTexels);   // commit the chosen layout
         }
         double used = 0;
         foreach (var c in charts) used += c.Width * density * c.Scale * c.Height * density * c.Scale;

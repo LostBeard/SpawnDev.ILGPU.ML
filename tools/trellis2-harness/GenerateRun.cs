@@ -32,6 +32,43 @@ internal static class GenerateRun
         var px = new int[w * h]; Buffer.BlockCopy(bytes, 0, px, 0, bytes.Length);
         var (ctx, accel) = Gpu.Create();
         using var _c = ctx; using var _a = accel;
+        return Core(accel, px, w, h, outGlb);
+    }
+
+    /// <summary>
+    /// Text to 3D: SD Turbo (the ImageGenerationPipeline the ML / SpawnDev.AI demos use) draws the object on a plain background, the foreground
+    /// mask cuts it out, TRELLIS.2 lifts it to a GLB. The image model is released before the 3D stages load (one model resident at a time).
+    ///   text2glb "&lt;prompt&gt;" &lt;out.glb&gt;      (env TRELLIS2_SEED picks the image seed too)
+    /// </summary>
+    public static int Text(string prompt, string outGlb)
+    {
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        int seed = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_SEED"), out var sd) ? sd : 42;
+        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        var source = new SpawnDev.ILGPU.ML.Hub.HttpClientModelSource(http, SpawnDev.ILGPU.ML.Hub.FileModelStore.Default());
+        using var gen = new Trellis2TextTo3D(accel, Paths(), source, Path.Combine(Gpu.WeightDir, "isnet", "isnet-general-use.onnx"));
+        gen.StageDone = (name, sec) => Console.WriteLine($"  {name,-48} {sec,7:F2}s");
+        var total = Stopwatch.StartNew();
+        var glb = gen.GenerateGlbAsync(prompt, new Trellis2Options(), seed).GetAwaiter().GetResult();
+        File.WriteAllBytes(outGlb, glb);
+        var img = gen.LastImage!;
+        var prev = new uint[img.Width * img.Height]; Buffer.BlockCopy(img.ImageRGBA, 0, prev, 0, prev.Length * 4);
+        for (int i = 0; i < prev.Length; i++) prev[i] |= 0xFF000000u;
+        File.WriteAllBytes(Path.ChangeExtension(outGlb, ".image.png"), PngEncoder.EncodeRgba8(prev, img.Width, img.Height));
+        Console.WriteLine($"total {total.Elapsed.TotalSeconds:F1}s (image seed {gen.LastImageSeed}); wrote {outGlb} ({glb.Length / 1024} KiB)");
+        return 0;
+    }
+
+    internal static Trellis2Paths Paths() => new()
+    {
+        ModelDir = Path.Combine(Gpu.WeightDir, "TRELLIS.2-4B"),
+        SparseStructureDecoder = Path.Combine(Gpu.WeightDir, "TRELLIS-image-large", "ckpts", "ss_dec_conv3d_16l8_fp16"),
+        DinoWeights = Path.Combine(Gpu.WeightDir, "dinov3-timm-qkvb", "model.safetensors"),
+    };
+
+    private static int Core(Accelerator accel, int[] px, int w, int h, string outGlb)
+    {
         long baseline = Used(), peak = baseline;
         using var cts = new CancellationTokenSource();
         bool noPoll = Environment.GetEnvironmentVariable("TRELLIS2_NOPEAK") == "1";   // the nvidia-smi polling itself slows the driver calls it measures

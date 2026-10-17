@@ -41,5 +41,5 @@ def render(yaw, pitch):
         col = tex[ty, tx]
         sub[ok] = zz[ok]; im = img[y0:y1+1, x0:x1+1]; im[ok] = col[ok]
     return img
-views = [render(np.radians(a), np.radians(-25)) for a in (20, 110)]
+views = [render(np.radians(a), np.radians(25)) for a in (20, 110)]
 Image.fromarray(np.concatenate(views, 1)).save(out)

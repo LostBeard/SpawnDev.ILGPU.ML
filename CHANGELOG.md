@@ -12,6 +12,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   licence ("Built with DINOv3"); the IS-Net `ForegroundMask` is a development convenience (weights licence unstated). Tests `Trellis2_*`.
   `Trellis2Options.Resolution = 1024` runs the 1024 pipeline of TRELLIS.2 (sparse structure at 64^3, the 1024 shape/texture flow checkpoints on 1024 px DINOv3 features, decoders to 1024^3 voxels): the plant is 73 s and the
   crown 141 s with 3.6 GB peak on an RTX 4070 (6.4M voxels, 12.9M triangles before simplification; the slab-parallel `MeshSimplifier` takes that to 400k faces in 10 s).
+  **`Trellis2TextTo3D`**: prompt -> SD Turbo (`ImageGenerationPipeline`) -> `ForegroundMask` cut-out -> TRELLIS.2 -> GLB; retries the next image seed when the cut-out touches the frame (a cropped drawing becomes a truncated model), keeps the image model resident. A treasure chest from text: ~57 s on an RTX 4070 (image 5 s per attempt). `UvAtlas` now takes the widest padding within 20% of the best texel density (a generated chest went from 5% to 46% of the atlas holding texture).
 
 - **`YuNetFaceDetector` + `SFaceRecognizer`** (`Pipelines/FaceRecognitionPipelines.cs`): YuNet (MIT, `opencv/face_detection_yunet`, 75 k parameters, finds faces from ~10 px, five landmarks) and SFace (Apache-2.0,
   `opencv/face_recognition_sface`, MobileFaceNet, 128-number embeddings), the pair OpenCV's `FaceDetectorYN` / `FaceRecognizerSF` run. Host pre/post-processing (letterbox, anchor decode, NMS, the five-point
