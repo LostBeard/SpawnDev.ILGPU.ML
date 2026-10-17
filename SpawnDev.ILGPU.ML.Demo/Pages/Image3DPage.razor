@@ -19,7 +19,7 @@
             IsModelLoading="@_isLoading"
             IsModelLoaded="@_ready"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="12500">
+            ModelSizeMB="@_modelSizeMb">
 
     <div class="t3d-modes">
         <button class="t3d-mode @(_mode == "text" ? "active" : "")" @onclick='() => _mode = "text"' disabled="@_isRunning">Text to 3D</button>
@@ -239,8 +239,19 @@
     private string? _storageNote;
     private DateTime _lastProgressRender;
 
+    // header progress while TRELLIS.2 loads: bytes of the finished files + the file in flight, over all TRELLIS.2 files
+    private bool _trellisPhase;
+    private long _finishedBytes, _lastDone, _lastTotal;
+    private double _modelSizeMb = TrellisBytes / 1048576.0;
+
     private void OnDownloadProgress(long done, long total)
     {
+        if (_trellisPhase && total > 0)
+        {
+            if (done < _lastDone) _finishedBytes += _lastTotal;      // a new file started
+            _lastDone = done; _lastTotal = total;
+            _modelProgress = Math.Min(100, 100.0 * (_finishedBytes + done) / TrellisBytes);
+        }
         if (total <= 0 || (DateTime.UtcNow - _lastProgressRender).TotalMilliseconds < 250 && done < total) return;
         _lastProgressRender = DateTime.UtcNow;
         _downloadText = $"{done / 1048576.0:F0} / {total / 1048576.0:F0} MB";
@@ -253,6 +264,7 @@
         _downloadText = null;
         _stages.Add((name, seconds));
         _currentStage = NextStageHint(name);
+        if (_streamWeights) _currentStage = _currentStage?.Replace("first run: ", "streaming ");   // streamed weights download on every run
         _ = InvokeAsync(StateHasChanged);
     }
 
@@ -294,7 +306,7 @@
             if (!await EnsureAcceleratorAsync()) return;
             if (_sd == null)
             {
-                _isLoading = true; _currentStage = "SD Turbo (first run: 2.5 GB download)"; StateHasChanged();
+                _isLoading = true; _modelSizeMb = 2450; _currentStage = "SD Turbo (first run: 2.5 GB download)"; StateHasChanged();
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 _sd = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(_accelerator!, ModelSource, onProgress: (stage, pct) =>
                 {
@@ -377,9 +389,12 @@
 
     private async Task RunTrellisAsync(int[] px, int w, int h, System.Diagnostics.Stopwatch total, string label)
     {
-        _isLoading = !_ready;
-        _currentStage = "image prep"; _modelStatusText = "TRELLIS.2"; StateHasChanged();
-        _glb = await _trellis!.GenerateGlbAsync(px, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize });
+        _isLoading = !_ready || _streamWeights;                   // streamed weights load again on every run
+        _modelSizeMb = TrellisBytes / 1048576.0; _modelProgress = 0;
+        _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
+        _currentStage = "image prep"; _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : "TRELLIS.2"; StateHasChanged();
+        try { _glb = await _trellis!.GenerateGlbAsync(px, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize }); }
+        finally { _trellisPhase = false; }
         _ready = true; _isLoading = false;
         _inferenceMs = total.Elapsed.TotalMilliseconds;
         StateHasChanged();

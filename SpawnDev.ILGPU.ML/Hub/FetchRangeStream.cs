@@ -37,33 +37,69 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
         return _position;
     }
 
-    /// <summary>Smallest fetch: reads are served from a read-ahead window of at least this many bytes (one request per window, not per small tensor).</summary>
+    /// <summary>Size of one range request. Reads are served from these chunks (one request per chunk, not per small tensor).</summary>
     public int ReadAhead { get; set; } = 16 << 20;
-    private Uint8Array? _window;
-    private long _winStart, _winEnd;
+    /// <summary>
+    /// Chunks kept in flight ahead of the read position. MEASURED in Chrome against the hub, 16 MB ranges: one at a time 34.9 MB/s,
+    /// 4 in parallel 53.1 MB/s, 8 in parallel 57.2 MB/s.
+    /// </summary>
+    public int Depth { get; set; } = 4;
+
+    // consecutive chunks [Start, End) from the first one still needed to _nextFetch; later ones may still be in flight
+    private readonly List<(long Start, long End, Task<Uint8Array> Data)> _chunks = new();
+    private long _nextFetch;
 
     public async Task<Uint8Array> ReadUint8ArrayAsync(int count, CancellationToken cancellationToken = default)
     {
         if (_position >= _length || count <= 0) return new Uint8Array(0);
-        // a request must come back WHOLE (stream-copy loaders treat a short read as end of stream), so a window that does not cover it is refetched
+        // a request must come back WHOLE (stream-copy loaders treat a short read as end of stream)
         long want = Math.Min(count, _length - _position);
-        if (_window == null || _position < _winStart || _position + want > _winEnd)
-        {
-            _window?.Dispose(); _window = null;
-            long start = _position, end = Math.Min(_position + Math.Max(count, ReadAhead), _length) - 1;
-            _window = await FetchRangeAsync(start, end, cancellationToken);
-            _winStart = start; _winEnd = start + _window.Length;
-            BytesFetched += _window.Length;
-            if (_window.Length == 0) return new Uint8Array(0);
+        if (_chunks.Count == 0 || _position < _chunks[0].Start || _position > _nextFetch) Restart(_position);   // a seek outside what is fetched
+        while (_chunks.Count > 0 && _chunks[0].End <= _position) { Release(_chunks[0].Data); _chunks.RemoveAt(0); }
+        while (_nextFetch < _position + want) Schedule(cancellationToken);   // a read larger than the queue
+        while (_nextFetch < _length && _chunks.Count < Depth) Schedule(cancellationToken);
+
+        Uint8Array result;
+        var first = _chunks[0];
+        if (_position + want <= first.End)
+            result = (await first.Data).SubArray(_position - first.Start, _position - first.Start + want);   // a view: no copy
+        else
+        {   // spans chunks: assembled on the JS side (still never enters the .NET heap)
+            result = new Uint8Array(want);
+            long pos = _position, filled = 0;
+            for (int i = 0; filled < want; i++)
+            {
+                var c = _chunks[i];
+                long from = pos - c.Start, to = Math.Min(c.End - c.Start, from + (want - filled));
+                using var part = (await c.Data).SubArray(from, to);
+                result.Set(part, filled);
+                filled += to - from; pos += to - from;
+            }
         }
-        long from = _position - _winStart, to = Math.Min(from + count, _winEnd - _winStart);
-        var slice = _window.SubArray(from, to);          // a view on the same JS buffer: no copy
-        _position += to - from;
+        _position += want;
         Progress?.Invoke(_position, _length);
-        return slice;
+        return result;
     }
 
-    protected override void Dispose(bool disposing) { if (disposing) { _window?.Dispose(); _window = null; } base.Dispose(disposing); }
+    private void Schedule(CancellationToken ct)
+    {
+        long s = _nextFetch, e = Math.Min(s + ReadAhead, _length);
+        _chunks.Add((s, e, FetchRangeAsync(s, e - 1, ct)));
+        _nextFetch = e;
+        BytesFetched += e - s;
+    }
+
+    private void Restart(long position)
+    {
+        foreach (var c in _chunks) Release(c.Data);
+        _chunks.Clear();
+        _nextFetch = position;
+    }
+
+    // a chunk still in flight is released when it lands
+    private static void Release(Task<Uint8Array> t) => _ = t.ContinueWith(d => { if (d.Status == TaskStatus.RanToCompletion) d.Result.Dispose(); }, TaskScheduler.Default);
+
+    protected override void Dispose(bool disposing) { if (disposing) Restart(0); base.Dispose(disposing); }
 
     /// <summary>Per-request timeout (a stalled connection is aborted and retried) and attempts.</summary>
     public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(90);

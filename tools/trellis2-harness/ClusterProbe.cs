@@ -29,6 +29,22 @@ internal static class ClusterProbe
         var verts = o.Mesh.Vertices.GetAsArray1D();
         var faces = o.Mesh.Faces.View.SubView(0, (long)nf * 3).GetAsArray1D();
 
+        // TRELLIS2_DUMPMESH=dir: raw / clustered / clustered+collapse / collapse-only meshes in the atlasmesh format (ATLAS_DIAG=1 censuses them)
+        var dump = Environment.GetEnvironmentVariable("TRELLIS2_DUMPMESH");
+        if (dump != null)
+        {
+            Directory.CreateDirectory(dump);
+            var (rp, rf) = Compact(verts, faces);
+            Write(Path.Combine(dump, "raw.mesh"), rp, rf);
+            var (cp, cf) = new MeshClusterer(accel, new SparseKernels(accel)).ClusterAsync(o.Mesh.Vertices.View, nv, o.Mesh.Faces.View.SubView(0, (long)nf * 3), nf, grid).GetAwaiter().GetResult();
+            Write(Path.Combine(dump, "cl.mesh"), cp, cf);
+            var (qp, qf) = MeshSimplifier.Simplify(cp, cf, 150_000);
+            Write(Path.Combine(dump, "clq.mesh"), qp, qf);
+            var (op, of) = MeshSimplifier.Simplify(rp, rf, 150_000);
+            Write(Path.Combine(dump, "q.mesh"), op, of);
+            Console.WriteLine($"dumped meshes to {dump}");
+        }
+
         // ---- host oracle, level 1 --------------------------------------------------------------------------------------------------
         foreach (int level in new[] { 1, 2 })
         {
@@ -122,5 +138,22 @@ internal static class ClusterProbe
             Console.WriteLine($"device err {err} cone {cone} levels {lv}: {f.Length / 3} faces, {p.Length / 3} vertices, {sw.Elapsed.TotalSeconds:F2}s");
         }
         return 0;
+    }
+
+    private static (float[], int[]) Compact(float[] verts, int[] faces)
+    {
+        var remap = new int[verts.Length / 3]; Array.Fill(remap, -1); int used = 0;
+        foreach (int v in faces) if (remap[v] < 0) remap[v] = used++;
+        var p = new float[used * 3];
+        for (int v = 0; v < remap.Length; v++) if (remap[v] >= 0) for (int k = 0; k < 3; k++) p[remap[v] * 3 + k] = verts[v * 3 + k];
+        return (p, faces.Select(v => remap[v]).ToArray());
+    }
+
+    private static void Write(string path, float[] p, int[] f)
+    {
+        using var bw = new BinaryWriter(File.Create(path));
+        bw.Write(p.Length / 3); bw.Write(f.Length / 3);
+        foreach (var x in p) bw.Write(x);
+        foreach (var x in f) bw.Write(x);
     }
 }

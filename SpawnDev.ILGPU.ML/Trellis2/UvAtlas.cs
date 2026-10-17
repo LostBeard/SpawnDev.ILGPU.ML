@@ -110,17 +110,19 @@ public static class UvAtlas
         foreach (var f in area) totalArea += f;
         int pad = options.PaddingTexels;
         double density;
-        if (pad > 0) density = Pack(charts, options.Resolution, pad, options.MinChartTexels);
+        var byHeight = charts.ToArray();                    // shelf order (tallest first) is the same for every padding: sort once
+        Array.Sort(byHeight.Select(c => -c.Height).ToArray(), byHeight);
+        if (pad > 0) density = Pack(byHeight, options.Resolution, pad, options.MinChartTexels);
         else
         {
             // The widest padding that costs at most 20% of the best texel density. (Stopping at the first padding that reached ~1 texel per
             // mean edge took 4 texels around each of 32k charts on a generated chest: 5% of the atlas held texture, the rest was padding.)
             int[] candidates = { 4, 3, 2, 1 };
-            var dens = candidates.Select(c => Pack(charts, options.Resolution, c, options.MinChartTexels)).ToArray();
+            var dens = candidates.Select(c => Pack(byHeight, options.Resolution, c, options.MinChartTexels)).ToArray();
             double best = dens.Max();
             int pick = Array.FindIndex(dens, d => d >= 0.8 * best);
             pad = candidates[pick];
-            density = Pack(charts, options.Resolution, pad, options.MinChartTexels);   // commit the chosen layout
+            density = Pack(byHeight, options.Resolution, pad, options.MinChartTexels);   // commit the chosen layout
         }
         double used = 0;
         foreach (var c in charts) used += c.Width * density * c.Scale * c.Height * density * c.Scale;
@@ -303,9 +305,8 @@ public static class UvAtlas
     /// Shelf-pack the chart rectangles into a resolution x resolution atlas at the largest uniform density (texels per unit) that fits.
     /// Writes <see cref="Chart.X"/>/<see cref="Chart.Y"/> (texels, rectangle including its padding) and returns the density.
     /// </summary>
-    private static double Pack(List<Chart> charts, int resolution, int padding, int minTexels)
+    private static double Pack(Chart[] order, int resolution, int padding, int minTexels)
     {
-        var order = charts.OrderByDescending(c => c.Height).ToList();
         bool Fits(double density, bool commit)
         {
             double x = 0, y = 0, shelfH = 0;
@@ -323,7 +324,8 @@ public static class UvAtlas
         }
         double lo = 0, hi = 1;
         while (Fits(hi, false)) { lo = hi; hi *= 2; if (hi > 1e9) break; }
-        for (int i = 0; i < 40; i++)
+        // 0.1% is far below a texel at any density that fits (each Fits walks every chart: 40 fixed halvings cost seconds interpreted)
+        for (int i = 0; i < 40 && (lo <= 0 || hi > lo * 1.001); i++)
         {
             double mid = (lo + hi) / 2;
             if (mid <= 0) break;
