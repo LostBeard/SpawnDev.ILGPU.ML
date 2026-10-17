@@ -28,6 +28,8 @@ return command switch
     "ssdec" => Golden.SsDecoder(),
     "bench" => GemmBench.Run(),
     "atlas" => AtlasGate.Run(),
+    "simplify" => SimplifyGate.Run(),
+    "atlasmesh" => AtlasMeshRun.Run(args[1]),
     "generate" => GenerateRun.Run(args[1], args[2]),
     "prep" => Golden.Prep(),
     "dino" => Golden.Dino(),

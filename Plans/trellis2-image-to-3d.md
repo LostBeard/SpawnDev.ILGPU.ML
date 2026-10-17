@@ -55,7 +55,7 @@ classes with the real weights (CPU torch; `reference/golden_*.py`). Commands: `h
 - [x] M0 licenses read; TRELLIS.2 + TRELLIS-image-large MIT, DINOv3 usable (gated), RMBG-2.0 NC (not shipped). Background removal replacement: still open (see M0b).
 - [ ] M0b background removal: caller RGBA / mask first; permissive segmenter (BiRefNet MIT: verify weights license + port) second.
 - [x] M1 streaming SafeTensors reader, native bf16/fp16/fp32 device residency, one stage's weights at a time (peak 3.1 GB whole 512 run).
-- [ ] M2 DINOv3 ViT-L/16 feature extractor. BLOCKED on TJ accepting Meta's terms on HF (gated weights).
+- [x] M2 DINOv3 ViT-L/16 feature extractor: matches timm on the REAL weights (ungated timm mirror `timm/vit_large_patch16_dinov3_qkvb.lvd1689m`, DINOv3 licence; HF layout also accepted). Ship with "Built with DINOv3" + licence copy.
 - [x] M3 flow DiT (adaLN share_mod, RoPE-3D, qk RMS norm, cross attention): SS 6e-6 / SLat shape 1.9e-5 / tex 1.1e-5 in fp32; bf16 tensor cores within the reference's own bf16 noise.
 - [x] M4 Euler flow sampler + CFG + guidance interval + rescale: 2e-7 on all three shipped configs.
 - [x] M5 sparse-structure decoder + occupancy: logits 6e-7 fp32, occupancy coordinates identical.
@@ -63,8 +63,8 @@ classes with the real weights (CPU torch; `reference/golden_*.py`). Commands: `h
 - [x] M7 shape decoder + dual-grid mesh extraction: exact in fp32, vertices 6e-9, triangles identical.
 - [x] M8 texture decoder (guided): exact in fp32.
 - [x] M10a `Trellis2Pipeline.Run512` end to end on real checkpoints (stand-in condition): runs, 3.1 GB peak.
-- [ ] M9 mesh post: hole fill, simplify, UV unwrap (CuMesh = chart clustering + xatlas; both MIT, we write our own), UV-space rasterize, trilinear attribute bake, gap inpaint, PBR GLB writer.
-- [ ] M10 public entry points (managed / TypedArray / ArrayView1D), Trellis2Options, progress; 1024 cascade (shape decoder `upsample`, 49152 token cap).
+- [~] M9 (done: UV atlas, GPU bake, PNG + GLB writer, Khronos validator clean; OPEN: QEM simplify to ~300k faces so charts stay few on 1M+ face meshes, hole fill) mesh post: hole fill, simplify, UV unwrap (CuMesh = chart clustering + xatlas; both MIT, we write our own), UV-space rasterize, trilinear attribute bake, gap inpaint, PBR GLB writer.
+- [~] M10 `Trellis2ImageTo3D` public entry points DONE (managed / TypedArray / ArrayView1D, options, progress); OPEN: 1024 cascade (shape decoder `upsample`, 49152 token cap).
 - [ ] M11 perf (measured RTX 4070): GEMM 3.7 -> 35 TFLOPS (inline-PTX output registers, see below), flash attention 4.3 -> 9-14 TFLOPS. Next: attention (staging, ldmatrix), bf16 activation storage, fused epilogues, non-CUDA backends, Turing (sm_75: fp16 m16n8k8).
 - [ ] M12 text-to-3D = existing text-to-image step feeding M10.
 

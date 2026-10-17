@@ -217,7 +217,7 @@ public sealed class Trellis2Pipeline : IDisposable
     /// weld away unreferenced vertices, compute normals, unwrap a UV atlas, bake the PBR attributes into two textures on the device,
     /// and write the binary glTF (positions, normals, UVs, indices, base colour + metallic-roughness PNGs).
     /// </summary>
-    public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8)
+    public byte[] ToGlb(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 300_000)
     {
         var sw = Stopwatch.StartNew();
         _acc.Synchronize();
@@ -232,6 +232,12 @@ public sealed class Trellis2Pipeline : IDisposable
             if (remap[v] >= 0) { positions[remap[v] * 3] = verts[v * 3]; positions[remap[v] * 3 + 1] = verts[v * 3 + 1]; positions[remap[v] * 3 + 2] = verts[v * 3 + 2]; }
         var faces = new int[faces0.Length];
         for (int i = 0; i < faces.Length; i++) faces[i] = remap[faces0[i]];
+        if (maxFaces > 0 && faces.Length / 3 > maxFaces)
+        {
+            int before = faces.Length / 3;
+            (positions, faces) = MeshSimplifier.Simplify(positions, faces, maxFaces);
+            StageDone?.Invoke($"simplify {before} -> {faces.Length / 3} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+        }
         var normals = PbrGlbWriter.VertexNormals(positions, faces);
         StageDone?.Invoke("mesh read + normals", sw.Elapsed.TotalSeconds); sw.Restart();
 

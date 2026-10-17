@@ -17,10 +17,18 @@ public static class UvAtlas
     {
         /// <summary>Atlas side in texels (the packer targets this).</summary>
         public int Resolution = 2048;
-        /// <summary>Empty texels kept around every chart (bleeding / dilation room).</summary>
-        public int PaddingTexels = 4;
+        /// <summary>
+        /// Empty texels kept around every chart (bleeding / dilation room). 0 = automatic: the widest of 4, 3, 2, 1 that still leaves every
+        /// triangle at least one texel of room on average (a mesh of 100k+ small charts cannot afford 4 texels around each).
+        /// </summary>
+        public int PaddingTexels = 0;
         /// <summary>A face joins a chart while its normal is within this angle of the chart's average normal.</summary>
         public double MaxNormalDeviationDegrees = 40;
+        /// <summary>
+        /// A chart is scaled up (uniformly) until its longer side spans this many texels. Below ~2 texels a triangle can miss every texel centre,
+        /// and the dilation then fills it from a neighbouring chart (wrong colour).
+        /// </summary>
+        public int MinChartTexels = 3;
         /// <summary>How many times an overlapping chart may be split with a tighter cone.</summary>
         public int MaxSplitDepth = 8;
     }
@@ -42,6 +50,7 @@ public static class UvAtlas
         public double[] Uv = Array.Empty<double>();         // per face-corner (3 per face): projected, rotated, origin at (0,0)
         public double Width, Height;
         public double X, Y;                                 // packed origin, texels
+        public double Scale = 1;                            // extra uniform scale a small chart gets (texels per unit = density * Scale)
     }
 
     public static Result Unwrap(float[] positions, int[] faces, Options? options = null)
@@ -88,9 +97,22 @@ public static class UvAtlas
         // ---- pack ----
         double totalArea = 0;
         foreach (var f in area) totalArea += f;
-        double density = Pack(charts, options.Resolution, options.PaddingTexels);
+        int pad = options.PaddingTexels;
+        double density;
+        if (pad > 0) density = Pack(charts, options.Resolution, pad, options.MinChartTexels);
+        else
+        {
+            double wantDensity = 1.0 / Math.Sqrt(2.0 * totalArea / Math.Max(F, 1));       // about one texel per mean triangle edge
+            pad = 1; density = 0;
+            foreach (int candidate in new[] { 4, 3, 2, 1 })
+            {
+                density = Pack(charts, options.Resolution, candidate, options.MinChartTexels);
+                pad = candidate;
+                if (density >= wantDensity) break;
+            }
+        }
         double used = 0;
-        foreach (var c in charts) used += c.Width * density * c.Height * density;
+        foreach (var c in charts) used += c.Width * density * c.Scale * c.Height * density * c.Scale;
 
         // ---- emit ----
         var outPos = new List<float>(positions.Length);
@@ -98,7 +120,7 @@ public static class UvAtlas
         var src = new List<int>(positions.Length / 3);
         var outFaces = new int[F * 3];
         var remap = new int[positions.Length / 3]; var remapStamp = new int[remap.Length]; int rs = 0;
-        double R = options.Resolution, pad = options.PaddingTexels;
+        double R = options.Resolution;
         foreach (var chart in charts)
         {
             rs++;
@@ -115,8 +137,8 @@ public static class UvAtlas
                         src.Add(v);
                         outPos.Add(positions[v * 3]); outPos.Add(positions[v * 3 + 1]); outPos.Add(positions[v * 3 + 2]);
                         // corner uv is per face; vertices of one chart share the same planar map, so any corner of v gives its uv
-                        outUv.Add((float)((chart.X + pad + chart.Uv[(i * 3 + k) * 2] * density) / R));
-                        outUv.Add((float)((chart.Y + pad + chart.Uv[(i * 3 + k) * 2 + 1] * density) / R));
+                        outUv.Add((float)((chart.X + pad + chart.Uv[(i * 3 + k) * 2] * density * chart.Scale) / R));
+                        outUv.Add((float)((chart.Y + pad + chart.Uv[(i * 3 + k) * 2 + 1] * density * chart.Scale) / R));
                     }
                     outFaces[f * 3 + k] = remap[v];
                 }
@@ -268,7 +290,7 @@ public static class UvAtlas
     /// Shelf-pack the chart rectangles into a resolution x resolution atlas at the largest uniform density (texels per unit) that fits.
     /// Writes <see cref="Chart.X"/>/<see cref="Chart.Y"/> (texels, rectangle including its padding) and returns the density.
     /// </summary>
-    private static double Pack(List<Chart> charts, int resolution, int padding)
+    private static double Pack(List<Chart> charts, int resolution, int padding, int minTexels)
     {
         var order = charts.OrderByDescending(c => c.Height).ToList();
         bool Fits(double density, bool commit)
@@ -276,11 +298,12 @@ public static class UvAtlas
             double x = 0, y = 0, shelfH = 0;
             foreach (var c in order)
             {
-                double w = Math.Ceiling(c.Width * density) + 2 * padding, h = Math.Ceiling(c.Height * density) + 2 * padding;
+                double k = Math.Max(1.0, minTexels / Math.Max(Math.Max(c.Width, c.Height) * density, 1e-12));
+                double w = Math.Ceiling(c.Width * density * k) + 2 * padding, h = Math.Ceiling(c.Height * density * k) + 2 * padding;
                 if (w > resolution || h > resolution) return false;
                 if (x + w > resolution) { y += shelfH; x = 0; shelfH = 0; }
                 if (y + h > resolution) return false;
-                if (commit) { c.X = x; c.Y = y; }
+                if (commit) { c.X = x; c.Y = y; c.Scale = k; }
                 x += w; if (h > shelfH) shelfH = h;
             }
             return true;

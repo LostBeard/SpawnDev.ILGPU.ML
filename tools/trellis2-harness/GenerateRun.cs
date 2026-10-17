@@ -60,10 +60,12 @@ internal static class GenerateRun
         });
         gen.StageDone = (name, sec) => Console.WriteLine($"  {name,-32} {sec,7:F2}s   (peak so far {peak - baseline} MiB over baseline)");
         byte[] glb;
+        var mf = Environment.GetEnvironmentVariable("TRELLIS2_MAXFACES");
+        var options = new Trellis2Options { MaxFaces = mf != null ? int.Parse(mf) : new Trellis2Options().MaxFaces };
         if (Environment.GetEnvironmentVariable("TRELLIS2_DUMP") == "1")
         {
             // debug preview data: voxel centres + PBR attributes (read by reference/preview_voxels.py)
-            using var o = gen.Generate(input, w, h, null, out var pipe);
+            using var o = gen.Generate(input, w, h, options, out var pipe);
             var coords = o.Coords.GetAsArray1D(); var attrs = o.Attributes.GetAsArray1D();
             using var fs = File.Create(Path.ChangeExtension(outGlb, ".voxels.bin"));
             using var bw = new BinaryWriter(fs);
@@ -73,9 +75,9 @@ internal static class GenerateRun
                 for (int c = 0; c < 3; c++) bw.Write(coords[i * 3 + c]);
                 for (int c = 0; c < 6; c++) bw.Write(attrs[i * 6 + c]);
             }
-            glb = pipe.ToGlb(o);
+            glb = pipe.ToGlb(o, options.TextureSize, maxFaces: options.MaxFaces);
         }
-        else glb = gen.GenerateGlb(input, w, h);
+        else glb = gen.GenerateGlb(input, w, h, options);
         cts.Cancel(); poll.Wait();
         peak = Math.Max(peak, Used());
         File.WriteAllBytes(outGlb, glb);

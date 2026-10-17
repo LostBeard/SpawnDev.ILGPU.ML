@@ -25,6 +25,8 @@ public sealed class Trellis2Options
     public int Seed { get; init; } = 42;
     /// <summary>Side of the baked textures in texels.</summary>
     public int TextureSize { get; init; } = 2048;
+    /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh).</summary>
+    public int MaxFaces { get; init; } = 300_000;
 }
 
 /// <summary>
@@ -54,7 +56,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
     {
         options ??= new Trellis2Options();
         using var output = Generate(rgba, width, height, options, out var pipe);
-        return pipe.ToGlb(output, options.TextureSize);
+        return pipe.ToGlb(output, options.TextureSize, maxFaces: options.MaxFaces);
     }
 
     /// <summary>
