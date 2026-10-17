@@ -2,11 +2,19 @@
 
 EDIT THIS FILE, NOT THE OUTPUT (a fix made only in the generated .cs is lost the next time it is regenerated).
 
-Kernel: C[M,N] = act(bias[N] + A[M,K] * W[N,K]^T), A fp32 (rounded to bf16 while it is staged), W bf16, fp32 accumulate
-on the tensor cores: mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32. Block tile 128 x 128, K tile 32, 256 threads =
-8 warps as 2 (M) x 4 (N); a warp owns 64 x 32 = 4 x 4 mma tiles = 64 fp32 accumulators per thread.
-The accumulators are scalar locals (ILGPU's local-array lowering fails on this size inside the K loop).
+A family of tensor-core GEMM kernels, one per (operand type, A source):
+  C[M,N] = act(bias[N] + A[M,K] * W[N,K]^T) (+ res[M,N]),   A fp32 (rounded to the operand type while staged), W stored [N,K],
+  fp32 accumulate: mma.sync.aligned.m16n8k16.row.col.f32.{bf16|f16}.{bf16|f16}.f32.
+  operand type  Bf16: the DiT checkpoints (bf16 weights, activations rounded to bf16 like the reference's bf16 run)
+                F16 : the SC-VAE decoder checkpoints (fp16 weights, fp16 activations like the reference's use_fp16 torso)
+  A source      Dense : A[m*K + k]
+                Gather: sparse submanifold convolution as an implicit GEMM. K = 27 * cin, k = kk * cin + c; row m takes
+                        A[nbr[m*27 + kk] * cin + c], and zero when nbr < 0 (no neighbour). cin must be a multiple of 32
+                        so one K tile never straddles a kernel offset. W is [Cout][27][cin] (flex_gemm layout), i.e. exactly [N,K].
+Block tile 128 x 128, K tile 32, 256 threads = 8 warps as 2 (M) x 4 (N); a warp owns 64 x 32 = 4 x 4 mma tiles = 64 fp32
+accumulators per thread, kept as scalar locals (ILGPU's local-array lowering fails on this size inside the K loop).
 Shared tiles are 128 rows x 20 words (16 words of data + 4 padding): the lane pattern (g*20 + t) is bank-conflict free.
+Packing two floats into one operand register is a single cvt.rn.{bf16|f16}x2.f32 (sm_80+).
 Fragment layout (PTX ISA, m16n8k16): g = lane >> 2, t = lane & 3;
   A: a0 (g, 2t..2t+1) a1 (g+8, 2t..) a2 (g, 2t+8..) a3 (g+8, 2t+8..);  B: b0 (k 2t.., n g) b1 (k 2t+8.., n g);
   C: c0 (g, 2t) c1 (g, 2t+1) c2 (g+8, 2t) c3 (g+8, 2t+1).   Verified bit-exact by tools/trellis2-harness `mma`.
@@ -26,18 +34,13 @@ w("namespace SpawnDev.ILGPU.ML.Trellis2;")
 w("")
 w("using FV = ArrayView1D<float, Stride1D.Dense>;")
 w("using UV = ArrayView1D<uint, Stride1D.Dense>;")
+w("using IV = ArrayView1D<int, Stride1D.Dense>;")
 w("using BV = ArrayView1D<BFloat16, Stride1D.Dense>;")
+w("using HV = ArrayView1D<global::ILGPU.Half, Stride1D.Dense>;")
 w("")
 w("internal static class MmaGemm")
 w("{")
 w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, RowWords = 20;")
-w("")
-w("    /// <summary>Round-to-nearest-even fp32 -> bf16 bits (finite inputs).</summary>")
-w("    private static uint Bf16Bits(float f)")
-w("    {")
-w("        uint bits = (uint)Interop.FloatAsInt(f);")
-w("        return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;")
-w("    }")
 w("")
 w("    private static float Activate(float v, int act)")
 w("    {")
@@ -52,73 +55,116 @@ w("        }")
 w("        return v;")
 w("    }")
 w("")
-w("    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256.</summary>")
-w("    public static void Kernel(FV A, UV Wu, BV bias, FV C, int M, int K, int N, int hasBias, int act)")
-w("    {")
-w("        int numTilesN = (N + BN - 1) / BN;")
-w("        int tileRow = Grid.IdxX / numTilesN;")
-w("        int tileCol = Grid.IdxX % numTilesN;")
-w("        int tid = Group.IdxX;")
-w("        int warp = tid >> 5, lane = tid & 31;")
-w("        int g = lane >> 2, t = lane & 3;")
-w("        int wm = warp >> 2, wn = warp & 3;")
-w("        var aS = SharedMemory.Allocate<uint>(BM * RowWords);")
-w("        var bS = SharedMemory.Allocate<uint>(BN * RowWords);")
-for mt in range(MT):
+
+
+def kernel(dtype, gather):
+    t = "bf16" if dtype == "Bf16" else "f16"
+    bias_t = "BV" if dtype == "Bf16" else "HV"
+    name = f"Kernel{dtype}{'Gather' if gather else 'Dense'}"
+    mma = f"mma.sync.aligned.m16n8k16.row.col.f32.{t}.{t}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%0, %1, %2, %3}};"
+    cvt = f"cvt.rn.{t}x2.f32 %0, %2, %1;"   # %1 -> low half, %2 -> high half
+    w(f"    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. "
+      f"{'A rows are gathered through nbr (27 per row, cin channels each).' if gather else 'A is a dense [M,K] matrix.'} "
+      f"res (when hasRes != 0) is added after the activation.</summary>")
+    w(f"    public static void {name}(FV A, UV Wu, {bias_t} bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)")
+    w("    {")
+    w("        int numTilesN = (N + BN - 1) / BN;")
+    w("        int tileRow = Grid.IdxX / numTilesN;")
+    w("        int tileCol = Grid.IdxX % numTilesN;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 2, wn = warp & 3;")
+    w("        var aS = SharedMemory.Allocate<uint>(BM * RowWords);")
+    w("        var bS = SharedMemory.Allocate<uint>(BN * RowWords);")
+    for mt in range(MT):
+        for nt in range(NT):
+            w(f"        Ref<float> c{mt}{nt}0 = default, c{mt}{nt}1 = default, c{mt}{nt}2 = default, c{mt}{nt}3 = default;")
+    w("")
+    w("        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row")
+    w("        int aRowG = tileRow * BM + ldRow;")
+    w("        int bRowG = tileCol * BN + ldRow;")
+    w("        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;")
+    if gather:
+        w("        long nbrBase = (long)aRowG * 27;")
+    else:
+        w("        long aBase = (long)aRowG * K + ldHalf * 16;")
+    w("        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words")
+    w("")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    if gather:
+        w("            int kk = kt / cin, c0 = kt - kk * cin;")
+        w("            int src = aRowOk != 0 ? nbr[nbrBase + kk] : -1;")
+        w("            long aBase = (long)src * cin + c0 + ldHalf * 16;")
+        w("            int aOk = src >= 0 ? 1 : 0;")
+    else:
+        w("            int aOk = aRowOk;")
+    w("            for (int i = 0; i < 8; i++)")
+    w("            {")
+    if gather:
+        w("                float f0 = aOk != 0 ? A[aBase + 2 * i] : 0f;")
+        w("                float f1 = aOk != 0 ? A[aBase + 2 * i + 1] : 0f;")
+    else:
+        w("                float f0 = aOk != 0 ? A[aBase + kt + 2 * i] : 0f;")
+        w("                float f1 = aOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;")
+    w(f"                aS[ldRow * RowWords + ldHalf * 8 + i] = Pack{dtype}(f0, f1);")
+    w("                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;")
+    w("            }")
+    w("            Group.Barrier();")
+    w("")
+    w("            for (int s = 0; s < 2; s++)")
+    w("            {")
+    w("                int kw = s * 8;")
+    for mt in range(MT):
+        w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
+        w(f"                Input<uint> a{mt}0 = aS[ar{mt}];")
+        w(f"                Input<uint> a{mt}1 = aS[ar{mt} + 8 * RowWords];")
+        w(f"                Input<uint> a{mt}2 = aS[ar{mt} + 4];")
+        w(f"                Input<uint> a{mt}3 = aS[ar{mt} + 8 * RowWords + 4];")
     for nt in range(NT):
-        w(f"        Ref<float> c{mt}{nt}0 = default, c{mt}{nt}1 = default, c{mt}{nt}2 = default, c{mt}{nt}3 = default;")
-w("")
-w("        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row")
-w("        int aRowG = tileRow * BM + ldRow;")
-w("        int bRowG = tileCol * BN + ldRow;")
-w("        long aBase = (long)aRowG * K + ldHalf * 16;")
-w("        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words")
-w("        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;")
-w("")
-w("        for (int kt = 0; kt < K; kt += BK)")
-w("        {")
-w("            for (int i = 0; i < 8; i++)")
-w("            {")
-w("                float f0 = aRowOk != 0 ? A[aBase + kt + 2 * i] : 0f;")
-w("                float f1 = aRowOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;")
-w("                aS[ldRow * RowWords + ldHalf * 8 + i] = Bf16Bits(f0) | (Bf16Bits(f1) << 16);")
-w("                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;")
-w("            }")
-w("            Group.Barrier();")
-w("")
-w("            for (int s = 0; s < 2; s++)")
-w("            {")
-w("                int kw = s * 8;")
-for mt in range(MT):
-    w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
-    w(f"                Input<uint> a{mt}0 = aS[ar{mt}];")
-    w(f"                Input<uint> a{mt}1 = aS[ar{mt} + 8 * RowWords];")
-    w(f"                Input<uint> a{mt}2 = aS[ar{mt} + 4];")
-    w(f"                Input<uint> a{mt}3 = aS[ar{mt} + 8 * RowWords + 4];")
-for nt in range(NT):
-    w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
-    w(f"                Input<uint> b{nt}0 = bS[br{nt}];")
-    w(f"                Input<uint> b{nt}1 = bS[br{nt} + 4];")
-for mt in range(MT):
-    for nt in range(NT):
-        w("                CudaAsm.EmitRef(\"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\",")
-        w(f"                    ref c{mt}{nt}0, ref c{mt}{nt}1, ref c{mt}{nt}2, ref c{mt}{nt}3, ref a{mt}0, ref a{mt}1, ref a{mt}2, ref a{mt}3, ref b{nt}0, ref b{nt}1);")
-w("            }")
-w("            Group.Barrier();")
-w("        }")
-w("")
-w("        // epilogue: bias + activation, guarded stores")
-for mt in range(MT):
-    for nt in range(NT):
-        w("        {")
-        w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-        w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-        w("            float bias0 = 0f, bias1 = 0f;")
-        w("            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }")
-        w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = Activate(c{mt}{nt}0.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c{mt}{nt}1.Value + bias1, act); }}")
-        w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = Activate(c{mt}{nt}2.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c{mt}{nt}3.Value + bias1, act); }}")
-        w("        }")
-w("    }")
+        w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
+        w(f"                Input<uint> b{nt}0 = bS[br{nt}];")
+        w(f"                Input<uint> b{nt}1 = bS[br{nt} + 4];")
+    for mt in range(MT):
+        for nt in range(NT):
+            w(f'                CudaAsm.EmitRef("{mma}",')
+            w(f"                    ref c{mt}{nt}0, ref c{mt}{nt}1, ref c{mt}{nt}2, ref c{mt}{nt}3, ref a{mt}0, ref a{mt}1, ref a{mt}2, ref a{mt}3, ref b{nt}0, ref b{nt}1);")
+    w("            }")
+    w("            Group.Barrier();")
+    w("        }")
+    w("")
+    w("        // epilogue: bias + activation (+ residual), guarded stores")
+    for mt in range(MT):
+        for nt in range(NT):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w("            float bias0 = 0f, bias1 = 0f;")
+            w("            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }")
+            for (mrow, ci0, ci1) in (("m0", 0, 1), ("m1", 2, 3)):
+                w(f"            if ({mrow} < M)")
+                w("            {")
+                for (ncol, ci) in (("n0", ci0), ("n1", ci1)):
+                    b = "bias0" if ncol == "n0" else "bias1"
+                    w(f"                if ({ncol} < N) {{ float v = Activate(c{mt}{nt}{ci}.Value + {b}, act); if (hasRes != 0) v += res[(long){mrow} * N + {ncol}]; C[(long){mrow} * N + {ncol}] = v; }}")
+                w("            }")
+            w("        }")
+    w("    }")
+    w("")
+
+
+for dtype in ("Bf16", "F16"):
+    t_ = "bf16" if dtype == "Bf16" else "f16"
+    w(f"    private static uint Pack{dtype}(float lo, float hi)")
+    w("    {")
+    w(f'        CudaAsm.Emit("cvt.rn.{t_}x2.f32 %0, %2, %1;", out uint packed, lo, hi);   // %1 -> low half, %2 -> high half')
+    w("        return packed;")
+    w("    }")
+    w("")
+for dtype in ("Bf16", "F16"):
+    for gather in (False, True):
+        kernel(dtype, gather)
 w("}")
 
 path = sys.argv[1]

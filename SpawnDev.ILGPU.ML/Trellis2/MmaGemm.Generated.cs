@@ -7,18 +7,13 @@ namespace SpawnDev.ILGPU.ML.Trellis2;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using UV = ArrayView1D<uint, Stride1D.Dense>;
+using IV = ArrayView1D<int, Stride1D.Dense>;
 using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
+using HV = ArrayView1D<global::ILGPU.Half, Stride1D.Dense>;
 
 internal static class MmaGemm
 {
     public const int BM = 128, BN = 128, BK = 32, Threads = 256, RowWords = 20;
-
-    /// <summary>Round-to-nearest-even fp32 -> bf16 bits (finite inputs).</summary>
-    private static uint Bf16Bits(float f)
-    {
-        uint bits = (uint)Interop.FloatAsInt(f);
-        return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
-    }
 
     private static float Activate(float v, int act)
     {
@@ -33,8 +28,20 @@ internal static class MmaGemm
         return v;
     }
 
-    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256.</summary>
-    public static void Kernel(FV A, UV Wu, BV bias, FV C, int M, int K, int N, int hasBias, int act)
+    private static uint PackBf16(float lo, float hi)
+    {
+        CudaAsm.Emit("cvt.rn.bf16x2.f32 %0, %2, %1;", out uint packed, lo, hi);   // %1 -> low half, %2 -> high half
+        return packed;
+    }
+
+    private static uint PackF16(float lo, float hi)
+    {
+        CudaAsm.Emit("cvt.rn.f16x2.f32 %0, %2, %1;", out uint packed, lo, hi);   // %1 -> low half, %2 -> high half
+        return packed;
+    }
+
+    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. A is a dense [M,K] matrix. res (when hasRes != 0) is added after the activation.</summary>
+    public static void KernelBf16Dense(FV A, UV Wu, BV bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)
     {
         int numTilesN = (N + BN - 1) / BN;
         int tileRow = Grid.IdxX / numTilesN;
@@ -65,17 +72,18 @@ internal static class MmaGemm
         int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row
         int aRowG = tileRow * BM + ldRow;
         int bRowG = tileCol * BN + ldRow;
+        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;
         long aBase = (long)aRowG * K + ldHalf * 16;
         long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words
-        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;
 
         for (int kt = 0; kt < K; kt += BK)
         {
+            int aOk = aRowOk;
             for (int i = 0; i < 8; i++)
             {
-                float f0 = aRowOk != 0 ? A[aBase + kt + 2 * i] : 0f;
-                float f1 = aRowOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;
-                aS[ldRow * RowWords + ldHalf * 8 + i] = Bf16Bits(f0) | (Bf16Bits(f1) << 16);
+                float f0 = aOk != 0 ? A[aBase + kt + 2 * i] : 0f;
+                float f1 = aOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;
+                aS[ldRow * RowWords + ldHalf * 8 + i] = PackBf16(f0, f1);
                 bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;
             }
             Group.Barrier();
@@ -151,134 +159,1403 @@ internal static class MmaGemm
             Group.Barrier();
         }
 
-        // epilogue: bias + activation, guarded stores
+        // epilogue: bias + activation (+ residual), guarded stores
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c000.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c001.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c002.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c003.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c000.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c001.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c002.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c003.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c010.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c011.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c012.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c013.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c010.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c011.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c012.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c013.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c020.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c021.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c022.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c023.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c020.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c021.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c022.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c023.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c030.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c031.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c032.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c033.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c030.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c031.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c032.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c033.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c100.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c101.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c102.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c103.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c100.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c101.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c102.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c103.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c110.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c111.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c112.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c113.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c110.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c111.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c112.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c113.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c120.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c121.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c122.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c123.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c120.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c121.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c122.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c123.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c130.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c131.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c132.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c133.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c130.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c131.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c132.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c133.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c200.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c201.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c202.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c203.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c200.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c201.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c202.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c203.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c210.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c211.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c212.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c213.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c210.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c211.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c212.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c213.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c220.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c221.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c222.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c223.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c220.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c221.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c222.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c223.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c230.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c231.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c232.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c233.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c230.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c231.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c232.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c233.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c300.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c301.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c302.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c303.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c300.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c301.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c302.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c303.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c310.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c311.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c312.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c313.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c310.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c311.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c312.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c313.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c320.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c321.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c322.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c323.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c320.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c321.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c322.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c323.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             float bias0 = 0f, bias1 = 0f;
             if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = Activate(c330.Value + bias0, act); if (n1 < N) C[(long)m0 * N + n1] = Activate(c331.Value + bias1, act); }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = Activate(c332.Value + bias0, act); if (n1 < N) C[(long)m1 * N + n1] = Activate(c333.Value + bias1, act); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c330.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c331.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c332.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c333.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
         }
     }
+
+    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. A rows are gathered through nbr (27 per row, cin channels each). res (when hasRes != 0) is added after the activation.</summary>
+    public static void KernelBf16Gather(FV A, UV Wu, BV bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)
+    {
+        int numTilesN = (N + BN - 1) / BN;
+        int tileRow = Grid.IdxX / numTilesN;
+        int tileCol = Grid.IdxX % numTilesN;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = warp >> 2, wn = warp & 3;
+        var aS = SharedMemory.Allocate<uint>(BM * RowWords);
+        var bS = SharedMemory.Allocate<uint>(BN * RowWords);
+        Ref<float> c000 = default, c001 = default, c002 = default, c003 = default;
+        Ref<float> c010 = default, c011 = default, c012 = default, c013 = default;
+        Ref<float> c020 = default, c021 = default, c022 = default, c023 = default;
+        Ref<float> c030 = default, c031 = default, c032 = default, c033 = default;
+        Ref<float> c100 = default, c101 = default, c102 = default, c103 = default;
+        Ref<float> c110 = default, c111 = default, c112 = default, c113 = default;
+        Ref<float> c120 = default, c121 = default, c122 = default, c123 = default;
+        Ref<float> c130 = default, c131 = default, c132 = default, c133 = default;
+        Ref<float> c200 = default, c201 = default, c202 = default, c203 = default;
+        Ref<float> c210 = default, c211 = default, c212 = default, c213 = default;
+        Ref<float> c220 = default, c221 = default, c222 = default, c223 = default;
+        Ref<float> c230 = default, c231 = default, c232 = default, c233 = default;
+        Ref<float> c300 = default, c301 = default, c302 = default, c303 = default;
+        Ref<float> c310 = default, c311 = default, c312 = default, c313 = default;
+        Ref<float> c320 = default, c321 = default, c322 = default, c323 = default;
+        Ref<float> c330 = default, c331 = default, c332 = default, c333 = default;
+
+        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row
+        int aRowG = tileRow * BM + ldRow;
+        int bRowG = tileCol * BN + ldRow;
+        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;
+        long nbrBase = (long)aRowG * 27;
+        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words
+
+        for (int kt = 0; kt < K; kt += BK)
+        {
+            int kk = kt / cin, c0 = kt - kk * cin;
+            int src = aRowOk != 0 ? nbr[nbrBase + kk] : -1;
+            long aBase = (long)src * cin + c0 + ldHalf * 16;
+            int aOk = src >= 0 ? 1 : 0;
+            for (int i = 0; i < 8; i++)
+            {
+                float f0 = aOk != 0 ? A[aBase + 2 * i] : 0f;
+                float f1 = aOk != 0 ? A[aBase + 2 * i + 1] : 0f;
+                aS[ldRow * RowWords + ldHalf * 8 + i] = PackBf16(f0, f1);
+                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;
+            }
+            Group.Barrier();
+
+            for (int s = 0; s < 2; s++)
+            {
+                int kw = s * 8;
+                int ar0 = (wm * 64 + 0 + g) * RowWords + kw + t;
+                Input<uint> a00 = aS[ar0];
+                Input<uint> a01 = aS[ar0 + 8 * RowWords];
+                Input<uint> a02 = aS[ar0 + 4];
+                Input<uint> a03 = aS[ar0 + 8 * RowWords + 4];
+                int ar1 = (wm * 64 + 16 + g) * RowWords + kw + t;
+                Input<uint> a10 = aS[ar1];
+                Input<uint> a11 = aS[ar1 + 8 * RowWords];
+                Input<uint> a12 = aS[ar1 + 4];
+                Input<uint> a13 = aS[ar1 + 8 * RowWords + 4];
+                int ar2 = (wm * 64 + 32 + g) * RowWords + kw + t;
+                Input<uint> a20 = aS[ar2];
+                Input<uint> a21 = aS[ar2 + 8 * RowWords];
+                Input<uint> a22 = aS[ar2 + 4];
+                Input<uint> a23 = aS[ar2 + 8 * RowWords + 4];
+                int ar3 = (wm * 64 + 48 + g) * RowWords + kw + t;
+                Input<uint> a30 = aS[ar3];
+                Input<uint> a31 = aS[ar3 + 8 * RowWords];
+                Input<uint> a32 = aS[ar3 + 4];
+                Input<uint> a33 = aS[ar3 + 8 * RowWords + 4];
+                int br0 = (wn * 32 + 0 + g) * RowWords + kw + t;
+                Input<uint> b00 = bS[br0];
+                Input<uint> b01 = bS[br0 + 4];
+                int br1 = (wn * 32 + 8 + g) * RowWords + kw + t;
+                Input<uint> b10 = bS[br1];
+                Input<uint> b11 = bS[br1 + 4];
+                int br2 = (wn * 32 + 16 + g) * RowWords + kw + t;
+                Input<uint> b20 = bS[br2];
+                Input<uint> b21 = bS[br2 + 4];
+                int br3 = (wn * 32 + 24 + g) * RowWords + kw + t;
+                Input<uint> b30 = bS[br3];
+                Input<uint> b31 = bS[br3 + 4];
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c000, ref c001, ref c002, ref c003, ref a00, ref a01, ref a02, ref a03, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c010, ref c011, ref c012, ref c013, ref a00, ref a01, ref a02, ref a03, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c020, ref c021, ref c022, ref c023, ref a00, ref a01, ref a02, ref a03, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c030, ref c031, ref c032, ref c033, ref a00, ref a01, ref a02, ref a03, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c100, ref c101, ref c102, ref c103, ref a10, ref a11, ref a12, ref a13, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c110, ref c111, ref c112, ref c113, ref a10, ref a11, ref a12, ref a13, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c120, ref c121, ref c122, ref c123, ref a10, ref a11, ref a12, ref a13, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c130, ref c131, ref c132, ref c133, ref a10, ref a11, ref a12, ref a13, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c200, ref c201, ref c202, ref c203, ref a20, ref a21, ref a22, ref a23, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c210, ref c211, ref c212, ref c213, ref a20, ref a21, ref a22, ref a23, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c220, ref c221, ref c222, ref c223, ref a20, ref a21, ref a22, ref a23, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c230, ref c231, ref c232, ref c233, ref a20, ref a21, ref a22, ref a23, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c300, ref c301, ref c302, ref c303, ref a30, ref a31, ref a32, ref a33, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c310, ref c311, ref c312, ref c313, ref a30, ref a31, ref a32, ref a33, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c320, ref c321, ref c322, ref c323, ref a30, ref a31, ref a32, ref a33, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c330, ref c331, ref c332, ref c333, ref a30, ref a31, ref a32, ref a33, ref b30, ref b31);
+            }
+            Group.Barrier();
+        }
+
+        // epilogue: bias + activation (+ residual), guarded stores
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c000.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c001.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c002.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c003.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c010.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c011.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c012.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c013.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c020.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c021.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c022.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c023.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c030.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c031.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c032.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c033.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c100.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c101.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c102.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c103.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c110.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c111.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c112.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c113.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c120.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c121.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c122.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c123.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c130.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c131.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c132.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c133.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c200.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c201.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c202.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c203.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c210.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c211.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c212.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c213.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c220.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c221.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c222.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c223.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c230.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c231.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c232.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c233.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c300.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c301.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c302.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c303.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c310.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c311.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c312.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c313.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c320.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c321.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c322.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c323.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c330.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c331.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c332.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c333.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+    }
+
+    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. A is a dense [M,K] matrix. res (when hasRes != 0) is added after the activation.</summary>
+    public static void KernelF16Dense(FV A, UV Wu, HV bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)
+    {
+        int numTilesN = (N + BN - 1) / BN;
+        int tileRow = Grid.IdxX / numTilesN;
+        int tileCol = Grid.IdxX % numTilesN;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = warp >> 2, wn = warp & 3;
+        var aS = SharedMemory.Allocate<uint>(BM * RowWords);
+        var bS = SharedMemory.Allocate<uint>(BN * RowWords);
+        Ref<float> c000 = default, c001 = default, c002 = default, c003 = default;
+        Ref<float> c010 = default, c011 = default, c012 = default, c013 = default;
+        Ref<float> c020 = default, c021 = default, c022 = default, c023 = default;
+        Ref<float> c030 = default, c031 = default, c032 = default, c033 = default;
+        Ref<float> c100 = default, c101 = default, c102 = default, c103 = default;
+        Ref<float> c110 = default, c111 = default, c112 = default, c113 = default;
+        Ref<float> c120 = default, c121 = default, c122 = default, c123 = default;
+        Ref<float> c130 = default, c131 = default, c132 = default, c133 = default;
+        Ref<float> c200 = default, c201 = default, c202 = default, c203 = default;
+        Ref<float> c210 = default, c211 = default, c212 = default, c213 = default;
+        Ref<float> c220 = default, c221 = default, c222 = default, c223 = default;
+        Ref<float> c230 = default, c231 = default, c232 = default, c233 = default;
+        Ref<float> c300 = default, c301 = default, c302 = default, c303 = default;
+        Ref<float> c310 = default, c311 = default, c312 = default, c313 = default;
+        Ref<float> c320 = default, c321 = default, c322 = default, c323 = default;
+        Ref<float> c330 = default, c331 = default, c332 = default, c333 = default;
+
+        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row
+        int aRowG = tileRow * BM + ldRow;
+        int bRowG = tileCol * BN + ldRow;
+        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;
+        long aBase = (long)aRowG * K + ldHalf * 16;
+        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words
+
+        for (int kt = 0; kt < K; kt += BK)
+        {
+            int aOk = aRowOk;
+            for (int i = 0; i < 8; i++)
+            {
+                float f0 = aOk != 0 ? A[aBase + kt + 2 * i] : 0f;
+                float f1 = aOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;
+                aS[ldRow * RowWords + ldHalf * 8 + i] = PackF16(f0, f1);
+                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;
+            }
+            Group.Barrier();
+
+            for (int s = 0; s < 2; s++)
+            {
+                int kw = s * 8;
+                int ar0 = (wm * 64 + 0 + g) * RowWords + kw + t;
+                Input<uint> a00 = aS[ar0];
+                Input<uint> a01 = aS[ar0 + 8 * RowWords];
+                Input<uint> a02 = aS[ar0 + 4];
+                Input<uint> a03 = aS[ar0 + 8 * RowWords + 4];
+                int ar1 = (wm * 64 + 16 + g) * RowWords + kw + t;
+                Input<uint> a10 = aS[ar1];
+                Input<uint> a11 = aS[ar1 + 8 * RowWords];
+                Input<uint> a12 = aS[ar1 + 4];
+                Input<uint> a13 = aS[ar1 + 8 * RowWords + 4];
+                int ar2 = (wm * 64 + 32 + g) * RowWords + kw + t;
+                Input<uint> a20 = aS[ar2];
+                Input<uint> a21 = aS[ar2 + 8 * RowWords];
+                Input<uint> a22 = aS[ar2 + 4];
+                Input<uint> a23 = aS[ar2 + 8 * RowWords + 4];
+                int ar3 = (wm * 64 + 48 + g) * RowWords + kw + t;
+                Input<uint> a30 = aS[ar3];
+                Input<uint> a31 = aS[ar3 + 8 * RowWords];
+                Input<uint> a32 = aS[ar3 + 4];
+                Input<uint> a33 = aS[ar3 + 8 * RowWords + 4];
+                int br0 = (wn * 32 + 0 + g) * RowWords + kw + t;
+                Input<uint> b00 = bS[br0];
+                Input<uint> b01 = bS[br0 + 4];
+                int br1 = (wn * 32 + 8 + g) * RowWords + kw + t;
+                Input<uint> b10 = bS[br1];
+                Input<uint> b11 = bS[br1 + 4];
+                int br2 = (wn * 32 + 16 + g) * RowWords + kw + t;
+                Input<uint> b20 = bS[br2];
+                Input<uint> b21 = bS[br2 + 4];
+                int br3 = (wn * 32 + 24 + g) * RowWords + kw + t;
+                Input<uint> b30 = bS[br3];
+                Input<uint> b31 = bS[br3 + 4];
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c000, ref c001, ref c002, ref c003, ref a00, ref a01, ref a02, ref a03, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c010, ref c011, ref c012, ref c013, ref a00, ref a01, ref a02, ref a03, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c020, ref c021, ref c022, ref c023, ref a00, ref a01, ref a02, ref a03, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c030, ref c031, ref c032, ref c033, ref a00, ref a01, ref a02, ref a03, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c100, ref c101, ref c102, ref c103, ref a10, ref a11, ref a12, ref a13, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c110, ref c111, ref c112, ref c113, ref a10, ref a11, ref a12, ref a13, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c120, ref c121, ref c122, ref c123, ref a10, ref a11, ref a12, ref a13, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c130, ref c131, ref c132, ref c133, ref a10, ref a11, ref a12, ref a13, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c200, ref c201, ref c202, ref c203, ref a20, ref a21, ref a22, ref a23, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c210, ref c211, ref c212, ref c213, ref a20, ref a21, ref a22, ref a23, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c220, ref c221, ref c222, ref c223, ref a20, ref a21, ref a22, ref a23, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c230, ref c231, ref c232, ref c233, ref a20, ref a21, ref a22, ref a23, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c300, ref c301, ref c302, ref c303, ref a30, ref a31, ref a32, ref a33, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c310, ref c311, ref c312, ref c313, ref a30, ref a31, ref a32, ref a33, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c320, ref c321, ref c322, ref c323, ref a30, ref a31, ref a32, ref a33, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c330, ref c331, ref c332, ref c333, ref a30, ref a31, ref a32, ref a33, ref b30, ref b31);
+            }
+            Group.Barrier();
+        }
+
+        // epilogue: bias + activation (+ residual), guarded stores
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c000.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c001.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c002.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c003.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c010.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c011.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c012.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c013.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c020.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c021.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c022.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c023.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c030.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c031.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c032.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c033.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c100.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c101.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c102.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c103.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c110.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c111.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c112.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c113.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c120.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c121.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c122.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c123.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c130.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c131.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c132.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c133.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c200.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c201.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c202.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c203.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c210.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c211.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c212.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c213.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c220.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c221.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c222.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c223.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c230.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c231.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c232.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c233.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c300.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c301.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c302.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c303.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c310.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c311.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c312.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c313.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c320.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c321.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c322.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c323.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c330.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c331.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c332.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c333.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+    }
+
+    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. A rows are gathered through nbr (27 per row, cin channels each). res (when hasRes != 0) is added after the activation.</summary>
+    public static void KernelF16Gather(FV A, UV Wu, HV bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)
+    {
+        int numTilesN = (N + BN - 1) / BN;
+        int tileRow = Grid.IdxX / numTilesN;
+        int tileCol = Grid.IdxX % numTilesN;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = warp >> 2, wn = warp & 3;
+        var aS = SharedMemory.Allocate<uint>(BM * RowWords);
+        var bS = SharedMemory.Allocate<uint>(BN * RowWords);
+        Ref<float> c000 = default, c001 = default, c002 = default, c003 = default;
+        Ref<float> c010 = default, c011 = default, c012 = default, c013 = default;
+        Ref<float> c020 = default, c021 = default, c022 = default, c023 = default;
+        Ref<float> c030 = default, c031 = default, c032 = default, c033 = default;
+        Ref<float> c100 = default, c101 = default, c102 = default, c103 = default;
+        Ref<float> c110 = default, c111 = default, c112 = default, c113 = default;
+        Ref<float> c120 = default, c121 = default, c122 = default, c123 = default;
+        Ref<float> c130 = default, c131 = default, c132 = default, c133 = default;
+        Ref<float> c200 = default, c201 = default, c202 = default, c203 = default;
+        Ref<float> c210 = default, c211 = default, c212 = default, c213 = default;
+        Ref<float> c220 = default, c221 = default, c222 = default, c223 = default;
+        Ref<float> c230 = default, c231 = default, c232 = default, c233 = default;
+        Ref<float> c300 = default, c301 = default, c302 = default, c303 = default;
+        Ref<float> c310 = default, c311 = default, c312 = default, c313 = default;
+        Ref<float> c320 = default, c321 = default, c322 = default, c323 = default;
+        Ref<float> c330 = default, c331 = default, c332 = default, c333 = default;
+
+        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row
+        int aRowG = tileRow * BM + ldRow;
+        int bRowG = tileCol * BN + ldRow;
+        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;
+        long nbrBase = (long)aRowG * 27;
+        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words
+
+        for (int kt = 0; kt < K; kt += BK)
+        {
+            int kk = kt / cin, c0 = kt - kk * cin;
+            int src = aRowOk != 0 ? nbr[nbrBase + kk] : -1;
+            long aBase = (long)src * cin + c0 + ldHalf * 16;
+            int aOk = src >= 0 ? 1 : 0;
+            for (int i = 0; i < 8; i++)
+            {
+                float f0 = aOk != 0 ? A[aBase + 2 * i] : 0f;
+                float f1 = aOk != 0 ? A[aBase + 2 * i + 1] : 0f;
+                aS[ldRow * RowWords + ldHalf * 8 + i] = PackF16(f0, f1);
+                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;
+            }
+            Group.Barrier();
+
+            for (int s = 0; s < 2; s++)
+            {
+                int kw = s * 8;
+                int ar0 = (wm * 64 + 0 + g) * RowWords + kw + t;
+                Input<uint> a00 = aS[ar0];
+                Input<uint> a01 = aS[ar0 + 8 * RowWords];
+                Input<uint> a02 = aS[ar0 + 4];
+                Input<uint> a03 = aS[ar0 + 8 * RowWords + 4];
+                int ar1 = (wm * 64 + 16 + g) * RowWords + kw + t;
+                Input<uint> a10 = aS[ar1];
+                Input<uint> a11 = aS[ar1 + 8 * RowWords];
+                Input<uint> a12 = aS[ar1 + 4];
+                Input<uint> a13 = aS[ar1 + 8 * RowWords + 4];
+                int ar2 = (wm * 64 + 32 + g) * RowWords + kw + t;
+                Input<uint> a20 = aS[ar2];
+                Input<uint> a21 = aS[ar2 + 8 * RowWords];
+                Input<uint> a22 = aS[ar2 + 4];
+                Input<uint> a23 = aS[ar2 + 8 * RowWords + 4];
+                int ar3 = (wm * 64 + 48 + g) * RowWords + kw + t;
+                Input<uint> a30 = aS[ar3];
+                Input<uint> a31 = aS[ar3 + 8 * RowWords];
+                Input<uint> a32 = aS[ar3 + 4];
+                Input<uint> a33 = aS[ar3 + 8 * RowWords + 4];
+                int br0 = (wn * 32 + 0 + g) * RowWords + kw + t;
+                Input<uint> b00 = bS[br0];
+                Input<uint> b01 = bS[br0 + 4];
+                int br1 = (wn * 32 + 8 + g) * RowWords + kw + t;
+                Input<uint> b10 = bS[br1];
+                Input<uint> b11 = bS[br1 + 4];
+                int br2 = (wn * 32 + 16 + g) * RowWords + kw + t;
+                Input<uint> b20 = bS[br2];
+                Input<uint> b21 = bS[br2 + 4];
+                int br3 = (wn * 32 + 24 + g) * RowWords + kw + t;
+                Input<uint> b30 = bS[br3];
+                Input<uint> b31 = bS[br3 + 4];
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c000, ref c001, ref c002, ref c003, ref a00, ref a01, ref a02, ref a03, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c010, ref c011, ref c012, ref c013, ref a00, ref a01, ref a02, ref a03, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c020, ref c021, ref c022, ref c023, ref a00, ref a01, ref a02, ref a03, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c030, ref c031, ref c032, ref c033, ref a00, ref a01, ref a02, ref a03, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c100, ref c101, ref c102, ref c103, ref a10, ref a11, ref a12, ref a13, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c110, ref c111, ref c112, ref c113, ref a10, ref a11, ref a12, ref a13, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c120, ref c121, ref c122, ref c123, ref a10, ref a11, ref a12, ref a13, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c130, ref c131, ref c132, ref c133, ref a10, ref a11, ref a12, ref a13, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c200, ref c201, ref c202, ref c203, ref a20, ref a21, ref a22, ref a23, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c210, ref c211, ref c212, ref c213, ref a20, ref a21, ref a22, ref a23, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c220, ref c221, ref c222, ref c223, ref a20, ref a21, ref a22, ref a23, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c230, ref c231, ref c232, ref c233, ref a20, ref a21, ref a22, ref a23, ref b30, ref b31);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c300, ref c301, ref c302, ref c303, ref a30, ref a31, ref a32, ref a33, ref b00, ref b01);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c310, ref c311, ref c312, ref c313, ref a30, ref a31, ref a32, ref a33, ref b10, ref b11);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c320, ref c321, ref c322, ref c323, ref a30, ref a31, ref a32, ref a33, ref b20, ref b21);
+                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+                    ref c330, ref c331, ref c332, ref c333, ref a30, ref a31, ref a32, ref a33, ref b30, ref b31);
+            }
+            Group.Barrier();
+        }
+
+        // epilogue: bias + activation (+ residual), guarded stores
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c000.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c001.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c002.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c003.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c010.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c011.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c012.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c013.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c020.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c021.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c022.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c023.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c030.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c031.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c032.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c033.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c100.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c101.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c102.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c103.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c110.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c111.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c112.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c113.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c120.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c121.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c122.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c123.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c130.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c131.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c132.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c133.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c200.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c201.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c202.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c203.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c210.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c211.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c212.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c213.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c220.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c221.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c222.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c223.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c230.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c231.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c232.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c233.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c300.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c301.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c302.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c303.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c310.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c311.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c312.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c313.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c320.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c321.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c322.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c323.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            float bias0 = 0f, bias1 = 0f;
+            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }
+            if (m0 < M)
+            {
+                if (n0 < N) { float v = Activate(c330.Value + bias0, act); if (hasRes != 0) v += res[(long)m0 * N + n0]; C[(long)m0 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c331.Value + bias1, act); if (hasRes != 0) v += res[(long)m0 * N + n1]; C[(long)m0 * N + n1] = v; }
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) { float v = Activate(c332.Value + bias0, act); if (hasRes != 0) v += res[(long)m1 * N + n0]; C[(long)m1 * N + n0] = v; }
+                if (n1 < N) { float v = Activate(c333.Value + bias1, act); if (hasRes != 0) v += res[(long)m1 * N + n1]; C[(long)m1 * N + n1] = v; }
+            }
+        }
+    }
+
 }

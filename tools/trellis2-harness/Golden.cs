@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML.Trellis2;
 
@@ -167,6 +168,74 @@ internal static class Golden
             ok &= Compare($"sampler {name}", ReadF32(Path.Combine(dir, name + ".bin")), x.GetAsArray1D(), 2e-5);
         }
         Console.WriteLine(ok ? "SAMPLER PASS" : "SAMPLER FAIL");
+        return ok ? 0 : 1;
+    }
+
+    /// <summary>Exact equality of an int array (voxel coordinates): voxel sets AND their order must match the reference.</summary>
+    internal static bool CompareInts(string name, int[] want, int[] got)
+    {
+        if (want.Length != got.Length) { Console.WriteLine($"FAIL {name}: {got.Length / 3} voxels, reference {want.Length / 3}"); return false; }
+        for (int i = 0; i < want.Length; i++)
+            if (want[i] != got[i]) { Console.WriteLine($"FAIL {name}: first difference at {i} (voxel {i / 3}): want {want[i]} got {got[i]}"); return false; }
+        return true;
+    }
+
+    /// <summary>The shape and texture SC-VAE decoders on the device against the real decoder classes (reference/golden_decoders.py).</summary>
+    public static int Decoders()
+    {
+        string dir = Path.Combine(Gpu.WeightDir, "golden", "decoders");
+        if (!Directory.Exists(dir)) { Console.WriteLine($"no golden at {dir}; run reference/golden_decoders.py"); return 2; }
+        var (ctx, accel) = Gpu.Create();
+        using var _c = ctx; using var _a = accel;
+        bool mma = DiTKernels.EnableTensorCores && accel.AcceleratorType == AcceleratorType.Cuda;
+        double tol = mma ? 1e-2 : 1e-4;
+        Console.WriteLine($"decoders: {(mma ? "fp16 tensor cores, structure forced from the reference (a flipped logit would change the voxel set)" : "fp32 reference kernels, structure predicted")}; tolerance relRMS {tol:E1}");
+        var dk = new DiTKernels(accel);
+        var sk = new SparseKernels(accel);
+        int[] coords0 = ReadI32(Path.Combine(dir, "coords0.i32"));
+        int n0 = coords0.Length / 3;
+        using var cb = accel.Allocate1D(coords0);
+        bool ok = true;
+
+        // the reference's subdivision logits per level, as device buffers (forced structure / texture guide)
+        var refSubs = new List<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>();
+        for (int i = 0; i < 4; i++)
+        {
+            var l = ReadF32(Path.Combine(dir, $"shape_sub{i}.f32"));
+            refSubs.Add((accel.Allocate1D(l), l.Length / 8));
+        }
+
+        void RunOne(string kind, string ckpt, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide, bool force, bool keep, out SparseVaeDecoder.Result? keepResult)
+        {
+            using var weights = GpuWeights.Load(accel, Path.Combine(Gpu.WeightDir, "TRELLIS.2-4B", "ckpts", ckpt));
+            var dec = new SparseVaeDecoder(accel, sk, dk, weights);
+            dec.Tap = (stage, feats, coords, count, ch) =>
+            {
+                string name = kind + "_" + stage;
+                string f = Path.Combine(dir, name + ".f32");
+                if (!File.Exists(f)) return;
+                accel.Synchronize();
+                ok &= Compare(name, ReadF32(f), feats.SubView(0, (long)count * ch).GetAsArray1D(), tol);
+                string cf = Path.Combine(dir, name + "_coords.i32");
+                if (File.Exists(cf)) ok &= CompareInts(name + " coords", ReadI32(cf), coords.SubView(0, count * 3).GetAsArray1D());
+            };
+            var lat = ReadF32(Path.Combine(dir, kind + "_latent.f32"));
+            using var lb = accel.Allocate1D(lat);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var res = dec.Decode(lb.View, cb.View, n0, 32, guide, keepSubdivisions: keep, forceGuide: force);
+            Console.WriteLine($"{kind} decode {sw.Elapsed.TotalSeconds:F2}s -> {res.Count} voxels x {res.Channels}");
+            if (keep) keepResult = res; else { keepResult = null; res.Dispose(); }
+        }
+
+        RunOne("shape", "shape_dec_next_dc_f16c32_fp16", mma ? refSubs : null, force: mma, keep: !mma, out var shapeRes);
+        // subdivision logits of the predicted structure vs the reference (fp32 path: exact structure)
+        if (shapeRes != null)
+            for (int i = 0; i < shapeRes.Subdivisions.Count; i++)
+                ok &= Compare($"shape subdiv{i}", ReadF32(Path.Combine(dir, $"shape_sub{i}.f32")), shapeRes.Subdivisions[i].Logits.GetAsArray1D(), tol);
+        RunOne("tex", "tex_dec_next_dc_f16c32_fp16", shapeRes?.Subdivisions ?? refSubs, force: false, keep: false, out _);
+        shapeRes?.Dispose();
+        foreach (var s in refSubs) s.Logits.Dispose();
+        Console.WriteLine(ok ? "DECODERS PASS" : "DECODERS FAIL");
         return ok ? 0 : 1;
     }
 

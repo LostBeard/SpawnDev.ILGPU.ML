@@ -43,7 +43,8 @@ public sealed class DiTKernels
     /// reference does). TRELLIS2_MMA=0 forces the fp32 reference kernel: the A/B for any numerical question.
     /// </summary>
     public static bool EnableTensorCores = Environment.GetEnvironmentVariable("TRELLIS2_MMA") != "0";
-    private Action<KernelConfig, FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int, int, int, int>? _mmaLinear;
+    private Action<KernelConfig, FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinear;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;   // placeholder for the gather operand of the dense kernels (never read)
 
     private bool UseMma(int M, int K, int N)
         => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16;
@@ -54,9 +55,10 @@ public sealed class DiTKernels
         var b = bias ?? w.SubView(0, 1);   // never read when hasBias == 0
         if (UseMma(M, K, N))
         {
-            _mmaLinear ??= _acc.LoadStreamKernel<FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int, int, int, int>(MmaGemm.Kernel);
+            _mmaLinear ??= _acc.LoadStreamKernel<FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelBf16Dense);
+            _noNbr ??= _acc.Allocate1D<int>(1);
             int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
-            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x, w.Cast<BFloat16, uint>(), b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
+            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x, w.Cast<BFloat16, uint>(), b, o, o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
             return;
         }
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
