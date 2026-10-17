@@ -40,14 +40,21 @@ def kernel(name, wtype, gather):
     # B loads: 128 n x 4 words, 2 per thread; idx = tid + 256 r -> nrow = idx >> 2, kw = idx & 3
     for r in range(2):
         w(f"        int bRow{r} = ({r * TH} + tid) >> 2, bW{r} = ({r * TH} + tid) & 3, bN{r} = nBase + bRow{r};")
+    # Row bases hoisted out of the k loop, in int: the host guarantees M*K, M*N, N*K < 2^31 (TiledGemm.Fits). (long) index math is
+    # EMULATED on WebGPU (vec2<u32>): a 64-bit multiply + adds on every global load of every k step.
+    if not gather:
+        for r in range(4):
+            w(f"        int aOff{r} = aM{r} * K + aK{r};")
+    for r in range(2):
+        w(f"        int bOff{r} = ((bN{r} * K) >> 1) + bW{r};")
     for i in range(8):
         w("        float " + ", ".join(f"c{i}{j} = 0f" for j in range(8)) + ";")
     def loadA(r, k0):
         if gather:
             return (f"aM{r} < M ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f")
-        return f"aM{r} < M ? A[(long)aM{r} * K + {k0} + aK{r}] : 0f"
+        return f"aM{r} < M ? A[aOff{r} + {k0}] : 0f"
     def loadB(r, k0):
-        return f"bN{r} < N ? W[(((long)bN{r} * K + {k0}) >> 1) + bW{r}] : 0u"
+        return f"bN{r} < N ? W[bOff{r} + ({k0} >> 1)] : 0u"
     # prefetch registers for k0 = 0
     for r in range(4):
         w(f"        float pa{r} = {loadA(r, '0')};")
@@ -90,7 +97,7 @@ def kernel(name, wtype, gather):
         w(f"        int m{i} = mBase + ty + {16 * i};")
         w(f"        if (m{i} < M)")
         w("        {")
-        w(f"            long rb = (long)m{i} * N;")
+        w(f"            int rb = m{i} * N;")
         for j in range(8):
             w(f"            if (n{j} < N) {{ float v = DiTKernels.Activate(c{i}{j} + bias{j}, act); if (hasRes == 1) v += Res[rb + n{j}]; else if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
         w("        }")
@@ -112,6 +119,9 @@ w("internal static class TiledGemm")
 w("{")
 w(f"    public const int BM = {BM}, BN = {BN}, BK = {BK}, Threads = {TH};")
 w("")
+w("    /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>")
+w("    public static bool Fits(long M, long K, long N, long rowsA = -1) => M * K < int.MaxValue && M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue);")
+w("")
 w("    private static float Bf16Lo(uint u) => Interop.IntAsFloat(u << 16);")
 w("    private static float Bf16Hi(uint u) => Interop.IntAsFloat(u & 0xFFFF0000u);")
 w("    private static float HalfBits(uint h)")
@@ -126,8 +136,8 @@ w("    private static float F16Hi(uint u) => HalfBits(u >> 16);")
 w("    private static float GatherA(FV A, IV nbr, int m, int k, int cin)")
 w("    {")
 w("        int tap = k / cin, ci = k - tap * cin;")
-w("        int src = nbr[(long)m * 27 + tap];")
-w("        return src >= 0 ? A[(long)src * cin + ci] : 0f;")
+w("        int src = nbr[m * 27 + tap];")
+w("        return src >= 0 ? A[src * cin + ci] : 0f;")
 w("    }")
 w("")
 kernel("Bf16Dense", "bf16", False)

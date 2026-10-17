@@ -145,7 +145,7 @@ public sealed class SparseKernels
             _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, 27 * cin, cout, cin, 1, 0, 0);
             return;
         }
-        if (UseTiled(27 * cin))
+        if (UseTiled(27 * cin) && TiledGemm.Fits(M, 27 * cin, cout, x.Length / cin))
         {
             _tiledGather ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Gather);
             EnsureTiledDummies();
@@ -336,7 +336,7 @@ public sealed class SparseKernels
             _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), b, o, res ?? o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
             return;
         }
-        if (UseTiled(K))
+        if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
             _tiledLinear ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.F16Dense);
             EnsureTiledDummies();

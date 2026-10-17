@@ -212,4 +212,49 @@ public abstract partial class MLTestBase
         }
         return "flash attention: " + string.Join(", ", report);
     });
+
+    /// <summary>
+    /// Throughput of the DiT's kernels at the real 1.3B shapes (width 1536, 12 heads x 128, MLP 6144, 4096 tokens = the sparse-structure
+    /// flow): how far each backend is from the silicon. Prints "[Benchmark] Trellis2 ..." lines (PMT_CONSOLE_LOG=Trellis2 shows them for browser lanes).
+    /// </summary>
+    [TestMethod]
+    public async Task Trellis2_DiTKernels_Benchmark() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        const int T = 4096, C = 1536, H = 12, D = 128, Mlp = 6144;
+        var dk = new DiTKernels(accelerator);
+        using var x = accelerator.Allocate1D(Enumerable.Range(0, T * Mlp).Select(i => (float)Math.Sin(i * 0.37)).ToArray());
+        using var w = accelerator.Allocate1D(Enumerable.Range(0, Mlp * C).Select(i => BFloat16.FromRawBits((ushort)(0x3C00 + (i % 255)))).ToArray());
+        using var o = accelerator.Allocate1D<float>((long)T * Math.Max(Mlp, 3 * C));
+        var report = new List<string>();
+        bool slow = accelerator.AcceleratorType == AcceleratorType.CPU;
+        async Task<double> Time(Action op, int reps = 10)
+        {
+            if (slow) reps = 1;
+            for (int i = 0; i < (slow ? 1 : 3); i++) { op(); await accelerator.SynchronizeAsync(); }   // compile + warm (and let the clocks ramp)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int r = 0; r < reps; r++) op();
+            await accelerator.SynchronizeAsync();
+            return sw.Elapsed.TotalSeconds / reps;
+        }
+        // "k8": one k step over the mlp-up tile count = the per-tile fixed cost (prologue + epilogue) alone
+        for (int pass = 0; pass < (slow ? 1 : 2); pass++)                   // report the second pass: everything compiled, clocks up
+        foreach (var (name, K, N) in new[] { ("qkv", C, 3 * C), ("mlp-up", C, Mlp), ("mlp-down", Mlp, C), ("k8", 8, Mlp) })
+        {
+            if (pass == 0 && !slow) { await Time(() => dk.Linear(x.View.SubView(0, (long)T * K), w.View.SubView(0, (long)N * K), null, o.View.SubView(0, (long)T * N), T, K, N), 2); continue; }
+            double s = await Time(() => dk.Linear(x.View.SubView(0, (long)T * K), w.View.SubView(0, (long)N * K), null, o.View.SubView(0, (long)T * N), T, K, N));
+            double tf = 2.0 * T * K * N / s / 1e12;
+            report.Add($"{name} {s * 1000:F1} ms {tf:F2} TFLOPS");
+        }
+        if (dk.UsesFlashAttention(D))
+        {
+            using var qkv = accelerator.Allocate1D(Enumerable.Range(0, T * 3 * C).Select(i => (float)Math.Cos(i * 0.11) * 0.5f).ToArray());
+            double s = await Time(() => dk.Attention(qkv.View, 3 * C, 0, qkv.View, 3 * C, C, 2 * C, default, o.View.SubView(0, (long)T * C), T, T, H, D));
+            double tf = 4.0 * T * T * H * D / s / 1e12;
+            report.Add($"self-attention {s * 1000:F1} ms {tf:F2} TFLOPS");
+        }
+        var line = $"[Benchmark] Trellis2 DiT kernels [{accelerator.AcceleratorType}] " + string.Join(" | ", report);
+        Console.WriteLine(line);
+        return line;
+    });
 }

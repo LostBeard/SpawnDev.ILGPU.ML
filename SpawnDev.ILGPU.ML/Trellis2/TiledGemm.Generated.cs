@@ -13,6 +13,9 @@ internal static class TiledGemm
 {
     public const int BM = 128, BN = 128, BK = 8, Threads = 256;
 
+    /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>
+    public static bool Fits(long M, long K, long N, long rowsA = -1) => M * K < int.MaxValue && M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue);
+
     private static float Bf16Lo(uint u) => Interop.IntAsFloat(u << 16);
     private static float Bf16Hi(uint u) => Interop.IntAsFloat(u & 0xFFFF0000u);
     private static float HalfBits(uint h)
@@ -27,8 +30,8 @@ internal static class TiledGemm
     private static float GatherA(FV A, IV nbr, int m, int k, int cin)
     {
         int tap = k / cin, ci = k - tap * cin;
-        int src = nbr[(long)m * 27 + tap];
-        return src >= 0 ? A[(long)src * cin + ci] : 0f;
+        int src = nbr[m * 27 + tap];
+        return src >= 0 ? A[src * cin + ci] : 0f;
     }
 
     /// <summary>bf16 weights, dense rows. grid = ceil(M/128) * ceil(N/128), group = 256.</summary>
@@ -46,6 +49,12 @@ internal static class TiledGemm
         int aRow3 = (768 + tid) >> 3, aK3 = (768 + tid) & 7, aM3 = mBase + aRow3;
         int bRow0 = (0 + tid) >> 2, bW0 = (0 + tid) & 3, bN0 = nBase + bRow0;
         int bRow1 = (256 + tid) >> 2, bW1 = (256 + tid) & 3, bN1 = nBase + bRow1;
+        int aOff0 = aM0 * K + aK0;
+        int aOff1 = aM1 * K + aK1;
+        int aOff2 = aM2 * K + aK2;
+        int aOff3 = aM3 * K + aK3;
+        int bOff0 = ((bN0 * K) >> 1) + bW0;
+        int bOff1 = ((bN1 * K) >> 1) + bW1;
         float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c04 = 0f, c05 = 0f, c06 = 0f, c07 = 0f;
         float c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f, c14 = 0f, c15 = 0f, c16 = 0f, c17 = 0f;
         float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c24 = 0f, c25 = 0f, c26 = 0f, c27 = 0f;
@@ -54,12 +63,12 @@ internal static class TiledGemm
         float c50 = 0f, c51 = 0f, c52 = 0f, c53 = 0f, c54 = 0f, c55 = 0f, c56 = 0f, c57 = 0f;
         float c60 = 0f, c61 = 0f, c62 = 0f, c63 = 0f, c64 = 0f, c65 = 0f, c66 = 0f, c67 = 0f;
         float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
-        float pa0 = aM0 < M ? A[(long)aM0 * K + 0 + aK0] : 0f;
-        float pa1 = aM1 < M ? A[(long)aM1 * K + 0 + aK1] : 0f;
-        float pa2 = aM2 < M ? A[(long)aM2 * K + 0 + aK2] : 0f;
-        float pa3 = aM3 < M ? A[(long)aM3 * K + 0 + aK3] : 0f;
-        uint pb0 = bN0 < N ? W[(((long)bN0 * K + 0) >> 1) + bW0] : 0u;
-        uint pb1 = bN1 < N ? W[(((long)bN1 * K + 0) >> 1) + bW1] : 0u;
+        float pa0 = aM0 < M ? A[aOff0 + 0] : 0f;
+        float pa1 = aM1 < M ? A[aOff1 + 0] : 0f;
+        float pa2 = aM2 < M ? A[aOff2 + 0] : 0f;
+        float pa3 = aM3 < M ? A[aOff3 + 0] : 0f;
+        uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
+        uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
         for (int k0 = 0; k0 < K; k0 += 8)
         {
             As[aK0 * 132 + aRow0] = pa0;
@@ -72,12 +81,12 @@ internal static class TiledGemm
             int kn = k0 + 8;
             if (kn < K)
             {
-                pa0 = aM0 < M ? A[(long)aM0 * K + kn + aK0] : 0f;
-                pa1 = aM1 < M ? A[(long)aM1 * K + kn + aK1] : 0f;
-                pa2 = aM2 < M ? A[(long)aM2 * K + kn + aK2] : 0f;
-                pa3 = aM3 < M ? A[(long)aM3 * K + kn + aK3] : 0f;
-                pb0 = bN0 < N ? W[(((long)bN0 * K + kn) >> 1) + bW0] : 0u;
-                pb1 = bN1 < N ? W[(((long)bN1 * K + kn) >> 1) + bW1] : 0u;
+                pa0 = aM0 < M ? A[aOff0 + kn] : 0f;
+                pa1 = aM1 < M ? A[aOff1 + kn] : 0f;
+                pa2 = aM2 < M ? A[aOff2 + kn] : 0f;
+                pa3 = aM3 < M ? A[aOff3 + kn] : 0f;
+                pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
+                pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
             }
             for (int kk = 0; kk < 8; kk++)
             {
@@ -128,7 +137,7 @@ internal static class TiledGemm
         int m0 = mBase + ty + 0;
         if (m0 < M)
         {
-            long rb = (long)m0 * N;
+            int rb = m0 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -141,7 +150,7 @@ internal static class TiledGemm
         int m1 = mBase + ty + 16;
         if (m1 < M)
         {
-            long rb = (long)m1 * N;
+            int rb = m1 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -154,7 +163,7 @@ internal static class TiledGemm
         int m2 = mBase + ty + 32;
         if (m2 < M)
         {
-            long rb = (long)m2 * N;
+            int rb = m2 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -167,7 +176,7 @@ internal static class TiledGemm
         int m3 = mBase + ty + 48;
         if (m3 < M)
         {
-            long rb = (long)m3 * N;
+            int rb = m3 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -180,7 +189,7 @@ internal static class TiledGemm
         int m4 = mBase + ty + 64;
         if (m4 < M)
         {
-            long rb = (long)m4 * N;
+            int rb = m4 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -193,7 +202,7 @@ internal static class TiledGemm
         int m5 = mBase + ty + 80;
         if (m5 < M)
         {
-            long rb = (long)m5 * N;
+            int rb = m5 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -206,7 +215,7 @@ internal static class TiledGemm
         int m6 = mBase + ty + 96;
         if (m6 < M)
         {
-            long rb = (long)m6 * N;
+            int rb = m6 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -219,7 +228,7 @@ internal static class TiledGemm
         int m7 = mBase + ty + 112;
         if (m7 < M)
         {
-            long rb = (long)m7 * N;
+            int rb = m7 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -246,6 +255,12 @@ internal static class TiledGemm
         int aRow3 = (768 + tid) >> 3, aK3 = (768 + tid) & 7, aM3 = mBase + aRow3;
         int bRow0 = (0 + tid) >> 2, bW0 = (0 + tid) & 3, bN0 = nBase + bRow0;
         int bRow1 = (256 + tid) >> 2, bW1 = (256 + tid) & 3, bN1 = nBase + bRow1;
+        int aOff0 = aM0 * K + aK0;
+        int aOff1 = aM1 * K + aK1;
+        int aOff2 = aM2 * K + aK2;
+        int aOff3 = aM3 * K + aK3;
+        int bOff0 = ((bN0 * K) >> 1) + bW0;
+        int bOff1 = ((bN1 * K) >> 1) + bW1;
         float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c04 = 0f, c05 = 0f, c06 = 0f, c07 = 0f;
         float c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f, c14 = 0f, c15 = 0f, c16 = 0f, c17 = 0f;
         float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c24 = 0f, c25 = 0f, c26 = 0f, c27 = 0f;
@@ -254,12 +269,12 @@ internal static class TiledGemm
         float c50 = 0f, c51 = 0f, c52 = 0f, c53 = 0f, c54 = 0f, c55 = 0f, c56 = 0f, c57 = 0f;
         float c60 = 0f, c61 = 0f, c62 = 0f, c63 = 0f, c64 = 0f, c65 = 0f, c66 = 0f, c67 = 0f;
         float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
-        float pa0 = aM0 < M ? A[(long)aM0 * K + 0 + aK0] : 0f;
-        float pa1 = aM1 < M ? A[(long)aM1 * K + 0 + aK1] : 0f;
-        float pa2 = aM2 < M ? A[(long)aM2 * K + 0 + aK2] : 0f;
-        float pa3 = aM3 < M ? A[(long)aM3 * K + 0 + aK3] : 0f;
-        uint pb0 = bN0 < N ? W[(((long)bN0 * K + 0) >> 1) + bW0] : 0u;
-        uint pb1 = bN1 < N ? W[(((long)bN1 * K + 0) >> 1) + bW1] : 0u;
+        float pa0 = aM0 < M ? A[aOff0 + 0] : 0f;
+        float pa1 = aM1 < M ? A[aOff1 + 0] : 0f;
+        float pa2 = aM2 < M ? A[aOff2 + 0] : 0f;
+        float pa3 = aM3 < M ? A[aOff3 + 0] : 0f;
+        uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
+        uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
         for (int k0 = 0; k0 < K; k0 += 8)
         {
             As[aK0 * 132 + aRow0] = pa0;
@@ -272,12 +287,12 @@ internal static class TiledGemm
             int kn = k0 + 8;
             if (kn < K)
             {
-                pa0 = aM0 < M ? A[(long)aM0 * K + kn + aK0] : 0f;
-                pa1 = aM1 < M ? A[(long)aM1 * K + kn + aK1] : 0f;
-                pa2 = aM2 < M ? A[(long)aM2 * K + kn + aK2] : 0f;
-                pa3 = aM3 < M ? A[(long)aM3 * K + kn + aK3] : 0f;
-                pb0 = bN0 < N ? W[(((long)bN0 * K + kn) >> 1) + bW0] : 0u;
-                pb1 = bN1 < N ? W[(((long)bN1 * K + kn) >> 1) + bW1] : 0u;
+                pa0 = aM0 < M ? A[aOff0 + kn] : 0f;
+                pa1 = aM1 < M ? A[aOff1 + kn] : 0f;
+                pa2 = aM2 < M ? A[aOff2 + kn] : 0f;
+                pa3 = aM3 < M ? A[aOff3 + kn] : 0f;
+                pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
+                pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
             }
             for (int kk = 0; kk < 8; kk++)
             {
@@ -328,7 +343,7 @@ internal static class TiledGemm
         int m0 = mBase + ty + 0;
         if (m0 < M)
         {
-            long rb = (long)m0 * N;
+            int rb = m0 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -341,7 +356,7 @@ internal static class TiledGemm
         int m1 = mBase + ty + 16;
         if (m1 < M)
         {
-            long rb = (long)m1 * N;
+            int rb = m1 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -354,7 +369,7 @@ internal static class TiledGemm
         int m2 = mBase + ty + 32;
         if (m2 < M)
         {
-            long rb = (long)m2 * N;
+            int rb = m2 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -367,7 +382,7 @@ internal static class TiledGemm
         int m3 = mBase + ty + 48;
         if (m3 < M)
         {
-            long rb = (long)m3 * N;
+            int rb = m3 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -380,7 +395,7 @@ internal static class TiledGemm
         int m4 = mBase + ty + 64;
         if (m4 < M)
         {
-            long rb = (long)m4 * N;
+            int rb = m4 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -393,7 +408,7 @@ internal static class TiledGemm
         int m5 = mBase + ty + 80;
         if (m5 < M)
         {
-            long rb = (long)m5 * N;
+            int rb = m5 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -406,7 +421,7 @@ internal static class TiledGemm
         int m6 = mBase + ty + 96;
         if (m6 < M)
         {
-            long rb = (long)m6 * N;
+            int rb = m6 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -419,7 +434,7 @@ internal static class TiledGemm
         int m7 = mBase + ty + 112;
         if (m7 < M)
         {
-            long rb = (long)m7 * N;
+            int rb = m7 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -446,6 +461,8 @@ internal static class TiledGemm
         int aRow3 = (768 + tid) >> 3, aK3 = (768 + tid) & 7, aM3 = mBase + aRow3;
         int bRow0 = (0 + tid) >> 2, bW0 = (0 + tid) & 3, bN0 = nBase + bRow0;
         int bRow1 = (256 + tid) >> 2, bW1 = (256 + tid) & 3, bN1 = nBase + bRow1;
+        int bOff0 = ((bN0 * K) >> 1) + bW0;
+        int bOff1 = ((bN1 * K) >> 1) + bW1;
         float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c04 = 0f, c05 = 0f, c06 = 0f, c07 = 0f;
         float c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f, c14 = 0f, c15 = 0f, c16 = 0f, c17 = 0f;
         float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c24 = 0f, c25 = 0f, c26 = 0f, c27 = 0f;
@@ -458,8 +475,8 @@ internal static class TiledGemm
         float pa1 = aM1 < M ? GatherA(A, nbr, aM1, 0 + aK1, cin) : 0f;
         float pa2 = aM2 < M ? GatherA(A, nbr, aM2, 0 + aK2, cin) : 0f;
         float pa3 = aM3 < M ? GatherA(A, nbr, aM3, 0 + aK3, cin) : 0f;
-        uint pb0 = bN0 < N ? W[(((long)bN0 * K + 0) >> 1) + bW0] : 0u;
-        uint pb1 = bN1 < N ? W[(((long)bN1 * K + 0) >> 1) + bW1] : 0u;
+        uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
+        uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
         for (int k0 = 0; k0 < K; k0 += 8)
         {
             As[aK0 * 132 + aRow0] = pa0;
@@ -476,8 +493,8 @@ internal static class TiledGemm
                 pa1 = aM1 < M ? GatherA(A, nbr, aM1, kn + aK1, cin) : 0f;
                 pa2 = aM2 < M ? GatherA(A, nbr, aM2, kn + aK2, cin) : 0f;
                 pa3 = aM3 < M ? GatherA(A, nbr, aM3, kn + aK3, cin) : 0f;
-                pb0 = bN0 < N ? W[(((long)bN0 * K + kn) >> 1) + bW0] : 0u;
-                pb1 = bN1 < N ? W[(((long)bN1 * K + kn) >> 1) + bW1] : 0u;
+                pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
+                pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
             }
             for (int kk = 0; kk < 8; kk++)
             {
@@ -528,7 +545,7 @@ internal static class TiledGemm
         int m0 = mBase + ty + 0;
         if (m0 < M)
         {
-            long rb = (long)m0 * N;
+            int rb = m0 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -541,7 +558,7 @@ internal static class TiledGemm
         int m1 = mBase + ty + 16;
         if (m1 < M)
         {
-            long rb = (long)m1 * N;
+            int rb = m1 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -554,7 +571,7 @@ internal static class TiledGemm
         int m2 = mBase + ty + 32;
         if (m2 < M)
         {
-            long rb = (long)m2 * N;
+            int rb = m2 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -567,7 +584,7 @@ internal static class TiledGemm
         int m3 = mBase + ty + 48;
         if (m3 < M)
         {
-            long rb = (long)m3 * N;
+            int rb = m3 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -580,7 +597,7 @@ internal static class TiledGemm
         int m4 = mBase + ty + 64;
         if (m4 < M)
         {
-            long rb = (long)m4 * N;
+            int rb = m4 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -593,7 +610,7 @@ internal static class TiledGemm
         int m5 = mBase + ty + 80;
         if (m5 < M)
         {
-            long rb = (long)m5 * N;
+            int rb = m5 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -606,7 +623,7 @@ internal static class TiledGemm
         int m6 = mBase + ty + 96;
         if (m6 < M)
         {
-            long rb = (long)m6 * N;
+            int rb = m6 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
@@ -619,7 +636,7 @@ internal static class TiledGemm
         int m7 = mBase + ty + 112;
         if (m7 < M)
         {
-            long rb = (long)m7 * N;
+            int rb = m7 * N;
             if (n0 < N) { float v = DiTKernels.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
             if (n1 < N) { float v = DiTKernels.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
             if (n2 < N) { float v = DiTKernels.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }

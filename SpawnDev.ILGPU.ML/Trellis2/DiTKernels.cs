@@ -63,7 +63,7 @@ public sealed class DiTKernels
             _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), w.Cast<BFloat16, U4>(), b, o, o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
             return;
         }
-        if (UseTiled(K))
+        if (UseTiled(K) && TiledGemm.Fits(M, K, N))
         {
             _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int>(TiledGemm.Bf16Dense);
             EnsureDummies();
