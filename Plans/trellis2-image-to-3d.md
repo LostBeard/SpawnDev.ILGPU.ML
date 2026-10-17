@@ -47,21 +47,34 @@ BackgroundRemovalPipeline (RMBG 1.4 shaped, takes any segmenter session), GLTFEx
 NOT present: sparse tensors, submanifold sparse conv, sparse spatial ops, hash map, RoPE-3D sparse attention, flow sampler, DINOv3, UV unwrap, texture bake, PBR GLB.
 No tensor-core use anywhere. SpawnDev.ILGPU has inline PTX (`LanguageIntrinsics`), so `mma.sync` fp16 tensor-core GEMM on the CUDA backend is a library-first perf item (Rule 2) once correctness is done.
 
-## Milestones (each: CPU/oracle test at production scale, then GPU, local feed only, no full gates per change)
+## Milestones (each: oracle test at production scale, then GPU, local feed only, no full gates per change)
 
-- [ ] M0 licenses read (done) + background removal answer: caller RGBA / mask first; permissive segmenter (BiRefNet is MIT: verify weights license + port) second.
-- [ ] M1 weight loading: bf16 safetensors -> fp16 GPU, staged load/free. Real TRELLIS.2-4B files in `C:\Users\TJ\.cache\huggingface\spawndev-trellis2`.
-- [ ] M2 DINOv3 ViT-L/16 (RoPE ViT, 4 register tokens, layerscale) feature extractor, weights from the user's own gated download.
-- [ ] M3 flow DiT block: adaLN share_mod, self-attn + 3D RoPE + qk RMS norm, cross-attn + qk RMS norm, SwiGLU-free FFN (mlp 5.3334), timestep embed. Dense 16^3 (SS) then sparse variable length (SLat). Flash attention at N up to 49152.
-- [ ] M4 Euler flow sampler with CFG + guidance interval + guidance rescale (read classifier_free_guidance_mixin.py + guidance_interval_mixin.py first).
-- [ ] M5 sparse-structure conv3d decoder (dense), occupancy -> coords (GPU argwhere/compact).
-- [ ] M6 sparse infrastructure: GPU hash map, submanifold 3x3x3 conv (neighbour map + gather GEMM), spatial2channel / channel2spatial / subdivision-guided upsample, ConvNeXt block, layer norm over features.
-- [ ] M7 shape decoder + dual-grid mesh extraction on GPU.
-- [ ] M8 texture decoder (guided subdivisions) -> per-voxel PBR.
-- [ ] M9 mesh post: hole fill, simplify, UV unwrap (own implementation), UV-space rasterize, trilinear attribute bake, gap inpaint, PBR GLB writer (positions, normals, UVs, base colour, metallic-roughness textures).
-- [ ] M10 whole pipeline `Trellis2ImagePipeline.GenerateAsync(...)`; entry points get managed, TypedArray, ArrayView1D overloads (Rule 4) and a Trellis2Options; PROGRESS callback.
-- [ ] M11 12 GB measured end to end (peak VRAM + time per stage on the RTX 4070), then perf: tensor-core GEMM, fused sparse conv, attention.
+Status 2026-10-17. Every numerical piece below is gated by `tools/trellis2-harness` against tensors dumped from the REAL reference
+classes with the real weights (CPU torch; `reference/golden_*.py`). Commands: `header upload mma attn ssflow slat sampler ssdec decoders dualgrid run512 bench ptx`.
+
+- [x] M0 licenses read; TRELLIS.2 + TRELLIS-image-large MIT, DINOv3 usable (gated), RMBG-2.0 NC (not shipped). Background removal replacement: still open (see M0b).
+- [ ] M0b background removal: caller RGBA / mask first; permissive segmenter (BiRefNet MIT: verify weights license + port) second.
+- [x] M1 streaming SafeTensors reader, native bf16/fp16/fp32 device residency, one stage's weights at a time (peak 3.1 GB whole 512 run).
+- [ ] M2 DINOv3 ViT-L/16 feature extractor. BLOCKED on TJ accepting Meta's terms on HF (gated weights).
+- [x] M3 flow DiT (adaLN share_mod, RoPE-3D, qk RMS norm, cross attention): SS 6e-6 / SLat shape 1.9e-5 / tex 1.1e-5 in fp32; bf16 tensor cores within the reference's own bf16 noise.
+- [x] M4 Euler flow sampler + CFG + guidance interval + rescale: 2e-7 on all three shipped configs.
+- [x] M5 sparse-structure decoder + occupancy: logits 6e-7 fp32, occupancy coordinates identical.
+- [x] M6 sparse infrastructure: GPU hash neighbour tables, gathered-row implicit-GEMM conv, subdivision, C2S, ConvNeXt.
+- [x] M7 shape decoder + dual-grid mesh extraction: exact in fp32, vertices 6e-9, triangles identical.
+- [x] M8 texture decoder (guided): exact in fp32.
+- [x] M10a `Trellis2Pipeline.Run512` end to end on real checkpoints (stand-in condition): runs, 3.1 GB peak.
+- [ ] M9 mesh post: hole fill, simplify, UV unwrap (CuMesh = chart clustering + xatlas; both MIT, we write our own), UV-space rasterize, trilinear attribute bake, gap inpaint, PBR GLB writer.
+- [ ] M10 public entry points (managed / TypedArray / ArrayView1D), Trellis2Options, progress; 1024 cascade (shape decoder `upsample`, 49152 token cap).
+- [ ] M11 perf (measured RTX 4070): GEMM 3.7 -> 35 TFLOPS (inline-PTX output registers, see below), flash attention 4.3 -> 9-14 TFLOPS. Next: attention (staging, ldmatrix), bf16 activation storage, fused epilogues, non-CUDA backends, Turing (sm_75: fp16 m16n8k8).
 - [ ] M12 text-to-3D = existing text-to-image step feeding M10.
+
+### The inline-PTX local-memory finding (2026-10-17)
+
+`CudaAsm.EmitRef` and single-`out` `Emit` made every MMA operand a local-memory round trip: the first GEMM PTX had 232 `ld.local` and
+256 `st.local` and ran at 9% of tensor throughput. Fixed IN THE LIBRARY (SpawnDev.ILGPU 5.3.8-local.5, forks 2.3.13-local.3):
+(1) `CudaAsm.Emit` overloads with 2-4 `out` operands and up to 16 operands (`CudaAsm.Generated.tt`);
+(2) the PTX backend keeps an `out` local that is only an emit output in the register the statement wrote (`PTXCodeGenerator.Values.cs`,
+`IsPromotableEmitOutput`). PTX of the GEMM: 0 `ld.local`, 0 `st.local`. Tests: `BackendTestBase.CudaAsmMultiOut` in the ILGPU repo.
 
 ## Oracle problem
 

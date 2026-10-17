@@ -133,6 +133,14 @@ internal static class Golden
         sw.Restart();
         dit.Forward(fb.View, t, cdb.View, condTokens, ob.View);
         Console.WriteLine($"forward (warm) {sw.Elapsed.TotalSeconds:F2}s");
+        if (FlowDiT.Profile)
+        {
+            dit.ProfileMs.Clear();
+            dit.Forward(fb.View, t, cdb.View, condTokens, ob.View);
+            double tot = dit.ProfileMs.Values.Sum();
+            foreach (var kv in dit.ProfileMs.OrderByDescending(k => k.Value)) Console.WriteLine($"  {kv.Key,-16} {kv.Value,9:F1} ms  {100 * kv.Value / tot,5:F1}%");
+            Console.WriteLine($"  {"total",-16} {tot,9:F1} ms");
+        }
         ok &= Compare("y", ReadF32(Path.Combine(dir, "y.bin")), ob.GetAsArray1D(), yTol);
         Console.WriteLine(ok ? $"SLAT {kind.ToUpperInvariant()} PASS" : $"SLAT {kind.ToUpperInvariant()} FAIL");
         return ok ? 0 : 1;

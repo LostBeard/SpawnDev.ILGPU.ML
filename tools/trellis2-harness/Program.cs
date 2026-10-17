@@ -26,6 +26,9 @@ return command switch
     "decoders" => Golden.Decoders(),
     "dualgrid" => Golden.DualGrid(),
     "ssdec" => Golden.SsDecoder(),
+    "bench" => GemmBench.Run(),
+    "ptx" => PtxDump.Run(args[1], args[2], args[3]),
+    "run512" => PipelineRun.Run512(args.Length > 1 ? int.Parse(args[1]) : 42),
     "slat" => Golden.SlatFlow(args.Length > 1 ? args[1] : "shape"),
     _ => Usage(command),
 };

@@ -33,6 +33,19 @@ public sealed class FlowDiT : IDisposable
     public int ModelChannels => _dim;
     public int TokenCount => _n;
 
+    /// <summary>TRELLIS2_PROFILE=1: per-op device time of the NEXT forward (synchronises around every op), summed by name in <see cref="ProfileMs"/>.</summary>
+    public static readonly bool Profile = Environment.GetEnvironmentVariable("TRELLIS2_PROFILE") == "1";
+    public readonly Dictionary<string, double> ProfileMs = new();
+    private void T(string name, Action a)
+    {
+        if (!Profile) { a(); return; }
+        _acc.Synchronize();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        a();
+        _acc.Synchronize();
+        ProfileMs[name] = ProfileMs.GetValueOrDefault(name) + sw.Elapsed.TotalMilliseconds;
+    }
+
     /// <summary>Test hook: (stage name, activation view, element count); valid only during the call.</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
@@ -124,29 +137,29 @@ public sealed class FlowDiT : IDisposable
             _k.AddBf16(_w.BF16(p + "modulation"), _mod, _modv, 6 * C);   // shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
             // self attention
-            _k.LayerNormModulate(_h, _hn, _modv, 0 * C, 1 * C, N, C, 1e-6f);
-            _k.Linear(_hn, _w.BF16(p + "self_attn.to_qkv.weight"), _w.BF16(p + "self_attn.to_qkv.bias"), _qkv, N, C, 3 * C);
-            _k.HeadNorm(_qkv, _w.BF16(p + "self_attn.q_rms_norm.gamma"), _phases!.View, N, 3 * C, 0 * C, H, D);
-            _k.HeadNorm(_qkv, _w.BF16(p + "self_attn.k_rms_norm.gamma"), _phases.View, N, 3 * C, 1 * C, H, D);
-            _k.Attention(_qkv, 3 * C, 0, _qkv, 3 * C, 1 * C, 2 * C, _scores, _attn, N, N, H, D);
-            _k.Linear(_attn, _w.BF16(p + "self_attn.to_out.weight"), _w.BF16(p + "self_attn.to_out.bias"), _proj, N, C, C);
-            _k.GateResidual(_h, _proj, _modv, 2 * C, N * C, C);
+            T("norm+mod", () => _k.LayerNormModulate(_h, _hn, _modv, 0 * C, 1 * C, N, C, 1e-6f));
+            T("linear qkv", () => _k.Linear(_hn, _w.BF16(p + "self_attn.to_qkv.weight"), _w.BF16(p + "self_attn.to_qkv.bias"), _qkv, N, C, 3 * C));
+            T("head norm", () => { _k.HeadNorm(_qkv, _w.BF16(p + "self_attn.q_rms_norm.gamma"), _phases!.View, N, 3 * C, 0 * C, H, D);
+                                   _k.HeadNorm(_qkv, _w.BF16(p + "self_attn.k_rms_norm.gamma"), _phases.View, N, 3 * C, 1 * C, H, D); });
+            T("self attention", () => _k.Attention(_qkv, 3 * C, 0, _qkv, 3 * C, 1 * C, 2 * C, _scores, _attn, N, N, H, D));
+            T("linear out", () => _k.Linear(_attn, _w.BF16(p + "self_attn.to_out.weight"), _w.BF16(p + "self_attn.to_out.bias"), _proj, N, C, C));
+            T("gate residual", () => _k.GateResidual(_h, _proj, _modv, 2 * C, N * C, C));
 
             // cross attention (no modulation, no RoPE; norm2 is the affine one)
-            _k.LayerNormAffine(_h, _hn, _w.BF16(p + "norm2.weight"), _w.BF16(p + "norm2.bias"), N, C, 1e-6f);
-            _k.Linear(_hn, _w.BF16(p + "cross_attn.to_q.weight"), _w.BF16(p + "cross_attn.to_q.bias"), _q, N, C, C);
-            _k.Linear(cond, _w.BF16(p + "cross_attn.to_kv.weight"), _w.BF16(p + "cross_attn.to_kv.bias"), _kv, condTokens, _condCh, 2 * C);
-            _k.HeadNorm(_q, _w.BF16(p + "cross_attn.q_rms_norm.gamma"), null, N, C, 0, H, D);
-            _k.HeadNorm(_kv, _w.BF16(p + "cross_attn.k_rms_norm.gamma"), null, condTokens, 2 * C, 0, H, D);
-            _k.Attention(_q, C, 0, _kv, 2 * C, 0, C, _scores, _attn, N, condTokens, H, D);
-            _k.Linear(_attn, _w.BF16(p + "cross_attn.to_out.weight"), _w.BF16(p + "cross_attn.to_out.bias"), _proj, N, C, C);
-            _k.GateResidual(_h, _proj, _modv, -1, N * C, C);
+            T("norm affine", () => _k.LayerNormAffine(_h, _hn, _w.BF16(p + "norm2.weight"), _w.BF16(p + "norm2.bias"), N, C, 1e-6f));
+            T("linear q", () => _k.Linear(_hn, _w.BF16(p + "cross_attn.to_q.weight"), _w.BF16(p + "cross_attn.to_q.bias"), _q, N, C, C));
+            T("linear kv", () => _k.Linear(cond, _w.BF16(p + "cross_attn.to_kv.weight"), _w.BF16(p + "cross_attn.to_kv.bias"), _kv, condTokens, _condCh, 2 * C));
+            T("head norm", () => { _k.HeadNorm(_q, _w.BF16(p + "cross_attn.q_rms_norm.gamma"), null, N, C, 0, H, D);
+                                   _k.HeadNorm(_kv, _w.BF16(p + "cross_attn.k_rms_norm.gamma"), null, condTokens, 2 * C, 0, H, D); });
+            T("cross attention", () => _k.Attention(_q, C, 0, _kv, 2 * C, 0, C, _scores, _attn, N, condTokens, H, D));
+            T("linear out", () => _k.Linear(_attn, _w.BF16(p + "cross_attn.to_out.weight"), _w.BF16(p + "cross_attn.to_out.bias"), _proj, N, C, C));
+            T("gate residual", () => _k.GateResidual(_h, _proj, _modv, -1, N * C, C));
 
             // feed forward
-            _k.LayerNormModulate(_h, _hn, _modv, 3 * C, 4 * C, N, C, 1e-6f);
-            _k.Linear(_hn, _w.BF16(p + "mlp.mlp.0.weight"), _w.BF16(p + "mlp.mlp.0.bias"), _mlp, N, C, _hidden, DiTKernels.Act.GeluTanh);
-            _k.Linear(_mlp, _w.BF16(p + "mlp.mlp.2.weight"), _w.BF16(p + "mlp.mlp.2.bias"), _proj, N, _hidden, C);
-            _k.GateResidual(_h, _proj, _modv, 5 * C, N * C, C);
+            T("norm+mod", () => _k.LayerNormModulate(_h, _hn, _modv, 3 * C, 4 * C, N, C, 1e-6f));
+            T("linear mlp1", () => _k.Linear(_hn, _w.BF16(p + "mlp.mlp.0.weight"), _w.BF16(p + "mlp.mlp.0.bias"), _mlp, N, C, _hidden, DiTKernels.Act.GeluTanh));
+            T("linear mlp2", () => _k.Linear(_mlp, _w.BF16(p + "mlp.mlp.2.weight"), _w.BF16(p + "mlp.mlp.2.bias"), _proj, N, _hidden, C));
+            T("gate residual", () => _k.GateResidual(_h, _proj, _modv, 5 * C, N * C, C));
 
             if (Tap != null)
             {

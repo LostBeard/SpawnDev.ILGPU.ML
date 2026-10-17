@@ -92,7 +92,7 @@ public sealed class SparseStructureDecoder : IDisposable
     }
 
     /// <summary>
-    /// <paramref name="latent"/> is [latentCh, res^3] channel-first. Returns the occupancy logits [(8 res)^3] (1 channel); caller disposes.
+    /// <paramref name="latent"/> is [latentCh, res^3] channel-first. Returns the occupancy logits [(4 res)^3] (1 channel); caller disposes.
     /// </summary>
     public MemoryBuffer1D<float, Stride1D.Dense> Decode(FV latent, int res)
     {

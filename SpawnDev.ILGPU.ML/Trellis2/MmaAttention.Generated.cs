@@ -31,55 +31,55 @@ internal static class MmaAttention
         bool r0ok = row0 < Nq, r1ok = row1 < Nq;
 
         // Q fragments, rounded to bf16 once
-        Input<uint> qa00 = r0ok ? Pack(Q[qb0 + 0 + 2 * t], Q[qb0 + 0 + 2 * t + 1]) : 0u;
-        Input<uint> qa01 = r1ok ? Pack(Q[qb1 + 0 + 2 * t], Q[qb1 + 0 + 2 * t + 1]) : 0u;
-        Input<uint> qa02 = r0ok ? Pack(Q[qb0 + 8 + 2 * t], Q[qb0 + 8 + 2 * t + 1]) : 0u;
-        Input<uint> qa03 = r1ok ? Pack(Q[qb1 + 8 + 2 * t], Q[qb1 + 8 + 2 * t + 1]) : 0u;
-        Input<uint> qa10 = r0ok ? Pack(Q[qb0 + 16 + 2 * t], Q[qb0 + 16 + 2 * t + 1]) : 0u;
-        Input<uint> qa11 = r1ok ? Pack(Q[qb1 + 16 + 2 * t], Q[qb1 + 16 + 2 * t + 1]) : 0u;
-        Input<uint> qa12 = r0ok ? Pack(Q[qb0 + 24 + 2 * t], Q[qb0 + 24 + 2 * t + 1]) : 0u;
-        Input<uint> qa13 = r1ok ? Pack(Q[qb1 + 24 + 2 * t], Q[qb1 + 24 + 2 * t + 1]) : 0u;
-        Input<uint> qa20 = r0ok ? Pack(Q[qb0 + 32 + 2 * t], Q[qb0 + 32 + 2 * t + 1]) : 0u;
-        Input<uint> qa21 = r1ok ? Pack(Q[qb1 + 32 + 2 * t], Q[qb1 + 32 + 2 * t + 1]) : 0u;
-        Input<uint> qa22 = r0ok ? Pack(Q[qb0 + 40 + 2 * t], Q[qb0 + 40 + 2 * t + 1]) : 0u;
-        Input<uint> qa23 = r1ok ? Pack(Q[qb1 + 40 + 2 * t], Q[qb1 + 40 + 2 * t + 1]) : 0u;
-        Input<uint> qa30 = r0ok ? Pack(Q[qb0 + 48 + 2 * t], Q[qb0 + 48 + 2 * t + 1]) : 0u;
-        Input<uint> qa31 = r1ok ? Pack(Q[qb1 + 48 + 2 * t], Q[qb1 + 48 + 2 * t + 1]) : 0u;
-        Input<uint> qa32 = r0ok ? Pack(Q[qb0 + 56 + 2 * t], Q[qb0 + 56 + 2 * t + 1]) : 0u;
-        Input<uint> qa33 = r1ok ? Pack(Q[qb1 + 56 + 2 * t], Q[qb1 + 56 + 2 * t + 1]) : 0u;
-        Input<uint> qa40 = r0ok ? Pack(Q[qb0 + 64 + 2 * t], Q[qb0 + 64 + 2 * t + 1]) : 0u;
-        Input<uint> qa41 = r1ok ? Pack(Q[qb1 + 64 + 2 * t], Q[qb1 + 64 + 2 * t + 1]) : 0u;
-        Input<uint> qa42 = r0ok ? Pack(Q[qb0 + 72 + 2 * t], Q[qb0 + 72 + 2 * t + 1]) : 0u;
-        Input<uint> qa43 = r1ok ? Pack(Q[qb1 + 72 + 2 * t], Q[qb1 + 72 + 2 * t + 1]) : 0u;
-        Input<uint> qa50 = r0ok ? Pack(Q[qb0 + 80 + 2 * t], Q[qb0 + 80 + 2 * t + 1]) : 0u;
-        Input<uint> qa51 = r1ok ? Pack(Q[qb1 + 80 + 2 * t], Q[qb1 + 80 + 2 * t + 1]) : 0u;
-        Input<uint> qa52 = r0ok ? Pack(Q[qb0 + 88 + 2 * t], Q[qb0 + 88 + 2 * t + 1]) : 0u;
-        Input<uint> qa53 = r1ok ? Pack(Q[qb1 + 88 + 2 * t], Q[qb1 + 88 + 2 * t + 1]) : 0u;
-        Input<uint> qa60 = r0ok ? Pack(Q[qb0 + 96 + 2 * t], Q[qb0 + 96 + 2 * t + 1]) : 0u;
-        Input<uint> qa61 = r1ok ? Pack(Q[qb1 + 96 + 2 * t], Q[qb1 + 96 + 2 * t + 1]) : 0u;
-        Input<uint> qa62 = r0ok ? Pack(Q[qb0 + 104 + 2 * t], Q[qb0 + 104 + 2 * t + 1]) : 0u;
-        Input<uint> qa63 = r1ok ? Pack(Q[qb1 + 104 + 2 * t], Q[qb1 + 104 + 2 * t + 1]) : 0u;
-        Input<uint> qa70 = r0ok ? Pack(Q[qb0 + 112 + 2 * t], Q[qb0 + 112 + 2 * t + 1]) : 0u;
-        Input<uint> qa71 = r1ok ? Pack(Q[qb1 + 112 + 2 * t], Q[qb1 + 112 + 2 * t + 1]) : 0u;
-        Input<uint> qa72 = r0ok ? Pack(Q[qb0 + 120 + 2 * t], Q[qb0 + 120 + 2 * t + 1]) : 0u;
-        Input<uint> qa73 = r1ok ? Pack(Q[qb1 + 120 + 2 * t], Q[qb1 + 120 + 2 * t + 1]) : 0u;
+        uint qa00 = r0ok ? Pack(Q[qb0 + 0 + 2 * t], Q[qb0 + 0 + 2 * t + 1]) : 0u;
+        uint qa01 = r1ok ? Pack(Q[qb1 + 0 + 2 * t], Q[qb1 + 0 + 2 * t + 1]) : 0u;
+        uint qa02 = r0ok ? Pack(Q[qb0 + 8 + 2 * t], Q[qb0 + 8 + 2 * t + 1]) : 0u;
+        uint qa03 = r1ok ? Pack(Q[qb1 + 8 + 2 * t], Q[qb1 + 8 + 2 * t + 1]) : 0u;
+        uint qa10 = r0ok ? Pack(Q[qb0 + 16 + 2 * t], Q[qb0 + 16 + 2 * t + 1]) : 0u;
+        uint qa11 = r1ok ? Pack(Q[qb1 + 16 + 2 * t], Q[qb1 + 16 + 2 * t + 1]) : 0u;
+        uint qa12 = r0ok ? Pack(Q[qb0 + 24 + 2 * t], Q[qb0 + 24 + 2 * t + 1]) : 0u;
+        uint qa13 = r1ok ? Pack(Q[qb1 + 24 + 2 * t], Q[qb1 + 24 + 2 * t + 1]) : 0u;
+        uint qa20 = r0ok ? Pack(Q[qb0 + 32 + 2 * t], Q[qb0 + 32 + 2 * t + 1]) : 0u;
+        uint qa21 = r1ok ? Pack(Q[qb1 + 32 + 2 * t], Q[qb1 + 32 + 2 * t + 1]) : 0u;
+        uint qa22 = r0ok ? Pack(Q[qb0 + 40 + 2 * t], Q[qb0 + 40 + 2 * t + 1]) : 0u;
+        uint qa23 = r1ok ? Pack(Q[qb1 + 40 + 2 * t], Q[qb1 + 40 + 2 * t + 1]) : 0u;
+        uint qa30 = r0ok ? Pack(Q[qb0 + 48 + 2 * t], Q[qb0 + 48 + 2 * t + 1]) : 0u;
+        uint qa31 = r1ok ? Pack(Q[qb1 + 48 + 2 * t], Q[qb1 + 48 + 2 * t + 1]) : 0u;
+        uint qa32 = r0ok ? Pack(Q[qb0 + 56 + 2 * t], Q[qb0 + 56 + 2 * t + 1]) : 0u;
+        uint qa33 = r1ok ? Pack(Q[qb1 + 56 + 2 * t], Q[qb1 + 56 + 2 * t + 1]) : 0u;
+        uint qa40 = r0ok ? Pack(Q[qb0 + 64 + 2 * t], Q[qb0 + 64 + 2 * t + 1]) : 0u;
+        uint qa41 = r1ok ? Pack(Q[qb1 + 64 + 2 * t], Q[qb1 + 64 + 2 * t + 1]) : 0u;
+        uint qa42 = r0ok ? Pack(Q[qb0 + 72 + 2 * t], Q[qb0 + 72 + 2 * t + 1]) : 0u;
+        uint qa43 = r1ok ? Pack(Q[qb1 + 72 + 2 * t], Q[qb1 + 72 + 2 * t + 1]) : 0u;
+        uint qa50 = r0ok ? Pack(Q[qb0 + 80 + 2 * t], Q[qb0 + 80 + 2 * t + 1]) : 0u;
+        uint qa51 = r1ok ? Pack(Q[qb1 + 80 + 2 * t], Q[qb1 + 80 + 2 * t + 1]) : 0u;
+        uint qa52 = r0ok ? Pack(Q[qb0 + 88 + 2 * t], Q[qb0 + 88 + 2 * t + 1]) : 0u;
+        uint qa53 = r1ok ? Pack(Q[qb1 + 88 + 2 * t], Q[qb1 + 88 + 2 * t + 1]) : 0u;
+        uint qa60 = r0ok ? Pack(Q[qb0 + 96 + 2 * t], Q[qb0 + 96 + 2 * t + 1]) : 0u;
+        uint qa61 = r1ok ? Pack(Q[qb1 + 96 + 2 * t], Q[qb1 + 96 + 2 * t + 1]) : 0u;
+        uint qa62 = r0ok ? Pack(Q[qb0 + 104 + 2 * t], Q[qb0 + 104 + 2 * t + 1]) : 0u;
+        uint qa63 = r1ok ? Pack(Q[qb1 + 104 + 2 * t], Q[qb1 + 104 + 2 * t + 1]) : 0u;
+        uint qa70 = r0ok ? Pack(Q[qb0 + 112 + 2 * t], Q[qb0 + 112 + 2 * t + 1]) : 0u;
+        uint qa71 = r1ok ? Pack(Q[qb1 + 112 + 2 * t], Q[qb1 + 112 + 2 * t + 1]) : 0u;
+        uint qa72 = r0ok ? Pack(Q[qb0 + 120 + 2 * t], Q[qb0 + 120 + 2 * t + 1]) : 0u;
+        uint qa73 = r1ok ? Pack(Q[qb1 + 120 + 2 * t], Q[qb1 + 120 + 2 * t + 1]) : 0u;
 
-        Ref<float> o00 = default, o01 = default, o02 = default, o03 = default;
-        Ref<float> o10 = default, o11 = default, o12 = default, o13 = default;
-        Ref<float> o20 = default, o21 = default, o22 = default, o23 = default;
-        Ref<float> o30 = default, o31 = default, o32 = default, o33 = default;
-        Ref<float> o40 = default, o41 = default, o42 = default, o43 = default;
-        Ref<float> o50 = default, o51 = default, o52 = default, o53 = default;
-        Ref<float> o60 = default, o61 = default, o62 = default, o63 = default;
-        Ref<float> o70 = default, o71 = default, o72 = default, o73 = default;
-        Ref<float> o80 = default, o81 = default, o82 = default, o83 = default;
-        Ref<float> o90 = default, o91 = default, o92 = default, o93 = default;
-        Ref<float> o100 = default, o101 = default, o102 = default, o103 = default;
-        Ref<float> o110 = default, o111 = default, o112 = default, o113 = default;
-        Ref<float> o120 = default, o121 = default, o122 = default, o123 = default;
-        Ref<float> o130 = default, o131 = default, o132 = default, o133 = default;
-        Ref<float> o140 = default, o141 = default, o142 = default, o143 = default;
-        Ref<float> o150 = default, o151 = default, o152 = default, o153 = default;
+        float o00 = 0f, o01 = 0f, o02 = 0f, o03 = 0f;
+        float o10 = 0f, o11 = 0f, o12 = 0f, o13 = 0f;
+        float o20 = 0f, o21 = 0f, o22 = 0f, o23 = 0f;
+        float o30 = 0f, o31 = 0f, o32 = 0f, o33 = 0f;
+        float o40 = 0f, o41 = 0f, o42 = 0f, o43 = 0f;
+        float o50 = 0f, o51 = 0f, o52 = 0f, o53 = 0f;
+        float o60 = 0f, o61 = 0f, o62 = 0f, o63 = 0f;
+        float o70 = 0f, o71 = 0f, o72 = 0f, o73 = 0f;
+        float o80 = 0f, o81 = 0f, o82 = 0f, o83 = 0f;
+        float o90 = 0f, o91 = 0f, o92 = 0f, o93 = 0f;
+        float o100 = 0f, o101 = 0f, o102 = 0f, o103 = 0f;
+        float o110 = 0f, o111 = 0f, o112 = 0f, o113 = 0f;
+        float o120 = 0f, o121 = 0f, o122 = 0f, o123 = 0f;
+        float o130 = 0f, o131 = 0f, o132 = 0f, o133 = 0f;
+        float o140 = 0f, o141 = 0f, o142 = 0f, o143 = 0f;
+        float o150 = 0f, o151 = 0f, o152 = 0f, o153 = 0f;
         float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;
 
         for (int kb = 0; kb < Nk; kb += 64)
@@ -101,293 +101,485 @@ internal static class MmaAttention
             }
             Group.Barrier();
 
-            Ref<float> s00 = default, s01 = default, s02 = default, s03 = default;
-            Ref<float> s10 = default, s11 = default, s12 = default, s13 = default;
-            Ref<float> s20 = default, s21 = default, s22 = default, s23 = default;
-            Ref<float> s30 = default, s31 = default, s32 = default, s33 = default;
-            Ref<float> s40 = default, s41 = default, s42 = default, s43 = default;
-            Ref<float> s50 = default, s51 = default, s52 = default, s53 = default;
-            Ref<float> s60 = default, s61 = default, s62 = default, s63 = default;
-            Ref<float> s70 = default, s71 = default, s72 = default, s73 = default;
+            float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
+            float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
+            float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
+            float s30 = 0f, s31 = 0f, s32 = 0f, s33 = 0f;
+            float s40 = 0f, s41 = 0f, s42 = 0f, s43 = 0f;
+            float s50 = 0f, s51 = 0f, s52 = 0f, s53 = 0f;
+            float s60 = 0f, s61 = 0f, s62 = 0f, s63 = 0f;
+            float s70 = 0f, s71 = 0f, s72 = 0f, s73 = 0f;
             {
                 int kw = 0 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa00, ref qa01, ref qa02, ref qa03, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa00, ref qa01, ref qa02, ref qa03, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa00, ref qa01, ref qa02, ref qa03, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa00, ref qa01, ref qa02, ref qa03, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa00, ref qa01, ref qa02, ref qa03, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa00, ref qa01, ref qa02, ref qa03, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa00, ref qa01, ref qa02, ref qa03, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa00, ref qa01, ref qa02, ref qa03, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 8 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa10, ref qa11, ref qa12, ref qa13, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa10, ref qa11, ref qa12, ref qa13, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa10, ref qa11, ref qa12, ref qa13, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa10, ref qa11, ref qa12, ref qa13, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa10, ref qa11, ref qa12, ref qa13, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa10, ref qa11, ref qa12, ref qa13, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa10, ref qa11, ref qa12, ref qa13, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa10, ref qa11, ref qa12, ref qa13, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 16 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa20, ref qa21, ref qa22, ref qa23, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa20, ref qa21, ref qa22, ref qa23, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa20, ref qa21, ref qa22, ref qa23, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa20, ref qa21, ref qa22, ref qa23, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa20, ref qa21, ref qa22, ref qa23, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa20, ref qa21, ref qa22, ref qa23, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa20, ref qa21, ref qa22, ref qa23, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa20, ref qa21, ref qa22, ref qa23, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 24 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa30, ref qa31, ref qa32, ref qa33, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa30, ref qa31, ref qa32, ref qa33, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa30, ref qa31, ref qa32, ref qa33, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa30, ref qa31, ref qa32, ref qa33, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa30, ref qa31, ref qa32, ref qa33, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa30, ref qa31, ref qa32, ref qa33, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa30, ref qa31, ref qa32, ref qa33, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa30, ref qa31, ref qa32, ref qa33, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 32 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa40, ref qa41, ref qa42, ref qa43, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa40, ref qa41, ref qa42, ref qa43, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa40, ref qa41, ref qa42, ref qa43, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa40, ref qa41, ref qa42, ref qa43, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa40, ref qa41, ref qa42, ref qa43, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa40, ref qa41, ref qa42, ref qa43, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa40, ref qa41, ref qa42, ref qa43, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa40, ref qa41, ref qa42, ref qa43, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 40 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa50, ref qa51, ref qa52, ref qa53, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa50, ref qa51, ref qa52, ref qa53, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa50, ref qa51, ref qa52, ref qa53, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa50, ref qa51, ref qa52, ref qa53, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa50, ref qa51, ref qa52, ref qa53, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa50, ref qa51, ref qa52, ref qa53, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa50, ref qa51, ref qa52, ref qa53, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa50, ref qa51, ref qa52, ref qa53, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 48 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa60, ref qa61, ref qa62, ref qa63, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa60, ref qa61, ref qa62, ref qa63, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa60, ref qa61, ref qa62, ref qa63, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa60, ref qa61, ref qa62, ref qa63, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa60, ref qa61, ref qa62, ref qa63, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa60, ref qa61, ref qa62, ref qa63, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa60, ref qa61, ref qa62, ref qa63, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa60, ref qa61, ref qa62, ref qa63, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
             {
                 int kw = 56 + t;
-                Input<uint> kb00 = ks[(0 + g) * 68 + kw];
-                Input<uint> kb01 = ks[(0 + g) * 68 + kw + 4];
-                Input<uint> kb10 = ks[(8 + g) * 68 + kw];
-                Input<uint> kb11 = ks[(8 + g) * 68 + kw + 4];
-                Input<uint> kb20 = ks[(16 + g) * 68 + kw];
-                Input<uint> kb21 = ks[(16 + g) * 68 + kw + 4];
-                Input<uint> kb30 = ks[(24 + g) * 68 + kw];
-                Input<uint> kb31 = ks[(24 + g) * 68 + kw + 4];
-                Input<uint> kb40 = ks[(32 + g) * 68 + kw];
-                Input<uint> kb41 = ks[(32 + g) * 68 + kw + 4];
-                Input<uint> kb50 = ks[(40 + g) * 68 + kw];
-                Input<uint> kb51 = ks[(40 + g) * 68 + kw + 4];
-                Input<uint> kb60 = ks[(48 + g) * 68 + kw];
-                Input<uint> kb61 = ks[(48 + g) * 68 + kw + 4];
-                Input<uint> kb70 = ks[(56 + g) * 68 + kw];
-                Input<uint> kb71 = ks[(56 + g) * 68 + kw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s00, ref s01, ref s02, ref s03, ref qa70, ref qa71, ref qa72, ref qa73, ref kb00, ref kb01);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s10, ref s11, ref s12, ref s13, ref qa70, ref qa71, ref qa72, ref qa73, ref kb10, ref kb11);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s20, ref s21, ref s22, ref s23, ref qa70, ref qa71, ref qa72, ref qa73, ref kb20, ref kb21);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s30, ref s31, ref s32, ref s33, ref qa70, ref qa71, ref qa72, ref qa73, ref kb30, ref kb31);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s40, ref s41, ref s42, ref s43, ref qa70, ref qa71, ref qa72, ref qa73, ref kb40, ref kb41);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s50, ref s51, ref s52, ref s53, ref qa70, ref qa71, ref qa72, ref qa73, ref kb50, ref kb51);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s60, ref s61, ref s62, ref s63, ref qa70, ref qa71, ref qa72, ref qa73, ref kb60, ref kb61);
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref s70, ref s71, ref s72, ref s73, ref qa70, ref qa71, ref qa72, ref qa73, ref kb70, ref kb71);
+                uint kb00 = ks[(0 + g) * 68 + kw];
+                uint kb01 = ks[(0 + g) * 68 + kw + 4];
+                uint kb10 = ks[(8 + g) * 68 + kw];
+                uint kb11 = ks[(8 + g) * 68 + kw + 4];
+                uint kb20 = ks[(16 + g) * 68 + kw];
+                uint kb21 = ks[(16 + g) * 68 + kw + 4];
+                uint kb30 = ks[(24 + g) * 68 + kw];
+                uint kb31 = ks[(24 + g) * 68 + kw + 4];
+                uint kb40 = ks[(32 + g) * 68 + kw];
+                uint kb41 = ks[(32 + g) * 68 + kw + 4];
+                uint kb50 = ks[(40 + g) * 68 + kw];
+                uint kb51 = ks[(40 + g) * 68 + kw + 4];
+                uint kb60 = ks[(48 + g) * 68 + kw];
+                uint kb61 = ks[(48 + g) * 68 + kw + 4];
+                uint kb70 = ks[(56 + g) * 68 + kw];
+                uint kb71 = ks[(56 + g) * 68 + kw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb00, kb01, s00, s01, s02, s03);
+                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb10, kb11, s10, s11, s12, s13);
+                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb20, kb21, s20, s21, s22, s23);
+                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb30, kb31, s30, s31, s32, s33);
+                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb40, kb41, s40, s41, s42, s43);
+                s40 = d0; s41 = d1; s42 = d2; s43 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb50, kb51, s50, s51, s52, s53);
+                s50 = d0; s51 = d1; s52 = d2; s53 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb60, kb61, s60, s61, s62, s63);
+                s60 = d0; s61 = d1; s62 = d2; s63 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, kb70, kb71, s70, s71, s72, s73);
+                s70 = d0; s71 = d1; s72 = d2; s73 = d3;
+                }
             }
 
             // online softmax in the log2 domain; keys >= Nk are masked
@@ -400,22 +592,22 @@ internal static class MmaAttention
             int kk6 = kb + 48 + 2 * t;
             int kk7 = kb + 56 + 2 * t;
             const float sc = 0.12751743082459868f;
-            float x00 = kk0 < Nk ? s00.Value * sc : -1e30f, x01 = kk0 + 1 < Nk ? s01.Value * sc : -1e30f;
-            float x02 = kk0 < Nk ? s02.Value * sc : -1e30f, x03 = kk0 + 1 < Nk ? s03.Value * sc : -1e30f;
-            float x10 = kk1 < Nk ? s10.Value * sc : -1e30f, x11 = kk1 + 1 < Nk ? s11.Value * sc : -1e30f;
-            float x12 = kk1 < Nk ? s12.Value * sc : -1e30f, x13 = kk1 + 1 < Nk ? s13.Value * sc : -1e30f;
-            float x20 = kk2 < Nk ? s20.Value * sc : -1e30f, x21 = kk2 + 1 < Nk ? s21.Value * sc : -1e30f;
-            float x22 = kk2 < Nk ? s22.Value * sc : -1e30f, x23 = kk2 + 1 < Nk ? s23.Value * sc : -1e30f;
-            float x30 = kk3 < Nk ? s30.Value * sc : -1e30f, x31 = kk3 + 1 < Nk ? s31.Value * sc : -1e30f;
-            float x32 = kk3 < Nk ? s32.Value * sc : -1e30f, x33 = kk3 + 1 < Nk ? s33.Value * sc : -1e30f;
-            float x40 = kk4 < Nk ? s40.Value * sc : -1e30f, x41 = kk4 + 1 < Nk ? s41.Value * sc : -1e30f;
-            float x42 = kk4 < Nk ? s42.Value * sc : -1e30f, x43 = kk4 + 1 < Nk ? s43.Value * sc : -1e30f;
-            float x50 = kk5 < Nk ? s50.Value * sc : -1e30f, x51 = kk5 + 1 < Nk ? s51.Value * sc : -1e30f;
-            float x52 = kk5 < Nk ? s52.Value * sc : -1e30f, x53 = kk5 + 1 < Nk ? s53.Value * sc : -1e30f;
-            float x60 = kk6 < Nk ? s60.Value * sc : -1e30f, x61 = kk6 + 1 < Nk ? s61.Value * sc : -1e30f;
-            float x62 = kk6 < Nk ? s62.Value * sc : -1e30f, x63 = kk6 + 1 < Nk ? s63.Value * sc : -1e30f;
-            float x70 = kk7 < Nk ? s70.Value * sc : -1e30f, x71 = kk7 + 1 < Nk ? s71.Value * sc : -1e30f;
-            float x72 = kk7 < Nk ? s72.Value * sc : -1e30f, x73 = kk7 + 1 < Nk ? s73.Value * sc : -1e30f;
+            float x00 = kk0 < Nk ? s00 * sc : -1e30f, x01 = kk0 + 1 < Nk ? s01 * sc : -1e30f;
+            float x02 = kk0 < Nk ? s02 * sc : -1e30f, x03 = kk0 + 1 < Nk ? s03 * sc : -1e30f;
+            float x10 = kk1 < Nk ? s10 * sc : -1e30f, x11 = kk1 + 1 < Nk ? s11 * sc : -1e30f;
+            float x12 = kk1 < Nk ? s12 * sc : -1e30f, x13 = kk1 + 1 < Nk ? s13 * sc : -1e30f;
+            float x20 = kk2 < Nk ? s20 * sc : -1e30f, x21 = kk2 + 1 < Nk ? s21 * sc : -1e30f;
+            float x22 = kk2 < Nk ? s22 * sc : -1e30f, x23 = kk2 + 1 < Nk ? s23 * sc : -1e30f;
+            float x30 = kk3 < Nk ? s30 * sc : -1e30f, x31 = kk3 + 1 < Nk ? s31 * sc : -1e30f;
+            float x32 = kk3 < Nk ? s32 * sc : -1e30f, x33 = kk3 + 1 < Nk ? s33 * sc : -1e30f;
+            float x40 = kk4 < Nk ? s40 * sc : -1e30f, x41 = kk4 + 1 < Nk ? s41 * sc : -1e30f;
+            float x42 = kk4 < Nk ? s42 * sc : -1e30f, x43 = kk4 + 1 < Nk ? s43 * sc : -1e30f;
+            float x50 = kk5 < Nk ? s50 * sc : -1e30f, x51 = kk5 + 1 < Nk ? s51 * sc : -1e30f;
+            float x52 = kk5 < Nk ? s52 * sc : -1e30f, x53 = kk5 + 1 < Nk ? s53 * sc : -1e30f;
+            float x60 = kk6 < Nk ? s60 * sc : -1e30f, x61 = kk6 + 1 < Nk ? s61 * sc : -1e30f;
+            float x62 = kk6 < Nk ? s62 * sc : -1e30f, x63 = kk6 + 1 < Nk ? s63 * sc : -1e30f;
+            float x70 = kk7 < Nk ? s70 * sc : -1e30f, x71 = kk7 + 1 < Nk ? s71 * sc : -1e30f;
+            float x72 = kk7 < Nk ? s72 * sc : -1e30f, x73 = kk7 + 1 < Nk ? s73 * sc : -1e30f;
             float mx0 = MathF.Max(MathF.Max(MathF.Max(x00, x01), MathF.Max(x10, x11)), MathF.Max(MathF.Max(x20, x21), MathF.Max(x30, x31)));
             mx0 = MathF.Max(mx0, MathF.Max(MathF.Max(MathF.Max(x40, x41), MathF.Max(x50, x51)), MathF.Max(MathF.Max(x60, x61), MathF.Max(x70, x71))));
             float mx1 = MathF.Max(MathF.Max(MathF.Max(x02, x03), MathF.Max(x12, x13)), MathF.Max(MathF.Max(x22, x23), MathF.Max(x32, x33)));
@@ -443,307 +635,499 @@ internal static class MmaAttention
             float p72 = MathF.Exp((x72 - mn1) * 0.6931471805599453f), p73 = MathF.Exp((x73 - mn1) * 0.6931471805599453f);
             l0 = l0 * al0 + (p00 + p01 + p10 + p11 + p20 + p21 + p30 + p31 + p40 + p41 + p50 + p51 + p60 + p61 + p70 + p71);
             l1 = l1 * al1 + (p02 + p03 + p12 + p13 + p22 + p23 + p32 + p33 + p42 + p43 + p52 + p53 + p62 + p63 + p72 + p73);
-            o00.Value *= al0; o01.Value *= al0; o02.Value *= al1; o03.Value *= al1;
-            o10.Value *= al0; o11.Value *= al0; o12.Value *= al1; o13.Value *= al1;
-            o20.Value *= al0; o21.Value *= al0; o22.Value *= al1; o23.Value *= al1;
-            o30.Value *= al0; o31.Value *= al0; o32.Value *= al1; o33.Value *= al1;
-            o40.Value *= al0; o41.Value *= al0; o42.Value *= al1; o43.Value *= al1;
-            o50.Value *= al0; o51.Value *= al0; o52.Value *= al1; o53.Value *= al1;
-            o60.Value *= al0; o61.Value *= al0; o62.Value *= al1; o63.Value *= al1;
-            o70.Value *= al0; o71.Value *= al0; o72.Value *= al1; o73.Value *= al1;
-            o80.Value *= al0; o81.Value *= al0; o82.Value *= al1; o83.Value *= al1;
-            o90.Value *= al0; o91.Value *= al0; o92.Value *= al1; o93.Value *= al1;
-            o100.Value *= al0; o101.Value *= al0; o102.Value *= al1; o103.Value *= al1;
-            o110.Value *= al0; o111.Value *= al0; o112.Value *= al1; o113.Value *= al1;
-            o120.Value *= al0; o121.Value *= al0; o122.Value *= al1; o123.Value *= al1;
-            o130.Value *= al0; o131.Value *= al0; o132.Value *= al1; o133.Value *= al1;
-            o140.Value *= al0; o141.Value *= al0; o142.Value *= al1; o143.Value *= al1;
-            o150.Value *= al0; o151.Value *= al0; o152.Value *= al1; o153.Value *= al1;
+            o00 *= al0; o01 *= al0; o02 *= al1; o03 *= al1;
+            o10 *= al0; o11 *= al0; o12 *= al1; o13 *= al1;
+            o20 *= al0; o21 *= al0; o22 *= al1; o23 *= al1;
+            o30 *= al0; o31 *= al0; o32 *= al1; o33 *= al1;
+            o40 *= al0; o41 *= al0; o42 *= al1; o43 *= al1;
+            o50 *= al0; o51 *= al0; o52 *= al1; o53 *= al1;
+            o60 *= al0; o61 *= al0; o62 *= al1; o63 *= al1;
+            o70 *= al0; o71 *= al0; o72 *= al1; o73 *= al1;
+            o80 *= al0; o81 *= al0; o82 *= al1; o83 *= al1;
+            o90 *= al0; o91 *= al0; o92 *= al1; o93 *= al1;
+            o100 *= al0; o101 *= al0; o102 *= al1; o103 *= al1;
+            o110 *= al0; o111 *= al0; o112 *= al1; o113 *= al1;
+            o120 *= al0; o121 *= al0; o122 *= al1; o123 *= al1;
+            o130 *= al0; o131 *= al0; o132 *= al1; o133 *= al1;
+            o140 *= al0; o141 *= al0; o142 *= al1; o143 *= al1;
+            o150 *= al0; o151 *= al0; o152 *= al1; o153 *= al1;
 
             // O += P V : the score C fragments are the P A-fragments (n-tiles 2s and 2s+1 form one k16 step)
             {
-                Input<uint> pa0 = Pack(p00, p01);
-                Input<uint> pa1 = Pack(p02, p03);
-                Input<uint> pa2 = Pack(p10, p11);
-                Input<uint> pa3 = Pack(p12, p13);
+                uint pa0 = Pack(p00, p01);
+                uint pa1 = Pack(p02, p03);
+                uint pa2 = Pack(p10, p11);
+                uint pa3 = Pack(p12, p13);
                 int vw = 0 + t;
-                Input<uint> vb00 = vt[(0 + g) * 36 + vw];
-                Input<uint> vb01 = vt[(0 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o00, ref o01, ref o02, ref o03, ref pa0, ref pa1, ref pa2, ref pa3, ref vb00, ref vb01);
-                Input<uint> vb10 = vt[(8 + g) * 36 + vw];
-                Input<uint> vb11 = vt[(8 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o10, ref o11, ref o12, ref o13, ref pa0, ref pa1, ref pa2, ref pa3, ref vb10, ref vb11);
-                Input<uint> vb20 = vt[(16 + g) * 36 + vw];
-                Input<uint> vb21 = vt[(16 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o20, ref o21, ref o22, ref o23, ref pa0, ref pa1, ref pa2, ref pa3, ref vb20, ref vb21);
-                Input<uint> vb30 = vt[(24 + g) * 36 + vw];
-                Input<uint> vb31 = vt[(24 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o30, ref o31, ref o32, ref o33, ref pa0, ref pa1, ref pa2, ref pa3, ref vb30, ref vb31);
-                Input<uint> vb40 = vt[(32 + g) * 36 + vw];
-                Input<uint> vb41 = vt[(32 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o40, ref o41, ref o42, ref o43, ref pa0, ref pa1, ref pa2, ref pa3, ref vb40, ref vb41);
-                Input<uint> vb50 = vt[(40 + g) * 36 + vw];
-                Input<uint> vb51 = vt[(40 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o50, ref o51, ref o52, ref o53, ref pa0, ref pa1, ref pa2, ref pa3, ref vb50, ref vb51);
-                Input<uint> vb60 = vt[(48 + g) * 36 + vw];
-                Input<uint> vb61 = vt[(48 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o60, ref o61, ref o62, ref o63, ref pa0, ref pa1, ref pa2, ref pa3, ref vb60, ref vb61);
-                Input<uint> vb70 = vt[(56 + g) * 36 + vw];
-                Input<uint> vb71 = vt[(56 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o70, ref o71, ref o72, ref o73, ref pa0, ref pa1, ref pa2, ref pa3, ref vb70, ref vb71);
-                Input<uint> vb80 = vt[(64 + g) * 36 + vw];
-                Input<uint> vb81 = vt[(64 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o80, ref o81, ref o82, ref o83, ref pa0, ref pa1, ref pa2, ref pa3, ref vb80, ref vb81);
-                Input<uint> vb90 = vt[(72 + g) * 36 + vw];
-                Input<uint> vb91 = vt[(72 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o90, ref o91, ref o92, ref o93, ref pa0, ref pa1, ref pa2, ref pa3, ref vb90, ref vb91);
-                Input<uint> vb100 = vt[(80 + g) * 36 + vw];
-                Input<uint> vb101 = vt[(80 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o100, ref o101, ref o102, ref o103, ref pa0, ref pa1, ref pa2, ref pa3, ref vb100, ref vb101);
-                Input<uint> vb110 = vt[(88 + g) * 36 + vw];
-                Input<uint> vb111 = vt[(88 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o110, ref o111, ref o112, ref o113, ref pa0, ref pa1, ref pa2, ref pa3, ref vb110, ref vb111);
-                Input<uint> vb120 = vt[(96 + g) * 36 + vw];
-                Input<uint> vb121 = vt[(96 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o120, ref o121, ref o122, ref o123, ref pa0, ref pa1, ref pa2, ref pa3, ref vb120, ref vb121);
-                Input<uint> vb130 = vt[(104 + g) * 36 + vw];
-                Input<uint> vb131 = vt[(104 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o130, ref o131, ref o132, ref o133, ref pa0, ref pa1, ref pa2, ref pa3, ref vb130, ref vb131);
-                Input<uint> vb140 = vt[(112 + g) * 36 + vw];
-                Input<uint> vb141 = vt[(112 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o140, ref o141, ref o142, ref o143, ref pa0, ref pa1, ref pa2, ref pa3, ref vb140, ref vb141);
-                Input<uint> vb150 = vt[(120 + g) * 36 + vw];
-                Input<uint> vb151 = vt[(120 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o150, ref o151, ref o152, ref o153, ref pa0, ref pa1, ref pa2, ref pa3, ref vb150, ref vb151);
+                uint vb00 = vt[(0 + g) * 36 + vw];
+                uint vb01 = vt[(0 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb00, vb01, o00, o01, o02, o03);
+                o00 = d0; o01 = d1; o02 = d2; o03 = d3;
+                }
+                uint vb10 = vt[(8 + g) * 36 + vw];
+                uint vb11 = vt[(8 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb10, vb11, o10, o11, o12, o13);
+                o10 = d0; o11 = d1; o12 = d2; o13 = d3;
+                }
+                uint vb20 = vt[(16 + g) * 36 + vw];
+                uint vb21 = vt[(16 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb20, vb21, o20, o21, o22, o23);
+                o20 = d0; o21 = d1; o22 = d2; o23 = d3;
+                }
+                uint vb30 = vt[(24 + g) * 36 + vw];
+                uint vb31 = vt[(24 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb30, vb31, o30, o31, o32, o33);
+                o30 = d0; o31 = d1; o32 = d2; o33 = d3;
+                }
+                uint vb40 = vt[(32 + g) * 36 + vw];
+                uint vb41 = vt[(32 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb40, vb41, o40, o41, o42, o43);
+                o40 = d0; o41 = d1; o42 = d2; o43 = d3;
+                }
+                uint vb50 = vt[(40 + g) * 36 + vw];
+                uint vb51 = vt[(40 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb50, vb51, o50, o51, o52, o53);
+                o50 = d0; o51 = d1; o52 = d2; o53 = d3;
+                }
+                uint vb60 = vt[(48 + g) * 36 + vw];
+                uint vb61 = vt[(48 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb60, vb61, o60, o61, o62, o63);
+                o60 = d0; o61 = d1; o62 = d2; o63 = d3;
+                }
+                uint vb70 = vt[(56 + g) * 36 + vw];
+                uint vb71 = vt[(56 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb70, vb71, o70, o71, o72, o73);
+                o70 = d0; o71 = d1; o72 = d2; o73 = d3;
+                }
+                uint vb80 = vt[(64 + g) * 36 + vw];
+                uint vb81 = vt[(64 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb80, vb81, o80, o81, o82, o83);
+                o80 = d0; o81 = d1; o82 = d2; o83 = d3;
+                }
+                uint vb90 = vt[(72 + g) * 36 + vw];
+                uint vb91 = vt[(72 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb90, vb91, o90, o91, o92, o93);
+                o90 = d0; o91 = d1; o92 = d2; o93 = d3;
+                }
+                uint vb100 = vt[(80 + g) * 36 + vw];
+                uint vb101 = vt[(80 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb100, vb101, o100, o101, o102, o103);
+                o100 = d0; o101 = d1; o102 = d2; o103 = d3;
+                }
+                uint vb110 = vt[(88 + g) * 36 + vw];
+                uint vb111 = vt[(88 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb110, vb111, o110, o111, o112, o113);
+                o110 = d0; o111 = d1; o112 = d2; o113 = d3;
+                }
+                uint vb120 = vt[(96 + g) * 36 + vw];
+                uint vb121 = vt[(96 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb120, vb121, o120, o121, o122, o123);
+                o120 = d0; o121 = d1; o122 = d2; o123 = d3;
+                }
+                uint vb130 = vt[(104 + g) * 36 + vw];
+                uint vb131 = vt[(104 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb130, vb131, o130, o131, o132, o133);
+                o130 = d0; o131 = d1; o132 = d2; o133 = d3;
+                }
+                uint vb140 = vt[(112 + g) * 36 + vw];
+                uint vb141 = vt[(112 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb140, vb141, o140, o141, o142, o143);
+                o140 = d0; o141 = d1; o142 = d2; o143 = d3;
+                }
+                uint vb150 = vt[(120 + g) * 36 + vw];
+                uint vb151 = vt[(120 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb150, vb151, o150, o151, o152, o153);
+                o150 = d0; o151 = d1; o152 = d2; o153 = d3;
+                }
             }
             {
-                Input<uint> pa0 = Pack(p20, p21);
-                Input<uint> pa1 = Pack(p22, p23);
-                Input<uint> pa2 = Pack(p30, p31);
-                Input<uint> pa3 = Pack(p32, p33);
+                uint pa0 = Pack(p20, p21);
+                uint pa1 = Pack(p22, p23);
+                uint pa2 = Pack(p30, p31);
+                uint pa3 = Pack(p32, p33);
                 int vw = 8 + t;
-                Input<uint> vb00 = vt[(0 + g) * 36 + vw];
-                Input<uint> vb01 = vt[(0 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o00, ref o01, ref o02, ref o03, ref pa0, ref pa1, ref pa2, ref pa3, ref vb00, ref vb01);
-                Input<uint> vb10 = vt[(8 + g) * 36 + vw];
-                Input<uint> vb11 = vt[(8 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o10, ref o11, ref o12, ref o13, ref pa0, ref pa1, ref pa2, ref pa3, ref vb10, ref vb11);
-                Input<uint> vb20 = vt[(16 + g) * 36 + vw];
-                Input<uint> vb21 = vt[(16 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o20, ref o21, ref o22, ref o23, ref pa0, ref pa1, ref pa2, ref pa3, ref vb20, ref vb21);
-                Input<uint> vb30 = vt[(24 + g) * 36 + vw];
-                Input<uint> vb31 = vt[(24 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o30, ref o31, ref o32, ref o33, ref pa0, ref pa1, ref pa2, ref pa3, ref vb30, ref vb31);
-                Input<uint> vb40 = vt[(32 + g) * 36 + vw];
-                Input<uint> vb41 = vt[(32 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o40, ref o41, ref o42, ref o43, ref pa0, ref pa1, ref pa2, ref pa3, ref vb40, ref vb41);
-                Input<uint> vb50 = vt[(40 + g) * 36 + vw];
-                Input<uint> vb51 = vt[(40 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o50, ref o51, ref o52, ref o53, ref pa0, ref pa1, ref pa2, ref pa3, ref vb50, ref vb51);
-                Input<uint> vb60 = vt[(48 + g) * 36 + vw];
-                Input<uint> vb61 = vt[(48 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o60, ref o61, ref o62, ref o63, ref pa0, ref pa1, ref pa2, ref pa3, ref vb60, ref vb61);
-                Input<uint> vb70 = vt[(56 + g) * 36 + vw];
-                Input<uint> vb71 = vt[(56 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o70, ref o71, ref o72, ref o73, ref pa0, ref pa1, ref pa2, ref pa3, ref vb70, ref vb71);
-                Input<uint> vb80 = vt[(64 + g) * 36 + vw];
-                Input<uint> vb81 = vt[(64 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o80, ref o81, ref o82, ref o83, ref pa0, ref pa1, ref pa2, ref pa3, ref vb80, ref vb81);
-                Input<uint> vb90 = vt[(72 + g) * 36 + vw];
-                Input<uint> vb91 = vt[(72 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o90, ref o91, ref o92, ref o93, ref pa0, ref pa1, ref pa2, ref pa3, ref vb90, ref vb91);
-                Input<uint> vb100 = vt[(80 + g) * 36 + vw];
-                Input<uint> vb101 = vt[(80 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o100, ref o101, ref o102, ref o103, ref pa0, ref pa1, ref pa2, ref pa3, ref vb100, ref vb101);
-                Input<uint> vb110 = vt[(88 + g) * 36 + vw];
-                Input<uint> vb111 = vt[(88 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o110, ref o111, ref o112, ref o113, ref pa0, ref pa1, ref pa2, ref pa3, ref vb110, ref vb111);
-                Input<uint> vb120 = vt[(96 + g) * 36 + vw];
-                Input<uint> vb121 = vt[(96 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o120, ref o121, ref o122, ref o123, ref pa0, ref pa1, ref pa2, ref pa3, ref vb120, ref vb121);
-                Input<uint> vb130 = vt[(104 + g) * 36 + vw];
-                Input<uint> vb131 = vt[(104 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o130, ref o131, ref o132, ref o133, ref pa0, ref pa1, ref pa2, ref pa3, ref vb130, ref vb131);
-                Input<uint> vb140 = vt[(112 + g) * 36 + vw];
-                Input<uint> vb141 = vt[(112 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o140, ref o141, ref o142, ref o143, ref pa0, ref pa1, ref pa2, ref pa3, ref vb140, ref vb141);
-                Input<uint> vb150 = vt[(120 + g) * 36 + vw];
-                Input<uint> vb151 = vt[(120 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o150, ref o151, ref o152, ref o153, ref pa0, ref pa1, ref pa2, ref pa3, ref vb150, ref vb151);
+                uint vb00 = vt[(0 + g) * 36 + vw];
+                uint vb01 = vt[(0 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb00, vb01, o00, o01, o02, o03);
+                o00 = d0; o01 = d1; o02 = d2; o03 = d3;
+                }
+                uint vb10 = vt[(8 + g) * 36 + vw];
+                uint vb11 = vt[(8 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb10, vb11, o10, o11, o12, o13);
+                o10 = d0; o11 = d1; o12 = d2; o13 = d3;
+                }
+                uint vb20 = vt[(16 + g) * 36 + vw];
+                uint vb21 = vt[(16 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb20, vb21, o20, o21, o22, o23);
+                o20 = d0; o21 = d1; o22 = d2; o23 = d3;
+                }
+                uint vb30 = vt[(24 + g) * 36 + vw];
+                uint vb31 = vt[(24 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb30, vb31, o30, o31, o32, o33);
+                o30 = d0; o31 = d1; o32 = d2; o33 = d3;
+                }
+                uint vb40 = vt[(32 + g) * 36 + vw];
+                uint vb41 = vt[(32 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb40, vb41, o40, o41, o42, o43);
+                o40 = d0; o41 = d1; o42 = d2; o43 = d3;
+                }
+                uint vb50 = vt[(40 + g) * 36 + vw];
+                uint vb51 = vt[(40 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb50, vb51, o50, o51, o52, o53);
+                o50 = d0; o51 = d1; o52 = d2; o53 = d3;
+                }
+                uint vb60 = vt[(48 + g) * 36 + vw];
+                uint vb61 = vt[(48 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb60, vb61, o60, o61, o62, o63);
+                o60 = d0; o61 = d1; o62 = d2; o63 = d3;
+                }
+                uint vb70 = vt[(56 + g) * 36 + vw];
+                uint vb71 = vt[(56 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb70, vb71, o70, o71, o72, o73);
+                o70 = d0; o71 = d1; o72 = d2; o73 = d3;
+                }
+                uint vb80 = vt[(64 + g) * 36 + vw];
+                uint vb81 = vt[(64 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb80, vb81, o80, o81, o82, o83);
+                o80 = d0; o81 = d1; o82 = d2; o83 = d3;
+                }
+                uint vb90 = vt[(72 + g) * 36 + vw];
+                uint vb91 = vt[(72 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb90, vb91, o90, o91, o92, o93);
+                o90 = d0; o91 = d1; o92 = d2; o93 = d3;
+                }
+                uint vb100 = vt[(80 + g) * 36 + vw];
+                uint vb101 = vt[(80 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb100, vb101, o100, o101, o102, o103);
+                o100 = d0; o101 = d1; o102 = d2; o103 = d3;
+                }
+                uint vb110 = vt[(88 + g) * 36 + vw];
+                uint vb111 = vt[(88 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb110, vb111, o110, o111, o112, o113);
+                o110 = d0; o111 = d1; o112 = d2; o113 = d3;
+                }
+                uint vb120 = vt[(96 + g) * 36 + vw];
+                uint vb121 = vt[(96 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb120, vb121, o120, o121, o122, o123);
+                o120 = d0; o121 = d1; o122 = d2; o123 = d3;
+                }
+                uint vb130 = vt[(104 + g) * 36 + vw];
+                uint vb131 = vt[(104 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb130, vb131, o130, o131, o132, o133);
+                o130 = d0; o131 = d1; o132 = d2; o133 = d3;
+                }
+                uint vb140 = vt[(112 + g) * 36 + vw];
+                uint vb141 = vt[(112 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb140, vb141, o140, o141, o142, o143);
+                o140 = d0; o141 = d1; o142 = d2; o143 = d3;
+                }
+                uint vb150 = vt[(120 + g) * 36 + vw];
+                uint vb151 = vt[(120 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb150, vb151, o150, o151, o152, o153);
+                o150 = d0; o151 = d1; o152 = d2; o153 = d3;
+                }
             }
             {
-                Input<uint> pa0 = Pack(p40, p41);
-                Input<uint> pa1 = Pack(p42, p43);
-                Input<uint> pa2 = Pack(p50, p51);
-                Input<uint> pa3 = Pack(p52, p53);
+                uint pa0 = Pack(p40, p41);
+                uint pa1 = Pack(p42, p43);
+                uint pa2 = Pack(p50, p51);
+                uint pa3 = Pack(p52, p53);
                 int vw = 16 + t;
-                Input<uint> vb00 = vt[(0 + g) * 36 + vw];
-                Input<uint> vb01 = vt[(0 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o00, ref o01, ref o02, ref o03, ref pa0, ref pa1, ref pa2, ref pa3, ref vb00, ref vb01);
-                Input<uint> vb10 = vt[(8 + g) * 36 + vw];
-                Input<uint> vb11 = vt[(8 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o10, ref o11, ref o12, ref o13, ref pa0, ref pa1, ref pa2, ref pa3, ref vb10, ref vb11);
-                Input<uint> vb20 = vt[(16 + g) * 36 + vw];
-                Input<uint> vb21 = vt[(16 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o20, ref o21, ref o22, ref o23, ref pa0, ref pa1, ref pa2, ref pa3, ref vb20, ref vb21);
-                Input<uint> vb30 = vt[(24 + g) * 36 + vw];
-                Input<uint> vb31 = vt[(24 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o30, ref o31, ref o32, ref o33, ref pa0, ref pa1, ref pa2, ref pa3, ref vb30, ref vb31);
-                Input<uint> vb40 = vt[(32 + g) * 36 + vw];
-                Input<uint> vb41 = vt[(32 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o40, ref o41, ref o42, ref o43, ref pa0, ref pa1, ref pa2, ref pa3, ref vb40, ref vb41);
-                Input<uint> vb50 = vt[(40 + g) * 36 + vw];
-                Input<uint> vb51 = vt[(40 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o50, ref o51, ref o52, ref o53, ref pa0, ref pa1, ref pa2, ref pa3, ref vb50, ref vb51);
-                Input<uint> vb60 = vt[(48 + g) * 36 + vw];
-                Input<uint> vb61 = vt[(48 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o60, ref o61, ref o62, ref o63, ref pa0, ref pa1, ref pa2, ref pa3, ref vb60, ref vb61);
-                Input<uint> vb70 = vt[(56 + g) * 36 + vw];
-                Input<uint> vb71 = vt[(56 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o70, ref o71, ref o72, ref o73, ref pa0, ref pa1, ref pa2, ref pa3, ref vb70, ref vb71);
-                Input<uint> vb80 = vt[(64 + g) * 36 + vw];
-                Input<uint> vb81 = vt[(64 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o80, ref o81, ref o82, ref o83, ref pa0, ref pa1, ref pa2, ref pa3, ref vb80, ref vb81);
-                Input<uint> vb90 = vt[(72 + g) * 36 + vw];
-                Input<uint> vb91 = vt[(72 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o90, ref o91, ref o92, ref o93, ref pa0, ref pa1, ref pa2, ref pa3, ref vb90, ref vb91);
-                Input<uint> vb100 = vt[(80 + g) * 36 + vw];
-                Input<uint> vb101 = vt[(80 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o100, ref o101, ref o102, ref o103, ref pa0, ref pa1, ref pa2, ref pa3, ref vb100, ref vb101);
-                Input<uint> vb110 = vt[(88 + g) * 36 + vw];
-                Input<uint> vb111 = vt[(88 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o110, ref o111, ref o112, ref o113, ref pa0, ref pa1, ref pa2, ref pa3, ref vb110, ref vb111);
-                Input<uint> vb120 = vt[(96 + g) * 36 + vw];
-                Input<uint> vb121 = vt[(96 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o120, ref o121, ref o122, ref o123, ref pa0, ref pa1, ref pa2, ref pa3, ref vb120, ref vb121);
-                Input<uint> vb130 = vt[(104 + g) * 36 + vw];
-                Input<uint> vb131 = vt[(104 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o130, ref o131, ref o132, ref o133, ref pa0, ref pa1, ref pa2, ref pa3, ref vb130, ref vb131);
-                Input<uint> vb140 = vt[(112 + g) * 36 + vw];
-                Input<uint> vb141 = vt[(112 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o140, ref o141, ref o142, ref o143, ref pa0, ref pa1, ref pa2, ref pa3, ref vb140, ref vb141);
-                Input<uint> vb150 = vt[(120 + g) * 36 + vw];
-                Input<uint> vb151 = vt[(120 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o150, ref o151, ref o152, ref o153, ref pa0, ref pa1, ref pa2, ref pa3, ref vb150, ref vb151);
+                uint vb00 = vt[(0 + g) * 36 + vw];
+                uint vb01 = vt[(0 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb00, vb01, o00, o01, o02, o03);
+                o00 = d0; o01 = d1; o02 = d2; o03 = d3;
+                }
+                uint vb10 = vt[(8 + g) * 36 + vw];
+                uint vb11 = vt[(8 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb10, vb11, o10, o11, o12, o13);
+                o10 = d0; o11 = d1; o12 = d2; o13 = d3;
+                }
+                uint vb20 = vt[(16 + g) * 36 + vw];
+                uint vb21 = vt[(16 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb20, vb21, o20, o21, o22, o23);
+                o20 = d0; o21 = d1; o22 = d2; o23 = d3;
+                }
+                uint vb30 = vt[(24 + g) * 36 + vw];
+                uint vb31 = vt[(24 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb30, vb31, o30, o31, o32, o33);
+                o30 = d0; o31 = d1; o32 = d2; o33 = d3;
+                }
+                uint vb40 = vt[(32 + g) * 36 + vw];
+                uint vb41 = vt[(32 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb40, vb41, o40, o41, o42, o43);
+                o40 = d0; o41 = d1; o42 = d2; o43 = d3;
+                }
+                uint vb50 = vt[(40 + g) * 36 + vw];
+                uint vb51 = vt[(40 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb50, vb51, o50, o51, o52, o53);
+                o50 = d0; o51 = d1; o52 = d2; o53 = d3;
+                }
+                uint vb60 = vt[(48 + g) * 36 + vw];
+                uint vb61 = vt[(48 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb60, vb61, o60, o61, o62, o63);
+                o60 = d0; o61 = d1; o62 = d2; o63 = d3;
+                }
+                uint vb70 = vt[(56 + g) * 36 + vw];
+                uint vb71 = vt[(56 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb70, vb71, o70, o71, o72, o73);
+                o70 = d0; o71 = d1; o72 = d2; o73 = d3;
+                }
+                uint vb80 = vt[(64 + g) * 36 + vw];
+                uint vb81 = vt[(64 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb80, vb81, o80, o81, o82, o83);
+                o80 = d0; o81 = d1; o82 = d2; o83 = d3;
+                }
+                uint vb90 = vt[(72 + g) * 36 + vw];
+                uint vb91 = vt[(72 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb90, vb91, o90, o91, o92, o93);
+                o90 = d0; o91 = d1; o92 = d2; o93 = d3;
+                }
+                uint vb100 = vt[(80 + g) * 36 + vw];
+                uint vb101 = vt[(80 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb100, vb101, o100, o101, o102, o103);
+                o100 = d0; o101 = d1; o102 = d2; o103 = d3;
+                }
+                uint vb110 = vt[(88 + g) * 36 + vw];
+                uint vb111 = vt[(88 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb110, vb111, o110, o111, o112, o113);
+                o110 = d0; o111 = d1; o112 = d2; o113 = d3;
+                }
+                uint vb120 = vt[(96 + g) * 36 + vw];
+                uint vb121 = vt[(96 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb120, vb121, o120, o121, o122, o123);
+                o120 = d0; o121 = d1; o122 = d2; o123 = d3;
+                }
+                uint vb130 = vt[(104 + g) * 36 + vw];
+                uint vb131 = vt[(104 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb130, vb131, o130, o131, o132, o133);
+                o130 = d0; o131 = d1; o132 = d2; o133 = d3;
+                }
+                uint vb140 = vt[(112 + g) * 36 + vw];
+                uint vb141 = vt[(112 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb140, vb141, o140, o141, o142, o143);
+                o140 = d0; o141 = d1; o142 = d2; o143 = d3;
+                }
+                uint vb150 = vt[(120 + g) * 36 + vw];
+                uint vb151 = vt[(120 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb150, vb151, o150, o151, o152, o153);
+                o150 = d0; o151 = d1; o152 = d2; o153 = d3;
+                }
             }
             {
-                Input<uint> pa0 = Pack(p60, p61);
-                Input<uint> pa1 = Pack(p62, p63);
-                Input<uint> pa2 = Pack(p70, p71);
-                Input<uint> pa3 = Pack(p72, p73);
+                uint pa0 = Pack(p60, p61);
+                uint pa1 = Pack(p62, p63);
+                uint pa2 = Pack(p70, p71);
+                uint pa3 = Pack(p72, p73);
                 int vw = 24 + t;
-                Input<uint> vb00 = vt[(0 + g) * 36 + vw];
-                Input<uint> vb01 = vt[(0 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o00, ref o01, ref o02, ref o03, ref pa0, ref pa1, ref pa2, ref pa3, ref vb00, ref vb01);
-                Input<uint> vb10 = vt[(8 + g) * 36 + vw];
-                Input<uint> vb11 = vt[(8 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o10, ref o11, ref o12, ref o13, ref pa0, ref pa1, ref pa2, ref pa3, ref vb10, ref vb11);
-                Input<uint> vb20 = vt[(16 + g) * 36 + vw];
-                Input<uint> vb21 = vt[(16 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o20, ref o21, ref o22, ref o23, ref pa0, ref pa1, ref pa2, ref pa3, ref vb20, ref vb21);
-                Input<uint> vb30 = vt[(24 + g) * 36 + vw];
-                Input<uint> vb31 = vt[(24 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o30, ref o31, ref o32, ref o33, ref pa0, ref pa1, ref pa2, ref pa3, ref vb30, ref vb31);
-                Input<uint> vb40 = vt[(32 + g) * 36 + vw];
-                Input<uint> vb41 = vt[(32 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o40, ref o41, ref o42, ref o43, ref pa0, ref pa1, ref pa2, ref pa3, ref vb40, ref vb41);
-                Input<uint> vb50 = vt[(40 + g) * 36 + vw];
-                Input<uint> vb51 = vt[(40 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o50, ref o51, ref o52, ref o53, ref pa0, ref pa1, ref pa2, ref pa3, ref vb50, ref vb51);
-                Input<uint> vb60 = vt[(48 + g) * 36 + vw];
-                Input<uint> vb61 = vt[(48 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o60, ref o61, ref o62, ref o63, ref pa0, ref pa1, ref pa2, ref pa3, ref vb60, ref vb61);
-                Input<uint> vb70 = vt[(56 + g) * 36 + vw];
-                Input<uint> vb71 = vt[(56 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o70, ref o71, ref o72, ref o73, ref pa0, ref pa1, ref pa2, ref pa3, ref vb70, ref vb71);
-                Input<uint> vb80 = vt[(64 + g) * 36 + vw];
-                Input<uint> vb81 = vt[(64 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o80, ref o81, ref o82, ref o83, ref pa0, ref pa1, ref pa2, ref pa3, ref vb80, ref vb81);
-                Input<uint> vb90 = vt[(72 + g) * 36 + vw];
-                Input<uint> vb91 = vt[(72 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o90, ref o91, ref o92, ref o93, ref pa0, ref pa1, ref pa2, ref pa3, ref vb90, ref vb91);
-                Input<uint> vb100 = vt[(80 + g) * 36 + vw];
-                Input<uint> vb101 = vt[(80 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o100, ref o101, ref o102, ref o103, ref pa0, ref pa1, ref pa2, ref pa3, ref vb100, ref vb101);
-                Input<uint> vb110 = vt[(88 + g) * 36 + vw];
-                Input<uint> vb111 = vt[(88 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o110, ref o111, ref o112, ref o113, ref pa0, ref pa1, ref pa2, ref pa3, ref vb110, ref vb111);
-                Input<uint> vb120 = vt[(96 + g) * 36 + vw];
-                Input<uint> vb121 = vt[(96 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o120, ref o121, ref o122, ref o123, ref pa0, ref pa1, ref pa2, ref pa3, ref vb120, ref vb121);
-                Input<uint> vb130 = vt[(104 + g) * 36 + vw];
-                Input<uint> vb131 = vt[(104 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o130, ref o131, ref o132, ref o133, ref pa0, ref pa1, ref pa2, ref pa3, ref vb130, ref vb131);
-                Input<uint> vb140 = vt[(112 + g) * 36 + vw];
-                Input<uint> vb141 = vt[(112 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o140, ref o141, ref o142, ref o143, ref pa0, ref pa1, ref pa2, ref pa3, ref vb140, ref vb141);
-                Input<uint> vb150 = vt[(120 + g) * 36 + vw];
-                Input<uint> vb151 = vt[(120 + g) * 36 + vw + 4];
-                CudaAsm.EmitRef("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
-                    ref o150, ref o151, ref o152, ref o153, ref pa0, ref pa1, ref pa2, ref pa3, ref vb150, ref vb151);
+                uint vb00 = vt[(0 + g) * 36 + vw];
+                uint vb01 = vt[(0 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb00, vb01, o00, o01, o02, o03);
+                o00 = d0; o01 = d1; o02 = d2; o03 = d3;
+                }
+                uint vb10 = vt[(8 + g) * 36 + vw];
+                uint vb11 = vt[(8 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb10, vb11, o10, o11, o12, o13);
+                o10 = d0; o11 = d1; o12 = d2; o13 = d3;
+                }
+                uint vb20 = vt[(16 + g) * 36 + vw];
+                uint vb21 = vt[(16 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb20, vb21, o20, o21, o22, o23);
+                o20 = d0; o21 = d1; o22 = d2; o23 = d3;
+                }
+                uint vb30 = vt[(24 + g) * 36 + vw];
+                uint vb31 = vt[(24 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb30, vb31, o30, o31, o32, o33);
+                o30 = d0; o31 = d1; o32 = d2; o33 = d3;
+                }
+                uint vb40 = vt[(32 + g) * 36 + vw];
+                uint vb41 = vt[(32 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb40, vb41, o40, o41, o42, o43);
+                o40 = d0; o41 = d1; o42 = d2; o43 = d3;
+                }
+                uint vb50 = vt[(40 + g) * 36 + vw];
+                uint vb51 = vt[(40 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb50, vb51, o50, o51, o52, o53);
+                o50 = d0; o51 = d1; o52 = d2; o53 = d3;
+                }
+                uint vb60 = vt[(48 + g) * 36 + vw];
+                uint vb61 = vt[(48 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb60, vb61, o60, o61, o62, o63);
+                o60 = d0; o61 = d1; o62 = d2; o63 = d3;
+                }
+                uint vb70 = vt[(56 + g) * 36 + vw];
+                uint vb71 = vt[(56 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb70, vb71, o70, o71, o72, o73);
+                o70 = d0; o71 = d1; o72 = d2; o73 = d3;
+                }
+                uint vb80 = vt[(64 + g) * 36 + vw];
+                uint vb81 = vt[(64 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb80, vb81, o80, o81, o82, o83);
+                o80 = d0; o81 = d1; o82 = d2; o83 = d3;
+                }
+                uint vb90 = vt[(72 + g) * 36 + vw];
+                uint vb91 = vt[(72 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb90, vb91, o90, o91, o92, o93);
+                o90 = d0; o91 = d1; o92 = d2; o93 = d3;
+                }
+                uint vb100 = vt[(80 + g) * 36 + vw];
+                uint vb101 = vt[(80 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb100, vb101, o100, o101, o102, o103);
+                o100 = d0; o101 = d1; o102 = d2; o103 = d3;
+                }
+                uint vb110 = vt[(88 + g) * 36 + vw];
+                uint vb111 = vt[(88 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb110, vb111, o110, o111, o112, o113);
+                o110 = d0; o111 = d1; o112 = d2; o113 = d3;
+                }
+                uint vb120 = vt[(96 + g) * 36 + vw];
+                uint vb121 = vt[(96 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb120, vb121, o120, o121, o122, o123);
+                o120 = d0; o121 = d1; o122 = d2; o123 = d3;
+                }
+                uint vb130 = vt[(104 + g) * 36 + vw];
+                uint vb131 = vt[(104 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb130, vb131, o130, o131, o132, o133);
+                o130 = d0; o131 = d1; o132 = d2; o133 = d3;
+                }
+                uint vb140 = vt[(112 + g) * 36 + vw];
+                uint vb141 = vt[(112 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb140, vb141, o140, o141, o142, o143);
+                o140 = d0; o141 = d1; o142 = d2; o143 = d3;
+                }
+                uint vb150 = vt[(120 + g) * 36 + vw];
+                uint vb151 = vt[(120 + g) * 36 + vw + 4];
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, pa0, pa1, pa2, pa3, vb150, vb151, o150, o151, o152, o153);
+                o150 = d0; o151 = d1; o152 = d2; o153 = d3;
+                }
             }
             Group.Barrier();
         }
@@ -752,37 +1136,37 @@ internal static class MmaAttention
         l1 += Warp.ShuffleXor(l1, 1); l1 += Warp.ShuffleXor(l1, 2);
         float inv0 = 1f / l0, inv1 = 1f / l1;
         long ob0 = (long)row0 * H * 128 + h * 128, ob1 = (long)row1 * H * 128 + h * 128;
-        if (r0ok) { O[ob0 + 0 + 2 * t] = o00.Value * inv0; O[ob0 + 0 + 2 * t + 1] = o01.Value * inv0; }
-        if (r1ok) { O[ob1 + 0 + 2 * t] = o02.Value * inv1; O[ob1 + 0 + 2 * t + 1] = o03.Value * inv1; }
-        if (r0ok) { O[ob0 + 8 + 2 * t] = o10.Value * inv0; O[ob0 + 8 + 2 * t + 1] = o11.Value * inv0; }
-        if (r1ok) { O[ob1 + 8 + 2 * t] = o12.Value * inv1; O[ob1 + 8 + 2 * t + 1] = o13.Value * inv1; }
-        if (r0ok) { O[ob0 + 16 + 2 * t] = o20.Value * inv0; O[ob0 + 16 + 2 * t + 1] = o21.Value * inv0; }
-        if (r1ok) { O[ob1 + 16 + 2 * t] = o22.Value * inv1; O[ob1 + 16 + 2 * t + 1] = o23.Value * inv1; }
-        if (r0ok) { O[ob0 + 24 + 2 * t] = o30.Value * inv0; O[ob0 + 24 + 2 * t + 1] = o31.Value * inv0; }
-        if (r1ok) { O[ob1 + 24 + 2 * t] = o32.Value * inv1; O[ob1 + 24 + 2 * t + 1] = o33.Value * inv1; }
-        if (r0ok) { O[ob0 + 32 + 2 * t] = o40.Value * inv0; O[ob0 + 32 + 2 * t + 1] = o41.Value * inv0; }
-        if (r1ok) { O[ob1 + 32 + 2 * t] = o42.Value * inv1; O[ob1 + 32 + 2 * t + 1] = o43.Value * inv1; }
-        if (r0ok) { O[ob0 + 40 + 2 * t] = o50.Value * inv0; O[ob0 + 40 + 2 * t + 1] = o51.Value * inv0; }
-        if (r1ok) { O[ob1 + 40 + 2 * t] = o52.Value * inv1; O[ob1 + 40 + 2 * t + 1] = o53.Value * inv1; }
-        if (r0ok) { O[ob0 + 48 + 2 * t] = o60.Value * inv0; O[ob0 + 48 + 2 * t + 1] = o61.Value * inv0; }
-        if (r1ok) { O[ob1 + 48 + 2 * t] = o62.Value * inv1; O[ob1 + 48 + 2 * t + 1] = o63.Value * inv1; }
-        if (r0ok) { O[ob0 + 56 + 2 * t] = o70.Value * inv0; O[ob0 + 56 + 2 * t + 1] = o71.Value * inv0; }
-        if (r1ok) { O[ob1 + 56 + 2 * t] = o72.Value * inv1; O[ob1 + 56 + 2 * t + 1] = o73.Value * inv1; }
-        if (r0ok) { O[ob0 + 64 + 2 * t] = o80.Value * inv0; O[ob0 + 64 + 2 * t + 1] = o81.Value * inv0; }
-        if (r1ok) { O[ob1 + 64 + 2 * t] = o82.Value * inv1; O[ob1 + 64 + 2 * t + 1] = o83.Value * inv1; }
-        if (r0ok) { O[ob0 + 72 + 2 * t] = o90.Value * inv0; O[ob0 + 72 + 2 * t + 1] = o91.Value * inv0; }
-        if (r1ok) { O[ob1 + 72 + 2 * t] = o92.Value * inv1; O[ob1 + 72 + 2 * t + 1] = o93.Value * inv1; }
-        if (r0ok) { O[ob0 + 80 + 2 * t] = o100.Value * inv0; O[ob0 + 80 + 2 * t + 1] = o101.Value * inv0; }
-        if (r1ok) { O[ob1 + 80 + 2 * t] = o102.Value * inv1; O[ob1 + 80 + 2 * t + 1] = o103.Value * inv1; }
-        if (r0ok) { O[ob0 + 88 + 2 * t] = o110.Value * inv0; O[ob0 + 88 + 2 * t + 1] = o111.Value * inv0; }
-        if (r1ok) { O[ob1 + 88 + 2 * t] = o112.Value * inv1; O[ob1 + 88 + 2 * t + 1] = o113.Value * inv1; }
-        if (r0ok) { O[ob0 + 96 + 2 * t] = o120.Value * inv0; O[ob0 + 96 + 2 * t + 1] = o121.Value * inv0; }
-        if (r1ok) { O[ob1 + 96 + 2 * t] = o122.Value * inv1; O[ob1 + 96 + 2 * t + 1] = o123.Value * inv1; }
-        if (r0ok) { O[ob0 + 104 + 2 * t] = o130.Value * inv0; O[ob0 + 104 + 2 * t + 1] = o131.Value * inv0; }
-        if (r1ok) { O[ob1 + 104 + 2 * t] = o132.Value * inv1; O[ob1 + 104 + 2 * t + 1] = o133.Value * inv1; }
-        if (r0ok) { O[ob0 + 112 + 2 * t] = o140.Value * inv0; O[ob0 + 112 + 2 * t + 1] = o141.Value * inv0; }
-        if (r1ok) { O[ob1 + 112 + 2 * t] = o142.Value * inv1; O[ob1 + 112 + 2 * t + 1] = o143.Value * inv1; }
-        if (r0ok) { O[ob0 + 120 + 2 * t] = o150.Value * inv0; O[ob0 + 120 + 2 * t + 1] = o151.Value * inv0; }
-        if (r1ok) { O[ob1 + 120 + 2 * t] = o152.Value * inv1; O[ob1 + 120 + 2 * t + 1] = o153.Value * inv1; }
+        if (r0ok) { O[ob0 + 0 + 2 * t] = o00 * inv0; O[ob0 + 0 + 2 * t + 1] = o01 * inv0; }
+        if (r1ok) { O[ob1 + 0 + 2 * t] = o02 * inv1; O[ob1 + 0 + 2 * t + 1] = o03 * inv1; }
+        if (r0ok) { O[ob0 + 8 + 2 * t] = o10 * inv0; O[ob0 + 8 + 2 * t + 1] = o11 * inv0; }
+        if (r1ok) { O[ob1 + 8 + 2 * t] = o12 * inv1; O[ob1 + 8 + 2 * t + 1] = o13 * inv1; }
+        if (r0ok) { O[ob0 + 16 + 2 * t] = o20 * inv0; O[ob0 + 16 + 2 * t + 1] = o21 * inv0; }
+        if (r1ok) { O[ob1 + 16 + 2 * t] = o22 * inv1; O[ob1 + 16 + 2 * t + 1] = o23 * inv1; }
+        if (r0ok) { O[ob0 + 24 + 2 * t] = o30 * inv0; O[ob0 + 24 + 2 * t + 1] = o31 * inv0; }
+        if (r1ok) { O[ob1 + 24 + 2 * t] = o32 * inv1; O[ob1 + 24 + 2 * t + 1] = o33 * inv1; }
+        if (r0ok) { O[ob0 + 32 + 2 * t] = o40 * inv0; O[ob0 + 32 + 2 * t + 1] = o41 * inv0; }
+        if (r1ok) { O[ob1 + 32 + 2 * t] = o42 * inv1; O[ob1 + 32 + 2 * t + 1] = o43 * inv1; }
+        if (r0ok) { O[ob0 + 40 + 2 * t] = o50 * inv0; O[ob0 + 40 + 2 * t + 1] = o51 * inv0; }
+        if (r1ok) { O[ob1 + 40 + 2 * t] = o52 * inv1; O[ob1 + 40 + 2 * t + 1] = o53 * inv1; }
+        if (r0ok) { O[ob0 + 48 + 2 * t] = o60 * inv0; O[ob0 + 48 + 2 * t + 1] = o61 * inv0; }
+        if (r1ok) { O[ob1 + 48 + 2 * t] = o62 * inv1; O[ob1 + 48 + 2 * t + 1] = o63 * inv1; }
+        if (r0ok) { O[ob0 + 56 + 2 * t] = o70 * inv0; O[ob0 + 56 + 2 * t + 1] = o71 * inv0; }
+        if (r1ok) { O[ob1 + 56 + 2 * t] = o72 * inv1; O[ob1 + 56 + 2 * t + 1] = o73 * inv1; }
+        if (r0ok) { O[ob0 + 64 + 2 * t] = o80 * inv0; O[ob0 + 64 + 2 * t + 1] = o81 * inv0; }
+        if (r1ok) { O[ob1 + 64 + 2 * t] = o82 * inv1; O[ob1 + 64 + 2 * t + 1] = o83 * inv1; }
+        if (r0ok) { O[ob0 + 72 + 2 * t] = o90 * inv0; O[ob0 + 72 + 2 * t + 1] = o91 * inv0; }
+        if (r1ok) { O[ob1 + 72 + 2 * t] = o92 * inv1; O[ob1 + 72 + 2 * t + 1] = o93 * inv1; }
+        if (r0ok) { O[ob0 + 80 + 2 * t] = o100 * inv0; O[ob0 + 80 + 2 * t + 1] = o101 * inv0; }
+        if (r1ok) { O[ob1 + 80 + 2 * t] = o102 * inv1; O[ob1 + 80 + 2 * t + 1] = o103 * inv1; }
+        if (r0ok) { O[ob0 + 88 + 2 * t] = o110 * inv0; O[ob0 + 88 + 2 * t + 1] = o111 * inv0; }
+        if (r1ok) { O[ob1 + 88 + 2 * t] = o112 * inv1; O[ob1 + 88 + 2 * t + 1] = o113 * inv1; }
+        if (r0ok) { O[ob0 + 96 + 2 * t] = o120 * inv0; O[ob0 + 96 + 2 * t + 1] = o121 * inv0; }
+        if (r1ok) { O[ob1 + 96 + 2 * t] = o122 * inv1; O[ob1 + 96 + 2 * t + 1] = o123 * inv1; }
+        if (r0ok) { O[ob0 + 104 + 2 * t] = o130 * inv0; O[ob0 + 104 + 2 * t + 1] = o131 * inv0; }
+        if (r1ok) { O[ob1 + 104 + 2 * t] = o132 * inv1; O[ob1 + 104 + 2 * t + 1] = o133 * inv1; }
+        if (r0ok) { O[ob0 + 112 + 2 * t] = o140 * inv0; O[ob0 + 112 + 2 * t + 1] = o141 * inv0; }
+        if (r1ok) { O[ob1 + 112 + 2 * t] = o142 * inv1; O[ob1 + 112 + 2 * t + 1] = o143 * inv1; }
+        if (r0ok) { O[ob0 + 120 + 2 * t] = o150 * inv0; O[ob0 + 120 + 2 * t + 1] = o151 * inv0; }
+        if (r1ok) { O[ob1 + 120 + 2 * t] = o152 * inv1; O[ob1 + 120 + 2 * t + 1] = o153 * inv1; }
     }
 }

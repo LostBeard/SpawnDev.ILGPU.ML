@@ -37,6 +37,12 @@ w("using UV = ArrayView1D<uint, Stride1D.Dense>;")
 w("using IV = ArrayView1D<int, Stride1D.Dense>;")
 w("using BV = ArrayView1D<BFloat16, Stride1D.Dense>;")
 w("using HV = ArrayView1D<global::ILGPU.Half, Stride1D.Dense>;")
+w("using F4V = ArrayView1D<F4, Stride1D.Dense>;")
+w("using U4V = ArrayView1D<U4, Stride1D.Dense>;")
+w("")
+w("/// <summary>128-bit views over the fp32 activations and the packed 16-bit weights: one load instruction moves 16 bytes.</summary>")
+w("public struct F4 { public float X, Y, Z, W; }")
+w("public struct U4 { public uint X, Y, Z, W; }")
 w("")
 w("internal static class MmaGemm")
 w("{")
@@ -61,12 +67,12 @@ def kernel(dtype, gather):
     t = "bf16" if dtype == "Bf16" else "f16"
     bias_t = "BV" if dtype == "Bf16" else "HV"
     name = f"Kernel{dtype}{'Gather' if gather else 'Dense'}"
-    mma = f"mma.sync.aligned.m16n8k16.row.col.f32.{t}.{t}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%0, %1, %2, %3}};"
+    mma = f"mma.sync.aligned.m16n8k16.row.col.f32.{t}.{t}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%10, %11, %12, %13}};"
     cvt = f"cvt.rn.{t}x2.f32 %0, %2, %1;"   # %1 -> low half, %2 -> high half
     w(f"    /// <summary>One 128 x 128 output tile per group. grid = ceil(M/128) * ceil(N/128), group = 256. "
       f"{'A rows are gathered through nbr (27 per row, cin channels each).' if gather else 'A is a dense [M,K] matrix.'} "
       f"res (when hasRes != 0) is added after the activation.</summary>")
-    w(f"    public static void {name}(FV A, UV Wu, {bias_t} bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)")
+    w(f"    public static void {name}(F4V A, U4V Wu, {bias_t} bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)")
     w("    {")
     w("        int numTilesN = (N + BN - 1) / BN;")
     w("        int tileRow = Grid.IdxX / numTilesN;")
@@ -79,57 +85,77 @@ def kernel(dtype, gather):
     w("        var bS = SharedMemory.Allocate<uint>(BN * RowWords);")
     for mt in range(MT):
         for nt in range(NT):
-            w(f"        Ref<float> c{mt}{nt}0 = default, c{mt}{nt}1 = default, c{mt}{nt}2 = default, c{mt}{nt}3 = default;")
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
     w("")
-    w("        int ldRow = tid >> 1, ldHalf = tid & 1;            // this thread stages 16 consecutive k of one row")
-    w("        int aRowG = tileRow * BM + ldRow;")
-    w("        int bRowG = tileCol * BN + ldRow;")
-    w("        int aRowOk = aRowG < M ? 1 : 0, bRowOk = bRowG < N ? 1 : 0;")
-    if gather:
-        w("        long nbrBase = (long)aRowG * 27;")
-    else:
-        w("        long aBase = (long)aRowG * K + ldHalf * 16;")
-    w("        long bBase = ((long)bRowG * K + ldHalf * 16) >> 1;  // in uint words")
+    w("        // staging: A tile = 128 rows x 32 k fp32 = 1024 float4, 4 per thread; B tile = 128 rows x 32 k packed 16-bit = 512 uint4, 2 per thread.")
+    w("        // The NEXT tile's global loads are issued before the current tile's MMAs (software pipelining), so their latency hides behind the math.")
+    w("        int arow = tid >> 3, a4 = tid & 7;")
+    w("        int brow = tid >> 2, b4 = tid & 3;")
+    for i in range(4):
+        w(f"        int aRg{i} = tileRow * BM + arow + {32 * i}; int aOk{i} = aRg{i} < M ? 1 : 0;")
+    for i in range(2):
+        w(f"        int bRg{i} = tileCol * BN + brow + {64 * i}; int bOk{i} = bRg{i} < N ? 1 : 0;")
+        w(f"        long bBase{i} = (long)bRg{i} * (K >> 3) + b4;")
+    for i in range(4):
+        if gather:
+            w(f"        long nbrBase{i} = (long)aRg{i} * 27;")
+        else:
+            w(f"        long aBase{i} = (long)aRg{i} * (K >> 2) + a4;")
+    w("        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;")
+    w("        U4 pb0 = default, pb1 = default;")
+    w("")
+    def load(kt_expr):
+        lines = []
+        if gather:
+            lines.append(f"int kkL = ({kt_expr}) / cin, c0L = ({kt_expr}) - kkL * cin;")
+            for i in range(4):
+                lines.append(f"{{ int src = aOk{i} != 0 ? nbr[nbrBase{i} + kkL] : -1; pa{i} = src >= 0 ? A[(long)src * (cin >> 2) + (c0L >> 2) + a4] : default(F4); }}")
+        else:
+            for i in range(4):
+                lines.append(f"pa{i} = aOk{i} != 0 ? A[aBase{i} + (({kt_expr}) >> 2)] : default(F4);")
+        for i in range(2):
+            lines.append(f"pb{i} = bOk{i} != 0 ? Wu[bBase{i} + (({kt_expr}) >> 3)] : default(U4);")
+        return lines
+    w("        {")
+    for l in load("0"):
+        w("            " + l)
+    w("        }")
     w("")
     w("        for (int kt = 0; kt < K; kt += BK)")
     w("        {")
-    if gather:
-        w("            int kk = kt / cin, c0 = kt - kk * cin;")
-        w("            int src = aRowOk != 0 ? nbr[nbrBase + kk] : -1;")
-        w("            long aBase = (long)src * cin + c0 + ldHalf * 16;")
-        w("            int aOk = src >= 0 ? 1 : 0;")
-    else:
-        w("            int aOk = aRowOk;")
-    w("            for (int i = 0; i < 8; i++)")
-    w("            {")
-    if gather:
-        w("                float f0 = aOk != 0 ? A[aBase + 2 * i] : 0f;")
-        w("                float f1 = aOk != 0 ? A[aBase + 2 * i + 1] : 0f;")
-    else:
-        w("                float f0 = aOk != 0 ? A[aBase + kt + 2 * i] : 0f;")
-        w("                float f1 = aOk != 0 ? A[aBase + kt + 2 * i + 1] : 0f;")
-    w(f"                aS[ldRow * RowWords + ldHalf * 8 + i] = Pack{dtype}(f0, f1);")
-    w("                bS[ldRow * RowWords + ldHalf * 8 + i] = bRowOk != 0 ? Wu[bBase + (kt >> 1) + i] : 0u;")
-    w("            }")
+    for i in range(4):
+        w(f"            aS[(arow + {32 * i}) * RowWords + a4 * 2] = Pack{dtype}(pa{i}.X, pa{i}.Y);")
+        w(f"            aS[(arow + {32 * i}) * RowWords + a4 * 2 + 1] = Pack{dtype}(pa{i}.Z, pa{i}.W);")
+    for i in range(2):
+        for j, c in enumerate("XYZW"):
+            w(f"            bS[(brow + {64 * i}) * RowWords + b4 * 4 + {j}] = pb{i}.{c};")
     w("            Group.Barrier();")
+    w("            if (kt + BK < K)")
+    w("            {")
+    for l in load("kt + BK"):
+        w("                " + l)
+    w("            }")
     w("")
     w("            for (int s = 0; s < 2; s++)")
     w("            {")
     w("                int kw = s * 8;")
     for mt in range(MT):
         w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
-        w(f"                Input<uint> a{mt}0 = aS[ar{mt}];")
-        w(f"                Input<uint> a{mt}1 = aS[ar{mt} + 8 * RowWords];")
-        w(f"                Input<uint> a{mt}2 = aS[ar{mt} + 4];")
-        w(f"                Input<uint> a{mt}3 = aS[ar{mt} + 8 * RowWords + 4];")
+        w(f"                uint a{mt}0 = aS[ar{mt}];")
+        w(f"                uint a{mt}1 = aS[ar{mt} + 8 * RowWords];")
+        w(f"                uint a{mt}2 = aS[ar{mt} + 4];")
+        w(f"                uint a{mt}3 = aS[ar{mt} + 8 * RowWords + 4];")
     for nt in range(NT):
         w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
-        w(f"                Input<uint> b{nt}0 = bS[br{nt}];")
-        w(f"                Input<uint> b{nt}1 = bS[br{nt} + 4];")
+        w(f"                uint b{nt}0 = bS[br{nt}];")
+        w(f"                uint b{nt}1 = bS[br{nt} + 4];")
     for mt in range(MT):
         for nt in range(NT):
-            w(f'                CudaAsm.EmitRef("{mma}",')
-            w(f"                    ref c{mt}{nt}0, ref c{mt}{nt}1, ref c{mt}{nt}2, ref c{mt}{nt}3, ref a{mt}0, ref a{mt}1, ref a{mt}2, ref a{mt}3, ref b{nt}0, ref b{nt}1);")
+            w("                {")
+            w(f'                CudaAsm.Emit("{mma}",')
+            w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+            w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+            w("                }")
     w("            }")
     w("            Group.Barrier();")
     w("        }")
@@ -147,7 +173,7 @@ def kernel(dtype, gather):
                 w("            {")
                 for (ncol, ci) in (("n0", ci0), ("n1", ci1)):
                     b = "bias0" if ncol == "n0" else "bias1"
-                    w(f"                if ({ncol} < N) {{ float v = Activate(c{mt}{nt}{ci}.Value + {b}, act); if (hasRes != 0) v += res[(long){mrow} * N + {ncol}]; C[(long){mrow} * N + {ncol}] = v; }}")
+                    w(f"                if ({ncol} < N) {{ float v = Activate(c{mt}{nt}{ci} + {b}, act); if (hasRes != 0) v += res[(long){mrow} * N + {ncol}]; C[(long){mrow} * N + {ncol}] = v; }}")
                 w("            }")
             w("        }")
     w("    }")

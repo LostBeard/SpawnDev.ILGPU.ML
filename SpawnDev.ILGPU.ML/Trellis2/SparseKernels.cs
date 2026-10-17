@@ -117,7 +117,7 @@ public sealed class SparseKernels
     // =====================================================================================================
     // Submanifold convolution (3x3x3): out[m,n] = bias[n] + sum_kk sum_c x[nbr[m,kk], c] * W[n,kk,c]
     // =====================================================================================================
-    private Action<KernelConfig, FV, UV, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaConv;
+    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaConv;
     private Action<Index1D, FV, HV, HV, FV, IV, int, int, int, int>? _naiveConv;
     private static void NaiveConvImpl(Index1D idx, FV x, HV w, HV bias, FV o, IV nbr, int M, int cin, int cout, int hasBias)
     {
@@ -138,10 +138,10 @@ public sealed class SparseKernels
     {
         if (Cuda && cin % MmaGemm.BK == 0 && cout % 2 == 0)
         {
-            _mmaConv ??= _acc.LoadStreamKernel<FV, UV, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Gather);
+            _mmaConv ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Gather);
             _noRes ??= _acc.Allocate1D<float>(1);
             int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((cout + MmaGemm.BN - 1) / MmaGemm.BN);
-            _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias, o, _noRes.View, nbr, M, 27 * cin, cout, cin, 1, 0, 0);
+            _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, 27 * cin, cout, cin, 1, 0, 0);
             return;
         }
         _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvImpl);
@@ -285,7 +285,7 @@ public sealed class SparseKernels
     // =====================================================================================================
     // Linear with fp16 weight [N,K] and bias, optional activation and residual:  o = act(x W^T + b) (+ res)
     // =====================================================================================================
-    private Action<KernelConfig, FV, UV, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinear;
+    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinear;
     private Action<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>? _naiveLinear;
     private static void NaiveLinearImpl(Index1D idx, FV x, HV w, HV bias, FV o, FV res, int M, int K, int N, int hasBias, int act, int hasRes)
     {
@@ -304,10 +304,10 @@ public sealed class SparseKernels
         var b = bias ?? weight.SubView(0, 1);
         if (Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16)
         {
-            _mmaLinear ??= _acc.LoadStreamKernel<FV, UV, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
+            _mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
             _noNbr ??= _acc.Allocate1D<int>(1);
             int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
-            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), b, o, res ?? o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
+            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), b, o, res ?? o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
             return;
         }
         _naiveLinear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>(NaiveLinearImpl);
