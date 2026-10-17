@@ -92,6 +92,9 @@ public sealed class DiTKernels
         _dummyB ??= _acc.Allocate1D<BFloat16>(2); _dummyB2 ??= _acc.Allocate1D<BFloat16>(2);
     }
 
+    // NOT inlined: the tiled GEMM epilogue calls this 64 times per thread; inlined, every call site carried all three activation bodies
+    // (the WGSL of one GEMM ran to ~600 KB, and the browser compiles shaders on first use).
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     internal static float Activate(float v, int act)
     {
         if (act == 1) return v / (1f + MathF.Exp(-v));                              // SiLU

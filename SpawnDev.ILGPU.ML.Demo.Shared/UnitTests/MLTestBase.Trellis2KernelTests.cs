@@ -214,6 +214,58 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Where a cold session's kernel cost goes, for the two largest generated kernels: LoadStreamKernel (IL -> IR -> backend code; on the
+    /// browser this runs in the interpreted .NET runtime) versus the first launch (WebGPU: shader module + pipeline creation) minus a warm launch.
+    /// Prints "[Benchmark] Trellis2 compile ..." (PMT_CONSOLE_LOG=Trellis2).
+    /// </summary>
+    [TestMethod]
+    public async Task Trellis2_KernelCompile_Benchmark() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        const int M = 256, K = 256, N = 256;
+        using var x = accelerator.Allocate1D<float>(M * K);
+        using var w = accelerator.Allocate1D<uint>(N * K / 2);
+        using var b = accelerator.Allocate1D<uint>(N / 2);
+        using var o = accelerator.Allocate1D<float>(M * N);
+        using var r = accelerator.Allocate1D<float>(1);
+        using var nb = accelerator.Allocate1D<int>(1);
+        var report = new List<string>();
+        var sizes = new Dictionary<string, int>();
+        var prevHook = global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled;
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+            global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = (name, src, e) => { prevHook?.Invoke(name, src, e); sizes[name] = src.Length; };
+        try {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var gemm = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>(TiledGemm.Bf16Dense);
+        double load = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        var cfg = new KernelConfig(4, TiledGemm.Threads);
+        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0); await accelerator.SynchronizeAsync();
+        double first = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        gemm(cfg, x.View, w.View, b.View, o.View, r.View, nb.View, M, K, N, 0, 0, 0, 0); await accelerator.SynchronizeAsync();
+        double warm = sw.Elapsed.TotalMilliseconds;
+        report.Add($"gemm load {load:F0} ms, first launch {first - warm:F0} ms");
+
+        const int T = 256, H = 2, D = 128;
+        using var qkv = accelerator.Allocate1D<float>(T * 3 * H * D);
+        using var ao = accelerator.Allocate1D<float>(T * H * D);
+        sw.Restart();
+        var attn = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int>(TiledAttention.SelfD128Smem);
+        load = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        var acfg = new KernelConfig((T / TiledAttention.QueriesPerGroupSmem) * H, TiledAttention.Threads);
+        attn(acfg, qkv.View, ao.View, T, T, H, 3 * H * D, 0, 3 * H * D, H * D, 2 * H * D); await accelerator.SynchronizeAsync();
+        first = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        attn(acfg, qkv.View, ao.View, T, T, H, 3 * H * D, 0, 3 * H * D, H * D, 2 * H * D); await accelerator.SynchronizeAsync();
+        warm = sw.Elapsed.TotalMilliseconds;
+        report.Add($"attention(smem) load {load:F0} ms, first launch {first - warm:F0} ms");
+        foreach (var (n, len) in sizes) report.Add($"{n} WGSL {len / 1024} KB");
+        var line = $"[Benchmark] Trellis2 compile [{accelerator.AcceleratorType}] " + string.Join(" | ", report);
+        Console.WriteLine(line);
+        return line;
+        }
+        finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = prevHook; }
+    });
+
+    /// <summary>
     /// Throughput of the DiT's kernels at the real 1.3B shapes (width 1536, 12 heads x 128, MLP 6144, 4096 tokens = the sparse-structure
     /// flow): how far each backend is from the silicon. Prints "[Benchmark] Trellis2 ..." lines (PMT_CONSOLE_LOG=Trellis2 shows them for browser lanes).
     /// </summary>
