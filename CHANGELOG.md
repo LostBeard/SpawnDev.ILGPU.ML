@@ -3,6 +3,18 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased
+
+- **Auto-rigging of generated characters (UniRig), `SpawnDev.ILGPU.ML.UniRig`.** `UniRigRigger.RigGlbAsync(glb)` turns a character GLB (a TRELLIS.2 humanoid) into a rigged one: a skeleton
+  and per-vertex skin weights, textures untouched. The skeleton stage is UniRig's own network re-implemented on ILGPU from the checkpoint's tensor shapes (not from its source): a
+  perceiver shape encoder (Fourier point embedding, cross-attention over 65,536 surface samples, 16 self-attention blocks) feeding an OPT-350m decoder with a KV cache that writes the bone
+  tree as tokens under a grammar (`UniRigTokenizer`). The skin weights are UniRig's skinning prior, geodesic voxel binding (`UniRigVoxelSkin`: visual-hull voxelisation, a graph of mesh
+  vertices and interior voxels, Dijkstra per joint). Against the reference classes on CPU: encoder latents relRMS 4.6e-3 (CUDA) / 2.3e-3 (OpenCL, bf16 weights alone), decoder logits
+  1.8e-3, same 25-joint skeleton and tree with joint error under half a coordinate bin, skin weights 1.4e-6 on the reference's own voxels. A TRELLIS.2 humanoid: 28 joints and
+  weights in 5.6 s cold on an RTX 4070; the rigged GLB validates with 0 errors and posing a shoulder moves the arm and nothing else. NOT included yet: the learned skin network (PTv3 +
+  attention) that refines the prior. Weights are the published MIT checkpoints exported to bf16 safetensors by `tools/unirig-harness/reference/export_weights.py` (not shipped in the
+  package). Tests `UniRig_*` (pure and reference-gated). Licence note: the upstream `src/model/michelangelo/` folder is GPL-3.0; this port shares no code with it.
+
 ## 5.3.14 - 2026-10-18 - TRELLIS.2 meshes are cleaned up (MeshRepair)
 
 Requires SpawnDev.ILGPU 5.3.8.
