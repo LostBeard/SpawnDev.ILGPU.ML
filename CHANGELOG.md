@@ -3,7 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased
+## 5.3.15 - 2026-10-18 - Auto-rigging: SkinTokens and UniRig
+
+Requires SpawnDev.ILGPU 5.3.8. Docs: [Docs/rigging.md](Docs/rigging.md).
 
 - **Auto-rigging of generated characters (UniRig), `SpawnDev.ILGPU.ML.UniRig`.** `UniRigRigger.RigGlbAsync(glb)` turns a character GLB (a TRELLIS.2 humanoid) into a rigged one: a skeleton
   and per-vertex skin weights, textures untouched. The skeleton stage is UniRig's own network re-implemented on ILGPU from the checkpoint's tensor shapes (not from its source): a

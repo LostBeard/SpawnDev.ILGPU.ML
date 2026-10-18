@@ -100,6 +100,10 @@ CPU; `Trellis2_UvAtlas_*`, `Trellis2_MeshSimplifier_*`, `Trellis2_PbrGlb_*` cove
 (HeavyModel) runs the real model. `Trellis2_DiTKernels_Benchmark` / `Trellis2_KernelCompile_Benchmark` (HeavyModel) measure throughput
 and shader compile cost.
 
+## Next step: rig it
+
+A generated character can be given a skeleton and learned skin weights with `SkinTokensRigger` (and the demo's **Rig this model** button): see [rigging.md](rigging.md).
+
 ## Licences
 
 TRELLIS.2 code and weights: MIT. DINOv3 weights: Meta's DINOv3 licence ("Built with DINOv3"). SD Turbo: Stability AI's licence.
