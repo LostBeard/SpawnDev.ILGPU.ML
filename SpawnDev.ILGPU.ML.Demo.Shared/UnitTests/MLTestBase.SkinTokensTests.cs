@@ -229,4 +229,58 @@ public abstract partial class MLTestBase
         Console.WriteLine("[SkinTokens] VAE stages: " + string.Join("; ", lines));
         Ur_Expect(firstBad == "", $"first stage beyond 2e-2: {firstBad}. All: {string.Join("; ", lines)}");
     });
+
+    /// <summary>SkinTokens end to end on a TRELLIS-generated humanoid GLB (GLB in, rigged GLB out): a valid skinned glTF whose right arm follows a posed shoulder and whose other side stays still.</summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task SkinTokens_Rigger_RigsAGeneratedHumanoid() => await RunTest(async accelerator =>
+    {
+        var dir = St_Require(accelerator);
+        var humanoid = Path.Combine(dir, "inputs", "humanoid.glb");
+        if (!File.Exists(humanoid)) throw new UnsupportedTestException("inputs/humanoid.glb (a TRELLIS.2 generated T-pose humanoid) not found");
+        var glb = File.ReadAllBytes(humanoid);
+        using var weights = GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "skintokens.safetensors"));
+        using var rigger = new SkinTokensRigger(accelerator, weights);
+        var res = await rigger.RigGlbAsync(glb, seed: 0);
+        var keep = Path.Combine(dir, "tmp"); if (Directory.Exists(keep)) File.WriteAllBytes(Path.Combine(keep, "skintokens_rigged_humanoid.glb"), res.Glb);   // for inspection (validate_glb.mjs, pose_check.py)
+        var sk = res.Skeleton;
+        Ur_Expect(sk.Count is >= 15 and <= 60, $"{sk.Count} joints for a humanoid");
+        Ur_Expect(sk.Parents.Count(p => p < 0) == 1 && sk.Parents.Select((p, i) => p < i).All(b => b), "one root, parents before children");
+
+        var mesh = RiggedGlb.ReadMesh(res.Glb); var orig = RiggedGlb.ReadMesh(glb);
+        Ur_Expect(mesh.Positions.SequenceEqual(orig.Positions), "the rigged file keeps the mesh");
+        int V = mesh.Positions.Length / 3, J = sk.Count;
+        float lo = mesh.Positions.Where((_, i) => i % 3 == 1).Min(), hi = mesh.Positions.Where((_, i) => i % 3 == 1).Max();
+        for (int j = 0; j < J; j++)
+            Ur_Expect(sk.Joints[j * 3 + 1] > lo - 0.05f * (hi - lo) && sk.Joints[j * 3 + 1] < hi + 0.05f * (hi - lo), $"joint {j} lies within the model's height");
+
+        // read the skin back out of the file and pose it: rotate the outermost shoulder on +x
+        int jsonLen = (int)BitConverter.ToUInt32(res.Glb, 12), bin = 20 + jsonLen + 8;
+        using var doc = JsonDocument.Parse(res.Glb.AsMemory(20, jsonLen)); var root = doc.RootElement;
+        var prim = root.GetProperty("meshes")[0].GetProperty("primitives")[0].GetProperty("attributes");
+        int Off(int a) { var acc = root.GetProperty("accessors")[a]; return bin + root.GetProperty("bufferViews")[acc.GetProperty("bufferView").GetInt32()].GetProperty("byteOffset").GetInt32(); }
+        int jo = Off(prim.GetProperty("JOINTS_0").GetInt32()), wo = Off(prim.GetProperty("WEIGHTS_0").GetInt32());
+        for (int v = 0; v < V; v++)
+        {
+            float s = 0; for (int k = 0; k < 4; k++) s += BitConverter.ToSingle(res.Glb, wo + v * 16 + k * 4);
+            Ur_Expect(Math.Abs(s - 1) < 1e-4, $"vertex {v} weights sum to {s}");
+        }
+        float span = sk.Joints.Where((_, i) => i % 3 == 0).Max();
+        int shoulder = -1;
+        for (int j = 0; j < J && shoulder < 0; j++) if (sk.Joints[j * 3] > 0.2f * span && sk.Parents[j] >= 0 && sk.Joints[sk.Parents[j] * 3] <= 0.2f * span) shoulder = j;
+        Ur_Expect(shoulder >= 0, "a joint out on the right arm");
+        var follows = new bool[J]; follows[shoulder] = true; for (int j = 0; j < J; j++) if (sk.Parents[j] >= 0 && follows[sk.Parents[j]]) follows[j] = true;
+        float height = hi - lo; int armVerts = 0, leftMoved = 0, bodyMoved = 0;
+        for (int v = 0; v < V; v++)
+        {
+            float follow = 0; for (int k = 0; k < 4; k++) if (follows[BitConverter.ToUInt16(res.Glb, jo + v * 8 + k * 2)]) follow += BitConverter.ToSingle(res.Glb, wo + v * 16 + k * 4);
+            float x = mesh.Positions[v * 3];
+            if (follow > 0.5f) armVerts++;
+            if (x < -0.1f * height && follow > 0.01f) leftMoved++;
+            if (Math.Abs(x) < 0.08f * height && follow > 0.25f) bodyMoved++;
+        }
+        Ur_Expect(armVerts > V * 0.05, $"only {armVerts} of {V} vertices follow the right arm");
+        Ur_Expect(leftMoved == 0, $"{leftMoved} vertices on the left half would move with the right shoulder");
+        Ur_Expect(bodyMoved < V * 0.01, $"{bodyMoved} vertices of the torso, head and legs would move noticeably with the right shoulder");
+        Console.WriteLine($"[SkinTokens] rigged humanoid: {J} joints, {armVerts} of {V} vertices follow the right arm, left half {leftMoved}, body {bodyMoved} on {accelerator.AcceleratorType}");
+    });
 }
