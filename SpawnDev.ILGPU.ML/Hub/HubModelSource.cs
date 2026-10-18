@@ -45,10 +45,13 @@ public class HubModelSource : ICachingModelSource, IDisposable
     }
 
     /// <summary>Create a source over an existing cache, so several sources share one OPFS store.</summary>
-    public HubModelSource(OpfsModelCache cache)
+    /// <param name="cache">The shared OPFS cache.</param>
+    /// <param name="http">Optional; needed only by <see cref="OpenForInspectionAsync"/> (see the other constructor).</param>
+    public HubModelSource(OpfsModelCache cache, HttpClient? http = null)
     {
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         _ownsCache = false;
+        _http = http;
     }
 
     /// <summary>The OPFS cache backing this source, for listing, sizing and eviction.</summary>
@@ -78,6 +81,9 @@ public class HubModelSource : ICachingModelSource, IDisposable
     /// <remarks>A cache UI needs this to tell "storage unavailable" apart from "nothing cached yet" - the
     /// listing is empty either way, and only one of them is worth warning the user about.</remarks>
     public Task<bool> IsAvailableAsync() => _cache.IsAvailableAsync();
+
+    /// <summary>The browser's storage quota and usage for this origin, or null when unavailable. See <see cref="BrowserStorageEstimate"/>: the quota is not always a limit.</summary>
+    public Task<BrowserStorageEstimate?> GetStorageEstimateAsync() => _cache.GetStorageEstimateAsync();
 
     /// <inheritdoc/>
     public Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)

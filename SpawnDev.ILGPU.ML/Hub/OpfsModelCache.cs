@@ -110,6 +110,22 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     }
 
     /// <summary>
+    /// What the browser says this origin's storage quota and usage are, or null when it cannot say (no <c>navigator.storage</c>).
+    /// </summary>
+    /// <remarks>Read <see cref="BrowserStorageEstimate"/> before using the number as a budget: Chrome reports <c>usage + 10 GiB</c>, not the real limit.</remarks>
+    public async Task<BrowserStorageEstimate?> GetStorageEstimateAsync()
+    {
+        try
+        {
+            using var navigator = _js.Get<Navigator>("navigator");
+            using var storage = navigator.Storage;
+            var est = await storage.Estimate().ConfigureAwait(false);
+            return new BrowserStorageEstimate(est.Quota, est.Usage);
+        }
+        catch { return null; }   // no StorageManager here (insecure context / not a browser)
+    }
+
+    /// <summary>
     /// True when <paramref name="cacheKey"/> is cached AND complete AND its size matches what was recorded.
     /// A partially downloaded entry reports false - it is resumable, not usable.
     /// </summary>

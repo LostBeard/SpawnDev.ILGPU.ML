@@ -1,13 +1,21 @@
+using SpawnDev.SpawnJS.JSObjects;
+
 namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
-/// An <see cref="IModelSource"/> for model sets larger than the origin's storage quota (Chrome grants an origin a share of the free disk:
-/// 11 GB on a machine with 80 GB free), where caching everything into OPFS would fail part-way. Per file: a file already in the hub cache
-/// opens from OPFS; a file in <see cref="CacheFiles"/> downloads into OPFS once (<see cref="HubModelSource.OpenAsync(string, string, CancellationToken)"/>);
-/// every other file streams from the hub with HTTP range requests on every load and stores NOTHING. <see cref="PlanCacheAsync"/> picks the
-/// files to cache so that the fewest bytes stream. Readers should read in large chunks (each read is one request).
+/// An <see cref="IModelSource"/> for model sets that may be larger than the room a browser origin has, where caching everything into OPFS
+/// could fail part-way. Per file: a file already in the hub cache opens from OPFS; a file in <see cref="CacheFiles"/> downloads into OPFS
+/// once (<see cref="HubModelSource.OpenAsync(string, string, CancellationToken)"/>); every other file streams from the hub with HTTP range
+/// requests on every load and stores NOTHING. <see cref="PlanCacheAsync(IEnumerable{ValueTuple{string, string}}, BrowserStorageEstimate?, long, CancellationToken)"/>
+/// picks the files to cache so that the fewest bytes stream. Readers should read in large chunks (each read is one request).
+/// <para>
+/// ⚠️ <c>navigator.storage.estimate()</c> is not a trustworthy limit (see <see cref="BrowserStorageEstimate"/>: Chrome reports usage + 10 GiB
+/// and takes more). The plan therefore trusts only an exact headroom; when the headroom is open-ended every file is planned for the cache,
+/// and a file whose write the browser really refuses (<c>QuotaExceededError</c>) drops its half-written entry and streams instead
+/// (<see cref="CacheFallback"/>), so the load still succeeds.
+/// </para>
 /// </summary>
-public sealed class RangeStreamModelSource : IModelSource
+public class RangeStreamModelSource : IModelSource
 {
     private readonly HubModelSource _hub;
 
@@ -22,10 +30,37 @@ public sealed class RangeStreamModelSource : IModelSource
 
     private static string Key(string repoId, string filePath) => repoId.Trim('/') + "/" + filePath.TrimStart('/');
 
+    /// <summary>Raised with "repo/path" when the browser refused to store a file planned for the cache; that file streams from now on.</summary>
+    public event Action<string>? CacheFallback;
+
+    /// <summary>True when <paramref name="ex"/> (or anything it wraps) is the browser's <c>QuotaExceededError</c>.</summary>
+    public static bool IsQuotaExceeded(Exception? ex)
+    {
+        for (; ex != null; ex = ex.InnerException)
+            if (ex is JSException { Name: "QuotaExceededError" }) return true;
+        return false;
+    }
+
+    /// <summary>Download a file planned for the cache into OPFS and open it. Virtual so a test can make the browser's refusal happen on demand (a full disk cannot be summoned).</summary>
+    protected virtual Task<Stream> DownloadIntoCacheAsync(string repoId, string filePath, CancellationToken cancellationToken)
+        => _hub.OpenAsync(repoId, filePath, cancellationToken);
+
     public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
     {
-        if (CacheFiles.Contains(Key(repoId, filePath)) || await _hub.Store.ExistsAsync(_hub.CacheKey(repoId, filePath)).ConfigureAwait(false))
+        var cacheKey = _hub.CacheKey(repoId, filePath);
+        if (await _hub.Store.ExistsAsync(cacheKey).ConfigureAwait(false))
             return await _hub.OpenAsync(repoId, filePath, cancellationToken).ConfigureAwait(false);
+        if (CacheFiles.Contains(Key(repoId, filePath)))
+        {
+            try { return await DownloadIntoCacheAsync(repoId, filePath, cancellationToken).ConfigureAwait(false); }
+            catch (Exception ex) when (IsQuotaExceeded(ex))
+            {
+                // The estimate promised room and the write was refused anyway. The half-written entry still holds quota: drop it, stream this file.
+                CacheFiles.Remove(Key(repoId, filePath));
+                try { await _hub.Store.RemoveAsync(cacheKey).ConfigureAwait(false); } catch { /* nothing left to remove */ }
+                CacheFallback?.Invoke(Key(repoId, filePath));
+            }
+        }
         var probe = await _hub.OpenForInspectionAsync(repoId, filePath, cancellationToken).ConfigureAwait(false);
         if (!OperatingSystem.IsBrowser()) return new Counting(probe, this);
         // browser: fetch ranges that stay in JS (the loader uploads them to the GPU without touching the .NET heap)
@@ -39,6 +74,20 @@ public sealed class RangeStreamModelSource : IModelSource
     /// of files). Returns (bytes cached or to be cached, bytes that will stream on every load).
     /// </summary>
     public async Task<(long CachedBytes, long StreamedBytes)> PlanCacheAsync(IEnumerable<(string Repo, string Path)> files, long budgetBytes, CancellationToken cancellationToken = default)
+    {
+        return await PlanCoreAsync(files, budgetBytes, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <see cref="PlanCacheAsync(IEnumerable{ValueTuple{string, string}}, long, CancellationToken)"/> with the budget taken from the browser's
+    /// storage estimate: an exact headroom (minus <paramref name="marginBytes"/>) bounds the plan, an open-ended one
+    /// (<see cref="BrowserStorageEstimate.HeadroomIsOpenEnded"/>) or an unknown one (null) plans every file for the cache.
+    /// </summary>
+    public Task<(long CachedBytes, long StreamedBytes)> PlanCacheAsync(IEnumerable<(string Repo, string Path)> files, BrowserStorageEstimate? estimate,
+        long marginBytes = BrowserStorageEstimate.DefaultMarginBytes, CancellationToken cancellationToken = default)
+        => PlanCoreAsync(files, estimate?.PlanningBudget(marginBytes) ?? long.MaxValue / 2, cancellationToken);
+
+    private async Task<(long CachedBytes, long StreamedBytes)> PlanCoreAsync(IEnumerable<(string Repo, string Path)> files, long budgetBytes, CancellationToken cancellationToken)
     {
         CacheFiles.Clear();
         long cached = 0;

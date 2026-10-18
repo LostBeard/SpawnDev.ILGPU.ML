@@ -3,6 +3,19 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased
+
+- **The TRELLIS.2 demo no longer caps browser storage at 10 GB.** `navigator.storage.estimate()` is not a limit on stock Chrome 151: an origin
+  with no usage reports a quota of exactly 10 GiB and the quota rises one byte per byte written (usage 0 / quota 10, 1 / 11 ... 14 / 24 GiB;
+  fresh profile, different drive, no flags; all 14 GiB of OPFS writes succeeded). The demo budgeted `quota - usage` and so cached ~9.7 GB of
+  11 GB, streaming the rest on the first run (and the note told users the site "may store 10 GB"). New `BrowserStorageEstimate`
+  (`HeadroomIsOpenEnded`, `PlanningBudget`), `OpfsModelCache` / `HubModelSource.GetStorageEstimateAsync()`,
+  `RangeStreamModelSource.PlanCacheAsync(files, estimate)`: an exact headroom bounds the plan, a window-shaped one plans every file for the
+  cache. A write the browser really refuses (`QuotaExceededError`) now drops its partial entry and streams that file instead of failing the
+  load (`RangeStreamModelSource.CacheFallback`, `IsQuotaExceeded`). `HubModelSource(OpfsModelCache, HttpClient?)`. Tests:
+  `RangeStreamModelSource_*`.
+
+
 ## 5.3.12 - 2026-10-17 - SentencePiece add_space_prefix (Gemma multi-turn chat fixed)
 
 Requires SpawnDev.ILGPU 5.3.8.

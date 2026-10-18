@@ -207,26 +207,25 @@
             _error = "This demo needs WebGPU (Chrome or Edge on a desktop GPU).";
             return false;
         }
-        // Per file: cache the TRELLIS.2 checkpoints in OPFS as far as the browser grants this site room, stream the rest from the hub with range
-        // requests on every run (Chrome gives an origin a share of the FREE disk: 11 GB on a machine with 80 GB free, against 11 GB of weights;
-        // caching all-or-nothing streamed everything there, the plan caches all but ~1 GB).
-        long free = long.MaxValue / 2;
-        try
-        {
-            using var navigator = JS.Get<SpawnDev.SpawnJS.JSObjects.Navigator>("navigator");
-            using var storage = navigator.Storage;
-            var est = await storage.Estimate();
-            free = est.Quota - est.Usage;
-        }
-        catch { }
+        // Per file: cache the TRELLIS.2 checkpoints in OPFS, stream from the hub with range requests (on every run) only what the browser has no
+        // room for. navigator.storage.estimate() is NOT a limit: Chrome 151 reports usage + 10 GiB however much it would really take (measured:
+        // 14 GiB written against a 10 GiB "quota"), so the plan believes only an exact headroom (BrowserStorageEstimate) and a write the browser
+        // really refuses falls back to streaming that file (RangeStreamModelSource.CacheFallback).
+        var estimate = await ModelSource.GetStorageEstimateAsync();
         var ranged = new SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource(ModelSource);
         ranged.OnProgress += OnDownloadProgress;
-        var (cachedBytes, streamedBytes) = await ranged.PlanCacheAsync(Trellis2Weights.HubWeightFiles(), free - 300_000_000L);
+        ranged.CacheFallback += key =>
+        {
+            _streamWeights = true;
+            _storageNote = "The browser refused to store all of the TRELLIS.2 weights, so part of them stream from the hub on every run.";
+            _ = InvokeAsync(StateHasChanged);
+        };
+        var (cachedBytes, streamedBytes) = await ranged.PlanCacheAsync(Trellis2Weights.HubWeightFiles(), estimate);
         _streamWeights = streamedBytes > 0;
         _downloadBytes = streamedBytes + await UncachedBytesAsync(ranged);   // what the next run transfers
         _streamedBytes = streamedBytes;
-        if (_streamWeights)
-            _storageNote = $"This site may store {free / 1073741824.0:F1} GB in your browser: {cachedBytes / 1073741824.0:F1} GB of the TRELLIS.2 weights are cached, "
+        if (_streamWeights && estimate is { } e)
+            _storageNote = $"This browser reports room for {e.Headroom / 1073741824.0:F1} GB more: {cachedBytes / 1073741824.0:F1} GB of the TRELLIS.2 weights are cached, "
                 + $"the other {streamedBytes / 1073741824.0:F1} GB stream from the hub on every run.";
         _trellis = new Trellis2ImageTo3D(_accelerator, Trellis2Weights.FromModelSource(ranged)) { StageDone = OnStageDone };
         return true;
