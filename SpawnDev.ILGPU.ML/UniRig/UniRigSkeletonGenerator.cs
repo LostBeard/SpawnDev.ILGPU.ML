@@ -25,6 +25,20 @@ public sealed class UniRigSkeletonGenerator : IDisposable
 
     public sealed record Result(int[] Tokens, UniRigTokenizer.Skeleton Skeleton);
 
+    /// <summary>
+    /// The skeleton of a mesh, in the mesh's own space: <see cref="UniRigMeshSampler"/> turns it into the input, the device does the rest.
+    /// <paramref name="positions"/> xyz and <paramref name="faces"/> triangle indices; the joints in the result are scaled back to the mesh.
+    /// </summary>
+    public async Task<(UniRigTokenizer.Skeleton Skeleton, int[] Tokens)> RigMeshAsync(Accelerator accelerator, float[] positions, int[] faces, int seed = 0, int maxNewTokens = 1024)
+    {
+        var s = UniRigMeshSampler.Sample(positions, faces, seed);
+        using var pts = accelerator.Allocate1D(s.Points); using var nrm = accelerator.Allocate1D(s.Normals);
+        var r = await GenerateAsync(pts.View, nrm.View, UniRigMeshSampler.NumSamples, s.QueryRows, maxNewTokens);
+        var joints = new float[r.Skeleton.Joints.Length];
+        s.ToMeshSpace(r.Skeleton.Joints, joints);
+        return (new UniRigTokenizer.Skeleton(joints, r.Skeleton.Parents), r.Tokens);
+    }
+
     /// <param name="pts">[n,3] mesh points scaled into [-1,1] (see <see cref="UniRigMeshSampler"/>).</param>
     /// <param name="nrm">[n,3] unit normals.</param>
     /// <param name="queryRows">The 1024 encoder query points (<see cref="UniRigMeshSampler.QueryRows"/>).</param>

@@ -18,12 +18,13 @@ return command switch
     "tokenizer" => Gates.Tokenizer(dir),
     "decoder" => Gates.Decoder(dir),
     "generate" => Gates.Generate(dir),
+    "rig" => Gates.Rig(dir, args.Length > 1 ? args[1] : throw new ArgumentException("rig <mesh.obj> [out.json] [seed]"), args.Length > 2 ? args[2] : null, args.Length > 3 ? int.Parse(args[3]) : 0),
     _ => Usage(command),
 };
 
 static int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: encoder | tokenizer | decoder | generate");
+    Console.WriteLine($"unknown command '{bad}'. commands: encoder | tokenizer | decoder | generate | rig <mesh.obj> [out.json] [seed]");
     return 2;
 }
 
@@ -230,6 +231,33 @@ namespace UniRigHarness
             bool pass = r.Skeleton.Count == bs[0] && badParents == 0 && sum / cmp <= Bin && worst <= 6 * Bin;
             Console.WriteLine(pass ? "PASS" : "FAIL");
             return pass ? 0 : 1;
+        }
+
+        /// <summary>A mesh (plain v / f OBJ) to a skeleton in the mesh's own space, all in C#: sampler, encoder, decoder, grammar. Writes joints + parents as JSON.</summary>
+        public static int Rig(string dir, string objPath, string? outJson, int seed)
+        {
+            var pos = new List<float>(); var idx = new List<int>();
+            foreach (var line in File.ReadLines(objPath))
+            {
+                var t = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (t.Length >= 4 && t[0] == "v") for (int k = 1; k <= 3; k++) pos.Add(float.Parse(t[k], System.Globalization.CultureInfo.InvariantCulture));
+                else if (t.Length >= 4 && t[0] == "f") for (int k = 1; k <= 3; k++) idx.Add(int.Parse(t[k].Split('/')[0]) - 1);
+            }
+            var (ctx, accel) = Gpu.Create();
+            using var _c = ctx; using var _a = accel;
+            using var weights = GpuWeights.LoadFile(accel, Path.Combine(dir, "weights", "skeleton.safetensors"));
+            using var gen = new UniRigSkeletonGenerator(accel, weights);
+            var sw = Stopwatch.StartNew();
+            var (sk, tokens) = gen.RigMeshAsync(accel, pos.ToArray(), idx.ToArray(), seed).GetAwaiter().GetResult();
+            Console.WriteLine($"rig      : {pos.Count / 3} verts, {idx.Count / 3} faces -> {sk.Count} joints from {tokens.Length} tokens in {sw.Elapsed.TotalSeconds:F2}s (includes kernel compile)");
+            for (int j = 0; j < sk.Count; j++)
+                Console.WriteLine($"  {j,3} parent {sk.Parents[j],3}  ({sk.Joints[j * 3]:F3}, {sk.Joints[j * 3 + 1]:F3}, {sk.Joints[j * 3 + 2]:F3})");
+            if (outJson != null)
+            {
+                File.WriteAllText(outJson, System.Text.Json.JsonSerializer.Serialize(new { joints = sk.Joints, parents = sk.Parents, tokens }));
+                Console.WriteLine($"wrote {outJson}");
+            }
+            return 0;
         }
 
         private static double StdOf(float[] a, int start, int count)
