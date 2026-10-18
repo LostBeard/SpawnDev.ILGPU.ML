@@ -102,6 +102,18 @@ internal static class GenerateRun
         {
             // debug preview data: voxel centres + PBR attributes (read by reference/preview_voxels.py)
             using var o = gen.Generate(input, w, h, options, out var pipe);
+            if (Environment.GetEnvironmentVariable("TRELLIS2_MESHSTAGES") == "1")
+            {
+                // every stage's mesh as <out>.<stage>.obj, for reference/mesh_audit.py (which stage makes it open / non-manifold?)
+                pipe.MeshStage = (stage, pos, idx) =>
+                {
+                    using var sw = new StreamWriter(Path.ChangeExtension(outGlb, "." + stage + ".obj"));
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    for (int i = 0; i < pos.Length; i += 3) sw.WriteLine(string.Create(inv, $"v {pos[i]:R} {pos[i + 1]:R} {pos[i + 2]:R}"));
+                    for (int i = 0; i < idx.Length; i += 3) sw.WriteLine($"f {idx[i] + 1} {idx[i + 1] + 1} {idx[i + 2] + 1}");
+                    Console.WriteLine($"  mesh stage '{stage}': {pos.Length / 3} verts, {idx.Length / 3} faces");
+                };
+            }
             var coords = o.Coords.GetAsArray1D(); var attrs = o.Attributes.GetAsArray1D();
             using var fs = File.Create(Path.ChangeExtension(outGlb, ".voxels.bin"));
             using var bw = new BinaryWriter(fs);

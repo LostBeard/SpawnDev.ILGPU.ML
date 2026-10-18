@@ -315,19 +315,29 @@ public sealed class Trellis2Pipeline : IDisposable
     public MeshClusterer.Options? ClusterOptions { get; set; }
     private MeshClusterer? _clusterer;
 
+    /// <summary>
+    /// Diagnostic: the mesh (positions xyz, triangle indices) as it leaves each stage of <see cref="ToGlbAsync"/>:
+    /// "extracted" (what the topology work received: the dual-grid mesh, or its device pre-clustering), "simplified", "atlas" (UV seams split).
+    /// Null costs nothing. Used to find which stage makes a mesh non-manifold or open (harness TRELLIS2_MESHSTAGES).
+    /// </summary>
+    public Action<string, float[], int[]>? MeshStage { get; set; }
+
     private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw)
     {
+        MeshStage?.Invoke("extracted", positions, faces);
         if (maxFaces > 0 && faces.Length / 3 > maxFaces)
         {
             int before = faces.Length / 3;
             (positions, faces) = MeshSimplifier.Simplify(positions, faces, maxFaces);
             StageDone?.Invoke($"simplify {before} -> {faces.Length / 3} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+            MeshStage?.Invoke("simplified", positions, faces);
         }
         var normals = PbrGlbWriter.VertexNormals(positions, faces);
         StageDone?.Invoke("mesh read + normals", sw.Elapsed.TotalSeconds); sw.Restart();
 
         var atlas = UvAtlas.Unwrap(positions, faces, new UvAtlas.Options { Resolution = textureSize });
         StageDone?.Invoke($"uv atlas ({atlas.ChartCount} charts, {atlas.Utilization:P0})", sw.Elapsed.TotalSeconds); sw.Restart();
+        MeshStage?.Invoke("atlas", atlas.Positions, atlas.Faces);
 
         TextureBaker.Textures tex;
         using (var pos = _acc.Allocate1D(atlas.Positions))
