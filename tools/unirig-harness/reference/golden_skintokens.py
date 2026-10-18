@@ -59,7 +59,7 @@ if __name__ == '__main__':
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     max_new = int(sys.argv[3]) if len(sys.argv) > 3 else 1400
     out = os.path.join(st_env.ST_DIR, 'golden'); os.makedirs(out, exist_ok=True)
-    save = lambda name, a: np.save(os.path.join(out, name + '.npy'), np.ascontiguousarray(a.detach().float().cpu().numpy() if torch.is_tensor(a) else a))
+    save = lambda name, a: np.save(os.path.join(out, name + '.npy'), np.ascontiguousarray((a.detach().cpu().long().numpy() if not a.is_floating_point() else a.detach().float().cpu().numpy()) if torch.is_tensor(a) else a))
 
     # record every farthest-point-sampling call (positions in, indices out); the first is the VAE cond encoder's, the second the mesh encoder's... order is asserted below
     import src.model.utils as mu
@@ -85,6 +85,18 @@ if __name__ == '__main__':
     tok = model.tokenizer
     P = torch.from_numpy(pts).to(dev); Nn = torch.from_numpy(nrm).to(dev)
     with torch.no_grad():
+        # probes: the first outputs of the VAE's modules (rows capped), for the C# port to find where it first diverges
+        PROBE = {}
+        def probe(name, mod):
+            def hook(m, i, o):
+                out = o[0] if isinstance(o, tuple) else o
+                PROBE.setdefault(name, []).append(out.detach().float().cpu().numpy()[0][:4000])
+            mod.register_forward_hook(hook)
+        vm = model.vae.model
+        probe('cond.proj_in', vm.cond_encoder.proj_in)
+        for bi, b in enumerate(vm.cond_encoder.blocks): probe(f'cond.block{bi}', b)
+        probe('cond.norm_out', vm.cond_encoder.norm_out)
+        probe('dec.proj_query', vm.decoder.proj_query); probe('dec.block10', vm.decoder.blocks[-1]); probe('dec.norm_out', vm.decoder.norm_out); probe('dec.proj_out', vm.decoder.proj_out)
         # 1) the cond path of the VAE (seeded here; the shipped generate() leaves the seed None = random picks)
         cond = torch.cat([P, Nn], dim=-1).unsqueeze(0)
         FPS.clear()
@@ -97,12 +109,16 @@ if __name__ == '__main__':
 
         # 2) the mesh encoder -> prefix
         import src.model.tokenrig as tr
+        enc = model.mesh_encoder.encoder
+        probe('mesh.cross', enc.cross_attn)
+        for bi, b in enumerate(enc.self_attn.resblocks): probe(f'mesh.self{bi}', b)
         FPS.clear()
         mesh_cond = tr.encode_mesh_cond(model.mesh_encoder, model.output_proj, model.tokens_skin_cond, {'vertices': P, 'normals': Nn})
         pre, fps_idx = FPS[-1]
         ind = np.random.default_rng(seed=0).choice(pts.shape[0], 4 * 512, replace=False)
         assert np.array_equal(pre.cpu().numpy(), pts[ind]), 'mesh pre-sample is not default_rng(0).choice'
         save('mesh_presample_idx', ind); save('mesh_fps_idx', fps_idx); save('mesh_cond', mesh_cond[0])
+        save('mesh_latents', model.mesh_encoder.encode_latents(pc=P.unsqueeze(0), feats=Nn.unsqueeze(0))[1][0])        # ln_post output, before output_proj
         print('mesh_cond', tuple(mesh_cond.shape), 'mean', float(mesh_cond.mean()), 'std', float(mesh_cond.std()))
 
         # 3) greedy generation with the grammar
@@ -143,6 +159,10 @@ if __name__ == '__main__':
         for b in model.vae.model.decoder.blocks[:-1]:
             h = b(h)
         save('skin_kv0', h[0])
+        for name, lst in PROBE.items():
+            if name.startswith('mesh.'): save('probe_' + name, lst[0])
+            elif name.startswith('cond.'): save('probe_' + name, lst[0] if name != 'cond.proj_in' else np.concatenate([lst[0][:384], lst[1][:3616]]))     # proj_in: 384 queries then the first keys
+            else: save('probe_' + name, lst[0])
         print('J', J, 'skin_pred', tuple(skin.shape), 'min/max', float(skin.min()), float(skin.max()), 'row-sum range', float(skin.sum(1).min()), float(skin.sum(1).max()))
     json.dump({'seed': seed, 'num_samples': int(pts.shape[0]), 'J': int(J), 'sequence_length': int(ids.numel()), 'switch_position': eos_pos, 'torch': torch.__version__,
                'dtype': 'float32 (weights bf16 -> fp32 exactly)', 'attn': 'sdpa', 'repetition_penalty': 1.0, 'greedy': True}, open(os.path.join(out, 'manifest.json'), 'w'), indent=1)

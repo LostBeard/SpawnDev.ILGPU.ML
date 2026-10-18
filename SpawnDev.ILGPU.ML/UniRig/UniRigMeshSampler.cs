@@ -16,14 +16,16 @@ public sealed class UniRigMeshSampler
     /// <summary>[n,3] unit normals.</summary>
     public float[] Normals { get; }
     /// <summary>The 1024 point indices that become the encoder's query tokens.</summary>
-    public int[] QueryRows { get; }
+    public int[] QueryRows => QuerySets[0];
+    /// <summary>One farthest-point-sampled query set per requested size (<see cref="Sample(float[], int[], int, int, int, int[])"/>); the first is <see cref="QueryRows"/>.</summary>
+    public int[][] QuerySets { get; }
     /// <summary>Mesh centre (bounding box middle): mesh position = normalised * <see cref="Scale"/> + this.</summary>
     public float[] Center { get; }
     /// <summary>Half the longest bounding-box side.</summary>
     public float Scale { get; }
 
-    private UniRigMeshSampler(float[] points, float[] normals, int[] rows, float[] center, float scale)
-    { Points = points; Normals = normals; QueryRows = rows; Center = center; Scale = scale; }
+    private UniRigMeshSampler(float[] points, float[] normals, int[][] rows, float[] center, float scale)
+    { Points = points; Normals = normals; QuerySets = rows; Center = center; Scale = scale; }
 
     /// <summary>Map a joint position from the normalised space back into the mesh's own space.</summary>
     public void ToMeshSpace(ReadOnlySpan<float> joints, Span<float> o)
@@ -32,7 +34,13 @@ public sealed class UniRigMeshSampler
             for (int k = 0; k < 3; k++) o[i + k] = joints[i + k] * Scale + Center[k];
     }
 
-    public static UniRigMeshSampler Sample(float[] positions, int[] faces, int seed = 0)
+    public static UniRigMeshSampler Sample(float[] positions, int[] faces, int seed = 0) => Sample(positions, faces, seed, NumSamples, VertexSamples, new[] { PreSamples / 4 });
+
+    /// <summary>
+    /// The same recipe for another network: <paramref name="numSamples"/> points (<paramref name="vertexSamples"/> of them vertex samples) and, for each entry of
+    /// <paramref name="queryCounts"/>, 4x that many pre-sampled points reduced by farthest-point sampling to the query set (SkinTokens: 54000 / 16384 and 512 + 384 queries).
+    /// </summary>
+    public static UniRigMeshSampler Sample(float[] positions, int[] faces, int seed, int numSamples, int vertexSamples, int[] queryCounts)
     {
         int nv = positions.Length / 3, nf = faces.Length / 3;
         if (nv == 0 || nf == 0) throw new ArgumentException("empty mesh");
@@ -66,8 +74,8 @@ public sealed class UniRigMeshSampler
         for (int t = 0; t < nf; t++) { run += weight[t]; cum[t] = run; }
 
         var rng = new Random(seed);
-        int nVertexSamples = Math.Min(VertexSamples, nv), nSurface = NumSamples - nVertexSamples;
-        var points = new float[NumSamples * 3]; var normals = new float[NumSamples * 3];
+        int nVertexSamples = Math.Min(vertexSamples, nv), nSurface = numSamples - nVertexSamples;
+        var points = new float[numSamples * 3]; var normals = new float[numSamples * 3];
         var pick = Shuffled(nv, nVertexSamples, rng);
         for (int i = 0; i < nVertexSamples; i++)
             for (int k = 0; k < 3; k++) { points[i * 3 + k] = p[pick[i] * 3 + k]; normals[i * 3 + k] = (float)vn[pick[i] * 3 + k]; }
@@ -87,9 +95,14 @@ public sealed class UniRigMeshSampler
             }
         }
         // the encoder's eval-mode query points: 4096 at random, then farthest-point sampling keeps a quarter, starting from the first
-        var pre = Shuffled(NumSamples, PreSamples, rng);
-        var fps = FarthestPoints(points, pre, PreSamples / 4);
-        return new UniRigMeshSampler(points, normals, fps.Select(i => pre[i]).ToArray(), center, scale);
+        var sets = new int[queryCounts.Length][];
+        for (int q = 0; q < queryCounts.Length; q++)
+        {
+            var pre = Shuffled(numSamples, queryCounts[q] * 4, rng);
+            var fps = FarthestPoints(points, pre, queryCounts[q]);
+            sets[q] = fps.Select(i => pre[i]).ToArray();
+        }
+        return new UniRigMeshSampler(points, normals, sets, center, scale);
     }
 
     /// <summary>The first <paramref name="count"/> of a random permutation of 0..n-1 (partial Fisher-Yates).</summary>

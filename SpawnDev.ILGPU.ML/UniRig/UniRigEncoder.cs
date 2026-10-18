@@ -26,19 +26,31 @@ public sealed class UniRigEncoder : IDisposable
 {
     public const int Heads = 8, Width = 512, SelfLayers = 16, QueryTokens = 1024, OutWidth = 1024, HeadDim = Width / Heads;
 
+    /// <summary>
+    /// Which copy of the shape encoder to run. The default is the skeleton stage's (16 self-attention layers, 1024 query tokens, projected to 1024 by <c>output_proj</c>);
+    /// SkinTokens uses the same network at 8 layers and 512 queries under <c>mesh_encoder.encoder.</c> and projects it itself (<see cref="OutputProj"/> null: the
+    /// result is the [queries, 512] output of <c>ln_post</c>).
+    /// </summary>
+    public sealed record Options(string Prefix = "mesh_encoder.encoder.", int SelfLayers = UniRigEncoder.SelfLayers, int QueryTokens = UniRigEncoder.QueryTokens, string? OutputProj = "output_proj");
+
     private readonly Accelerator _acc;
     private readonly GpuWeights _w;
     private readonly DiTKernels _k;
     private readonly UniRigKernels _u;
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _ws = new();
+    private readonly Options _o;
+
+    /// <summary>Diagnostics: when set, called with (name, the [queries, 512] state, rows, cols) after the cross-attention block ("cross") and after each self-attention block ("self0"...).</summary>
+    public Action<string, FV, int, int>? Probe { get; set; }
     private int _n = -1;
     private MemoryBuffer1D<float, Stride1D.Dense> _feat = null!, _x = null!, _kn = null!, _kv = null!, _q = null!, _h = null!, _qkv = null!, _attn = null!, _proj = null!,
         _mlp = null!, _scores = null!, _dummy = null!, _out = null!;
     private MemoryBuffer1D<int, Stride1D.Dense>? _rows;
 
     /// <param name="weights">The skeleton checkpoint exported by export_weights.py (the encoder's tensors and output_proj are used).</param>
-    public UniRigEncoder(Accelerator accelerator, GpuWeights weights)
+    public UniRigEncoder(Accelerator accelerator, GpuWeights weights, Options? options = null)
     {
+        _o = options ?? new Options();
         _acc = accelerator; _w = weights;
         _k = new DiTKernels(accelerator); _u = new UniRigKernels(accelerator);
     }
@@ -51,10 +63,10 @@ public sealed class UniRigEncoder : IDisposable
         foreach (var b in _ws) b.Dispose();
         _ws.Clear();
         _n = n;
-        int C = Width, Nq = QueryTokens;
+        int C = Width, Nq = _o.QueryTokens;
         _feat = Alloc((long)n * UniRigKernels.FourierWidth); _x = Alloc((long)n * C); _kn = Alloc((long)n * C); _kv = Alloc((long)n * 2 * C);
         _q = Alloc((long)Nq * C); _h = Alloc((long)Nq * C); _qkv = Alloc((long)Nq * 3 * C); _attn = Alloc((long)Nq * C); _proj = Alloc((long)Nq * C);
-        _mlp = Alloc((long)Nq * 4 * C); _dummy = Alloc(1); _out = Alloc((long)Nq * OutWidth);
+        _mlp = Alloc((long)Nq * 4 * C); _dummy = Alloc(1); _out = Alloc((long)Nq * (_o.OutputProj == null ? Width : OutWidth));
         // the reference attention materialises H*Nq*Nk scores; the flash kernels (CUDA tensor cores, portable tiled) need none
         _scores = Alloc(_k.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * Nq * n);
         _rows ??= _acc.Allocate1D<int>(Nq);
@@ -76,17 +88,18 @@ public sealed class UniRigEncoder : IDisposable
     /// </summary>
     public MemoryBuffer1D<float, Stride1D.Dense> Encode(FV pts, FV nrm, int n, int[] queryRows)
     {
-        if (queryRows.Length != QueryTokens) throw new ArgumentException($"expected {QueryTokens} query rows", nameof(queryRows));
+        if (queryRows.Length != _o.QueryTokens) throw new ArgumentException($"expected {_o.QueryTokens} query rows", nameof(queryRows));
         EnsureWorkspace(n);
-        int C = Width, Nq = QueryTokens, H = Heads, D = HeadDim;
+        int C = Width, Nq = _o.QueryTokens, H = Heads, D = HeadDim;
+        string enc = _o.Prefix;
         _rows!.CopyFromCPU(queryRows);
 
         _u.FourierEmbed(pts, nrm, _feat.View, n);
-        _k.Linear(_feat.View, _w.BF16("mesh_encoder.encoder.input_proj.weight"), _w.BF16("mesh_encoder.encoder.input_proj.bias"), _x.View, n, UniRigKernels.FourierWidth, C);
+        _k.Linear(_feat.View, _w.BF16(enc + "input_proj.weight"), _w.BF16(enc + "input_proj.bias"), _x.View, n, UniRigKernels.FourierWidth, C);
         _u.GatherRows(_x.View, _rows.View, _q.View, Nq, C);
 
         // cross-attention: 1024 queries over every point
-        const string ca = "mesh_encoder.encoder.cross_attn.";
+        string ca = enc + "cross_attn.";
         LayerNorm(_q.View, _h.View, ca + "ln_1", Nq);
         _k.Linear(_h.View, _w.BF16(ca + "attn.c_q.weight"), null, _attn.View, Nq, C, C);                  // queries (borrow _attn as scratch)
         LayerNorm(_x.View, _kn.View, ca + "ln_2", n);
@@ -97,10 +110,11 @@ public sealed class UniRigEncoder : IDisposable
         LayerNorm(_q.View, _h.View, ca + "ln_3", Nq);
         Mlp(_h.View, _mlp.View, _proj.View, ca + "mlp", Nq);
         _k.GateResidual(_q.View, _proj.View, _dummy.View, -1, Nq * C, C);
+        if (Probe != null) { _acc.Synchronize(); Probe("cross", _q.View, Nq, C); }
 
-        for (int i = 0; i < SelfLayers; i++)
+        for (int i = 0; i < _o.SelfLayers; i++)
         {
-            string b = $"mesh_encoder.encoder.self_attn.resblocks.{i}.";
+            string b = $"{enc}self_attn.resblocks.{i}.";
             LayerNorm(_q.View, _h.View, b + "ln_1", Nq);
             _k.Linear(_h.View, _w.BF16(b + "attn.c_qkv.weight"), null, _qkv.View, Nq, C, 3 * C);
             _k.Attention(_qkv.View, 3 * C, 0, _qkv.View, 3 * C, C, 2 * C, _scores.View, _attn.View, Nq, Nq, H, D);
@@ -109,10 +123,12 @@ public sealed class UniRigEncoder : IDisposable
             LayerNorm(_q.View, _h.View, b + "ln_2", Nq);
             Mlp(_h.View, _mlp.View, _proj.View, b + "mlp", Nq);
             _k.GateResidual(_q.View, _proj.View, _dummy.View, -1, Nq * C, C);
+            if (Probe != null) { _acc.Synchronize(); Probe($"self{i}", _q.View, Nq, C); }
         }
 
-        LayerNorm(_q.View, _h.View, "mesh_encoder.encoder.ln_post", Nq);
-        _k.Linear(_h.View, _w.BF16("output_proj.weight"), _w.BF16("output_proj.bias"), _out.View, Nq, C, OutWidth);
+        LayerNorm(_q.View, _h.View, enc + "ln_post", Nq);
+        if (_o.OutputProj == null) { _out.View.SubView(0, (long)Nq * C).CopyFrom(_h.View.SubView(0, (long)Nq * C)); return _out; }
+        _k.Linear(_h.View, _w.BF16(_o.OutputProj + ".weight"), _w.BF16(_o.OutputProj + ".bias"), _out.View, Nq, C, OutWidth);
         return _out;
     }
 

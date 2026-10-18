@@ -89,4 +89,8 @@ def build_tokenrig(device='cuda'):
     sd = {k.replace('_orig_mod.', ''): v for k, v in ck['state_dict'].items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print('TokenRig state dict: missing', len(missing), missing[:4], 'unexpected', len(unexpected), unexpected[:4])
-    return model.float().to(device).eval(), hp
+    model = model.float().to(device).eval()
+    # nn.RMSNorm(eps=None) uses finfo(input dtype).eps. The shipped model is bf16 (eps 0.0078125); the float32 golden would silently use 1.19e-7 instead and the mesh prefix would
+    # differ by a fraction of a percent. Pin the shipped value so the golden is "the shipped computation at higher activation precision".
+    model.output_proj[1].eps = torch.finfo(torch.bfloat16).eps
+    return model, hp
