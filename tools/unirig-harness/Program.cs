@@ -15,12 +15,15 @@ var command = args.Length > 0 ? args[0].ToLowerInvariant() : "";
 return command switch
 {
     "encoder" => Gates.Encoder(dir),
+    "tokenizer" => Gates.Tokenizer(dir),
+    "decoder" => Gates.Decoder(dir),
+    "generate" => Gates.Generate(dir),
     _ => Usage(command),
 };
 
 static int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: encoder");
+    Console.WriteLine($"unknown command '{bad}'. commands: encoder | tokenizer | decoder | generate");
     return 2;
 }
 
@@ -86,6 +89,154 @@ namespace UniRigHarness
             bool ok = rel < 0.02;
             Console.WriteLine(ok ? "PASS" : "FAIL (relRMS >= 2e-2)");
             return ok ? 0 : 1;
+        }
+
+        /// <summary>The grammar's allowed set at every step of the reference's real generation, and the detokenized skeleton, against the reference's.</summary>
+        public static int Tokenizer(string dir)
+        {
+            var g = Path.Combine(dir, "golden", "skeleton");
+            var (full64, _) = Npy.Load<long>(Path.Combine(g, "full_ids.npy"));
+            var full = full64.Select(v => (int)v).ToArray();
+            var allowed = System.Text.Json.JsonSerializer.Deserialize<List<List<int>>>(File.ReadAllText(Path.Combine(g, "allowed.json")))!;
+            int bad = 0;
+            for (int r = 1; r < full.Length; r++)
+            {
+                var mine = UniRigTokenizer.Allowed(UniRigTokenizer.StateAfter(full.AsSpan(0, r + 1)));
+                if (!mine.SequenceEqual(allowed[r - 1])) { if (bad++ < 3) Console.WriteLine($"  step {r}: allowed set differs (mine {mine.Count} ids, reference {allowed[r - 1].Count})"); }
+            }
+            Console.WriteLine($"grammar  : {full.Length - 1} steps, {bad} differ from the reference's allowed sets");
+
+            var (bones, bs) = Npy.Load<float>(Path.Combine(g, "bones.npy"));              // [J, 6]: parent position, joint position
+            var (refParents, _) = Npy.Load<long>(Path.Combine(g, "parents.npy"));
+            var sk = UniRigTokenizer.Detokenize(full.Append(UniRigTokenizer.Eos).ToArray());
+            double maxDiff = 0; int parentDiff = 0;
+            for (int j = 0; j < bs[0]; j++)
+            {
+                for (int c = 0; c < 3; c++) maxDiff = Math.Max(maxDiff, Math.Abs(sk.Joints[j * 3 + c] - bones[j * 6 + 3 + c]));
+                if (sk.Parents[j] != (int)refParents[j]) parentDiff++;
+            }
+            Console.WriteLine($"detokenize: {sk.Count} joints (reference {bs[0]}), max joint position diff {maxDiff:E2}, parents differing {parentDiff}");
+            bool ok = bad == 0 && sk.Count == bs[0] && parentDiff == 0 && maxDiff < 1e-6;
+            Console.WriteLine(ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// The OPT decoder, teacher-forced: the REFERENCE's encoder latents and the golden [bos, cls, ...] sequence in one prefill; its logits for every step against the
+        /// reference's. Judged on relRMS and on whether the grammar-constrained argmax at each step is the token the reference generated.
+        /// </summary>
+        public static int Decoder(string dir)
+        {
+            var g = Path.Combine(dir, "golden", "skeleton");
+            var (lat, _) = Npy.Load<float>(Path.Combine(g, "latents.npy"));                 // [1, 1024, 1024] from the reference encoder
+            var (full64, _) = Npy.Load<long>(Path.Combine(g, "full_ids.npy"));
+            var (gold, gs) = Npy.Load<float>(Path.Combine(g, "logits_teacher.npy"));       // [93, 267]
+            var allowed = System.Text.Json.JsonSerializer.Deserialize<List<List<int>>>(File.ReadAllText(Path.Combine(g, "allowed.json")))!;
+            var full = full64.Select(v => (int)v).ToArray();
+            int steps = gs[0], V = gs[1];
+
+            var (ctx, accel) = Gpu.Create();
+            using var _c = ctx; using var _a = accel;
+            var sw = Stopwatch.StartNew();
+            using var weights = GpuWeights.LoadFile(accel, Path.Combine(dir, "weights", "skeleton.safetensors"), name => name.StartsWith("transformer."));
+            Console.WriteLine($"weights  : {weights.Bytes / 1e6:F0} MB on the device in {sw.Elapsed.TotalSeconds:F1}s");
+            using var cond = accel.Allocate1D(lat);
+            using var dec = new UniRigDecoder(accel, weights);
+            float[] got = Array.Empty<float>();
+            double[] times = new double[2];
+            for (int run = 0; run < times.Length; run++)
+            {
+                sw.Restart();
+                got = dec.PrefillAsync(cond.View, 1024, full, steps).GetAwaiter().GetResult();
+                times[run] = sw.Elapsed.TotalSeconds;
+            }
+            double num = 0, den = 0; int argAgree = 0, maskedAgree = 0;
+            for (int r = 0; r < steps; r++)
+            {
+                int bestU = 0, bestM = -1; float vu = float.NegativeInfinity, vm = float.NegativeInfinity, rv = float.NegativeInfinity; int bestR = 0;
+                var ok = new HashSet<int>(allowed[r]);
+                for (int v = 0; v < V; v++)
+                {
+                    float a = got[r * V + v], b = gold[r * V + v];
+                    num += (double)(a - b) * (a - b); den += (double)b * b;
+                    if (a > vu) { vu = a; bestU = v; }
+                    if (ok.Contains(v) && a > vm) { vm = a; bestM = v; }
+                    if (b > rv) { rv = b; bestR = v; }
+                }
+                int expect = r + 2 < full.Length ? full[r + 2] : UniRigTokenizer.Eos;
+                if (bestU == bestR) argAgree++;
+                if (bestM == expect) maskedAgree++;
+            }
+            double rel = Math.Sqrt(num / den);
+            Console.WriteLine($"decoder  : logits [{steps},{V}] relRMS vs reference {rel:E2}; unmasked argmax agrees {argAgree}/{steps}; grammar-constrained argmax reproduces the generated token {maskedAgree}/{steps}; {times[0]:F2}s cold, {times[1]:F2}s");
+            bool pass = rel < 0.05 && maskedAgree >= steps - 2;
+            Console.WriteLine(pass ? "PASS" : "FAIL");
+            return pass ? 0 : 1;
+        }
+
+        /// <summary>The whole skeleton stage on the golden's points (C# encoder + C# decoder + grammar, greedy) against the reference's generated skeleton.</summary>
+        public static int Generate(string dir)
+        {
+            var g = Path.Combine(dir, "golden", "skeleton");
+            var (pts, ps) = Npy.Load<float>(Path.Combine(g, "points.npy"));
+            var (nrm, _) = Npy.Load<float>(Path.Combine(g, "normals.npy"));
+            var (pre, _) = Npy.Load<long>(Path.Combine(g, "presample_idx.npy"));
+            var (fps, _) = Npy.Load<long>(Path.Combine(g, "fps_idx.npy"));
+            var (full64, _) = Npy.Load<long>(Path.Combine(g, "full_ids.npy"));
+            var (bones, bs) = Npy.Load<float>(Path.Combine(g, "bones.npy"));
+            var (refParents, _) = Npy.Load<long>(Path.Combine(g, "parents.npy"));
+            var gold = full64.Select(v => (int)v).Append(UniRigTokenizer.Eos).ToArray();           // [bos, cls, ..., eos]
+            int n = ps[0];
+            var rows = fps.Select(i => (int)pre[i]).ToArray();
+
+            var (ctx, accel) = Gpu.Create();
+            using var _c = ctx; using var _a = accel;
+            using var weights = GpuWeights.LoadFile(accel, Path.Combine(dir, "weights", "skeleton.safetensors"));
+            using var p = accel.Allocate1D(pts); using var q = accel.Allocate1D(nrm);
+            using var gen = new UniRigSkeletonGenerator(accel, weights);
+            UniRigSkeletonGenerator.Result r = null!;
+            var times = new double[2];
+            for (int run = 0; run < times.Length; run++)
+            {
+                var sw = Stopwatch.StartNew();
+                r = gen.GenerateAsync(p.View, q.View, n, rows).GetAwaiter().GetResult();
+                times[run] = sw.Elapsed.TotalSeconds;
+            }
+            int common = 0; while (common < gold.Length && common < r.Tokens.Length && gold[common] == r.Tokens[common]) common++;
+            Console.WriteLine($"tokens   : {r.Tokens.Length} generated (reference {gold.Length}); identical for the first {common}; {times[0]:F2}s cold, {times[1]:F2}s");
+            if (common < Math.Min(gold.Length, r.Tokens.Length))
+            {
+                // is the first difference a near-tie in the REFERENCE's own logits? row (common - 2) of logits_teacher is the distribution that chose token `common`
+                var (lg, ls) = Npy.Load<float>(Path.Combine(g, "logits_teacher.npy"));
+                int row = common - 2;
+                if (row >= 0 && row < ls[0])
+                {
+                    float a = lg[row * ls[1] + gold[common]], b = lg[row * ls[1] + r.Tokens[common]];
+                    Console.WriteLine($"first difference at token {common}: reference chose {gold[common]}, C# chose {r.Tokens[common]}; the reference's own logits for them: {a:F3} vs {b:F3} (margin {a - b:F3}; logit std ~{StdOf(lg, row * ls[1], ls[1]):F2})");
+                }
+            }
+            Console.WriteLine($"skeleton : {r.Skeleton.Count} joints (reference {bs[0]})");
+            double worst = 0, sum = 0; int cmp = Math.Min(r.Skeleton.Count, bs[0]), badParents = 0;
+            for (int j = 0; j < cmp; j++)
+            {
+                double dx = r.Skeleton.Joints[j * 3] - bones[j * 6 + 3], dy = r.Skeleton.Joints[j * 3 + 1] - bones[j * 6 + 4], dz = r.Skeleton.Joints[j * 3 + 2] - bones[j * 6 + 5];
+                double d = Math.Sqrt(dx * dx + dy * dy + dz * dz); worst = Math.Max(worst, d); sum += d;
+                if (r.Skeleton.Parents[j] != (int)refParents[j]) badParents++;
+            }
+            Console.WriteLine($"           joint position error vs reference over the first {cmp}: mean {sum / cmp:F4}, worst {worst:F4} (one coordinate bin = {2.0 / 256:F4}); parents differing {badParents}");
+            // The decoder's logits agree with the reference to relRMS ~2e-3 (decoder gate), but greedy decoding flips on a near-tie: the first difference above was a 0.016 margin on a logit
+            // std of 2.9, adjacent coordinate bins, and every later token follows from it. So the gate is the SKELETON, not the token stream: same joints, same tree, positions within a few bins.
+            const double Bin = 2.0 / 256;
+            bool pass = r.Skeleton.Count == bs[0] && badParents == 0 && sum / cmp <= Bin && worst <= 6 * Bin;
+            Console.WriteLine(pass ? "PASS" : "FAIL");
+            return pass ? 0 : 1;
+        }
+
+        private static double StdOf(float[] a, int start, int count)
+        {
+            double s = 0, ss = 0;
+            for (int i = 0; i < count; i++) { s += a[start + i]; ss += (double)a[start + i] * a[start + i]; }
+            double m = s / count; return Math.Sqrt(ss / count - m * m);
         }
 
         private static string QueryText(float[] a) { double s = 0, ss = 0; foreach (var v in a) { s += v; ss += (double)v * v; } double m = s / a.Length; return $"[1024,1024] mean {m:F4} std {Math.Sqrt(ss / a.Length - m * m):F4}"; }
