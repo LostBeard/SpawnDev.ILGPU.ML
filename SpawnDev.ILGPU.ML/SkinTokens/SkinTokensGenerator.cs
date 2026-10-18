@@ -83,6 +83,8 @@ public sealed class SkinTokensGenerator : IDisposable
 
     /// <summary>Wall seconds per stage of the last <see cref="GenerateAsync"/>: mesh encoder, cond encoder, prefill, skeleton tokens, skin tokens, skin decode.</summary>
     public List<(string Stage, double Seconds)> Timings { get; } = new();
+    /// <summary>Called as each stage of <see cref="GenerateAsync"/> finishes (name, seconds): progress for a UI.</summary>
+    public Action<string, double>? StageDone { get; set; }
 
     /// <param name="Ids">Every id, start tokens first: [bos, cls, skeleton..., switch, skin tokens..., end].</param>
     /// <param name="Skeleton">Joints in the normalised ([-1,1]) space and parents.</param>
@@ -93,7 +95,7 @@ public sealed class SkinTokensGenerator : IDisposable
     public async Task<Result> GenerateAsync(FV pts, FV nrm, int n, int[] meshQueryRows, int[] condQueryRows, int maxSkeletonTokens = 1400, int cls = UniRigTokenizer.ClsArticulationXl)
     {
         Timings.Clear(); var sw = System.Diagnostics.Stopwatch.StartNew();
-        void Mark(string stage) { Timings.Add((stage, sw.Elapsed.TotalSeconds)); sw.Restart(); }
+        void Mark(string stage) { Timings.Add((stage, sw.Elapsed.TotalSeconds)); StageDone?.Invoke(stage, sw.Elapsed.TotalSeconds); sw.Restart(); }
         var prefix = _encoder.Encode(pts, nrm, n, meshQueryRows);
         await _acc.WaitAsync(); Mark("mesh encoder");
         _vae.EncodeCond(pts, nrm, n, condQueryRows);

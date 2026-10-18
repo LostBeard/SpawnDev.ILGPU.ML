@@ -23,6 +23,9 @@ public sealed class SkinTokensRigger : IDisposable
 
     public sealed record Result(byte[] Glb, UniRigTokenizer.Skeleton Skeleton);
 
+    /// <summary>Called as each stage finishes (name, seconds): progress for a UI.</summary>
+    public Action<string, double>? StageDone { get => _generator.StageDone; set => _generator.StageDone = value; }
+
     /// <param name="weights">The SkinTokens export (export_weights.py skintokens).</param>
     public SkinTokensRigger(Accelerator accelerator, GpuWeights weights)
     {

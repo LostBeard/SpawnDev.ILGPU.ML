@@ -3,6 +3,7 @@
 @using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Trellis2
+@using SpawnDev.ILGPU.ML.SkinTokens
 @implements IDisposable
 
 <PageTitle>Text &amp; Image to 3D — SpawnDev.ILGPU.ML</PageTitle>
@@ -87,7 +88,17 @@
         <div class="t3d-result-info">@_resultInfo</div>
         <div class="result-actions">
             <button class="action-btn download-btn" @onclick="DownloadGlb">Download .glb</button>
+            <button class="action-btn rig-btn" @onclick="RigModelAsync" disabled="@(_isRunning || _rigging)"
+                    title="Adds a skeleton and learned skin weights (SkinTokens, MIT) so the character can be animated. Best on a standing humanoid in a T or A pose.">@(_rigging ? "Rigging…" : "Rig this model")</button>
+            @if (_rigged != null)
+            {
+                <button class="action-btn download-btn" @onclick="DownloadRigged">Download rigged .glb</button>
+            }
         </div>
+        @if (_rigNote != null)
+        {
+            <div class="t3d-hint">@_rigNote</div>
+        }
     </div>
 
     @if (!_ready && !_isLoading && _glb == null)
@@ -111,7 +122,7 @@
     }
 
     <PrivacyBadge />
-    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + SD Turbo + RMBG-1.4; built with DINOv3" />
+    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + SD Turbo + RMBG-1.4; built with DINOv3; rigging: SkinTokens (VAST AI, MIT)" />
 </DemoLayout>
 
 <style>
@@ -140,6 +151,8 @@
     .result-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
     .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
     .download-btn { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .rig-btn { border: 1px solid rgba(139,92,246,0.35); background: rgba(139,92,246,0.12); color: #c4b5fd; }
+    .rig-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
     .model-needed a { color: #fcd34d; }
     .error-banner { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; color: #fca5a5; font-size: 0.85rem; white-space: pre-wrap; }
@@ -301,9 +314,69 @@
         _ => null,
     };
 
+    // Rig this model: SkinTokens (VAST AI Research, MIT; the converted bf16 weights are LostBeard/SkinTokens-bf16) writes a skeleton and learned skin weights into the GLB.
+    // The 1.15 GB of weights stream into OPFS on the first rig and are reused after that. The rigger is built for the call and released straight after: it holds ~3 GB of GPU
+    // memory (weights, KV cache, activations) that the next TRELLIS.2 generation needs.
+    private const string SkinTokensRepo = "LostBeard/SkinTokens-bf16";
+    private bool _rigging;
+    private byte[]? _rigged;
+    private string? _rigNote;
+
+    private async Task RigModelAsync()
+    {
+        if (_glb == null || _accelerator == null || _rigging) return;
+        _rigging = true; _isRunning = true; _error = null; _rigged = null; _rigNote = "Rigging: loading SkinTokens (1.15 GB the first time)...";
+        _isLoading = true; _modelSizeMb = 1150; _modelProgress = 0; _modelStatusText = "SkinTokens"; _currentStage = "SkinTokens weights";
+        StateHasChanged();
+        var total = System.Diagnostics.Stopwatch.StartNew();
+        GpuWeights? weights = null; SkinTokensRigger? rigger = null;
+        try
+        {
+            var estimate = await ModelSource.GetStorageEstimateAsync();
+            var ranged = new SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource(ModelSource);
+            ranged.OnProgress += OnDownloadProgress;
+            await ranged.PlanCacheAsync(SkinTokensWeights.HubWeightFiles(SkinTokensRepo), estimate);
+            weights = await SkinTokensWeights.LoadAsync(_accelerator, ranged, SkinTokensRepo);
+            _isLoading = false; _modelProgress = 100;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            OnStageDone("skintokens weights", total.Elapsed.TotalSeconds);
+            _currentStage = "rig: mesh encoder"; StateHasChanged(); await Task.Yield();
+            rigger = new SkinTokensRigger(_accelerator, weights) { StageDone = (name, seconds) => { OnStageDone("rig " + name, seconds); _ = InvokeAsync(StateHasChanged); } };
+            var result = await rigger.RigGlbAsync(_glb, _seed);
+            _rigged = result.Glb;
+            _rigNote = $"Rigged: {result.Skeleton.Count} joints with learned skin weights · {_rigged.Length / 1048576.0:F1} MB GLB · {total.Elapsed.TotalSeconds:F0} s. Download it, or load it in a viewer that plays skinned meshes.";
+        }
+        catch (Exception ex) { Fail(ex); _rigNote = null; }
+        finally
+        {
+            rigger?.Dispose(); weights?.Dispose();
+            _rigging = false; _isRunning = false; _isLoading = false; _currentStage = null;
+            StateHasChanged();
+        }
+    }
+
+    private void DownloadRigged()
+    {
+        if (_rigged == null) return;
+        try
+        {
+            using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(new[] { _rigged }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "model/gltf-binary" });
+            var url = SpawnDev.SpawnJS.JSObjects.URL.CreateObjectURL(blob);
+            using var document = JS.Get<SpawnDev.SpawnJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.SpawnJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = url;
+            link.Download = "model-rigged.glb";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch (Exception ex) { Fail(ex); }
+    }
+
     private void Begin()
     {
-        _error = null; _glb = null; _resultInfo = null; _stages.Clear();
+        _error = null; _glb = null; _resultInfo = null; _stages.Clear(); _rigged = null; _rigNote = null;
         _isRunning = true;
         _ = InvokeAsync(StateHasChanged);
     }
