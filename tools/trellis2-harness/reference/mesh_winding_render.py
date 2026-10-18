@@ -5,6 +5,11 @@ usage: python mesh_winding_render.py mesh.obj|mesh.glb out.png [more.obj ...]   
 Four views per mesh. A face that faces the camera is shaded grey (headlight Lambert); a face that is the front-most surface at its pixel but whose
 winding normal points AWAY from the camera is RED. On a solid wound outward the front-most surface always faces the camera, so any red is a face
 a viewer with back-face culling or one-sided lighting would get wrong. Prints the share of visible pixels that are red.
+
+CAVEAT (measured 2026-10-18): on a mesh with holes this OVERSTATES wrongly wound faces. Through a hole the front-most surface is the far wall seen from
+inside; it is wound correctly for ITS outside but faces away from the camera, so it renders red. Only a closed region is judged fairly. A winding-independent
+inside test (parity of ray crossings, region by region) turned almost nothing on the repaired crown, witch and humanoid (red share 49.4 -> 49.4%,
+30.7 -> 30.1%, 8.65 -> 8.65%), so the red share is not mainly regions wound the wrong way.
 """
 import sys
 import numpy as np
