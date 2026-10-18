@@ -19,6 +19,7 @@ return command switch
     "decoder" => Gates.Decoder(dir),
     "generate" => Gates.Generate(dir),
     "voxelskin" => Gates.VoxelSkin(dir),
+    "riggl" => Gates.RigGlb(dir, args.Length > 2 ? args[1] : throw new ArgumentException("riggl <in.glb> <out.glb> [seed]"), args[2], args.Length > 3 ? int.Parse(args[3]) : 0),
     "rig" => Gates.Rig(dir, args.Length > 1 ? args[1] : throw new ArgumentException("rig <mesh.obj> [out.json] [seed]"), args.Length > 2 ? args[2] : null, args.Length > 3 ? int.Parse(args[3]) : 0),
     _ => Usage(command),
 };
@@ -289,6 +290,22 @@ namespace UniRigHarness
             bool pass = max < 1e-4 && common >= 0.999 * Math.Max(mine.Count, refVox.Count);
             Console.WriteLine(pass ? "PASS" : "FAIL");
             return pass ? 0 : 1;
+        }
+
+        /// <summary>A generated character GLB to a rigged GLB: skeleton + skin weights, textures untouched.</summary>
+        public static int RigGlb(string dir, string inGlb, string outGlb, int seed)
+        {
+            var glb = File.ReadAllBytes(inGlb);
+            var (ctx, accel) = Gpu.Create();
+            using var _c = ctx; using var _a = accel;
+            using var weights = GpuWeights.LoadFile(accel, Path.Combine(dir, "weights", "skeleton.safetensors"));
+            using var rigger = new UniRigRigger(accel, weights);
+            var sw = Stopwatch.StartNew();
+            var r = rigger.RigGlbAsync(glb, seed).GetAwaiter().GetResult();
+            Console.WriteLine($"riggl    : {r.Skeleton.Count} joints, {glb.Length / 1024} KiB -> {r.Glb.Length / 1024} KiB in {sw.Elapsed.TotalSeconds:F2}s (includes kernel compile)");
+            File.WriteAllBytes(outGlb, r.Glb);
+            Console.WriteLine($"wrote {outGlb}");
+            return 0;
         }
 
         private static int ArgMax(float[] a, int start, int count) { int b = 0; for (int i = 1; i < count; i++) if (a[start + i] > a[start + b]) b = i; return b; }
