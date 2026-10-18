@@ -71,7 +71,7 @@ public sealed class SkinTokensVae : IDisposable
         _k.Linear(attn.View, _w.BF16(p + "attn1.to_out.0.weight"), _w.BF16(p + "attn1.to_out.0.bias"), proj.View, T, Width, Width);
         _k.GateResidual(h, proj.View, _dummy.View, -1, T * Width, Width);
         FeedForward(h, p, T, hn.View, ff.View, proj.View);
-        _acc.Synchronize(); scores?.Dispose();
+        _acc.Fence(); scores?.Dispose();
     }
 
     /// <summary>
@@ -106,14 +106,14 @@ public sealed class SkinTokensVae : IDisposable
         _k.Linear(attn.View, _w.BF16(p + "attn2.to_out.0.weight"), _w.BF16(p + "attn2.to_out.0.bias"), proj.View, CondTokens, Width, Width);
         _k.GateResidual(h.View, proj.View, _dummy.View, -1, CondTokens * Width, Width);
         FeedForward(h.View, p, CondTokens, hn.View, ff.View, proj.View);
-        _acc.Synchronize();
+        _acc.Fence();
         P("cond.block0", h.View, CondTokens, Width);
         for (int b = 1; b <= 2; b++) { SelfBlock(h.View, e + $"blocks.{b}.", CondTokens); P($"cond.block{b}", h.View, CondTokens, Width); }
         Ln(h.View, hn.View, e + "norm_out", CondTokens);
         P("cond.norm_out", hn.View, CondTokens, Width);
         _cond ??= Alloc((long)CondTokens * Latent);
         _k.Linear(hn.View, _w.BF16("vae.model.cond_quant.weight"), _w.BF16("vae.model.cond_quant.bias"), _cond.View, CondTokens, Width, Latent);
-        _acc.Synchronize();
+        _acc.Fence();
         ProjectCond();
         return _cond;
     }
@@ -131,7 +131,7 @@ public sealed class SkinTokensVae : IDisposable
     {
         _condPost ??= Alloc((long)CondTokens * Width);
         _k.Linear(_cond!.View, _w.BF16("vae.model.post_quant.weight"), _w.BF16("vae.model.post_quant.bias"), _condPost.View, CondTokens, Latent, Width);
-        _acc.Synchronize();
+        _acc.Fence();
     }
 
     /// <summary>
@@ -154,7 +154,7 @@ public sealed class SkinTokensVae : IDisposable
             if (r0 == 0) P("dec.proj_query", q0, Math.Min(m, 4000), Width);
             Ln(q0, hn.View, p + "norm2", m);
             _k.Linear(hn.View, _w.BF16(p + "attn2.to_q.weight"), null, _qn.View.SubView((long)r0 * Width, (long)m * Width), m, Width, Width);
-            _acc.Synchronize();
+            _acc.Fence();
         }
     }
 
@@ -177,6 +177,7 @@ public sealed class SkinTokensVae : IDisposable
         _k.Linear(z.View, _w.BF16("vae.model.post_quant.weight"), _w.BF16("vae.model.post_quant.bias"), h.View.SubView(0, TokensPerBone * Width), TokensPerBone, Latent, Width);
         h.View.SubView((long)TokensPerBone * Width, (long)CondTokens * Width).CopyFrom(_condPost.View);
         for (int b = 0; b < SelfBlocks; b++) SelfBlock(h.View, d + $"blocks.{b}.", T);
+        _acc.Fence();                                                              // ids (disposed on return) is still read by queued work on the browser backends
         return h;
     }
 
@@ -210,7 +211,7 @@ public sealed class SkinTokensVae : IDisposable
             Ln(hc.View, hn.View, d + "norm_out", m);
             P("dec.norm_out", hn.View, Math.Min(m, 4000), Width);
             _u.SkinHead(hn.View, _w.BF16(d + "proj_out.weight"), _w.BF16(d + "proj_out.bias"), skin.SubView((long)r0 * columns, (long)m * columns), m, Width, column, columns);
-            _acc.Synchronize();
+            _acc.Fence();
         }
     }
 

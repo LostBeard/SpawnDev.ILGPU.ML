@@ -95,9 +95,9 @@ public sealed class SkinTokensGenerator : IDisposable
         Timings.Clear(); var sw = System.Diagnostics.Stopwatch.StartNew();
         void Mark(string stage) { Timings.Add((stage, sw.Elapsed.TotalSeconds)); sw.Restart(); }
         var prefix = _encoder.Encode(pts, nrm, n, meshQueryRows);
-        await Task.Run(() => _acc.Synchronize()); Mark("mesh encoder");
+        await _acc.WaitAsync(); Mark("mesh encoder");
         _vae.EncodeCond(pts, nrm, n, condQueryRows);
-        await Task.Run(() => _acc.Synchronize()); Mark("cond encoder");
+        await _acc.WaitAsync(); Mark("cond encoder");
         var ids = new List<int> { UniRigTokenizer.Bos, cls };
         var logits = await _decoder.PrefillAsync(prefix.View, SkinTokensMeshEncoder.Tokens, ids.ToArray());
         Mark("prefill");
@@ -141,7 +141,7 @@ public sealed class SkinTokensGenerator : IDisposable
             for (int t = 0; t < codes.Length; t++) codes[t] = ids[first + j * SkinTokensVae.TokensPerBone + t] - SkeletonVocab;
             _vae.DecodeBone(codes, skin.View, j, J);
         }
-        await Task.Run(() => _acc.Synchronize());
+        await _acc.WaitAsync();
         Mark($"skin decode ({J} bones x {n} points)");
         return new Result(ids.ToArray(), skeleton, await skin.View.CopyToHostAsync(), n);
     }

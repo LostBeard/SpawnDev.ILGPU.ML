@@ -289,4 +289,44 @@ public abstract partial class MLTestBase
         Ur_Expect(bodyMoved < V * 0.01, $"{bodyMoved} vertices of the torso, head and legs would move noticeably with the right shoulder");
         Console.WriteLine($"[SkinTokens] rigged humanoid: {J} joints, {armVerts} of {V} vertices follow the right arm, left half {leftMoved}, body {bodyMoved} on {accelerator.AcceleratorType}");
     });
+
+    // ───────────────────────────────── browser lane: weights and goldens over HTTP ─────────────────────────────────
+
+    private const string StServer = "http://127.0.0.1:8765/";            // tools/unirig-harness/serve-files.mjs E:/spawndev-unirig 8765
+
+    private static T[] St_NpyBytes<T>(byte[] b) where T : unmanaged
+    {
+        int hlen = b[6] == 1 ? BitConverter.ToUInt16(b, 8) : BitConverter.ToInt32(b, 8), off = (b[6] == 1 ? 10 : 12) + hlen;
+        var data = new T[(b.Length - off) / System.Runtime.InteropServices.Marshal.SizeOf<T>()];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(data.AsSpan()).Clear();
+        b.AsSpan(off).CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(data.AsSpan()));
+        return data;
+    }
+
+    /// <summary>
+    /// The whole SkinTokens pass on the golden's cloud on ANY backend that can read the weights over HTTP (the browser WebGPU lane in particular): a valid rig whose bone count is
+    /// near the reference's. Needs the local file server (see <see cref="StServer"/>); skipped when it is not running.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task SkinTokens_OverHttp_ProducesAValidRig() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] points; try { points = await http.GetByteArrayAsync(StServer + "skintokens/golden/points.npy"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs E:/spawndev-unirig 8765"); }
+        var pts = St_NpyBytes<float>(points); var nrm = St_NpyBytes<float>(await http.GetByteArrayAsync(StServer + "skintokens/golden/normals.npy"));
+        var mpre = St_NpyBytes<long>(await http.GetByteArrayAsync(StServer + "skintokens/golden/mesh_presample_idx.npy")); var mfps = St_NpyBytes<long>(await http.GetByteArrayAsync(StServer + "skintokens/golden/mesh_fps_idx.npy"));
+        var cpre = St_NpyBytes<long>(await http.GetByteArrayAsync(StServer + "skintokens/golden/cond_presample_idx.npy")); var cfps = St_NpyBytes<long>(await http.GetByteArrayAsync(StServer + "skintokens/golden/cond_fps_idx.npy"));
+        int n = pts.Length / 3; var sw = System.Diagnostics.Stopwatch.StartNew();
+        await using var stream = await http.GetStreamAsync(StServer + "weights/skintokens.safetensors");
+        using var weights = await SkinTokensWeights.LoadAsync(accelerator, stream);
+        double load = sw.Elapsed.TotalSeconds; sw.Restart();
+        using var p = accelerator.Allocate1D(pts); using var q = accelerator.Allocate1D(nrm); using var gen = new SkinTokensGenerator(accelerator, weights);
+        var r = await gen.GenerateAsync(p.View, q.View, n, St_Rows(mpre, mfps), St_Rows(cpre, cfps));
+        int J = r.Skeleton.Count;
+        Ur_Expect(J >= 10 && J <= 120, $"{J} bones");
+        Ur_Expect(r.Skeleton.Parents[0] == -1 && Enumerable.Range(1, J - 1).All(j => r.Skeleton.Parents[j] >= 0 && r.Skeleton.Parents[j] < j), "parents are not a tree in creation order");
+        Ur_Expect(r.Skin.Length == n * J && r.Skin.All(v => float.IsFinite(v) && v >= 0f && v <= 1f), "skin weights are not finite values in [0,1]");
+        Console.WriteLine($"[SkinTokens] over HTTP on {accelerator.AcceleratorType}: weights {load:F1} s, rig {sw.Elapsed.TotalSeconds:F1} s, {J} bones ({string.Join(", ", gen.Timings.Select(t => $"{t.Stage} {t.Seconds:F2}"))})");
+    });
 }
