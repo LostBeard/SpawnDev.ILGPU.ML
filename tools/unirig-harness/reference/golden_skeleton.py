@@ -66,6 +66,22 @@ if __name__ == '__main__':
         res = model.generate(vertices=torch.from_numpy(pts), normals=torch.from_numpy(nrm), cls='articulationxl',
                              max_new_tokens=max_new, num_beams=1, do_sample=False, num_return_sequences=1)
         print(f'generate {time.time() - t0:.1f}s, tokens {len(res.tokens)}, bones {res.bones.shape}')
+    # Teacher-forced decoder logits and the grammar's allowed set at every step, for the golden token sequence (gates the C# decoder and grammar separately).
+    # res.tokens = [cls, generated...] (bos and the final eos are not in it). The sequence the model consumed is [bos] + res.tokens; after its last token it
+    # predicted eos. Row r of the logits (r = 0 is the bos position) is the distribution of the token AFTER full[r]; the generation loop starts at r = 1 (the cls).
+    full = np.concatenate([[tokenizer.bos], np.asarray(res.tokens)]).astype(np.int64)
+    with torch.no_grad():
+        emb = model.transformer.get_input_embeddings()(torch.from_numpy(full).unsqueeze(0))
+        logits = model.transformer(inputs_embeds=torch.cat([lat.to(emb.dtype), emb], dim=1), use_cache=False).logits[0, lat.shape[1]:][1:]   # rows 1..len(full)-1
+    allowed = [sorted(int(x) for x in tokenizer.next_posible_token(ids=full[:r + 1])) for r in range(1, len(full))]     # the set offered after full[:r+1]
+    expect = np.concatenate([full[2:], [tokenizer.eos]])                       # what each row must pick (greedy under the grammar)
+    masked = logits.clone(); mask = torch.full_like(masked, float('-inf'))
+    for r, a in enumerate(allowed): mask[r, a] = 0
+    pick = (masked + mask).argmax(-1).numpy()
+    print('teacher-forced greedy under the grammar reproduces the generated tokens:', bool((pick == expect).all()), f'({int((pick == expect).sum())}/{len(expect)})')
+    np.save(os.path.join(out, 'logits_teacher.npy'), logits.numpy()); np.save(os.path.join(out, 'full_ids.npy'), full)
+    json.dump(allowed, open(os.path.join(out, 'allowed.json'), 'w'))
+    print('teacher logits', tuple(logits.shape), 'full ids', full.shape, 'allowed steps', len(allowed))
     np.save(os.path.join(out, 'points.npy'), pts); np.save(os.path.join(out, 'normals.npy'), nrm)
     np.save(os.path.join(out, 'latents.npy'), lat.numpy())
     np.save(os.path.join(out, 'tokens.npy'), np.asarray(res.tokens)); np.save(os.path.join(out, 'bones.npy'), np.asarray(res.bones))
