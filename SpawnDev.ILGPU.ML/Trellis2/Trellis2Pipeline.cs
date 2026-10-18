@@ -322,14 +322,29 @@ public sealed class Trellis2Pipeline : IDisposable
     /// </summary>
     public Action<string, float[], int[]>? MeshStage { get; set; }
 
+    /// <summary>Run <see cref="MeshRepair"/> before and after the edge collapse (default on; <see cref="Trellis2Options.RepairMesh"/>).</summary>
+    public bool RepairMesh { get; set; } = true;
+
+    private (float[], int[]) Repair(string stage, float[] positions, int[] faces, Stopwatch sw)
+    {
+        var (p, f, r) = MeshRepair.Repair(positions, faces);
+        StageDone?.Invoke($"mesh repair {stage}: open {r.Before.BoundaryEdges}->{r.After.BoundaryEdges}, non-manifold {r.Before.NonManifoldEdges}->{r.After.NonManifoldEdges}, " +
+            $"wrong-way edges {r.Before.OrientationConflicts}->{r.After.OrientationConflicts}, {r.HolesFilled} holes closed, {r.FragmentComponents} fragments removed", sw.Elapsed.TotalSeconds);
+        sw.Restart();
+        return (p, f);
+    }
+
     private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw)
     {
         MeshStage?.Invoke("extracted", positions, faces);
+        if (RepairMesh) { (positions, faces) = Repair("(dual grid)", positions, faces, sw); MeshStage?.Invoke("repaired", positions, faces); }
         if (maxFaces > 0 && faces.Length / 3 > maxFaces)
         {
             int before = faces.Length / 3;
             (positions, faces) = MeshSimplifier.Simplify(positions, faces, maxFaces);
             StageDone?.Invoke($"simplify {before} -> {faces.Length / 3} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+            // the edge collapse of a repaired mesh still leaves a few pinches and one-face gaps: repair again, on 150k faces it is a fraction of a second
+            if (RepairMesh) (positions, faces) = Repair("(simplified)", positions, faces, sw);
             MeshStage?.Invoke("simplified", positions, faces);
         }
         var normals = PbrGlbWriter.VertexNormals(positions, faces);

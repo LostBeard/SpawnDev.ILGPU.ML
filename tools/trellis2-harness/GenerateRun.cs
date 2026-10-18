@@ -102,6 +102,7 @@ internal static class GenerateRun
         {
             // debug preview data: voxel centres + PBR attributes (read by reference/preview_voxels.py)
             using var o = gen.Generate(input, w, h, options, out var pipe);
+            if (Environment.GetEnvironmentVariable("TRELLIS2_NOREPAIR") == "1") pipe.RepairMesh = false;   // A/B arm: the mesh as the decoder made it
             if (Environment.GetEnvironmentVariable("TRELLIS2_MESHSTAGES") == "1")
             {
                 // every stage's mesh as <out>.<stage>.obj, for reference/mesh_audit.py (which stage makes it open / non-manifold?)

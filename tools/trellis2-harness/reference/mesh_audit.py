@@ -46,19 +46,23 @@ def load_glb(path):
     return acc(p['attributes']['POSITION']).astype(np.float64), acc(p['indices']).astype(np.int64).reshape(-1, 3)
 
 
-def weld(pos, idx, quant=1.0 / 4096):
+def weld(pos, idx, rel=2e-6):
+    """Merge vertices that coincide to float32 noise (rel x bbox diagonal). MeshRepair's split copies sit ~1e-4 x the longest side
+    apart, so a loader that merges vertices by position sees them as separate - which is the point of the nudge."""
+    diag = float(np.linalg.norm(pos.max(0) - pos.min(0))) or 1.0
+    quant = rel * diag
     q = np.round(pos / quant).astype(np.int64)
     _, first, inv = np.unique(q, axis=0, return_index=True, return_inverse=True)
     f = inv.reshape(-1)[idx]
     return pos[first], f
 
 
-def audit(path):
+def audit(path, detail=False):
     pos, idx = load_glb(path)
-    return audit_mesh(pos, idx, path)
+    return audit_mesh(pos, idx, path, detail=detail)
 
 
-def audit_mesh(pos, idx, path, quiet=False):
+def audit_mesh(pos, idx, path, quiet=False, detail=False):
     v, f = weld(pos, idx)
     n_in = len(f)
     # drop collapsed faces from the weld, but count them: they are degenerate
@@ -106,6 +110,22 @@ def audit_mesh(pos, idx, path, quiet=False):
     euler = len(used) - len(ukey) + len(f)
     if quiet:
         return dict(boundary=boundary, nonmanifold=nonmanifold, conflicts=int(pair_same), comps=int(ncomp), small=small_faces, euler=int(euler), volume=vol)
+    if detail:
+        # where do the defects live? per component: faces, open edges, orientation conflicts (edges whose two faces run the same way)
+        ef = fs[:-1][same]; eg = fs[1:][same]
+        dkey = de[:, 0] * nv + de[:, 1]
+        # per undirected edge with exactly two faces: conflict if both half-edges carry the same directed key
+        h_sorted = np.argsort(inv, kind='stable'); ks2 = inv[h_sorted]; dk_s = dkey[h_sorted]
+        pair = (ks2[:-1] == ks2[1:]) & (cnt[ks2[:-1]] == 2)
+        conf = pair & (dk_s[:-1] == dk_s[1:])
+        conf_comp = np.bincount(lab[(h_sorted[:-1] % len(f))[conf]], minlength=ncomp)
+        bnd_half = np.where(cnt[inv] == 1)[0]
+        bnd_comp = np.bincount(lab[bnd_half % len(f)], minlength=ncomp)
+        print('  top components by faces: faces / open edges / orientation conflicts')
+        for c in np.argsort(-sizes)[:8]:
+            print(f'    comp {c}: {sizes[c]} / {bnd_comp[c]} / {conf_comp[c]}')
+        small = sizes < 100
+        print(f'  components under 100 faces: {int(small.sum())} ({int(sizes[small].sum())} faces, {int(bnd_comp[small].sum())} open edges, {int(conf_comp[small].sum())} conflicts)')
     print(f'== {path}')
     print(f'  GLB verts {len(pos)} faces {n_in}  |  welded verts {len(used)} faces {len(f)} (collapsed by weld {int(collapsed.sum())})')
     print(f'  bbox diag {diag:.3f}  area {area.sum():.4f}  signed volume {vol:.5f} ({"inside-out" if vol < 0 else "ok"})')
@@ -162,5 +182,6 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--selftest']:
         selftest()
     else:
-        for p in sys.argv[1:]:
-            audit(p)
+        detail = '--detail' in sys.argv
+        for p in [a for a in sys.argv[1:] if not a.startswith('--')]:
+            audit(p, detail)

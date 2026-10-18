@@ -35,6 +35,12 @@ public sealed class Trellis2Options
     public int Resolution { get; init; } = 512;
     /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh, 1-2.5M triangles). Measured on the official crown: 120k looks the same as 300k; at 40-50k thin sheets shred and texels go missing.</summary>
     public int MaxFaces { get; init; } = 150_000;
+    /// <summary>
+    /// Clean the mesh up (<see cref="MeshRepair"/>) before and after it is simplified, as the reference's <c>to_glb</c> does: no non-manifold edges, one consistent
+    /// winding, small holes closed, floating fragments removed. The dual-grid mesh straight from the decoder is open and non-manifold (crown: 4.7% open edges,
+    /// 227k non-manifold edges, 730k orientation conflicts). Costs a few seconds of host time on a multi-million face mesh.
+    /// </summary>
+    public bool RepairMesh { get; init; } = true;
 }
 
 /// <summary>
@@ -73,6 +79,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
     {
         options ??= new Trellis2Options();
         var (output, pipe) = await GenerateAsync(rgba, width, height, options, ct);
+        pipe.RepairMesh = options.RepairMesh;
         using (output) return await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
     }
 

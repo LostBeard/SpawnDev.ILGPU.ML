@@ -32,6 +32,7 @@ return command switch
     "loadbench" => LoadBench.Run(args[1]),
     "atlasmesh" => AtlasMeshRun.Run(args[1]),
     "cluster" => ClusterProbe.Run(args[1]),
+    "repair" => RepairRun.Run(args[1], args[2], args.Length > 4 && args[3] == "simplify" ? int.Parse(args[4]) : 0),
     "generate" => GenerateRun.Run(args[1], args[2]),
     "text2glb" => GenerateRun.Text(args[1], args[2]),
     "prep" => Golden.Prep(),
