@@ -18,6 +18,7 @@ return command switch
     "tokenizer" => Gates.Tokenizer(dir),
     "decoder" => Gates.Decoder(dir),
     "generate" => Gates.Generate(dir),
+    "voxelskin" => Gates.VoxelSkin(dir),
     "rig" => Gates.Rig(dir, args.Length > 1 ? args[1] : throw new ArgumentException("rig <mesh.obj> [out.json] [seed]"), args.Length > 2 ? args[2] : null, args.Length > 3 ? int.Parse(args[3]) : 0),
     _ => Usage(command),
 };
@@ -259,6 +260,38 @@ namespace UniRigHarness
             }
             return 0;
         }
+
+        /// <summary>The skinning prior: C# graph + Dijkstra + weights on the reference's own voxels against the reference's skin, then the C# voxelisation against the same voxel set.</summary>
+        public static int VoxelSkin(string dir)
+        {
+            var g = Path.Combine(dir, "golden", "voxel_skin");
+            var (v, vs) = Npy.Load<float>(Path.Combine(g, "vertices.npy"));
+            var (fi, _) = Npy.Load<int>(Path.Combine(g, "faces.npy"));
+            var (jn, js) = Npy.Load<float>(Path.Combine(g, "joints.npy"));
+            var (gc, _) = Npy.Load<float>(Path.Combine(g, "grid_coords.npy"));
+            var (gold, _) = Npy.Load<float>(Path.Combine(g, "skin.npy"));
+            int grid = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(g, "manifest.json"))).RootElement.GetProperty("grid").GetInt32();
+            int n = vs[0], J = js[0];
+
+            var sw = Stopwatch.StartNew();
+            var refVox = UniRigVoxelSkin.FromCoords(gc, grid);
+            var skin = UniRigVoxelSkin.Compute(v, fi, jn, refVox);
+            Console.WriteLine($"skin     : {n} vertices x {J} joints, {refVox.Count} voxels, graph + Dijkstra {sw.Elapsed.TotalSeconds:F2}s");
+            double max = 0, sum = 0; int worstRow = -1;
+            for (int i = 0; i < gold.Length; i++) { double d = Math.Abs(skin[i] - gold[i]); sum += d; if (d > max) { max = d; worstRow = i / J; } }
+            Console.WriteLine($"           vs reference skin: max |diff| {max:E2} (vertex {worstRow}), mean {sum / gold.Length:E2}; dominant bone differs on {Enumerable.Range(0, n).Count(i => ArgMax(skin, i * J, J) != ArgMax(gold, i * J, J))} vertices");
+
+            sw.Restart();
+            var mine = UniRigVoxelSkin.Voxelize(v, fi, grid);
+            var theirs = new HashSet<long>(); for (int q = 0; q < refVox.Count; q++) theirs.Add(((long)refVox.Cells[q * 3] * grid + refVox.Cells[q * 3 + 1]) * grid + refVox.Cells[q * 3 + 2]);
+            int common = 0; for (int q = 0; q < mine.Count; q++) if (theirs.Contains(((long)mine.Cells[q * 3] * grid + mine.Cells[q * 3 + 1]) * grid + mine.Cells[q * 3 + 2])) common++;
+            Console.WriteLine($"voxelize : {mine.Count} voxels (reference-side implementation {refVox.Count}), {common} in common, {sw.Elapsed.TotalSeconds:F2}s");
+            bool pass = max < 1e-4 && common >= 0.999 * Math.Max(mine.Count, refVox.Count);
+            Console.WriteLine(pass ? "PASS" : "FAIL");
+            return pass ? 0 : 1;
+        }
+
+        private static int ArgMax(float[] a, int start, int count) { int b = 0; for (int i = 1; i < count; i++) if (a[start + i] > a[start + b]) b = i; return b; }
 
         private static double StdOf(float[] a, int start, int count)
         {
