@@ -3,7 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased
+## 5.3.13 - 2026-10-18 - browser storage is not capped at 10 GB
+
+Requires SpawnDev.ILGPU 5.3.8.
 
 - **The TRELLIS.2 demo no longer caps browser storage at 10 GB.** `navigator.storage.estimate()` is not a limit on stock Chrome 151: an origin
   with no usage reports a quota of exactly 10 GiB and the quota rises one byte per byte written (usage 0 / quota 10, 1 / 11 ... 14 / 24 GiB;
