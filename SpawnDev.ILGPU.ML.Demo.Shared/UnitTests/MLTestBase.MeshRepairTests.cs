@@ -171,6 +171,28 @@ public abstract partial class MLTestBase
         return MeshRepair.Measure(np.ToArray(), f.Select(i => remap[i]).ToArray());
     }
 
+    /// <summary>The topology of a GLB's first mesh as a loader that merges vertices by position sees it (a GLB duplicates vertices along UV seams).</summary>
+    internal static MeshRepair.Topology Mr_GlbWeldedTopology(byte[] glb)
+    {
+        int jsonLen = (int)BitConverter.ToUInt32(glb, 12), bin = 20 + jsonLen + 8;
+        using var doc = System.Text.Json.JsonDocument.Parse(glb.AsMemory(20, jsonLen));
+        var root = doc.RootElement; var prim = root.GetProperty("meshes")[0].GetProperty("primitives")[0];
+        byte[] Bytes(int accessor, out int count, out int comps, out int ctype)
+        {
+            var a = root.GetProperty("accessors")[accessor]; var bv = root.GetProperty("bufferViews")[a.GetProperty("bufferView").GetInt32()];
+            count = a.GetProperty("count").GetInt32(); ctype = a.GetProperty("componentType").GetInt32();
+            comps = a.GetProperty("type").GetString() switch { "SCALAR" => 1, "VEC2" => 2, "VEC3" => 3, _ => 4 };
+            int off = bin + (bv.TryGetProperty("byteOffset", out var bo) ? bo.GetInt32() : 0) + (a.TryGetProperty("byteOffset", out var ao) ? ao.GetInt32() : 0);
+            return glb.AsSpan(off, count * comps * (ctype == 5123 ? 2 : 4)).ToArray();
+        }
+        var pb = Bytes(prim.GetProperty("attributes").GetProperty("POSITION").GetInt32(), out int nv, out _, out _);
+        var ib = Bytes(prim.GetProperty("indices").GetInt32(), out int ni, out _, out int ict);
+        var pos = new float[nv * 3]; Buffer.BlockCopy(pb, 0, pos, 0, pb.Length);
+        var idx = new int[ni];
+        for (int i = 0; i < ni; i++) idx[i] = ict == 5123 ? BitConverter.ToUInt16(ib, i * 2) : (int)BitConverter.ToUInt32(ib, i * 4);
+        return Mr_WeldedTopology(pos, idx);
+    }
+
     /// <summary>
     /// The repair must survive a loader that merges vertices by position. Split vertex copies are moved a hair toward their own fan; without that
     /// a weld glues them back together and every non-manifold edge returns (MEASURED on the crown: 175,233 non-manifold edges after a weld of a mesh

@@ -3,6 +3,25 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.14 - 2026-10-18 - TRELLIS.2 meshes are cleaned up (MeshRepair)
+
+Requires SpawnDev.ILGPU 5.3.8.
+
+- **`MeshRepair`: the reference's mesh clean-up, on by default (`Trellis2Options.RepairMesh`).** The dual-grid mesh straight from the decoder is open and
+  non-manifold; the reference's `to_glb` repairs it before it simplifies and unwraps, and this port did not. MEASURED on the crown (3,003,556 faces): 4.7%
+  open edges, 227,561 non-manifold edges, 730,872 edges whose two faces are wound opposite ways. `MeshRepair` (host, about 5 s on 3M faces) removes
+  duplicate and degenerate faces; resolves non-manifold edges by pairing the faces that continue each other as a sheet and splitting the rest into their
+  own vertices (no geometry deleted; copies are nudged 1e-4 of the model so a loader that merges vertices by position does not undo it); removes floating
+  fragments; gives every piece one winding (most parallel edges first) and turns a closed piece with negative volume outward; closes boundary loops up to
+  3% of the model. It runs before and after the edge collapse. Through the pipeline on the crown: non-manifold edges 53,093 -> 0 (also after a weld by
+  position), wrong-way edges 28,013 -> 9,756, faces contradicting their stored vertex normal 37.1% -> 20.0%, UV charts 98,678 -> 59,067 and atlas use
+  31% -> 45%, +2.6 s of a 38.7 s run. `Trellis2Pipeline.MeshStage` reports the mesh after each stage; harness `repair`, `TRELLIS2_MESHSTAGES`,
+  `reference/mesh_audit.py` (independent audit) and `mesh_winding_render.py`.
+- **Not done:** consistent winding is not outward winding for thin or open shapes (the crown is a filigree; about half of its visible faces are still wound
+  away from the viewer, the GLB is double-sided so shading copes), and one-voxel-thick sheets still share vertices between their two layers.
+- Tests `MeshRepair_*`; `Trellis2_ImageToGlb_EndToEnd` now asserts the generated GLB has no non-manifold edges after a weld by position.
+
+
 ## 5.3.13 - 2026-10-18 - browser storage is not capped at 10 GB
 
 Requires SpawnDev.ILGPU 5.3.8.

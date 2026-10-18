@@ -167,7 +167,11 @@ public abstract partial class MLTestBase
         int triangles = doc.RootElement.GetProperty("accessors").EnumerateArray()
             .Where(a => a.GetProperty("type").GetString() == "SCALAR").Select(a => a.GetProperty("count").GetInt32()).Max() / 3;
         if (triangles < 1000) throw new Exception($"only {triangles} triangles");
+        // The mesh must be well formed as a loader that merges vertices by position sees it: the dual-grid mesh straight from the decoder has tens of
+        // thousands of non-manifold edges (Trellis2Options.RepairMesh, MeshRepair).
+        var topo = Mr_GlbWeldedTopology(glb);
+        if (topo.NonManifoldEdges != 0) throw new Exception($"the generated GLB has {topo.NonManifoldEdges} non-manifold edges after a weld by position: {topo}");
         await Task.CompletedTask;
-        return $"{glb.Length / 1024} KiB GLB, {triangles} triangles; " + string.Join(", ", stages.TakeLast(6));
+        return $"{glb.Length / 1024} KiB GLB, {triangles} triangles, {topo.NonManifoldEdges} non-manifold / {topo.OrientationConflicts} wrong-way edges; " + string.Join(", ", stages.TakeLast(6));
     });
 }
