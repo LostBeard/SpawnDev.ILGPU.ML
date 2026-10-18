@@ -81,6 +81,9 @@ public sealed class SkinTokensGenerator : IDisposable
         _vae = new SkinTokensVae(accelerator, weights);
     }
 
+    /// <summary>Wall seconds per stage of the last <see cref="GenerateAsync"/>: mesh encoder, cond encoder, prefill, skeleton tokens, skin tokens, skin decode.</summary>
+    public List<(string Stage, double Seconds)> Timings { get; } = new();
+
     /// <param name="Ids">Every id, start tokens first: [bos, cls, skeleton..., switch, skin tokens..., end].</param>
     /// <param name="Skeleton">Joints in the normalised ([-1,1]) space and parents.</param>
     /// <param name="Skin">[n, J] weights in 0..1 as the VAE writes them (not normalised to sum 1).</param>
@@ -89,10 +92,15 @@ public sealed class SkinTokensGenerator : IDisposable
     /// <summary>The prefix, the cond latents and the generated rig of a point cloud already on the device.</summary>
     public async Task<Result> GenerateAsync(FV pts, FV nrm, int n, int[] meshQueryRows, int[] condQueryRows, int maxSkeletonTokens = 1400, int cls = UniRigTokenizer.ClsArticulationXl)
     {
+        Timings.Clear(); var sw = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string stage) { Timings.Add((stage, sw.Elapsed.TotalSeconds)); sw.Restart(); }
         var prefix = _encoder.Encode(pts, nrm, n, meshQueryRows);
+        await Task.Run(() => _acc.Synchronize()); Mark("mesh encoder");
         _vae.EncodeCond(pts, nrm, n, condQueryRows);
+        await Task.Run(() => _acc.Synchronize()); Mark("cond encoder");
         var ids = new List<int> { UniRigTokenizer.Bos, cls };
         var logits = await _decoder.PrefillAsync(prefix.View, SkinTokensMeshEncoder.Tokens, ids.ToArray());
+        Mark("prefill");
 
         // phase 1: the skeleton under UniRig's grammar, until the switch token
         var state = UniRigTokenizer.StateAfter(ids.ToArray());
@@ -109,6 +117,7 @@ public sealed class SkinTokensGenerator : IDisposable
         }
         var skeleton = UniRigTokenizer.Detokenize(ids.ToArray());
         int J = skeleton.Count;
+        Mark($"skeleton tokens ({ids.Count - 2})");
 
         // phase 2: 4 skin tokens per bone, nothing else
         int need = J * SkinTokensVae.TokensPerBone;
@@ -120,6 +129,7 @@ public sealed class SkinTokensGenerator : IDisposable
             if (i + 1 < need) logits = await _decoder.StepAsync(best);
         }
         ids.Add(EndToken);
+        Mark($"skin tokens ({need})");
 
         // the skin weights: every bone's 4 codes against every point
         using var skin = _acc.Allocate1D<float>((long)n * J);
@@ -132,6 +142,7 @@ public sealed class SkinTokensGenerator : IDisposable
             _vae.DecodeBone(codes, skin.View, j, J);
         }
         await Task.Run(() => _acc.Synchronize());
+        Mark($"skin decode ({J} bones x {n} points)");
         return new Result(ids.ToArray(), skeleton, await skin.View.CopyToHostAsync(), n);
     }
 

@@ -21,7 +21,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   over 54,000 samples, 10 self-attention blocks, a query block) decodes every bone's tokens into weights at every sample, which are mapped to the mesh by an 8-nearest inverse-distance
   blend. Gated against the REAL reference in float32 (`tools/unirig-harness/reference/golden_skintokens.py`): with exact kernels 295 of 296 generated tokens are identical and the skin
   weights match to 5.7e-5 relRMS; the CUDA tensor-core path costs ~1e-2 (bf16 activations; 2e-4 without) and still finds the same 35 bones. A TRELLIS.2 humanoid: 42 joints, the posed right
-  arm moves 18,082 of 67,186 vertices and the left half none; the GLB validates with 0 errors; 16.5 s on an RTX 4070. Two quirks of the shipped model are reproduced on purpose: its
+  arm moves 18,082 of 67,186 vertices and the left half none; the GLB validates with 0 errors; 5.8 s warm (7.1 s cold) on an RTX 4070 (a coalesced GEMV for single-token steps took a token from 43 to 11 ms). Two quirks of the shipped model are reproduced on purpose: its
   non-persistent frequency / phase / `inv_freq` tables are rounded to bf16 by `.to(bfloat16)`, and the pip checkpoint's logits processor ends the sequence one skin token early (its last
   bone is decoded with the END id wrapped to FSQ code 0); this port writes all four tokens of every bone. Weights: `export_weights.py skintokens` (1.15 GB bf16, not shipped in the package).
   Tests `SkinTokens_*`. Decoding is greedy (the shipped sampling is random); not yet on the browser path.

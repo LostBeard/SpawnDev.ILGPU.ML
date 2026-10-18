@@ -189,7 +189,13 @@ public abstract partial class MLTestBase
         using var p = accelerator.Allocate1D(pts); using var q = accelerator.Allocate1D(nrm); using var gen = new SkinTokensGenerator(accelerator, weights);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var r = await gen.GenerateAsync(p.View, q.View, ps[0], St_Rows(mpre, mfps), St_Rows(cpre, cfps));
+        double cold = sw.Elapsed.TotalSeconds; var coldStages = string.Join(", ", gen.Timings.Select(t => $"{t.Stage} {t.Seconds:F2}"));
+        sw.Restart();
+        var r2 = await gen.GenerateAsync(p.View, q.View, ps[0], St_Rows(mpre, mfps), St_Rows(cpre, cfps));
+        double warm = sw.Elapsed.TotalSeconds;
+        Console.WriteLine($"[SkinTokens] cold {cold:F1} s ({coldStages}); warm {warm:F1} s ({string.Join(", ", gen.Timings.Select(t => $"{t.Stage} {t.Seconds:F2}"))})");
         int J = r.Skeleton.Count;
+        Ur_Expect(r2.Ids.SequenceEqual(r.Ids), "two runs of the same input differ");
         Ur_Expect(J >= 10 && J <= 3 * refJ, $"{J} bones (the reference found {refJ})");
         Ur_Expect(r.Skeleton.Parents[0] == -1 && Enumerable.Range(1, J - 1).All(j => r.Skeleton.Parents[j] >= 0 && r.Skeleton.Parents[j] < j), "parents are not a tree in creation order");
         Ur_Expect(r.Skin.Length == n * J && r.Skin.All(v => float.IsFinite(v) && v >= 0f && v <= 1f), "skin weights are not finite values in [0,1]");

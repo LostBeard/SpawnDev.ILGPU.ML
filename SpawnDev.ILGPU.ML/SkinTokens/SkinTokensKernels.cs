@@ -17,6 +17,35 @@ public sealed class SkinTokensKernels
     private readonly Accelerator _acc;
     public SkinTokensKernels(Accelerator accelerator) => _acc = accelerator;
 
+    // ───────────────────────────────────────────── single-row linear (decode) ─────────────────────────────────────────────
+
+    private const int GemvThreads = 128;
+    private Action<KernelConfig, FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int>? _gemv;
+    private static void GemvImpl(FV x, ArrayView1D<uint, Stride1D.Dense> w, BV bias, FV o, int K, int hasBias)
+    {
+        int n = Grid.IdxX, t = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvThreads);
+        long rowPairs = (long)n * (K / 2);                                         // weights as bf16 pairs in one uint: two values per 32-bit coalesced load
+        float acc = 0f;
+        for (int p = t; p < K / 2; p += GemvThreads)
+        {
+            uint u = w[rowPairs + p];
+            acc += x[2 * p] * Interop.IntAsFloat(u << 16) + x[2 * p + 1] * Interop.IntAsFloat(u & 0xFFFF0000u);
+        }
+        sh[t] = acc;
+        Group.Barrier();
+        for (int s = GemvThreads / 2; s > 0; s >>= 1) { if (t < s) sh[t] += sh[t + s]; Group.Barrier(); }
+        if (t == 0) o[n] = sh[0] + (hasBias != 0 ? PrecisionConvert.ConvertToSingle(bias[n]) : 0f);
+    }
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBias;
+    /// <summary>o[0, n] = x[0, :] . w[n, :] (+ bias[n]) for one row: one 128-thread group per output, coalesced bf16 pairs. K must be even. Replaces the general GEMM, which launches too few blocks at M = 1.</summary>
+    public void Gemv(FV x, BV w, BV? bias, FV o, int K, int N)
+    {
+        _gemv ??= _acc.LoadStreamKernel<FV, ArrayView1D<uint, Stride1D.Dense>, BV, FV, int, int>(GemvImpl);
+        _noBias ??= _acc.Allocate1D<BFloat16>(1);
+        _gemv(new KernelConfig(N, GemvThreads), x, w.Cast<BFloat16, uint>(), bias ?? _noBias.View, o, K, bias.HasValue ? 1 : 0);
+    }
+
     // ───────────────────────────────────────────── norms ─────────────────────────────────────────────
 
     private Action<Index1D, FV, FV, BV, int, float>? _rms;

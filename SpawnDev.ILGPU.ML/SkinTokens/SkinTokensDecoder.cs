@@ -83,6 +83,16 @@ public sealed class SkinTokensDecoder : IDisposable
         return await ForwardAsync(1, 1);
     }
 
+    /// <summary>x[rows, K] times w[N, K]^T: the general GEMM for a prefill, the coalesced GEMV for a single token.</summary>
+    private void Lin(FV x, string weight, FV o, int rows, int K, int N)
+    {
+        if (rows == 1 && UseGemv) _u.Gemv(x, _w.BF16(weight), null, o, K, N);
+        else _k.Linear(x, _w.BF16(weight), null, o, rows, K, N);
+    }
+
+    /// <summary>Single-token steps use <see cref="SkinTokensKernels.Gemv"/> (default); turn off to compare with the general GEMM.</summary>
+    public static bool UseGemv = Environment.GetEnvironmentVariable("SKINTOKENS_GEMV") != "0";
+
     /// <summary>T rows already embedded in _h at positions _pos.._pos+T-1.</summary>
     private async Task<float[]> ForwardAsync(int T, int lastRows)
     {
@@ -91,24 +101,24 @@ public sealed class SkinTokensDecoder : IDisposable
         {
             string b = $"transformer.model.layers.{l}.";
             _u.RmsNorm(_h.View, _hn.View, _w.BF16(b + "input_layernorm.weight"), T, C, RmsEps);
-            _k.Linear(_hn.View, _w.BF16(b + "self_attn.qkv_proj.weight"), null, _qkv.View, T, C, QkvCols);
+            Lin(_hn.View, b + "self_attn.qkv_proj.weight", _qkv.View, T, C, QkvCols);
             _u.RmsNormHeads(_qkv.View, _w.BF16(b + "self_attn.q_norm.weight"), T, QkvCols, 0, QHeads, HeadDim, RmsEps);
             _u.RmsNormHeads(_qkv.View, _w.BF16(b + "self_attn.k_norm.weight"), T, QkvCols, QCols, KvHeads, HeadDim, RmsEps);
             _u.Rope(_qkv.View, _invFreq.View, T, QkvCols, 0, QHeads, HeadDim, p0);
             _u.Rope(_qkv.View, _invFreq.View, T, QkvCols, QCols, KvHeads, HeadDim, p0);
             _u.StoreKv(_qkv.View, _kc[l].View, _vc[l].View, p0, T, QCols, KvCols);
             _u.CausalGqa(_qkv.View, _kc[l].View, _vc[l].View, _scores.View, _attn.View, p0, T, QHeads, HeadDim, Rep);
-            _k.Linear(_attn.View, _w.BF16(b + "self_attn.o_proj.weight"), null, _proj.View, T, QCols, C);
+            Lin(_attn.View, b + "self_attn.o_proj.weight", _proj.View, T, QCols, C);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, T * C, C);
             _u.RmsNorm(_h.View, _hn.View, _w.BF16(b + "post_attention_layernorm.weight"), T, C, RmsEps);
-            _k.Linear(_hn.View, _w.BF16(b + "mlp.gate_up_proj.weight"), null, _gateUp.View, T, C, 2 * Inter);
+            Lin(_hn.View, b + "mlp.gate_up_proj.weight", _gateUp.View, T, C, 2 * Inter);
             _u.Swiglu(_gateUp.View, _act.View, T, Inter);
-            _k.Linear(_act.View, _w.BF16(b + "mlp.down_proj.weight"), null, _proj.View, T, Inter, C);
+            Lin(_act.View, b + "mlp.down_proj.weight", _proj.View, T, Inter, C);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, T * C, C);
         }
         var last = _h.View.SubView((long)(T - lastRows) * C, (long)lastRows * C);
         _u.RmsNorm(last, _hn.View, _w.BF16("transformer.model.norm.weight"), lastRows, C, RmsEps);
-        _k.Linear(_hn.View, _w.BF16("transformer.lm_head.weight"), null, _logits.View, lastRows, C, Vocab);
+        Lin(_hn.View, "transformer.lm_head.weight", _logits.View, lastRows, C, Vocab);
         _pos += T;
         return await _logits.View.SubView(0, (long)lastRows * Vocab).CopyToHostAsync();
     }
