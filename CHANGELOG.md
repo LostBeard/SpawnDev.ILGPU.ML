@@ -5,6 +5,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **FLUX.2 klein reference-image editing.** `Flux2Request.References` (up to 10 pictures, any size, the picture takes the first one's size), `Flux2Pipeline.EncodeReferenceAsync` + `vae_encoder.onnx` (in the model repo), `Flux2ReferencePrep` (the reference's Lanczos / centre-crop preparation), non-square pictures (`DecodeAsync(vaeInput, rows, columns)`), `AssetGenerator.EditPictureAsync`, console `--edit-instruction`. Gated against diffusers: **44.4 dB** on the edited picture. Details in [Docs/flux2.md](Docs/flux2.md).
+
 - **Shape editing of a region.** `Trellis2Pipeline.EditShapeRegionAsync`, `Trellis2ImageTo3D.EditShapeRegionAsync`, `AssetGenerator.EditShapeRegionAsync`, console `--edit-shape` (and `--edit-picture` accepts a prompt): the structure, shape and texture flows are re-sampled inside a region under a new picture with the rest pinned, so geometry can be added or removed there (a plume on a helmet; shoulders and body unchanged). Generations keep their structure latent (`EditState.SsLatent`). Details in [Docs/trellis2.md](Docs/trellis2.md).
 
 - **Picture checking with CLIP.** `PromptMatchScorer` (CLIP ViT-B/32, local) scores drawn pictures against the prompt; `AssetGenerator.GenerateAsync` builds the picture that matches best and fits its frame and draws another batch when none matches (`ScorePictures`, `MinPromptMatch`, `LowMatchRetries`; `GeneratedAsset.PromptMatch`). The scene planner asks for plain visual descriptions. Tests: `PromptMatchScorer_*` (CUDA, real CLIP). See [Docs/assetgen.md](Docs/assetgen.md).

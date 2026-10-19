@@ -138,6 +138,22 @@ public sealed class AssetGenerator : IDisposable
         return pictures;
     }
 
+    /// <summary>
+    /// Edit a picture with FLUX.2 klein's reference-image mode: <paramref name="source"/> (and up to nine <paramref name="moreReferences"/>) go in as references and <paramref name="instruction"/> says what to
+    /// change ("give the knight a tall red plume on the helmet"); the result has the first picture's size and keeps what the instruction does not mention. Needs the VAE encoder file in the model repo
+    /// (<see cref="Flux2Pipeline.VaeEncoderFile"/>, downloaded on first use). Pair it with <see cref="EditRegionAsync"/> / <see cref="EditShapeRegionAsync"/>: edit the 2D picture, then apply it to the 3D model.
+    /// </summary>
+    public async Task<AssetPicture> EditPictureAsync(AssetPicture source, string instruction, int seed = 1, IReadOnlyList<AssetPicture>? moreReferences = null)
+    {
+        _flux ??= await Timed("load FLUX.2 klein", () => Flux2Pipeline.CreateAsync(_acc, _source, FluxRepo, 512, (s, p) => Status?.Invoke($"FLUX.2 klein {s} {p}%"), default, ImageModelBits));
+        _flux.KeepTransformerResident = KeepImageModelResident;
+        var refs = new List<Flux2ReferenceImage> { new(source.Width, source.Height, source.Rgba) };
+        if (moreReferences != null) refs.AddRange(moreReferences.Select(p => new Flux2ReferenceImage(p.Width, p.Height, p.Rgba)));
+        var images = await Timed("edit the picture", () => _flux.RunManyAsync(new Flux2Request { Prompt = instruction, Steps = 4, References = refs, Progress = (s, i, n) => Status?.Invoke($"FLUX.2 klein: {s}") }, new[] { seed }));
+        var img = images[0];
+        return new AssetPicture(seed, img.Width, img.Height, img.Rgba);
+    }
+
     /// <summary>Free the image model's resident transformer (<see cref="KeepImageModelResident"/>) so the 3D stage has the GPU.</summary>
     public void ReleaseImageModel() => _flux?.ReleaseResident();
 

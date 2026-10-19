@@ -19,6 +19,7 @@
 //    --size <px>               picture side for FLUX.2, a multiple of 16 (default 512)
 //    --edit-picture p.png|"a prompt" --edit-region "z>0.1"   after the model is built, re-texture that REGION (generator frame: x right, y depth, z up; the model fills [-0.5,0.5]^3; also box:x0,y0,z0,x1,y1,z1 and sphere:cx,cy,cz,r)
 //                              (--edit-shape: change the SHAPE there too, geometry can be added or removed) from another picture (RGBA with a cut-out alpha, or any picture: it is cut out), keeping the rest; writes <name>_edited.glb. No rig / animation in this mode.
+//    --edit-instruction "give the knight a red plume"   like --edit-picture, but the edit picture is made by FLUX.2 klein EDITING the picture the model was built from (reference-image mode); it keeps what the instruction does not mention
 //    --image-model flux2|sd    default flux2             --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
@@ -46,7 +47,7 @@ using SpawnDev.ILGPU.ML.Trellis2;
 bool ci = false, pick = false, rig = true, animate = true;
 int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4;
 double clearance = 8;
-string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null; bool editShape = false; var model = ImageModel.Flux2Klein;
+string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null, editInstruction = null; bool editShape = false; var model = ImageModel.Flux2Klein;
 var words = new List<string>();
 for (int i = 0; i < args.Length; i++)
 {
@@ -70,6 +71,7 @@ for (int i = 0; i < args.Length; i++)
         case "--edit-picture" when i + 1 < args.Length: editPicture = args[++i]; break;
         case "--edit-region" when i + 1 < args.Length: editRegion = args[++i]; break;
         case "--edit-shape": editShape = true; break;
+        case "--edit-instruction" when i + 1 < args.Length: editInstruction = args[++i]; break;
         case "--image-model" when i + 1 < args.Length: model = args[++i].ToLowerInvariant() is "sd" or "sdturbo" ? ImageModel.SdTurbo : ImageModel.Flux2Klein; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
@@ -116,7 +118,7 @@ async Task<int> Run()
             return int.TryParse(Console.ReadLine(), out int n) ? n : 0;
         };
 
-    if (editPicture != null)
+    if (editPicture != null || editInstruction != null)
     {
         var region = AssetGenerator.RegionFromSpec(editRegion ?? throw new ArgumentException("--edit-picture needs --edit-region"));
         var drawn = await gen.DrawAsync(prompt, Enumerable.Range(seed, Math.Max(1, pictures)).ToArray(), model, size);
@@ -128,7 +130,14 @@ async Task<int> Run()
         await File.WriteAllBytesAsync(outName + ".glb", built.Glb);
         Console.WriteLine($"\nWrote {outName}.glb ({built.Glb.Length / 1048576.0:F1} MB, {built.Tokens} tokens)");
         int ew, eh; byte[] rgba;
-        if (File.Exists(editPicture))
+        if (editInstruction != null)
+        {   // FLUX.2 klein edits the picture the model was built from: the instruction says what to change, the rest stays
+            var ep = await gen.EditPictureAsync(picked, editInstruction, seed + 500);
+            gen.ReleaseImageModel();
+            (ew, eh, rgba) = (ep.Width, ep.Height, ep.Rgba);
+            await File.WriteAllBytesAsync(outName + "_editpicture.png", AssetGenerator.EncodePng(rgba, ew, eh));
+        }
+        else if (File.Exists(editPicture))
         {
             var png = await File.ReadAllBytesAsync(editPicture);
             (ew, eh) = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.GetDimensions(png);

@@ -63,3 +63,11 @@ Tests: `Flux2_*` in `MLTestBase.Flux2Tests.cs` (desktop lanes; skipped without t
 
 Weights: Apache-2.0 (Black Forest Labs). The 4-bit export is a modified copy, hosted at <https://huggingface.co/LostBeard/FLUX.2-klein-4B-q4-ILGPU> with the licence and a model card that states the change.
 Code: MIT like the rest of the library. FLUX.2 klein 9B is non-commercial and is not used.
+
+## Editing with reference images (2026-10-19)
+
+FLUX.2 klein edits and composes pictures: up to 10 REFERENCE images go in next to the prompt (`Flux2Request.References`). Each is prepared like the reference pipeline (`Flux2ReferencePrep`: shrunk to 1024 x 1024 pixels of area with Lanczos when larger, then centre-cropped down to multiples of 16, pixels to [-1, 1]), encoded by the VAE ENCODER (`vae_encoder.onnx`, 138 MB, in the model repo next to the decoder; `Flux2Pipeline.EncodeReferenceAsync`: distribution mode, 2 x 2 patchify, the same batch-norm statistics as the decode path, packed row by row to 128-channel tokens), and appended to the picture's own tokens in the transformer's sequence with their own position (t = 10 + 10 i, row, column, 0). The model predicts only the picture's tokens (the first ones); the schedule's shift depends on the picture's token count alone. The picture has the first reference's size (or `Width` x `Height`), not necessarily square: a non-square picture is decoded by the tiled VAE (`DecodeAsync(vaeInput, rows, columns)`).
+
+`AssetGenerator.EditPictureAsync(picture, "give the knight a tall red plume on the helmet")` is the one-call form; the console's `--edit-instruction` chains it into the 3D region edits (`--edit-region`, `--edit-shape`): FLUX.2 edits the 2D picture, TRELLIS.2 applies it to the 3D model.
+
+Gate against diffusers (`golden_klein_edit.py`, `Flux2_ReferenceEncoder_MatchesTheReference`, `Flux2_ReferenceEdit_MatchesTheReference`, CUDA): preprocessed pixels equal the reference's, encoder latents relRMS 2.3e-2 (the reference encodes in bf16, the export is fp32), the whole edit **44.4 dB PSNR against the reference's edited picture** (mean difference 0.42 grey levels, 46 s with the bf16 weights). On the knight: "Add a tall red feather plume on top of the knight's helmet. Keep everything else exactly the same." returns the same knight with a red plume, about 33 s through the 4-bit weights in the console.
