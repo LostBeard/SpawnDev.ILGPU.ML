@@ -4,6 +4,8 @@
 
 [**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
+> **5.3.19:** repeat FLUX.2 draws of a prompt take ~8 s instead of ~75 s in the browser (the transformer stays loaded, the prompt embeddings are cached); animated characters get an **arm clearance** setting so arms and armour stop passing through the torso.
+>
 > **New in 5.3.18: [FLUX.2 klein 4B](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) draws the picture for text to 3D.** Black Forest Labs' step-distilled 4B text-to-image model (Apache-2.0) re-implemented on ILGPU (Qwen3-4B text encoder, 3.9B flow transformer, VAE; 4-bit weights, 4.4 GB, 2.6 GB on the GPU at a time) replaces SD Turbo's 2023 look: full-body characters with real hands and armour. New in the demo: draw 4 or 8 pictures of one prompt (the extra ones cost ~7 s each) and pick the one to build in 3D. Every stage gated against diffusers. [How it works →](Docs/flux2.md)
 >
 > **5.3.17 (fix):** drawing with SD Turbo no longer loses the WebGPU device on stable Chrome 145-151 ("A valid external Instance reference no longer exists"); see the [changelog](CHANGELOG.md).
