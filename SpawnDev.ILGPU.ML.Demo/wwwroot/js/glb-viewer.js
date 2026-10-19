@@ -127,7 +127,7 @@
         if (tr.comps === 4) slerpQuat(out, tr.values, k * 4, tr.values, (k + 1) * 4, u);
         else for (let c = 0; c < 3; c++) out[c] = tr.values[k * 3 + c] + u * (tr.values[(k + 1) * 3 + c] - tr.values[k * 3 + c]);
     }
-    function poseMatrices(skin, anim, t, inPlace, outTex) {
+    function poseMatrices(skin, anim, t, inPlace, outTex, outPos) {
         const J = skin.J, world = new Array(J), q = new Float32Array(4), tmp = new Float32Array(3);
         const rot = new Float32Array(J * 4), trans = Float32Array.from(skin.restT);
         for (let j = 0; j < J; j++) rot[j * 4 + 3] = 1;
@@ -145,6 +145,7 @@
                                         2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y), 0, trans[j * 3], trans[j * 3 + 1], trans[j * 3 + 2], 1]);
             world[j] = skin.parent[j] >= 0 ? mul(world[skin.parent[j]], L) : L;
             outTex.set(mul(world[j], skin.ibm.subarray(j * 16, j * 16 + 16)), j * 16);
+            if (outPos) { outPos[j * 3] = world[j][12]; outPos[j * 3 + 1] = world[j][13]; outPos[j * 3 + 2] = world[j][14]; }
         }
     }
 
@@ -173,13 +174,23 @@
             const wb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, wb); gl.bufferData(gl.ARRAY_BUFFER, mesh.weights, gl.STATIC_DRAW);
             gl.enableVertexAttribArray(wl); gl.vertexAttribPointer(wl, 4, gl.FLOAT, false, 0, 0);
         }
+        // skeleton overlay (glbViewer.skeleton(canvas, true)): the bones as lines and the joints as dots, drawn over the model
+        const lineProg = gl.createProgram();
+        gl.attachShader(lineProg, compile(gl, gl.VERTEX_SHADER, `#version 300 es
+            in vec3 aPos; uniform mat4 uMvp; void main() { gl_Position = uMvp * vec4(aPos, 1.0); gl_PointSize = 7.0; }`));
+        gl.attachShader(lineProg, compile(gl, gl.FRAGMENT_SHADER, `#version 300 es
+            precision mediump float; uniform vec3 uColor; out vec4 frag; void main() { frag = vec4(uColor, 1.0); }`));
+        gl.linkProgram(lineProg);
+        const lineVao = gl.createVertexArray(), lineBuf = gl.createBuffer();
+        let jointPos = null;
         let jointTex = null, jointData = null;
         if (skinned) {
             jointData = new Float32Array(mesh.skin.J * 16);
             jointTex = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, jointTex);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            poseMatrices(mesh.skin, null, 0, true, jointData);                                  // the bind pose: identity joint matrices
+            jointPos = new Float32Array(mesh.skin.J * 3);
+            poseMatrices(mesh.skin, null, 0, true, jointData, jointPos);                                  // the bind pose: identity joint matrices
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, mesh.skin.J, 0, gl.RGBA, gl.FLOAT, jointData);
             gl.activeTexture(gl.TEXTURE0);
         }
@@ -197,7 +208,7 @@
         let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
         for (let i = 0; i < mesh.positions.length; i += 3) for (let k = 0; k < 3; k++) { const v = mesh.positions[i + k]; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
         const ctr = [0, 1, 2].map(k => (mn[k] + mx[k]) / 2), ext = Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) || 1;
-        const state = { yaw: 0.6, pitch: 0.35, dist: 2.2, auto: true, drag: null, raf: 0, gl, count: mesh.indices.length, mesh, anim: -1, t0: 0, inPlace: true };
+        const state = { yaw: 0.6, pitch: 0.35, dist: 2.2, auto: true, drag: null, raf: 0, gl, count: mesh.indices.length, mesh, anim: -1, t0: 0, inPlace: true, fixedT: null, skeleton: false };
         const uMvp = gl.getUniformLocation(prog, "uMvp"), uModel = gl.getUniformLocation(prog, "uModel");
         const uTex = gl.getUniformLocation(prog, "uTex"), uHasTex = gl.getUniformLocation(prog, "uHasTex");
         const onDown = e => { state.drag = { x: e.clientX, y: e.clientY }; state.auto = false; canvas.setPointerCapture(e.pointerId); };
@@ -220,13 +231,23 @@
             gl.uniform1i(gl.getUniformLocation(prog, "uSkinned"), skinned ? 1 : 0); gl.uniform1i(gl.getUniformLocation(prog, "uJointTex"), 1);
             if (skinned) {
                 const anim = state.anim >= 0 ? mesh.animations[state.anim] : null;
-                const t = anim && anim.duration > 0 ? ((performance.now() - state.t0) / 1000) % anim.duration : 0;
-                poseMatrices(mesh.skin, anim, t, state.inPlace, jointData);
+                const t = anim && anim.duration > 0 ? (state.fixedT != null ? state.fixedT : (performance.now() - state.t0) / 1000) % anim.duration : 0;
+                poseMatrices(mesh.skin, anim, t, state.inPlace, jointData, jointPos);
                 gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, jointTex);
                 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, mesh.skin.J, 0, gl.RGBA, gl.FLOAT, jointData);
                 gl.activeTexture(gl.TEXTURE0);
             }
             gl.drawElements(gl.TRIANGLES, state.count, gl.UNSIGNED_INT, 0);
+            if (state.skeleton && skinned) {
+                const J = mesh.skin.J, lines = [];
+                for (let j = 0; j < J; j++) { const pa = mesh.skin.parent[j]; if (pa >= 0) lines.push(jointPos[pa * 3], jointPos[pa * 3 + 1], jointPos[pa * 3 + 2], jointPos[j * 3], jointPos[j * 3 + 1], jointPos[j * 3 + 2]); }
+                gl.useProgram(lineProg); gl.bindVertexArray(lineVao); gl.disable(gl.DEPTH_TEST);
+                gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lines), gl.DYNAMIC_DRAW);
+                const al = gl.getAttribLocation(lineProg, "aPos"); gl.enableVertexAttribArray(al); gl.vertexAttribPointer(al, 3, gl.FLOAT, false, 0, 0);
+                gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, "uMvp"), false, mvp); gl.uniform3f(gl.getUniformLocation(lineProg, "uColor"), 1.0, 0.62, 0.1);
+                gl.drawArrays(gl.LINES, 0, lines.length / 3); gl.uniform3f(gl.getUniformLocation(lineProg, "uColor"), 1.0, 0.9, 0.5); gl.drawArrays(gl.POINTS, 0, lines.length / 3);
+                gl.enable(gl.DEPTH_TEST);
+            }
             state.raf = requestAnimationFrame(frame);
         };
         state.raf = requestAnimationFrame(frame);
@@ -242,6 +263,24 @@
         s.anim = i; s.t0 = performance.now(); s.inPlace = inPlace !== false;
         return i >= 0;
     }
+    // Freeze the viewer at one pose, for capturing frames at exact times: animation `which` (index, name or -1 for the bind pose) at `seconds`, the model turned `yaw` radians.
+    // `resume(canvas)` goes back to real-time playback and auto-rotation.
+    function pose(canvas, which, seconds, yaw, inPlace) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s) return false;
+        s.anim = typeof which === "string" ? (s.mesh.animations || []).findIndex(a => a.name === which) : which;
+        s.fixedT = seconds; s.yaw = yaw; s.auto = false; s.inPlace = inPlace !== false;
+        return true;
+    }
+    function resume(canvas) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s) return false;
+        s.fixedT = null; s.auto = true; s.t0 = performance.now(); return true;
+    }
+    function skeleton(canvas, on) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s) return false; s.skeleton = !!on; return true;
+    }
     function animations(canvas) {
         if (typeof canvas === "string") canvas = document.getElementById(canvas);
         const s = viewers.get(canvas); return s && s.mesh.animations ? s.mesh.animations.map(a => a.name) : [];
@@ -256,5 +295,5 @@
         viewers.delete(canvas);   // (the context stays: the same canvas gets it back on the next show)
     }
 
-    window.glbViewer = { show, dispose, play, animations };
+    window.glbViewer = { show, dispose, play, animations, pose, resume, skeleton };
 })();

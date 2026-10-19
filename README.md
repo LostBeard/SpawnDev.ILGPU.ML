@@ -6,6 +6,10 @@
 
 > **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
 >
+> ![A knight drawn by SD Turbo, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-19_TextTo3D-Rig-Animate-Knight.gif)
+>
+> *A prompt becomes a 3D character that is rigged and dances, entirely on your GPU in your browser: SD Turbo -> TRELLIS.2 -> SkinTokens -> Kimodo clips.*
+>
 > **5.3.15: [Rig this model](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A generated character gets a skeleton and learned skin weights on your GPU: `SkinTokensRigger` (VAST AI's SkinTokens, MIT, re-implemented on ILGPU) turns a GLB into a rigged GLB in ~6 s on CUDA, and the Image-to-3D demo has a **Rig this model** button (1.15 GB, cached in your browser). Checked against the real PyTorch model: 295 of 296 generated tokens identical, skin weights to 5.7e-5. [How it works →](Docs/rigging.md)
 >
 > **5.3.11: [Text & Image to 3D in your browser](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d).** Type a prompt or drop a photo and get a textured PBR 3D model (GLB) built entirely on your own GPU over WebGPU: SD Turbo draws the object, RMBG-1.4 cuts it out, and [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft, MIT, 4B parameters) generates the mesh and textures. To our knowledge this is the first fully client-side TRELLIS.2 on the web — no server, no upload. About 2-3 minutes on a desktop GPU once the weights are cached (~10 GB, opt-in). [How it works →](Docs/trellis2.md)
