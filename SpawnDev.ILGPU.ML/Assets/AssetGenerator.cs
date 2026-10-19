@@ -218,6 +218,23 @@ public sealed class AssetGenerator : IDisposable
     }
 
     /// <summary>
+    /// Edit the SHAPE inside a region of <paramref name="source"/> from a new cut-out picture: geometry can be added or removed inside the region (the structure, shape and texture are re-sampled there
+    /// under the new picture), everything outside keeps its shape and texture. Same region language as <see cref="EditRegionAsync"/>. Returns a new editable model; <paramref name="source"/> is left alone.
+    /// </summary>
+    public async Task<EditableModel> EditShapeRegionAsync(EditableModel source, int[] cutOutPixels, int width, int height, Func<float, float, float, bool> inRegion, Trellis2Options? options = null, int seed = 1)
+    {
+        options ??= new Trellis2Options();
+        ReleaseImageModel();
+        _trellis ??= new Trellis2ImageTo3D(_acc, Trellis2Weights.FromModelSource(_source)) { StageDone = (n, s) => StageDone?.Invoke(n, s) };
+        Status?.Invoke("editing the shape of a region (TRELLIS.2 structure, shape and texture flows)");
+        using var pixels = RgbaUpload.FromManaged(_acc, cutOutPixels, width, height);
+        var (output, pipe) = await _trellis.EditShapeRegionAsync(source.Output, pixels.View, width, height, inRegion, seed);
+        pipe.RepairMesh = options.RepairMesh; pipe.Remesh = options.Remesh;
+        var glb = await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
+        return new EditableModel(glb, output);
+    }
+
+    /// <summary>
     /// A region from text, in the generator's frame (x right, y depth, z up; the model fills [-0.5, 0.5]^3): <c>z&gt;0.1</c>, <c>x&lt;-0.05</c> (one axis against a bound), <c>box:x0,y0,z0,x1,y1,z1</c>,
     /// <c>sphere:cx,cy,cz,r</c>. Several joined with <c>;</c> are a union.
     /// </summary>

@@ -113,6 +113,41 @@ public sealed class Trellis2ImageTo3D : IDisposable
         return (output, pipeline);
     }
 
+    /// <summary>
+    /// Edit the SHAPE inside a region of a generated asset from a new picture (see <see cref="Trellis2Pipeline.EditShapeRegionAsync"/>): geometry can be added or removed inside the region,
+    /// everything outside keeps its shape and texture. Returns the edited output (the caller disposes it; <paramref name="source"/> is left alone) and the pipeline to build a GLB from it with.
+    /// </summary>
+    public async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> EditShapeRegionAsync(Trellis2Pipeline.Output source, IV rgba, int width, int height,
+        Func<float, float, float, bool> inRegion, int seed = 1, CancellationToken ct = default)
+    {
+        var st = source.Edit ?? throw new InvalidOperationException("This output carries no latents to edit.");
+        var sw = Stopwatch.StartNew();
+        _precompile ??= Task.WhenAll(_dk.PrecompileAsync(), _sk.PrecompileAsync());
+        var pipeline = await Trellis2Pipeline.CreateAsync(_acc, _weights, ct);
+        pipeline.StageDone = StageDone;
+        const int tokens512 = 1 + 4 + 32 * 32;
+        int tokens = 1 + 4 + (st.Res / 16) * (st.Res / 16);
+        using var ssCond = _acc.Allocate1D<float>((long)tokens512 * 1024);
+        MemoryBuffer1D<float, Stride1D.Dense>? cond1024 = null;
+        try
+        {
+            using var w = await _weights.LoadDinoAsync(_acc, ct);
+            await _precompile;
+            using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
+            using (var image = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 512)) dino.Extract(image.View, 512, ssCond.View);
+            if (st.Res == 1024)
+            {
+                using var image1024 = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 1024);
+                cond1024 = _acc.Allocate1D<float>((long)tokens * 1024);
+                dino.Extract(image1024.View, 1024, cond1024.View);
+            }
+            StageDone?.Invoke("edit shape: dinov3 features", sw.Elapsed.TotalSeconds);
+            var output = await pipeline.EditShapeRegionAsync(source, ssCond.View, tokens512, cond1024?.View ?? ssCond.View, tokens, inRegion, seed, ct);
+            return (output, pipeline);
+        }
+        finally { cond1024?.Dispose(); }
+    }
+
     /// <summary>Desktop wrapper of <see cref="GenerateAsync"/> (blocks).</summary>
     public Trellis2Pipeline.Output Generate(IV rgba, int width, int height, Trellis2Options? options, out Trellis2Pipeline pipeline)
     {

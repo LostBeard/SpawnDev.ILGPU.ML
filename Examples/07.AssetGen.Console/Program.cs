@@ -17,8 +17,8 @@
 //    --seed <N>                first seed (default 1); --pictures <N> draws N seeds (default 2) and keeps the one that fits its frame best
 //    --pick                    show the drawn pictures (PNG files) and ask which to build
 //    --size <px>               picture side for FLUX.2, a multiple of 16 (default 512)
-//    --edit-picture p.png --edit-region "z>0.1"   after the model is built, re-texture that REGION (generator frame: x right, y depth, z up; the model fills [-0.5,0.5]^3; also box:x0,y0,z0,x1,y1,z1 and sphere:cx,cy,cz,r)
-//                              from another picture (RGBA with a cut-out alpha, or any picture: it is cut out), keeping the rest; writes <name>_edited.glb. No rig / animation in this mode.
+//    --edit-picture p.png|"a prompt" --edit-region "z>0.1"   after the model is built, re-texture that REGION (generator frame: x right, y depth, z up; the model fills [-0.5,0.5]^3; also box:x0,y0,z0,x1,y1,z1 and sphere:cx,cy,cz,r)
+//                              (--edit-shape: change the SHAPE there too, geometry can be added or removed) from another picture (RGBA with a cut-out alpha, or any picture: it is cut out), keeping the rest; writes <name>_edited.glb. No rig / animation in this mode.
 //    --image-model flux2|sd    default flux2             --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
@@ -46,7 +46,7 @@ using SpawnDev.ILGPU.ML.Trellis2;
 bool ci = false, pick = false, rig = true, animate = true;
 int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4;
 double clearance = 8;
-string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null; var model = ImageModel.Flux2Klein;
+string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null; bool editShape = false; var model = ImageModel.Flux2Klein;
 var words = new List<string>();
 for (int i = 0; i < args.Length; i++)
 {
@@ -69,6 +69,7 @@ for (int i = 0; i < args.Length; i++)
         case "--moves" when i + 1 < args.Length: movesArg = args[++i]; break;
         case "--edit-picture" when i + 1 < args.Length: editPicture = args[++i]; break;
         case "--edit-region" when i + 1 < args.Length: editRegion = args[++i]; break;
+        case "--edit-shape": editShape = true; break;
         case "--image-model" when i + 1 < args.Length: model = args[++i].ToLowerInvariant() is "sd" or "sdturbo" ? ImageModel.SdTurbo : ImageModel.Flux2Klein; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
@@ -126,14 +127,27 @@ async Task<int> Run()
         await File.WriteAllBytesAsync(outName + ".png", AssetGenerator.EncodePng(picked.Rgba, picked.Width, picked.Height));
         await File.WriteAllBytesAsync(outName + ".glb", built.Glb);
         Console.WriteLine($"\nWrote {outName}.glb ({built.Glb.Length / 1048576.0:F1} MB, {built.Tokens} tokens)");
-        var png = await File.ReadAllBytesAsync(editPicture);
-        var (ew, eh) = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.GetDimensions(png);
-        var rgba = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.DecodePixels(png) ?? throw new InvalidDataException("the edit picture must be an 8-bit, non-interlaced PNG");
+        int ew, eh; byte[] rgba;
+        if (File.Exists(editPicture))
+        {
+            var png = await File.ReadAllBytesAsync(editPicture);
+            (ew, eh) = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.GetDimensions(png);
+            rgba = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.DecodePixels(png) ?? throw new InvalidDataException("the edit picture must be an 8-bit, non-interlaced PNG");
+        }
+        else
+        {   // not a file: it is a prompt, the edit picture is drawn from it with the same image model
+            var ep = (await gen.DrawAsync(editPicture, new[] { seed + 500 }, model, size))[0];
+            gen.ReleaseImageModel();
+            (ew, eh, rgba) = (ep.Width, ep.Height, ep.Rgba);
+            await File.WriteAllBytesAsync(outName + "_editpicture.png", AssetGenerator.EncodePng(rgba, ew, eh));
+        }
         var epix = new int[ew * eh]; Buffer.BlockCopy(rgba, 0, epix, 0, epix.Length * 4);
         bool hasAlpha = epix.Any(v => ((v >> 24) & 255) < 255);
         int[] ecut = epix;
         if (!hasAlpha) ecut = (await gen.CutOutAsync(new AssetPicture(0, ew, eh, rgba))).Pixels;
-        using var edited = await gen.EditRegionAsync(built, ecut, ew, eh, region, new Trellis2Options { Seed = picked.Seed, MaxFaces = faces, TextureSize = texture }, seed);
+        using var edited = editShape
+            ? await gen.EditShapeRegionAsync(built, ecut, ew, eh, region, new Trellis2Options { Seed = picked.Seed, MaxFaces = faces, TextureSize = texture }, seed)
+            : await gen.EditRegionAsync(built, ecut, ew, eh, region, new Trellis2Options { Seed = picked.Seed, MaxFaces = faces, TextureSize = texture }, seed);
         await File.WriteAllBytesAsync(outName + "_edited.glb", edited.Glb);
         Console.WriteLine($"Wrote {outName}_edited.glb ({edited.Glb.Length / 1048576.0:F1} MB). Done in {total.Elapsed.TotalSeconds:F0} s.");
         return 0;
