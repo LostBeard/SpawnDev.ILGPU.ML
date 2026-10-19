@@ -1,4 +1,4 @@
-# Auto-rigging: skeleton and skin weights for a generated character (SkinTokens, UniRig)
+# Auto-rigging and animation: skeleton, skin weights and moves for a generated character (SkinTokens, UniRig, Kimodo clips)
 
 A mesh from `Trellis2ImageTo3D` is a statue. `SkinTokensRigger` gives it a skeleton and learned skin weights so it can be posed and animated: a GLB goes in, the same GLB with joint nodes, a skin and per-vertex
 `JOINTS_0` / `WEIGHTS_0` comes out (textures and materials untouched). It runs on CUDA, OpenCL and in the browser on WebGPU, on the same ILGPU kernels as the rest of the library.
@@ -67,6 +67,40 @@ A single-token step is a coalesced GEMV (`SkinTokensKernels.Gemv`: one 128-threa
    float32 values costs 0.3-5% relRMS. (`nn.RMSNorm(eps=None)` likewise uses bf16's epsilon 0.0078125.)
 2. **The last skin token.** The published logits processor counts the switch token among the skin tokens, so it ends the sequence one token early and decodes the last bone with the END id
    (33035 - 267 = 32768, which the FSQ digits wrap to code 0). This port writes all four tokens of every bone.
+
+## Animating a rigged character (Kimodo moves)
+
+A rigged humanoid can play NVIDIA Kimodo's text-to-motion clips. Kimodo writes motion for its own 77-joint **SOMA** skeleton; SkinTokens invents a different skeleton for every mesh, so the library maps one onto the other
+by the SHAPE of the bone tree (nothing depends on bone numbers or one character's proportions) and retargets in world space:
+
+```csharp
+var sk = RiggedGlb.ReadSkeleton(riggedGlb);                                         // or the rigger's result.Skeleton
+var heads = Enumerable.Range(0, sk.Count).Select(i => new Vec3(sk.Joints[i*3], sk.Joints[i*3+1], sk.Joints[i*3+2])).ToArray();
+var retargeter = new HumanoidRetargeter(sk.Parents, heads);                          // throws NotAHumanoidException if it is not a standing humanoid
+var walk = retargeter.Retarget(MotionClip.FromNpz(File.ReadAllBytes("walk.npz"), "walk"), speed: 1.0);
+File.WriteAllBytes("animated.glb", AnimatedGlb.Add(riggedGlb, new[] { walk, wave, dance }));   // one glTF animation per clip
+```
+
+`RetargetedClip` also exposes the raw tracks (`Times`, local `Rotations` as x y z w per bone per frame, `RootTranslation`) for an engine that drives its own skeleton.
+
+- **Mapping** (`HumanoidMapper`): under the root, the child reaching highest is the spine and the two reaching lowest are the legs; facing comes from the legs (the knee bends forward of the hip-ankle line, or foot to toe);
+  walking up the spine, the first bone that forks into a neck and two arms is the chest; an arm is its first four bones; a hand with five finger chains maps thumb to pinky by position, any other hand moves its fingers
+  with SOMA's middle finger; chains shorter or longer than SOMA's are stretched or squeezed onto its joints; extra bones (hair, a cape, a weapon) follow the nearest body bone above them. A prop-heavy character,
+  a quadruped or anything without two legs, a spine and two arms is refused with a message saying which part was missing.
+- **Retargeting** (`HumanoidRetargeter`): each bone's world rotation is SOMA's turn of its joint (clips store rotations away from SOMA's T-pose, in world space), re-expressed in the rig's axes, applied to the rig's rest after
+  **rest alignment**: generated characters rarely stand in a clean T-pose, so every limb bone with one child is first swung to point where SOMA's matching bone points. The hips' travel is scaled by the ratio of hip heights
+  so a short character does not moonwalk.
+- **Not included:** the upstream project also pushes arms out of the body using the skinned mesh as a collision proxy, and has a "stiff fingers" mode for hands whose weights bleed; neither is ported, so a bulky character
+  can put a hand through its body and a hand with leaky weights can spike when it curls. There is no foot IK: a feet-planted walk is only as clean as the clip.
+- **Clips:** `MotionClip.FromNpz` reads the packed format (quats, joints0, hips, fps). The demo bundles the 22 preset moves of image-to-3dlab (`SpawnDev.ILGPU.ML.Demo/wwwroot/motions`, `.bin` files that are `.npz` archives;
+  NOTICE.md there): made with NVIDIA Kimodo (code Apache-2.0, model under the NVIDIA Open Model License; NVIDIA claims no ownership of its outputs). Check those licences before commercial use.
+- **Credit:** the approach (SOMA mapping by tree shape, world-space retargeting, rest alignment, hip scaling) is that of [image-to-3dlab](https://github.com/Bingeljell/image-to-3dlab) (Apache-2.0) `scripts/kimodo_retarget.py`;
+  this is an independent C# implementation, checked against that script's numbers (`tools/unirig-harness/reference/golden_retarget.py` runs it as a black box).
+
+Measured: the mapping is identical and the local rotations agree with the reference script to 4e-8 (1 - |dot|, float32 rounding) on walk, wave, run and idle for a real 42-bone SkinTokens rig; 7 tests on a stick figure pin
+the semantics (an arm raise lands where SOMA's does, a rig turned to face +X still waves the correct arm, a splayed rest pose is straightened, a four-legged body is refused). A TRELLIS.2 humanoid walks
+(`tools/unirig-harness/reference/anim_check.py` contact sheet: strides alternate, the head stays level, the feet hold the floor) and the animated GLB validates with 0 errors. In the demo page (real Chrome, local build) a TRELLIS humanoid
+goes generate -> Rig this model (23 joints, 36 s) -> Animate (22 moves, 12 MB GLB) and plays on the GPU-skinned mesh; the viewer plays "in place" by default so a walk stays in frame.
 
 ## Weights and tooling
 

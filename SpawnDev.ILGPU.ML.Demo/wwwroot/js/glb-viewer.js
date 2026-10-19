@@ -1,5 +1,7 @@
 // Minimal GLB viewer for the Text/Image to 3D demo: WebGL2, one textured mesh (POSITION, NORMAL, TEXCOORD_0, uint32 indices,
 // baseColorTexture), orbit with the mouse (drag to rotate, wheel to zoom), slow auto-rotation until the first drag.
+// A rigged GLB (JOINTS_0 / WEIGHTS_0, a skin, glTF animations) is skinned on the GPU: joint matrices go to the shader through a float texture,
+// glbViewer.animations(canvas) lists the clips and glbViewer.play(canvas, indexOrName, inPlace) plays one (in place by default: the hips' travel is dropped so a walk stays in frame).
 // Same-origin script (the demo is cross-origin isolated, so a CDN viewer would need CORP headers). No dependencies.
 (function () {
     "use strict";
@@ -26,6 +28,29 @@
             indices: view(prim.indices, Uint32Array, 1),
             image: null,
         };
+        if (prim.attributes.JOINTS_0 !== undefined && prim.attributes.WEIGHTS_0 !== undefined && json.skins && json.skins.length) {
+            const jAcc = json.accessors[prim.attributes.JOINTS_0];
+            mesh.joints = view(prim.attributes.JOINTS_0, jAcc.componentType === 5121 ? Uint8Array : Uint16Array, 4);
+            mesh.jointsType = jAcc.componentType === 5121 ? "u8" : "u16";
+            mesh.weights = view(prim.attributes.WEIGHTS_0, Float32Array, 4);
+            const sk = json.skins[0], J = sk.joints.length, index = new Map(sk.joints.map((n, i) => [n, i]));
+            const parent = new Int32Array(J).fill(-1);
+            sk.joints.forEach((n, i) => (json.nodes[n].children || []).forEach(c => { if (index.has(c)) parent[index.get(c)] = i; }));
+            const restT = new Float32Array(J * 3);
+            sk.joints.forEach((n, i) => { const t = json.nodes[n].translation || [0, 0, 0]; restT.set(t, i * 3); });
+            mesh.skin = { J, parent, restT, ibm: view(sk.inverseBindMatrices, Float32Array, 16) };
+            mesh.animations = (json.animations || []).map((a, k) => {
+                const tracks = [];
+                for (const ch of a.channels) {
+                    const j = index.get(ch.target.node); if (j === undefined) continue;
+                    const smp = a.samplers[ch.sampler];
+                    const times = view(smp.input, Float32Array, 1), comps = ch.target.path === "rotation" ? 4 : 3;
+                    tracks.push({ joint: j, path: ch.target.path, times, values: view(smp.output, Float32Array, comps), comps });
+                }
+                const duration = tracks.reduce((m, t) => Math.max(m, t.times[t.times.length - 1]), 0);
+                return { name: a.name || ("animation " + k), tracks, duration };
+            });
+        }
         const mat = json.materials && json.materials[prim.material || 0];
         const texInfo = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorTexture;
         if (texInfo) {
@@ -36,10 +61,18 @@
     }
 
     const VS = `#version 300 es
-        in vec3 aPos; in vec3 aNrm; in vec2 aUv;
-        uniform mat4 uMvp; uniform mat4 uModel;
+        in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aJoints; in vec4 aWeights;
+        uniform mat4 uMvp; uniform mat4 uModel; uniform bool uSkinned; uniform highp sampler2D uJointTex;
         out vec3 vNrm; out vec2 vUv;
-        void main() { vNrm = mat3(uModel) * aNrm; vUv = aUv; gl_Position = uMvp * vec4(aPos, 1.0); }`;
+        mat4 jointMat(float j) { int r = int(j + 0.5); return mat4(texelFetch(uJointTex, ivec2(0, r), 0), texelFetch(uJointTex, ivec2(1, r), 0), texelFetch(uJointTex, ivec2(2, r), 0), texelFetch(uJointTex, ivec2(3, r), 0)); }
+        void main() {
+            vec4 p = vec4(aPos, 1.0); vec3 n = aNrm;
+            if (uSkinned) {
+                mat4 sk = aWeights.x * jointMat(aJoints.x) + aWeights.y * jointMat(aJoints.y) + aWeights.z * jointMat(aJoints.z) + aWeights.w * jointMat(aJoints.w);
+                p = sk * p; n = mat3(sk) * aNrm;
+            }
+            vNrm = mat3(uModel) * n; vUv = aUv; gl_Position = uMvp * p;
+        }`;
     const FS = `#version 300 es
         precision highp float;
         in vec3 vNrm; in vec2 vUv;
@@ -76,6 +109,45 @@
     function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]); }
     function translate(x, y, z) { return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]); }
 
+    // joint matrices of a skin at time t of an animation: local T (rest, or the animated root translation) and R (animated or identity), parents first, times the inverse bind matrices
+    function slerpQuat(out, a, ao, b, bo, u) {
+        let ax = a[ao], ay = a[ao + 1], az = a[ao + 2], aw = a[ao + 3], bx = b[bo], by = b[bo + 1], bz = b[bo + 2], bw = b[bo + 3];
+        let d = ax * bx + ay * by + az * bz + aw * bw; if (d < 0) { bx = -bx; by = -by; bz = -bz; bw = -bw; d = -d; }
+        let ka, kb;
+        if (d > 0.9995) { ka = 1 - u; kb = u; } else { const th = Math.acos(d), s = Math.sin(th); ka = Math.sin((1 - u) * th) / s; kb = Math.sin(u * th) / s; }
+        const x = ka * ax + kb * bx, y = ka * ay + kb * by, z = ka * az + kb * bz, w = ka * aw + kb * bw, n = 1 / Math.hypot(x, y, z, w);
+        out[0] = x * n; out[1] = y * n; out[2] = z * n; out[3] = w * n;
+    }
+    function sampleTrack(tr, t, out) {
+        const times = tr.times, n = times.length;
+        let k = 0; if (t >= times[n - 1]) k = n - 2; else { while (k < n - 2 && times[k + 1] <= t) k++; }
+        k = Math.max(0, k);
+        const span = times[k + 1] - times[k], u = n < 2 || span <= 0 ? 0 : Math.min(1, Math.max(0, (t - times[k]) / span));
+        if (n < 2) { for (let c = 0; c < tr.comps; c++) out[c] = tr.values[c]; return; }
+        if (tr.comps === 4) slerpQuat(out, tr.values, k * 4, tr.values, (k + 1) * 4, u);
+        else for (let c = 0; c < 3; c++) out[c] = tr.values[k * 3 + c] + u * (tr.values[(k + 1) * 3 + c] - tr.values[k * 3 + c]);
+    }
+    function poseMatrices(skin, anim, t, inPlace, outTex) {
+        const J = skin.J, world = new Array(J), q = new Float32Array(4), tmp = new Float32Array(3);
+        const rot = new Float32Array(J * 4), trans = Float32Array.from(skin.restT);
+        for (let j = 0; j < J; j++) rot[j * 4 + 3] = 1;
+        if (anim) for (const tr of anim.tracks) {
+            if (tr.path === "rotation") { sampleTrack(tr, t, q); rot.set(q, tr.joint * 4); }
+            else if (tr.path === "translation") {
+                sampleTrack(tr, t, tmp);
+                if (inPlace) { tmp[0] = skin.restT[tr.joint * 3]; tmp[2] = skin.restT[tr.joint * 3 + 2]; }            // drop the hips' travel along the ground, keep their bob
+                trans.set(tmp, tr.joint * 3);
+            }
+        }
+        for (let j = 0; j < J; j++) {
+            const x = rot[j * 4], y = rot[j * 4 + 1], z = rot[j * 4 + 2], w = rot[j * 4 + 3];
+            const L = new Float32Array([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y), 0, 2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x), 0,
+                                        2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y), 0, trans[j * 3], trans[j * 3 + 1], trans[j * 3 + 2], 1]);
+            world[j] = skin.parent[j] >= 0 ? mul(world[skin.parent[j]], L) : L;
+            outTex.set(mul(world[j], skin.ibm.subarray(j * 16, j * 16 + 16)), j * 16);
+        }
+    }
+
     async function show(canvas, glbBytes) {
         if (typeof canvas === "string") canvas = document.getElementById(canvas);
         dispose(canvas);
@@ -93,6 +165,24 @@
             gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
         };
         attr("aPos", mesh.positions, 3); attr("aNrm", mesh.normals, 3); attr("aUv", mesh.uvs, 2);
+        const skinned = !!mesh.skin;
+        if (skinned) {
+            const jl = gl.getAttribLocation(prog, "aJoints"), wl = gl.getAttribLocation(prog, "aWeights");
+            const jb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, jb); gl.bufferData(gl.ARRAY_BUFFER, mesh.joints, gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(jl); gl.vertexAttribPointer(jl, 4, mesh.jointsType === "u8" ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT, false, 0, 0);
+            const wb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, wb); gl.bufferData(gl.ARRAY_BUFFER, mesh.weights, gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(wl); gl.vertexAttribPointer(wl, 4, gl.FLOAT, false, 0, 0);
+        }
+        let jointTex = null, jointData = null;
+        if (skinned) {
+            jointData = new Float32Array(mesh.skin.J * 16);
+            jointTex = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, jointTex);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            poseMatrices(mesh.skin, null, 0, true, jointData);                                  // the bind pose: identity joint matrices
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, mesh.skin.J, 0, gl.RGBA, gl.FLOAT, jointData);
+            gl.activeTexture(gl.TEXTURE0);
+        }
         const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
         let hasTex = false;
         if (mesh.image) {
@@ -107,7 +197,7 @@
         let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
         for (let i = 0; i < mesh.positions.length; i += 3) for (let k = 0; k < 3; k++) { const v = mesh.positions[i + k]; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
         const ctr = [0, 1, 2].map(k => (mn[k] + mx[k]) / 2), ext = Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) || 1;
-        const state = { yaw: 0.6, pitch: 0.35, dist: 2.2, auto: true, drag: null, raf: 0, gl, count: mesh.indices.length };
+        const state = { yaw: 0.6, pitch: 0.35, dist: 2.2, auto: true, drag: null, raf: 0, gl, count: mesh.indices.length, mesh, anim: -1, t0: 0, inPlace: true };
         const uMvp = gl.getUniformLocation(prog, "uMvp"), uModel = gl.getUniformLocation(prog, "uModel");
         const uTex = gl.getUniformLocation(prog, "uTex"), uHasTex = gl.getUniformLocation(prog, "uHasTex");
         const onDown = e => { state.drag = { x: e.clientX, y: e.clientY }; state.auto = false; canvas.setPointerCapture(e.pointerId); };
@@ -127,12 +217,34 @@
             const mvp = mul(perspective(0.8, w / Math.max(h, 1), 0.05, 50), mul(translate(0, 0, -state.dist), model));
             gl.uniformMatrix4fv(uMvp, false, mvp); gl.uniformMatrix4fv(uModel, false, model);
             gl.uniform1i(uTex, 0); gl.uniform1i(uHasTex, hasTex ? 1 : 0);
+            gl.uniform1i(gl.getUniformLocation(prog, "uSkinned"), skinned ? 1 : 0); gl.uniform1i(gl.getUniformLocation(prog, "uJointTex"), 1);
+            if (skinned) {
+                const anim = state.anim >= 0 ? mesh.animations[state.anim] : null;
+                const t = anim && anim.duration > 0 ? ((performance.now() - state.t0) / 1000) % anim.duration : 0;
+                poseMatrices(mesh.skin, anim, t, state.inPlace, jointData);
+                gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, jointTex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, mesh.skin.J, 0, gl.RGBA, gl.FLOAT, jointData);
+                gl.activeTexture(gl.TEXTURE0);
+            }
             gl.drawElements(gl.TRIANGLES, state.count, gl.UNSIGNED_INT, 0);
             state.raf = requestAnimationFrame(frame);
         };
         state.raf = requestAnimationFrame(frame);
         viewers.set(canvas, state);
-        return { vertices: mesh.positions.length / 3, triangles: mesh.indices.length / 3 };
+        return { vertices: mesh.positions.length / 3, triangles: mesh.indices.length / 3, animations: (mesh.animations || []).map(a => a.name) };
+    }
+
+    // Play one of the file's animations (by index or name; null/-1 = the bind pose). inPlace (default true) drops the hips' travel so the character stays in frame.
+    function play(canvas, which, inPlace) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s || !s.mesh.animations) return false;
+        let i = typeof which === "string" ? s.mesh.animations.findIndex(a => a.name === which) : (which === null || which === undefined ? -1 : which);
+        s.anim = i; s.t0 = performance.now(); s.inPlace = inPlace !== false;
+        return i >= 0;
+    }
+    function animations(canvas) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); return s && s.mesh.animations ? s.mesh.animations.map(a => a.name) : [];
     }
 
     function dispose(canvas) {
@@ -144,5 +256,5 @@
         viewers.delete(canvas);   // (the context stays: the same canvas gets it back on the next show)
     }
 
-    window.glbViewer = { show, dispose };
+    window.glbViewer = { show, dispose, play, animations };
 })();

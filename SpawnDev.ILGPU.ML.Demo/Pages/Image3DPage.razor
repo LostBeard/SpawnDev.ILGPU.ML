@@ -99,6 +99,28 @@
         {
             <div class="t3d-hint">@_rigNote</div>
         }
+        @if (_rigged != null)
+        {
+            <div class="result-actions">
+                <button class="action-btn rig-btn" @onclick="AnimateAsync" disabled="@(_isRunning || _rigging || _animating)"
+                        title="Plays 22 preset moves (NVIDIA Kimodo, via image-to-3dlab) on the rig. Needs a standing humanoid: two legs, a spine, a neck and two arms.">@(_animating ? "Animating…" : _animated == null ? "Animate (22 moves)" : "Animate again")</button>
+                @if (_animated != null)
+                {
+                    <select @bind="_move" @bind:after="PlayMoveAsync" class="t3d-select">
+                        @foreach (var m in _moves)
+                        {
+                            <option value="@m.Id">@m.Label</option>
+                        }
+                    </select>
+                    <label class="t3d-hint"><input type="checkbox" @bind="_inPlace" @bind:after="PlayMoveAsync" /> in place</label>
+                    <button class="action-btn download-btn" @onclick="DownloadAnimated">Download animated .glb (all moves)</button>
+                }
+            </div>
+            @if (_animNote != null)
+            {
+                <div class="t3d-hint">@_animNote</div>
+            }
+        }
     </div>
 
     @if (!_ready && !_isLoading && _glb == null)
@@ -325,7 +347,7 @@
     private async Task RigModelAsync()
     {
         if (_glb == null || _accelerator == null || _rigging) return;
-        _rigging = true; _isRunning = true; _error = null; _rigged = null; _rigNote = "Rigging: loading SkinTokens (1.15 GB the first time)...";
+        _rigging = true; _isRunning = true; _error = null; _rigged = null; _animated = null; _animNote = null; _rigNote = "Rigging: loading SkinTokens (1.15 GB the first time)...";
         _isLoading = true; _modelSizeMb = 1150; _modelProgress = 0; _modelStatusText = "SkinTokens"; _currentStage = "SkinTokens weights";
         StateHasChanged();
         var total = System.Diagnostics.Stopwatch.StartNew();
@@ -355,6 +377,73 @@
         }
     }
 
+    // Animate: the rig's skeleton is matched to Kimodo's SOMA skeleton by the shape of its bone tree and 22 preset moves (wwwroot/motions, NVIDIA Kimodo clips packed by
+    // image-to-3dlab, Apache-2.0) are retargeted onto it; the result is one GLB with all the moves as glTF animations, previewed in the viewer.
+    private sealed record Move(string Id, string Label);
+    private readonly List<Move> _moves = new();
+    private byte[]? _animated;
+    private bool _animating, _inPlace = true;
+    private string _move = "walk";
+    private string? _animNote;
+
+    private async Task AnimateAsync()
+    {
+        if (_rigged == null || _animating) return;
+        _animating = true; _error = null; _animNote = "Retargeting the moves onto the rig...";
+        StateHasChanged();
+        try
+        {
+            var sk = SpawnDev.ILGPU.ML.UniRig.RiggedGlb.ReadSkeleton(_rigged);
+            var heads = Enumerable.Range(0, sk.Count).Select(i => new SpawnDev.ILGPU.ML.Animation.Vec3(sk.Joints[i * 3], sk.Joints[i * 3 + 1], sk.Joints[i * 3 + 2])).ToArray();
+            var retargeter = new SpawnDev.ILGPU.ML.Animation.HumanoidRetargeter(sk.Parents, heads);
+            using var index = System.Text.Json.JsonDocument.Parse(await Http.GetStringAsync("motions/moves.json"));
+            var moves = index.RootElement.GetProperty("moves").EnumerateArray().Select(m => new Move(m.GetProperty("id").GetString()!, m.GetProperty("label").GetString()!)).ToList();
+            var clips = new List<SpawnDev.ILGPU.ML.Animation.RetargetedClip>();
+            foreach (var m in moves)
+            {
+                var clip = SpawnDev.ILGPU.ML.Animation.MotionClip.FromNpz(await Http.GetByteArrayAsync($"motions/{m.Id}.bin"), m.Id);
+                clips.Add(retargeter.Retarget(clip));
+            }
+            _animated = SpawnDev.ILGPU.ML.Animation.AnimatedGlb.Add(_rigged, clips);
+            _moves.Clear(); _moves.AddRange(moves);
+            if (!_moves.Any(m => m.Id == _move)) _move = _moves[0].Id;
+            StateHasChanged(); await Task.Yield();
+            using var viewer = JS.Get<SpawnJSObject>("glbViewer");
+            await viewer.JSRef!.CallVoidAsync("show", "t3d-canvas", _animated);
+            await viewer.JSRef!.CallVoidAsync("play", "t3d-canvas", _move, _inPlace);
+            _animNote = $"{_moves.Count} moves on {sk.Count} bones · {_animated.Length / 1048576.0:F1} MB GLB. Pick a move; drag to orbit. Clips: NVIDIA Kimodo via image-to-3dlab (see motions/NOTICE.md).";
+        }
+        catch (SpawnDev.ILGPU.ML.Animation.NotAHumanoidException ex) { _animated = null; _animNote = "This model does not look like a standing humanoid, so the moves cannot be mapped onto it (" + ex.Message + ")."; }
+        catch (Exception ex) { _animated = null; _animNote = null; Fail(ex); }
+        finally { _animating = false; StateHasChanged(); }
+    }
+
+    private async Task PlayMoveAsync()
+    {
+        if (_animated == null) return;
+        try { using var viewer = JS.Get<SpawnJSObject>("glbViewer"); await viewer.JSRef!.CallVoidAsync("play", "t3d-canvas", _move, _inPlace); }
+        catch (Exception ex) { Fail(ex); }
+    }
+
+    private void DownloadAnimated()
+    {
+        if (_animated == null) return;
+        try
+        {
+            using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(new[] { _animated }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "model/gltf-binary" });
+            var url = SpawnDev.SpawnJS.JSObjects.URL.CreateObjectURL(blob);
+            using var document = JS.Get<SpawnDev.SpawnJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.SpawnJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = url;
+            link.Download = "model-animated.glb";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch (Exception ex) { Fail(ex); }
+    }
+
     private void DownloadRigged()
     {
         if (_rigged == null) return;
@@ -376,7 +465,7 @@
 
     private void Begin()
     {
-        _error = null; _glb = null; _resultInfo = null; _stages.Clear(); _rigged = null; _rigNote = null;
+        _error = null; _glb = null; _resultInfo = null; _stages.Clear(); _rigged = null; _rigNote = null; _animated = null; _animNote = null;
         _isRunning = true;
         _ = InvokeAsync(StateHasChanged);
     }

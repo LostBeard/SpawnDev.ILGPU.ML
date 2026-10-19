@@ -3,6 +3,14 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased - Humanoid animation (Kimodo moves on a rigged character)
+
+- **`SpawnDev.ILGPU.ML.Animation`: play NVIDIA Kimodo clips on a SkinTokens-rigged humanoid.** `HumanoidMapper` finds the body of any generated humanoid by the shape of its bone tree (spine, two legs, a chest forking into a neck and two arms,
+  five-finger hands or not) and names its bones after Kimodo's 77-joint SOMA skeleton; `HumanoidRetargeter` applies each joint's world-space turn to the rig's rest after rest alignment (limbs swung to SOMA's T-pose directions) and scales the hips' travel;
+  `AnimatedGlb.Add` writes the result as glTF animations on the rigged GLB; `MotionClip.FromNpz` reads the packed clips; `RiggedGlb.ReadSkeleton` reads a rig back out of a file. Approach after image-to-3dlab's `kimodo_retarget.py` (Apache-2.0), independent C#, gated against that
+  script's numbers on a real SkinTokens rig (mapping identical, rotations 4e-8) plus 7 stick-figure tests; a TRELLIS.2 humanoid walks and the animated GLB validates with 0 errors. The Image-to-3D demo gets an **Animate** button (22 preset moves bundled, NVIDIA Kimodo clips packed by
+  image-to-3dlab, with NOTICE), a move picker, an "in place" toggle and **Download animated .glb**; the demo viewer now skins on the GPU and plays glTF animations. Docs: [Docs/rigging.md](Docs/rigging.md). Not included: arm clearance (keeping hands out of the body) and stiff-finger mode.
+
 ## 5.3.15 - 2026-10-18 - Auto-rigging: SkinTokens and UniRig
 
 Requires SpawnDev.ILGPU 5.3.8. Docs: [Docs/rigging.md](Docs/rigging.md).
