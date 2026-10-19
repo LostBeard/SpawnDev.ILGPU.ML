@@ -50,3 +50,17 @@ A scene is glTF nodes with transforms referencing generated GLBs (plus lights, s
 2. Prototype RePaint-style region regeneration on the TRELLIS.2 texture stage (recolour a part), measure; then the shape stage.
 3. Layout step with Gemma plus a layout-to-glTF writer, driven by `AssetGenerator`, as a first end-to-end small scene.
 4. Evaluate a native scene model against that baseline.
+
+## 6. Licence and weights check (GitHub / Hugging Face APIs, 2026-10-19)
+
+| Candidate | Licence | Notes |
+|---|---|---|
+| [VoxHammer](https://github.com/Nelipot-Lee/VoxHammer) | MIT code | Built on TRELLIS v1 (image-large / text-large) **plus the v1 sparse-structure and SLat encoders**; asks for a 40 GB card (research code, not our footprint). The method (invert, cache, replace in the preserved region) is what we would re-implement on TRELLIS.2. |
+| [Nano3D](https://github.com/JAMESYJL/Nano3D) | MIT | TRELLIS v1 + FlowEdit; needs an edited guide image (the paper uses Nano Banana, hosted). |
+| [SceneGen](https://github.com/Mengmouxu/SceneGen) | MIT code and checkpoints | **Not a cheap port**: needs TRELLIS v1 stages, SAM2 (Apache-2.0) and **VGGT-1B (CC-BY-NC-4.0: non-commercial)**, 16 GB minimum. |
+| One2Scene | **no licence file** (all rights reserved by default) | Do not build on it without the authors' permission. |
+| HunyuanWorld-1.0 | custom Tencent licence (NOASSERTION; known regional restrictions) | Read the licence text before any use. |
+| PartCrafter | MIT | Part-decomposed meshes; worth a look for multi-object scenes. |
+| TRELLIS.2 | MIT | **Ships the encoders too**: `shape_enc_next_dc_f16c32_fp16` and `tex_enc_next_dc_f16c32_fp16` (Hugging Face `microsoft/TRELLIS.2-4B`, alongside the decoders we already port), plus `texturing_pipeline.json`. |
+
+The encoders matter: with them an existing mesh and its PBR attributes can be turned into structured latents, which is what inversion-based editing and re-texturing an arbitrary mesh need. The first prototype does not need them: a generated asset's own latents can be kept and edited (RePaint-style, below).
