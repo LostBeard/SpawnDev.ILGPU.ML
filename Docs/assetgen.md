@@ -25,10 +25,12 @@ The 3D stage keeps 300k triangles by default (`AssetGenerator.DefaultMaxFaces`):
 (the examples copy them from the demo's `wwwroot/motions`, see `NOTICE.md` there). `KeepImageModelResident = true` keeps FLUX.2's transformer on the GPU between draws (about 2 s a picture after the first on a desktop GPU); it is released before the 3D stage. `ImageModelBits = 8` selects the near-lossless FLUX.2 weights.
 `ImageModel.SdTurbo` draws with SD-Turbo instead.
 
+`ImageModel.OpenAi` draws with the OpenAI Images API (DALL-E 3 by default, or gpt-image-1) through `OpenAiImageSource`. **It is not local:** the prompt is sent to api.openai.com with your API key and OpenAI bills each picture. The library never reads, stores or logs a key; you pass it in (`gen.OpenAiImages = new OpenAiImageSource(key)`), and the console example reads `OPENAI_API_KEY` only when `--image-model openai` is asked for. TRELLIS takes any picture, so this is simply another source for the same cut-out and 3D stages. Tested against a fake HTTP server (request shape, response and error parsing), not against the live service.
+
 ## The console tool (`Examples/07.AssetGen.Console`)
 
 ```
-AssetGen.Console "<prompt>" [--out name] [--seed N] [--pictures N] [--pick] [--size px] [--image-model flux2|sd] [--quality 4|8]
+AssetGen.Console "<prompt>" [--out name] [--seed N] [--pictures N] [--pick] [--size px] [--image-model flux2|sd|openai] [--quality 4|8]
                            [--faces N] [--texture N] [--no-rig] [--no-animate] [--moves a,b,c] [--arm-clearance deg] [--bridge-hops N] [--cache dir] [--ci]
 ```
 

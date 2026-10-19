@@ -17,7 +17,8 @@
 //    --seed <N>                first seed (default 1); --pictures <N> draws N seeds (default 2) and keeps the one that fits its frame best
 //    --pick                    show the drawn pictures (PNG files) and ask which to build
 //    --size <px>               picture side for FLUX.2, a multiple of 16 (default 512)
-//    --image-model flux2|sd    default flux2             --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
+//    --image-model flux2|sd|openai    default flux2 (openai = DALL-E 3 through the OpenAI API: NOT local, sends the prompt to OpenAI with OPENAI_API_KEY, billed per picture; OPENAI_IMAGE_MODEL picks dall-e-3 (default) or gpt-image-1)
+//                --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
 //    --no-rig                  stop after the 3D model          --no-animate  stop after the rig
@@ -65,7 +66,7 @@ for (int i = 0; i < args.Length; i++)
         case "--out" when i + 1 < args.Length: outName = args[++i]; break;
         case "--cache" when i + 1 < args.Length: cacheDir = args[++i]; break;
         case "--moves" when i + 1 < args.Length: movesArg = args[++i]; break;
-        case "--image-model" when i + 1 < args.Length: model = args[++i].ToLowerInvariant() is "sd" or "sdturbo" ? ImageModel.SdTurbo : ImageModel.Flux2Klein; break;
+        case "--image-model" when i + 1 < args.Length: { var m = args[++i].ToLowerInvariant(); model = m is "sd" or "sdturbo" ? ImageModel.SdTurbo : m is "openai" or "dalle" or "dall-e-3" ? ImageModel.OpenAi : ImageModel.Flux2Klein; break; }
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -96,6 +97,15 @@ async Task<int> Run()
     foreach (var m in moves) if (!ids.Contains(m)) { Console.Error.WriteLine($"unknown move '{m}'; available: {string.Join(", ", ids)}"); return 2; }
 
     using var gen = new AssetGenerator(accelerator, source, loader) { ImageModelBits = quality, BridgeHops = bridgeHops };
+    OpenAiImageSource? openAi = null;
+    if (model == ImageModel.OpenAi)
+    {
+        var key = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (string.IsNullOrWhiteSpace(key)) { Console.Error.WriteLine("--image-model openai needs the OPENAI_API_KEY environment variable."); return 2; }
+        Console.WriteLine("Note: --image-model openai sends the prompt to api.openai.com and is billed by OpenAI per picture.");
+        gen.OpenAiImages = openAi = new OpenAiImageSource(key, Environment.GetEnvironmentVariable("OPENAI_IMAGE_MODEL") ?? "dall-e-3");
+    }
+    using var openAiLifetime = openAi;
     var total = System.Diagnostics.Stopwatch.StartNew();
     gen.StageDone = (stage, s) => Console.WriteLine($"  {stage,-44} {s,7:F1} s   (total {total.Elapsed.TotalSeconds:F0} s)");
     gen.Status = s => { if (s.Contains('%')) Console.Write($"\r  {s,-70}"); };
