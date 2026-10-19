@@ -1,0 +1,139 @@
+{
+ "license": "Clips made with NVIDIA Kimodo (NVIDIA Open Model License). NVIDIA claims no ownership of outputs.",
+ "source": "https://github.com/Bingeljell/image-to-3dlab (image_to_3dlab/motions, Apache-2.0)",
+ "made_with": "Kimodo-SOMA-RP-v1.1",
+ "moves": [
+  {
+   "id": "idle",
+   "label": "Idle",
+   "seconds": 4.0,
+   "prompt": "A person stands still and breathes calmly, looking around."
+  },
+  {
+   "id": "walk",
+   "label": "Walk",
+   "seconds": 4.0,
+   "prompt": "A person walks forward."
+  },
+  {
+   "id": "walk_woman",
+   "label": "Walk (woman)",
+   "seconds": 4.0,
+   "prompt": "A woman walks forward."
+  },
+  {
+   "id": "run",
+   "label": "Run",
+   "seconds": 3.0,
+   "prompt": "A person runs forward."
+  },
+  {
+   "id": "jump",
+   "label": "Jump",
+   "seconds": 2.5,
+   "prompt": "A person jumps up in place."
+  },
+  {
+   "id": "wave",
+   "label": "Wave",
+   "seconds": 3.0,
+   "prompt": "A person waves with their right hand."
+  },
+  {
+   "id": "punch",
+   "label": "Punch",
+   "seconds": 2.0,
+   "prompt": "A person throws a punch with their right fist."
+  },
+  {
+   "id": "kick",
+   "label": "Kick",
+   "seconds": 2.0,
+   "prompt": "A person kicks forward with their right leg."
+  },
+  {
+   "id": "sword_swing",
+   "label": "Sword swing",
+   "seconds": 2.5,
+   "prompt": "A person swings a sword overhead with both hands."
+  },
+  {
+   "id": "dance",
+   "label": "Dance",
+   "seconds": 5.0,
+   "prompt": "A person dances happily."
+  },
+  {
+   "id": "sit",
+   "label": "Sit down",
+   "seconds": 3.0,
+   "prompt": "A person sits down on the ground."
+  },
+  {
+   "id": "sneak",
+   "label": "Sneak",
+   "seconds": 4.0,
+   "prompt": "A person sneaks forward in a crouch."
+  },
+  {
+   "id": "strafe_left",
+   "label": "Strafe left",
+   "seconds": 3.0,
+   "prompt": "A person sidesteps to the left."
+  },
+  {
+   "id": "death",
+   "label": "Death",
+   "seconds": 3.0,
+   "prompt": "A person falls backward to the ground and lies still."
+  },
+  {
+   "id": "hit_react",
+   "label": "Hit react",
+   "seconds": 2.0,
+   "prompt": "A person gets hit in the chest and staggers backward."
+  },
+  {
+   "id": "cheer",
+   "label": "Cheer",
+   "seconds": 3.0,
+   "prompt": "A person raises both arms in the air and cheers."
+  },
+  {
+   "id": "roll",
+   "label": "Roll",
+   "seconds": 3.0,
+   "prompt": "A person does a forward roll on the ground."
+  },
+  {
+   "id": "kata",
+   "label": "Kata",
+   "seconds": 5,
+   "prompt": "A person performs a martial arts kata with fast punches and blocks."
+  },
+  {
+   "id": "roundhouse",
+   "label": "Roundhouse kick",
+   "seconds": 2.5,
+   "prompt": "A person does a high roundhouse kick."
+  },
+  {
+   "id": "flying_kick",
+   "label": "Flying kick",
+   "seconds": 2.5,
+   "prompt": "A person jumps and does a flying kick."
+  },
+  {
+   "id": "fight_stance",
+   "label": "Fighting stance",
+   "seconds": 4,
+   "prompt": "A person bounces lightly on their feet in a fighting stance."
+  },
+  {
+   "id": "punch_combo",
+   "label": "Punch combo",
+   "seconds": 3,
+   "prompt": "A person throws a fast combination of punches."
+  }
+ ]
+}
