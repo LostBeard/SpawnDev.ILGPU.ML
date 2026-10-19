@@ -269,7 +269,7 @@ public abstract partial class MLTestBase
         var hb = new byte[hlen]; f.ReadExactly(hb); var header = System.Text.Encoding.ASCII.GetString(hb);
         var descr = System.Text.RegularExpressions.Regex.Match(header, @"'descr':\s*'([^']+)'").Groups[1].Value;
         var shape = System.Text.RegularExpressions.Regex.Match(header, @"'shape':\s*\(([^)]*)\)").Groups[1].Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse).ToArray();
-        string want = typeof(T) == typeof(float) ? "<f4" : typeof(T) == typeof(int) ? "<i4" : "<i8";
+        string want = typeof(T) == typeof(float) ? "<f4" : typeof(T) == typeof(double) ? "<f8" : typeof(T) == typeof(int) ? "<i4" : "<i8";
         if (descr != want || header.Contains("'fortran_order': True")) throw new InvalidDataException($"{path}: {descr} / {header}");
         var data = new T[shape.Aggregate(1L, (a, b) => a * b)];
         f.ReadExactly(System.Runtime.InteropServices.MemoryMarshal.AsBytes(data.AsSpan()));

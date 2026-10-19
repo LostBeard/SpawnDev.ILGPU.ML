@@ -17,7 +17,7 @@ public static class RiggedGlb
     private static JsonNode Num(int v) => JsonValue.Create(v)!;
     private static JsonNode Num(float v) => JsonValue.Create(v)!;
 
-    private static (JsonObject Root, byte[] Bin) Parse(byte[] glb)
+    internal static (JsonObject Root, byte[] Bin) Parse(byte[] glb)
     {
         if (glb.Length < 20 || BinaryPrimitives.ReadUInt32LittleEndian(glb) != 0x46546C67) throw new InvalidDataException("not a binary glTF");
         int jsonLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(12));
@@ -48,6 +48,26 @@ public static class RiggedGlb
         for (int i = 0; i < ic; i++)
             idx[i] = ict == 5123 ? BinaryPrimitives.ReadUInt16LittleEndian(bin.AsSpan(io + i * 2)) : (int)BinaryPrimitives.ReadUInt32LittleEndian(bin.AsSpan(io + i * 4));
         return new Mesh(pos, idx);
+    }
+
+    /// <summary>The skeleton of a GLB rigged by <see cref="Add"/> (or any skin whose joints have no rotation): each joint's position in the file's space and its parent, bones in skin order.</summary>
+    public static UniRigTokenizer.Skeleton ReadSkeleton(byte[] glb)
+    {
+        var (root, _) = Parse(glb);
+        var skin = root["skins"]?[0]?.AsObject() ?? throw new InvalidOperationException("the GLB has no skin");
+        var joints = skin["joints"]!.AsArray().Select(j => j!.GetValue<int>()).ToArray();
+        var nodes = root["nodes"]!.AsArray();
+        var indexOf = new Dictionary<int, int>(); for (int i = 0; i < joints.Length; i++) indexOf[joints[i]] = i;
+        var parents = Enumerable.Repeat(-1, joints.Length).ToArray();
+        for (int i = 0; i < joints.Length; i++)
+            if (nodes[joints[i]]!["children"] is JsonArray ch) foreach (var c in ch) if (indexOf.TryGetValue(c!.GetValue<int>(), out int ci)) parents[ci] = i;
+        var pos = new float[joints.Length * 3];
+        for (int i = 0; i < joints.Length; i++)                                      // parents precede children
+        {
+            var t = nodes[joints[i]]!["translation"]?.AsArray();
+            for (int k = 0; k < 3; k++) pos[i * 3 + k] = (t == null ? 0f : t[k]!.GetValue<float>()) + (parents[i] >= 0 ? pos[parents[i] * 3 + k] : 0f);
+        }
+        return new UniRigTokenizer.Skeleton(pos, parents);
     }
 
     /// <param name="glb">The mesh file.</param>
@@ -136,6 +156,12 @@ public static class RiggedGlb
         foreach (var n in nodes) if (n is JsonObject o && o["mesh"] != null) { o["skin"] = skins.Count - 1; break; }
         root["scenes"]![0]!["nodes"]!.AsArray().Add(Num(armature));
 
+        return Assemble(root, data);
+    }
+
+    /// <summary>The binary glTF of a patched JSON document and its (grown) binary chunk.</summary>
+    internal static byte[] Assemble(JsonObject root, MemoryStream data)
+    {
         var json = new MemoryStream(); using (var w = new Utf8JsonWriter(json)) root.WriteTo(w);
         while (json.Length % 4 != 0) json.WriteByte(0x20);
         int total = 12 + 8 + (int)json.Length + 8 + (int)data.Length;
