@@ -43,7 +43,13 @@ pipe = _Pipe(); pipe.tokenizer = tokenizer; pipe.scheduler = scheduler; pipe.vae
 
 
 def save(name, t):
-    a = t.detach().float().cpu().numpy() if torch.is_tensor(t) else np.asarray(t)
+    if torch.is_tensor(t):
+        t = t.detach().cpu()
+        a = t.numpy() if t.dtype in (torch.int32, torch.int64) else t.float().numpy()      # integer tensors (ids) stay integers; the C# reader wants int64
+        if a.dtype == np.int32: a = a.astype(np.int64)
+    else:
+        a = np.asarray(t)
+    a = np.ascontiguousarray(a)                    # permuted tensors would save as fortran_order, which the C# reader refuses
     np.save(os.path.join(out, name + ".npy"), a)
 
 
@@ -85,8 +91,22 @@ tdev = torch.device("cpu") if fp32 else dev
 with torch.no_grad():
     for i, t in enumerate(timesteps):
         ts = t.expand(cur.shape[0]).to(cur.dtype)
+        hooks = []
+        if i == 0:                  # per-block checkpoints of the first step, to localise a mismatch in the port (hooks must return None: a return value replaces the module output)
+            def hook(fn):
+                def h(m, a, o): fn(o)
+                return h
+            hooks.append(tr.time_guidance_embed.register_forward_hook(hook(lambda o: save("dbg_temb", o))))
+            hooks.append(tr.x_embedder.register_forward_hook(hook(lambda o: save("dbg_x", o))))
+            hooks.append(tr.context_embedder.register_forward_hook(hook(lambda o: save("dbg_ctx", o))))
+            for k, blk in enumerate(tr.transformer_blocks):
+                hooks.append(blk.register_forward_hook(hook(lambda o, k=k: (save(f"dbg_double{k + 1}_txt", o[0]), save(f"dbg_double{k + 1}_img", o[1])))))
+            for k, blk in enumerate(tr.single_transformer_blocks):
+                if k in (0, 4, 9, 14, 19):
+                    hooks.append(blk.register_forward_hook(hook(lambda o, k=k: save(f"dbg_single{k + 1}", o))))
         pred = tr(hidden_states=cur.to(tdev), timestep=(ts / 1000).to(tdev), guidance=None, encoder_hidden_states=emb.to(tdev),
                   txt_ids=ids_txt.to(tdev), img_ids=ids.to(tdev), return_dict=False)[0]
+        for h in hooks: h.remove()
         save(f"pred_{i}", pred)
         cur = pipe.scheduler.step(pred.to(dev), t, cur.to(dev), return_dict=False)[0]
         save(f"latents_{i}", cur)
