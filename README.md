@@ -14,7 +14,7 @@
 >
 > **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
 >
-> ![A knight drawn by FLUX.2 klein, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-19_TextTo3D-Rig-Animate-Knight-FLUX2.gif)
+> ![A knight drawn by FLUX.2 klein at 1024 px, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-19_TextTo3D-Rig-Animate-Knight-FLUX2-1024.gif)
 >
 > *A prompt becomes a 3D character that is rigged and dances, entirely on your GPU in your browser: FLUX.2 klein -> TRELLIS.2 -> SkinTokens -> Kimodo clips.*
 >

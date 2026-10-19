@@ -24,12 +24,31 @@ import json
 RECT = json.load(open(os.path.join(src, 'rect.json'))) if os.path.exists(os.path.join(src, 'rect.json')) else None
 
 
+def detect_rect(path):
+    """The viewer canvas inside a viewport screenshot: the block of pixels that are the viewer's clear colour (a stale rect.json, measured before the page scrolled, would crop nothing)."""
+    import numpy as np
+    a = np.asarray(Image.open(path).convert('RGB')).astype(int)
+    m = (abs(a[:, :, 0] - BG[0]) < 3) & (abs(a[:, :, 1] - BG[1]) < 3) & (abs(a[:, :, 2] - BG[2]) < 3)
+    rows = np.nonzero(m.mean(axis=1) > 0.3)[0]; cols = np.nonzero(m.mean(axis=0) > 0.3)[0]
+    return {'x': int(cols.min()), 'y': int(rows.min()), 'width': int(cols.max() - cols.min() + 1), 'height': int(rows.max() - rows.min() + 1)}
+
+
+_first = sorted(glob.glob(os.path.join(src, 'A_*.png')))
+if _first:
+    _h = Image.open(_first[0]).size[1]
+    if RECT is None or RECT['y'] + RECT['height'] > _h + 1 or RECT['y'] < 0:
+        RECT = detect_rect(_first[len(_first) // 2])
+        print('canvas rectangle detected from the frames:', RECT)
+
+
 def frames(prefix):
     """The captured viewport frames, cropped to the canvas (rect.json holds its viewport rectangle)."""
     out = []
     for f in sorted(glob.glob(os.path.join(src, prefix + '_*.png'))):
         im = Image.open(f).convert('RGB')
         if RECT: im = im.crop((round(RECT['x']), round(RECT['y']), round(RECT['x'] + RECT['width']), round(RECT['y'] + RECT['height'])))
+        c = im.getpixel((12, 12))                                              # a frame taken before the viewer had cleared to its colour is not part of the film
+        if max(abs(c[0] - BG[0]), abs(c[1] - BG[1]), abs(c[2] - BG[2])) > 6: continue
         out.append(im)
     return out
 
@@ -86,16 +105,16 @@ intro = Image.new('RGB', (W, H), BG); d = ImageDraw.Draw(intro)
 d.text((20, 18), 'Text to 3D, rigged and animated', font=font(26, True), fill=(235, 238, 245))
 d.text((20, 54), 'on your GPU, in your browser', font=font(18), fill=(140, 155, 180))
 f = font(17); y = 112
-for ln in wrap('"' + prompt + '"', f, W - 250, d): d.text((20, y), ln, font=f, fill=(180, 200, 255)); y += 24
+for ln in wrap('"' + prompt + '"', f, W - 290, d): d.text((20, y), ln, font=f, fill=(180, 200, 255)); y += 24
 pic = os.path.join(src, 'picture.png')
 if os.path.exists(pic):
-    p = Image.open(pic).convert('RGB').resize((200, 200), Image.LANCZOS); intro.paste(p, (W - 220, 100))
+    p = Image.open(pic).convert('RGB').resize((240, 240), Image.LANCZOS); intro.paste(p, (W - 260, 90))
 d.text((20, H - 90), 'FLUX.2 klein  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 62), 'all on the GPU, all in the browser', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 34), 'SpawnDev.ILGPU.ML', font=font(16, True), fill=(110, 130, 170))
 
 seq = [(intro, 38)]
-A = [card('1', 'Text to 3D', 'FLUX.2 klein draws it, TRELLIS.2 builds the mesh and PBR textures')(im) for im in allf['A']]
+A = [card('1', 'Text to 3D', 'FLUX.2 (1024 px) draws it, TRELLIS.2 builds mesh + PBR textures')(im) for im in allf['A']]
 B = [card('2', 'Rig', 'SkinTokens writes the skeleton and learned skin weights')(im) for im in allf['B']]
 CDE = [card('3', 'Animate', 'Kimodo moves retargeted onto the generated skeleton')(im) for k in 'CDE' for im in allf[k]]
 for im in A + B + CDE: seq.append((im, 1))
