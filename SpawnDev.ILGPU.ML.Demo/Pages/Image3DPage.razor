@@ -149,6 +149,10 @@
                         }
                     </select>
                     <label class="t3d-hint"><input type="checkbox" @bind="_inPlace" @bind:after="PlayMoveAsync" /> in place</label>
+                    <label class="t3d-hint" title="Swings the upper arms away from the body so arms and armour do not pass through the torso. Applied when the moves are retargeted.">arm clearance
+                        <select @bind="_armClearance" @bind:after="AnimateAsync" class="t3d-select" disabled="@(_isRunning || _animating)">
+                            <option value="0">0°</option><option value="5">5°</option><option value="8">8°</option><option value="12">12°</option><option value="18">18°</option>
+                        </select></label>
                     <button class="action-btn download-btn" @onclick="DownloadAnimated">Download animated .glb (all moves)</button>
                 }
             </div>
@@ -431,6 +435,7 @@
     private readonly List<Move> _moves = new();
     private byte[]? _animated;
     private bool _animating, _inPlace = true;
+    private int _armClearance = 8;                      // degrees: generated characters are bulkier than Kimodo's slim body
     private string _move = "walk";
     private string? _animNote;
 
@@ -450,7 +455,7 @@
             foreach (var m in moves)
             {
                 var clip = SpawnDev.ILGPU.ML.Animation.MotionClip.FromNpz(await Http.GetByteArrayAsync($"motions/{m.Id}.bin"), m.Id);
-                clips.Add(retargeter.Retarget(clip));
+                clips.Add(retargeter.Retarget(clip, 1.0, _armClearance));
             }
             _animated = SpawnDev.ILGPU.ML.Animation.AnimatedGlb.Add(_rigged, clips);
             _moves.Clear(); _moves.AddRange(moves);

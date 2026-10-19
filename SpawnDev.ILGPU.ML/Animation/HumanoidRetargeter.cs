@@ -79,7 +79,9 @@ public sealed class HumanoidRetargeter
 
     /// <param name="clip">A SOMA clip.</param>
     /// <param name="speed">Play faster (&gt; 1) or slower (&lt; 1); strikes gain snap at 1.25.</param>
-    public RetargetedClip Retarget(MotionClip clip, double speed = 1.0)
+    /// <param name="armClearanceDegrees">Swing both upper arms this far away from the body (about the torso's forward axis, whatever the arm is doing). Generated characters are often bulky (armour,
+    /// a coat, a cape) and Kimodo's arms hang for a slim body, so a few degrees keep the arms out of the torso; 0 plays the clip as it is.</param>
+    public RetargetedClip Retarget(MotionClip clip, double speed = 1.0, double armClearanceDegrees = 0)
     {
         if (speed <= 0) throw new ArgumentOutOfRangeException(nameof(speed));
         int J = _parents.Length, T = clip.Frames; int root = Array.IndexOf(_parents, -1);
@@ -87,6 +89,12 @@ public sealed class HumanoidRetargeter
         double lowest = double.MaxValue; foreach (var h in _heads) lowest = Math.Min(lowest, Vec3.Dot(h, _up));
         double scale = (Vec3.Dot(_heads[root], _up) - lowest) / SomaHipHeight(clip.Joints0);
         var align = RestAlignment(axes, SomaTpose(clip)); var axesT = axes.Transpose();
+
+        // the upper arms' extra swing: left arm +phi, right arm -phi about the forward axis, in the parent's frame (the torso), so it follows the body however it turns
+        int leftArm = SomaSkeleton.IndexOf("LeftArm"), rightArm = SomaSkeleton.IndexOf("RightArm");
+        double phi = armClearanceDegrees * Math.PI / 180;
+        Mat3 Swing(double a) { double c = Math.Cos(a), s = Math.Sin(a); return axes * new Mat3(c, -s, 0, s, c, 0, 0, 0, 1) * axesT; }
+        var swingLeft = Swing(phi); var swingRight = Swing(-phi);
 
         var rot = new float[T * J * 4]; var trans = new float[T * 3]; var times = new float[T];
         var world = new Mat3[J]; var prev = new (double X, double Y, double Z, double W)[J];
@@ -96,6 +104,7 @@ public sealed class HumanoidRetargeter
             for (int b = 0; b < J; b++)
             {
                 var local = _parents[b] < 0 ? world[b] : world[_parents[b]].Transpose() * world[b];
+                if (phi != 0 && _parents[b] >= 0) { int sj = Mapping.Soma[b]; if (sj == leftArm) local = swingLeft * local; else if (sj == rightArm) local = swingRight * local; }
                 var q = local.ToQuaternion();
                 if (t > 0 && q.X * prev[b].X + q.Y * prev[b].Y + q.Z * prev[b].Z + q.W * prev[b].W < 0) q = (-q.X, -q.Y, -q.Z, -q.W);   // the short way round between frames
                 prev[b] = q;

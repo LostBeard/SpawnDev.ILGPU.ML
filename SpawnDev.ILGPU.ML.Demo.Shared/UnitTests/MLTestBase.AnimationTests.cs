@@ -152,6 +152,28 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Animation_Retarget_ArmClearanceSwingsTheUpperArmsOutward() => await RunPureTest(async () =>
+    {
+        var rig = Anim_StickFigure();
+        // both arms hanging straight down (SOMA: 90 degrees about +Z for the left arm chain, -90 for the right), then 12 degrees of clearance
+        // (frame 0 is the T-pose every clip starts from; the arms hang at frame 1)
+        var hang = Anim_ClipWith(2, (t, n) => t == 0 ? Mat3.Identity : n is "LeftArm" or "LeftForeArm" or "LeftHand" ? Anim_RotZ(-90) : n is "RightArm" or "RightForeArm" or "RightHand" ? Anim_RotZ(90) : Mat3.Identity);
+        var retargeter = new HumanoidRetargeter(rig.Parents, rig.Heads);
+        var plain = Anim_Fk(rig, retargeter.Retarget(hang), 1); var clear = Anim_Fk(rig, retargeter.Retarget(hang, 1.0, 12), 1);
+        foreach (var (side, sign) in new[] { ("L", 1.0), ("R", -1.0) })
+        {
+            var arm = rig.By["arm" + side]; var hand = rig.By["hand" + side];
+            var v0 = plain[hand] - plain[arm]; var v1 = clear[hand] - clear[arm];
+            double out0 = v0.X * sign, out1 = v1.X * sign;
+            Ur_Expect(v0.Y < -0.4 && Math.Abs(out0) < 1e-4, $"{side}: without clearance the arm hangs straight down ({v0.X:F3}, {v0.Y:F3})");
+            Ur_Expect(Math.Abs(v1.Length - v0.Length) < 1e-4 && Math.Abs(out1 - v0.Length * Math.Sin(12 * Math.PI / 180)) < 1e-4, $"{side}: 12 degrees of clearance moves the hand {out1:F4} outward (expected {v0.Length * Math.Sin(12 * Math.PI / 180):F4})");
+            Ur_Expect(Math.Abs(v1.Z) < 1e-4, $"{side}: the swing stays in the body's frontal plane");
+        }
+        Ur_Expect((plain[rig.By["spine2"]] - clear[rig.By["spine2"]]).Length < 1e-6 && (plain[rig.By["chest"]] - clear[rig.By["chest"]]).Length < 1e-6, "the clearance moves nothing but the arms");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Animation_Retarget_FollowsTheCharactersFacing() => await RunPureTest(async () =>
     {
         // the same figure turned to face +X (everything rotated 90 degrees about Y): SOMA's "left arm up" is still the character's left arm up
