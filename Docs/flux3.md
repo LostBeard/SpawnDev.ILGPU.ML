@@ -49,4 +49,9 @@ The transformer is also gated on a small random-weight copy against the referenc
 ## Prompts
 
 FLUX 3 Image Klein is trained on full scene captions (medium and style, scene, lighting and camera, every subject with colours, materials and position): a short prompt gives a generic picture. Black Forest Labs' own pipeline always runs a prompt upsampler first (their 9B `flux-3-image-klein-pup`, or any LLM with their system prompt).
-`Flux3Request.Caption` is the caption the transformer sees, unchanged.
+`Flux3Request.Caption` is the caption the transformer sees, unchanged. `Flux3PromptUpsampler` writes one from a short request with any local LLM and BFL's text-to-image system prompt (Apache-2.0, embedded): `Flux3PromptUpsampler.FromPipeline(ggufPipeline).ExpandAsync("a red fox in the snow", 512, 512)`.
+On "a red fox in the snow" qwen3:8b wrote a clean 187-word caption (medium, scene, lighting, subject, depth of field); gemma3:4b wrote 330 words with an invented sign. The Image Generation page offers it as a checkbox backed by Qwen3 4B (Q4_K_M, 2.5 GB, freed before FLUX 3 loads). Text to image only: the edit prompt needs a vision-language model that sees the references.
+
+## In the browser
+
+The Image Generation page runs FLUX 3 from the hosted export through the hub source (OPFS cache). Chrome WebGPU, RTX 4070, 4-bit, cold start including all downloads (about 6 GB): 512 x 384 with one reference picture in 12.6 minutes. The over-HTTP test (`Flux3_OverHttp_DrawsAPicture`, local file server, no download wait): text to image 512 px 257 s with the weights loading, the next picture with a reference 164 s.

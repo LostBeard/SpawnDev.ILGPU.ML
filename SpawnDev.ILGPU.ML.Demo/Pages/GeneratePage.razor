@@ -46,10 +46,18 @@
             <div class="gen-setting">
                 <label>@(_references.Count > 0 ? "Longer side:" : "Size:")</label>
                 <select @bind="_fluxSize" class="gen-setting-select" disabled="@(_isRunning)" title="Larger pictures are decoded in 512 px tiles, so memory stays flat; the transformer's work grows with the area. With reference images the picture keeps the first reference's proportions.">
-                    <option value="512">512x512</option>
-                    <option value="768">768x768</option>
-                    <option value="1024">1024x1024</option>
+                    <option value="512">@(_references.Count > 0 ? "512 px" : "512x512")</option>
+                    <option value="768">@(_references.Count > 0 ? "768 px" : "768x768")</option>
+                    <option value="1024">@(_references.Count > 0 ? "1024 px" : "1024x1024")</option>
                 </select>
+            </div>
+            }
+            @if (_model == "flux3" && _references.Count == 0)
+            {
+            <div class="gen-setting">
+                <label title="FLUX 3 draws from a full scene caption. A small local language model (Qwen3 4B, a 2.5 GB download, freed afterwards) writes one from your prompt with Black Forest Labs' own upsampler instructions.">
+                    <input type="checkbox" @bind="_expandPrompt" disabled="@(_isRunning)" /> Write the full caption for me (Qwen3 4B, 2.5 GB)
+                </label>
             </div>
             }
             @if (_model == "sd")
@@ -118,6 +126,10 @@
                 <span class="gen-info-item">@_numSteps steps</span>
                 <span class="gen-info-item">Seed: @_usedSeed</span>
             </div>
+            @if (!string.IsNullOrEmpty(_usedCaption))
+            {
+                <details class="gen-caption"><summary>Caption used</summary><p>@_usedCaption</p></details>
+            }
             <div class="result-actions">
                 <button class="action-btn download-btn" @onclick="DownloadResult">Download</button>
                 <button class="action-btn clear-btn" @onclick="ClearResult">New Generation</button>
@@ -149,7 +161,11 @@
 <style>
     .gen-prompt-section { margin-bottom: 1rem; }
     .gen-label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.4rem; }
-    .gen-prompt-row { display: flex; gap: 0.5rem; }
+    .gen-prompt-row { display: flex; gap: 0.5rem; align-items: flex-start; }
+    textarea.gen-prompt-input { resize: vertical; font-family: inherit; }
+    .gen-caption { margin-top: 0.75rem; text-align: left; color: #94a3b8; font-size: 0.8rem; }
+    .gen-caption summary { cursor: pointer; color: #64748b; }
+    .gen-caption p { margin: 0.4rem 0 0; white-space: pre-wrap; }
     .gen-prompt-input {
         flex: 1;
         padding: 0.6rem 0.75rem;
@@ -258,6 +274,9 @@
     private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
     private const string Flux3Repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
     private ReferenceImages? _refs;
+    private bool _expandPrompt;                         // FLUX 3: a local LLM writes the full scene caption first
+    private string? _usedCaption;
+    private const string CaptionLlmRepo = "Qwen/Qwen3-4B-GGUF", CaptionLlmFile = "Qwen3-4B-Q4_K_M.gguf";
     private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
 
     private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }
@@ -272,6 +291,35 @@
         double aspect = (double)first.Width / first.Height;
         int w = aspect >= 1 ? _fluxSize : (int)Math.Round(_fluxSize * aspect / 16) * 16, h = aspect >= 1 ? (int)Math.Round(_fluxSize / aspect / 16) * 16 : _fluxSize;
         return (Math.Max(64, w), Math.Max(64, h));
+    }
+
+    /// <summary>The caption FLUX 3 draws from: <see cref="_prompt"/> expanded by Qwen3 4B with Black Forest Labs' upsampler instructions. The transformer leaves the GPU first, the language model leaves it after.</summary>
+    private async Task<string> ExpandPromptAsync(int width, int height)
+    {
+        _flux3!.ReleaseResident();
+        Stream? open = null; SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline? llm = null;
+        try
+        {
+            var download = new Progress<SpawnDev.ILGPU.ML.Hub.ModelDownloadProgress>(p =>
+            {
+                _modelStatusText = p.Fraction is { } f ? $"Qwen3 4B — downloading {f:P0}" : $"Qwen3 4B — downloading {p.BytesReceived / 1048576} MiB";
+                _ = InvokeAsync(StateHasChanged);
+            });
+            open = await ModelSource.OpenAsync(CaptionLlmRepo, CaptionLlmFile, download);
+            llm = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator!, open, maxSeqLen: 4096,
+                onProgress: (stage, pct) => { _modelStatusText = $"Qwen3 4B — {stage} {pct}%"; _ = InvokeAsync(StateHasChanged); });
+            llm.EnableWebGPUDecodeCapture = true;
+            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWebGPUGemv = true;
+            _modelStatusText = "Qwen3 4B — writing the caption";
+            await InvokeAsync(StateHasChanged);
+            var caption = await SpawnDev.ILGPU.ML.Flux3.Flux3PromptUpsampler.FromPipeline(llm).ExpandAsync(_prompt, width, height);
+            return string.IsNullOrWhiteSpace(caption) ? _prompt : caption;
+        }
+        finally
+        {
+            await _accelerator!.SynchronizeAsync();
+            llm?.Dispose(); open?.Dispose();
+        }
     }
 
     private void ModelChanged()
@@ -423,9 +471,12 @@
                 int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
                 var (pw, ph) = PictureSize();
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                string caption = _prompt;
+                if (_expandPrompt && _references.Count == 0) caption = await ExpandPromptAsync(pw, ph);
+                _usedCaption = caption == _prompt ? null : caption;
                 var image = await _flux3.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
                 {
-                    Caption = _prompt, Seed = seed, Width = pw, Height = ph, References = _references.Count > 0 ? _references : null,
+                    Caption = caption, Seed = seed, Width = pw, Height = ph, References = _references.Count > 0 ? _references : null,
                     Progress = (stage, i, n) => { _modelStatusText = $"FLUX 3 Klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 16; _ = InvokeAsync(StateHasChanged); },
                 });
                 _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _resultWidth = image.Width; _resultHeight = image.Height; _numSteps = 16;

@@ -253,4 +253,19 @@ public abstract partial class MLTestBase
         Check(await pipe.RunAsync(new Flux3Request { Caption = caption, Seed = 3, Width = 512, Height = 384, References = new[] { new Flux2ReferenceImage(256, 192, refPixels) } }), "with a reference picture");
         Ur_Expect(first.Width == 512 && first.Height == 512, "512 px picture");
     });
+
+    /// <summary>The prompt upsampler asks the model with Black Forest Labs' system prompt and a canvas line, and returns the caption alone (reasoning blocks, fences and quotes removed).</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task Flux3_PromptUpsampler_BuildsTheRequestAndCleansTheAnswer() => await RunTest(async accelerator =>
+    {
+        string? gotSystem = null, gotUser = null;
+        var up = new Flux3PromptUpsampler((system, user) => { gotSystem = system; gotUser = user; return Task.FromResult("<think>plan the scene</think>\n\"Full-color outdoor photograph of a red fox on snow.\"\n"); });
+        var caption = await up.ExpandAsync("a red fox in the snow", 512, 384);
+        Ur_Expect(caption == "Full-color outdoor photograph of a red fox on snow.", $"cleaned caption: {caption}");
+        Ur_Expect(gotSystem == Flux3PromptUpsampler.TextToImagePrompt && gotSystem!.Contains("prompt upsampler of a text-to-image model"), "the system prompt is the reference's");
+        Ur_Expect(gotUser == "TARGET CANVAS: 512:384\na red fox in the snow", $"user message: {gotUser}");
+        await up.ExpandAsync("x");
+        Ur_Expect(gotUser == "x", "no canvas line without a size");
+        Ur_Expect(Flux3PromptUpsampler.Clean("```\nA caption.\n```") == "A caption.", "code fence removed");
+    });
 }
