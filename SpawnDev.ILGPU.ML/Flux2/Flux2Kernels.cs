@@ -5,6 +5,7 @@ namespace SpawnDev.ILGPU.ML.Flux2;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using UV = ArrayView1D<uint, Stride1D.Dense>;
+using IV = ArrayView1D<int, Stride1D.Dense>;
 
 /// <summary>
 /// The kernels FLUX.2 klein needs beside <see cref="Trellis2.DiTKernels"/> (linear, layer norm, flash attention, residual) and <see cref="SkinTokens.SkinTokensKernels"/> (RMS norm, rotary
@@ -85,6 +86,28 @@ public sealed class Flux2Kernels
     }
 
     // ───────────────────────────────────────────── the DiT's rotary embedding and SwiGLU ──────────────────
+
+    private Action<Index1D, FV, FV, IV, int, int, int, int>? _ropeHalf;
+    private static void RopeHalfImpl(Index1D i, FV buf, FV invFreq, IV positions, int stride, int off, int H, int D)
+    {
+        int half = D / 2;
+        int k = i % half, rest = i / half, h = rest % H, n = rest / H;
+        float ang = positions[n] * invFreq[k];
+        float c = MathF.Cos(ang), s = MathF.Sin(ang);
+        long b = (long)n * stride + off + h * D;
+        float x0 = buf[b + k], x1 = buf[b + half + k];                     // rotate_half: element k pairs with element k + D/2
+        buf[b + k] = x0 * c - x1 * s;
+        buf[b + half + k] = x1 * c + x0 * s;
+    }
+    /// <summary>
+    /// In place rotary embedding (HF rotate_half convention) of the H head vectors of width D at columns off.. of rows [n, stride] with an explicit position per row
+    /// (<paramref name="positions"/>[row]; FLUX 3's text encoder puts its padding rows at position 1, not at their index).
+    /// </summary>
+    public void RopeHalfPositions(FV buf, FV invFreq, IV positions, int rows, int stride, int off, int H, int D)
+    {
+        _ropeHalf ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int, int>(RopeHalfImpl);
+        _ropeHalf(rows * H * (D / 2), buf, invFreq, positions, stride, off, H, D);
+    }
 
     private Action<Index1D, FV, FV, FV, int, int, int, int>? _ropeInterleaved;
     private static void RopeInterleavedImpl(Index1D i, FV buf, FV cos, FV sin, int stride, int off, int H, int D)

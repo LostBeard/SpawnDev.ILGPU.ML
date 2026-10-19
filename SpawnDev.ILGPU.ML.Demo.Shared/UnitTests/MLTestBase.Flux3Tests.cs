@@ -64,4 +64,71 @@ public abstract partial class MLTestBase
         Ur_Expect(relSL < tol, $"last single block relRMS {relSL:E2}");
         Ur_Expect(rel < tol, $"velocity relRMS {rel:E2}");
     });
+
+    // ---- the real checkpoint (gated; golden/t2i written by golden_flux3.py, weights by quantize_flux3.py / quantize_flux3_text.py / export_flux3_vae.py) -----------------------------------------
+
+    private static string F3_RequireReal(Accelerator accelerator)
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("FLUX 3 runs on the desktop GPU lanes (CUDA, OpenCL)");
+        var dir = Environment.GetEnvironmentVariable("F3_DIR") ?? "E:/spawndev-flux3";
+        foreach (var f in new[] { "golden/t2i/text_tokens.npy", "weights/transformer_q8.safetensors", "weights/text_encoder_q8.safetensors", "weights/vae_decoder.onnx", "weights/vae_norm.json", "repo/text_encoder/tokenizer.json" })
+            if (!File.Exists(Path.Combine(dir, f))) throw new UnsupportedTestException($"FLUX 3 {f} not found (F3_DIR, default E:/spawndev-flux3; tools/unirig-harness/reference/flux3/)");
+        return dir;
+    }
+
+    /// <summary>The Qwen3-VL text tower (8-bit blocks) against the reference's stacked hidden states of the same caption: token ids, then the [80, 20480] conditioning matrix.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux3_TextEncoder_MatchesTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator); var g = Path.Combine(dir, "golden", "t2i");
+        var meta = JsonDocument.Parse(File.ReadAllText(Path.Combine(g, "meta.json"))).RootElement;
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "repo", "text_encoder", "tokenizer.json")));
+        var (goldIds, _) = Ur_Npy<float>(Path.Combine(g, "text_ids.npy")); var (goldTokens, _) = Ur_Npy<float>(Path.Combine(g, "text_tokens.npy"));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux3Pipeline(accelerator, tok, () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder_q8.safetensors")))), null!, vae, F3_Norm(dir));
+        var (ids, real) = pipe.Tokenize(meta.GetProperty("caption").GetString()!);
+        Ur_Expect(ids.Length == goldIds.Length && Enumerable.Range(0, ids.Length).All(i => ids[i] == (int)goldIds[i]), $"token ids equal the reference's ({ids.Length} tokens, {real} real)");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (rows, n) = await pipe.EncodeTextAsync(meta.GetProperty("caption").GetString()!);
+        double rel = F2_RelRms(rows, goldTokens);
+        double relReal = F2_RelRms(rows, goldTokens, real * Flux3TextEncoder.EmbedWidth);
+        Console.WriteLine($"[Flux3] text encoder on {accelerator.AcceleratorType}: {n} tokens in {sw.Elapsed.TotalSeconds:F1} s, relRMS {rel:E2} (real rows {relReal:E2}) vs the reference's bf16 run");
+        Ur_Expect(rel < 0.05, $"conditioning relRMS {rel:E2}");
+    });
+
+    private static Flux2VaeNorm F3_Norm(string dir) => Flux2VaeNorm.FromJson(File.ReadAllText(Path.Combine(dir, "weights", "vae_norm.json")));
+
+    /// <summary>The whole text to image from the reference's caption and start noise: text encoder, 16 flow-map steps (8-bit transformer), VAE; the picture against the reference's.</summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux3_Pipeline_MatchesTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator); var g = Path.Combine(dir, "golden", "t2i");
+        var meta = JsonDocument.Parse(File.ReadAllText(Path.Combine(g, "meta.json"))).RootElement;
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "repo", "text_encoder", "tokenizer.json")));
+        var (noise, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        int size = meta.GetProperty("size").GetInt32();
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux3Pipeline(accelerator, tok,
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder_q8.safetensors")))),
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer_q8.safetensors")))), vae, F3_Norm(dir));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await pipe.RunAsync(new Flux3Request { Caption = meta.GetProperty("caption").GetString()!, Width = size, Height = size, Steps = meta.GetProperty("steps").GetInt32(), Alpha = (float)meta.GetProperty("alpha").GetDouble(), Noise = noise,
+            Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n}") });
+        double sq = 0, abs = 0; int n = size * size;
+        for (int p = 0; p < n; p++)
+            for (int c = 0; c < 3; c++)
+            {
+                double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255), have = result.Rgba[p * 4 + c];
+                sq += (have - want) * (have - want); abs += Math.Abs(have - want);
+            }
+        double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
+        Console.WriteLine($"[Flux3] pipeline on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the reference picture");
+        using (var f = File.Create(Path.Combine(g, "csharp.ppm")))
+        {
+            f.Write(System.Text.Encoding.ASCII.GetBytes("P6\n" + size + " " + size + "\n255\n"));
+            var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
+            f.Write(rgb);
+        }
+        Ur_Expect(psnr > 20, $"picture PSNR {psnr:F1} dB vs the reference");
+    });
 }
