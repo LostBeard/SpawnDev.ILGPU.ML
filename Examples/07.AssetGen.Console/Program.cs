@@ -18,7 +18,7 @@
 //    --pick                    show the drawn pictures (PNG files) and ask which to build
 //    --size <px>               picture side for FLUX.2, a multiple of 16 (default 512)
 //    --image-model flux2|sd    default flux2             --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
-//    --faces <N> --texture <N> mesh triangle budget (default 150000) and texture size (default 2048)
+//    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
 //    --no-rig                  stop after the 3D model          --no-animate  stop after the rig
 //    --moves a,b,c             clips to bake in (default: all 22; names are the files in motions/)
@@ -42,7 +42,7 @@ using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Trellis2;
 
 bool ci = false, pick = false, rig = true, animate = true;
-int seed = 1, pictures = 2, size = 512, faces = 150_000, texture = 2048, quality = 4, bridgeHops = 4;
+int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4;
 double clearance = 8;
 string? outName = null, cacheDir = null, movesArg = null; var model = ImageModel.Flux2Klein;
 var words = new List<string>();

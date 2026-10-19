@@ -19,6 +19,8 @@ var animated = await gen.AnimateAsync(rigged, new[] { "walk", "dance", "wave" },
 var asset = await gen.GenerateAsync("a knight", seed: 11, pictures: 4, moves: motionIds);
 ```
 
+The 3D stage keeps 300k triangles by default (`AssetGenerator.DefaultMaxFaces`): at 150k the mesh simplifier starts eating the thin shells of armour and cloth, which shows as dark flecks and cracks.
+
 `source` is any `IModelSource`: on a desktop `new HttpClientModelSource(http, new FileModelStore(folder))` (resumable downloads, cached on disk), in a browser the OPFS source. `AssetGenerator.MotionsFromDirectory(dir)` loads the bundled `*.bin` Kimodo clips
 (the examples copy them from the demo's `wwwroot/motions`, see `NOTICE.md` there). `KeepImageModelResident = true` keeps FLUX.2's transformer on the GPU between draws (about 2 s a picture after the first on a desktop GPU); it is released before the 3D stage. `ImageModelBits = 8` selects the near-lossless FLUX.2 weights.
 `ImageModel.SdTurbo` draws with SD-Turbo instead.

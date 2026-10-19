@@ -161,7 +161,7 @@ public partial class MainWindow : Window
             {
                 var (cut, touch) = await gen.CutOutAsync(item.Picture);
                 if (touch > 0.02) Log($"note: the subject touches {touch:P0} of the picture's edge, so the model may be cropped; pick another picture for a whole object");
-                return await gen.BuildModelAsync(cut, item.Picture.Width, item.Picture.Height, new Trellis2Options { Seed = item.Picture.Seed });
+                return await gen.BuildModelAsync(cut, item.Picture.Width, item.Picture.Height, new Trellis2Options { Seed = item.Picture.Seed, MaxFaces = AssetGenerator.DefaultMaxFaces });
             });
             await ShowGlbAsync(_glb);
             Log($"3D model: {_glb.Length / 1048576.0:F1} MB.");

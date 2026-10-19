@@ -35,6 +35,8 @@ public sealed class AssetGenerator : IDisposable
 {
     public const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU", SkinTokensRepo = "LostBeard/SkinTokens-bf16";
     /// <summary>Appended to the prompt: one whole object, centred, plain white background, so the cut-out and the 3D stage get a clean subject.</summary>
+    /// <summary>The triangle budget the 3D stage simplifies to by default. 300k: at 150k the edge collapse starts to eat the thin shells of armour and cloth (dark flecks and cracks; measured on a knight, 497k faces before simplification), at 300k they are mostly kept.</summary>
+    public const int DefaultMaxFaces = 300_000;
     public const string PromptSuffix = ", a single object, centered, the whole object in frame with an empty margin around it, isolated on a plain white background, soft studio lighting, high detail";
 
     private readonly Accelerator _acc;
@@ -211,7 +213,7 @@ public sealed class AssetGenerator : IDisposable
                 if (touch < best) { best = touch; picked = p; cut = px; }
             }
         }
-        var glb = await BuildModelAsync(cut, picked.Width, picked.Height, trellis ?? new Trellis2Options { Seed = picked.Seed });
+        var glb = await BuildModelAsync(cut, picked.Width, picked.Height, trellis ?? new Trellis2Options { Seed = picked.Seed, MaxFaces = DefaultMaxFaces });
         byte[]? rigged = null, animated = null; var used = new List<string>();
         if (rig)
         {

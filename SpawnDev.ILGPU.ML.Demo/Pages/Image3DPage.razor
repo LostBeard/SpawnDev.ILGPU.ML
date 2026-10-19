@@ -83,8 +83,8 @@
             <select @bind="_maxFaces" class="t3d-select" disabled="@_isRunning">
                 <option value="50000">50k (light)</option>
                 <option value="100000">100k</option>
-                <option value="150000">150k (default)</option>
-                <option value="300000">300k (detailed)</option>
+                <option value="150000">150k</option>
+                <option value="300000">300k (default)</option>
             </select>
         </label>
         <label>Texture
@@ -235,7 +235,7 @@
     private string _mode = "text";
     private string _prompt = "a wooden treasure chest with iron bands";
     private int _seed = 42;
-    private int _maxFaces = 150_000;
+    private int _maxFaces = 300_000;               // thin armour and cloth lose pieces at 150k (flecks and cracks); 300k keeps them
     private int _textureSize = 2048;
     private bool _isRunning, _isLoading, _ready;
     private double _modelProgress, _inferenceMs;

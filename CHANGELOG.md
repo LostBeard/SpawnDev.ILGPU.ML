@@ -5,6 +5,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Text to 3D: 300k triangles by default (was 150k).** Dark flecks and cracks in generated characters came from the edge-collapse simplifier eating the thin shells of armour and cloth (the unsimplified knight has 497k faces; measured side by side at 150k / 300k / unsimplified, a doubled 4096 texture changed nothing, 60k was worse). The page, `AssetGenerator.DefaultMaxFaces`, the console tool and the WPF app now keep 300k (GLB about 25-40 MB); 150k stays in the page's triangles selector.
 - **`SpawnDev.ILGPU.ML.Assets.AssetGenerator` and Examples 07 (`AssetGen.Console`) and 08 (`AssetGen.Wpf`): text to rigged, animated 3D character on the desktop.** One class runs the browser demo's whole chain on CUDA / OpenCL / WebGPU: `DrawAsync` (FLUX.2 klein or SD-Turbo), `CutOutAsync` (RMBG-1.4),
   `BuildModelAsync` (TRELLIS.2), `RigAsync` (SkinTokens), `AnimateAsync` (Kimodo clips), or `GenerateAsync` for all of it; each model loads on its own so a 12 GB card is enough. The console tool writes `.png` and `.glb` files (RTX 4070, models cached: a knight in 77 s; first run with 17 GB of downloads 479 s);
   the WPF app draws 1-8 pictures, lets you pick one, builds, rigs and animates it, and previews it in the demo's WebGL viewer hosted in WebView2. [Docs/assetgen.md](Docs/assetgen.md).
