@@ -3,6 +3,10 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased
+
+- **Region editing of a generated asset (prototype).** `Trellis2Pipeline.RetextureRegionAsync`, `Trellis2ImageTo3D.EditRegionAsync`, `AssetGenerator.BuildEditableModelAsync` / `EditRegionAsync` / `RegionFromSpec`; console `--edit-picture` / `--edit-region`. Re-textures a region from a new picture, keeps the rest (RePaint on the texture flow, geometry unchanged). `FlowSampler.Sample` gains an `afterStep` hook; generations keep their latents (`Output.Edit`). Details and measurements in [Docs/trellis2.md](Docs/trellis2.md).
+
 ## 5.3.21 - 2026-10-19 - Text to 3D: no more dark dots (the reference's remesh and projected bake)
 
 Requires SpawnDev.ILGPU 5.3.8.

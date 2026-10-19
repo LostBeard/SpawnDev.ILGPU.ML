@@ -120,9 +120,9 @@ public sealed class FlowSampler
 
     /// <summary>
     /// Integrate from noise to sample. <paramref name="x"/> holds the initial noise on entry and the sample on exit
-    /// (<paramref name="count"/> elements). Model evaluations are issued synchronously by <paramref name="model"/>.
+    /// (<paramref name="count"/> elements). Model evaluations are issued synchronously by <paramref name="model"/>. <paramref name="afterStep"/> gets (step, the time x has reached) after every Euler step.
     /// </summary>
-    public void Sample(Model model, FV x, int count, Options o, Action<int, int>? progress = null)
+    public void Sample(Model model, FV x, int count, Options o, Action<int, int>? progress = null, Action<int, double>? afterStep = null)
     {
         _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
         _cfg ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(CfgImpl);
@@ -160,6 +160,7 @@ public sealed class FlowSampler
                 }
             }
             _axpy(count, x, pred.View, (float)(t - tPrev));
+            afterStep?.Invoke(step, tPrev);                     // x is now at time tPrev: RePaint-style editing puts the known part back here
             _acc.Fence();
             progress?.Invoke(step + 1, steps.Length);
         }

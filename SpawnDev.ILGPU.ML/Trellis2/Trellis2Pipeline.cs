@@ -28,7 +28,27 @@ public sealed class Trellis2Pipeline : IDisposable
         public MemoryBuffer1D<float, Stride1D.Dense> Attributes = null!;
         public MemoryBuffer1D<int, Stride1D.Dense> Coords = null!;
         public int VoxelCount, Grid;
+        /// <summary>The latents this asset was generated from, on the host (a few MB): what <see cref="RetextureRegionAsync"/> edits. Null for an Output not made by a generation.</summary>
+        public EditState? Edit;
         public void Dispose() { Mesh?.Dispose(); Attributes?.Dispose(); Coords?.Dispose(); }
+    }
+
+    /// <summary>The structured latents of a generated asset (sampler output, normalised space): the occupied tokens, the shape latent that conditions the texture flow, and the texture latent.</summary>
+    public sealed class EditState
+    {
+        /// <summary>512 or 1024.</summary>
+        public int Res;
+        /// <summary>Tokens per axis (Res / 16).</summary>
+        public int SlatGrid;
+        public int Count;
+        /// <summary>[Count, 3] token coordinates on the SlatGrid^3 lattice.</summary>
+        public int[] Coords = Array.Empty<int>();
+        /// <summary>[Count, 32]</summary>
+        public float[] ShapeSlat = Array.Empty<float>();
+        /// <summary>[Count, channels]</summary>
+        public float[] TexSlat = Array.Empty<float>();
+        /// <summary>World position (the volume is [-0.5, 0.5]^3) of the centre of token i.</summary>
+        public (float X, float Y, float Z) TokenCentre(int i) => ((Coords[i * 3] + 0.5f) / SlatGrid - 0.5f, (Coords[i * 3 + 1] + 0.5f) / SlatGrid - 0.5f, (Coords[i * 3 + 2] + 0.5f) / SlatGrid - 0.5f);
     }
 
     /// <summary>Per-stage progress: (stage name, seconds spent in it).</summary>
@@ -250,6 +270,10 @@ public sealed class Trellis2Pipeline : IDisposable
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] tex: {Moments(texSlat.View, count)}");
             { var dt = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_TEX") ?? ""; if (dt.Length > 0) { _acc.Synchronize(); var a = texSlat.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dt, "tex_slat.f32"), b); } }
         }
+        var edit = new EditState { Res = res, SlatGrid = slatGrid, Count = n0 };
+        edit.Coords = await coords32.View.SubView(0, (long)n0 * 3).CopyToHostAsync();
+        edit.ShapeSlat = await shapeSlat.View.SubView(0, (long)n0 * 32).CopyToHostAsync();
+        result.Edit = edit;
         shapeSlat.Dispose();
 
         // ---- 5. texture decoder -> PBR voxels -------------------------------------------------------------
@@ -257,6 +281,7 @@ public sealed class Trellis2Pipeline : IDisposable
             using var tm = Upload(_texMean); using var ts = Upload(_texStd);
             using var lat = _acc.Allocate1D<float>(texSlat.Length);
             _affine((int)texSlat.Length, texSlat.View, tm.View, ts.View, lat.View, 32);
+            edit.TexSlat = await texSlat.View.SubView(0, texSlat.Length).CopyToHostAsync();
             texSlat.Dispose();
             using var w = await _weights.LoadCheckpointAsync(_acc, "tex_dec_next_dc_f16c32_fp16", ct);
             var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
@@ -270,6 +295,107 @@ public sealed class Trellis2Pipeline : IDisposable
         }
         shapeDec.Dispose();
         coords32.Dispose();
+        return result;
+    }
+
+    // ---- region editing (training-free, RePaint-style) ---------------------------------------------------------------
+    private Action<Index1D, FV, FV, FV, IV, int, float, float>? _repaint;
+    private static void RepaintImpl(Index1D i, FV x, FV known, FV eps, IV keep, int ch, float a, float b)
+    {
+        if (keep[i / ch] != 0) x[i] = a * known[i] + b * eps[i];
+    }
+
+    /// <summary>
+    /// Re-texture a REGION of a generated asset from a new picture, keeping everything else. The texture flow is run again under the new image (conditioned on the same shape latent, so the
+    /// geometry does not change), and after every Euler step the tokens OUTSIDE the region are put back to the original texture latent noised to the current time
+    /// (x_t = (1 - t) x0 + (sigma + (1 - sigma) t) eps, the flow's own path): RePaint for flow matching, no training. The region is where <paramref name="inRegion"/> says so for the
+    /// token's centre in world coordinates (the volume is [-0.5, 0.5]^3). The mesh is extracted again from the kept shape latent (identical), the texture is decoded from the edited latent.
+    /// </summary>
+    /// <param name="source">a generation's output (it carries its latents, <see cref="Output.Edit"/>); not disposed</param>
+    /// <param name="cond">DINOv3 features of the new picture, [condTokens, 1024]: the 512 px features for a 512 asset, the 1024 px ones for a 1024 asset</param>
+    public async Task<Output> RetextureRegionAsync(Output source, FV cond, int condTokens, Func<float, float, float, bool> inRegion, int seed = 1, CancellationToken ct = default)
+    {
+        var st = source.Edit ?? throw new InvalidOperationException("This output carries no latents to edit (it was not made by a generation).");
+        int n0 = st.Count, res = st.Res, slatGrid = st.SlatGrid;
+        string suffix = res == 512 ? "512" : "1024";
+        _affine ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int>(AffineImpl);
+        _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
+        _halfShift ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(HalfShiftImpl);
+        _zero ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV>(ZeroImpl);
+        _repaint ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, int, float, float>(RepaintImpl);
+        var keepHost = new int[n0]; int regenerated = 0;
+        for (int i = 0; i < n0; i++)
+        {
+            var (cx, cy, cz) = st.TokenCentre(i);
+            bool inside = inRegion(cx, cy, cz);
+            keepHost[i] = inside ? 0 : 1;
+            if (inside) regenerated++;
+        }
+        if (regenerated == 0) throw new ArgumentException("The region holds no tokens of this asset.", nameof(inRegion));
+        var sw = Stopwatch.StartNew();
+        using var neg = _acc.Allocate1D<float>((long)condTokens * 1024);
+        _zero((int)neg.Length, neg.View);
+        using var coords32 = _acc.Allocate1D(st.Coords);
+        using var shapeSlat = _acc.Allocate1D(st.ShapeSlat);
+        using var keep = _acc.Allocate1D(keepHost);
+        var result = new Output { Grid = res };
+
+        // the shape decoder again: the mesh (identical) and the subdivision guide the texture decoder needs
+        SparseVaeDecoder.Result shapeDec;
+        {
+            using var sm = Upload(_shapeMean); using var ss = Upload(_shapeStd);
+            using var lat = _acc.Allocate1D<float>(shapeSlat.Length);
+            _affine((int)shapeSlat.Length, shapeSlat.View, sm.View, ss.View, lat.View, 32);
+            using var w = await _weights.LoadCheckpointAsync(_acc, "shape_dec_next_dc_f16c32_fp16", ct);
+            var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
+            shapeDec = await dec.DecodeAsync(lat.View, coords32.View, n0, slatGrid, keepSubdivisions: true);
+            result.Mesh = await _mesher.ExtractAsync(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
+            await StageAsync($"edit: shape decode + mesh ({result.Mesh.FaceCount} triangles)", sw);
+        }
+
+        // the texture flow under the new picture, the kept tokens pinned to the original latent
+        MemoryBuffer1D<float, Stride1D.Dense> texSlat;
+        {
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16", ct);
+            using var dit = new FlowDiT(_acc, _dk, w);
+            dit.SetTokens(coords32.View, n0);
+            int ch = dit.OutChannels, count = n0 * ch;
+            if (st.TexSlat.Length != count) throw new InvalidOperationException("The stored texture latent does not match the checkpoint.");
+            using var known = _acc.Allocate1D(st.TexSlat);
+            using var eps = _acc.Allocate1D<float>(count);
+            _sampler.Randn(eps.View, count, (ulong)seed * 7919UL + 3);
+            texSlat = _acc.Allocate1D<float>(count);
+            texSlat.View.CopyFrom(eps.View);
+            using var modelIn = _acc.Allocate1D<float>((long)n0 * dit.InChannels);
+            float sigma = _texOpts.SigmaMin;
+            await StageAsync("edit: tex flow load", sw);
+            _sampler.Sample((xv, t1000, useCond, v) =>
+            {
+                _concat(n0 * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
+                dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);
+            }, texSlat.View, count, _texOpts, null, (step, tPrev) => _repaint(count, texSlat.View, known.View, eps.View, keep.View, ch, (float)(1.0 - tPrev), (float)(sigma + (1.0 - sigma) * tPrev)));
+            await StageAsync($"edit: tex flow sample ({regenerated} of {n0} tokens regenerated)", sw);
+        }
+
+        var edit = new EditState { Res = res, SlatGrid = slatGrid, Count = n0, Coords = st.Coords, ShapeSlat = st.ShapeSlat };
+        {
+            using var tm = Upload(_texMean); using var ts = Upload(_texStd);
+            using var lat = _acc.Allocate1D<float>(texSlat.Length);
+            _affine((int)texSlat.Length, texSlat.View, tm.View, ts.View, lat.View, 32);
+            edit.TexSlat = await texSlat.View.SubView(0, texSlat.Length).CopyToHostAsync();
+            texSlat.Dispose();
+            using var w = await _weights.LoadCheckpointAsync(_acc, "tex_dec_next_dc_f16c32_fp16", ct);
+            var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
+            using var tex = await dec.DecodeAsync(lat.View, coords32.View, n0, slatGrid, guide: shapeDec.Subdivisions);
+            result.Attributes = _acc.Allocate1D<float>(tex.Feats.Length);
+            _halfShift((int)tex.Feats.Length, tex.Feats.View, result.Attributes.View);
+            result.Coords = _acc.Allocate1D<int>((long)tex.Count * 3);
+            result.Coords.View.CopyFrom(tex.Coords.View.SubView(0, (long)tex.Count * 3));
+            result.VoxelCount = tex.Count;
+            await StageAsync("edit: tex decode", sw);
+        }
+        shapeDec.Dispose();
+        result.Edit = edit;
         return result;
     }
 

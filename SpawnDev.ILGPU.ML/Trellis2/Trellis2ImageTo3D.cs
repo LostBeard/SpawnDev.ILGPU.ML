@@ -86,6 +86,33 @@ public sealed class Trellis2ImageTo3D : IDisposable
         using (output) return await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
     }
 
+    /// <summary>
+    /// Re-texture a region of a generated asset from a new picture (see <see cref="Trellis2Pipeline.RetextureRegionAsync"/>): the picture is prepared and its DINOv3 features
+    /// extracted like for a generation, the flow runs again with the tokens outside the region pinned to the asset's own texture latent. Returns the edited output (the caller disposes it;
+    /// <paramref name="source"/> is left alone) and the pipeline to build a GLB from it with.
+    /// </summary>
+    public async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> EditRegionAsync(Trellis2Pipeline.Output source, IV rgba, int width, int height,
+        Func<float, float, float, bool> inRegion, int seed = 1, CancellationToken ct = default)
+    {
+        var st = source.Edit ?? throw new InvalidOperationException("This output carries no latents to edit.");
+        var sw = Stopwatch.StartNew();
+        _precompile ??= Task.WhenAll(_dk.PrecompileAsync(), _sk.PrecompileAsync());
+        var pipeline = await Trellis2Pipeline.CreateAsync(_acc, _weights, ct);
+        pipeline.StageDone = StageDone;
+        using var image = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, st.Res);
+        int tokens = 1 + 4 + (st.Res / 16) * (st.Res / 16);
+        using var cond = _acc.Allocate1D<float>((long)tokens * 1024);
+        {
+            using var w = await _weights.LoadDinoAsync(_acc, ct);
+            await _precompile;
+            using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
+            dino.Extract(image.View, st.Res, cond.View);
+        }
+        StageDone?.Invoke("edit: dinov3 features", sw.Elapsed.TotalSeconds);
+        var output = await pipeline.RetextureRegionAsync(source, cond.View, tokens, inRegion, seed, ct);
+        return (output, pipeline);
+    }
+
     /// <summary>Desktop wrapper of <see cref="GenerateAsync"/> (blocks).</summary>
     public Trellis2Pipeline.Output Generate(IV rgba, int width, int height, Trellis2Options? options, out Trellis2Pipeline pipeline)
     {

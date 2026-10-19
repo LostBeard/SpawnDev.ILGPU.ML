@@ -64,3 +64,7 @@ A scene is glTF nodes with transforms referencing generated GLBs (plus lights, s
 | TRELLIS.2 | MIT | **Ships the encoders too**: `shape_enc_next_dc_f16c32_fp16` and `tex_enc_next_dc_f16c32_fp16` (Hugging Face `microsoft/TRELLIS.2-4B`, alongside the decoders we already port), plus `texturing_pipeline.json`. |
 
 The encoders matter: with them an existing mesh and its PBR attributes can be turned into structured latents, which is what inversion-based editing and re-texturing an arbitrary mesh need. The first prototype does not need them: a generated asset's own latents can be kept and edited (RePaint-style, below).
+
+## 7. Prototype result: region re-texturing (2026-10-19)
+
+Built and measured, see [Docs/trellis2.md](../Docs/trellis2.md) (Editing a region): RePaint on the TRELLIS.2 texture flow works. Upper body of a knight re-textured from a red-armour picture in ~20 s, the rest unchanged to 0.0025, no seam. Next steps on the editing side: the shape stage under the mask, the encoders for arbitrary meshes, VoxHammer-style inversion, a text prompt instead of a picture.

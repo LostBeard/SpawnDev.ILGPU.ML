@@ -5,6 +5,7 @@ using SpawnDev.ILGPU.ML.Flux2;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.SkinTokens;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Trellis2;
 using SpawnDev.ILGPU.ML.UniRig;
 
@@ -21,6 +22,20 @@ public enum ImageModel
 
 /// <summary>A picture drawn for a prompt.</summary>
 public sealed record AssetPicture(int Seed, int Width, int Height, byte[] Rgba);
+
+/// <summary>
+/// A generated 3D model that keeps its latents, so a region of it can be re-textured (<see cref="AssetGenerator.EditRegionAsync"/>). Holds a few GB of device memory until disposed
+/// (the mesh and per-voxel attributes); the GLB is already built.
+/// </summary>
+public sealed class EditableModel : IDisposable
+{
+    public byte[] Glb { get; }
+    internal Trellis2Pipeline.Output Output { get; }
+    internal EditableModel(byte[] glb, Trellis2Pipeline.Output output) { Glb = glb; Output = output; }
+    /// <summary>Tokens of the structured latent (the unit a region is made of).</summary>
+    public int Tokens => Output.Edit?.Count ?? 0;
+    public void Dispose() => Output.Dispose();
+}
 
 /// <summary>What <see cref="AssetGenerator.GenerateAsync"/> made.</summary>
 public sealed record GeneratedAsset(AssetPicture Picture, int[] CutOut, byte[] Glb, byte[]? RiggedGlb, byte[]? AnimatedGlb, IReadOnlyList<string> Moves);
@@ -157,6 +172,72 @@ public sealed class AssetGenerator : IDisposable
         _trellis ??= new Trellis2ImageTo3D(_acc, Trellis2Weights.FromModelSource(_source)) { StageDone = (n, s) => StageDone?.Invoke(n, s) };
         Status?.Invoke("building the 3D model (TRELLIS.2)");
         return await _trellis.GenerateGlbAsync(cutOutPixels, width, height, options);
+    }
+
+    /// <summary><see cref="BuildModelAsync"/>, keeping the latents so a region can be edited later with <see cref="EditRegionAsync"/>. The caller disposes the model.</summary>
+    public async Task<EditableModel> BuildEditableModelAsync(int[] cutOutPixels, int width, int height, Trellis2Options? options = null)
+    {
+        options ??= new Trellis2Options();
+        ReleaseImageModel();
+        _trellis ??= new Trellis2ImageTo3D(_acc, Trellis2Weights.FromModelSource(_source)) { StageDone = (n, s) => StageDone?.Invoke(n, s) };
+        Status?.Invoke("building the 3D model (TRELLIS.2)");
+        using var pixels = RgbaUpload.FromManaged(_acc, cutOutPixels, width, height);
+        var (output, pipe) = await _trellis.GenerateAsync(pixels.View, width, height, options);
+        pipe.RepairMesh = options.RepairMesh; pipe.Remesh = options.Remesh;
+        var glb = await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
+        return new EditableModel(glb, output);
+    }
+
+    /// <summary>
+    /// Re-texture a region of <paramref name="source"/> from a new cut-out picture: tokens whose centre (world coordinates, the model lives in [-0.5, 0.5]^3,
+    /// generator frame: x right, y depth, z up; the GLB writer turns z up into y up) is inside <paramref name="inRegion"/> are regenerated under the new picture, everything else keeps its texture; the geometry does not change.
+    /// Returns a new editable model (so edits can be chained); <paramref name="source"/> is left alone.
+    /// </summary>
+    public async Task<EditableModel> EditRegionAsync(EditableModel source, int[] cutOutPixels, int width, int height, Func<float, float, float, bool> inRegion, Trellis2Options? options = null, int seed = 1)
+    {
+        options ??= new Trellis2Options();
+        ReleaseImageModel();
+        _trellis ??= new Trellis2ImageTo3D(_acc, Trellis2Weights.FromModelSource(_source)) { StageDone = (n, s) => StageDone?.Invoke(n, s) };
+        Status?.Invoke("editing a region (TRELLIS.2 texture flow)");
+        using var pixels = RgbaUpload.FromManaged(_acc, cutOutPixels, width, height);
+        var (output, pipe) = await _trellis.EditRegionAsync(source.Output, pixels.View, width, height, inRegion, seed);
+        pipe.RepairMesh = options.RepairMesh; pipe.Remesh = options.Remesh;
+        var glb = await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
+        return new EditableModel(glb, output);
+    }
+
+    /// <summary>
+    /// A region from text, in the generator's frame (x right, y depth, z up; the model fills [-0.5, 0.5]^3): <c>z&gt;0.1</c>, <c>x&lt;-0.05</c> (one axis against a bound), <c>box:x0,y0,z0,x1,y1,z1</c>,
+    /// <c>sphere:cx,cy,cz,r</c>. Several joined with <c>;</c> are a union.
+    /// </summary>
+    public static Func<float, float, float, bool> RegionFromSpec(string spec)
+    {
+        var parts = new List<Func<float, float, float, bool>>();
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        foreach (var raw in spec.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var p = raw.ToLowerInvariant();
+            if (p.StartsWith("box:"))
+            {
+                var v = p[4..].Split(',').Select(t => float.Parse(t, inv)).ToArray();
+                if (v.Length != 6) throw new FormatException("box:x0,y0,z0,x1,y1,z1");
+                parts.Add((x, y, z) => x >= Math.Min(v[0], v[3]) && x <= Math.Max(v[0], v[3]) && y >= Math.Min(v[1], v[4]) && y <= Math.Max(v[1], v[4]) && z >= Math.Min(v[2], v[5]) && z <= Math.Max(v[2], v[5]));
+            }
+            else if (p.StartsWith("sphere:"))
+            {
+                var v = p[7..].Split(',').Select(t => float.Parse(t, inv)).ToArray();
+                if (v.Length != 4) throw new FormatException("sphere:cx,cy,cz,r");
+                parts.Add((x, y, z) => (x - v[0]) * (x - v[0]) + (y - v[1]) * (y - v[1]) + (z - v[2]) * (z - v[2]) <= v[3] * v[3]);
+            }
+            else if (p.Length > 2 && "xyz".Contains(p[0]) && (p[1] == '>' || p[1] == '<'))
+            {
+                int axis = p[0] - 'x'; bool greater = p[1] == '>'; float bound = float.Parse(p[2..], inv);
+                parts.Add((x, y, z) => { float c = axis == 0 ? x : axis == 1 ? y : z; return greater ? c > bound : c < bound; });
+            }
+            else throw new FormatException($"unknown region '{raw}' (use z>0.1, box:..., sphere:...)");
+        }
+        if (parts.Count == 0) throw new FormatException("an empty region");
+        return (x, y, z) => { foreach (var f in parts) if (f(x, y, z)) return true; return false; };
     }
 
     // ───────────────────────────── 4. rig ─────────────────────────────
