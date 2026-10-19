@@ -202,4 +202,55 @@ public abstract partial class MLTestBase
         }
         Ur_Expect(sd > 20, $"the picture is not flat (spread {sd:F1})");
     });
+
+    private const string F3Server = "http://127.0.0.1:8767/";
+
+    /// <summary>A plain HTTP file server as a model source: every repo maps to the server root (tests only; the demo uses the hub source with its OPFS cache).</summary>
+    private sealed class F3HttpSource(HttpClient http) : SpawnDev.ILGPU.ML.Hub.IModelSource
+    {
+        public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+        {
+            if (filePath.EndsWith(".onnx")) return new MemoryStream(await http.GetByteArrayAsync(F3Server + filePath, cancellationToken));   // the ONNX reader needs a seekable stream
+            return await http.GetStreamAsync(F3Server + filePath, cancellationToken);
+        }
+        public Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => http.GetByteArrayAsync(F3Server + filePath, cancellationToken);
+    }
+
+    /// <summary>
+    /// The whole pipeline built from a model source and run on any lane with a GPU, the browser WebGPU lane included: 4-bit stages streamed from a local file server
+    /// (node tools/unirig-harness/serve-files.mjs E:/spawndev-flux3/hf_upload 8767), a caption, a picture that is not blank; then the same caption with a reference picture. Timings go to the log.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux3_OverHttp_DrawsAPicture() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        try { await http.GetByteArrayAsync(F3Server + "vae_norm.json"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs E:/spawndev-flux3/hf_upload 8767"); }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var pipe = await Flux3Pipeline.CreateAsync(accelerator, new F3HttpSource(http), "local");
+        pipe.KeepTransformerResident = true;
+        double create = sw.Elapsed.TotalSeconds; sw.Restart();
+        const string caption = "Full-color studio photograph, eye-level shot of a small red ceramic teapot with a white lid, centred on a plain light grey background, soft light from the upper left.";
+        Flux2Image Check(Flux2Image result, string what)
+        {
+            double sum = 0, sumSq = 0; int px = result.Width * result.Height;
+            for (int i = 0; i < px; i++) { double l = result.Rgba[i * 4] + result.Rgba[i * 4 + 1] + result.Rgba[i * 4 + 2]; sum += l; sumSq += l * l; }
+            double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean));
+            Console.WriteLine($"[Flux3] {what} on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, {result.Width}x{result.Height}, mean luminance {mean / 3:F0}, std {std / 3:F0}");
+            Ur_Expect(std / 3 > 10, $"{what}: picture is flat (luminance std {std / 3:F1})");
+            return result;
+        }
+        var first = Check(await pipe.RunAsync(new Flux3Request { Caption = caption, Seed = 3, Width = 512, Height = 512, Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F1} s") }), "text to image");
+        sw.Restart();
+        var refPixels = new byte[256 * 192 * 4];                                     // a synthetic reference: a diagonal gradient with a dark disc
+        for (int y = 0; y < 192; y++)
+            for (int x = 0; x < 256; x++)
+            {
+                int o = (y * 256 + x) * 4; bool disc = (x - 128) * (x - 128) + (y - 96) * (y - 96) < 50 * 50;
+                refPixels[o] = (byte)(disc ? 30 : 60 + x / 2); refPixels[o + 1] = (byte)(disc ? 30 : 120 + y / 3); refPixels[o + 2] = (byte)(disc ? 30 : 200 - x / 3); refPixels[o + 3] = 255;
+            }
+        Check(await pipe.RunAsync(new Flux3Request { Caption = caption, Seed = 3, Width = 512, Height = 384, References = new[] { new Flux2ReferenceImage(256, 192, refPixels) } }), "with a reference picture");
+        Ur_Expect(first.Width == 512 && first.Height == 512, "512 px picture");
+    });
 }

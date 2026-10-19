@@ -159,9 +159,8 @@ public sealed class Flux3Transformer : IDisposable
         if (_c.FlowMap)
         {
             TimeVector(tNext, "ref_time_in", _vecRef.View);
-            var a = _vecImg.View.GetAsArray1D(); var b = _vecOther.View.GetAsArray1D(); var r = _vecRef.View.GetAsArray1D();
-            for (int i = 0; i < D; i++) { a[i] += r[i]; b[i] += r[i]; }
-            _vecImg.View.CopyFromCPU(a); _vecOther.View.CopyFromCPU(b);
+            _k.GateResidual(_vecImg.View, _vecRef.View, _tin.View, -1, D, D);          // plain residual on the device: the browser backends have no synchronous read-back
+            _k.GateResidual(_vecOther.View, _vecRef.View, _tin.View, -1, D, D);
         }
         for (int m = 0; m < 3; m++)
         {
