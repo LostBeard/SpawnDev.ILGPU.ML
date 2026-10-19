@@ -32,6 +32,7 @@ public sealed class GpuMeshSimplifier
     public List<(int Faces, int Collapses)> LastRounds { get; private set; } = new();
 
     private const float Inf = 3.0e38f;
+    private const int SubPasses = 5;
 
     // ---- quadric math (all in the frame of vertex a's original position) -----------------------------------------------------------------------------
     private static float Err(float aa, float ab, float ac, float bb, float bc, float cc, float bx, float by, float bz, float c, float x, float y, float z)
@@ -241,33 +242,57 @@ public sealed class GpuMeshSimplifier
         bestCost[v] = bc; bestNbr[v] = bu;
     }
 
-    private static void RingMinImpl(Index1D v, IV faces, IV vstart, IV vfaces, FV bestCost, IV bestNbr, FV nmCost, IV nmA, IV nmB)
+    private static void RingMinImpl(Index1D v, IV faces, IV vstart, IV vfaces, FV bestCost, IV bestNbr, IV blocked, FV nmCost, IV nmA, IV nmB)
     {
         float c = Inf; int ka = -1, kb = -1;
-        // the vertex itself ...
-        int w0 = bestNbr[v];
-        if (w0 >= 0) { c = bestCost[v]; ka = v < w0 ? v : w0; kb = v < w0 ? w0 : v; }
-        // ... and every neighbour: the best key among their best edges
-        for (int i = vstart[v]; i < vstart[v + 1]; i++)
-            for (int k = 0; k < 3; k++)
-            {
-                int u = faces[vfaces[i] * 3 + k];
-                if (u == v || bestNbr[u] < 0) continue;
-                int w = bestNbr[u], a = u < w ? u : w, b = u < w ? w : u;
-                if (ka < 0 || KeyLess(bestCost[u], a, b, c, ka, kb)) { c = bestCost[u]; ka = a; kb = b; }
-            }
+        if (blocked[v] == 0)
+        {
+            // the vertex itself ...
+            int w0 = bestNbr[v];
+            if (w0 >= 0 && blocked[w0] == 0) { c = bestCost[v]; ka = v < w0 ? v : w0; kb = v < w0 ? w0 : v; }
+            // ... and every free neighbour: the best key among their best edges (an edge into a blocked vertex does not count)
+            for (int i = vstart[v]; i < vstart[v + 1]; i++)
+                for (int k = 0; k < 3; k++)
+                {
+                    int u = faces[vfaces[i] * 3 + k];
+                    if (u == v || blocked[u] != 0 || bestNbr[u] < 0 || blocked[bestNbr[u]] != 0) continue;
+                    int w = bestNbr[u], a = u < w ? u : w, b = u < w ? w : u;
+                    if (ka < 0 || KeyLess(bestCost[u], a, b, c, ka, kb)) { c = bestCost[u]; ka = a; kb = b; }
+                }
+        }
         nmCost[v] = c; nmA[v] = ka; nmB[v] = kb;
     }
 
-    private static void SelectImpl(Index1D v, FV bestCost, IV bestNbr, FV nmCost, IV nmA, IV nmB, IV selected, IV counter, float maxCost)
+    // adds to the round's selection (never clears it): free vertices whose best edge is mutual and the cheapest in both ends' free rings
+    private static void SelectImpl(Index1D v, FV bestCost, IV bestNbr, FV nmCost, IV nmA, IV nmB, IV blocked, IV selected, IV counter)
     {
-        selected[v] = -1;
+        if (blocked[v] != 0) return;
         int u = bestNbr[v];
-        if (u < 0 || u < v || bestNbr[u] != v || bestCost[v] > maxCost) return;      // handled once, from the lower end
+        if (u < 0 || u < v || blocked[u] != 0 || bestNbr[u] != v) return;      // handled once, from the lower end
         float c = bestCost[v];
         if (nmCost[v] != c || nmA[v] != v || nmB[v] != u || nmCost[u] != c || nmA[u] != v || nmB[u] != u) return;
         selected[v] = u;
         Atomic.Add(ref counter[0], 1);
+    }
+
+    // everything touching a selected edge or its neighbours is off limits for the rest of the round
+    private static void BlockImpl(Index1D v, IV selected, IV faces, IV vstart, IV vfaces, IV blocked)
+    {
+        int u = selected[v];
+        if (u < 0) return;
+        blocked[v] = 1; blocked[u] = 1;
+        for (int side = 0; side < 2; side++)
+        {
+            int w = side == 0 ? v : u;
+            for (int i = vstart[w]; i < vstart[w + 1]; i++)
+                for (int k = 0; k < 3; k++) blocked[faces[vfaces[i] * 3 + k]] = 1;
+        }
+    }
+
+    private static void ThresholdImpl(Index1D v, FV bestCost, IV selected, IV counter, float tau)
+    {
+        if (selected[v] < 0) return;
+        if (bestCost[v] > tau) selected[v] = -1; else Atomic.Add(ref counter[0], 1);
     }
 
     private static void CountBelowImpl(Index1D v, FV bestCost, IV selected, IV counter, float tau)
@@ -281,6 +306,7 @@ public sealed class GpuMeshSimplifier
     }
 
     private static void IotaImpl(Index1D i, IV v) { v[i] = i; }
+    private static void FillMinus1Impl(Index1D i, IV v) { v[i] = -1; }
 
     private static void CollapseImpl(Index1D v, FV pos, FV org, FV Q, IV selected, IV rep)
     {
@@ -320,15 +346,18 @@ public sealed class GpuMeshSimplifier
     /// <summary>
     /// Reduce the mesh to about <paramref name="targetFaces"/>. The inputs stay untouched; the result is a new mesh in device buffers (compacted positions and faces).
     /// </summary>
-    public async Task<DeviceTriMesh> SimplifyAsync(FV positions, int vertexCount, IV faces, int faceCount, int targetFaces, int maxRounds = 60)
+    public async Task<DeviceTriMesh> SimplifyAsync(FV positions, int vertexCount, IV faces, int faceCount, int targetFaces, int maxRounds = 400)
     {
         LastRounds = new List<(int, int)>();
         var count = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(CountImpl);
         var fill = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV>(FillImpl);
         var quadric = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, IV, IV>(QuadricImpl);
         var best = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, IV, IV, FV, IV>(BestEdgeImpl);
-        var ring = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, IV, FV, IV, IV>(RingMinImpl);
-        var select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, IV, IV, IV, float>(SelectImpl);
+        var ring = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, IV, IV, FV, IV, IV>(RingMinImpl);
+        var select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, IV, IV, IV, IV>(SelectImpl);
+        var block = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV, IV>(BlockImpl);
+        var threshold = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, float>(ThresholdImpl);
+        var fillMinus1 = _acc.LoadAutoGroupedStreamKernel<Index1D, IV>(FillMinus1Impl);
         var countBelow = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, float>(CountBelowImpl);
         var maxCost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV>(MaxCostImpl);
         var iota = _acc.LoadAutoGroupedStreamKernel<Index1D, IV>(IotaImpl);
@@ -350,7 +379,7 @@ public sealed class GpuMeshSimplifier
         using var vfaces = _acc.Allocate1D<int>(Math.Max(3L, (long)nf * 3));
         using var bestCost = _acc.Allocate1D<float>(nv); using var bestNbr = _acc.Allocate1D<int>(nv);
         using var nmCost = _acc.Allocate1D<float>(nv); using var nmA = _acc.Allocate1D<int>(nv); using var nmB = _acc.Allocate1D<int>(nv);
-        using var selected = _acc.Allocate1D<int>(nv); using var rep = _acc.Allocate1D<int>(nv);
+        using var selected = _acc.Allocate1D<int>(nv); using var rep = _acc.Allocate1D<int>(nv); using var blocked = _acc.Allocate1D<int>(nv);
         using var counter = _acc.Allocate1D<int>(1);
         using var keep = _acc.Allocate1D<int>(Math.Max(1L, nf)); using var koff = _acc.Allocate1D<int>(nf + 1L);
         var cur = facesA; var other = facesB;
@@ -364,10 +393,19 @@ public sealed class GpuMeshSimplifier
                 fill(nf, cur.View, vstart.View, vfill.View, vfaces.View);
                 if (round == 0) quadric(nv, pos.View, org.View, Q.View, cur.View, vstart.View, vfaces.View);
                 best(nv, pos.View, org.View, Q.View, cur.View, vstart.View, vfaces.View, bestCost.View, bestNbr.View);
-                ring(nv, cur.View, vstart.View, vfaces.View, bestCost.View, bestNbr.View, nmCost.View, nmA.View, nmB.View);
-                counter.MemSetToZero();
-                select(nv, bestCost.View, bestNbr.View, nmCost.View, nmA.View, nmB.View, selected.View, counter.View, Inf);
-                int selectedCount = (await counter.View.CopyToHostAsync())[0];
+                // a few matching passes over the same edge costs: each takes the cheapest edges that do not touch an earlier pass's, so a round collapses a large share of the mesh instead of a sparse local-minimum set
+                fillMinus1(nv, selected.View); blocked.MemSetToZero();
+                int selectedCount = 0;
+                for (int pass = 0; pass < SubPasses; pass++)
+                {
+                    ring(nv, cur.View, vstart.View, vfaces.View, bestCost.View, bestNbr.View, blocked.View, nmCost.View, nmA.View, nmB.View);
+                    counter.MemSetToZero();
+                    select(nv, bestCost.View, bestNbr.View, nmCost.View, nmA.View, nmB.View, blocked.View, selected.View, counter.View);
+                    int got = (await counter.View.CopyToHostAsync())[0];
+                    if (got == 0) break;
+                    selectedCount += got;
+                    block(nv, selected.View, cur.View, vstart.View, vfaces.View, blocked.View);
+                }
                 if (selectedCount == 0) break;
                 // faces left to remove, at about two per collapse; when a full round would overshoot, collapse only the cheapest edges that reach the target
                 int toRemove = nf - targetFaces;
@@ -386,7 +424,7 @@ public sealed class GpuMeshSimplifier
                     }
                     float tau = BitConverter.Int32BitsToSingle(lo);
                     counter.MemSetToZero();
-                    select(nv, bestCost.View, bestNbr.View, nmCost.View, nmA.View, nmB.View, selected.View, counter.View, tau);
+                    threshold(nv, bestCost.View, selected.View, counter.View, tau);
                     selectedCount = (await counter.View.CopyToHostAsync())[0];
                 }
                 iota(nv, rep.View);
