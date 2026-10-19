@@ -626,6 +626,7 @@
             {
                 _modelStatusText = $"FLUX.2 klein — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
             });
+            _flux.KeepTransformerResident = true;       // "Draw 4 more" reuses it; RunTrellisAsync releases it before TRELLIS.2 needs the memory
             OnStageDone("image model load", sw.Elapsed.TotalSeconds);
         }
         _isLoading = false;
@@ -718,6 +719,7 @@
 
     private async Task RunTrellisAsync(int[] px, int w, int h, System.Diagnostics.Stopwatch total, string label)
     {
+        _flux?.ReleaseResident();                                  // FLUX.2's transformer (2.6 GB) must not sit on the GPU while TRELLIS.2 runs
         _isLoading = _downloadBytes > 0;                          // the first run downloads; streamed weights load again on every run
         _modelSizeMb = _downloadBytes / 1048576.0; _modelProgress = 0;
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;

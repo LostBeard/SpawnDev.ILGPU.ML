@@ -3,6 +3,11 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased
+
+- **FLUX.2: keep the transformer between draws.** `Flux2Pipeline.KeepTransformerResident` leaves the 2.4 GB transformer on the device after a run (`ReleaseResident()` / `Dispose()` free it) and the pipeline always keeps the last prompt's embeddings, so drawing the same prompt again loads
+  nothing: on Chrome WebGPU the Image Generation page goes from about 75 s to about 8 s per further picture. The Generate page keeps it; Text to 3D keeps it while you pick and releases it before TRELLIS.2 starts. Test `Flux2_RunMany_LoadsEachStageOnce_AndKeepsTheTransformer`.
+
 ## 5.3.18 - 2026-10-19 - FLUX.2 klein 4B text to image, and pick-your-picture in text to 3D
 
 Requires SpawnDev.ILGPU 5.3.8. Docs: [Docs/flux2.md](Docs/flux2.md).

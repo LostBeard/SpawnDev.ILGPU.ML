@@ -181,24 +181,38 @@ public sealed class Flux2Pipeline : IDisposable
         int side = request.Size / 16, nImg = side * side, nTxt = Flux2TextEncoder.SeqLen;
         void Report(string s, int i, int n) => request.Progress?.Invoke(s, i, n);
 
-        // 1. text
-        Report("text encoder", 0, 1);
-        var (ids, real) = _tokenizer.EncodePadded(request.Prompt);
+        // 1. text (the embeddings of the last prompt are kept, so drawing the same prompt again never loads the encoder)
         float[] embeds;
-        using (var w = await _encoderWeights())
-        using (var enc = new Flux2TextEncoder(_acc, w))
+        if (_cachedEmbeds != null && _cachedPrompt == request.Prompt) embeds = _cachedEmbeds;
+        else
         {
-            enc.Encode(ids, real);
-            await _acc.SynchronizeAsync();
-            embeds = await enc.Output.CopyToHostAsync();
+            Report("text encoder", 0, 1);
+            var (ids, real) = _tokenizer.EncodePadded(request.Prompt);
+            using (var w = await _encoderWeights())
+            using (var enc = new Flux2TextEncoder(_acc, w))
+            {
+                enc.Encode(ids, real);
+                await _acc.SynchronizeAsync();
+                embeds = await enc.Output.CopyToHostAsync();
+            }
+            _cachedPrompt = request.Prompt; _cachedEmbeds = embeds;
         }
 
         // 2. denoise and decode each seed; the transformer stays loaded for all of them
         var sigmas = Flux2Scheduler.Sigmas(nImg, request.Steps);
         var imgIds = ImageIds(side); var txtIds = TextIds(nTxt);
         var images = new List<Flux2Image>();
-        using var tw = await _transformerWeights();
-        using var tr = new Flux2Transformer(_acc, tw, nTxt, nImg);
+        Flux2Weights tw; Flux2Transformer tr;
+        if (_residentTr != null && _residentTokens == nImg) { tw = _residentWeights!; tr = _residentTr; }
+        else
+        {
+            ReleaseResident();
+            Report("transformer", 0, 1);
+            tw = await _transformerWeights();
+            tr = new Flux2Transformer(_acc, tw, nTxt, nImg);
+        }
+        try
+        {
         for (int n = 0; n < seeds.Length; n++)
         {
             var latents = request.Noise?.ToArray() ?? GaussianNoise(nImg * Flux2Transformer.InChannels, seeds[n]);
@@ -216,9 +230,34 @@ public sealed class Flux2Pipeline : IDisposable
             images.Add(image);
             if (onImage != null) await onImage(n, image);
         }
+        }
+        finally
+        {
+            if (KeepTransformerResident) { _residentWeights = tw; _residentTr = tr; _residentTokens = nImg; }
+            else { if (ReferenceEquals(tr, _residentTr)) { _residentTr = null; _residentWeights = null; } tr.Dispose(); tw.Dispose(); }
+        }
         return images;
     }
 
-    /// <summary>Frees the resident VAE decoder. The accelerator is not touched.</summary>
-    public void Dispose() { _vae.Dispose(); _elementWise?.Dispose(); }
+    /// <summary>
+    /// Keep the transformer's weights on the device after a run (the next run of the same size skips the 2.4 GB load: about 60 s in a browser). Off by default because the weights hold GPU memory until
+    /// <see cref="ReleaseResident"/> (or <see cref="Dispose"/>) frees them; a page that goes on to run another big model should release first.
+    /// </summary>
+    public bool KeepTransformerResident { get; set; }
+
+    private Flux2Weights? _residentWeights;
+    private Flux2Transformer? _residentTr;
+    private int _residentTokens;
+    private string? _cachedPrompt;
+    private float[]? _cachedEmbeds;
+
+    /// <summary>Free the transformer kept by <see cref="KeepTransformerResident"/> (the cached prompt embeddings stay: they are host memory).</summary>
+    public void ReleaseResident()
+    {
+        _residentTr?.Dispose(); _residentWeights?.Dispose();
+        _residentTr = null; _residentWeights = null; _residentTokens = 0;
+    }
+
+    /// <summary>Frees the resident VAE decoder and any kept transformer. The accelerator is not touched.</summary>
+    public void Dispose() { ReleaseResident(); _vae.Dispose(); _elementWise?.Dispose(); }
 }

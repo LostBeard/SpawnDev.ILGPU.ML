@@ -268,7 +268,7 @@ public abstract partial class MLTestBase
 
     /// <summary>Several seeds of one prompt: the weights are loaded once per stage (the factories are called once each), the pictures differ from each other, and each is delivered as it finishes.</summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Flux2_RunMany_LoadsEachStageOnce() => await RunTest(async accelerator =>
+    public async Task Flux2_RunMany_LoadsEachStageOnce_AndKeepsTheTransformer() => await RunTest(async accelerator =>
     {
         var dir = F2_Require(accelerator);
         var enc = Path.Combine(dir, "weights", "text_encoder_q4.safetensors"); var trf = Path.Combine(dir, "weights", "transformer_q4.safetensors");
@@ -282,6 +282,16 @@ public abstract partial class MLTestBase
         var delivered = new List<int>();
         var images = await pipe.RunManyAsync(new Flux2Request { Prompt = "a knight in plate armor, full body, white background" }, new[] { 1, 2, 3 }, (i, _) => { delivered.Add(i); return Task.CompletedTask; });
         Ur_Expect(encLoads == 1 && trfLoads == 1, $"each stage's weights loaded once (encoder {encLoads}, transformer {trfLoads})");
+        // drawing the same prompt again with the transformer kept: nothing is loaded; after releasing it only the transformer is (the prompt embeddings are cached)
+        pipe.KeepTransformerResident = true;
+        await pipe.RunManyAsync(new Flux2Request { Prompt = "a knight in plate armor, full body, white background" }, new[] { 4 });      // loads the transformer once more and keeps it
+        int trfAfterKeep = trfLoads;
+        await pipe.RunManyAsync(new Flux2Request { Prompt = "a knight in plate armor, full body, white background" }, new[] { 5 });
+        Ur_Expect(encLoads == 1, $"the cached prompt embeddings spared the encoder (loads {encLoads})");
+        Ur_Expect(trfLoads == trfAfterKeep, $"a kept transformer is not loaded again (loads {trfLoads}, expected {trfAfterKeep})");
+        pipe.ReleaseResident(); pipe.KeepTransformerResident = false;
+        await pipe.RunManyAsync(new Flux2Request { Prompt = "a different prompt entirely, a red teapot" }, new[] { 6 });
+        Ur_Expect(encLoads == 2, $"a new prompt loads the encoder (loads {encLoads})");
         Ur_Expect(images.Count == 3 && delivered.SequenceEqual(new[] { 0, 1, 2 }), "three pictures delivered in order");
         long diff01 = 0; for (int i = 0; i < images[0].Rgba.Length; i += 4) diff01 += Math.Abs(images[0].Rgba[i] - images[1].Rgba[i]);
         double meanDiff = diff01 / (images[0].Rgba.Length / 4.0);

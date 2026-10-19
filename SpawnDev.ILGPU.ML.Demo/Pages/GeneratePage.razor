@@ -292,6 +292,7 @@
                 {
                     _modelStatusText = $"FLUX.2 klein — {stage}"; _modelProgress = pct; InvokeAsync(StateHasChanged);
                 });
+                _flux.KeepTransformerResident = true;        // this page does nothing else with the GPU: the next picture skips the 2.4 GB reload
                 _modelStatusText = "FLUX.2 klein";
                 _isModelLoaded = true;
                 return;

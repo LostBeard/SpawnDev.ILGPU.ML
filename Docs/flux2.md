@@ -19,6 +19,8 @@ var many = await pipe.RunManyAsync(new Flux2Request { Prompt = "..." }, new[] { 
 | transformer | 3.9B flow DiT, 5 double + 20 single blocks (`Flux2Transformer`) | 2.42 GB | shared adaLN, 4-axis interleaved RoPE, no biases; 4 Euler steps (`Flux2Scheduler`, dynamic shift) |
 | VAE decoder | AutoencoderKLFlux2 as ONNX | 199 MB (fp32) | runs on the library's ONNX session, resident |
 
+`KeepTransformerResident = true` keeps the 2.4 GB transformer on the device between runs and the last prompt's embeddings are always kept, so redrawing the same prompt costs only its steps (about 8 s in a browser instead of 75 s); `ReleaseResident()` frees it.
+
 The three big models are never on the GPU together: each is streamed in, run and disposed (`Flux2Weights`), so the peak is the largest stage, about 2.6 GB of weights plus activations.
 
 ## 4-bit weights
