@@ -183,7 +183,6 @@
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.InferenceSession? _session;
     private SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline? _pipeline;
-    private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
     private Dictionary<string, float[]>? _capturedLayers;
     private List<string> _layerNames = new();
@@ -243,14 +242,13 @@
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
             _imageWidth = w; _imageHeight = h;
 
             // Run inference with CapturedOutputs enabled
             SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
             try
             {
-                await _pipeline!.ClassifyAsync(_rgbaPixels, _imageWidth, _imageHeight);
+                await _pipeline!.ClassifyAsync(data, _imageWidth, _imageHeight);
                 _capturedLayers = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs;
 
                 // Find Conv/feature layers (they have spatial structure)

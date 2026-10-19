@@ -359,11 +359,10 @@
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
-            var rgbaPixels = data.Read<int>();
             _stillImageWidth = w;
             _stillImageHeight = h;
 
-            await RunDetection(rgbaPixels, w, h, maxFaces: 1);
+            await RunDetection(() => _pipeline!.DetectAsync(data, w, h, maxFaces: 1));
         }
         catch (Exception ex)
         {
@@ -383,7 +382,7 @@
             if (_pipeline == null) return;
             var rgbaPixels = new int[frameBytes.Length / 4];
             Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
-            await RunDetection(rgbaPixels, 640, 480, maxFaces: 4);
+            await RunDetection(() => _pipeline!.DetectAsync(rgbaPixels, 640, 480, maxFaces: 4));
         }
         catch (Exception ex)
         {
@@ -397,12 +396,12 @@
         }
     }
 
-    private async Task RunDetection(int[] rgbaPixels, int width, int height, int maxFaces = 1)
+    private async Task RunDetection(Func<Task<SpawnDev.ILGPU.ML.Preprocessing.FaceDetectionResult>> detect)
     {
         _isRunning = true;
         try
         {
-            var result = await _pipeline!.DetectAsync(rgbaPixels, width, height, maxFaces: maxFaces);
+            var result = await detect();
             _inferenceMs = result.InferenceTimeMs;
             _faceCount = result.FaceCount;
             _faces = result.Faces.Select(f => new FaceDetection

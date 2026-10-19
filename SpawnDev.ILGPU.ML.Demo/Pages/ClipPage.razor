@@ -90,7 +90,9 @@
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
     private List<ConfidenceBars.Prediction>? _results;
-    private int[]? _rgbaPixels;
+    // the picture stays in the browser (the Uint8ClampedArray of its ImageData); it goes to the GPU from there for each run
+    private SpawnDev.SpawnJS.JSObjects.ImageData? _imageData;
+    private SpawnDev.SpawnJS.JSObjects.TypedArray? _imageBytes;
     private int _imageWidth, _imageHeight;
 
     private List<BackendSelector.BackendInfo> _backends = new()
@@ -198,9 +200,9 @@
             canvas.Width = w; canvas.Height = h;
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
-            using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
+            _imageBytes?.Dispose(); _imageData?.Dispose();
+            _imageData = ctx.GetImageData(0, 0, w, h);
+            _imageBytes = _imageData.Data;
             _imageWidth = w; _imageHeight = h;
 
             // Opt-in: dropping/picking an image IS the run action — load the model now if needed.
@@ -214,7 +216,7 @@
 
     private async Task RunClassification()
     {
-        if (_rgbaPixels == null) return;
+        if (_imageBytes == null) return;
         if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
         if (_pipeline == null) return;
         _isRunning = true;
@@ -231,7 +233,7 @@
 
             if (labels.Length == 0) return;
 
-            var result = await _pipeline.ClassifyAsync(_rgbaPixels, _imageWidth, _imageHeight, labels);
+            var result = await _pipeline.ClassifyAsync(_imageBytes, _imageWidth, _imageHeight, labels);
             _inferenceMs = result.InferenceTimeMs;
 
             _results = result.Predictions.Select(p => new ConfidenceBars.Prediction
@@ -255,12 +257,13 @@
     {
         _results = null;
         _imageDataUrl = null;
-        _rgbaPixels = null;
+        _imageBytes?.Dispose(); _imageData?.Dispose(); _imageBytes = null; _imageData = null;
         StateHasChanged();
     }
 
     public void Dispose()
     {
+        _imageBytes?.Dispose(); _imageData?.Dispose();
         _pipeline?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();

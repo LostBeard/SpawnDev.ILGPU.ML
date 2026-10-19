@@ -416,11 +416,10 @@
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
-            var rgbaPixels = data.Read<int>();
             _imageWidth = w;
             _imageHeight = h;
 
-            await RunDetection(rgbaPixels, w, h);
+            await RunDetection(() => _pipeline!.DetectAsync(data, w, h, confidenceThreshold: _confidenceThreshold / 100f));
         }
         catch (Exception ex)
         {
@@ -440,7 +439,7 @@
             if (_pipeline == null) return;
             var rgbaPixels = new int[frameBytes.Length / 4];
             Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
-            await RunDetection(rgbaPixels, 640, 480);
+            await RunDetection(() => _pipeline!.DetectAsync(rgbaPixels, 640, 480, confidenceThreshold: _confidenceThreshold / 100f));
         }
         catch (Exception ex)
         {
@@ -453,14 +452,12 @@
         }
     }
 
-    private async Task RunDetection(int[] rgbaPixels, int width, int height)
+    private async Task RunDetection(Func<Task<SpawnDev.ILGPU.ML.Preprocessing.DetectionResult>> detect)
     {
         _isRunning = true;
         try
         {
-            var result = await _pipeline!.DetectAsync(
-                rgbaPixels, width, height,
-                confidenceThreshold: _confidenceThreshold / 100f);
+            var result = await detect();
             _inferenceMs = result.InferenceTimeMs;
             _detections = result.Objects.Select(o => new BoundingBoxOverlay.Detection
             {

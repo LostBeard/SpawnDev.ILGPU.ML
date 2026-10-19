@@ -434,14 +434,13 @@
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
-            var rgbaPixels = data.Read<int>();
             _stillImageWidth = w;
             _stillImageHeight = h;
 
             _isRunning = true;
             StateHasChanged();
 
-            var result = await _pipeline.EstimateAsync(rgbaPixels, w, h);
+            var result = await _pipeline.EstimateAsync(data, w, h);
             _inferenceMs = result.InferenceTimeMs;
 
             // Diagnostic logging for the active investigation. Prints per-keypoint
