@@ -3,6 +3,10 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.17 - 2026-10-19 - Fix: WebGPU device lost drawing with SD Turbo on Chrome 151
+
+- **Fixed: "A valid external Instance reference no longer exists" (WebGPU device lost) in the browser SD Turbo VAE decode, on the stable Chrome 145-151 line.** Two causes, found by running the same page in Chrome 151 (fails) and Chromium 153 (passes), then A/B-ing per-op sync (passes). (1) `GraphExecutor` drains on WebGPU only *submitted* the queue when `QueueOrderedDrains` is on, even when the drain fired because the deferred-release byte cap was reached, so the host queued the rest of the graph far ahead of the GPU while every buffer it replaced stayed resident until the queue ran; a byte-cap drain now waits for the GPU (the node-cadence drains stay submit-only, so the DAv3 speedup is untouched). (2) The text-to-3D page runs RMBG-1.4 between two SD Turbo draws and RMBG's session kept its 1024 px feature maps parked (the second decode reached 8.7 GB of VRAM); new `BackgroundRemovalPipeline.ReleaseWorkingMemory()` (same pattern as `DepthEstimationPipeline`) and the page calls it after each cut-out. Four consecutive draws with cut-outs now pass on Chrome 151.
+
 ## 5.3.16 - 2026-10-19 - Humanoid animation (Kimodo moves on a rigged character)
 
 Requires SpawnDev.ILGPU 5.3.8.

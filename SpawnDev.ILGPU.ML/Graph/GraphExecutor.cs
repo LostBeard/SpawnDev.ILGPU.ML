@@ -3586,8 +3586,13 @@ public class GraphExecutor : IDisposable
                 try
                 {
                     // See QueueOrderedDrains: on a WebGPU plain forward the queue orders every reuse after the
-                    // submitted work, so submitting is enough - no host round trip.
-                    if (QueueOrderedDrains && !SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.WebGPU)
+                    // submitted work, so submitting is enough - no host round trip. NOT when the drain fired because
+                    // the deferred-release BYTE CAP was hit: that is memory pressure, and a submit alone lets the host
+                    // enqueue the rest of the graph far ahead of the GPU while every buffer it replaced stays resident
+                    // until the queued work runs (a 512 px SD VAE decode reached 8.3 GB of VRAM and Chrome 145-151 lost
+                    // the device; per-op sync passed). The byte-cap drain waits so the cap bounds REAL memory.
+                    if (QueueOrderedDrains && !SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.WebGPU
+                        && nodeIdx % EffectiveSyncInterval == 0)
                         _accelerator.Flush();
                     else
                         await _accelerator.SynchronizeAsync();

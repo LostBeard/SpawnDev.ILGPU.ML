@@ -177,6 +177,15 @@ public class BackgroundRemovalPipeline : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Give back the GPU memory a run leaves parked for the next one (the session's free activation buckets: a 1024 px
+    /// pass keeps gigabytes of feature maps). Weights stay; the next run re-allocates. Call it when background removal is
+    /// done for now and another model needs the GPU: the text-to-3D page runs RMBG between two SD Turbo decodes, and with
+    /// RMBG's buffers still parked the second decode reached 8.7 GB of VRAM and Chrome 151 dropped the device.
+    /// Returns the bytes freed.
+    /// </summary>
+    public long ReleaseWorkingMemory() => _session.ReleaseWorkingMemory();
+
     public void Dispose()
     {
         _session?.Dispose();

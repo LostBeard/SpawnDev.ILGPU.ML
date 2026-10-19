@@ -4,6 +4,8 @@
 
 [**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
+> **5.3.17 (fix):** drawing with SD Turbo no longer loses the WebGPU device on stable Chrome 145-151 ("A valid external Instance reference no longer exists"); see the [changelog](CHANGELOG.md).
+>
 > **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
 >
 > ![A knight drawn by SD Turbo, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-19_TextTo3D-Rig-Animate-Knight.gif)

@@ -545,6 +545,7 @@
             _rmbg = new SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline(session, _accelerator!);
         }
         var r = await _rmbg.RemoveBackgroundAsync(px, w, h);
+        _rmbg.ReleaseWorkingMemory();   // its 1024 px feature maps stay parked otherwise, and the next SD decode needs that VRAM
         return r.ResultPixels;
     }
 
