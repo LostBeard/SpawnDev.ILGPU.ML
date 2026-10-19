@@ -285,6 +285,7 @@ public sealed class Trellis2Pipeline : IDisposable
     public async Task<byte[]> ToGlbAsync(Output output, int textureSize = 2048, int dilation = 8, int maxFaces = 150_000)
     {
         var sw = Stopwatch.StartNew();
+        if (Remesh) return await RemeshGlbAsync(output, textureSize, dilation, maxFaces, sw);
         if (maxFaces > 0 && PreCluster && output.Mesh.FaceCount > maxFaces * 2 && Environment.GetEnvironmentVariable("TRELLIS2_NOCLUSTER") != "1")
         {
             // coarsen on the device first (O(n)); the host's edge collapse then finishes from a fraction of the faces
@@ -307,6 +308,36 @@ public sealed class Trellis2Pipeline : IDisposable
         var faces = new int[faces0.Length];
         for (int i = 0; i < faces.Length; i++) faces[i] = remap[faces0[i]];
         return await FinishGlbAsync(output, positions, faces, textureSize, dilation, maxFaces, sw);
+    }
+
+    /// <summary>
+    /// Rebuild the extracted mesh as a closed shell before simplifying, unwrapping and baking (<see cref="NarrowBandRemesher"/>: the reference's <c>to_glb(remesh=True)</c>, which its own example uses),
+    /// and read every texel's colour at the nearest point of the ORIGINAL mesh (<see cref="TextureBaker"/> with a <see cref="MeshDistanceGrid"/>). Pinholes and cracks close, thin plates become one
+    /// watertight outward-facing skin and the dark inner layer of a plate no longer bleeds into the baked colour. Default on (<see cref="Trellis2Options.Remesh"/>).
+    /// </summary>
+    public bool Remesh { get; set; } = true;
+    /// <summary>Offset of the remeshed shell from the original surface, in voxels (reference 1).</summary>
+    public float RemeshBand { get; set; } = 1f;
+
+    private async Task<byte[]> RemeshGlbAsync(Output output, int textureSize, int dilation, int maxFaces, Stopwatch sw)
+    {
+        var verts = await output.Mesh.Vertices.View.CopyToHostAsync();
+        var faces0 = await output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).CopyToHostAsync();
+        var remap = new int[verts.Length / 3]; Array.Fill(remap, -1);
+        int used = 0;
+        foreach (int v in faces0) if (remap[v] < 0) remap[v] = used++;
+        var positions = new float[used * 3];
+        for (int v = 0; v < remap.Length; v++)
+            if (remap[v] >= 0) { positions[remap[v] * 3] = verts[v * 3]; positions[remap[v] * 3 + 1] = verts[v * 3 + 1]; positions[remap[v] * 3 + 2] = verts[v * 3 + 2]; }
+        var faces = new int[faces0.Length];
+        for (int i = 0; i < faces.Length; i++) faces[i] = remap[faces0[i]];
+        StageDone?.Invoke($"mesh read ({faces.Length / 3} faces)", sw.Elapsed.TotalSeconds); sw.Restart();
+        MeshStage?.Invoke("extracted", positions, faces);
+        if (RepairMesh) { (positions, faces) = Repair("(dual grid)", positions, faces, sw); MeshStage?.Invoke("repaired", positions, faces); }
+        var rm = await NarrowBandRemesher.RemeshAsync(_acc, positions, faces, output.Grid, RemeshBand);
+        StageDone?.Invoke($"remesh: {rm.ActiveVoxels} band voxels, {rm.GridVertices} corners -> {rm.Faces.Length / 3} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+        MeshStage?.Invoke("remeshed", rm.Positions, rm.Faces);
+        using (rm) return await FinishGlbAsync(output, rm.Positions, rm.Faces, textureSize, dilation, maxFaces, sw, rm.Source, remeshed: true);
     }
 
     /// <summary>Coarsen the dual-grid mesh on the device (<see cref="MeshClusterer"/>) before the host edge collapse. Default on.</summary>
@@ -334,10 +365,10 @@ public sealed class Trellis2Pipeline : IDisposable
         return (p, f);
     }
 
-    private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw)
+    private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw, MeshDistanceGrid? project = null, bool remeshed = false)
     {
-        MeshStage?.Invoke("extracted", positions, faces);
-        if (RepairMesh) { (positions, faces) = Repair("(dual grid)", positions, faces, sw); MeshStage?.Invoke("repaired", positions, faces); }
+        if (!remeshed) MeshStage?.Invoke("extracted", positions, faces);
+        if (RepairMesh && !remeshed) { (positions, faces) = Repair("(dual grid)", positions, faces, sw); MeshStage?.Invoke("repaired", positions, faces); }
         if (maxFaces > 0 && faces.Length / 3 > maxFaces)
         {
             int before = faces.Length / 3;
@@ -346,6 +377,11 @@ public sealed class Trellis2Pipeline : IDisposable
             // the edge collapse of a repaired mesh still leaves a few pinches and one-face gaps: repair again, on 150k faces it is a fraction of a second
             if (RepairMesh) (positions, faces) = Repair("(simplified)", positions, faces, sw);
             MeshStage?.Invoke("simplified", positions, faces);
+        }
+        if (RepairMesh)
+        {
+            int realigned = MeshRepair.AlignWindingToNormals(positions, faces);
+            StageDone?.Invoke($"winding aligned to the normals: {realigned} triangles flipped", sw.Elapsed.TotalSeconds); sw.Restart();
         }
         var normals = PbrGlbWriter.VertexNormals(positions, faces);
         StageDone?.Invoke("mesh read + normals", sw.Elapsed.TotalSeconds); sw.Restart();
@@ -358,7 +394,7 @@ public sealed class Trellis2Pipeline : IDisposable
         using (var pos = _acc.Allocate1D(atlas.Positions))
         using (var uv = _acc.Allocate1D(atlas.Uvs))
         using (var fb = _acc.Allocate1D(atlas.Faces))
-            tex = await new TextureBaker(_acc, _sk).BakeAsync(pos.View, uv.View, fb.View, atlas.Faces.Length / 3, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation);
+            tex = await new TextureBaker(_acc, _sk).BakeAsync(pos.View, uv.View, fb.View, atlas.Faces.Length / 3, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation, project);
         StageDone?.Invoke("texture bake", sw.Elapsed.TotalSeconds); sw.Restart();
 
         var splitNormals = new float[atlas.Positions.Length];

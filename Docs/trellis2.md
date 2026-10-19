@@ -21,8 +21,10 @@ weights stream into the browser and everything runs on the visitor's GPU.
 | Sparse structure | 1.3B flow transformer (12 Euler steps, classifier-free guidance) + structure decoder -> occupied cells | GPU |
 | Shape | 1.3B shape flow on the sparse voxels + SC-VAE decoder -> FlexiDualGrid mesh (1-3M triangles) | GPU |
 | Texture | 1.3B texture flow + SC-VAE decoder -> PBR attributes per voxel | GPU |
-| Mesh | `MeshClusterer` (adaptive octree quadric clustering) on the device, then quadric edge collapse (`MeshSimplifier`) to 150k triangles | GPU, then host |
-| UV atlas + bake | `UvAtlas` charts and packs; `TextureBaker` rasterises and samples the voxel attributes on the device | host, then GPU |
+| Mesh repair | `MeshRepair` on the dual-grid mesh: non-manifold edges, winding, small holes, floating fragments | host |
+| Remesh | `NarrowBandRemesher` (the reference's `to_glb(remesh=True)`): the distance field of the mesh (`MeshDistanceGrid`, on the device) shifted one voxel, extracted by dual contouring on the voxels the band crosses. Closes pinholes and cracks, turns a thin plate into one watertight outward-facing skin; the skin inside a closed solid is dropped | GPU distances, host topology |
+| Mesh | quadric edge collapse (`MeshSimplifier`) to 300k triangles, then `MeshRepair` again | host |
+| UV atlas + bake | `UvAtlas` charts and packs; `TextureBaker` rasterises the atlas, moves every texel onto the nearest point of the ORIGINAL (pre-remesh) mesh (`MeshDistanceGrid.ProjectTexels`, the reference's `bvh.unsigned_distance`) and samples the voxel attributes there, so the colour is read exactly on the surface the decoder painted | host, then GPU |
 | GLB | PNG encode + `PbrGlbWriter` | host |
 
 Every network stage was gated against the reference implementation's own classes (CPU torch goldens, `tools/trellis2-harness`).
@@ -96,7 +98,7 @@ The demo page (`SpawnDev.ILGPU.ML.Demo/Pages/Image3DPage.razor`) shows the whole
 
 `Trellis2_TiledLinear_MatchesHostReference`, `Trellis2_TiledSparseConv_MatchesHostReference`, `Trellis2_FlashAttention_MatchesHostReference`
 and `Trellis2_MeshClusterer_SphereStaysOnSurface` run the portable kernels against host double references on WebGPU, CUDA, OpenCL and
-CPU; `Trellis2_UvAtlas_*`, `Trellis2_MeshSimplifier_*`, `Trellis2_PbrGlb_*` cover the host stages; `Trellis2_ImageToGlb_EndToEnd`
+CPU; `Remesh_*` (distance grid against a brute-force oracle, the remesh of a sphere, a pinhole and a thin double sheet, the projection) run on CUDA and OpenCL; `Trellis2_UvAtlas_*`, `Trellis2_MeshSimplifier_*`, `Trellis2_PbrGlb_*` cover the host stages; `Trellis2_ImageToGlb_EndToEnd`
 (HeavyModel) runs the real model. `Trellis2_DiTKernels_Benchmark` / `Trellis2_KernelCompile_Benchmark` (HeavyModel) measure throughput
 and shader compile cost.
 
@@ -109,3 +111,7 @@ A generated character can be given a skeleton and learned skin weights with `Ski
 TRELLIS.2 code and weights: MIT. DINOv3 weights: Meta's DINOv3 licence ("Built with DINOv3"). SD Turbo: Stability AI's licence.
 RMBG-1.4: BRIA's licence. Weights are not shipped in the package; the demo downloads them from the Hugging Face hub (through the
 SpawnDev hub proxy) on first use. Check each licence before commercial use.
+
+## Why the remesh (measured)
+
+Without it the generated mesh is the raw dual-grid mesh, simplified. A thin plate of armour is two surfaces one voxel apart, and the texture decoder paints the inner one near black; the raw mesh also has voxel-sized pinholes. Baking colour at the simplified mesh's own positions lets that dark inner layer show through wherever the surface sits a little deep, and the pinholes show it directly: a knight came out with dozens of black dots (the "holes"). Measured on that knight: 964 hole loops longer than the hole-fill limit, 34% of the texture voxels near black, 15k dark islands in the baked colour, and none of the cheaper fixes (recolouring voxels, filling texture islands, smoothing normals, flipping triangles) removed the dots. The reference does not have the problem because `to_glb(remesh=True)` rebuilds the surface and reads colour from the original; this is that, ported (`Trellis2Options.Remesh`, default on).

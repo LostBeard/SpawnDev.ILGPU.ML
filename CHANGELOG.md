@@ -3,6 +3,14 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.21 - 2026-10-19 - Text to 3D: no more dark dots (the reference's remesh and projected bake)
+
+Requires SpawnDev.ILGPU 5.3.8.
+
+- **`NarrowBandRemesher` and `MeshDistanceGrid`: the reference's `to_glb(remesh=True)`, ported (`Trellis2Options.Remesh`, default on).** Generated characters had dozens of black dots ("holes") in thin armour: voxel-sized pinholes in the mesh, and the near-black inner layer of every plate bleeding into the baked colour. The mesh is now rebuilt as a closed shell (narrow-band dual contouring of the mesh's distance field, band 1 voxel; the skin inside a closed solid is dropped), and every texel's colour is read at the nearest point of the ORIGINAL mesh. On the knight: 1.45M faces out of the remesh in 0.7 s on CUDA, watertight, consistently wound; the textured model has no dots. Browser (WebGPU): the same model in 123 s, rig 80 s, animate, GLB 25 MB (was 29.5). 12 tests (`Remesh_*`, CUDA and OpenCL).
+- `MeshRepair.AlignWindingToNormals`: triangles wound against their own normals are flipped (a back-facing triangle renders black in a viewer that flips the normal of back faces).
+- `Trellis2Options.MaxHolePerimeter` is not changed; `RepairMesh` still runs before and after the simplifier.
+
 ## 5.3.20 - 2026-10-19 - Text to character on the desktop, FLUX.2 8-bit and 1024 px, rig bridge cleanup, 300k triangles
 
 Requires SpawnDev.ILGPU 5.3.8.

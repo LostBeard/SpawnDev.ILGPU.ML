@@ -112,6 +112,12 @@ public sealed class TextureBaker
         float px = (positions[i0 * 3] * w0 + positions[i1 * 3] * w1 + positions[i2 * 3] * w2 + 0.5f) * grid;
         float py = (positions[i0 * 3 + 1] * w0 + positions[i1 * 3 + 1] * w1 + positions[i2 * 3 + 1] * w2 + 0.5f) * grid;
         float pz = (positions[i0 * 3 + 2] * w0 + positions[i1 * 3 + 2] * w1 + positions[i2 * 3 + 2] * w2 + 0.5f) * grid;
+        Sample(texel, px, py, pz, keys, vals, attrs, outAttrs, grid, mask, shift);
+    }
+
+    // the attribute volume sampled at a point (voxel units): trilinear over the 8 voxel centres around it, absent voxels drop out, the nearest voxel within 3 when none is near
+    private static void Sample(int texel, float px, float py, float pz, IV keys, IV vals, FV attrs, FV outAttrs, int grid, int mask, int shift)
+    {
         float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, wsum = 0f;
         for (int o = 0; o < 8; o++)
         {
@@ -145,6 +151,13 @@ public sealed class TextureBaker
         float inv = 1f / MathF.Max(wsum, 1e-12f);
         outAttrs[texel * 6] = a0 * inv; outAttrs[texel * 6 + 1] = a1 * inv; outAttrs[texel * 6 + 2] = a2 * inv;
         outAttrs[texel * 6 + 3] = a3 * inv; outAttrs[texel * 6 + 4] = a4 * inv; outAttrs[texel * 6 + 5] = a5 * inv;
+    }
+
+    private Action<Index1D, IV, FV, IV, IV, FV, FV, int, int, int>? _bakeAt;
+    private static void BakeAtImpl(Index1D texel, IV idMap, FV at, IV keys, IV vals, FV attrs, FV outAttrs, int grid, int mask, int shift)
+    {
+        if (idMap[texel] == 0) return;
+        Sample(texel, (at[texel * 3] + 0.5f) * grid, (at[texel * 3 + 1] + 0.5f) * grid, (at[texel * 3 + 2] + 0.5f) * grid, keys, vals, attrs, outAttrs, grid, mask, shift);
     }
 
     // one dilation pass: an uncovered texel takes the mean of its covered 8-neighbours
@@ -198,15 +211,17 @@ public sealed class TextureBaker
     /// Bake. <paramref name="positions"/> [V,3], <paramref name="uvs"/> [V,2] in [0,1] (row = v * size), <paramref name="faces"/> [F,3] describe the
     /// unwrapped mesh; <paramref name="voxelCoords"/> [N,3] / <paramref name="voxelAttrs"/> [N,6] the attribute volume on a <paramref name="grid"/>^3 lattice.
     /// </summary>
-    public Textures Bake(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8)
-        => Task.Run(() => BakeAsync(positions, uvs, faces, faceCount, voxelCoords, voxelAttrs, voxelCount, grid, size, dilation)).GetAwaiter().GetResult();
+    public Textures Bake(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8, MeshDistanceGrid? project = null)
+        => Task.Run(() => BakeAsync(positions, uvs, faces, faceCount, voxelCoords, voxelAttrs, voxelCount, grid, size, dilation, project)).GetAwaiter().GetResult();
 
     /// <summary><see cref="Bake"/>, browser-safe (the textures are awaited readbacks).</summary>
-    public async Task<Textures> BakeAsync(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8)
+    /// <param name="project">when given, each texel's colour is read where the nearest point of THAT mesh (the original, before remesh and simplification) lies, not at the texel's own position on the unwrapped mesh: the reference's <c>bvh.unsigned_distance</c> before <c>grid_sample_3d</c></param>
+    public async Task<Textures> BakeAsync(FV positions, FV uvs, IV faces, int faceCount, IV voxelCoords, FV voxelAttrs, int voxelCount, int grid, int size, int dilation = 8, MeshDistanceGrid? project = null)
     {
         _raster ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterImpl);
         _rasterNear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(RasterNearImpl);
         _bake ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, FV, IV, IV, FV, FV, int, int, int>(BakeImpl);
+        _bakeAt ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV, FV, FV, int, int, int>(BakeAtImpl);
         _dilate ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int>(DilateImpl);
         _coverFlag ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(CoverFlagImpl);
         _pack ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV>(PackImpl);
@@ -222,7 +237,13 @@ public sealed class TextureBaker
         var a = _acc.Allocate1D<float>((long)texels * 6);
         var b = _acc.Allocate1D<float>((long)texels * 6);
         _zeroF(texels * 6, a.View); _zeroF(texels * 6, b.View);
-        _bake(texels, idMap.View, bary.View, faces, positions, hash.Keys.View, hash.Vals.View, voxelAttrs, a.View, grid, hash.Mask, hash.Shift);
+        if (project != null)
+        {
+            using var at = _acc.Allocate1D<float>((long)texels * 3);
+            project.ProjectTexels(texels, idMap.View, bary.View, faces, positions, at.View);
+            _bakeAt(texels, idMap.View, at.View, hash.Keys.View, hash.Vals.View, voxelAttrs, a.View, grid, hash.Mask, hash.Shift);
+        }
+        else _bake(texels, idMap.View, bary.View, faces, positions, hash.Keys.View, hash.Vals.View, voxelAttrs, a.View, grid, hash.Mask, hash.Shift);
         var covA = _acc.Allocate1D<int>(texels);
         var covB = _acc.Allocate1D<int>(texels);
         _coverFlag(texels, idMap.View, covA.View);

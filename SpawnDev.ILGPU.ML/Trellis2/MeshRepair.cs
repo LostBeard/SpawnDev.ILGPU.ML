@@ -431,6 +431,42 @@ public static class MeshRepair
             if (flip[t]) { (f[t * 3 + 1], f[t * 3 + 2]) = (f[t * 3 + 2], f[t * 3 + 1]); flipped++; }
     }
 
+    // ── 6. winding that agrees with the shading normals ───────────────────────────────────────────
+
+    /// <summary>
+    /// Flip every triangle whose winding disagrees with the (area-weighted) vertex normals of its corners, then repeat a few times so the normals settle. After <see cref="Repair"/> a generated mesh still has a few
+    /// thousand wrong-way edges (a thin sheet cannot be oriented consistently with its neighbours): those triangles are wound backwards inside an otherwise outward surface, and a viewer that treats the back side of
+    /// a double-sided material by flipping the normal (glTF says it must) shades each of them black, which looks like dark flecks and holes in smooth armour. Aligning the winding to the surrounding normals
+    /// fixes the shading without moving a vertex. Triangles whose corner normals nearly cancel (|cos| below 0.2: a fold, both sides of a thin plate) are left alone.
+    /// Returns the number of triangles flipped (in place).
+    /// </summary>
+    public static int AlignWindingToNormals(float[] positions, int[] faces, int passes = 3)
+    {
+        int total = 0;
+        for (int pass = 0; pass < passes; pass++)
+        {
+            var vn = PbrGlbWriter.VertexNormals(positions, faces);
+            int flipped = 0;
+            for (int t = 0; t < faces.Length / 3; t++)
+            {
+                int a = faces[t * 3], b = faces[t * 3 + 1], c = faces[t * 3 + 2];
+                double ax = positions[b * 3] - positions[a * 3], ay = positions[b * 3 + 1] - positions[a * 3 + 1], az = positions[b * 3 + 2] - positions[a * 3 + 2];
+                double bx = positions[c * 3] - positions[a * 3], by = positions[c * 3 + 1] - positions[a * 3 + 1], bz = positions[c * 3 + 2] - positions[a * 3 + 2];
+                double nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+                double sx = vn[a * 3] + vn[b * 3] + vn[c * 3], sy = vn[a * 3 + 1] + vn[b * 3 + 1] + vn[c * 3 + 1], sz = vn[a * 3 + 2] + vn[b * 3 + 2] + vn[c * 3 + 2];
+                double ln = Math.Sqrt(nx * nx + ny * ny + nz * nz), ls = Math.Sqrt(sx * sx + sy * sy + sz * sz);
+                if (ln < 1e-20 || ls < 1e-12) continue;
+                double cos = (nx * sx + ny * sy + nz * sz) / (ln * ls);
+                if (cos >= -0.2) continue;
+                (faces[t * 3 + 1], faces[t * 3 + 2]) = (faces[t * 3 + 2], faces[t * 3 + 1]);
+                flipped++;
+            }
+            total += flipped;
+            if (flipped == 0) break;
+        }
+        return total;
+    }
+
     // ── 5. small holes ────────────────────────────────────────────────────────────────────────────
 
     /// <summary>

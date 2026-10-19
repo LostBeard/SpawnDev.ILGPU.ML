@@ -174,6 +174,24 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task MeshRepair_AlignWindingToNormals_FlipsOnlyBackwardsTriangles() => await RunPureTest(async () =>
+    {
+        // a flat 6 x 6 sheet facing +Z; one triangle wound backwards must flip back, the rest stay
+        const int n = 6;
+        var p = new List<float>(); var f = new List<int>();
+        for (int y = 0; y <= n; y++) for (int x = 0; x <= n; x++) { p.Add(x); p.Add(y); p.Add(0); }
+        int V(int x, int y) => y * (n + 1) + x;
+        for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) f.AddRange(new[] { V(x, y), V(x + 1, y), V(x + 1, y + 1), V(x, y), V(x + 1, y + 1), V(x, y + 1) });
+        var pa = p.ToArray(); var good = f.ToArray(); var fa = (int[])good.Clone();
+        Ur_Expect(SpawnDev.ILGPU.ML.Trellis2.MeshRepair.AlignWindingToNormals(pa, fa) == 0 && fa.SequenceEqual(good), "a consistently wound sheet is left as it is");
+        int t = 14;                                                     // a triangle in the middle of the sheet, backwards
+        (fa[t * 3 + 1], fa[t * 3 + 2]) = (fa[t * 3 + 2], fa[t * 3 + 1]);
+        int flipped = SpawnDev.ILGPU.ML.Trellis2.MeshRepair.AlignWindingToNormals(pa, fa);
+        Ur_Expect(flipped == 1 && fa.SequenceEqual(good), $"the backwards triangle flips back ({flipped} flipped)");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task SkinTokens_RigCleanup_CutsOnlyTheBridgesBetweenFarParts() => await RunPureTest(async () =>
     {
         // a chain of 8 bones 0-1-2-3-4-5-6-7 (hops are index differences)
