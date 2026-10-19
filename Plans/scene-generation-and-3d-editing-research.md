@@ -68,3 +68,7 @@ The encoders matter: with them an existing mesh and its PBR attributes can be tu
 ## 7. Prototype result: region re-texturing (2026-10-19)
 
 Built and measured, see [Docs/trellis2.md](../Docs/trellis2.md) (Editing a region): RePaint on the TRELLIS.2 texture flow works. Upper body of a knight re-textured from a red-armour picture in ~20 s, the rest unchanged to 0.0025, no seam. Next steps on the editing side: the shape stage under the mask, the encoders for arbitrary meshes, VoxHammer-style inversion, a text prompt instead of a picture.
+
+## 8. Baseline result: layout, then assets (2026-10-19)
+
+Built and measured: [Docs/scenes.md](../Docs/scenes.md). A local LLM (qwen3:14b, 42 s) wrote a six-object blacksmith's workshop layout, six assets were generated and composed into one glTF in 8.7 minutes. The scene is coherent and correctly grounded and scaled; limits are sparse layouts, no stacking, an unverified picture-to-prompt match (a bell for "bellows"), and a viewer that shows one mesh. This is the baseline a native scene model (SceneGen: MIT but VGGT-1B is non-commercial and it needs TRELLIS v1) would have to beat on quality per minute.

@@ -79,6 +79,14 @@ tokens/sec), not byte-identity.
   use a fixed default + fixed seed.
 - **`--ci`** — non-interactive, deterministic, asserts a known result, exits `0` on success.
 
+## 09 · SceneGen.Console (a scene from a sentence)
+
+```bash
+dotnet run --project Examples/09.SceneGen.Console -- "a blacksmith's workshop" --out workshop
+```
+
+A local LLM (`--llm qwen3:14b`, an Ollama name or a .gguf) writes a layout, every distinct object is generated with `AssetGenerator`, and `GltfSceneComposer` puts them in one glTF scene. Details and measurements: [Docs/scenes.md](../Docs/scenes.md).
+
 ## 07 · AssetGen.Console and 08 · AssetGen.Wpf (text to character)
 
 ```bash

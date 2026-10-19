@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>SceneGen.Console</AssemblyName>
+    <RootNamespace>SpawnDev.ILGPU.ML.Examples.SceneGenConsole</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- resolves an Ollama model name (gemma4:12b) to its GGUF blob in Ollama's cache, without copying it -->
+    <Compile Include="..\06.OllamaServer.Console\OllamaModelStore.cs" Link="OllamaModelStore.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+  </ItemGroup>
+
+</Project>
