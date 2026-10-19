@@ -1,4 +1,5 @@
 using System.Text.Json;
+using BBP = global::SpawnDev.ILGPU.BrowserBufferPolicy;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Flux2;
 using SpawnDev.ILGPU.ML.Flux3;
@@ -304,5 +305,39 @@ public abstract partial class MLTestBase
         foreach (var (name, (calls, ms)) in tr.Profile.OrderByDescending(kv => kv.Value.Ms))
             Console.WriteLine($"[Flux3Profile]   {name,-20} {calls,4} calls {ms,8:F1} ms {100 * ms / sum,5:F1} %");
         Ur_Expect(plainMs > 0, "a step ran");
+    });
+
+    /// <summary>
+    /// The weights of both big FLUX 3 stages, opened through the page's own source (HubModelSource: OPFS cache over the hub) and uploaded with <see cref="Flux2Weights.LoadAsync"/>, must go JS -> GPU and never through the .NET heap:
+    /// SpawnDev.ILGPU counts every host -> device CopyFromCPU on a browser backend (<c>BrowserBufferPolicy.HostCopyBytes</c>) and the zero-copy stream path counts what it moved (<c>StreamBytes</c>). Prints both with the read / write split,
+    /// and fails if more than a few MB came through the managed heap. First run downloads about 5.8 GB into the browser's OPFS.
+    /// </summary>
+    [TestMethod(Timeout = 7_200_000, Category = "HeavyModel")]
+    public async Task Flux3_Browser_WeightsStayOutOfTheManagedHeap() => await RunTest(async accelerator =>
+    {
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js == null || !js.IsBrowser) throw new UnsupportedTestException("browser-only (OPFS)");
+        if (accelerator.AcceleratorType.ToString().IndexOf("WebGPU", StringComparison.OrdinalIgnoreCase) < 0) throw new UnsupportedTestException($"WebGPU only; this lane is {accelerator.AcceleratorType}");
+        using var source = new SpawnDev.ILGPU.ML.Hub.HubModelSource(js);
+        const string repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
+        foreach (var file in new[] { "text_encoder_q4.safetensors", "transformer_q4.safetensors" })
+        {
+            // warm the OPFS cache first so the measured load is the cached one (the download is not what is being judged)
+            await using (var warm = await source.OpenAsync(repo, file)) { }
+            BBP.ResetHostCopyCensus();
+            BBP.ResetStreamUploadTiming();
+            BBP.TraceStreamUploadTiming = true;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Flux2Weights w;
+            try { w = await Flux2Weights.LoadAsync(accelerator, source, repo, file); }
+            finally { BBP.TraceStreamUploadTiming = false; }
+            await accelerator.SynchronizeAsync();
+            double sec = sw.Elapsed.TotalSeconds;
+            long heapBytes = BBP.HostCopyBytes, streamed = BBP.StreamBytes;
+            Console.WriteLine($"[Flux3Weights] {file}: loaded in {sec:F1} s; JS->GPU {streamed / 1048576.0:F0} MiB in {BBP.StreamChunks} chunks (stream read {BBP.StreamReadMs / 1000:F1} s, GPU write {BBP.StreamWriteMs / 1000:F1} s); " +
+                $"through the .NET heap: {heapBytes / 1048576.0:F2} MiB in {BBP.HostCopyCount} copies, largest {BBP.LargestHostCopyBytes / 1024.0:F0} KiB");
+            w.Dispose();
+            Ur_Expect(heapBytes < 4 * 1048576, $"{file}: {heapBytes / 1048576.0:F1} MiB of weights went through the .NET heap (the stream must be a JS stream so each chunk goes JS -> GPU)");
+        }
     });
 }

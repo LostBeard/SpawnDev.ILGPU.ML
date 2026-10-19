@@ -23,6 +23,8 @@ public static class CaptionWriter
         {
             var download = new Progress<ModelDownloadProgress>(p =>
                 status(p.Fraction is { } f ? $"{Label} — downloading {f:P0}" : $"{Label} — downloading {p.BytesReceived / 1048576} MiB"));
+            // generation reads only the last position's logits: without this the prefill computes the 152k-wide LM head for every prompt row (the 3.7k-character upsampler prompt is about 900 rows: a ~550 MB logits tensor)
+            SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.EnableLastPositionLogits = true;
             open = await source.OpenAsync(Repo, File, download);
             llm = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, open, maxSeqLen: 4096,
                 onProgress: (stage, pct) => status($"{Label} — {stage} {pct}%"));

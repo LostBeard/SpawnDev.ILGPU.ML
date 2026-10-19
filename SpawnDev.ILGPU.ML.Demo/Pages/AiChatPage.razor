@@ -188,6 +188,7 @@
             _openModel?.Dispose();
             _openModel = await ModelSource.OpenAsync(model.Repo, model.File, download, _loadCts.Token);
 
+            SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.EnableLastPositionLogits = true;   // chat samples only the last position: no LM head over every prompt row
             _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel,
                 maxSeqLen: 4096,
                 onProgress: (stage, pct) => { _status = $"{Humanize(stage)} {pct}%"; InvokeAsync(StateHasChanged); },
