@@ -201,7 +201,11 @@ public class FusedDequantMatMul : IDisposable
         // WebGL falls through to the general per-element M*N kernel below (correct; the pre-GEMV path).
         bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
                        || (_accelerator.AcceleratorType == AcceleratorType.WebGPU && !EnableWebGPUGemv);
-        if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
+        // WebGPU validates WGSL uniformity: a barrier under a loop or branch whose condition comes from a storage-buffer read is rejected
+        // (Plans/webgpu-q4k-gemv-uniform-barrier-2026-10-19.md). The Q4_K GEMV (barriers inside its per-super-block loop) is such a kernel, so on
+        // WebGPU Q4_K stays on the per-element kernel below: correct, slower. The Q8_0 / Q4_0 / Q4_1 / Q5_0 / Q6_K GEMVs barrier only in the final reduction.
+        bool webGpuUniformBarrierUnsafe = _accelerator.AcceleratorType == AcceleratorType.WebGPU && type == GGMLType.Q4_K;
+        if (M == 1 && !gpuBrowser && !ForcePerElementGemv && !webGpuUniformBarrierUnsafe)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             // dp4a int8-activation Q4_K GEMV: quantize the activation to int8 (block_q8_1) once, then dot in the
@@ -307,7 +311,8 @@ public class FusedDequantMatMul : IDisposable
         // Multi-row dequant GEMM for M>1 (prefill) — opt-in (GGUF_GEMM_MR=1) until A/B-verified. Same shared-mem
         // /barrier shape as the GEMV, so it's gated to non-browser-GPU backends (WebGL has no workgroup shared
         // memory; WebGPU's workgroup reduction is slow on Tint/Dawn — both keep the per-element kernel below).
-        if (M > 1 && EnableMultiRowGemm && !gpuBrowser && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
+        // Never on WebGPU, even with EnableWebGPUGemv: these kernels barrier inside data-dependent loops, which WebGPU's WGSL validation rejects.
+        if (M > 1 && EnableMultiRowGemm && !gpuBrowser && _accelerator.AcceleratorType != AcceleratorType.WebGPU && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
         {
             // M>=RB_TILE (large prefill): FLOP-efficient register-blocked tiled dequant GEMM. Smaller M: multi-row.
             // The register-blocked kernel launches RB_BLOCK*RB_BLOCK (256) threads per group; the ILGPU CPU

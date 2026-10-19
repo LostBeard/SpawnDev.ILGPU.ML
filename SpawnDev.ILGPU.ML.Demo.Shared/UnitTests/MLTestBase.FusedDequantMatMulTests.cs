@@ -81,6 +81,55 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task FusedDequantMatMul_MatchesOracle_MXFP4() => await FusedMatMulOracle(GGMLType.MXFP4);
 
+    /// <summary>
+    /// With <see cref="FusedDequantMatMul.EnableWebGPUGemv"/> on (what the AI Chat and Image Generation pages set) every fused type must still COMPILE and match the oracle at M = 1 (decode) and M = 5 (prefill):
+    /// WebGPU rejects WGSL that puts a barrier under data-dependent control flow, which the Q4_K GEMV and the Q4_K / Q6_K multi-row GEMMs do, so those stay off WebGPU (found with Qwen3-4B Q4_K_M / Q4_0 in Chrome).
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task FusedDequantMatMul_WebGpuGemvOn_AllTypes_CompileAndMatchOracle() => await RunTest(async accelerator =>
+    {
+        bool saved = FusedDequantMatMul.EnableWebGPUGemv;
+        try
+        {
+            FusedDequantMatMul.EnableWebGPUGemv = true;
+            foreach (var type in new[] { GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K })
+                foreach (int M in new[] { 1, 5 })
+                {
+                    const int K = 512, N = 8;
+                    var rng = new Random(900 + (int)type + M);
+                    var input = new float[M * K];
+                    for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                    int bytesPerRow = RowBytes(type, K);
+                    var weightBytes = new byte[N * bytesPerRow];
+                    var wRows = new float[N][];
+                    for (int n = 0; n < N; n++)
+                    {
+                        var rowBytes = MakeBlocks(type, K, rng);
+                        Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                        wRows[n] = ReferenceDequant(type, rowBytes, K);
+                    }
+                    var expected = new float[M * N];
+                    for (int m = 0; m < M; m++)
+                        for (int n = 0; n < N; n++)
+                        {
+                            float sum = 0f;
+                            for (int k = 0; k < K; k++) sum += input[m * K + k] * wRows[n][k];
+                            expected[m * N + n] = sum;
+                        }
+                    using var inputBuf = accelerator.Allocate1D(input);
+                    using var weightBuf = AllocatePadded(accelerator, weightBytes);
+                    using var outputBuf = accelerator.Allocate1D<float>(M * N);
+                    using var fused = new FusedDequantMatMul(accelerator);
+                    fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, M, K, N, type);
+                    await accelerator.SynchronizeAsync();
+                    var got = await outputBuf.CopyToHostAsync<float>(0, M * N);
+                    AssertCloseQuant(got, expected, 2e-3f, $"WebGpuGemvOn {type} M={M}");
+                }
+        }
+        finally { FusedDequantMatMul.EnableWebGPUGemv = saved; }
+        Console.WriteLine("[FusedDequantMatMul] EnableWebGPUGemv on: Q4_0 Q4_1 Q5_0 Q8_0 Q4_K Q6_K at M=1 and M=5 match the oracle");
+    });
+
     private async Task FusedMatMulOracle(GGMLType type) => await RunTest(async accelerator =>
     {
         // K is a multiple of 256 so the same dims serve legacy and K-quant blocks.
