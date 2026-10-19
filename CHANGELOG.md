@@ -5,6 +5,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Picture checking with CLIP.** `PromptMatchScorer` (CLIP ViT-B/32, local) scores drawn pictures against the prompt; `AssetGenerator.GenerateAsync` builds the picture that matches best and fits its frame and draws another batch when none matches (`ScorePictures`, `MinPromptMatch`, `LowMatchRetries`; `GeneratedAsset.PromptMatch`). The scene planner asks for plain visual descriptions. Tests: `PromptMatchScorer_*` (CUDA, real CLIP). See [Docs/assetgen.md](Docs/assetgen.md).
+
 - **Scenes from a sentence: layout, then assets (baseline).** `SceneLayout` (JSON, tolerant parser), `SceneLayoutPlanner` (a local LLM writes the layout, asks again with the reason when unusable), `SceneGenerator` (each distinct object generated once with `AssetGenerator`), `GltfSceneComposer` (assets into one glTF scene: stored once, instanced, scaled to height, stood on a ground quad). `Examples/09.SceneGen.Console`: "a blacksmith's workshop" in 8.7 minutes on an RTX 4070 (layout 42 s with qwen3:14b). Details: [Docs/scenes.md](Docs/scenes.md).
 
 - **Region editing of a generated asset (prototype).** `Trellis2Pipeline.RetextureRegionAsync`, `Trellis2ImageTo3D.EditRegionAsync`, `AssetGenerator.BuildEditableModelAsync` / `EditRegionAsync` / `RegionFromSpec`; console `--edit-picture` / `--edit-region`. Re-textures a region from a new picture, keeps the rest (RePaint on the texture flow, geometry unchanged). `FlowSampler.Sample` gains an `afterStep` hook; generations keep their latents (`Output.Edit`). Details and measurements in [Docs/trellis2.md](Docs/trellis2.md).

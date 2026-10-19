@@ -38,7 +38,7 @@ public sealed class EditableModel : IDisposable
 }
 
 /// <summary>What <see cref="AssetGenerator.GenerateAsync"/> made.</summary>
-public sealed record GeneratedAsset(AssetPicture Picture, int[] CutOut, byte[] Glb, byte[]? RiggedGlb, byte[]? AnimatedGlb, IReadOnlyList<string> Moves);
+public sealed record GeneratedAsset(AssetPicture Picture, int[] CutOut, byte[] Glb, byte[]? RiggedGlb, byte[]? AnimatedGlb, IReadOnlyList<string> Moves, float? PromptMatch = null);
 
 /// <summary>
 /// The whole text-to-character chain on the native GPU backends (CUDA, OpenCL) or WebGPU, the same stages as the browser demo, as one object an app can drive step by step or in one call:
@@ -71,6 +71,17 @@ public sealed class AssetGenerator : IDisposable
     public bool KeepImageModelResident { get; set; }
     /// <summary>FLUX.2 weight precision: 4 (default; 4.4 GB download, 2.6 GB on the GPU at a time) or 8 (near lossless; 7.9 GB, 4.4 GB at a time). Set before the first draw.</summary>
     public int ImageModelBits { get; set; } = 4;
+    /// <summary>
+    /// Check the drawn pictures against the prompt with CLIP (<see cref="PromptMatchScorer"/>, 600 MB downloaded once) when <see cref="GenerateAsync"/> draws several: the picture that best matches the words
+    /// and fits its frame is built, and when even the best one is below <see cref="MinPromptMatch"/> another batch is drawn (<see cref="LowMatchRetries"/> times) before the minutes-long 3D stage is spent on it. Default on.
+    /// </summary>
+    public bool ScorePictures { get; set; } = true;
+    /// <summary>The CLIP similarity below which a picture is taken for "not of the thing asked for". Matched pairs scored 0.24-0.31 and other objects 0.13-0.19 (knight pictures, the cat and portrait samples); 0.21 sits between.</summary>
+    public float MinPromptMatch { get; set; } = 0.21f;
+    /// <summary>How many more batches of pictures are drawn when the best of a batch matches the prompt worse than <see cref="MinPromptMatch"/>.</summary>
+    public int LowMatchRetries { get; set; } = 1;
+    private PromptMatchScorer? _scorer;
+
     /// <summary>The rig cleanup (<see cref="SkinTokensRigger.BridgeHops"/>): 4 by default, 0 keeps the learned weights and the mesh untouched.</summary>
     public int BridgeHops { get; set; } = 4;
 
@@ -277,7 +288,7 @@ public sealed class AssetGenerator : IDisposable
         Trellis2Options? trellis = null, bool rig = true, IEnumerable<string>? moves = null, double armClearanceDegrees = 8, Func<IReadOnlyList<AssetPicture>, Task<int>>? choose = null)
     {
         var drawn = await DrawAsync(prompt, Enumerable.Range(seed, Math.Max(1, pictures)).ToArray(), model, size);
-        AssetPicture picked; int[] cut;
+        AssetPicture picked; int[] cut; float? match = null;
         if (choose != null)
         {
             picked = drawn[Math.Clamp(await choose(drawn), 0, drawn.Count - 1)];
@@ -287,11 +298,14 @@ public sealed class AssetGenerator : IDisposable
         else
         {
             ReleaseImageModel();
-            picked = drawn[0]; cut = Array.Empty<int>(); double best = double.MaxValue;
-            foreach (var p in drawn)
+            (picked, cut, match) = await ChooseBestAsync(prompt, drawn);
+            for (int retry = 1; retry <= LowMatchRetries && match != null && match < MinPromptMatch; retry++)
             {
-                var (px, touch) = await CutOutAsync(p);
-                if (touch < best) { best = touch; picked = p; cut = px; }
+                Status?.Invoke($"no picture matches \"{prompt}\" (best {match:F2} < {MinPromptMatch:F2}): drawing {drawn.Count} more");
+                var more = await DrawAsync(prompt, Enumerable.Range(seed + 1000 * retry, Math.Max(1, pictures)).ToArray(), model, size);
+                ReleaseImageModel();
+                var (p2, c2, m2) = await ChooseBestAsync(prompt, more);
+                if (m2 > match) { picked = p2; cut = c2; match = m2; }
             }
         }
         var glb = await BuildModelAsync(cut, picked.Width, picked.Height, trellis ?? new Trellis2Options { Seed = picked.Seed, MaxFaces = DefaultMaxFaces });
@@ -305,7 +319,33 @@ public sealed class AssetGenerator : IDisposable
                 if (used.Count > 0) animated = await AnimateAsync(rigged, used, armClearanceDegrees);
             }
         }
-        return new GeneratedAsset(picked, cut, glb, rigged, animated, used);
+        return new GeneratedAsset(picked, cut, glb, rigged, animated, used, match);
+    }
+
+    /// <summary>
+    /// The best of several drawn pictures: cut each out, and rank by how well it matches <paramref name="prompt"/> (CLIP, when <see cref="ScorePictures"/> and there is a choice) minus 1.5 times the
+    /// share of the frame's border its subject touches (a cropped subject makes a truncated model); without scoring, the picture that fits its frame best, as before.
+    /// </summary>
+    private async Task<(AssetPicture Picture, int[] CutOut, float? Match)> ChooseBestAsync(string prompt, IReadOnlyList<AssetPicture> drawn)
+    {
+        var cuts = new List<(int[] Px, double Touch)>();
+        foreach (var p in drawn) cuts.Add(await CutOutAsync(p));
+        bool score = ScorePictures && drawn.Count > 1;
+        float[]? sims = null;
+        if (score)
+        {
+            _scorer ??= await Timed("load CLIP", () => PromptMatchScorer.CreateAsync(_acc, _source));
+            sims = new float[drawn.Count];
+            for (int i = 0; i < drawn.Count; i++) sims[i] = await _scorer.ScoreAsync(drawn[i], prompt);
+        }
+        int best = 0; double bestRank = double.MinValue;
+        for (int i = 0; i < drawn.Count; i++)
+        {
+            double rank = (sims != null ? sims[i] : 0) - (sims != null ? 1.5 : 1.0) * cuts[i].Touch;
+            if (rank > bestRank) { bestRank = rank; best = i; }
+        }
+        if (sims != null) StageDone?.Invoke($"picture match to the prompt: {string.Join(", ", sims.Select(x => x.ToString("F2")))}", 0);
+        return (drawn[best], cuts[best].Px, sims?[best]);
     }
 
     // ───────────────────────────── helpers ─────────────────────────────
@@ -346,7 +386,7 @@ public sealed class AssetGenerator : IDisposable
 
     public void Dispose()
     {
-        _flux?.Dispose(); _sd?.Dispose(); _rmbg?.Dispose();
-        _flux = null; _sd = null; _rmbg = null; _trellis = null;
+        _flux?.Dispose(); _sd?.Dispose(); _rmbg?.Dispose(); _scorer?.Dispose();
+        _flux = null; _sd = null; _rmbg = null; _scorer = null; _trellis = null;
     }
 }

@@ -35,6 +35,7 @@ public sealed class SceneGenerator
             int objSeed = seed + k * 100;
             var o = trellis ?? new Trellis2Options { MaxFaces = 80_000, TextureSize = 1024 };
             var asset = await _assets.GenerateAsync(obj.Prompt, objSeed, pictures, model, size, new Trellis2Options { Seed = objSeed, MaxFaces = o.MaxFaces, TextureSize = o.TextureSize, Resolution = o.Resolution, RepairMesh = o.RepairMesh, Remesh = o.Remesh }, rig: false);
+            if (asset.PromptMatch is float m) Progress?.Invoke($"  {obj.Name}: picture matches the prompt {m:F2}{(m < _assets.MinPromptMatch ? " (LOW: check this object)" : "")}");
             built[obj.Name] = asset.Glb;
             if (onAsset != null) await onAsset(obj.Name, asset.Glb);
         }

@@ -25,6 +25,8 @@ The 3D stage keeps 300k triangles by default (`AssetGenerator.DefaultMaxFaces`):
 (the examples copy them from the demo's `wwwroot/motions`, see `NOTICE.md` there). `KeepImageModelResident = true` keeps FLUX.2's transformer on the GPU between draws (about 2 s a picture after the first on a desktop GPU); it is released before the 3D stage. `ImageModelBits = 8` selects the near-lossless FLUX.2 weights.
 `ImageModel.SdTurbo` draws with SD-Turbo instead.
 
+**Picture checking (`ScorePictures`, on when several pictures are drawn).** CLIP ViT-B/32 (`PromptMatchScorer`, 600 MB downloaded once, ~2 s to load) scores each drawn picture against the prompt; the picture that matches best and fits its frame is built (`score = CLIP - 1.5 x border touch`), and when even the best is below `MinPromptMatch` (0.21) another batch is drawn (`LowMatchRetries`, default 1) before the minutes-long 3D stage. Measured: matched pairs 0.24-0.31, other objects 0.13-0.19 (a cat sample 0.303 against 0.240 for the next description, a portrait 0.237 against 0.181). CLIP is a ranker, not a fine judge: for "a large leather bellows" FLUX drew a church bell three times and all three scored 0.30-0.31. The scene planner therefore asks the LLM to describe each object by what it looks like in plain words, not by a rare name.
+
 ## The console tool (`Examples/07.AssetGen.Console`)
 
 ```

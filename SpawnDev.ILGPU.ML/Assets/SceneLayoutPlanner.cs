@@ -29,6 +29,7 @@ public sealed class SceneLayoutPlanner
         "\"height\" is the real-world height of the object in metres (a chair 0.9, a door 2.0, a barrel 0.9, a tree 6); \"rotation\" is degrees about the vertical axis; " +
         "\"prompt\" describes ONE object on its own, as if photographed alone on an empty floor (what it is, its material and style): it must not mention any other object, a table or bench it stands on, a room or a scene; " +
         "everything stands directly on the ground, nothing is placed on top of another object; " +
+        "describe each object by what it LOOKS like in plain words (shape, material, colour, a few distinctive parts) and avoid rare or technical names a picture model may not know: write \"a hand-operated air pump shaped like an accordion, brown leather folds between two wooden boards with a long iron nozzle\", not \"a bellows\"; " +
         "an object that appears several times is ONE entry with several instances; keep objects inside the ground and do not overlap them; " +
         "group objects the way a real place would be arranged; use few distinct objects and several instances of the repeated ones; the ground colour is a hex colour that fits the place.";
 
