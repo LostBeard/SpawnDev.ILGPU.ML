@@ -6,7 +6,7 @@
 <PageTitle>Image Generation — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Image Generation"
-            Description="Generate images from text with SD-Turbo — single-step diffusion on your GPU. Same ImageGenerationPipeline as SpawnDev.AI."
+            Description="Generate images from text on your GPU: FLUX.2 klein 4B (4 steps, 4-bit weights) or SD-Turbo (one step). Nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -18,7 +18,7 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="2500">
+            ModelSizeMB="@(_model == "flux2" ? 4600 : 2500)">
 
     <div class="gen-prompt-section">
         <label class="gen-label">Prompt:</label>
@@ -34,6 +34,15 @@
 
         <div class="gen-settings">
             <div class="gen-setting">
+                <label>Model:</label>
+                <select @bind="_model" @bind:after="ModelChanged" class="gen-setting-select" disabled="@(_isRunning || _isModelLoading)">
+                    <option value="flux2">FLUX.2 klein 4B (sharper, 4.6 GB)</option>
+                    <option value="sd">SD Turbo (faster, 2.5 GB)</option>
+                </select>
+            </div>
+            @if (_model == "sd")
+            {
+            <div class="gen-setting">
                 <label>Steps:</label>
                 <input type="number" min="1" max="50" @bind="_numSteps" class="gen-setting-input" disabled="@(_isRunning)" />
             </div>
@@ -42,15 +51,16 @@
                 <input type="number" min="0" max="20" step="0.5" @bind="_guidanceScale" class="gen-setting-input" disabled="@(_isRunning)" title="SD-Turbo is designed for guidance 0" />
             </div>
             <div class="gen-setting">
-                <label>Seed:</label>
-                <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" disabled="@(_isRunning)" />
-            </div>
-            <div class="gen-setting">
                 <label>Size:</label>
                 <select @bind="_imageSize" class="gen-setting-select" disabled="@(_isRunning)">
                     <option value="256">256x256</option>
                     <option value="512">512x512</option>
                 </select>
+            </div>
+            }
+            <div class="gen-setting">
+                <label>Seed:</label>
+                <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" disabled="@(_isRunning)" />
             </div>
         </div>
 
@@ -98,7 +108,7 @@
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            SD-Turbo is ~2.5&nbsp;GB (text encoder + U-Net + VAE). Enter a prompt and click
+            @(_model == "flux2" ? "FLUX.2 klein is ~4.6 GB (4-bit text encoder, transformer and VAE; two of them are on the GPU at a time)" : "SD-Turbo is ~2.5 GB (text encoder + U-Net + VAE)"). Enter a prompt and click
             <strong>Download &amp; Generate</strong> — weights stream from the hub into OPFS on first use
             (same path as SpawnDev.AI). Cached after that. Manage cache on
             <a href="cache">Model Cache</a>.
@@ -112,7 +122,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo SourceFile="Pages/GeneratePage.razor" Note="SD-Turbo" />
+    <PipelineHowTo SourceFile="Pages/GeneratePage.razor" Note="FLUX.2 klein 4B (Black Forest Labs, Apache-2.0; 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) and SD-Turbo" />
 
 </DemoLayout>
 
@@ -219,7 +229,17 @@
     private double _modelProgress, _inferenceMs;
     private string? _generatedImageUrl;
     private string? _error;
-    private string _modelStatusText = "SD Turbo";
+    private string _modelStatusText = "FLUX.2 klein";
+    private string _model = "flux2";                    // "flux2" | "sd"
+    private SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline? _flux;
+    private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
+
+    private void ModelChanged()
+    {
+        _pipeline?.Dispose(); _pipeline = null; _flux?.Dispose(); _flux = null;
+        _isModelLoaded = false; _generatedImageUrl = null; _error = null;
+        _modelStatusText = _model == "flux2" ? "FLUX.2 klein" : "SD Turbo";
+    }
 
     private string GenerateButtonLabel =>
         _isModelLoading ? "Loading…"
@@ -264,7 +284,18 @@
                 return;
             }
 
-            _pipeline?.Dispose();
+            _pipeline?.Dispose(); _flux?.Dispose(); _pipeline = null; _flux = null;
+            if (_model == "flux2")
+            {
+                // only the tokenizer and the small VAE load now; the encoder and the transformer stream in per picture and leave again
+                _flux = await SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline.CreateAsync(_accelerator, ModelSource, FluxRepo, 512, (stage, pct) =>
+                {
+                    _modelStatusText = $"FLUX.2 klein — {stage}"; _modelProgress = pct; InvokeAsync(StateHasChanged);
+                });
+                _modelStatusText = "FLUX.2 klein";
+                _isModelLoaded = true;
+                return;
+            }
             // HubModelSource streams ONNX weights over HTTP into OPFS — never a 1.7GB U-Net byte[].
             _pipeline = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(
                 _accelerator, ModelSource, onProgress: (stage, pct) =>
@@ -324,7 +355,7 @@
         // Lazy load on first generate — matches AiImageEngine.
         if (!_isModelLoaded && !_isModelLoading)
             await LoadModelAsync();
-        if (_pipeline == null || !_isModelLoaded) return;
+        if ((_pipeline == null && _flux == null) || !_isModelLoaded) return;
 
         _isRunning = true;
         _currentStep = 0;
@@ -333,7 +364,22 @@
 
         try
         {
-            _pipeline.NumInferenceSteps = Math.Max(1, _numSteps);
+            if (_flux != null)
+            {
+                int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var image = await _flux.RunAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
+                {
+                    Prompt = _prompt, Seed = seed, Size = 512, Steps = 4,
+                    Progress = (stage, i, n) => { _modelStatusText = $"FLUX.2 klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 4; _ = InvokeAsync(StateHasChanged); },
+                });
+                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _imageSize = 512; _numSteps = 4;
+                _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
+                _modelStatusText = "FLUX.2 klein";
+                _isRunning = false; StateHasChanged();
+                return;
+            }
+            _pipeline!.NumInferenceSteps = Math.Max(1, _numSteps);
             _pipeline.GuidanceScale = _guidanceScale;
             _pipeline.Width = _imageSize;
             _pipeline.Height = _imageSize;
@@ -393,6 +439,7 @@
     public void Dispose()
     {
         _pipeline?.Dispose();
+        _flux?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();
     }
