@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.ILGPU.ML.Trellis2;
 
@@ -55,7 +56,7 @@ public sealed class Flux2Request
 /// each is loaded, run and disposed in turn (the encoder's and transformer's weights come from the factories, so a caller may stream, quantise or cache them as it likes), which is what lets a
 /// 4B model run in a browser tab's memory. Apache-2.0 weights (black-forest-labs/FLUX.2-klein-4B).
 /// </summary>
-public sealed class Flux2Pipeline
+public sealed class Flux2Pipeline : IDisposable
 {
     private readonly Accelerator _acc;
     private readonly Qwen2Tokenizer _tokenizer;
@@ -68,6 +69,32 @@ public sealed class Flux2Pipeline
     public Flux2Pipeline(Accelerator accelerator, Qwen2Tokenizer tokenizer, Func<Task<Flux2Weights>> encoderWeights, Func<Task<Flux2Weights>> transformerWeights, InferenceSession vaeDecoder, Flux2VaeNorm vaeNorm)
     {
         _acc = accelerator; _tokenizer = tokenizer; _encoderWeights = encoderWeights; _transformerWeights = transformerWeights; _vae = vaeDecoder; _norm = vaeNorm;
+    }
+
+    /// <summary>Files a run reads, as (repo, path): for storage planning (<see cref="RangeStreamModelSource.PlanCacheAsync(IEnumerable{ValueTuple{string, string}}, long, CancellationToken)"/>).</summary>
+    public static IReadOnlyList<(string Repo, string Path)> HubFiles(string repo) => new[] { (repo, EncoderFile), (repo, TransformerFile), (repo, VaeFile) };
+
+    public const string EncoderFile = "text_encoder_q4.safetensors", TransformerFile = "transformer_q4.safetensors", VaeFile = "vae_decoder.onnx", TokenizerFile = "tokenizer.json", NormFile = "vae_norm.json";
+
+    /// <summary>
+    /// Build the pipeline from a model source (the 4-bit export of black-forest-labs/FLUX.2-klein-4B: <see cref="EncoderFile"/>, <see cref="TransformerFile"/>, <see cref="VaeFile"/>, <see cref="TokenizerFile"/>, <see cref="NormFile"/>).
+    /// Only the tokenizer, the batch-norm statistics and the small VAE decoder are loaded now (the VAE stays resident, ~200 MB); the two big stages stream in when a run needs them and leave when it is done with them.
+    /// <paramref name="size"/> is the picture side the VAE graph is built for.
+    /// </summary>
+    public static async Task<Flux2Pipeline> CreateAsync(Accelerator accelerator, IModelSource source, string repo, int size = 512, Action<string, int>? onProgress = null, CancellationToken cancellationToken = default)
+    {
+        onProgress?.Invoke("tokenizer", 0);
+        var tok = new Qwen2Tokenizer(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, TokenizerFile, cancellationToken)));
+        var norm = Flux2VaeNorm.FromJson(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, NormFile, cancellationToken)));
+        onProgress?.Invoke("tokenizer", 100);
+        int lat = size / 8;
+        InferenceSession vae;
+        await using (var s = await source.OpenAsync(repo, VaeFile, cancellationToken))
+            vae = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, s, onProgress: (st, pct) => onProgress?.Invoke("vae:" + st, pct),
+                inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, lat, lat } }, ct: cancellationToken);
+        return new Flux2Pipeline(accelerator, tok,
+            () => Flux2Weights.LoadAsync(accelerator, source, repo, EncoderFile, cancellationToken),
+            () => Flux2Weights.LoadAsync(accelerator, source, repo, TransformerFile, cancellationToken), vae, norm);
     }
 
     /// <summary>The position ids of the image tokens, [tokens, 4] = (0, row, column, 0), and of the text tokens, (0, 0, 0, index).</summary>
@@ -179,4 +206,7 @@ public sealed class Flux2Pipeline
         Report("vae", 0, 1);
         return await DecodeAsync(ToVaeInput(latents, side), side);
     }
+
+    /// <summary>Frees the resident VAE decoder. The accelerator is not touched.</summary>
+    public void Dispose() { _vae.Dispose(); _elementWise?.Dispose(); }
 }

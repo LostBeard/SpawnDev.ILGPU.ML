@@ -1,5 +1,7 @@
+using System.Text.Json;
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.SkinTokens;
 using SpawnDev.ILGPU.ML.Trellis2;
 
@@ -29,6 +31,14 @@ public sealed class Flux2Weights : IDisposable
         foreach (var name in weights.Names)
             if (weights.IsU32(name)) { var s = weights.Shape(name); most = Math.Max(most, (long)s[0] * (s[1] / 5 * 32)); }
         if (most > 0) _scratch = accelerator.Allocate1D<uint>(most / 2);
+    }
+
+    /// <summary>Stream one stage's safetensors file from a model source (browser OPFS / hub, or HttpClient + a file store on desktop) onto the device.</summary>
+    public static async Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
+    {
+        await using var stream = await source.OpenAsync(repo, file, cancellationToken);
+        using var empty = JsonDocument.Parse("{}");
+        return new Flux2Weights(accelerator, await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", cancellationToken: cancellationToken));
     }
 
     public bool IsQuantized(string name) => _w.IsU32(name);

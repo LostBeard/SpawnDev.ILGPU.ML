@@ -51,7 +51,7 @@ public sealed class Flux2Transformer : IDisposable
         _img = Alloc<float>(I * Dim); _txt = Alloc<float>(T * Dim); _normI = Alloc<float>(I * Dim); _normT = Alloc<float>(T * Dim);
         _qkv = Alloc<float>(N * 3 * Dim); _attn = Alloc<float>(N * Dim); _attnImg = Alloc<float>(I * Dim); _attnTxt = Alloc<float>(T * Dim);
         _proj = Alloc<float>(N * Dim); _gateUp = Alloc<float>(N * 2 * MlpHidden); _act = Alloc<float>(N * MlpHidden);
-        _single = Alloc<float>(N * (3 * Dim + 2 * MlpHidden)); _scores = Alloc<float>(_acc.AcceleratorType == AcceleratorType.Cuda ? 1 : (long)Heads * N * N);
+        _single = Alloc<float>(N * (3 * Dim + 2 * MlpHidden)); _scores = Alloc<float>(_k.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * N * N);   // the flash kernels (tensor-core on CUDA, portable tiled elsewhere) need no score matrix
         _temb = Alloc<float>(Dim); _tembAct = Alloc<float>(Dim); _tproj = Alloc<float>(TimeChannels); _thid = Alloc<float>(Dim);
         _modImg = Alloc<float>(6 * Dim); _modTxt = Alloc<float>(6 * Dim); _modSingle = Alloc<float>(3 * Dim); _modOut = Alloc<float>(2 * Dim);
         _cosT = Alloc<float>(N * HeadDim); _sinT = Alloc<float>(N * HeadDim); _out = Alloc<float>(I * InChannels);

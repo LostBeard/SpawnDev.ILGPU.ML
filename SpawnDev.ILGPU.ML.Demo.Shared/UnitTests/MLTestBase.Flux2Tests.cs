@@ -265,4 +265,40 @@ public abstract partial class MLTestBase
         }
         Ur_Expect(psnr > 15, $"4-bit picture PSNR {psnr:F1} dB vs the reference");
     });
+
+    private const string F2Server = "http://127.0.0.1:8766/";
+
+    /// <summary>A plain HTTP file server as a model source: every repo maps to the server root (tests only; the demo uses the hub source with its OPFS cache).</summary>
+    private sealed class F2HttpSource(HttpClient http) : SpawnDev.ILGPU.ML.Hub.IModelSource
+    {
+        public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+        {
+            if (filePath.EndsWith(".onnx")) return new MemoryStream(await http.GetByteArrayAsync(F2Server + filePath, cancellationToken));   // the ONNX reader needs a seekable stream
+            return await http.GetStreamAsync(F2Server + filePath, cancellationToken);
+        }
+        public Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => http.GetByteArrayAsync(F2Server + filePath, cancellationToken);
+    }
+
+    /// <summary>
+    /// The whole pipeline built from a model source and run (any lane that has a GPU, the browser WebGPU lane included): 4-bit stages streamed from a local file server
+    /// (node tools/unirig-harness/serve-files.mjs E:/spawndev-flux2/hf_upload 8766), a prompt, a seed, a picture that is not blank. Timings go to the log.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux2_OverHttp_DrawsAPicture() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        try { await http.GetByteArrayAsync(F2Server + "vae_norm.json"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs E:/spawndev-flux2/hf_upload 8766"); }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var pipe = await Flux2Pipeline.CreateAsync(accelerator, new F2HttpSource(http), "local");
+        double create = sw.Elapsed.TotalSeconds; sw.Restart();
+        var result = await pipe.RunAsync(new Flux2Request { Prompt = "a friendly robot, full body, white background", Seed = 3, Progress = (s, i, n) => Console.WriteLine($"[Flux2] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F1} s") });
+        double sum = 0, sumSq = 0; int px = result.Width * result.Height;
+        for (int i = 0; i < px; i++) { double l = result.Rgba[i * 4] + result.Rgba[i * 4 + 1] + result.Rgba[i * 4 + 2]; sum += l; sumSq += l * l; }
+        double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean));
+        Console.WriteLine($"[Flux2] over HTTP on {accelerator.AcceleratorType}: create {create:F1} s, picture {sw.Elapsed.TotalSeconds:F1} s, {result.Width}x{result.Height}, mean luminance {mean / 3:F0}, std {std / 3:F0}");
+        Ur_Expect(result.Width == 512 && result.Height == 512, "512 px picture");
+        Ur_Expect(std / 3 > 15, $"picture is flat (luminance std {std / 3:F1})");
+    });
 }
