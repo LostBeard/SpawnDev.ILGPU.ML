@@ -4,7 +4,9 @@
 
 [**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
-> **New in 5.3.15: [Rig this model](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A generated character gets a skeleton and learned skin weights on your GPU: `SkinTokensRigger` (VAST AI's SkinTokens, MIT, re-implemented on ILGPU) turns a GLB into a rigged GLB in ~6 s on CUDA, and the Image-to-3D demo has a **Rig this model** button (1.15 GB, cached in your browser). Checked against the real PyTorch model: 295 of 296 generated tokens identical, skin weights to 5.7e-5. [How it works →](Docs/rigging.md)
+> **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
+>
+> **5.3.15: [Rig this model](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A generated character gets a skeleton and learned skin weights on your GPU: `SkinTokensRigger` (VAST AI's SkinTokens, MIT, re-implemented on ILGPU) turns a GLB into a rigged GLB in ~6 s on CUDA, and the Image-to-3D demo has a **Rig this model** button (1.15 GB, cached in your browser). Checked against the real PyTorch model: 295 of 296 generated tokens identical, skin weights to 5.7e-5. [How it works →](Docs/rigging.md)
 >
 > **5.3.11: [Text & Image to 3D in your browser](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d).** Type a prompt or drop a photo and get a textured PBR 3D model (GLB) built entirely on your own GPU over WebGPU: SD Turbo draws the object, RMBG-1.4 cuts it out, and [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft, MIT, 4B parameters) generates the mesh and textures. To our knowledge this is the first fully client-side TRELLIS.2 on the web — no server, no upload. About 2-3 minutes on a desktop GPU once the weights are cached (~10 GB, opt-in). [How it works →](Docs/trellis2.md)
 >
@@ -37,6 +39,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
 - **Streaming weight loader** — Large models (GPT-2 652MB) load one tensor at a time. Minimal CPU peak memory. FP16 on GPU supported.
 - **122+ numpy-verified operator tests** — every operator validated against known-correct reference data, CPU reference comparison minimum bar
+- **Humanoid animation (Kimodo moves)** *(5.3.16)* — `HumanoidMapper` / `HumanoidRetargeter` / `AnimatedGlb` (`SpawnDev.ILGPU.ML.Animation`) play NVIDIA Kimodo motion clips on a SkinTokens-rigged humanoid: the rig is matched to Kimodo's 77-joint SOMA skeleton by the shape of its bone tree, clips are retargeted in world space with rest alignment and hip scaling, and the result is glTF animations on the rigged GLB. [**Docs/rigging.md**](Docs/rigging.md)
 - **Auto-rigging (SkinTokens, UniRig)** *(5.3.15)* — `SkinTokensRigger.RigGlbAsync(glb)` gives a generated character a skeleton and **learned** skin weights in one pass (Michelangelo shape encoder, a Qwen3-style decoder that writes the bones and 4 FSQ skin tokens per bone, a skin VAE decoded at 54,000 surface samples), as a rigged GLB with textures untouched. 5.8 s warm on an RTX 4070; in the browser on WebGPU. Gated against the real PyTorch model (295/296 tokens identical, skin 5.7e-5). `UniRigRigger` is the smaller skeleton + skinning-prior alternative. [**Docs/rigging.md**](Docs/rigging.md)
 - **Text & image to 3D (TRELLIS.2)** *(5.3.11)* — a prompt or a photo becomes a textured PBR GLB: `Trellis2ImageTo3D` / `Trellis2TextTo3D` run the full TRELLIS.2-4B pipeline (DINOv3 features, three 1.3B flow transformers, sparse VAE decoders, dual-grid mesh, UV atlas, GPU texture bake). ~40 s on CUDA (tensor cores), and in the browser on WebGPU (~2-3 min cached) — to our knowledge the first fully client-side TRELLIS.2 on the web. [**Docs/trellis2.md**](Docs/trellis2.md). (TripoSR / LGM single-image 3D remain planned.)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
@@ -410,6 +413,7 @@ Registered op-types live in `OperatorRegistry.BuiltinOpTypes` (live count on the
 | **Trellis2ImageTo3D** | RGBA image (alpha = foreground) | Textured PBR GLB (TRELLIS.2-4B, 512 or 1024 pipeline) |
 | **Trellis2TextTo3D** | Prompt text | Textured PBR GLB (SD Turbo → cut-out → TRELLIS.2) |
 | **SkinTokensRigger** | Character GLB | The same GLB rigged: skeleton + learned skin weights (SkinTokens / TokenRig, 1.15 GB bf16) |
+| **HumanoidRetargeter** + **AnimatedGlb** | Rigged humanoid GLB + Kimodo SOMA clips | The same GLB with the moves as glTF animations (`MotionClip.FromNpz`) |
 | **UniRigRigger** | Character GLB | The same GLB rigged: UniRig skeleton + geodesic voxel skinning prior |
 
 ## Demo App
@@ -458,7 +462,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does |
 |------|-------------|
-| **Text & Image to 3D (TRELLIS.2)** | `/text-to-3d` and `/image-to-3d`: a prompt (SD Turbo draws it) or a photo, cut out with RMBG-1.4, turned into a textured PBR GLB by TRELLIS.2-4B on your GPU. Live stage timings, rotating 3D preview, GLB download, and **Rig this model** (SkinTokens: skeleton + learned skin weights, +1.15 GB, Download rigged .glb). ~10 GB of weights, opt-in, cached in browser storage. |
+| **Text & Image to 3D (TRELLIS.2)** | `/text-to-3d` and `/image-to-3d`: a prompt (SD Turbo draws it) or a photo, cut out with RMBG-1.4, turned into a textured PBR GLB by TRELLIS.2-4B on your GPU. Live stage timings, rotating 3D preview, GLB download, **Rig this model** (SkinTokens: skeleton + learned skin weights, +1.15 GB, Download rigged .glb) and **Animate** (22 Kimodo moves, in-place toggle, Download animated .glb). ~10 GB of weights, opt-in, cached in browser storage. |
 | **Image Generation** | SD-Turbo text→image on your GPU (single-step, ~2.5 GB opt-in download). Same `ImageGenerationPipeline` as SpawnDev.AI. |
 | **Image to 3D (TripoSR)** | Planned. The TripoSR reconstruction path is not wired; use Text & Image to 3D (TRELLIS.2) for working image-to-3D. |
 | **Image to Gaussian Splats (LGM)** | Planned — single image → splats → [SpawnScene](https://github.com/LostBeard/SpawnScene). Not a working demo page yet. |

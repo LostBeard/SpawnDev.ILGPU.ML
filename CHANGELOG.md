@@ -3,7 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased - Humanoid animation (Kimodo moves on a rigged character)
+## 5.3.16 - 2026-10-19 - Humanoid animation (Kimodo moves on a rigged character)
+
+Requires SpawnDev.ILGPU 5.3.8.
 
 - **`SpawnDev.ILGPU.ML.Animation`: play NVIDIA Kimodo clips on a SkinTokens-rigged humanoid.** `HumanoidMapper` finds the body of any generated humanoid by the shape of its bone tree (spine, two legs, a chest forking into a neck and two arms,
   five-finger hands or not) and names its bones after Kimodo's 77-joint SOMA skeleton; `HumanoidRetargeter` applies each joint's world-space turn to the rig's rest after rest alignment (limbs swung to SOMA's T-pose directions) and scales the hips' travel;
