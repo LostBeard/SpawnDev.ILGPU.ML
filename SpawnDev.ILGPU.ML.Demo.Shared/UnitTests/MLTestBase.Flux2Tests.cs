@@ -135,4 +135,70 @@ public abstract partial class MLTestBase
         Ur_Expect(rel0 < 0.05, $"step 0 prediction relRMS {rel0:E2} vs the bf16 reference");
         Ur_Expect(rel1 < 0.05, $"step 1 prediction relRMS {rel1:E2} vs the bf16 reference");
     });
+
+    /// <summary>The flow schedule: shifted sigmas and timesteps for 4 steps at 1024 image tokens against the reference scheduler's.</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task Flux2_Scheduler_MatchesTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var (sig, _) = Ur_Npy<float>(Path.Combine(g, "sigmas.npy")); var (ts, _) = Ur_Npy<float>(Path.Combine(g, "timesteps.npy"));
+        var mine = Flux2Scheduler.Sigmas(1024, 4);
+        for (int i = 0; i < sig.Length; i++) Ur_Expect(Math.Abs(mine[i] - sig[i]) < 1e-6, $"sigma {i}: {mine[i]} vs {sig[i]}");
+        for (int i = 0; i < ts.Length; i++) Ur_Expect(Math.Abs(Flux2Scheduler.Timestep(mine, i) - ts[i]) < 1e-2, $"timestep {i}: {Flux2Scheduler.Timestep(mine, i)} vs {ts[i]}");
+        Console.WriteLine($"[Flux2] scheduler: sigmas [{string.Join(", ", mine.Select(v => v.ToString("F6")))}] match the reference");
+        await Task.CompletedTask;
+    });
+
+    private static Flux2VaeNorm F2_Norm(string dir) => Flux2VaeNorm.FromJson(File.ReadAllText(Path.Combine(dir, "weights", "vae_norm.json")));
+
+    /// <summary>Un-normalise + unpatchify of the reference's final latents against its vae_in, then the VAE decoder (ONNX through the library's session) against the reference picture.</summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Flux2_Vae_MatchesTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var (packed, _) = Ur_Npy<float>(Path.Combine(g, "latents_3.npy")); var (vaeIn, _) = Ur_Npy<float>(Path.Combine(g, "vae_in.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        var bytes = File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx"));
+        using var vae = InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux2Pipeline(accelerator, null!, null!, null!, vae, F2_Norm(dir));
+        var mine = pipe.ToVaeInput(packed, 32);
+        double relIn = F2_RelRms(mine, vaeIn);
+        var got = new float[3 * 512 * 512];
+        var img = await pipe.DecodeAsync(vaeIn, 32, got);
+        double rel = F2_RelRms(got, image), maxAbs = 0;
+        for (int i = 0; i < got.Length; i++) maxAbs = Math.Max(maxAbs, Math.Abs(got[i] - image[i]));
+        Console.WriteLine($"[Flux2] VAE on {accelerator.AcceleratorType}: un-normalise + unpatchify {relIn:E2}, decoder relRMS {rel:E2}, max |diff| {maxAbs:F3} (range [-1,1])");
+        Ur_Expect(relIn < 0.05, $"vae input relRMS {relIn:E2}");
+        Ur_Expect(rel < 0.05, $"decoded picture relRMS {rel:E2}");
+    });
+
+    /// <summary>The whole pipeline from the reference's prompt and start noise: encoder, 4 transformer steps, VAE; the picture against the reference's (the reference runs bf16 throughout, so a few grey levels of drift are expected).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux2_Pipeline_MatchesTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var (noise, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux2Pipeline(accelerator, tok,
+            () => Task.FromResult(GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder.safetensors"))),
+            () => Task.FromResult(GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer.safetensors"))), vae, F2_Norm(dir));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await pipe.RunAsync(new Flux2Request { Prompt = "a photo of a cat sitting on a red sofa", Size = 512, Steps = 4, Noise = noise, Progress = (s, i, n) => Console.WriteLine($"[Flux2] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F1} s") });
+        double sq = 0, abs = 0; int n = 512 * 512;
+        for (int p = 0; p < n; p++)
+            for (int c = 0; c < 3; c++)
+            {
+                double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255), have = result.Rgba[p * 4 + c];
+                sq += (have - want) * (have - want); abs += Math.Abs(have - want);
+            }
+        double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
+        Console.WriteLine($"[Flux2] pipeline on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the reference picture");
+        using (var f = File.Create(Path.Combine(g, "csharp.ppm")))
+        {
+            var head = System.Text.Encoding.ASCII.GetBytes("P6\n512 512\n255\n"); f.Write(head);
+            var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
+            f.Write(rgb);
+        }
+        Ur_Expect(psnr > 22, $"picture PSNR {psnr:F1} dB vs the reference");
+    });
 }

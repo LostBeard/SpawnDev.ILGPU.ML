@@ -4,6 +4,7 @@
 
 Input  latents  [1, 32, H/8, W/8]   after the pipeline's batch-norm un-normalise and unpatchify (golden vae_in.npy)
 Output image    [1, 3, H, W]        in [-1, 1]
+Also writes vae_norm.json beside it: the 128-channel batch-norm mean/var/eps the pipeline applies to the packed latents before the decoder.
 fp32 weights (the checkpoint is bf16; fp32 is the decoder's own reference precision, force_upcast). Spatial axes are dynamic.
 """
 import sys, torch
@@ -30,3 +31,7 @@ with torch.no_grad():
 torch.onnx.export(m, (x,), out, input_names=['latents'], output_names=['image'], opset_version=17, dynamo=False,
                   dynamic_axes={'latents': {2: 'h', 3: 'w'}, 'image': {2: 'H', 3: 'W'}})
 print('exported', out, tuple(ref.shape))
+import json, os
+norm = {'mean': vae.bn.running_mean.float().tolist(), 'var': vae.bn.running_var.float().tolist(), 'eps': float(vae.config.batch_norm_eps)}
+json.dump(norm, open(os.path.join(os.path.dirname(os.path.abspath(out)), 'vae_norm.json'), 'w'))   # the batch-norm statistics the pipeline un-normalises the packed latents with
+print('vae_norm.json', len(norm['mean']), 'channels, eps', norm['eps'])
