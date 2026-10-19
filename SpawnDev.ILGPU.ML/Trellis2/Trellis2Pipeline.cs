@@ -620,8 +620,39 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Offset of the remeshed shell from the original surface, in voxels (reference 1).</summary>
     public float RemeshBand { get; set; } = 1f;
 
+    /// <summary>Run the remesh in device kernels (<see cref="DeviceRemesher"/>: the mesh never leaves the GPU, no host repair first) instead of the host topology (<see cref="NarrowBandRemesher"/>). Default on; env TRELLIS2_HOSTREMESH=1 forces the host path (A/B).</summary>
+    public bool DeviceRemesh { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTREMESH") != "1";
+    private DeviceRemesher? _deviceRemesher;
+    /// <summary>Simplify on the device (<see cref="GpuMeshSimplifier"/>) instead of the host edge collapse. Default on; env TRELLIS2_HOSTSIMPLIFY=1 forces the host path (A/B).</summary>
+    public bool DeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTSIMPLIFY") != "1";
+    private GpuMeshSimplifier? _gpuSimplifier;
+
     private async Task<byte[]> RemeshGlbAsync(Output output, int textureSize, int dilation, int maxFaces, Stopwatch sw)
     {
+        if (DeviceRemesh)
+        {
+            _deviceRemesher ??= new DeviceRemesher(_acc, _sk);
+            using var rmd = await _deviceRemesher.RemeshAsync(output.Mesh.Vertices.View, output.Mesh.VertexCount, output.Mesh.Faces.View, output.Mesh.FaceCount, output.Grid, RemeshBand);
+            StageDone?.Invoke($"remesh on the device: {rmd.ActiveVoxels} band voxels, {rmd.GridVertices} corners -> {rmd.FaceCount} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+            DeviceTriMesh? simplified = null;
+            if (DeviceSimplify && maxFaces > 0 && rmd.FaceCount > maxFaces)
+            {
+                _gpuSimplifier ??= new GpuMeshSimplifier(_acc, _sk);
+                int before = rmd.FaceCount;
+                // a hair under the budget: the repair that follows closes holes and adds a few hundred faces, which must not push the mesh back over it
+                simplified = await _gpuSimplifier.SimplifyAsync(rmd.Positions.View, rmd.VertexCount, rmd.Faces.View, rmd.FaceCount, (int)(maxFaces * 0.995));
+                StageDone?.Invoke($"simplify on the device {before} -> {simplified.FaceCount} faces in {_gpuSimplifier.LastRounds.Count} rounds", sw.Elapsed.TotalSeconds); sw.Restart();
+            }
+            using var simplifiedOwner = simplified;
+            // the stages after it (repair, atlas) still run on the host and need arrays
+            var vp = simplified?.Positions ?? rmd.Positions; var vf = simplified?.Faces ?? rmd.Faces;
+            int vn = simplified?.VertexCount ?? rmd.VertexCount, fn = simplified?.FaceCount ?? rmd.FaceCount;
+            var dpos = vn == 0 ? Array.Empty<float>() : await vp.View.SubView(0, (long)vn * 3).CopyToHostAsync();
+            var dfaces = fn == 0 ? Array.Empty<int>() : await vf.View.SubView(0, (long)fn * 3).CopyToHostAsync();
+            MeshStage?.Invoke("remeshed", dpos, dfaces);
+            if (simplified != null && RepairMesh) { (dpos, dfaces) = Repair("(simplified)", dpos, dfaces, sw); MeshStage?.Invoke("simplified", dpos, dfaces); }
+            return await FinishGlbAsync(output, dpos, dfaces, textureSize, dilation, maxFaces, sw, rmd.Source, remeshed: true);
+        }
         var verts = await output.Mesh.Vertices.View.CopyToHostAsync();
         var faces0 = await output.Mesh.Faces.View.SubView(0, (long)output.Mesh.FaceCount * 3).CopyToHostAsync();
         var remap = new int[verts.Length / 3]; Array.Fill(remap, -1);

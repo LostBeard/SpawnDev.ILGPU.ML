@@ -211,9 +211,20 @@ public sealed class DeviceRemesher
         Atomic.Add(ref vol[root[tris[t * 3]]], (int)MathF.Round(triple / 6f * VolumeScale));
     }
 
-    private static void AnyNegativeImpl(Index1D v, IV root, IV vol, IV flag) { if (root[v] == v && vol[v] < 0) flag[0] = 1; }
+    private const float AreaScale = 67108864f;         // 2^26: a face's area as a fixed-point int; a surface of up to ~30 square units stays below 2^31
 
-    private static void KeepFaceImpl(Index1D t, IV tris, IV root, IV vol, IV keep) { keep[t] = vol[root[tris[t * 3]]] >= 0 ? 1 : 0; }
+    private static void AreaImpl(Index1D t, IV tris, FV p, IV root, IV area)
+    {
+        int a = tris[t * 3] * 3, b = tris[t * 3 + 1] * 3, c = tris[t * 3 + 2] * 3;
+        float ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2], vx = p[c] - p[a], vy = p[c + 1] - p[a + 1], vz = p[c + 2] - p[a + 2];
+        float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        Atomic.Add(ref area[root[tris[t * 3]]], (int)MathF.Round(0.5f * MathF.Sqrt(nx * nx + ny * ny + nz * nz) * AreaScale));
+    }
+
+    // a piece goes when it faces into the model (negative signed volume) or is a floating fragment (area below the threshold, as MeshRepair's RemoveFragments)
+    private static void AnyDropImpl(Index1D v, IV root, IV vol, IV area, IV flag, int minArea) { if (root[v] == v && (vol[v] < 0 || area[v] < minArea)) flag[0] = 1; }
+
+    private static void KeepFaceImpl(Index1D t, IV tris, IV root, IV vol, IV area, IV keep, int minArea) { int r = root[tris[t * 3]]; keep[t] = vol[r] >= 0 && area[r] >= minArea ? 1 : 0; }
 
     private static void CompactFacesImpl(Index1D t, IV keep, IV offsets, IV tris, IV outTris)
     {
@@ -234,6 +245,9 @@ public sealed class DeviceRemesher
     private static void RemapFacesImpl(Index1D i, IV offsets, IV tris) { tris[i] = offsets[tris[i]]; }
 
     private static void FillMinus1Impl(Index1D i, IV v) { v[i] = -1; }
+
+    /// <summary>Pieces with less area than this fraction of the volume's side squared are dropped as floating fragments (<see cref="MeshRepair.Options.MinComponentArea"/>); 0 keeps every piece with a positive volume.</summary>
+    public double MinComponentArea { get; set; } = 1e-5;
 
     /// <param name="worldPositions">the input mesh on the device, xyz in world units (the volume is [-0.5, 0.5]^3); vertices no face uses are fine</param>
     /// <param name="faces">its triangles</param>
@@ -326,8 +340,9 @@ public sealed class DeviceRemesher
             var union = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(UnionImpl);
             var rootK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(RootImpl);
             var volumeK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV>(VolumeImpl);
-            var anyNeg = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV>(AnyNegativeImpl);
-            var keepK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV>(KeepFaceImpl);
+            var areaK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV>(AreaImpl);
+            var anyDrop = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV, int>(AnyDropImpl);
+            var keepK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV, IV, int>(KeepFaceImpl);
             using var parent = _acc.Allocate1D<int>(nOut);
             iota(nOut, parent.View);
             union(nf, tris.View, parent.View);
@@ -335,12 +350,15 @@ public sealed class DeviceRemesher
             rootK(nOut, parent.View, root.View);
             using var vol = _acc.Allocate1D<int>(nOut); vol.MemSetToZero();
             volumeK(nf, tris.View, outPos.View, root.View, vol.View);
+            using var area = _acc.Allocate1D<int>(nOut); area.MemSetToZero();
+            areaK(nf, tris.View, outPos.View, root.View, area.View);
+            int minAreaFixed = (int)Math.Min(int.MaxValue, MinComponentArea * scale * scale * AreaScale);
             using var neg = _acc.Allocate1D<int>(1); neg.MemSetToZero();
-            anyNeg(nOut, root.View, vol.View, neg.View);
+            anyDrop(nOut, root.View, vol.View, area.View, neg.View, minAreaFixed);
             if ((await neg.View.CopyToHostAsync())[0] != 0)
             {
                 using var keep = _acc.Allocate1D<int>(nf);
-                keepK(nf, tris.View, root.View, vol.View, keep.View);
+                keepK(nf, tris.View, root.View, vol.View, area.View, keep.View, minAreaFixed);
                 using var foff = _acc.Allocate1D<int>(nf + 1L);
                 int nKept = await _sk.ExclusiveScanAsync(keep.View, nf, foff.View);
                 using var kept = _acc.Allocate1D<int>(Math.Max(3L, (long)nKept * 3));
