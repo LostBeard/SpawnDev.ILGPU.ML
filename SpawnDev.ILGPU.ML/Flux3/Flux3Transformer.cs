@@ -7,6 +7,7 @@ using SpawnDev.ILGPU.ML.Trellis2;
 namespace SpawnDev.ILGPU.ML.Flux3;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
+using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 
 /// <summary>The shape of a FLUX 3 image DiT (the released Klein is the default; the numbers are parameters so a small copy can be gated against the reference code on random weights).</summary>
 /// <param name="Dim">hidden width (3072)</param>
@@ -109,10 +110,26 @@ public sealed class Flux3Transformer : IDisposable
         return (cos, sin);
     }
 
+    /// <summary>When set, every stage of <see cref="Forward"/> is timed with a device sync on either side (name -> calls, milliseconds): a profile of where a step goes. Slows the step down; off (null) by default.</summary>
+    public Dictionary<string, (int Calls, double Ms)>? Profile { get; set; }
+
+    private void T(string name, Action stage)
+    {
+        if (Profile == null) { stage(); return; }
+        _acc.Synchronize();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        stage();
+        _acc.Synchronize();
+        Profile.TryGetValue(name, out var e);
+        Profile[name] = (e.Calls + 1, e.Ms + sw.Elapsed.TotalMilliseconds);
+    }
+
     private void Lin(FV x, string weight, FV o, int rows, int K, int N)
     {
-        if (rows == 1) _u.Gemv(x, _w.Matrix(weight), null, o, K, N);
-        else _k.Linear(x, _w.Matrix(weight), null, o, rows, K, N);
+        BV m = default;
+        T("weights (dequant)", () => m = _w.Matrix(weight));
+        if (rows == 1) T("gemv", () => _u.Gemv(x, m, null, o, K, N));
+        else T("gemm " + (N >= 2 * _dim ? "wide" : "narrow"), () => _k.Linear(x, m, null, o, rows, K, N));
     }
 
     /// <summary>Sinusoid of t * 1000 as the reference computes it (cos | sin of 128 frequencies), through an MLPEmbedder (in_layer, silu, out_layer) into <paramref name="o"/> [Dim].</summary>
@@ -140,15 +157,42 @@ public sealed class Flux3Transformer : IDisposable
     /// </summary>
     public void Forward(float[] image, float[] cond, float[] text, float t, float tNext, float[] imageIds, float[] condIds, float[] textIds)
     {
-        _inImg.View.SubView(0, image.Length).CopyFromCPU(image);
+        Prepare(cond, text, imageIds, condIds, textIds);
+        UploadLatents(image);
+        Forward(t, tNext);
+    }
+
+    /// <summary>
+    /// The inputs that stay the same for every step of a picture, uploaded ONCE: the reference pictures' tokens, the caption's rows and the rotary tables of every token's ids (a few ms of trigonometry that does not depend on the step).
+    /// </summary>
+    public void Prepare(float[] cond, float[] text, float[] imageIds, float[] condIds, float[] textIds)
+    {
         if (_nCond > 0) _inCond.View.SubView(0, cond.Length).CopyFromCPU(cond);
         _inTxt.View.SubView(0, text.Length).CopyFromCPU(text);
         var ids = new float[_n * 4];
         Array.Copy(imageIds, 0, ids, 0, _nImg * 4); Array.Copy(condIds, 0, ids, _nImg * 4, _nCond * 4); Array.Copy(textIds, 0, ids, (_nImg + _nCond) * 4, _nTxt * 4);
         var (cos, sin) = RopeTables(ids, _n, _c.Theta);
         _cos.View.SubView(0, cos.Length).CopyFromCPU(cos); _sin.View.SubView(0, sin.Length).CopyFromCPU(sin);
-        Forward(t, tNext);
     }
+
+    /// <summary>The picture's tokens [imageTokens, 128] the steps run on: stay on the device between steps (<see cref="Euler"/> updates them there).</summary>
+    public FV Latents => _inImg.View.SubView(0, (long)_nImg * Flux3Config.InChannels);
+
+    /// <summary>Upload the start latents (noise) once per picture.</summary>
+    public void UploadLatents(float[] image) => _inImg.View.SubView(0, image.Length).CopyFromCPU(image);
+
+    private Action<Index1D, FV, FV, float>? _euler;
+    private static void EulerImpl(Index1D i, FV x, FV velocity, float dt) { x[i] = x[i] + dt * velocity[i]; }
+
+    /// <summary>One Euler step on the device: latents += dt * the last <see cref="Step"/>'s velocity. No read-back, no host loop.</summary>
+    public void Euler(float dt)
+    {
+        _euler ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(EulerImpl);
+        _euler(_nImg * Flux3Config.InChannels, Latents, _out.View, dt);
+    }
+
+    /// <summary>One model call on the device-resident latents (after <see cref="Prepare"/> and <see cref="UploadLatents"/>); the velocity is left in <see cref="Output"/>.</summary>
+    public void Step(float t, float tNext) => Forward(t, tNext);
 
     private void Forward(float t, float tNext)
     {
@@ -211,22 +255,24 @@ public sealed class Flux3Transformer : IDisposable
         int D = _dim, M = _mlp, cols = _cols; long r0 = attnRow, n = attnRows;
         const float Eps = 1e-6f;
         foreach (var (row, rows, mod) in segments)
-            _k.LayerNormModulate(_x.View.SubView((long)row * D, (long)rows * D), _norm.View.SubView((long)row * D, (long)rows * D), mod, 0, D, rows, D, Eps);   // shift, scale
+            T("norm + modulate", () => _k.LayerNormModulate(_x.View.SubView((long)row * D, (long)rows * D), _norm.View.SubView((long)row * D, (long)rows * D), mod, 0, D, rows, D, Eps));   // shift, scale
         var fused = _fused.View.SubView(0, n * cols);
         Lin(_norm.View.SubView(r0 * D, n * D), prefix + ".qkv_mlp.weight", fused, attnRows, D, cols);                              // q | k | v | gate | up
-        _u.RmsNormHeads(fused, _w.Vector(prefix + ".norm_q.weight"), attnRows, cols, 0, _heads, Flux3Config.HeadDim, Eps);
-        _u.RmsNormHeads(fused, _w.Vector(prefix + ".norm_k.weight"), attnRows, cols, D, _heads, Flux3Config.HeadDim, Eps);
-        var cos = _cos.View.SubView(r0 * Flux3Config.HeadDim, n * Flux3Config.HeadDim); var sin = _sin.View.SubView(r0 * Flux3Config.HeadDim, n * Flux3Config.HeadDim);
-        _f.RopeInterleaved(fused, cos, sin, attnRows, cols, 0, _heads, Flux3Config.HeadDim);
-        _f.RopeInterleaved(fused, cos, sin, attnRows, cols, D, _heads, Flux3Config.HeadDim);
+        T("qk norm + rope", () =>
+        {
+            _u.RmsNormHeads(fused, _w.Vector(prefix + ".norm_q.weight"), attnRows, cols, 0, _heads, Flux3Config.HeadDim, Eps);
+            _u.RmsNormHeads(fused, _w.Vector(prefix + ".norm_k.weight"), attnRows, cols, D, _heads, Flux3Config.HeadDim, Eps);
+            var cs = _cos.View.SubView(r0 * Flux3Config.HeadDim, n * Flux3Config.HeadDim); var sn = _sin.View.SubView(r0 * Flux3Config.HeadDim, n * Flux3Config.HeadDim);
+            _f.RopeInterleaved(fused, cs, sn, attnRows, cols, 0, _heads, Flux3Config.HeadDim);
+            _f.RopeInterleaved(fused, cs, sn, attnRows, cols, D, _heads, Flux3Config.HeadDim);
+        });
         var attn = _attn.View.SubView(0, n * D);
-        _k.Attention(fused, cols, 0, fused, cols, D, 2 * D, _scores.View, attn, attnRows, attnRows, _heads, Flux3Config.HeadDim);
+        T("attention", () => _k.Attention(fused, cols, 0, fused, cols, D, 2 * D, _scores.View, attn, attnRows, attnRows, _heads, Flux3Config.HeadDim));
         var gu = _gateUp.View.SubView(0, n * (D + M));
-        _f.SwigluCols(fused, cols, 3 * D, gu, D + M, D, attnRows, M);
-        _f.CopyCols(attn, gu, attnRows, D, D, D + M, 0);
+        T("swiglu + copy", () => { _f.SwigluCols(fused, cols, 3 * D, gu, D + M, D, attnRows, M); _f.CopyCols(attn, gu, attnRows, D, D, D + M, 0); });
         Lin(gu, prefix + ".out.weight", attn, attnRows, D + M, D);                                                                   // attn_out | mlp_out
         foreach (var (row, rows, mod) in segments)
-            _k.GateResidual(_x.View.SubView((long)row * D, (long)rows * D), attn.SubView((long)(row - attnRow) * D, (long)rows * D), mod, 2 * D, rows * D, D);
+            T("gate residual", () => _k.GateResidual(_x.View.SubView((long)row * D, (long)rows * D), attn.SubView((long)(row - attnRow) * D, (long)rows * D), mod, 2 * D, rows * D, D));
     }
 
     public void Dispose()

@@ -79,6 +79,14 @@
             </div>
             }
             <div class="gen-setting">
+                <label>Pictures:</label>
+                <select @bind="_pictures" class="gen-setting-select" disabled="@(_isRunning)" title="Draw several pictures of the prompt (consecutive seeds) and choose.">
+                    <option value="1">1</option>
+                    <option value="4">4</option>
+                    <option value="8">8</option>
+                </select>
+            </div>
+            <div class="gen-setting">
                 <label>Seed:</label>
                 <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" disabled="@(_isRunning)" />
             </div>
@@ -119,19 +127,42 @@
     @if (_generatedImageUrl != null)
     {
         <div class="gen-result">
-            <img src="@_generatedImageUrl" alt="Generated image" class="gen-result-img" />
+            @if (_gallery.Count > 1)
+            {
+                <div class="gen-grid">
+                    @foreach (var item in _gallery)
+                    {
+                        <div class="gen-grid-item">
+                            <img src="@item.Url" alt="Generated image, seed @item.Seed" />
+                            <span class="gen-info-item">seed @item.Seed</span>
+                            <button class="action-btn download-btn" @onclick="() => DownloadPicture(item)">Download</button>
+                        </div>
+                    }
+                </div>
+            }
+            else
+            {
+                <img src="@_generatedImageUrl" alt="Generated image" class="gen-result-img" />
+            }
             <div class="gen-result-info">
                 <span class="gen-info-item">@_inferenceMs.ToString("F0")ms</span>
                 <span class="gen-info-item">@_resultWidth x @_resultHeight</span>
                 <span class="gen-info-item">@_numSteps steps</span>
                 <span class="gen-info-item">Seed: @_usedSeed</span>
             </div>
+            @if (!string.IsNullOrEmpty(_timings))
+            {
+                <div class="gen-result-info"><span class="gen-info-item">last picture: @_timings</span></div>
+            }
             @if (!string.IsNullOrEmpty(_usedCaption))
             {
                 <details class="gen-caption"><summary>Caption used</summary><p>@_usedCaption</p></details>
             }
             <div class="result-actions">
-                <button class="action-btn download-btn" @onclick="DownloadResult">Download</button>
+                @if (_gallery.Count <= 1)
+                {
+                    <button class="action-btn download-btn" @onclick="DownloadResult">Download</button>
+                }
                 <button class="action-btn clear-btn" @onclick="ClearResult">New Generation</button>
             </div>
         </div>
@@ -233,6 +264,9 @@
 
     .gen-result { text-align: center; margin: 1.5rem 0; }
     .gen-result-img { max-width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); }
+    .gen-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.75rem; }
+    .gen-grid-item { display: flex; flex-direction: column; align-items: center; gap: 0.35rem; }
+    .gen-grid-item img { width: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); }
     .gen-result-info { display: flex; gap: 1rem; justify-content: center; margin-top: 0.75rem; flex-wrap: wrap; }
     .gen-info-item { color: #64748b; font-size: 0.8rem; font-family: monospace; }
 
@@ -275,9 +309,10 @@
     private const string Flux3Repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
     private ReferenceImages? _refs;
     private bool _expandPrompt;                         // FLUX 3: a local LLM writes the full scene caption first
-    private string? _usedCaption;
-    // Q4_0, not Q4_K_M: the Q4_K GEMV keeps Group.Barrier inside a data-dependent loop, which WebGPU's WGSL validation rejects (non-uniform control flow); Q4_0 / Q8_0 / Q6_K GEMVs have their barriers outside any loop
-    private const string CaptionLlmRepo = "unsloth/Qwen3-4B-GGUF", CaptionLlmFile = "Qwen3-4B-Q4_0.gguf";
+    private string? _usedCaption, _timings;
+    private int _pictures = 1;                          // 1, 4 or 8 pictures of the prompt (consecutive seeds), shown together
+    private sealed record GalleryItem(int Seed, string Url);
+    private readonly List<GalleryItem> _gallery = new();
     private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
 
     private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }
@@ -298,29 +333,7 @@
     private async Task<string> ExpandPromptAsync(int width, int height)
     {
         _flux3!.ReleaseResident();
-        Stream? open = null; SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline? llm = null;
-        try
-        {
-            var download = new Progress<SpawnDev.ILGPU.ML.Hub.ModelDownloadProgress>(p =>
-            {
-                _modelStatusText = p.Fraction is { } f ? $"Qwen3 4B — downloading {f:P0}" : $"Qwen3 4B — downloading {p.BytesReceived / 1048576} MiB";
-                _ = InvokeAsync(StateHasChanged);
-            });
-            open = await ModelSource.OpenAsync(CaptionLlmRepo, CaptionLlmFile, download);
-            llm = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator!, open, maxSeqLen: 4096,
-                onProgress: (stage, pct) => { _modelStatusText = $"Qwen3 4B — {stage} {pct}%"; _ = InvokeAsync(StateHasChanged); });
-            llm.EnableWebGPUDecodeCapture = true;
-            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWebGPUGemv = true;
-            _modelStatusText = "Qwen3 4B — writing the caption";
-            await InvokeAsync(StateHasChanged);
-            var caption = await SpawnDev.ILGPU.ML.Flux3.Flux3PromptUpsampler.FromPipeline(llm).ExpandAsync(_prompt, width, height);
-            return string.IsNullOrWhiteSpace(caption) ? _prompt : caption;
-        }
-        finally
-        {
-            await _accelerator!.SynchronizeAsync();
-            llm?.Dispose(); open?.Dispose();
-        }
+        return await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, _prompt, width, height, text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); });
     }
 
     private void ModelChanged()
@@ -454,6 +467,7 @@
         if (string.IsNullOrWhiteSpace(_prompt)) return;
         _error = null;
         _generatedImageUrl = null;
+        _gallery.Clear();
 
         // Lazy load on first generate — matches AiImageEngine.
         if (!_isModelLoaded && !_isModelLoading)
@@ -467,67 +481,66 @@
 
         try
         {
-            if (_flux3 != null)
+            int baseSeed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
+            var (pw, ph) = PictureSize();
+            var total = System.Diagnostics.Stopwatch.StartNew();
+            _gallery.Clear();
+            // FLUX 3 draws from a full scene caption: written once for every picture of this click, with the transformer off the GPU while the language model runs
+            string caption = _prompt;
+            if (_flux3 != null && _expandPrompt && _references.Count == 0) caption = await ExpandPromptAsync(pw, ph);
+            _usedCaption = _flux3 != null && caption != _prompt ? caption : null;
+            for (int n = 0; n < _pictures; n++)
             {
-                int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
-                var (pw, ph) = PictureSize();
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                string caption = _prompt;
-                if (_expandPrompt && _references.Count == 0) caption = await ExpandPromptAsync(pw, ph);
-                _usedCaption = caption == _prompt ? null : caption;
-                var image = await _flux3.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
+                int seed = baseSeed + n;
+                _currentStep = 0;
+                string label = _pictures > 1 ? $" ({n + 1}/{_pictures})" : "";
+                byte[] rgba; int w, h;
+                if (_flux3 != null)
                 {
-                    Caption = caption, Seed = seed, Width = pw, Height = ph, References = _references.Count > 0 ? _references : null,
-                    Progress = (stage, i, n) => { _modelStatusText = $"FLUX 3 Klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 16; _ = InvokeAsync(StateHasChanged); },
-                });
-                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _resultWidth = image.Width; _resultHeight = image.Height; _numSteps = 16;
-                _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
-                _modelStatusText = "FLUX 3 Klein";
-                _isRunning = false; StateHasChanged();
-                return;
-            }
-            if (_flux != null)
-            {
-                int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
-                var (pw, ph) = PictureSize();
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                var image = await _flux.RunAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
+                    var image = await _flux3.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
+                    {
+                        Caption = caption, Seed = seed, Width = pw, Height = ph, References = _references.Count > 0 ? _references : null,
+                        Progress = (stage, i, c) => { _modelStatusText = $"FLUX 3 Klein{label} — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 16; _ = InvokeAsync(StateHasChanged); },
+                    });
+                    (rgba, w, h) = (image.Rgba, image.Width, image.Height); _numSteps = 16;
+                    _timings = string.Join(" · ", _flux3.LastTimings.Select(t => $"{t.Stage} {t.Seconds:F1} s"));
+                }
+                else if (_flux != null)
                 {
-                    Prompt = _prompt, Seed = seed, Size = _fluxSize, Width = _references.Count > 0 ? pw : 0, Height = _references.Count > 0 ? ph : 0, References = _references.Count > 0 ? _references : null, Steps = 4,
-                    Progress = (stage, i, n) => { _modelStatusText = $"FLUX.2 klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 4; _ = InvokeAsync(StateHasChanged); },
-                });
-                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _resultWidth = image.Width; _resultHeight = image.Height; _numSteps = 4;
-                _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
-                _modelStatusText = "FLUX.2 klein";
-                _isRunning = false; StateHasChanged();
-                return;
+                    var image = await _flux.RunAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
+                    {
+                        Prompt = _prompt, Seed = seed, Size = _fluxSize, Width = _references.Count > 0 ? pw : 0, Height = _references.Count > 0 ? ph : 0, References = _references.Count > 0 ? _references : null, Steps = 4,
+                        Progress = (stage, i, c) => { _modelStatusText = $"FLUX.2 klein{label} — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 4; _ = InvokeAsync(StateHasChanged); },
+                    });
+                    (rgba, w, h) = (image.Rgba, image.Width, image.Height); _numSteps = 4;
+                }
+                else
+                {
+                    _pipeline!.NumInferenceSteps = Math.Max(1, _numSteps);
+                    _pipeline.GuidanceScale = _guidanceScale;
+                    _pipeline.Width = _imageSize;
+                    _pipeline.Height = _imageSize;
+                    _pipeline.Seed = seed;
+                    _pipeline.OnProgress += OnPipelineProgress;
+                    try
+                    {
+                        var result = await _pipeline.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput { Prompt = _prompt, NegativePrompt = _negativePrompt });
+                        (rgba, w, h) = (result.ImageRGBA, result.Width, result.Height); seed = result.Seed;
+                    }
+                    finally { _pipeline.OnProgress -= OnPipelineProgress; }
+                }
+                var url = Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h);
+                _gallery.Add(new GalleryItem(seed, url));
+                _generatedImageUrl = url; _usedSeed = seed; _resultWidth = w; _resultHeight = h;
+                _inferenceMs = total.Elapsed.TotalMilliseconds;
+                await InvokeAsync(StateHasChanged);
             }
-            _pipeline!.NumInferenceSteps = Math.Max(1, _numSteps);
-            _pipeline.GuidanceScale = _guidanceScale;
-            _pipeline.Width = _imageSize;
-            _pipeline.Height = _imageSize;
-            _pipeline.Seed = _seed;
-            _pipeline.OnProgress += OnPipelineProgress;
-
-            var result = await _pipeline.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput
-            {
-                Prompt = _prompt,
-                NegativePrompt = _negativePrompt,
-            });
-
-            _pipeline.OnProgress -= OnPipelineProgress;
-
-            _inferenceMs = result.InferenceTimeMs;
-            _usedSeed = result.Seed;
-            _resultWidth = result.Width; _resultHeight = result.Height;
-            _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ImageRGBA, result.Width, result.Height);
+            _modelStatusText = ModelLabel;
         }
         catch (Exception ex)
         {
             _error = ex.Message;
             Console.WriteLine($"[Generate] Error: {ex}");
-            if (_pipeline != null)
-                _pipeline.OnProgress -= OnPipelineProgress;
         }
 
         _isRunning = false;
@@ -541,15 +554,19 @@
         _ = InvokeAsync(StateHasChanged);
     }
 
-    private void DownloadResult()
+    private void DownloadResult() => DownloadUrl(_generatedImageUrl, _usedSeed);
+
+    private void DownloadPicture(GalleryItem item) => DownloadUrl(item.Url, item.Seed);
+
+    private void DownloadUrl(string? url, int seed)
     {
-        if (_generatedImageUrl == null) return;
+        if (url == null) return;
         try
         {
             using var document = JS.Get<SpawnDev.SpawnJS.JSObjects.Document>("document");
             using var link = document.CreateElement<SpawnDev.SpawnJS.JSObjects.HTMLAnchorElement>("a");
-            link.Href = _generatedImageUrl;
-            link.Download = $"generated-{_usedSeed}.png";
+            link.Href = url;
+            link.Download = $"generated-{seed}.png";
             using var body = document.Body!;
             body.AppendChild(link);
             link.Click();
@@ -558,7 +575,7 @@
         catch { }
     }
 
-    private void ClearResult() { _generatedImageUrl = null; _currentStep = 0; _error = null; StateHasChanged(); }
+    private void ClearResult() { _generatedImageUrl = null; _gallery.Clear(); _currentStep = 0; _error = null; StateHasChanged(); }
 
     public void Dispose()
     {

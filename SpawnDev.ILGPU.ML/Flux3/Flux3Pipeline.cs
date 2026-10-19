@@ -137,6 +137,18 @@ public sealed class Flux3Pipeline : IDisposable
         return t;
     }
 
+    private string? _cachedCaption;
+    private (float[] Rows, int Tokens)? _cachedText;
+    private Flux2ReferenceImage[]? _cachedRefs;
+    private (float[] Tokens, float[] Ids) _cachedRefTokens;
+
+    private async Task<(float[] Rows, int Tokens)> CacheTextAsync(string caption)
+    {
+        var encoded = await EncodeTextAsync(caption);
+        _cachedCaption = caption; _cachedText = encoded;
+        return encoded;
+    }
+
     /// <summary>The caption's conditioning rows [tokens, 20480] and the token count (the text encoder is loaded for the call and freed after it).</summary>
     public async Task<(float[] Rows, int Tokens)> EncodeTextAsync(string caption)
     {
@@ -158,10 +170,18 @@ public sealed class Flux3Pipeline : IDisposable
         int rows = height / 16, cols = width / 16, nImg = rows * cols;
         void Report(string s, int i, int n) => request.Progress?.Invoke(s, i, n);
 
+        var clock = System.Diagnostics.Stopwatch.StartNew(); var timings = new List<(string Stage, double Seconds)>(); double mark = 0;
+        void Lap(string stage) { double now = clock.Elapsed.TotalSeconds; timings.Add((stage, now - mark)); mark = now; }
         Report("text encoder", 0, 1);
-        var (textRows, nTxt) = text ?? await EncodeTextAsync(request.Caption);
+        // the conditioning of the last caption is kept (host memory, 6.5 MB for 80 tokens): further pictures of the same caption (other seeds) skip loading and running the 2.3 GB text encoder
+        var (textRows, nTxt) = text ?? (_cachedCaption == request.Caption && _cachedText != null ? _cachedText.Value : await CacheTextAsync(request.Caption));
 
-        var (condRows, condIdArray) = await EncodeReferencesAsync(request.References, (i, n) => Report("reference", i, n));
+        // likewise the reference pictures' tokens, while the same picture objects are passed
+        (float[] condRows, float[] condIdArray) refs;
+        if (request.References != null && _cachedRefs != null && request.References.Count == _cachedRefs.Length && request.References.Zip(_cachedRefs, ReferenceEquals).All(x => x)) refs = _cachedRefTokens;
+        else { refs = await EncodeReferencesAsync(request.References, (i, n) => Report("reference", i, n)); _cachedRefs = request.References?.ToArray(); _cachedRefTokens = refs; }
+        var (condRows, condIdArray) = refs;
+        Lap("text + references");
         int nCond = condRows.Length / Flux3Config.InChannels;
 
         var latents = request.Noise?.ToArray() ?? Flux2Pipeline.GaussianNoise(nImg * Flux3Config.InChannels, request.Seed);
@@ -170,27 +190,37 @@ public sealed class Flux3Pipeline : IDisposable
         var schedule = Schedule(request.Steps, request.Alpha);
         Report("transformer", 0, 1);
         var w = _resident ?? await _ditWeights();
+        Lap("transformer weights (load)");
         try
         {
             if (KeepTransformerResident) _resident = w;
             using var tr = new Flux3Transformer(_acc, w, _config, nImg, nCond, nTxt);
+            // the caption, references and rotary tables go up once; the latents stay on the device through every step (an Euler kernel updates them): nothing crosses to the CPU until the picture is done
+            tr.Prepare(condRows, textRows, imageIds, condIdArray, textIds);
+            tr.UploadLatents(latents);
             for (int i = 0; i < request.Steps; i++)
             {
                 Report("denoise", i, request.Steps);
-                tr.Forward(latents, condRows, textRows, (float)schedule[i], (float)schedule[i + 1], imageIds, condIdArray, textIds);
-                await _acc.SynchronizeAsync();
-                var velocity = await tr.Output.SubView(0, (long)nImg * Flux3Config.InChannels).CopyToHostAsync();
-                float dt = (float)(schedule[i + 1] - schedule[i]);
-                for (int k = 0; k < latents.Length; k++) latents[k] += dt * velocity[k];
+                tr.Step((float)schedule[i], (float)schedule[i + 1]);
+                tr.Euler((float)(schedule[i + 1] - schedule[i]));
+                await _acc.SynchronizeAsync();                       // a wait, not a read-back: paces the command queue and lets the page report the step
             }
+            latents = await tr.Latents.CopyToHostAsync();
+            Lap($"{request.Steps} steps");
         }
         finally
         {
             if (!KeepTransformerResident) { if (ReferenceEquals(w, _resident)) _resident = null; w.Dispose(); }
         }
         Report("vae", 0, 1);
-        return await _vae.DecodeAsync(_vae.ToVaeInput(latents, rows, cols), rows, cols);
+        var picture = await _vae.DecodeAsync(_vae.ToVaeInput(latents, rows, cols), rows, cols);
+        Lap("vae decode");
+        LastTimings = timings;
+        return picture;
     }
+
+    /// <summary>Seconds each stage of the last <see cref="RunAsync(Flux3Request, ValueTuple{float[], int}?)"/> took (text and references: 0 when cached; transformer load: 0 when resident; the steps; the VAE decode).</summary>
+    public IReadOnlyList<(string Stage, double Seconds)> LastTimings { get; private set; } = Array.Empty<(string, double)>();
 
     /// <summary>
     /// Keep the transformer's weights on the device after a run, so the next picture skips the load (3.5 GB at 4 bits: about a minute in a browser). Off by default because the weights hold GPU memory until

@@ -9,7 +9,7 @@
 <PageTitle>Text &amp; Image to 3D — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Text & Image to 3D"
-            Description="Type what you want, or drop a picture of an object, and get a textured PBR 3D model (GLB) generated entirely on your GPU: FLUX.2 klein (or SD Turbo) draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the mesh and textures. Nothing leaves your machine."
+            Description="Type what you want, or drop a picture of an object, and get a textured PBR 3D model (GLB) generated entirely on your GPU: FLUX 3 Image Klein, FLUX.2 klein or SD Turbo draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the mesh and textures. Nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -37,10 +37,17 @@
         <div class="t3d-settings">
             <label>Image model
                 <select @bind="_imageModel" class="t3d-select" disabled="@_isRunning">
+                    <option value="flux3">FLUX 3 Image Klein 5.6B (best, slower: about 35 s a picture once loaded; 5.9 GB first download; non-commercial licence)</option>
                     <option value="flux2">FLUX.2 klein 4B (sharper; 4.6 GB first download)</option>
                     <option value="sd">SD Turbo (faster; 2.5 GB first download)</option>
                 </select>
             </label>
+            @if (_imageModel == "flux3")
+            {
+                <label title="FLUX 3 draws from a full scene caption. A small local language model (Qwen3 4B, a 2.4 GB download, freed afterwards) writes one from your prompt with Black Forest Labs' own upsampler instructions; the same caption is used for every picture of the prompt.">
+                    <input type="checkbox" @bind="_expandPrompt" disabled="@_isRunning" /> Write the full caption for me (Qwen3 4B, 2.4 GB)
+                </label>
+            }
             <label>Pictures
                 <select @bind="_pictures" class="t3d-select" disabled="@_isRunning">
                     <option value="1">Auto-pick the best fit</option>
@@ -49,6 +56,10 @@
                 </select>
             </label>
         </div>
+        @if (!string.IsNullOrEmpty(_usedCaption))
+        {
+            <details class="t3d-hint"><summary>Caption used</summary><p style="white-space:pre-wrap;margin:0.4rem 0 0">@_usedCaption</p></details>
+        }
         @if (_candidates.Count > 0 && _picking)
         {
             <div class="t3d-pick">
@@ -167,7 +178,7 @@
     {
         <div class="model-needed">
             This demo is opt-in and large: about <strong>11&nbsp;GB</strong> of TRELLIS.2 weights (three 2.5&nbsp;GB flow transformers, two decoders,
-            DINOv3) plus <strong>4.6&nbsp;GB</strong> of FLUX.2 klein (4-bit) or <strong>2.5&nbsp;GB</strong> of SD Turbo for text mode and 44&nbsp;MB of RMBG-1.4. Everything downloads on the first
+            DINOv3) plus <strong>5.9&nbsp;GB</strong> of FLUX 3 Image Klein (4-bit, plus 2.4&nbsp;GB for the optional caption writer), <strong>4.6&nbsp;GB</strong> of FLUX.2 klein (4-bit) or <strong>2.5&nbsp;GB</strong> of SD Turbo for text mode and 44&nbsp;MB of RMBG-1.4. Everything downloads on the first
             generation, streams into your browser's storage (OPFS) and is reused after that; the <a href="cache">Model Cache</a> page removes it.
             Needs WebGPU and a GPU with about 6&nbsp;GB of free memory. A generation takes a few minutes on a desktop GPU.
         </div>
@@ -184,7 +195,7 @@
     }
 
     <PrivacyBadge />
-    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + FLUX.2 klein 4B (Black Forest Labs, Apache-2.0, 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) or SD Turbo + RMBG-1.4; built with DINOv3; rigging: SkinTokens (VAST AI, MIT)" />
+    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + FLUX 3 Image Klein 5.6B (Black Forest Labs, FLUX Kommunity License, non-commercial; modified 4-bit export LostBeard/flux-3-image-klein-q4-ILGPU) or FLUX.2 klein 4B (Black Forest Labs, Apache-2.0, 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) or SD Turbo + RMBG-1.4; built with DINOv3; rigging: SkinTokens (VAST AI, MIT)" />
 </DemoLayout>
 
 <style>
@@ -246,7 +257,7 @@
     private byte[]? _glb;
     private readonly List<(string Name, double Seconds)> _stages = new();
 
-    private string ButtonLabel => _isRunning ? "Generating…" : _ready && (_mode == "image" || (_imageModel == "sd" ? _sd != null : _flux != null)) ? "Generate 3D" : "Download & Generate";
+    private string ButtonLabel => _isRunning ? "Generating…" : _ready && (_mode == "image" || (_imageModel == "sd" ? _sd != null : _imageModel == "flux3" ? _flux3 != null : _flux != null)) ? "Generate 3D" : "Download & Generate";
 
     private List<BackendSelector.BackendInfo> _backends = new() { new() { Id = "WebGPU", DisplayName = "WebGPU" } };
     private List<ImageDropZone.SampleImage> _samples = new()
@@ -266,7 +277,11 @@
     private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _sd;
     private SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline? _flux;
     private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
-    private string _imageModel = "flux2";               // "flux2" | "sd"
+    private SpawnDev.ILGPU.ML.Flux3.Flux3Pipeline? _flux3;
+    private const string Flux3Repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
+    private bool _expandPrompt = true;                  // FLUX 3: a local LLM writes the full scene caption first (once per prompt)
+    private string? _usedCaption, _captionFor;
+    private string _imageModel = "flux2";               // "flux3" | "flux2" | "sd"
     private int _pictures = 1;                          // 1 = auto-pick the best fit; 4 / 8 = draw that many and let the user pick
     private bool _picking;
     private readonly List<Candidate> _candidates = new();
@@ -544,7 +559,9 @@
             // Auto: draw, cut out, and keep the drawing whose cut-out touches the frame least (a cropped drawing becomes a truncated model).
             // SD Turbo is cheap per picture, so it tries one at a time (up to 4); FLUX.2 loads 4 GB of weights per call, so it draws two in one go.
             int[]? best = null; int bw = 0, bh = 0, usedSeed = _seed; double bestTouch = double.MaxValue; Candidate? bestCandidate = null;
-            int[][] rounds = _imageModel == "sd" ? new[] { new[] { _seed }, new[] { _seed + 1 }, new[] { _seed + 2 }, new[] { _seed + 3 } } : new[] { new[] { _seed, _seed + 1 } };
+            // FLUX 3 takes about two minutes a picture, so it tries two one at a time.
+            int[][] rounds = _imageModel == "sd" ? new[] { new[] { _seed }, new[] { _seed + 1 }, new[] { _seed + 2 }, new[] { _seed + 3 } }
+                : _imageModel == "flux3" ? new[] { new[] { _seed }, new[] { _seed + 1 } } : new[] { new[] { _seed, _seed + 1 } };
             foreach (var seeds in rounds)
             {
                 var drawn = await DrawAsync(seeds);
@@ -623,6 +640,17 @@
             });
             OnStageDone("image model load", sw.Elapsed.TotalSeconds);
         }
+        else if (_imageModel == "flux3" && _flux3 == null)
+        {
+            _isLoading = true; _modelSizeMb = 5900; _currentStage = "FLUX 3 Image Klein (first run: 5.9 GB download)"; StateHasChanged();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _flux3 = await SpawnDev.ILGPU.ML.Flux3.Flux3Pipeline.CreateAsync(_accelerator!, ModelSource, Flux3Repo, (stage, pct) =>
+            {
+                _modelStatusText = $"FLUX 3 Klein — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
+            });
+            _flux3.KeepTransformerResident = true;      // the next picture reuses it; RunTrellisAsync releases it before TRELLIS.2 needs the memory
+            OnStageDone("image model load", sw.Elapsed.TotalSeconds);
+        }
         else if (_imageModel == "flux2" && _flux == null)
         {
             _isLoading = true; _modelSizeMb = 4600; _currentStage = "FLUX.2 klein (first run: 4.6 GB download)"; StateHasChanged();
@@ -656,6 +684,36 @@
                 _currentStage = $"drawing (seed {seed})"; StateHasChanged();
                 var img = await _sd!.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput { Prompt = _prompt + PromptSuffix, Seed = seed });
                 await Add(seed, img.Width, img.Height, img.ImageRGBA);
+            }
+        }
+        else if (_imageModel == "flux3")
+        {
+            string caption = _prompt + PromptSuffix;
+            if (_expandPrompt)
+            {
+                if (_captionFor != _prompt)
+                {
+                    // the transformer must not sit on the GPU beside the language model
+                    _flux3!.ReleaseResident();
+                    var cw = System.Diagnostics.Stopwatch.StartNew();
+                    _currentStage = "writing the caption (Qwen3 4B)"; StateHasChanged();
+                    _usedCaption = await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, caption, 512, 512, text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); });
+                    _captionFor = _prompt;
+                    OnStageDone("caption (Qwen3 4B)", cw.Elapsed.TotalSeconds);
+                }
+                caption = _usedCaption!;
+            }
+            else _usedCaption = null;
+            foreach (var seed in seeds)
+            {
+                _currentStage = $"drawing (seed {seed})"; StateHasChanged();
+                var img = await _flux3!.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
+                {
+                    Caption = caption, Seed = seed, Width = 512, Height = 512,
+                    Progress = (stage, i, n) => { _currentStage = stage.StartsWith("denoise") ? $"drawing: step {i + 1} / {n} (seed {seed})" : $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
+                });
+                foreach (var (stage, seconds) in _flux3.LastTimings) OnStageDone("    " + stage, seconds);
+                await Add(seed, img.Width, img.Height, img.Rgba);
             }
         }
         else
@@ -725,6 +783,7 @@
     private async Task RunTrellisAsync(int[] px, int w, int h, System.Diagnostics.Stopwatch total, string label)
     {
         _flux?.ReleaseResident();                                  // FLUX.2's transformer (2.6 GB) must not sit on the GPU while TRELLIS.2 runs
+        _flux3?.ReleaseResident();                                 // nor FLUX 3's (3.5 GB)
         _isLoading = _downloadBytes > 0;                          // the first run downloads; streamed weights load again on every run
         _modelSizeMb = _downloadBytes / 1048576.0; _modelProgress = 0;
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
@@ -795,6 +854,8 @@
         ModelSource.OnProgress -= OnDownloadProgress;
         try { using var viewer = JS.Get<SpawnJSObject>("glbViewer"); viewer.JSRef!.CallVoid("dispose", "t3d-canvas"); } catch { }
         _sd?.Dispose();
+        _flux?.Dispose();
+        _flux3?.Dispose();
         _rmbg?.Dispose();
         _trellis?.Dispose();
         _accelerator?.Dispose();

@@ -70,6 +70,9 @@ public abstract partial class MLTestBase
     /// <summary>Weight bits the real-checkpoint gates load (F3_BITS = 4 or 8; default 8).</summary>
     private static string F3_Bits => Environment.GetEnvironmentVariable("F3_BITS") == "4" ? "4" : "8";
 
+    /// <summary>Euler steps the picture gates use instead of the reference's 16 (F3_STEPS): the flow-map model takes fewer, at some cost.</summary>
+    private static int? F3_Steps => int.TryParse(Environment.GetEnvironmentVariable("F3_STEPS"), out var n) && n > 0 ? n : null;
+
     private static string F3_RequireReal(Accelerator accelerator)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("FLUX 3 runs on the desktop GPU lanes (CUDA, OpenCL)");
@@ -115,8 +118,8 @@ public abstract partial class MLTestBase
             () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"text_encoder_q{F3_Bits}.safetensors")))),
             () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"transformer_q{F3_Bits}.safetensors")))), vae, F3_Norm(dir));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var result = await pipe.RunAsync(new Flux3Request { Caption = meta.GetProperty("caption").GetString()!, Width = size, Height = size, Steps = meta.GetProperty("steps").GetInt32(), Alpha = (float)meta.GetProperty("alpha").GetDouble(), Noise = noise,
-            Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n}") });
+        var result = await pipe.RunAsync(new Flux3Request { Caption = meta.GetProperty("caption").GetString()!, Width = size, Height = size, Steps = F3_Steps ?? meta.GetProperty("steps").GetInt32(), Alpha = (float)meta.GetProperty("alpha").GetDouble(), Noise = noise,
+            Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F2} s") });
         double sq = 0, abs = 0; int n = size * size;
         for (int p = 0; p < n; p++)
             for (int c = 0; c < 3; c++)
@@ -126,13 +129,13 @@ public abstract partial class MLTestBase
             }
         double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
         Console.WriteLine($"[Flux3] pipeline on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the reference picture");
-        using (var f = File.Create(Path.Combine(g, $"csharp_q{F3_Bits}.ppm")))
+        using (var f = File.Create(Path.Combine(g, $"csharp_q{F3_Bits}{(F3_Steps is { } st ? "_s" + st : "")}.ppm")))
         {
             f.Write(System.Text.Encoding.ASCII.GetBytes("P6\n" + size + " " + size + "\n255\n"));
             var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
             f.Write(rgb);
         }
-        Ur_Expect(psnr > 20, $"picture PSNR {psnr:F1} dB vs the reference");
+        if (F3_Steps == null) Ur_Expect(psnr > 20, $"picture PSNR {psnr:F1} dB vs the reference");
     });
 
     private static Flux2ReferenceImage F3_Reference(string path)
@@ -267,5 +270,39 @@ public abstract partial class MLTestBase
         await up.ExpandAsync("x");
         Ur_Expect(gotUser == "x", "no canvas line without a size");
         Ur_Expect(Flux3PromptUpsampler.Clean("```\nA caption.\n```") == "A caption.", "code fence removed");
+    });
+
+    /// <summary>
+    /// Where one denoising step goes: the real transformer (F3_BITS weights) at a 512 px picture's size (1024 image tokens + 80 text), every stage timed with a device sync on either side. Prints the table; asserts nothing
+    /// but that the step ran. CUDA uses the tensor-core GEMM; OpenCL runs the portable tiled GEMM and flash attention the browser's WebGPU lane runs.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux3_Transformer_Profile() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator);
+        int side = int.TryParse(Environment.GetEnvironmentVariable("F3_PROFILE_SIDE"), out var sd) ? sd : 512, rows = side / 16, nImg = rows * rows, nTxt = 80;
+        var rng = new Random(5);
+        float[] Rand(int n, float scale) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1) * scale; return a; }
+        var img = Rand(nImg * Flux3Config.InChannels, 1f); var text = Rand(nTxt * 20480, 1f);
+        var imageIds = Flux3Pipeline.ImageIds(rows, rows); var textIds = new float[nTxt * 4]; for (int i = 0; i < nTxt; i++) textIds[i * 4 + 3] = i;
+        var loadWatch = System.Diagnostics.Stopwatch.StartNew();
+        using var w = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"transformer_q{F3_Bits}.safetensors")));
+        using var tr = new Flux3Transformer(accelerator, w, new Flux3Config(), nImg, 0, nTxt);
+        await accelerator.SynchronizeAsync();
+        Console.WriteLine($"[Flux3Profile] {accelerator.AcceleratorType}, {side} px ({nImg} image tokens + {nTxt} text), weights q{F3_Bits}: load {loadWatch.Elapsed.TotalSeconds:F1} s");
+        tr.Forward(img, Array.Empty<float>(), text, 1f, 0.9f, imageIds, Array.Empty<float>(), textIds);       // warm: kernels compile, scratch allocates
+        await accelerator.SynchronizeAsync();
+        var plain = System.Diagnostics.Stopwatch.StartNew();
+        tr.Forward(img, Array.Empty<float>(), text, 0.9f, 0.8f, imageIds, Array.Empty<float>(), textIds);
+        await accelerator.SynchronizeAsync();
+        double plainMs = plain.Elapsed.TotalMilliseconds;
+        tr.Profile = new Dictionary<string, (int Calls, double Ms)>();
+        tr.Forward(img, Array.Empty<float>(), text, 0.8f, 0.7f, imageIds, Array.Empty<float>(), textIds);
+        await accelerator.SynchronizeAsync();
+        double sum = tr.Profile.Values.Sum(v => v.Ms);
+        Console.WriteLine($"[Flux3Profile] one step, unprofiled: {plainMs:F0} ms; profiled stages add up to {sum:F0} ms");
+        foreach (var (name, (calls, ms)) in tr.Profile.OrderByDescending(kv => kv.Value.Ms))
+            Console.WriteLine($"[Flux3Profile]   {name,-20} {calls,4} calls {ms,8:F1} ms {100 * ms / sum,5:F1} %");
+        Ur_Expect(plainMs > 0, "a step ran");
     });
 }
