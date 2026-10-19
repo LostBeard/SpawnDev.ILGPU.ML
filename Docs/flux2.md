@@ -35,7 +35,7 @@ gives a different (equally clean) picture than the bf16 weights; the bf16 path s
 - **8-bit** (`quantize_flux2.py ... 8`, `Flux2Pipeline.CreateAsync(..., bits: 8)`): the same blocks with a byte per weight, 9 bits in all: 3.5 GB encoder + 4.4 GB transformer, 4.4 GB on the GPU at a time. Per-matrix error 0.5% instead of 8%, and the whole pipeline lands
   where bf16 does (29.2 dB from the diffusers picture against 29.3). For desktop GPUs; the browser demo stays on 4-bit.
 - **Sizes above 512**: `Flux2Request.Size` is any multiple of 16 (768 and 1024 are tested). The transformer simply sees more tokens (1024 px = 4096 image tokens + 512 text); the VAE decodes in overlapping 512 px tiles with a 128 px feathered overlap, so its memory never
-  grows with the picture (`Flux2Pipeline.VaeTileLatent`, `VaeTileOverlap`). On the RTX 4070 (CUDA, 4-bit): 768 px 19.5 s and 1024 px 12.9 s warm. The tiled decode is 51 dB from decoding the whole 1024 px picture at once (test) and shows no seam at 100%.
+  grows with the picture (`Flux2Pipeline.VaeTileLatent`, `VaeTileOverlap`). On the RTX 4070 (CUDA, 4-bit): 768 px 19.5 s and 1024 px 12.9 s warm. In Chrome 151 WebGPU on the same card the Image Generation page draws 1024 px in 90 s the first time (weights loading included) and 30 s for the next picture of the prompt, with no memory trouble. The tiled decode is 51 dB from decoding the whole 1024 px picture at once (test) and shows no seam at 100%.
 
 ## Numbers
 
