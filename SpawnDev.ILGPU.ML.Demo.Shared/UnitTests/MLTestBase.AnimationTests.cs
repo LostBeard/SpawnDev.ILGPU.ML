@@ -174,6 +174,32 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task SkinTokens_RigCleanup_CutsOnlyTheBridgesBetweenFarParts() => await RunPureTest(async () =>
+    {
+        // a chain of 8 bones 0-1-2-3-4-5-6-7 (hops are index differences)
+        var parents = new[] { -1, 0, 1, 2, 3, 4, 5, 6 }; int J = parents.Length;
+        var hops = SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.HopMatrix(parents);
+        Ur_Expect(hops[0 * J + 7] == 7 && hops[2 * J + 5] == 3 && hops[4 * J + 4] == 0, "hop matrix of a chain");
+        // vertices: 0 = bone 1 only, 1 = bone 1 (0.6) + bone 2 (0.4) (an ordinary joint blend), 2 = bone 1 (0.5) + bone 7 (0.5) (a hand on a hip), 3 = bone 7 only
+        var w = new float[4 * J];
+        w[0 * J + 1] = 1f;
+        w[1 * J + 1] = .6f; w[1 * J + 2] = .4f;
+        w[2 * J + 1] = .55f; w[2 * J + 7] = .45f;
+        w[3 * J + 7] = 1f;
+        int snapped = SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.SnapFarInfluences(w, 4, J, hops, 4);
+        Ur_Expect(snapped == 1, $"only the far blend is snapped ({snapped} vertices)");
+        Ur_Expect(Math.Abs(w[1 * J + 1] - .6f) < 1e-6 && Math.Abs(w[1 * J + 2] - .4f) < 1e-6, "an ordinary joint blend is untouched");
+        Ur_Expect(Math.Abs(w[2 * J + 1] - 1f) < 1e-6 && w[2 * J + 7] == 0f, "the far influence is dropped and the row renormalised");
+        var dom = SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.DominantBones(w, 4, J);
+        // triangles: (0,1,1) within one part; (0,1,2) near; (2,3,3) joins bone 1 and bone 7 (6 hops); (1,1,3) joins bone 1 and bone 7
+        var tri = new[] { 0, 1, 1, 0, 1, 2, 2, 3, 3, 1, 1, 3 };
+        var bridge = SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.BridgeTriangles(tri, dom, J, hops, 4);
+        Ur_Expect(!bridge[0] && !bridge[1] && bridge[2] && bridge[3], $"bridges: {string.Join(",", bridge)}");
+        Ur_Expect(SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.SnapFarInfluences((float[])w.Clone(), 4, J, hops, 0) == 0 && !SpawnDev.ILGPU.ML.SkinTokens.RigCleanup.BridgeTriangles(tri, dom, J, hops, 0).Any(b => b), "0 turns the cleanup off");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Animation_Retarget_FollowsTheCharactersFacing() => await RunPureTest(async () =>
     {
         // the same figure turned to face +X (everything rotated 90 degrees about Y): SOMA's "left arm up" is still the character's left arm up

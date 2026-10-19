@@ -18,6 +18,9 @@ public sealed class GpuWeights : IDisposable
     private readonly Dictionary<string, MemoryBuffer1D<uint, Stride1D.Dense>> _u32 = new();   // I32 tensors: packed quantised blocks (FLUX.2 export), reinterpreted as 32-bit words
     private readonly Dictionary<string, int[]> _shapes = new();
 
+    /// <summary>The safetensors file's <c>__metadata__</c> strings (empty when it has none).</summary>
+    public IReadOnlyDictionary<string, string> Metadata { get; private set; } = new Dictionary<string, string>();
+
     /// <summary>The model's JSON config (<c>args</c> object of the checkpoint's sibling .json).</summary>
     public JsonElement Args { get; }
 
@@ -46,6 +49,7 @@ public sealed class GpuWeights : IDisposable
         try
         {
             using var reader = SafeTensorsFileReader.Open(safetensorsPath);
+            w.Metadata = reader.Metadata;
             var prof = Environment.GetEnvironmentVariable("TRELLIS2_PROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew(); double tAlloc = 0, tUp = 0;
             foreach (var t in reader.Tensors)
             {
@@ -98,7 +102,8 @@ public sealed class GpuWeights : IDisposable
             long pos = 8 + headerSize;
             long length = -1;
             try { if (stream.CanSeek) length = stream.Length - pos; } catch (NotSupportedException) { }
-            var (tensors, _) = SafeTensorsFileReader.ParseHeader(name, headerBytes, pos, length);
+            var (tensors, metadata) = SafeTensorsFileReader.ParseHeader(name, headerBytes, pos, length);
+            w.Metadata = metadata;
             var buf = new byte[16 << 20];
             foreach (var t in tensors)
             {

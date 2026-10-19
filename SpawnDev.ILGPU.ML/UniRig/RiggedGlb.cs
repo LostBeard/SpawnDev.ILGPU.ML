@@ -159,6 +159,26 @@ public static class RiggedGlb
         return Assemble(root, data);
     }
 
+    /// <summary>The GLB without the triangles <paramref name="remove"/> marks (one flag per triangle of the first primitive): the kept indices are packed into the same index accessor and its count shrinks.</summary>
+    public static byte[] WithoutTriangles(byte[] glb, bool[] remove)
+    {
+        var (root, bin) = Parse(glb);
+        var prim = root["meshes"]![0]!["primitives"]![0]!.AsObject();
+        int accIndex = prim["indices"]!.GetValue<int>();
+        var (io, ic, ict) = Accessor(root, accIndex);
+        if (remove.Length != ic / 3) throw new ArgumentException($"{remove.Length} flags for {ic / 3} triangles");
+        int size = ict == 5123 ? 2 : 4, kept = 0;
+        for (int t = 0; t < remove.Length; t++)
+        {
+            if (remove[t]) continue;
+            if (kept != t) Buffer.BlockCopy(bin, io + t * 3 * size, bin, io + kept * 3 * size, 3 * size);
+            kept++;
+        }
+        root["accessors"]![accIndex]!["count"] = kept * 3;
+        var data = new MemoryStream(); data.Write(bin);
+        return Assemble(root, data);
+    }
+
     /// <summary>The binary glTF of a patched JSON document and its (grown) binary chunk.</summary>
     internal static byte[] Assemble(JsonObject root, MemoryStream data)
     {

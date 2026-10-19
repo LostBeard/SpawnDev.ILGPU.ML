@@ -300,6 +300,106 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    /// <summary>The 8-bit block dequantiser against a CPU decode of the same words, on a real encoder matrix.</summary>
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task Flux2_Q8Dequant_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator);
+        var path = Path.Combine(dir, "weights", "text_encoder_q8.safetensors");
+        if (!File.Exists(path)) throw new UnsupportedTestException("text_encoder_q8.safetensors not found (quantize_flux2.py ... 8)");
+        const string name = "layers.0.self_attn.o_proj.weight";
+        using var weights = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, path, n => n == name));
+        Ur_Expect(weights.IsQuantized(name) && weights.QuantBits == 8, "the matrix is stored as 8-bit blocks");
+        var got = weights.Matrix(name).Cast<BFloat16, uint>().GetAsArray1D();
+        using var raw = GpuWeights.LoadFile(accelerator, path, n => n == name);
+        var words = raw.U32(name).GetAsArray1D(); var shape = raw.Shape(name); int N = shape[0], K = shape[1] / 9 * 32;
+        static float Half(uint h) => (float)BitConverter.UInt16BitsToHalf((ushort)h);
+        static uint Bf16(float f) { uint b = BitConverter.SingleToUInt32Bits(f); return (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16; }
+        int bad = 0;
+        for (int row = 0; row < N && bad == 0; row += 29)
+            for (int col = 0; col < K; col += 2)
+            {
+                uint P(int c) { long b9 = ((long)row * (K / 32) + c / 32) * 9; float d = Half(words[b9] & 0xFFFF), m = Half(words[b9] >> 16); int e = c % 32; return Bf16(d * ((words[b9 + 1 + e / 4] >> (8 * (e % 4))) & 255u) + m); }
+                uint want = P(col) | (P(col + 1) << 16);
+                if (got[((long)row * K + col) / 2] != want) { bad++; Console.WriteLine($"[Flux2] Q8 dequant mismatch at row {row} col {col}"); break; }
+            }
+        Console.WriteLine($"[Flux2] Q8 dequant [{N}, {K}] on {accelerator.AcceleratorType}: bit-identical to the CPU decode: {bad == 0}");
+        Ur_Expect(bad == 0, "GPU dequantisation differs from the CPU decode");
+        await Task.CompletedTask;
+    });
+
+    /// <summary>The whole pipeline on the 8-bit stages (reference prompt and noise): near lossless, so the picture stays close to the bf16 reference picture.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux2_Pipeline_Q8_StaysCloseToTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var enc = Path.Combine(dir, "weights", "text_encoder_q8.safetensors"); var trf = Path.Combine(dir, "weights", "transformer_q8.safetensors");
+        if (!File.Exists(enc) || !File.Exists(trf)) throw new UnsupportedTestException("the 8-bit exports are not found (quantize_flux2.py ... 8)");
+        var (noise, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux2Pipeline(accelerator, tok, () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, enc))), () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, trf))), vae, F2_Norm(dir));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await pipe.RunAsync(new Flux2Request { Prompt = "a photo of a cat sitting on a red sofa", Size = 512, Steps = 4, Noise = noise });
+        double sq = 0, abs = 0; int n = 512 * 512;
+        for (int p = 0; p < n; p++) for (int c = 0; c < 3; c++) { double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255), have = result.Rgba[p * 4 + c]; sq += (have - want) * (have - want); abs += Math.Abs(have - want); }
+        double psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(sq / (3.0 * n), 1e-9));
+        Console.WriteLine($"[Flux2] Q8 pipeline on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the bf16 reference picture");
+        Ur_Expect(psnr > 24, $"8-bit picture PSNR {psnr:F1} dB vs the reference (4-bit is ~19)");
+    });
+
+    /// <summary>Tiled VAE decoding (what pictures larger than the decoder's graph use) on a 1024 px latent (the reference's 512 px latents laid out 2 x 2): four 512 px tiles with 128 px of overlap against decoding the whole 1024 px picture at once.</summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Flux2_TiledVae_MatchesTheWholeDecode() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var (vaeIn, _) = Ur_Npy<float>(Path.Combine(g, "vae_in.npy"));
+        var bytes = File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx"));
+        var big = new float[32 * 128 * 128];
+        for (int c = 0; c < 32; c++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) big[(c * 128 + y) * 128 + x] = vaeIn[(c * 64 + y % 64) * 64 + x % 64];
+        using var whole = InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 128, 128 } });
+        using var tile = InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var wholePipe = new Flux2Pipeline(accelerator, null!, null!, null!, whole, F2_Norm(dir)) { VaeTileLatent = 128 };
+        var tiledPipe = new Flux2Pipeline(accelerator, null!, null!, null!, tile, F2_Norm(dir));          // tiles of 64 latent cells = 512 px, 16 cells (128 px) of overlap
+        var a = await wholePipe.DecodeAsync(big, 64); var b = await tiledPipe.DecodeAsync(big, 64);
+        double sq = 0; int n = a.Width * a.Height;
+        for (int p = 0; p < n; p++) for (int c = 0; c < 3; c++) { double d = a.Rgba[p * 4 + c] - b.Rgba[p * 4 + c]; sq += d * d; }
+        double psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(sq / (3.0 * n), 1e-9));
+        Console.WriteLine($"[Flux2] tiled VAE (four 512 px tiles, 128 px overlap) on {accelerator.AcceleratorType}: {psnr:F1} dB against decoding the whole 1024 px picture");
+        Ur_Expect(a.Width == 1024 && b.Width == 1024, "1024 px pictures");
+        Ur_Expect(psnr > 30, $"tiled decode PSNR {psnr:F1} dB against the whole decode");
+        await Task.CompletedTask;
+    });
+
+    /// <summary>A picture larger than 512 px (768 and 1024) from the 4-bit stages: the right size, not flat, and the time it took. Pictures are written beside the goldens for a look.</summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux2_LargerPictures_Draw() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var enc = Path.Combine(dir, "weights", "text_encoder_q4.safetensors"); var trf = Path.Combine(dir, "weights", "transformer_q4.safetensors");
+        if (!File.Exists(enc) || !File.Exists(trf)) throw new UnsupportedTestException("the 4-bit exports are not found (quantize_flux2.py)");
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var pipe = new Flux2Pipeline(accelerator, tok, () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, enc))), () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, trf))), vae, F2_Norm(dir));
+        foreach (int size in new[] { 768, 1024 })
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var img = (await pipe.RunManyAsync(new Flux2Request { Prompt = "a photo of a cat sitting on a red sofa", Size = size }, new[] { 3 }))[0];
+            double sum = 0, sumSq = 0; int px = img.Width * img.Height;
+            for (int i = 0; i < px; i++) { double l = img.Rgba[i * 4] + img.Rgba[i * 4 + 1] + img.Rgba[i * 4 + 2]; sum += l; sumSq += l * l; }
+            double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean)) / 3;
+            Console.WriteLine($"[Flux2] {size} px picture on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, luminance std {std:F0}");
+            using (var f = File.Create(Path.Combine(g, $"csharp_{size}.ppm")))
+            {
+                f.Write(System.Text.Encoding.ASCII.GetBytes($"P6\n{size} {size}\n255\n"));
+                var rgb = new byte[3 * px]; for (int p = 0; p < px; p++) { rgb[p * 3] = img.Rgba[p * 4]; rgb[p * 3 + 1] = img.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = img.Rgba[p * 4 + 2]; }
+                f.Write(rgb);
+            }
+            Ur_Expect(img.Width == size && img.Height == size, $"{size} px picture");
+            Ur_Expect(std > 15, $"{size} px picture is flat (luminance std {std:F1})");
+        }
+    });
+
     private const string F2Server = "http://127.0.0.1:8766/";
 
     /// <summary>A plain HTTP file server as a model source: every repo maps to the server root (tests only; the demo uses the hub source with its OPFS cache).</summary>

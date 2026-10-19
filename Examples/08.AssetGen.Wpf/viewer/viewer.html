@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; height: 100%; background: #0f141f; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  #hint { position: absolute; left: 12px; bottom: 10px; color: #64748b; font: 12px Segoe UI, sans-serif; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">drag to orbit, wheel to zoom</div>
+<script src="glb-viewer.js"></script>
+<script>
+  // Called by the WPF host: load a .glb from the mapped folder, play a move, list the moves.
+  async function loadGlb(url) {
+    const bytes = new Uint8Array(await (await fetch(url, { cache: 'no-store' })).arrayBuffer());
+    await glbViewer.show('c', bytes);
+    return true;
+  }
+  function playMove(name, inPlace) { return glbViewer.play('c', name, inPlace); }
+  function moves() { return JSON.stringify(glbViewer.animations('c') || []); }
+</script>
+</body>
+</html>

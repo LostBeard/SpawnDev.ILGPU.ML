@@ -40,6 +40,17 @@
                     <option value="sd">SD Turbo (faster, 2.5 GB)</option>
                 </select>
             </div>
+            @if (_model == "flux2")
+            {
+            <div class="gen-setting">
+                <label>Size:</label>
+                <select @bind="_fluxSize" class="gen-setting-select" disabled="@(_isRunning)" title="Larger pictures are decoded in 512 px tiles, so memory stays flat; the transformer's work grows with the area.">
+                    <option value="512">512x512</option>
+                    <option value="768">768x768</option>
+                    <option value="1024">1024x1024</option>
+                </select>
+            </div>
+            }
             @if (_model == "sd")
             {
             <div class="gen-setting">
@@ -231,6 +242,7 @@
     private string? _error;
     private string _modelStatusText = "FLUX.2 klein";
     private string _model = "flux2";                    // "flux2" | "sd"
+    private int _fluxSize = 512;
     private SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline? _flux;
     private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
 
@@ -371,10 +383,10 @@
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var image = await _flux.RunAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
                 {
-                    Prompt = _prompt, Seed = seed, Size = 512, Steps = 4,
+                    Prompt = _prompt, Seed = seed, Size = _fluxSize, Steps = 4,
                     Progress = (stage, i, n) => { _modelStatusText = $"FLUX.2 klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 4; _ = InvokeAsync(StateHasChanged); },
                 });
-                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _imageSize = 512; _numSteps = 4;
+                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _imageSize = image.Width; _numSteps = 4;
                 _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
                 _modelStatusText = "FLUX.2 klein";
                 _isRunning = false; StateHasChanged();

@@ -26,6 +26,15 @@ public sealed class SkinTokensRigger : IDisposable
     /// <summary>Called as each stage finishes (name, seconds): progress for a UI.</summary>
     public Action<string, double>? StageDone { get => _generator.StageDone; set => _generator.StageDone = value; }
 
+    /// <summary>
+    /// <see cref="RigCleanup"/>: bones this many hops or more from a vertex's dominant bone lose their influence on it, and triangles joining dominant bones further apart than this are removed (a hand fused to a hip
+    /// would otherwise stretch into a sliver when the arm moves). 4 by default; 0 keeps the learned weights and the mesh as they are.
+    /// </summary>
+    public int BridgeHops { get; set; } = 4;
+
+    /// <summary>What the last <see cref="RigGlbAsync"/> cleaned: vertices whose far influences were dropped, triangles removed.</summary>
+    public (int Vertices, int Triangles) LastCleanup { get; private set; }
+
     /// <param name="weights">The SkinTokens export (export_weights.py skintokens).</param>
     public SkinTokensRigger(Accelerator accelerator, GpuWeights weights)
     {
@@ -69,6 +78,16 @@ public sealed class SkinTokensRigger : IDisposable
         var joints = new float[r.Skeleton.Joints.Length];
         s.ToMeshSpace(r.Skeleton.Joints, joints);
         var skeleton = new UniRigTokenizer.Skeleton(joints, r.Skeleton.Parents);
+        LastCleanup = (0, 0);
+        if (BridgeHops > 0)
+        {
+            var hops = RigCleanup.HopMatrix(r.Skeleton.Parents);
+            int snapped = RigCleanup.SnapFarInfluences(weights, V, J, hops, BridgeHops);
+            var bridges = RigCleanup.BridgeTriangles(mesh.Indices, RigCleanup.DominantBones(weights, V, J), J, hops, BridgeHops);
+            int cut = bridges.Count(b => b);
+            if (cut > 0) glb = RiggedGlb.WithoutTriangles(glb, bridges);
+            LastCleanup = (snapped, cut);
+        }
         return new Result(RiggedGlb.Add(glb, skeleton, weights), skeleton);
     }
 

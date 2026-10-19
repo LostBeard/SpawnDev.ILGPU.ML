@@ -102,6 +102,12 @@ the semantics (an arm raise lands where SOMA's does, a rig turned to face +X sti
 (`tools/unirig-harness/reference/anim_check.py` contact sheet: strides alternate, the head stays level, the feet hold the floor) and the animated GLB validates with 0 errors. In the demo page (real Chrome, local build) a TRELLIS humanoid
 goes generate -> Rig this model (23 joints, 36 s) -> Animate (22 moves, 12 MB GLB) and plays on the GPU-skinned mesh; the viewer plays "in place" by default so a walk stays in frame.
 
+## Bridge cleanup
+
+A generated character whose hand rests on its hip is one connected surface, so the learned skin weights near the contact blend a hand bone with a hip bone, and the moment the arm swings the surface between them stretches into a long dark sliver. `RigCleanup`
+(applied by `SkinTokensRigger`, `BridgeHops` = 4 by default, 0 = off) measures how far apart two bones are in the skeleton tree (hops): a vertex drops its influence from bones 4 or more hops from the bone it mostly follows (a hand-to-hip blend, never a shoulder or an elbow), and triangles whose
+vertices follow bones that far apart are removed. On a knight whose hands touch its hips this changed 213 of 253,000 vertices and removed the slivers in every pose we looked at (dance, cheer, walk). `AssetGenerator.BridgeHops` and the console example's `--bridge-hops` pass it through.
+
 ## Weights and tooling
 
 - SkinTokens weights: `LostBeard/SkinTokens-bf16` (public, MIT, converted from VAST-AI/SkinTokens `grpo_1400.ckpt`; served by the hub at `/hf/LostBeard/SkinTokens-bf16/skintokens.safetensors`).

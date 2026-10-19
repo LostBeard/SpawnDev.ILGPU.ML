@@ -75,13 +75,15 @@ public sealed class Flux2Pipeline : IDisposable
     public static IReadOnlyList<(string Repo, string Path)> HubFiles(string repo) => new[] { (repo, EncoderFile), (repo, TransformerFile), (repo, VaeFile) };
 
     public const string EncoderFile = "text_encoder_q4.safetensors", TransformerFile = "transformer_q4.safetensors", VaeFile = "vae_decoder.onnx", TokenizerFile = "tokenizer.json", NormFile = "vae_norm.json";
+    /// <summary>The stage files for 4-bit (default, 4.4 GB, 2.6 GB on the GPU at a time) or 8-bit weights (near lossless, 7.9 GB, 4.4 GB at a time: a desktop GPU's choice).</summary>
+    public static (string Encoder, string Transformer) StageFiles(int bits) => bits == 8 ? ("text_encoder_q8.safetensors", "transformer_q8.safetensors") : (EncoderFile, TransformerFile);
 
     /// <summary>
     /// Build the pipeline from a model source (the 4-bit export of black-forest-labs/FLUX.2-klein-4B: <see cref="EncoderFile"/>, <see cref="TransformerFile"/>, <see cref="VaeFile"/>, <see cref="TokenizerFile"/>, <see cref="NormFile"/>).
     /// Only the tokenizer, the batch-norm statistics and the small VAE decoder are loaded now (the VAE stays resident, ~200 MB); the two big stages stream in when a run needs them and leave when it is done with them.
     /// <paramref name="size"/> is the picture side the VAE graph is built for.
     /// </summary>
-    public static async Task<Flux2Pipeline> CreateAsync(Accelerator accelerator, IModelSource source, string repo, int size = 512, Action<string, int>? onProgress = null, CancellationToken cancellationToken = default)
+    public static async Task<Flux2Pipeline> CreateAsync(Accelerator accelerator, IModelSource source, string repo, int size = 512, Action<string, int>? onProgress = null, CancellationToken cancellationToken = default, int bits = 4)
     {
         onProgress?.Invoke("tokenizer", 0);
         var tok = new Qwen2Tokenizer(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, TokenizerFile, cancellationToken)));
@@ -92,9 +94,10 @@ public sealed class Flux2Pipeline : IDisposable
         await using (var s = await source.OpenAsync(repo, VaeFile, cancellationToken))
             vae = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, s, onProgress: (st, pct) => onProgress?.Invoke("vae:" + st, pct),
                 inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, lat, lat } }, ct: cancellationToken);
+        var (encoderFile, transformerFile) = StageFiles(bits);
         return new Flux2Pipeline(accelerator, tok,
-            () => Flux2Weights.LoadAsync(accelerator, source, repo, EncoderFile, cancellationToken),
-            () => Flux2Weights.LoadAsync(accelerator, source, repo, TransformerFile, cancellationToken), vae, norm);
+            () => Flux2Weights.LoadAsync(accelerator, source, repo, encoderFile, cancellationToken),
+            () => Flux2Weights.LoadAsync(accelerator, source, repo, transformerFile, cancellationToken), vae, norm) { VaeTileLatent = lat };
     }
 
     /// <summary>The position ids of the image tokens, [tokens, 4] = (0, row, column, 0), and of the text tokens, (0, 0, 0, index).</summary>
@@ -153,6 +156,7 @@ public sealed class Flux2Pipeline : IDisposable
     public async Task<Flux2Image> DecodeAsync(float[] vaeInput, int side, float[]? image = null)
     {
         int lat = side * 2, size = lat * 8, pixels = size * size;
+        if (lat > VaeTileLatent) return await DecodeTiledAsync(vaeInput, lat, image);
         using var latBuf = _acc.Allocate1D(vaeInput);
         var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(latBuf.View, new[] { 1, 32, lat, lat }, _vae.InputNames[0]) });
         var vaeOut = outputs[_vae.OutputNames[0]];
@@ -164,6 +168,68 @@ public sealed class Flux2Pipeline : IDisposable
         var rgba = new byte[4 * pixels];
         Buffer.BlockCopy(packed, 0, rgba, 0, 4 * pixels);
         return new Flux2Image { Width = size, Height = size, Rgba = rgba };
+    }
+
+    /// <summary>
+    /// Side of the latent square the VAE graph is built for (64 = 512 px pictures). Larger pictures are decoded in overlapping tiles of this size, so the decoder's memory (about 1.2 GB at 512 px, four times that
+    /// at 1024) never grows with the picture: what lets a browser tab draw 1024 px. Set by <see cref="CreateAsync"/> from its size argument.
+    /// </summary>
+    public int VaeTileLatent { get; set; } = 64;
+
+    /// <summary>Latent cells of overlap between neighbouring tiles (16 = 128 px), feathered linearly so no seam shows.</summary>
+    public int VaeTileOverlap { get; set; } = 16;
+
+    private async Task<Flux2Image> DecodeTiledAsync(float[] vaeInput, int lat, float[]? image)
+    {
+        int T = VaeTileLatent, O = Math.Min(VaeTileOverlap, T / 2), stride = T - O, size = lat * 8, tilePx = T * 8, ramp = O * 8;
+        var sum = new float[3 * size * size]; var wsum = new float[size * size];
+        var starts = new List<int>(); for (int x = 0; x + T < lat; x += stride) starts.Add(x); starts.Add(lat - T);
+        var tileIn = new float[32 * T * T];
+        foreach (int y0 in starts)
+            foreach (int x0 in starts)
+            {
+                for (int c = 0; c < 32; c++)
+                    for (int y = 0; y < T; y++)
+                        Array.Copy(vaeInput, ((long)c * lat + y0 + y) * lat + x0, tileIn, (c * T + y) * T, T);
+                using var latBuf = _acc.Allocate1D(tileIn);
+                var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(latBuf.View, new[] { 1, 32, T, T }, _vae.InputNames[0]) });
+                var tile = await outputs[_vae.OutputNames[0]].Data.SubView(0, 3L * tilePx * tilePx).CopyToHostAsync();
+                int px0 = x0 * 8, py0 = y0 * 8;
+                for (int y = 0; y < tilePx; y++)
+                {
+                    float wy = Feather(y, tilePx, ramp, y0 == 0, y0 == lat - T);
+                    for (int x = 0; x < tilePx; x++)
+                    {
+                        float w = wy * Feather(x, tilePx, ramp, x0 == 0, x0 == lat - T);
+                        long o = (long)(py0 + y) * size + px0 + x;
+                        wsum[o] += w;
+                        for (int c = 0; c < 3; c++) sum[c * (long)size * size + o] += w * tile[((long)c * tilePx + y) * tilePx + x];
+                    }
+                }
+            }
+        long pixels = (long)size * size;
+        var rgba = new byte[4 * pixels];
+        for (long i = 0; i < pixels; i++)
+        {
+            float inv = 1f / wsum[i];
+            for (int c = 0; c < 3; c++)
+            {
+                float v = sum[c * pixels + i] * inv;
+                if (image != null) image[c * pixels + i] = v;
+                rgba[i * 4 + c] = (byte)Math.Clamp((int)((v + 1f) * 0.5f * 255f + 0.5f), 0, 255);
+            }
+            rgba[i * 4 + 3] = 255;
+        }
+        return new Flux2Image { Width = size, Height = size, Rgba = rgba };
+    }
+
+    /// <summary>Blend weight of pixel <paramref name="i"/> of a tile: a linear ramp over <paramref name="ramp"/> pixels at each side that has a neighbour, 1 elsewhere.</summary>
+    private static float Feather(int i, int n, int ramp, bool first, bool last)
+    {
+        float w = 1f;
+        if (!first && i < ramp) w = Math.Min(w, (i + 1f) / (ramp + 1f));
+        if (!last && n - 1 - i < ramp) w = Math.Min(w, (n - i) / (ramp + 1f));
+        return w;
     }
 
     public async Task<Flux2Image> RunAsync(Flux2Request request) => (await RunManyAsync(request, new[] { request.Seed }))[0];

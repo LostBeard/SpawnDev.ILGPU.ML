@@ -21,7 +21,9 @@ dotnet run --project Examples/<name>/<name>.csproj -- <args>
 | 04 | **`GGUFTextGen.Console`** | GGUF autoregressive decode + KV cache (qwen2.5-coder, gemma4); decode/prefill perf probes | ✅ shipped |
 | 05 | **`Gemma4Multimodal.Console`** | gemma4:12b vision+text (mmproj image tokens) | ⏳ written, verify pending |
 | 06 | **`OllamaServer.Console`** | **drop-in Ollama replacement** — native-GPU GGUF server (OpenAI + Ollama + Anthropic APIs) for Claude CLI / Pi / Codex / etc., zero-copy from your `~/.ollama` cache | 🚧 WIP (works; perf + huge-context decode are the active work) |
-| 07–09 | `*.BlazorWasm` | browser mirrors (zero-copy canvas for image-gen) | planned |
+| 07 | **`AssetGen.Console`** | **a prompt to a rigged, animated 3D character** on your own GPU (CUDA / OpenCL): FLUX.2 klein draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the textured mesh, SkinTokens rigs it, Kimodo moves animate it; `.png` + `.glb` files out | ✅ shipped |
+| 08 | **`AssetGen.Wpf`** | the same chain as a Windows app: draw 1-8 pictures, pick one, build it in 3D, rig, animate, preview in a WebGL viewer (WebView2), save the .glb | ✅ shipped |
+| 09+ | `*.BlazorWasm` | browser mirrors (zero-copy canvas for image-gen) | planned (the main demo already is one) |
 
 ## 02 · ModelInspector.Console
 
@@ -76,3 +78,14 @@ tokens/sec), not byte-identity.
 - **Arg-or-prompt** — primary input from `args`; if absent and interactive, prompt; if absent and `--ci`,
   use a fixed default + fixed seed.
 - **`--ci`** — non-interactive, deterministic, asserts a known result, exits `0` on success.
+
+## 07 · AssetGen.Console and 08 · AssetGen.Wpf (text to character)
+
+```bash
+dotnet run --project Examples/07.AssetGen.Console -- "a knight in plate armor, full body, standing" --cache D:\models
+dotnet run --project Examples/07.AssetGen.Console -- "a friendly robot" --pictures 4 --pick --no-animate
+dotnet run --project Examples/08.AssetGen.Wpf        # set ASSETGEN_CACHE to keep the models on a big drive
+```
+
+Both are thin shells over `SpawnDev.ILGPU.ML.Assets.AssetGenerator` (draw -> cut out -> 3D -> rig -> animate, each stage loaded on its own so a 12 GB card is enough). The first run downloads about 17 GB of models into the cache folder
+(FLUX.2 klein 4.4 GB, TRELLIS.2 11 GB, SkinTokens 1.2 GB, RMBG 44 MB) and resumes if interrupted. RTX 4070, CUDA, models cached: prompt to animated GLB in about 80 s; the pictures themselves take 2-3 s each after the first. See `Docs/assetgen.md`.

@@ -22,14 +22,21 @@ public sealed class Flux2Weights : IDisposable
     private readonly Flux2Kernels _f;
     private readonly SkinTokensKernels _u;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _scratch;
+    private readonly int _wordsPerBlock;                        // 5 = 4-bit blocks, 9 = 8-bit blocks (the file's metadata "quant" says which)
+
+    /// <summary>4 or 8: the bits per quantised weight of this stage (0 when it holds no quantised matrix).</summary>
+    public int QuantBits { get; }
 
     /// <summary>Wrap a loaded stage. Disposing this disposes <paramref name="weights"/> too.</summary>
     public Flux2Weights(Accelerator accelerator, GpuWeights weights)
     {
         _w = weights; _f = new Flux2Kernels(accelerator); _u = new SkinTokensKernels(accelerator);
+        weights.Metadata.TryGetValue("quant", out var quant);
+        QuantBits = quant != null && quant.StartsWith("q8", StringComparison.Ordinal) ? 8 : 4;
+        _wordsPerBlock = QuantBits == 8 ? 9 : 5;
         long most = 0;
         foreach (var name in weights.Names)
-            if (weights.IsU32(name)) { var s = weights.Shape(name); most = Math.Max(most, (long)s[0] * (s[1] / 5 * 32)); }
+            if (weights.IsU32(name)) { var s = weights.Shape(name); most = Math.Max(most, (long)s[0] * (s[1] / _wordsPerBlock * 32)); }
         if (most > 0) _scratch = accelerator.Allocate1D<uint>(most / 2);
     }
 
@@ -50,8 +57,8 @@ public sealed class Flux2Weights : IDisposable
     {
         if (!_w.IsU32(name)) return _w.BF16(name);
         var s = _w.Shape(name);
-        int n = s[0], k = s[1] / 5 * 32;
-        _f.DequantQ4(_w.U32(name), _scratch!.View, n, k);
+        int n = s[0], k = s[1] / _wordsPerBlock * 32;
+        if (QuantBits == 8) _f.DequantQ8(_w.U32(name), _scratch!.View, n, k); else _f.DequantQ4(_w.U32(name), _scratch!.View, n, k);
         return _scratch.View.SubView(0, (long)n * k / 2).Cast<uint, BFloat16>();
     }
 
@@ -61,7 +68,7 @@ public sealed class Flux2Weights : IDisposable
     /// <summary>o[t, :] = row ids[t] of the embedding table <paramref name="name"/> ([vocab, C]), fp32.</summary>
     public void Embed(IV ids, string name, FV o, int count, int C)
     {
-        if (_w.IsU32(name)) _f.DequantRows(_w.U32(name), ids, o, count, C);
+        if (_w.IsU32(name)) { if (QuantBits == 8) _f.DequantRows8(_w.U32(name), ids, o, count, C); else _f.DequantRows(_w.U32(name), ids, o, count, C); }
         else _u.Embed(ids, _w.BF16(name), o, count, C);
     }
 
