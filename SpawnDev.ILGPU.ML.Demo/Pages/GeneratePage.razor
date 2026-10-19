@@ -276,7 +276,8 @@
     private ReferenceImages? _refs;
     private bool _expandPrompt;                         // FLUX 3: a local LLM writes the full scene caption first
     private string? _usedCaption;
-    private const string CaptionLlmRepo = "Qwen/Qwen3-4B-GGUF", CaptionLlmFile = "Qwen3-4B-Q4_K_M.gguf";
+    // Q4_0, not Q4_K_M: the Q4_K GEMV keeps Group.Barrier inside a data-dependent loop, which WebGPU's WGSL validation rejects (non-uniform control flow); Q4_0 / Q8_0 / Q6_K GEMVs have their barriers outside any loop
+    private const string CaptionLlmRepo = "unsloth/Qwen3-4B-GGUF", CaptionLlmFile = "Qwen3-4B-Q4_0.gguf";
     private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
 
     private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }

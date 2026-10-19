@@ -46,7 +46,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4, _kernelQ5_0;
+        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4, _kernelQ5_0, _kernelQ4_1;
 
     // ── M=1 (GEMV) coalesced path ──
     // At seq=1 decode, M=1, so the general one-thread-per-output-element kernel above launches only N
@@ -85,7 +85,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K, _gemvWarpQ6_K, _gemvQ5_0;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K, _gemvWarpQ6_K, _gemvQ5_0, _gemvQ4_1;
 
     // Warp-cooperative GEMV (opt-in GGUF_GEMV_V2=1): the default GEMV pays two Group.Barrier() per super-block
     // (scale-decode + before-reuse) plus a shared-mem tree reduction — those syncs cap M=1 decode at ~10% of the
@@ -148,7 +148,7 @@ public class FusedDequantMatMul : IDisposable
     /// loader routes only these to the fused path; everything else dequantizes to F32
     /// on the CPU at load time.</summary>
     public static bool Supports(GGMLType type) =>
-        type is GGMLType.Q4_0 or GGMLType.Q5_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
+        type is GGMLType.Q4_0 or GGMLType.Q4_1 or GGMLType.Q5_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
 
     /// <summary>Elements per quantization block for a supported type.</summary>
     private static int BlockElements(GGMLType type) =>
@@ -283,6 +283,12 @@ public class FusedDequantMatMul : IDisposable
                         ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_0Impl);
                     _gemvQ4_0(gemvConfig, input, intView, output, paramsBuf.View);
                     return;
+                case GGMLType.Q4_1:
+                    _gemvQ4_1 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_1Impl);
+                    _gemvQ4_1(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
                 case GGMLType.Q5_0:
                     _gemvQ5_0 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -360,6 +366,10 @@ public class FusedDequantMatMul : IDisposable
                 _kernelQ4_0 ??= LoadKernel(FusedDequantQ4_0Impl);
                 _kernelQ4_0(M * N, input, intView, output, paramsBuf.View);
                 break;
+            case GGMLType.Q4_1:
+                _kernelQ4_1 ??= LoadKernel(FusedDequantQ4_1Impl);
+                _kernelQ4_1(M * N, input, intView, output, paramsBuf.View);
+                break;
             case GGMLType.Q5_0:
                 _kernelQ5_0 ??= LoadKernel(FusedDequantQ5_0Impl);
                 _kernelQ5_0(M * N, input, intView, output, paramsBuf.View);
@@ -422,6 +432,44 @@ public class FusedDequantMatMul : IDisposable
                 int packed = ReadByte(w, bOff + 2 + j);
                 sum += input[inBase + kBase + j] * (((packed & 0xF) - 8) * d);
                 sum += input[inBase + kBase + j + 16] * (((packed >> 4) - 8) * d);
+            }
+        }
+        output[idx] = sum;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Q4_1: 20 bytes per 32 values: [d:fp16][m:fp16][16 x packed nibbles]. Same nibble order as Q4_0
+    //  (element j = low nibble of byte j, j+16 = HIGH nibble of byte j); value = nibble * d + m.
+    //  llama.cpp's Q4_0 files keep a few tensors (ffn_down of some layers, attn_v) in Q4_1.
+    // ─────────────────────────────────────────────────────────────────────────
+    private static void FusedDequantQ4_1Impl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int m = idx / N;
+        int n = idx % N;
+        if (m >= M) return;
+
+        int blocksPerRow = K / 32;
+        int bytesPerRow = blocksPerRow * 20;
+        int inBase = m * K;
+
+        float sum = 0f;
+        for (int block = 0; block < blocksPerRow; block++)
+        {
+            int bOff = n * bytesPerRow + block * 20;
+            float d = HalfToFloat(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+            float mn = HalfToFloat(ReadByte(w, bOff + 2) | (ReadByte(w, bOff + 3) << 8));
+            int kBase = block * 32;
+
+            for (int j = 0; j < 16; j++)
+            {
+                int packed = ReadByte(w, bOff + 4 + j);
+                sum += input[inBase + kBase + j] * ((packed & 0xF) * d + mn);
+                sum += input[inBase + kBase + j + 16] * ((packed >> 4) * d + mn);
             }
         }
         output[idx] = sum;
@@ -1857,6 +1905,47 @@ public class FusedDequantMatMul : IDisposable
         int packed = ReadByte(w, bOff + 2 + (within & 15));
         int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
         return (nib - 8) * d;
+    }
+
+    // ── Q4_1 GEMV (M==1): 20B/32 = [d:fp16][m:fp16][16 packed nibbles]; el j=low nibble of byte j, el j+16=high; value=nib·d+m ──
+    private static void GemvDequantQ4_1Impl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K / 32 * 20);
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ4_1Element(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of a Q4_1 row (20B/32: [d:fp16][m:fp16][16 nibble bytes];
+    /// el j = low nibble of byte j, el j+16 = high nibble of byte j; value = nibble·d + m).</summary>
+    internal static float DecodeQ4_1Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int within = col & 31;                       // 0..31 within the 32-value block
+        int bOff = rowByteBase + (col >> 5) * 20;
+        float d = HalfToFloatFinite(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+        float m = HalfToFloatFinite(ReadByte(w, bOff + 2) | (ReadByte(w, bOff + 3) << 8));
+        int packed = ReadByte(w, bOff + 4 + (within & 15));
+        int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);
+        return nib * d + m;
     }
 
     // ── Q5_0 GEMV (M==1): 22B/32 = [d:fp16][qh:u32][16 nibbles]; el j=low nibble + qh bit j, el j+16=high nibble + qh bit j+16; value=((nib|xh)-16)·d ──

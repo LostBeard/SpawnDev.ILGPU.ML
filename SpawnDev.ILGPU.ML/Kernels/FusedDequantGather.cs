@@ -28,7 +28,7 @@ public class FusedDequantGather : IDisposable
 
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4, _kernelQ5_0;
+        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4, _kernelQ5_0, _kernelQ4_1;
 
     // Per-shape params cache; never disposed mid-session (WebGPU pending-dispatch rule).
     private readonly Dictionary<(int numIdx, int rowLength, int rows), MemoryBuffer1D<int, Stride1D.Dense>> _paramsBufs = new();
@@ -71,6 +71,10 @@ public class FusedDequantGather : IDisposable
             case GGMLType.Q4_0:
                 _kernelQ4_0 ??= Load(GatherQ4_0Impl);
                 _kernelQ4_0(total, intView, indices, output, paramsBuf.View);
+                break;
+            case GGMLType.Q4_1:
+                _kernelQ4_1 ??= Load(GatherQ4_1Impl);
+                _kernelQ4_1(total, intView, indices, output, paramsBuf.View);
                 break;
             case GGMLType.Q5_0:
                 _kernelQ5_0 ??= Load(GatherQ5_0Impl);
@@ -133,6 +137,33 @@ public class FusedDequantGather : IDisposable
         int packed = FusedDequantMatMul.ReadByte(w, bOff + 2 + (i < 16 ? i : i - 16));
         int nibble = i < 16 ? (packed & 0xF) : (packed >> 4);
         output[idx] = (nibble - 8) * d;
+    }
+
+    // Q4_1 (20 B/block: [d:fp16][m:fp16][16 nibble bytes]). Same ggml split order as Q4_0; value = nibble * d + m.
+    private static void GatherQ4_1Impl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int numIdx = p[0], rowLength = p[1], rows = p[2];
+        int gatherIdx = idx / rowLength;
+        int col = idx % rowLength;
+        if (gatherIdx >= numIdx) return;
+        int row = (int)indices[gatherIdx];
+        if (row < 0) row += rows;
+        if (row < 0 || row >= rows) { output[idx] = 0f; return; }
+
+        int bytesPerRow = rowLength / 32 * 20;
+        int bOff = row * bytesPerRow + (col / 32) * 20;
+        int i = col % 32;
+        float d = FusedDequantMatMul.HalfToFloat(
+            FusedDequantMatMul.ReadByte(w, bOff) | (FusedDequantMatMul.ReadByte(w, bOff + 1) << 8));
+        float m = FusedDequantMatMul.HalfToFloat(
+            FusedDequantMatMul.ReadByte(w, bOff + 2) | (FusedDequantMatMul.ReadByte(w, bOff + 3) << 8));
+        int packed = FusedDequantMatMul.ReadByte(w, bOff + 4 + (i < 16 ? i : i - 16));
+        int nibble = i < 16 ? (packed & 0xF) : (packed >> 4);
+        output[idx] = nibble * d + m;
     }
 
     // Q5_0 (22 B/block: [d:fp16][qh:u32 LE][16 nibble bytes]). Same ggml split order as Q4_0, plus a 5th
