@@ -16,7 +16,12 @@
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="FontWeight" Value="SemiBold" />
         </Style>
-        <Style TargetType="ComboBox"><Setter Property="Foreground" Value="#0F141F" /></Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Foreground" Value="#0F141F" />
+            <Setter Property="Background" Value="#E2E8F0" />
+            <Style.Triggers><Trigger Property="IsEnabled" Value="False"><Setter Property="Foreground" Value="#64748B" /></Trigger></Style.Triggers>
+        </Style>
+        <Style TargetType="ComboBoxItem"><Setter Property="Foreground" Value="#0F141F" /></Style>
         <Style TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource Muted}" /></Style>
         <Style TargetType="CheckBox"><Setter Property="Foreground" Value="{StaticResource Muted}" /></Style>
     </Application.Resources>

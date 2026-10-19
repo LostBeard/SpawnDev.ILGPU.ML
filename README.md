@@ -4,7 +4,7 @@
 
 [**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
-> **Next (unreleased): text to character on your desktop GPU.** `AssetGenerator` and two examples, a command-line tool and a WPF app ([Examples/07.AssetGen.Console](Examples/07.AssetGen.Console), [Examples/08.AssetGen.Wpf](Examples/08.AssetGen.Wpf)): a prompt becomes a textured, rigged, animated 3D character on CUDA or OpenCL (about 80 s on an RTX 4070 with the models cached). FLUX.2 klein also gains an 8-bit near-lossless option and 768/1024 px pictures, and rigging gains a bridge cleanup that removes the hand-to-hip slivers. [Docs/assetgen.md](Docs/assetgen.md)
+> **New in 5.3.20: text to character on your desktop GPU.** `AssetGenerator` and two examples, a command-line tool and a WPF app ([Examples/07.AssetGen.Console](Examples/07.AssetGen.Console), [Examples/08.AssetGen.Wpf](Examples/08.AssetGen.Wpf)): a prompt becomes a textured, rigged, animated 3D character on CUDA or OpenCL (about 80 s on an RTX 4070 with the models cached). FLUX.2 klein also gains an 8-bit near-lossless option and 768/1024 px pictures, and rigging gains a bridge cleanup that removes the hand-to-hip slivers. [Docs/assetgen.md](Docs/assetgen.md)
 >
 > **5.3.19:** repeat FLUX.2 draws of a prompt take ~8 s instead of ~75 s in the browser (the transformer stays loaded, the prompt embeddings are cached); animated characters get an **arm clearance** setting so arms and armour stop passing through the torso.
 >

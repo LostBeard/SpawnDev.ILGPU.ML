@@ -3,7 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased
+## 5.3.20 - 2026-10-19 - Text to character on the desktop, FLUX.2 8-bit and 1024 px, rig bridge cleanup, 300k triangles
+
+Requires SpawnDev.ILGPU 5.3.8.
 
 - **Text to 3D: 300k triangles by default (was 150k).** Dark flecks and cracks in generated characters came from the edge-collapse simplifier eating the thin shells of armour and cloth (the unsimplified knight has 497k faces; measured side by side at 150k / 300k / unsimplified, a doubled 4096 texture changed nothing, 60k was worse). The page, `AssetGenerator.DefaultMaxFaces`, the console tool and the WPF app now keep 300k (GLB about 25-40 MB); 150k stays in the page's triangles selector.
 - **`SpawnDev.ILGPU.ML.Assets.AssetGenerator` and Examples 07 (`AssetGen.Console`) and 08 (`AssetGen.Wpf`): text to rigged, animated 3D character on the desktop.** One class runs the browser demo's whole chain on CUDA / OpenCL / WebGPU: `DrawAsync` (FLUX.2 klein or SD-Turbo), `CutOutAsync` (RMBG-1.4),
