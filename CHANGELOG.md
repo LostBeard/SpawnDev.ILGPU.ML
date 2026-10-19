@@ -3,6 +3,18 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.18 - 2026-10-19 - FLUX.2 klein 4B text to image, and pick-your-picture in text to 3D
+
+Requires SpawnDev.ILGPU 5.3.8. Docs: [Docs/flux2.md](Docs/flux2.md).
+
+- **`SpawnDev.ILGPU.ML.Flux2`: FLUX.2 [klein] 4B (Black Forest Labs, Apache-2.0) on ILGPU.** `Flux2Pipeline.CreateAsync(accelerator, modelSource, repo)` then `RunAsync` / `RunManyAsync` (several seeds of one prompt: the prompt is encoded once and the
+  transformer stays loaded). Re-implemented from the checkpoint's tensors and gated stage by stage against diffusers / transformers in bf16: `Qwen2Tokenizer` (token-identical, ten prompts), `Flux2TextEncoder` (Qwen3-4B first 27 layers, hidden states 9/18/27,
+  1.5e-2 relRMS), `Flux2Transformer` (3.9B, 5 double + 20 single blocks, shared adaLN, 4-axis interleaved RoPE; step predictions 1.3e-2 / 2.8e-2 with per-block checkpoints), `Flux2Scheduler` (identical sigmas), VAE decoder via the ONNX session
+  (2.7e-3); whole pipeline 29.3 dB from the reference picture. 4-bit weights (`quantize_flux2.py`, `Flux2Weights`: dequantise one matrix at a time into a bf16 scratch, bit-identical to a CPU decode; `GpuWeights` keeps `I32` tensors): 2.42 GB transformer +
+  1.95 GB encoder, 2.6 GB on the GPU at a time. RTX 4070: 19 s cold (CUDA); Chrome WebGPU 74 s cold from a local server (`Flux2_OverHttp_DrawsAPicture`), denoise steps ~1.5 s. Weights: <https://huggingface.co/LostBeard/FLUX.2-klein-4B-q4-ILGPU> (Apache-2.0, modified copy, model card says how).
+- **Demo, Text to 3D:** image model picker (FLUX.2 klein default, SD Turbo kept) and **Pictures**: auto-pick the best fit, or draw 4 / 8 pictures of the prompt and choose which one TRELLIS.2 builds ("Draw 4 more", "Choose another picture" afterwards). The extra pictures cost about 7 s each.
+- `BackgroundRemovalPipeline.ReleaseWorkingMemory()` is now called by the page after each cut-out (see 5.3.17).
+
 ## 5.3.17 - 2026-10-19 - Fix: WebGPU device lost drawing with SD Turbo on Chrome 151
 
 - **Fixed: "A valid external Instance reference no longer exists" (WebGPU device lost) in the browser SD Turbo VAE decode, on the stable Chrome 145-151 line.** Two causes, found by running the same page in Chrome 151 (fails) and Chromium 153 (passes), then A/B-ing per-op sync (passes). (1) `GraphExecutor` drains on WebGPU only *submitted* the queue when `QueueOrderedDrains` is on, even when the drain fired because the deferred-release byte cap was reached, so the host queued the rest of the graph far ahead of the GPU while every buffer it replaced stayed resident until the queue ran; a byte-cap drain now waits for the GPU (the node-cadence drains stay submit-only, so the DAv3 speedup is untouched). (2) The text-to-3D page runs RMBG-1.4 between two SD Turbo draws and RMBG's session kept its 1024 px feature maps parked (the second decode reached 8.7 GB of VRAM); new `BackgroundRemovalPipeline.ReleaseWorkingMemory()` (same pattern as `DepthEstimationPipeline`) and the page calls it after each cut-out. Four consecutive draws with cut-outs now pass on Chrome 151.

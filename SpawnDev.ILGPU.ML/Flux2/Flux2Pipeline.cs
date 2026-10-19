@@ -166,9 +166,18 @@ public sealed class Flux2Pipeline : IDisposable
         return new Flux2Image { Width = size, Height = size, Rgba = rgba };
     }
 
-    public async Task<Flux2Image> RunAsync(Flux2Request request)
+    public async Task<Flux2Image> RunAsync(Flux2Request request) => (await RunManyAsync(request, new[] { request.Seed }))[0];
+
+    /// <summary>
+    /// Draw one prompt with several seeds: the prompt is encoded once and the transformer's weights stay on the device for every seed, so each extra picture costs only its denoise steps and a VAE
+    /// decode (a few seconds on a desktop GPU) instead of another 4 GB of weight loading. <paramref name="onImage"/> is called with (index, picture) as each one is finished. <see cref="Flux2Request.Seed"/> is ignored;
+    /// <see cref="Flux2Request.Noise"/> applies to a single seed only.
+    /// </summary>
+    public async Task<List<Flux2Image>> RunManyAsync(Flux2Request request, int[] seeds, Func<int, Flux2Image, Task>? onImage = null)
     {
         if (request.Size % 16 != 0 || request.Size < 64) throw new ArgumentException("Size must be a multiple of 16");
+        if (seeds.Length == 0) throw new ArgumentException("at least one seed");
+        if (request.Noise != null && seeds.Length != 1) throw new ArgumentException("Noise can only be given for a single seed");
         int side = request.Size / 16, nImg = side * side, nTxt = Flux2TextEncoder.SeqLen;
         void Report(string s, int i, int n) => request.Progress?.Invoke(s, i, n);
 
@@ -184,27 +193,30 @@ public sealed class Flux2Pipeline : IDisposable
             embeds = await enc.Output.CopyToHostAsync();
         }
 
-        // 2. denoise
-        var latents = request.Noise?.ToArray() ?? GaussianNoise(nImg * Flux2Transformer.InChannels, request.Seed);
+        // 2. denoise and decode each seed; the transformer stays loaded for all of them
         var sigmas = Flux2Scheduler.Sigmas(nImg, request.Steps);
         var imgIds = ImageIds(side); var txtIds = TextIds(nTxt);
-        using (var w = await _transformerWeights())
-        using (var tr = new Flux2Transformer(_acc, w, nTxt, nImg))
+        var images = new List<Flux2Image>();
+        using var tw = await _transformerWeights();
+        using var tr = new Flux2Transformer(_acc, tw, nTxt, nImg);
+        for (int n = 0; n < seeds.Length; n++)
         {
+            var latents = request.Noise?.ToArray() ?? GaussianNoise(nImg * Flux2Transformer.InChannels, seeds[n]);
             for (int i = 0; i < request.Steps; i++)
             {
-                Report("denoise", i, request.Steps);
+                Report(seeds.Length > 1 ? $"denoise {n + 1}/{seeds.Length}" : "denoise", i, request.Steps);
                 tr.Forward(latents, embeds, Flux2Scheduler.Timestep(sigmas, i), imgIds, txtIds);
                 await _acc.SynchronizeAsync();
                 var pred = await tr.Output.SubView(0, (long)nImg * Flux2Transformer.InChannels).CopyToHostAsync();
                 float dt = (float)(sigmas[i + 1] - sigmas[i]);
                 for (int k = 0; k < latents.Length; k++) latents[k] += dt * pred[k];
             }
+            Report("vae", n, seeds.Length);
+            var image = await DecodeAsync(ToVaeInput(latents, side), side);
+            images.Add(image);
+            if (onImage != null) await onImage(n, image);
         }
-
-        // 3. decode
-        Report("vae", 0, 1);
-        return await DecodeAsync(ToVaeInput(latents, side), side);
+        return images;
     }
 
     /// <summary>Frees the resident VAE decoder. The accelerator is not touched.</summary>

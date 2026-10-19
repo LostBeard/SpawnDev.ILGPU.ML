@@ -4,6 +4,8 @@
 
 [**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
+> **New in 5.3.18: [FLUX.2 klein 4B](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) draws the picture for text to 3D.** Black Forest Labs' step-distilled 4B text-to-image model (Apache-2.0) re-implemented on ILGPU (Qwen3-4B text encoder, 3.9B flow transformer, VAE; 4-bit weights, 4.4 GB, 2.6 GB on the GPU at a time) replaces SD Turbo's 2023 look: full-body characters with real hands and armour. New in the demo: draw 4 or 8 pictures of one prompt (the extra ones cost ~7 s each) and pick the one to build in 3D. Every stage gated against diffusers. [How it works →](Docs/flux2.md)
+>
 > **5.3.17 (fix):** drawing with SD Turbo no longer loses the WebGPU device on stable Chrome 145-151 ("A valid external Instance reference no longer exists"); see the [changelog](CHANGELOG.md).
 >
 > **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
@@ -305,6 +307,7 @@ Style models: mosaic, candy, rain princess, udnie, pointilism.
 | **DistilGPT-2** | Text generation | 314 MB | **Working** — streaming weight loader |
 | **Whisper Tiny** | Speech-to-text | 231 MB | **Working** - microphone to text, verified on all six backends (`Pipeline_Whisper_TranscribesKnownSpeech`) |
 | **SD-Turbo** | Image generation | ~2.5 GB (FP16) | ONE step, 512x512 from text prompts |
+| **FLUX.2 klein 4B** | Image generation (`Flux2Pipeline`) | 4.4 GB (4-bit) | 4 steps, 512x512, Qwen3-4B + 3.9B DiT + VAE; Apache-2.0; [Docs/flux2.md](Docs/flux2.md) |
 | **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Zero-shot classification from any text |
 | **SpeechT5** | Text-to-speech | 643 MB | Neural voice synthesis |
 | **DDPM MNIST** | Image generation (lightweight) | 1 MB | Diffusion pipeline proof-of-concept |
@@ -417,7 +420,7 @@ Registered op-types live in `OperatorRegistry.BuiltinOpTypes` (live count on the
 | **SpeechRecognitionPipeline** | Audio samples | Transcribed text (Whisper encoder+decoder) |
 | **AsyncDepthPipeline** | RGBA frames | Real-time depth with fast/slow path blending |
 | **Trellis2ImageTo3D** | RGBA image (alpha = foreground) | Textured PBR GLB (TRELLIS.2-4B, 512 or 1024 pipeline) |
-| **Trellis2TextTo3D** | Prompt text | Textured PBR GLB (SD Turbo → cut-out → TRELLIS.2) |
+| **Trellis2TextTo3D** | Prompt text | Textured PBR GLB (FLUX.2 klein or SD Turbo → cut-out → TRELLIS.2) |
 | **SkinTokensRigger** | Character GLB | The same GLB rigged: skeleton + learned skin weights (SkinTokens / TokenRig, 1.15 GB bf16) |
 | **HumanoidRetargeter** + **AnimatedGlb** | Rigged humanoid GLB + Kimodo SOMA clips | The same GLB with the moves as glTF animations (`MotionClip.FromNpz`) |
 | **UniRigRigger** | Character GLB | The same GLB rigged: UniRig skeleton + geodesic voxel skinning prior |

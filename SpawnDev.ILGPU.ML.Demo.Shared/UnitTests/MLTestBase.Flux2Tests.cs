@@ -266,6 +266,30 @@ public abstract partial class MLTestBase
         Ur_Expect(psnr > 15, $"4-bit picture PSNR {psnr:F1} dB vs the reference");
     });
 
+    /// <summary>Several seeds of one prompt: the weights are loaded once per stage (the factories are called once each), the pictures differ from each other, and each is delivered as it finishes.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux2_RunMany_LoadsEachStageOnce() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator);
+        var enc = Path.Combine(dir, "weights", "text_encoder_q4.safetensors"); var trf = Path.Combine(dir, "weights", "transformer_q4.safetensors");
+        if (!File.Exists(enc) || !File.Exists(trf)) throw new UnsupportedTestException("the 4-bit exports are not found (quantize_flux2.py)");
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        int encLoads = 0, trfLoads = 0;
+        var pipe = new Flux2Pipeline(accelerator, tok,
+            () => { encLoads++; return Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, enc))); },
+            () => { trfLoads++; return Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, trf))); }, vae, F2_Norm(dir));
+        var delivered = new List<int>();
+        var images = await pipe.RunManyAsync(new Flux2Request { Prompt = "a knight in plate armor, full body, white background" }, new[] { 1, 2, 3 }, (i, _) => { delivered.Add(i); return Task.CompletedTask; });
+        Ur_Expect(encLoads == 1 && trfLoads == 1, $"each stage's weights loaded once (encoder {encLoads}, transformer {trfLoads})");
+        Ur_Expect(images.Count == 3 && delivered.SequenceEqual(new[] { 0, 1, 2 }), "three pictures delivered in order");
+        long diff01 = 0; for (int i = 0; i < images[0].Rgba.Length; i += 4) diff01 += Math.Abs(images[0].Rgba[i] - images[1].Rgba[i]);
+        double meanDiff = diff01 / (images[0].Rgba.Length / 4.0);
+        Console.WriteLine($"[Flux2] RunMany on {accelerator.AcceleratorType}: 3 pictures, stage loads {encLoads}/{trfLoads}, mean red difference between seed 1 and 2 {meanDiff:F1}");
+        Ur_Expect(meanDiff > 3, $"seeds 1 and 2 drew almost the same picture ({meanDiff:F1})");
+        await Task.CompletedTask;
+    });
+
     private const string F2Server = "http://127.0.0.1:8766/";
 
     /// <summary>A plain HTTP file server as a model source: every repo maps to the server root (tests only; the demo uses the hub source with its OPFS cache).</summary>

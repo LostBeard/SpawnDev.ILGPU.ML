@@ -9,7 +9,7 @@
 <PageTitle>Text &amp; Image to 3D — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Text & Image to 3D"
-            Description="Type what you want, or drop a picture of an object, and get a textured PBR 3D model (GLB) generated entirely on your GPU: SD Turbo draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the mesh and textures. Nothing leaves your machine."
+            Description="Type what you want, or drop a picture of an object, and get a textured PBR 3D model (GLB) generated entirely on your GPU: FLUX.2 klein (or SD Turbo) draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the mesh and textures. Nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -34,6 +34,38 @@
                    placeholder="a wooden treasure chest with iron bands" disabled="@_isRunning" />
             <button class="t3d-btn" @onclick="GenerateFromText" disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isRunning)">@ButtonLabel</button>
         </div>
+        <div class="t3d-settings">
+            <label>Image model
+                <select @bind="_imageModel" class="t3d-select" disabled="@_isRunning">
+                    <option value="flux2">FLUX.2 klein 4B (sharper; 4.6 GB first download)</option>
+                    <option value="sd">SD Turbo (faster; 2.5 GB first download)</option>
+                </select>
+            </label>
+            <label>Pictures
+                <select @bind="_pictures" class="t3d-select" disabled="@_isRunning">
+                    <option value="1">Auto-pick the best fit</option>
+                    <option value="4">Draw 4, I pick</option>
+                    <option value="8">Draw 8, I pick</option>
+                </select>
+            </label>
+        </div>
+        @if (_candidates.Count > 0 && _picking)
+        {
+            <div class="t3d-pick">
+                <div class="t3d-hint">Pick the picture to build in 3D (the same prompt with different seeds):</div>
+                <div class="t3d-pick-grid">
+                    @foreach (var c in _candidates)
+                    {
+                        <div class="t3d-pick-item">
+                            <img src="@c.Url" alt="seed @c.Seed" />
+                            <button class="t3d-btn small" @onclick="() => MakeFromAsync(c)" disabled="@_isRunning">Make 3D from this</button>
+                            <span class="t3d-hint">seed @c.Seed</span>
+                        </div>
+                    }
+                </div>
+                <button class="t3d-btn small" @onclick="DrawMoreAsync" disabled="@_isRunning">Draw 4 more</button>
+            </div>
+        }
     }
     else
     {
@@ -86,6 +118,10 @@
             <canvas id="t3d-canvas" class="t3d-canvas"></canvas>
         </div>
         <div class="t3d-result-info">@_resultInfo</div>
+        @if (_candidates.Count > 1 && !_picking)
+        {
+            <button class="action-btn" @onclick="() => _picking = true" disabled="@_isRunning">Choose another picture</button>
+        }
         <div class="result-actions">
             <button class="action-btn download-btn" @onclick="DownloadGlb">Download .glb</button>
             <button class="action-btn rig-btn" @onclick="RigModelAsync" disabled="@(_isRunning || _rigging)"
@@ -127,7 +163,7 @@
     {
         <div class="model-needed">
             This demo is opt-in and large: about <strong>11&nbsp;GB</strong> of TRELLIS.2 weights (three 2.5&nbsp;GB flow transformers, two decoders,
-            DINOv3) plus <strong>2.5&nbsp;GB</strong> of SD Turbo for text mode and 44&nbsp;MB of RMBG-1.4. Everything downloads on the first
+            DINOv3) plus <strong>4.6&nbsp;GB</strong> of FLUX.2 klein (4-bit) or <strong>2.5&nbsp;GB</strong> of SD Turbo for text mode and 44&nbsp;MB of RMBG-1.4. Everything downloads on the first
             generation, streams into your browser's storage (OPFS) and is reused after that; the <a href="cache">Model Cache</a> page removes it.
             Needs WebGPU and a GPU with about 6&nbsp;GB of free memory. A generation takes a few minutes on a desktop GPU.
         </div>
@@ -144,7 +180,7 @@
     }
 
     <PrivacyBadge />
-    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + SD Turbo + RMBG-1.4; built with DINOv3; rigging: SkinTokens (VAST AI, MIT)" />
+    <PipelineHowTo SourceFile="Pages/Image3DPage.razor" Note="TRELLIS.2 (MIT) + FLUX.2 klein 4B (Black Forest Labs, Apache-2.0, 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) or SD Turbo + RMBG-1.4; built with DINOv3; rigging: SkinTokens (VAST AI, MIT)" />
 </DemoLayout>
 
 <style>
@@ -156,6 +192,11 @@
     .t3d-btn { padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; white-space: nowrap; margin-top: 0.5rem; }
     .t3d-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .t3d-hint { color: #64748b; font-size: 0.8rem; margin: 0.4rem 0; }
+    .t3d-btn.small { padding: 0.35rem 0.9rem; font-size: 0.8rem; }
+    .t3d-pick { margin-top: 0.9rem; }
+    .t3d-pick-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 0.75rem; }
+    .t3d-pick-item { display: flex; flex-direction: column; gap: 0.3rem; align-items: stretch; }
+    .t3d-pick-item img { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #0f172a; }
     .t3d-settings { display: flex; gap: 1.25rem; margin-top: 0.9rem; flex-wrap: wrap; color: #64748b; font-size: 0.8rem; }
     .t3d-settings label { display: flex; align-items: center; gap: 0.35rem; }
     .t3d-num { width: 80px; padding: 0.25rem 0.4rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; }
@@ -181,7 +222,7 @@
 </style>
 
 @code {
-    // Prompt / picture -> SD Turbo (text mode) -> RMBG-1.4 cut-out -> TRELLIS.2 (Trellis2ImageTo3D on the portable WebGPU kernels,
+    // Prompt / picture -> FLUX.2 klein or SD Turbo (text mode) -> RMBG-1.4 cut-out -> TRELLIS.2 (Trellis2ImageTo3D on the portable WebGPU kernels,
     // checkpoints streamed from the hub into OPFS one stage at a time) -> GLB -> preview (wwwroot/js/glb-viewer.js) + download.
     // Everything is opt-in: nothing loads until the first Generate.
     private const string PromptSuffix = ", a single object, centered, the whole object in frame with an empty margin around it, isolated on a plain white background, soft studio lighting, high detail";
@@ -201,7 +242,7 @@
     private byte[]? _glb;
     private readonly List<(string Name, double Seconds)> _stages = new();
 
-    private string ButtonLabel => _isRunning ? "Generating…" : _ready && (_mode == "image" || _sd != null) ? "Generate 3D" : "Download & Generate";
+    private string ButtonLabel => _isRunning ? "Generating…" : _ready && (_mode == "image" || (_imageModel == "sd" ? _sd != null : _flux != null)) ? "Generate 3D" : "Download & Generate";
 
     private List<BackendSelector.BackendInfo> _backends = new() { new() { Id = "WebGPU", DisplayName = "WebGPU" } };
     private List<ImageDropZone.SampleImage> _samples = new()
@@ -219,6 +260,13 @@
     private global::ILGPU.Context? _context;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _sd;
+    private SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline? _flux;
+    private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
+    private string _imageModel = "flux2";               // "flux2" | "sd"
+    private int _pictures = 1;                          // 1 = auto-pick the best fit; 4 / 8 = draw that many and let the user pick
+    private bool _picking;
+    private readonly List<Candidate> _candidates = new();
+    private sealed record Candidate(int Seed, int Width, int Height, byte[] Rgba, string Url);
     private SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline? _rmbg;
     private Trellis2ImageTo3D? _trellis;
 
@@ -478,36 +526,142 @@
         try
         {
             if (!await EnsureAcceleratorAsync()) return;
-            if (_sd == null)
+            await EnsureImageModelAsync();
+            _candidates.Clear(); _picking = false; _nextSeed = _seed;
+            if (_pictures > 1)
             {
-                _isLoading = true; _modelSizeMb = 2450; _currentStage = "SD Turbo (first run: 2.5 GB download)"; StateHasChanged();
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                _sd = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(_accelerator!, ModelSource, onProgress: (stage, pct) =>
+                // The user chooses: draw them all, show them, and wait.
+                await DrawAsync(Enumerable.Range(_nextSeed, _pictures).ToArray());
+                _nextSeed += _pictures;
+                _picking = true;
+                return;
+            }
+            // Auto: draw, cut out, and keep the drawing whose cut-out touches the frame least (a cropped drawing becomes a truncated model).
+            // SD Turbo is cheap per picture, so it tries one at a time (up to 4); FLUX.2 loads 4 GB of weights per call, so it draws two in one go.
+            int[]? best = null; int bw = 0, bh = 0, usedSeed = _seed; double bestTouch = double.MaxValue; Candidate? bestCandidate = null;
+            int[][] rounds = _imageModel == "sd" ? new[] { new[] { _seed }, new[] { _seed + 1 }, new[] { _seed + 2 }, new[] { _seed + 3 } } : new[] { new[] { _seed, _seed + 1 } };
+            foreach (var seeds in rounds)
+            {
+                var drawn = await DrawAsync(seeds);
+                foreach (var c in drawn)
                 {
-                    _modelStatusText = $"SD Turbo — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
-                });
-                OnStageDone("image model load", sw.Elapsed.TotalSeconds);
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    _currentStage = $"cutting out seed {c.Seed}"; StateHasChanged();
+                    var cut = await CutOutAsync(ToPixels(c), c.Width, c.Height);
+                    double touch = BorderTouch(cut, c.Width, c.Height);
+                    OnStageDone($"cut-out of seed {c.Seed} (on the frame {touch:P0})", sw.Elapsed.TotalSeconds);
+                    if (touch < bestTouch) { best = cut; bw = c.Width; bh = c.Height; usedSeed = c.Seed; bestTouch = touch; bestCandidate = c; }
+                }
+                if (bestTouch < 0.005) break;
             }
-            // Draw, cut out, and keep the drawing whose cut-out touches the frame least (a cropped drawing becomes a truncated model).
-            int[]? best = null; int bw = 0, bh = 0, usedSeed = _seed; double bestTouch = double.MaxValue;
-            for (int attempt = 0; attempt < 4; attempt++)
-            {
-                _currentStage = $"drawing (seed {_seed + attempt})"; StateHasChanged();
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                var img = await _sd.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput { Prompt = _prompt + PromptSuffix, Seed = _seed + attempt });
-                var px = new int[img.Width * img.Height];
-                Buffer.BlockCopy(img.ImageRGBA, 0, px, 0, px.Length * 4);
-                for (int i = 0; i < px.Length; i++) px[i] |= unchecked((int)0xFF000000);
-                var cut = await CutOutAsync(px, img.Width, img.Height);
-                double touch = BorderTouch(cut, img.Width, img.Height);
-                OnStageDone($"image seed {_seed + attempt} (cut-out on the frame {touch:P0})", sw.Elapsed.TotalSeconds);
-                if (touch < bestTouch) { best = cut; bw = img.Width; bh = img.Height; usedSeed = _seed + attempt; bestTouch = touch; _sourceImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, img.ImageRGBA, img.Width, img.Height); }
-                if (touch < 0.005) break;
-            }
+            _sourceImageUrl = bestCandidate!.Url;
             await RunTrellisAsync(best!, bw, bh, total, $"\"{_prompt}\" (image seed {usedSeed})");
         }
         catch (Exception ex) { Fail(ex); }
         finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
+    }
+
+    private int _nextSeed;
+
+    private async Task DrawMoreAsync()
+    {
+        Begin();
+        try
+        {
+            if (!await EnsureAcceleratorAsync()) return;
+            await EnsureImageModelAsync();
+            var seeds = Enumerable.Range(_nextSeed, 4).ToArray();
+            _nextSeed += 4;
+            await DrawAsync(seeds);
+        }
+        catch (Exception ex) { Fail(ex); }
+        finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
+    }
+
+    private async Task MakeFromAsync(Candidate c)
+    {
+        Begin();
+        _picking = false;
+        var total = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            if (!await EnsureAcceleratorAsync()) return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _currentStage = $"cutting out seed {c.Seed}"; StateHasChanged();
+            var cut = await CutOutAsync(ToPixels(c), c.Width, c.Height);
+            OnStageDone($"cut-out of seed {c.Seed}", sw.Elapsed.TotalSeconds);
+            _sourceImageUrl = c.Url;
+            await RunTrellisAsync(cut, c.Width, c.Height, total, $"\"{_prompt}\" (image seed {c.Seed})");
+        }
+        catch (Exception ex) { Fail(ex); }
+        finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
+    }
+
+    private static int[] ToPixels(Candidate c)
+    {
+        var px = new int[c.Width * c.Height];
+        Buffer.BlockCopy(c.Rgba, 0, px, 0, px.Length * 4);
+        for (int i = 0; i < px.Length; i++) px[i] |= unchecked((int)0xFF000000);
+        return px;
+    }
+
+    /// <summary>Load the chosen image model on first use (FLUX.2 klein builds only its tokenizer and small VAE here; its two 2 GB stages stream in per draw).</summary>
+    private async Task EnsureImageModelAsync()
+    {
+        if (_imageModel == "sd" && _sd == null)
+        {
+            _isLoading = true; _modelSizeMb = 2450; _currentStage = "SD Turbo (first run: 2.5 GB download)"; StateHasChanged();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _sd = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(_accelerator!, ModelSource, onProgress: (stage, pct) =>
+            {
+                _modelStatusText = $"SD Turbo — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
+            });
+            OnStageDone("image model load", sw.Elapsed.TotalSeconds);
+        }
+        else if (_imageModel == "flux2" && _flux == null)
+        {
+            _isLoading = true; _modelSizeMb = 4600; _currentStage = "FLUX.2 klein (first run: 4.6 GB download)"; StateHasChanged();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _flux = await SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline.CreateAsync(_accelerator!, ModelSource, FluxRepo, 512, (stage, pct) =>
+            {
+                _modelStatusText = $"FLUX.2 klein — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
+            });
+            OnStageDone("image model load", sw.Elapsed.TotalSeconds);
+        }
+        _isLoading = false;
+    }
+
+    /// <summary>Draw one picture per seed with the chosen model, adding each to the candidate list as it finishes.</summary>
+    private async Task<List<Candidate>> DrawAsync(int[] seeds)
+    {
+        var drawn = new List<Candidate>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        async Task Add(int seed, int w, int h, byte[] rgba)
+        {
+            var c = new Candidate(seed, w, h, rgba, Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h));
+            drawn.Add(c); _candidates.Add(c);
+            OnStageDone($"picture, seed {seed}", sw.Elapsed.TotalSeconds); sw.Restart();
+            await InvokeAsync(StateHasChanged);
+        }
+        if (_imageModel == "sd")
+        {
+            foreach (var seed in seeds)
+            {
+                _currentStage = $"drawing (seed {seed})"; StateHasChanged();
+                var img = await _sd!.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput { Prompt = _prompt + PromptSuffix, Seed = seed });
+                await Add(seed, img.Width, img.Height, img.ImageRGBA);
+            }
+        }
+        else
+        {
+            _currentStage = seeds.Length > 1 ? $"drawing {seeds.Length} pictures" : $"drawing (seed {seeds[0]})"; StateHasChanged();
+            await _flux!.RunManyAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
+            {
+                Prompt = _prompt + PromptSuffix, Size = 512, Steps = 4,
+                Progress = (stage, i, n) => { _currentStage = $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
+            }, seeds, (i, img) => Add(seeds[i], img.Width, img.Height, img.Rgba));
+        }
+        return drawn;
     }
 
     private async Task GenerateFromImage()
