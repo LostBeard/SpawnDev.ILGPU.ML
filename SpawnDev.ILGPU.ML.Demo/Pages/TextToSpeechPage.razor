@@ -415,10 +415,9 @@
         }
 
         var memberUrl = $"{HubBaseUrl}/src?url={archive}&member={member}";
-        var bytes = await InferenceSession.DownloadBytesChunkedAsync(Http, memberUrl);
-        if (bytes.Length != VocoderBytes)
-            throw new Exception($"vocoder is {bytes.Length} bytes, expected {VocoderBytes:N0}");
-        return InferenceSession.CreateFromFile(_accelerator!, bytes);
+        // the member is cached in OPFS and read as a JS-side stream: its 54 MB never become a .NET byte[] (the size is verified against a truncated body)
+        await using var vocoder = await ModelSource.OpenUrlAsync(memberUrl, ModelSource.CacheKey("bundled", $"zipvoice-vocos-24khz-{VocoderBytes}.onnx"), VocoderBytes);
+        return await InferenceSession.CreateFromOnnxStreamAsync(_accelerator!, vocoder);
     }
 
     private async Task SpeakAsync()

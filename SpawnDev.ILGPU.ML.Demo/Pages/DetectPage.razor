@@ -223,6 +223,7 @@
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
+    [Inject] SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -307,16 +308,13 @@
             var modelUrl = $"models/yolov8n/model.onnx?v={yoloBytes}";
             _modelProgress = 50;
             StateHasChanged();
-            var bytes = await Http.GetByteArrayAsync(modelUrl);
-            Console.WriteLine($"[Detect] downloaded {bytes.Length} bytes (expect {yoloBytes})");
-            if (bytes.Length != yoloBytes)
-                throw new InvalidDataException(
-                    $"YOLOv8 download truncated or corrupt: got {bytes.Length} bytes, expected {yoloBytes}. "
-                    + "Unregister the site's service worker (DevTools → Application) and reload.");
+            // the bundled copy goes into the OPFS cache and is read from there as a JS-side stream (the size is verified against a truncated body):
+            // its 12.8 MB never become a .NET byte[]
+            await using var modelStream = await ModelSource.OpenUrlAsync(new System.Uri(Http.BaseAddress!, modelUrl).ToString(), ModelSource.CacheKey("bundled", $"yolov8n-model-{yoloBytes}.onnx"), yoloBytes);
             _modelProgress = 70;
             StateHasChanged();
-            var session = InferenceSession.CreateFromFile(
-                _accelerator, bytes,
+            var session = await InferenceSession.CreateFromOnnxStreamAsync(
+                _accelerator, modelStream,
                 onProgress: (stage, pct) =>
                 {
                     _modelProgress = 70 + pct * 0.25;

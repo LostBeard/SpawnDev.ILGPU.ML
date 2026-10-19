@@ -1618,14 +1618,16 @@ public class InferenceSession : IDisposable
         long _prevOff = -1; double _streamMs = 0, _chunkedMs = 0; int _nStream = 0, _nChunked = 0;
         int skippedCpuOnly = 0; long _maxChunkedBytes = 0;
         // Fail-loud (Geordi's ILGPU 4.17.2-local.8 guard, my ILGPU-side placement call): during weight
-        // upload, ANY host CopyFromCPU over 64KB throws — i.e. a bulk weight that regressed onto the .NET
-        // path instead of streaming JS-side. Largest LEGIT materialized constant is ~308B (measured), so 64KB
-        // never false-fires on a real weight; a regression (KB-MB) screams in PMT. ENFORCE ONLY when the
+        // upload, ANY host CopyFromCPU over 1 MiB throws — i.e. a bulk weight that regressed onto the .NET
+        // path instead of streaming JS-side. The largest LEGIT materialized constants are small (~308 B in most
+        // graphs; YOLOv8n carries an 8,400-element int64 index tensor = 67,200 B, found by the per-model census
+        // tests), so the limit is 1 MiB: far below any weight, above every constant seen; a regression (MB) screams
+        // in PMT, and the census tests (WeightCensus_*) assert the total. ENFORCE ONLY when the
         // source is a browser zero-copy stream (IJSReadStream = the hub in production) — where zero-copy IS
         // available so a bulk CopyFromCPU is a genuine regression. A plain .NET stream (MemoryStream in
         // equivalence tests, or desktop) legitimately CopyFromCPUs (no zero-copy source), so don't guard it.
         bool _guardHostCopy = stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream;
-        if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = 65536;
+        if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = 1 << 20;
         try
         {
         foreach (var (sourceName, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))

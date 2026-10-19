@@ -104,7 +104,7 @@ public sealed class GpuWeights : IDisposable
             try { if (stream.CanSeek) length = stream.Length - pos; } catch (NotSupportedException) { }
             var (tensors, metadata) = SafeTensorsFileReader.ParseHeader(name, headerBytes, pos, length);
             w.Metadata = metadata;
-            var buf = new byte[16 << 20];
+            byte[]? skipBuf = null;                      // only a non-seekable stream with gaps between tensors needs it (WASM memory never shrinks: no 16 MiB high-water bump per load)
             foreach (var t in tensors)
             {
                 if (filter != null && !filter(t.Name)) continue;
@@ -112,16 +112,16 @@ public sealed class GpuWeights : IDisposable
                 {
                     long gap = t.DataOffset - pos;
                     if (stream.CanSeek) stream.Seek(gap, SeekOrigin.Current);
-                    else while (gap > 0) { int r = await stream.ReadAsync(buf.AsMemory(0, (int)Math.Min(buf.Length, gap)), cancellationToken); if (r <= 0) throw new EndOfStreamException(name); gap -= r; }
+                    else { skipBuf ??= new byte[1 << 20]; while (gap > 0) { int r = await stream.ReadAsync(skipBuf.AsMemory(0, (int)Math.Min(skipBuf.Length, gap)), cancellationToken); if (r <= 0) throw new EndOfStreamException(name); gap -= r; } }
                     pos = t.DataOffset;
                 }
                 long n = SafeTensorsFileReader.ElementCount(t);
                 switch (t.DType)
                 {
-                    case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
-                    case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
-                    case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
-                    case "I32": { var b = accelerator.Allocate1D<uint>(n); w._u32[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
+                    case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
+                    case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
+                    case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
+                    case "I32": { var b = accelerator.Allocate1D<uint>(n); w._u32[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
                     default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32/I32 native only");
                 }
                 pos += t.DataLength;
@@ -137,7 +137,7 @@ public sealed class GpuWeights : IDisposable
         }
     }
 
-    private static async Task UploadAsync<T>(Stream stream, MemoryBuffer1D<T, Stride1D.Dense> dst, long count, byte[] buf, CancellationToken ct) where T : unmanaged
+    private static async Task UploadAsync<T>(Stream stream, MemoryBuffer1D<T, Stride1D.Dense> dst, long count, CancellationToken ct) where T : unmanaged
     {
         int es = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
         long bytes = count * es;
@@ -149,6 +149,8 @@ public sealed class GpuWeights : IDisposable
             await dst.View.CopyFromStreamAsync(stream, cancellationToken: ct);
             return;
         }
+        // a tensor whose byte size is not a multiple of 4 (an odd-count bf16 / f16 vector): tiny in practice, read in bounded pieces
+        var buf = new byte[Math.Min(bytes, 1 << 20)];
         var staging = new T[Math.Min(count, buf.Length / es)];
         for (long done = 0; done < count;)
         {

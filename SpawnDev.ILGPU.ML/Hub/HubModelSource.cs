@@ -106,6 +106,23 @@ public class HubModelSource : ICachingModelSource, IDisposable
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Open an arbitrary URL (a model bundled with the page, a hub archive member) as a seekable JS-side stream, downloading it into the same OPFS cache first when needed: the bytes never enter the .NET heap.
+    /// <paramref name="expectedBytes"/> (when known) is verified against the cached entry; a short or long one (a truncated body served from a browser HTTP cache) is removed from the cache and reported, not used.
+    /// </summary>
+    public async Task<Stream> OpenUrlAsync(string url, string cacheKey, long expectedBytes = -1, IProgress<ModelDownloadProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        var stream = await _cache.OpenOrDownloadAsync(url, cacheKey, Combine(progress), cancellationToken).ConfigureAwait(false);
+        if (expectedBytes >= 0 && stream.Length != expectedBytes)
+        {
+            long got = stream.Length;
+            await stream.DisposeAsync().ConfigureAwait(false);
+            await _cache.RemoveAsync(cacheKey).ConfigureAwait(false);
+            throw new InvalidDataException($"'{url}' is {got} bytes, expected {expectedBytes}: the cached copy was removed (a truncated or stale body); reload to download it again.");
+        }
+        return stream;
+    }
+
     /// <summary>Feed both the per-call sink and the source-wide <see cref="OnProgress"/> event.</summary>
     private IProgress<ModelDownloadProgress>? Combine(IProgress<ModelDownloadProgress>? progress)
     {

@@ -183,7 +183,13 @@ public sealed class Flux2Pipeline : IDisposable
     {
         var factory = VaeEncoderFactory ?? throw new InvalidOperationException("This pipeline has no VAE encoder (VaeEncoderFactory): reference images need " + VaeEncoderFile + ".");
         var (chw, w, h) = Flux2ReferencePrep.Prepare(reference);
-        using var enc = await factory(h, w);
+        // the encoder graph is fixed-shape: the last one is kept, so several pictures of one size (or the same picture again) rebuild nothing
+        if (_encoder == null || _encoderKey != (h, w))
+        {
+            _encoder?.Dispose(); _encoder = null;
+            _encoder = await factory(h, w); _encoderKey = (h, w);
+        }
+        var enc = _encoder;
         using var img = _acc.Allocate1D(chw);
         var outputs = await enc.RunAsync(new Dictionary<string, Tensor> { [enc.InputNames[0]] = new Tensor(img.View, new[] { 1, 3, h, w }, enc.InputNames[0]) });
         int lh = h / 8, lw = w / 8;
@@ -411,6 +417,9 @@ public sealed class Flux2Pipeline : IDisposable
         _residentTr = null; _residentWeights = null; _residentTokens = 0;
     }
 
-    /// <summary>Frees the resident VAE decoder and any kept transformer. The accelerator is not touched.</summary>
-    public void Dispose() { ReleaseResident(); _vae.Dispose(); _elementWise?.Dispose(); }
+    private InferenceSession? _encoder;
+    private (int Height, int Width) _encoderKey;
+
+    /// <summary>Frees the resident VAE decoder and encoder and any kept transformer. The accelerator is not touched.</summary>
+    public void Dispose() { ReleaseResident(); _encoder?.Dispose(); _encoder = null; _vae.Dispose(); _elementWise?.Dispose(); }
 }
