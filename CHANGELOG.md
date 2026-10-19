@@ -3,6 +3,23 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## Unreleased (after 5.3.22) - the TRELLIS.2 mesh tail on the GPU
+
+Requires SpawnDev.ILGPU 5.3.8 (the kernels are written so the loop-inside-an-if bug fixed in the fork after 5.3.8 cannot hit them).
+
+- **Remesh, simplify, winding, normals and UV atlas run in device kernels; the mesh stays on the GPU until the file is written.** `DeviceRemesher` (parallel narrow-band remesh), `GpuMeshSimplifier` (parallel quadric edge collapse:
+  every round takes five matching passes of the cheapest edges that do not touch an earlier pass's; 4,669,548 -> 298,426 faces in 31 rounds on the crown), `DeviceUvAtlas` (charts grown in parallel from seeds inside a normal cone, a chart whose
+  projection would fold regrown tighter, planar projection rotated to the minimum bounding rectangle over 24 angles by atomic min/max, shelf packing with all candidate densities tried at once, seams from the vertex-to-faces table, no hash and
+  no sort). `Trellis2Options` / `Trellis2Pipeline.DeviceRemesh`, `DeviceSimplify`, `DeviceAtlas` (default on; env `TRELLIS2_HOSTREMESH=1`, `TRELLIS2_HOSTSIMPLIFY=1`, `TRELLIS2_HOSTATLAS=1` select the host versions for A/B).
+  The host repair of the simplified mesh no longer runs by default (`RepairAfterDeviceSimplify`, env `TRELLIS2_REPAIR_SIMPLIFIED=1`): the remeshed, simplified surface is closed and wound one way, and the repair opened pinholes along the
+  edges it split.
+- MEASURED, browser (interpreted dev build, WebGPU), crown at 300k faces: the host simplify + repair that used to follow the device simplify (6.2 s + 23.7 s) are gone; winding + normals + atlas 17.0 s -> 5.7 s; total 199 s -> 187 s.
+  Knight on CUDA: simplify 1.6 M -> 298k faces 0.3 s, winding + normals + atlas 0.6 s.
+- Tests: `GpuSimplify_*`, `DeviceRemesh_*`, `DeviceAtlas_*` (every corner keeps its geometry through the seam duplication, UV triangles wound like their faces and inside the atlas, no two triangles overlap, one texel density,
+  as tight as the host's: sphere 17 charts and 76.7% used against the host's 14 and 70.4%; the flipped-face test matches `MeshRepair.AlignWindingToNormals` exactly: 302 of 302 and the same corners), on CUDA, OpenCL and WebGPU.
+- Not done: the atlas does not run the host version's grid overlap test (a chart whose faces lean more than 65 degrees from its direction is regrown instead, which prevents folds and, in practice, overlaps); the texture bake, PNG and GLB
+  writer still run on the host side of the pipeline.
+
 ## 5.3.22 - 2026-10-19 - FLUX 3 Image Klein, reference-picture editing, 3D region editing, scenes
 
 Requires SpawnDev.ILGPU 5.3.8.

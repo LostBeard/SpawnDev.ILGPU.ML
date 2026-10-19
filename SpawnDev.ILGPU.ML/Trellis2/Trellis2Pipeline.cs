@@ -626,6 +626,9 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Simplify on the device (<see cref="GpuMeshSimplifier"/>) instead of the host edge collapse. Default on; env TRELLIS2_HOSTSIMPLIFY=1 forces the host path (A/B).</summary>
     public bool DeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTSIMPLIFY") != "1";
     private GpuMeshSimplifier? _gpuSimplifier;
+    /// <summary>Align the winding, compute the normals and unwrap the UV atlas on the device (<see cref="DeviceUvAtlas"/>) and bake from its buffers, so the mesh does not leave the GPU until the file is written. Default on; env TRELLIS2_HOSTATLAS=1 forces the host path (A/B). Used after the device remesh, unless the host repair of the simplified mesh is on.</summary>
+    public bool DeviceAtlas { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTATLAS") != "1";
+    private DeviceUvAtlas? _deviceAtlas;
     /// <summary>Run the host <see cref="MeshRepair"/> on the device-simplified mesh (splits non-manifold edges, closes the holes that leaves, re-winds). Off by default: the remeshed, simplified surface is already closed and consistently wound, and the repair opens pinholes along the edges it splits. Env TRELLIS2_REPAIR_SIMPLIFIED=1 turns it on (A/B).</summary>
     public bool RepairAfterDeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_REPAIR_SIMPLIFIED") == "1";
 
@@ -646,9 +649,19 @@ public sealed class Trellis2Pipeline : IDisposable
                 StageDone?.Invoke($"simplify on the device {before} -> {simplified.FaceCount} faces in {_gpuSimplifier.LastRounds.Count} rounds", sw.Elapsed.TotalSeconds); sw.Restart();
             }
             using var simplifiedOwner = simplified;
-            // the stages after it (repair, atlas) still run on the host and need arrays
             var vp = simplified?.Positions ?? rmd.Positions; var vf = simplified?.Faces ?? rmd.Faces;
             int vn = simplified?.VertexCount ?? rmd.VertexCount, fn = simplified?.FaceCount ?? rmd.FaceCount;
+            if (DeviceAtlas && !(simplified != null && RepairMesh && RepairAfterDeviceSimplify))
+            {
+                if (MeshStage != null)
+                {
+                    var hp = vn == 0 ? Array.Empty<float>() : await vp.View.SubView(0, (long)vn * 3).CopyToHostAsync();
+                    var hf = fn == 0 ? Array.Empty<int>() : await vf.View.SubView(0, (long)fn * 3).CopyToHostAsync();
+                    MeshStage("remeshed", hp, hf);
+                }
+                return await FinishGlbOnDeviceAsync(output, vp.View, vn, vf.View, fn, textureSize, dilation, sw, rmd.Source);
+            }
+            // the stages after it (host repair, host atlas) need arrays
             var dpos = vn == 0 ? Array.Empty<float>() : await vp.View.SubView(0, (long)vn * 3).CopyToHostAsync();
             var dfaces = fn == 0 ? Array.Empty<int>() : await vf.View.SubView(0, (long)fn * 3).CopyToHostAsync();
             MeshStage?.Invoke("remeshed", dpos, dfaces);
@@ -697,6 +710,31 @@ public sealed class Trellis2Pipeline : IDisposable
             $"wrong-way edges {r.Before.OrientationConflicts}->{r.After.OrientationConflicts}, {r.HolesFilled} holes closed, {r.FragmentComponents} fragments removed", sw.Elapsed.TotalSeconds);
         sw.Restart();
         return (p, f);
+    }
+
+    /// <summary>
+    /// The end of the export with the mesh still in device buffers: winding and normals, the UV atlas, the bake, and only then the arrays the file writer needs (the finished vertices, UVs, normals, faces and two textures).
+    /// </summary>
+    private async Task<byte[]> FinishGlbOnDeviceAsync(Output output, ArrayView1D<float, Stride1D.Dense> positions, int vertexCount, ArrayView1D<int, Stride1D.Dense> faces, int faceCount, int textureSize, int dilation, Stopwatch sw, MeshDistanceGrid? project)
+    {
+        _deviceAtlas ??= new DeviceUvAtlas(_acc, _sk);
+        using var atlas = await _deviceAtlas.UnwrapAsync(positions, vertexCount, faces, faceCount, new UvAtlas.Options { Resolution = textureSize }, alignWinding: RepairMesh);
+        StageDone?.Invoke($"winding, normals and uv atlas on the device ({atlas.ChartCount} charts, {atlas.Utilization:P0}; {atlas.Flipped} triangles flipped)", sw.Elapsed.TotalSeconds); sw.Restart();
+        if (MeshStage != null)
+            MeshStage("atlas", await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync(), await atlas.Faces.View.SubView(0, (long)atlas.FaceCount * 3).CopyToHostAsync());
+
+        var tex = await new TextureBaker(_acc, _sk).BakeAsync(atlas.Positions.View, atlas.Uvs.View, atlas.Faces.View, atlas.FaceCount, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation, project);
+        StageDone?.Invoke("texture bake", sw.Elapsed.TotalSeconds); sw.Restart();
+
+        var outPositions = await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync();
+        var outUvs = await atlas.Uvs.View.SubView(0, (long)atlas.VertexCount * 2).CopyToHostAsync();
+        var outNormals = await atlas.Normals.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync();
+        var outFaces = await atlas.Faces.View.SubView(0, (long)atlas.FaceCount * 3).CopyToHostAsync();
+        var bc = PngEncoder.EncodeRgba8(tex.BaseColorAlpha, textureSize, textureSize);
+        var mr = PngEncoder.EncodeRgba8(tex.MetallicRoughness, textureSize, textureSize);
+        var glb = PbrGlbWriter.Write(outPositions, outNormals, outUvs, outFaces, bc, mr);
+        StageDone?.Invoke("png + glb", sw.Elapsed.TotalSeconds);
+        return glb;
     }
 
     private async Task<byte[]> FinishGlbAsync(Output output, float[] positions, int[] faces, int textureSize, int dilation, int maxFaces, Stopwatch sw, MeshDistanceGrid? project = null, bool remeshed = false)

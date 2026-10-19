@@ -144,12 +144,12 @@ public sealed class GpuMeshSimplifier
     }
 
     // ---- the adjacency: vertex -> incident faces, rebuilt every round with atomics and a scan -------------------------------------------------------------
-    private static void CountImpl(Index1D t, IV faces, IV count)
+    internal static void CountImpl(Index1D t, IV faces, IV count)
     {
         Atomic.Add(ref count[faces[t * 3]], 1); Atomic.Add(ref count[faces[t * 3 + 1]], 1); Atomic.Add(ref count[faces[t * 3 + 2]], 1);
     }
 
-    private static void FillImpl(Index1D t, IV faces, IV vstart, IV fill, IV vfaces)
+    internal static void FillImpl(Index1D t, IV faces, IV vstart, IV fill, IV vfaces)
     {
         for (int k = 0; k < 3; k++)
         {
