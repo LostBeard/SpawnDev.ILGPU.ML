@@ -312,6 +312,7 @@ Style models: mosaic, candy, rain princess, udnie, pointilism.
 | **Whisper Tiny** | Speech-to-text | 231 MB | **Working** - microphone to text, verified on all six backends (`Pipeline_Whisper_TranscribesKnownSpeech`) |
 | **SD-Turbo** | Image generation | ~2.5 GB (FP16) | ONE step, 512x512 from text prompts |
 | **FLUX.2 klein 4B** | Image generation (`Flux2Pipeline`) | 4.4 GB (4-bit) | 4 steps, 512x512, Qwen3-4B + 3.9B DiT + VAE; Apache-2.0; [Docs/flux2.md](Docs/flux2.md) |
+| **FLUX 3 Image Klein 5.6B** | Image generation and editing with up to 10 reference pictures (`Flux3Pipeline`) | 5.7 GB (4-bit) | 16 steps, 512 px verified (larger sizes in progress), Qwen3-VL text tower + 5.6B flow-map DiT + VAE; weights under the FLUX Kommunity License (non-commercial); [Docs/flux3.md](Docs/flux3.md) |
 | **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Zero-shot classification from any text |
 | **SpeechT5** | Text-to-speech | 643 MB | Neural voice synthesis |
 | **DDPM MNIST** | Image generation (lightweight) | 1 MB | Diffusion pipeline proof-of-concept |

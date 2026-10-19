@@ -67,11 +67,14 @@ public abstract partial class MLTestBase
 
     // ---- the real checkpoint (gated; golden/t2i written by golden_flux3.py, weights by quantize_flux3.py / quantize_flux3_text.py / export_flux3_vae.py) -----------------------------------------
 
+    /// <summary>Weight bits the real-checkpoint gates load (F3_BITS = 4 or 8; default 8).</summary>
+    private static string F3_Bits => Environment.GetEnvironmentVariable("F3_BITS") == "4" ? "4" : "8";
+
     private static string F3_RequireReal(Accelerator accelerator)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("FLUX 3 runs on the desktop GPU lanes (CUDA, OpenCL)");
         var dir = Environment.GetEnvironmentVariable("F3_DIR") ?? "E:/spawndev-flux3";
-        foreach (var f in new[] { "golden/t2i/text_tokens.npy", "weights/transformer_q8.safetensors", "weights/text_encoder_q8.safetensors", "weights/vae_decoder.onnx", "weights/vae_norm.json", "repo/text_encoder/tokenizer.json" })
+        foreach (var f in new[] { "golden/t2i/text_tokens.npy", $"weights/transformer_q{F3_Bits}.safetensors", $"weights/text_encoder_q{F3_Bits}.safetensors", "weights/vae_decoder.onnx", "weights/vae_norm.json", "repo/text_encoder/tokenizer.json" })
             if (!File.Exists(Path.Combine(dir, f))) throw new UnsupportedTestException($"FLUX 3 {f} not found (F3_DIR, default E:/spawndev-flux3; tools/unirig-harness/reference/flux3/)");
         return dir;
     }
@@ -85,7 +88,7 @@ public abstract partial class MLTestBase
         var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "repo", "text_encoder", "tokenizer.json")));
         var (goldIds, _) = Ur_Npy<float>(Path.Combine(g, "text_ids.npy")); var (goldTokens, _) = Ur_Npy<float>(Path.Combine(g, "text_tokens.npy"));
         using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
-        var pipe = new Flux3Pipeline(accelerator, tok, () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder_q8.safetensors")))), null!, vae, F3_Norm(dir));
+        var pipe = new Flux3Pipeline(accelerator, tok, () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"text_encoder_q{F3_Bits}.safetensors")))), null!, vae, F3_Norm(dir));
         var (ids, real) = pipe.Tokenize(meta.GetProperty("caption").GetString()!);
         Ur_Expect(ids.Length == goldIds.Length && Enumerable.Range(0, ids.Length).All(i => ids[i] == (int)goldIds[i]), $"token ids equal the reference's ({ids.Length} tokens, {real} real)");
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -109,8 +112,8 @@ public abstract partial class MLTestBase
         int size = meta.GetProperty("size").GetInt32();
         using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
         var pipe = new Flux3Pipeline(accelerator, tok,
-            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder_q8.safetensors")))),
-            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer_q8.safetensors")))), vae, F3_Norm(dir));
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"text_encoder_q{F3_Bits}.safetensors")))),
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"transformer_q{F3_Bits}.safetensors")))), vae, F3_Norm(dir));
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var result = await pipe.RunAsync(new Flux3Request { Caption = meta.GetProperty("caption").GetString()!, Width = size, Height = size, Steps = meta.GetProperty("steps").GetInt32(), Alpha = (float)meta.GetProperty("alpha").GetDouble(), Noise = noise,
             Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n}") });
@@ -123,12 +126,80 @@ public abstract partial class MLTestBase
             }
         double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
         Console.WriteLine($"[Flux3] pipeline on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the reference picture");
-        using (var f = File.Create(Path.Combine(g, "csharp.ppm")))
+        using (var f = File.Create(Path.Combine(g, $"csharp_q{F3_Bits}.ppm")))
         {
             f.Write(System.Text.Encoding.ASCII.GetBytes("P6\n" + size + " " + size + "\n255\n"));
             var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
             f.Write(rgb);
         }
         Ur_Expect(psnr > 20, $"picture PSNR {psnr:F1} dB vs the reference");
+    });
+
+    private static Flux2ReferenceImage F3_Reference(string path)
+    {
+        var (raw, shape) = Ur_Npy<float>(path);                                  // [H, W, 3] in 0..255
+        int h = shape[0], w = shape[1]; var rgba = new byte[w * h * 4];
+        for (int p = 0; p < w * h; p++) { rgba[p * 4] = (byte)raw[p * 3]; rgba[p * 4 + 1] = (byte)raw[p * 3 + 1]; rgba[p * 4 + 2] = (byte)raw[p * 3 + 2]; rgba[p * 4 + 3] = 255; }
+        return new Flux2ReferenceImage(w, h, rgba);
+    }
+
+    private static async Task<Func<int, int, Task<InferenceSession>>> F3_EncoderFactory(Accelerator accelerator, string dir)
+    {
+        var bytes = await File.ReadAllBytesAsync(Path.Combine(dir, "weights", "vae_encoder.onnx"));
+        return (h, w) => Task.FromResult(InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["image"] = new[] { 1, 3, h, w } }));
+    }
+
+    /// <summary>Two reference pictures (one with sides that are not multiples of 16: the centre crop) as image_cond tokens against the reference autoencoder's: tokens at float noise next to bf16 rounding, ids exactly.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux3_References_MatchTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator); var g = Path.Combine(dir, "golden", "refs");
+        if (!File.Exists(Path.Combine(g, "cond.npy"))) throw new UnsupportedTestException("FLUX 3 golden/refs not found (golden_flux3_refs.py)");
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "repo", "text_encoder", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        using var pipe = new Flux3Pipeline(accelerator, tok, null!, null!, vae, F3_Norm(dir)) { VaeEncoderFactory = await F3_EncoderFactory(accelerator, dir) };
+        var (goldTokens, _) = Ur_Npy<float>(Path.Combine(g, "cond.npy")); var (goldIds, _) = Ur_Npy<float>(Path.Combine(g, "cond_ids.npy"));
+        var (tokens, ids) = await pipe.EncodeReferencesAsync(new[] { F3_Reference(Path.Combine(g, "ref_raw_0.npy")), F3_Reference(Path.Combine(g, "ref_raw_1.npy")) });
+        Ur_Expect(tokens.Length == goldTokens.Length, $"{tokens.Length / 128} reference tokens, the reference has {goldTokens.Length / 128}");
+        Ur_Expect(ids.Length == goldIds.Length && Enumerable.Range(0, ids.Length).All(i => ids[i] == goldIds[i]), "position ids equal the reference's");
+        double rel = F2_RelRms(tokens, goldTokens);
+        Console.WriteLine($"[Flux3] reference tokens on {accelerator.AcceleratorType}: {tokens.Length / 128} tokens, relRMS {rel:E2} vs the reference autoencoder (bf16 rounded)");
+        Ur_Expect(rel < 2e-2, $"reference tokens relRMS {rel:E2}");
+    });
+
+    /// <summary>The whole pipeline with a reference picture (the fox, as an edit of its own caption): runs and draws something that is neither flat nor identical to the text-only picture; the picture is saved for a look.</summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux3_Pipeline_WithReference_Draws() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator); var g = Path.Combine(dir, "golden", "t2i"); var gr = Path.Combine(dir, "golden", "refs");
+        if (!File.Exists(Path.Combine(gr, "ref_raw_0.npy"))) throw new UnsupportedTestException("FLUX 3 golden/refs not found (golden_flux3_refs.py)");
+        var meta = JsonDocument.Parse(File.ReadAllText(Path.Combine(g, "meta.json"))).RootElement;
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "repo", "text_encoder", "tokenizer.json")));
+        var (noise, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy"));
+        int size = meta.GetProperty("size").GetInt32();
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        using var pipe = new Flux3Pipeline(accelerator, tok,
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"text_encoder_q{F3_Bits}.safetensors")))),
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", $"transformer_q{F3_Bits}.safetensors")))), vae, F3_Norm(dir)) { VaeEncoderFactory = await F3_EncoderFactory(accelerator, dir) };
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await pipe.RunAsync(new Flux3Request { Caption = meta.GetProperty("caption").GetString()!, Width = size, Height = size, Steps = meta.GetProperty("steps").GetInt32(), Alpha = (float)meta.GetProperty("alpha").GetDouble(), Noise = noise,
+            References = new[] { F3_Reference(Path.Combine(gr, "ref_raw_0.npy")) }, Progress = (s, i, n) => Console.WriteLine($"[Flux3] {s} {i}/{n}") });
+        var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy")); int n = size * size; double sq = 0, mean = 0;
+        for (int p = 0; p < n; p++)
+            for (int c = 0; c < 3; c++)
+            {
+                double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255), have = result.Rgba[p * 4 + c];
+                sq += (have - want) * (have - want); mean += have;
+            }
+        mean /= 3.0 * n; double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
+        double sd = 0; for (int p = 0; p < n; p++) for (int c = 0; c < 3; c++) sd += Math.Pow(result.Rgba[p * 4 + c] - mean, 2); sd = Math.Sqrt(sd / (3.0 * n));
+        Console.WriteLine($"[Flux3] pipeline with a reference on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, {psnr:F1} dB against the text-only picture, grey-level spread {sd:F1}");
+        using (var f = File.Create(Path.Combine(g, $"csharp_ref_q{F3_Bits}.ppm")))
+        {
+            f.Write(System.Text.Encoding.ASCII.GetBytes($"P6 {size} {size} 255 "));
+            var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
+            f.Write(rgb);
+        }
+        Ur_Expect(sd > 20, $"the picture is not flat (spread {sd:F1})");
     });
 }

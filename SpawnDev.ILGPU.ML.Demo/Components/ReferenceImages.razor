@@ -1,0 +1,121 @@
+@using Microsoft.AspNetCore.Components.Forms
+@using SpawnDev.ILGPU.ML.Flux2
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
+
+<div class="refs">
+    <div class="refs-head">
+        <span class="refs-label">Reference images (@_items.Count / @MaxImages)</span>
+        <span class="refs-hint">optional: the picture is edited from, or composed of, what you add. Mention them in the prompt as image 1, image 2 ...</span>
+    </div>
+    <div class="refs-row">
+        @for (int i = 0; i < _items.Count; i++)
+        {
+            int index = i;
+            <div class="ref-thumb">
+                <img src="@_items[i].Url" alt="Reference image @(i + 1)" />
+                <span class="ref-index">@(i + 1)</span>
+                <button class="ref-remove" disabled="@Disabled" title="Remove" @onclick="() => RemoveAsync(index)">&#x2715;</button>
+            </div>
+        }
+        @if (_items.Count < MaxImages)
+        {
+            <label class="ref-add @(Disabled ? "disabled" : "")" title="Add reference images (JPG, PNG, WebP)">
+                +
+                <InputFile OnChange="AddAsync" accept="image/*" multiple disabled="@Disabled" class="ref-input" />
+            </label>
+        }
+    </div>
+    @if (_error != null)
+    {
+        <div class="refs-error">@_error</div>
+    }
+</div>
+
+@code {
+    private sealed record Item(string Url, Flux2ReferenceImage Image);
+
+    private readonly List<Item> _items = new();
+    private string? _error;
+
+    [Inject] SpawnJSRuntime JS { get; set; } = default!;
+
+    /// <summary>The most pictures the list takes.</summary>
+    [Parameter] public int MaxImages { get; set; } = 10;
+    /// <summary>A picture is shrunk to this many pixels on its longer side as it is added (references cost transformer tokens in proportion to their area).</summary>
+    [Parameter] public int MaxSide { get; set; } = 768;
+    [Parameter] public bool Disabled { get; set; }
+    [Parameter] public EventCallback<IReadOnlyList<Flux2ReferenceImage>> ReferencesChanged { get; set; }
+
+    public IReadOnlyList<Flux2ReferenceImage> References => _items.Select(i => i.Image).ToList();
+
+    public async Task ClearAsync()
+    {
+        _items.Clear();
+        await ReferencesChanged.InvokeAsync(References);
+        StateHasChanged();
+    }
+
+    private async Task AddAsync(InputFileChangeEventArgs e)
+    {
+        _error = null;
+        try
+        {
+            foreach (var file in e.GetMultipleFiles(MaxImages))
+            {
+                if (_items.Count >= MaxImages) break;
+                if (!file.ContentType.StartsWith("image/")) continue;
+                using var stream = file.OpenReadStream(20L * 1024 * 1024);
+                using var ms = new MemoryStream();
+                await stream.CopyToAsync(ms);
+                var bytes = ms.ToArray();
+                _items.Add(new Item($"data:{file.ContentType};base64,{Convert.ToBase64String(bytes)}", await DecodeAsync(bytes)));
+            }
+        }
+        catch (Exception ex) { _error = "Could not read the picture: " + ex.Message; }
+        await ReferencesChanged.InvokeAsync(References);
+        StateHasChanged();
+    }
+
+    private async Task RemoveAsync(int index)
+    {
+        if (index < 0 || index >= _items.Count) return;
+        _items.RemoveAt(index);
+        await ReferencesChanged.InvokeAsync(References);
+    }
+
+    private async Task<Flux2ReferenceImage> DecodeAsync(byte[] imageBytes)
+    {
+        using var blob = new Blob(new[] { imageBytes });
+        using var window = JS.Get<Window>("window");
+        using var bitmap = await window.CreateImageBitmap(blob);
+        int w = (int)bitmap.Width, h = (int)bitmap.Height;
+        double shrink = Math.Min(1.0, (double)MaxSide / Math.Max(w, h));
+        int nw = Math.Max(16, (int)Math.Round(w * shrink)), nh = Math.Max(16, (int)Math.Round(h * shrink));
+        using var canvas = new HTMLCanvasElement();
+        canvas.Width = nw; canvas.Height = nh;
+        using var ctx = canvas.Get2DContext();
+        ctx.DrawImage(bitmap, 0, 0, nw, nh);
+        using var imageData = ctx.GetImageData(0, 0, nw, nh);
+        using var data = imageData.Data;
+        return new Flux2ReferenceImage(nw, nh, data.ReadBytes());
+    }
+}
+
+<style>
+    .refs { margin-top: 0.9rem; }
+    .refs-head { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; align-items: baseline; margin-bottom: 0.4rem; }
+    .refs-label { color: #94a3b8; font-size: 0.85rem; }
+    .refs-hint { color: #475569; font-size: 0.75rem; }
+    .refs-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    .ref-thumb { position: relative; width: 84px; height: 84px; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.12); }
+    .ref-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .ref-index { position: absolute; left: 4px; bottom: 4px; min-width: 18px; padding: 0 5px; border-radius: 9px; background: rgba(0,0,0,0.65); color: #e2e8f0; font-size: 0.7rem; text-align: center; }
+    .ref-remove { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border: none; border-radius: 50%; background: rgba(0,0,0,0.6); color: white; font-size: 0.65rem; cursor: pointer; }
+    .ref-remove:hover:not(:disabled) { background: rgba(239,68,68,0.8); }
+    .ref-add { position: relative; width: 84px; height: 84px; border-radius: 8px; border: 2px dashed rgba(255,255,255,0.15); display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 1.6rem; cursor: pointer; background: rgba(255,255,255,0.02); }
+    .ref-add:hover:not(.disabled) { border-color: rgba(139,92,246,0.4); color: #c4b5fd; }
+    .ref-add.disabled { opacity: 0.5; cursor: not-allowed; }
+    .ref-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .refs-error { margin-top: 0.4rem; color: #fca5a5; font-size: 0.8rem; }
+</style>

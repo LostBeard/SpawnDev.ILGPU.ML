@@ -6,7 +6,7 @@
 <PageTitle>Image Generation — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Image Generation"
-            Description="Generate images from text on your GPU: FLUX.2 klein 4B (4 steps, 4-bit weights) or SD-Turbo (one step). Nothing leaves your machine."
+            Description="Generate images from text, or edit and combine your own pictures, on your GPU: FLUX 3 Image Klein 5.6B (16 steps), FLUX.2 klein 4B (4 steps), both with up to 10 reference images, or SD-Turbo (one step). Nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -18,14 +18,14 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="@(_model == "flux2" ? 4600 : 2500)">
+            ModelSizeMB="@(_model == "flux3" ? 5900 : _model == "flux2" ? 4600 : 2500)">
 
     <div class="gen-prompt-section">
         <label class="gen-label">Prompt:</label>
         <div class="gen-prompt-row">
-            <input type="text" class="gen-prompt-input" @bind="_prompt" @bind:event="oninput"
-                   placeholder="A serene mountain landscape at sunset with a lake reflection"
-                   disabled="@(_isModelLoading || _isRunning)" />
+            <textarea class="gen-prompt-input" rows="@(_model == "flux3" ? 5 : 1)" @bind="_prompt" @bind:event="oninput"
+                      placeholder="@(_model == "flux3" ? "FLUX 3 draws from a full scene caption: medium and style, the scene, lighting and camera, each subject with its colours, materials and position in the frame. A short prompt gives a generic picture." : "A serene mountain landscape at sunset with a lake reflection")"
+                      disabled="@(_isModelLoading || _isRunning)"></textarea>
             <button class="gen-btn" @onclick="GenerateImage"
                     disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isModelLoading || _isRunning)">
                 @GenerateButtonLabel
@@ -36,15 +36,16 @@
             <div class="gen-setting">
                 <label>Model:</label>
                 <select @bind="_model" @bind:after="ModelChanged" class="gen-setting-select" disabled="@(_isRunning || _isModelLoading)">
+                    <option value="flux3">FLUX 3 Image Klein 5.6B (best, 5.9 GB, non-commercial licence)</option>
                     <option value="flux2">FLUX.2 klein 4B (sharper, 4.6 GB)</option>
                     <option value="sd">SD Turbo (faster, 2.5 GB)</option>
                 </select>
             </div>
-            @if (_model == "flux2")
+            @if (_model == "flux2" || _model == "flux3")
             {
             <div class="gen-setting">
-                <label>Size:</label>
-                <select @bind="_fluxSize" class="gen-setting-select" disabled="@(_isRunning)" title="Larger pictures are decoded in 512 px tiles, so memory stays flat; the transformer's work grows with the area.">
+                <label>@(_references.Count > 0 ? "Longer side:" : "Size:")</label>
+                <select @bind="_fluxSize" class="gen-setting-select" disabled="@(_isRunning)" title="Larger pictures are decoded in 512 px tiles, so memory stays flat; the transformer's work grows with the area. With reference images the picture keeps the first reference's proportions.">
                     <option value="512">512x512</option>
                     <option value="768">768x768</option>
                     <option value="1024">1024x1024</option>
@@ -75,17 +76,25 @@
             </div>
         </div>
 
-        @if (!string.IsNullOrEmpty(_negativePrompt) || _showNegative)
+        @if (_model == "flux2" || _model == "flux3")
         {
-            <div class="gen-negative">
-                <label class="gen-label">Negative prompt:</label>
-                <input type="text" class="gen-prompt-input" @bind="_negativePrompt"
-                       placeholder="blurry, low quality, distorted" disabled="@(_isRunning)" />
-            </div>
+            <ReferenceImages @ref="_refs" MaxImages="10" MaxSide="768" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
         }
-        else
+
+        @if (_model == "sd")
         {
-            <button class="gen-toggle-neg" @onclick="() => _showNegative = true">+ Negative prompt</button>
+            @if (!string.IsNullOrEmpty(_negativePrompt) || _showNegative)
+            {
+                <div class="gen-negative">
+                    <label class="gen-label">Negative prompt:</label>
+                    <input type="text" class="gen-prompt-input" @bind="_negativePrompt"
+                           placeholder="blurry, low quality, distorted" disabled="@(_isRunning)" />
+                </div>
+            }
+            else
+            {
+                <button class="gen-toggle-neg" @onclick="() => _showNegative = true">+ Negative prompt</button>
+            }
         }
     </div>
 
@@ -105,7 +114,7 @@
             <img src="@_generatedImageUrl" alt="Generated image" class="gen-result-img" />
             <div class="gen-result-info">
                 <span class="gen-info-item">@_inferenceMs.ToString("F0")ms</span>
-                <span class="gen-info-item">@_imageSize x @_imageSize</span>
+                <span class="gen-info-item">@_resultWidth x @_resultHeight</span>
                 <span class="gen-info-item">@_numSteps steps</span>
                 <span class="gen-info-item">Seed: @_usedSeed</span>
             </div>
@@ -119,7 +128,7 @@
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            @(_model == "flux2" ? "FLUX.2 klein is ~4.6 GB (4-bit text encoder, transformer and VAE; two of them are on the GPU at a time)" : "SD-Turbo is ~2.5 GB (text encoder + U-Net + VAE)"). Enter a prompt and click
+            @(_model == "flux3" ? "FLUX 3 Image Klein is ~5.9 GB (4-bit text encoder, transformer and VAE; two of them are on the GPU at a time; the 140 MB VAE encoder comes with your first reference image). Its weights are under the FLUX Kommunity License: non-commercial use" : _model == "flux2" ? "FLUX.2 klein is ~4.6 GB (4-bit text encoder, transformer and VAE; two of them are on the GPU at a time)" : "SD-Turbo is ~2.5 GB (text encoder + U-Net + VAE)"). Enter a prompt and click
             <strong>Download &amp; Generate</strong> — weights stream from the hub into OPFS on first use
             (same path as SpawnDev.AI). Cached after that. Manage cache on
             <a href="cache">Model Cache</a>.
@@ -133,7 +142,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo SourceFile="Pages/GeneratePage.razor" Note="FLUX.2 klein 4B (Black Forest Labs, Apache-2.0; 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) and SD-Turbo" />
+    <PipelineHowTo SourceFile="Pages/GeneratePage.razor" Note="FLUX 3 Image Klein 5.6B (Black Forest Labs, FLUX Kommunity License, non-commercial; modified 4-bit export LostBeard/flux-3-image-klein-q4-ILGPU), FLUX.2 klein 4B (Black Forest Labs, Apache-2.0; 4-bit export LostBeard/FLUX.2-klein-4B-q4-ILGPU) and SD-Turbo" />
 
 </DemoLayout>
 
@@ -241,16 +250,36 @@
     private string? _generatedImageUrl;
     private string? _error;
     private string _modelStatusText = "FLUX.2 klein";
-    private string _model = "flux2";                    // "flux2" | "sd"
-    private int _fluxSize = 512;
+    private string _model = "flux2";                    // "flux3" | "flux2" | "sd"
+    private int _fluxSize = 512;                        // the picture side (its longer side when reference images set the proportions)
+    private int _resultWidth, _resultHeight;
     private SpawnDev.ILGPU.ML.Flux2.Flux2Pipeline? _flux;
+    private SpawnDev.ILGPU.ML.Flux3.Flux3Pipeline? _flux3;
     private const string FluxRepo = "LostBeard/FLUX.2-klein-4B-q4-ILGPU";
+    private const string Flux3Repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
+    private ReferenceImages? _refs;
+    private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
+
+    private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }
+
+    private string ModelLabel => _model == "flux3" ? "FLUX 3 Klein" : _model == "flux2" ? "FLUX.2 klein" : "SD Turbo";
+
+    /// <summary>The picture size: a square of <see cref="_fluxSize"/> pixels, or with reference images the first one's proportions with that longer side (multiples of 16).</summary>
+    private (int Width, int Height) PictureSize()
+    {
+        if (_references.Count == 0) return (_fluxSize, _fluxSize);
+        var first = _references[0];
+        double aspect = (double)first.Width / first.Height;
+        int w = aspect >= 1 ? _fluxSize : (int)Math.Round(_fluxSize * aspect / 16) * 16, h = aspect >= 1 ? (int)Math.Round(_fluxSize / aspect / 16) * 16 : _fluxSize;
+        return (Math.Max(64, w), Math.Max(64, h));
+    }
 
     private void ModelChanged()
     {
-        _pipeline?.Dispose(); _pipeline = null; _flux?.Dispose(); _flux = null;
+        _pipeline?.Dispose(); _pipeline = null; _flux?.Dispose(); _flux = null; _flux3?.Dispose(); _flux3 = null;
         _isModelLoaded = false; _generatedImageUrl = null; _error = null;
-        _modelStatusText = _model == "flux2" ? "FLUX.2 klein" : "SD Turbo";
+        _modelStatusText = ModelLabel;
+        if (_model == "sd") _ = _refs?.ClearAsync();
     }
 
     private string GenerateButtonLabel =>
@@ -296,7 +325,19 @@
                 return;
             }
 
-            _pipeline?.Dispose(); _flux?.Dispose(); _pipeline = null; _flux = null;
+            _pipeline?.Dispose(); _flux?.Dispose(); _flux3?.Dispose(); _pipeline = null; _flux = null; _flux3 = null;
+            if (_model == "flux3")
+            {
+                // only the tokenizer and the small VAE decoder load now; the text encoder and the transformer stream in per picture (the transformer then stays: the next picture skips the 3.5 GB reload)
+                _flux3 = await SpawnDev.ILGPU.ML.Flux3.Flux3Pipeline.CreateAsync(_accelerator, ModelSource, Flux3Repo, (stage, pct) =>
+                {
+                    _modelStatusText = $"FLUX 3 Klein — {stage}"; _modelProgress = pct; InvokeAsync(StateHasChanged);
+                });
+                _flux3.KeepTransformerResident = true;
+                _modelStatusText = "FLUX 3 Klein";
+                _isModelLoaded = true;
+                return;
+            }
             if (_model == "flux2")
             {
                 // only the tokenizer and the small VAE load now; the encoder and the transformer stream in per picture and leave again
@@ -368,7 +409,7 @@
         // Lazy load on first generate — matches AiImageEngine.
         if (!_isModelLoaded && !_isModelLoading)
             await LoadModelAsync();
-        if ((_pipeline == null && _flux == null) || !_isModelLoaded) return;
+        if ((_pipeline == null && _flux == null && _flux3 == null) || !_isModelLoaded) return;
 
         _isRunning = true;
         _currentStep = 0;
@@ -377,16 +418,33 @@
 
         try
         {
+            if (_flux3 != null)
+            {
+                int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
+                var (pw, ph) = PictureSize();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var image = await _flux3.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
+                {
+                    Caption = _prompt, Seed = seed, Width = pw, Height = ph, References = _references.Count > 0 ? _references : null,
+                    Progress = (stage, i, n) => { _modelStatusText = $"FLUX 3 Klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 16; _ = InvokeAsync(StateHasChanged); },
+                });
+                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _resultWidth = image.Width; _resultHeight = image.Height; _numSteps = 16;
+                _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
+                _modelStatusText = "FLUX 3 Klein";
+                _isRunning = false; StateHasChanged();
+                return;
+            }
             if (_flux != null)
             {
                 int seed = _seed ?? Environment.TickCount & 0x7FFFFFFF;
+                var (pw, ph) = PictureSize();
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var image = await _flux.RunAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
                 {
-                    Prompt = _prompt, Seed = seed, Size = _fluxSize, Steps = 4,
+                    Prompt = _prompt, Seed = seed, Size = _fluxSize, Width = _references.Count > 0 ? pw : 0, Height = _references.Count > 0 ? ph : 0, References = _references.Count > 0 ? _references : null, Steps = 4,
                     Progress = (stage, i, n) => { _modelStatusText = $"FLUX.2 klein — {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _numSteps = 4; _ = InvokeAsync(StateHasChanged); },
                 });
-                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _imageSize = image.Width; _numSteps = 4;
+                _inferenceMs = sw.Elapsed.TotalMilliseconds; _usedSeed = seed; _resultWidth = image.Width; _resultHeight = image.Height; _numSteps = 4;
                 _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, image.Rgba, image.Width, image.Height);
                 _modelStatusText = "FLUX.2 klein";
                 _isRunning = false; StateHasChanged();
@@ -409,6 +467,7 @@
 
             _inferenceMs = result.InferenceTimeMs;
             _usedSeed = result.Seed;
+            _resultWidth = result.Width; _resultHeight = result.Height;
             _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ImageRGBA, result.Width, result.Height);
         }
         catch (Exception ex)
@@ -453,6 +512,7 @@
     {
         _pipeline?.Dispose();
         _flux?.Dispose();
+        _flux3?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();
     }
