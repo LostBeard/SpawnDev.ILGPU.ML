@@ -719,7 +719,7 @@ public sealed class Trellis2Pipeline : IDisposable
     {
         _deviceAtlas ??= new DeviceUvAtlas(_acc, _sk);
         using var atlas = await _deviceAtlas.UnwrapAsync(positions, vertexCount, faces, faceCount, new UvAtlas.Options { Resolution = textureSize }, alignWinding: RepairMesh);
-        StageDone?.Invoke($"winding, normals and uv atlas on the device ({atlas.ChartCount} charts, {atlas.Utilization:P0}; {atlas.Flipped} triangles flipped)", sw.Elapsed.TotalSeconds); sw.Restart();
+        StageDone?.Invoke($"winding, normals and uv atlas on the device ({atlas.ChartCount} charts, {atlas.Utilization:P0}; {atlas.Flipped} triangles flipped; first kernels loaded in {_deviceAtlas.LoadSeconds:F1} s)", sw.Elapsed.TotalSeconds); sw.Restart();
         if (MeshStage != null)
             MeshStage("atlas", await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync(), await atlas.Faces.View.SubView(0, (long)atlas.FaceCount * 3).CopyToHostAsync());
 

@@ -1,10 +1,13 @@
 using System.Text.Json;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.ILGPU.ML.Trellis2;
 
 namespace SpawnDev.ILGPU.ML.Flux2;
+
+using FV = ArrayView1D<float, Stride1D.Dense>;
 
 /// <summary>The batch-norm statistics FLUX.2's VAE keeps for its 128-channel packed latents (export_flux2_vae.py writes vae_norm.json).</summary>
 public sealed class Flux2VaeNorm
@@ -175,11 +178,29 @@ public sealed class Flux2Pipeline : IDisposable
         return o;
     }
 
+    private Flux2Kernels? _f2;
+    private Flux2Kernels F2 => _f2 ??= new Flux2Kernels(_acc);
+    private MemoryBuffer1D<float, Stride1D.Dense>? _meanDev, _stdDev;
+    /// <summary>The batch-norm statistics on the device (uploaded once), for the kernels that patchify references and unpatchify latents.</summary>
+    private void EnsureNorm()
+    {
+        if (_meanDev != null) return;
+        _meanDev = _acc.Allocate1D(_norm.Mean); _stdDev = _acc.Allocate1D(_norm.Std);
+    }
+
     /// <summary>
     /// A reference picture as transformer tokens: prepared like the reference pipeline (<see cref="Flux2ReferencePrep"/>), encoded by the VAE (the mean of the latent distribution), patchified 2 x 2
-    /// (channel c * 4 + dy * 2 + dx), batch-normalised with the same statistics the decoder path undoes, packed row by row into [rows * columns, 128].
+    /// (channel c * 4 + dy * 2 + dx), batch-normalised with the same statistics the decoder path undoes, packed row by row into [rows * columns, 128]. The tokens come back as a host array (tests, tools);
+    /// a run uses <see cref="EncodeReferenceToDeviceAsync"/>, which leaves them on the device.
     /// </summary>
     public async Task<(float[] Tokens, int Rows, int Columns)> EncodeReferenceAsync(Flux2ReferenceImage reference)
+    {
+        var (tokens, rows, cols) = await EncodeReferenceToDeviceAsync(reference);
+        using (tokens) return (await tokens.View.CopyToHostAsync(), rows, cols);
+    }
+
+    /// <summary><see cref="EncodeReferenceAsync"/> with the tokens left on the device ([rows * columns, 128]; the caller disposes the buffer).</summary>
+    public async Task<(MemoryBuffer1D<float, Stride1D.Dense> Tokens, int Rows, int Columns)> EncodeReferenceToDeviceAsync(Flux2ReferenceImage reference)
     {
         var factory = VaeEncoderFactory ?? throw new InvalidOperationException("This pipeline has no VAE encoder (VaeEncoderFactory): reference images need " + VaeEncoderFile + ".");
         var (chw, w, h) = Flux2ReferencePrep.Prepare(reference);
@@ -193,36 +214,37 @@ public sealed class Flux2Pipeline : IDisposable
         using var img = _acc.Allocate1D(chw);
         var outputs = await enc.RunAsync(new Dictionary<string, Tensor> { [enc.InputNames[0]] = new Tensor(img.View, new[] { 1, 3, h, w }, enc.InputNames[0]) });
         int lh = h / 8, lw = w / 8;
-        var lat = await outputs[enc.OutputNames[0]].Data.SubView(0, 32L * lh * lw).CopyToHostAsync();
         int rows = h / 16, cols = w / 16;
-        var tokens = new float[(long)rows * cols * 128];
-        for (int c = 0; c < 32; c++)
-            for (int y = 0; y < rows; y++)
-                for (int x = 0; x < cols; x++)
-                    for (int py = 0; py < 2; py++)
-                        for (int px = 0; px < 2; px++)
-                        {
-                            int ch = c * 4 + py * 2 + px;
-                            float v = lat[((long)c * lh + 2 * y + py) * lw + 2 * x + px];
-                            tokens[((long)y * cols + x) * 128 + ch] = (v - _norm.Mean[ch]) / _norm.Std[ch];
-                        }
+        EnsureNorm();
+        var tokens = _acc.Allocate1D<float>((long)rows * cols * 128);
+        F2.RefTokens(outputs[enc.OutputNames[0]].Data.SubView(0, 32L * lh * lw), _meanDev!.View, _stdDev!.View, tokens.View, lh, lw);
+        await _acc.SynchronizeAsync();                       // the encoder's output belongs to its session: finished with it before the next run, and `img` outlives the launch
         return (tokens, rows, cols);
     }
 
-    /// <summary>Decode VAE input latents [32, 2*side, 2*side] (<see cref="ToVaeInput"/>) to RGBA; <paramref name="image"/> also receives the raw [-1, 1] planes when given.</summary>
+    /// <summary>Decode VAE input latents [32, 2*side, 2*side] (<see cref="ToVaeInput(float[], int)"/>) to RGBA; <paramref name="image"/> also receives the raw [-1, 1] planes when given.</summary>
     public Task<Flux2Image> DecodeAsync(float[] vaeInput, int side, float[]? image = null) => DecodeAsync(vaeInput, side, side, image);
 
     /// <summary><see cref="DecodeAsync(float[], int, float[])"/> for a rows x columns grid of tokens (a picture of 16 * columns x 16 * rows pixels); a non-square or smaller-than-the-graph picture goes through the tiled decode.</summary>
     public async Task<Flux2Image> DecodeAsync(float[] vaeInput, int rows, int columns, float[]? image = null)
     {
+        using var latBuf = _acc.Allocate1D(vaeInput);
+        return await DecodeDeviceAsync(latBuf.View, rows, columns, image);
+    }
+
+    /// <summary>
+    /// <see cref="DecodeAsync(float[], int, int, float[])"/> for latents already on the device ([32, 2 * rows, 2 * columns], <see cref="ToVaeInput(FV, int, int)"/>). The only thing that comes back is the finished picture
+    /// (and the raw planes when <paramref name="image"/> is given).
+    /// </summary>
+    public async Task<Flux2Image> DecodeDeviceAsync(FV vaeInput, int rows, int columns, float[]? image = null)
+    {
         if (rows != columns) return await DecodeTiledAsync(vaeInput, rows * 2, columns * 2, image);
         int side = rows;
         int lat = side * 2, size = lat * 8, pixels = size * size;
         if (lat > VaeTileLatent) return await DecodeTiledAsync(vaeInput, lat, lat, image);
-        using var latBuf = _acc.Allocate1D(vaeInput);
-        var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(latBuf.View, new[] { 1, 32, lat, lat }, _vae.InputNames[0]) });
+        var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(vaeInput, new[] { 1, 32, lat, lat }, _vae.InputNames[0]) });
         var vaeOut = outputs[_vae.OutputNames[0]];
-        if (image != null) vaeOut.Data.SubView(0, 3L * pixels).CopyToCPU(image);
+        if (image != null) { var planes = await vaeOut.Data.SubView(0, 3L * pixels).CopyToHostAsync(); Array.Copy(planes, image, planes.Length); }
         using var rgbaBuf = _acc.Allocate1D<int>(pixels);
         ElementWise.NchwDenormToRgba(vaeOut.Data.SubView(0, 3 * pixels), rgbaBuf.View, pixels);
         await _acc.SynchronizeAsync();
@@ -230,6 +252,17 @@ public sealed class Flux2Pipeline : IDisposable
         var rgba = new byte[4 * pixels];
         Buffer.BlockCopy(packed, 0, rgba, 0, 4 * pixels);
         return new Flux2Image { Width = size, Height = size, Rgba = rgba };
+    }
+
+    /// <summary>
+    /// Packed latents [rows * columns, 128] on the device to the VAE's input [32, 2 * rows, 2 * columns]: undo the batch-norm, then unpatchify (see <see cref="ToVaeInput(float[], int, int)"/>). The caller disposes the buffer.
+    /// </summary>
+    public MemoryBuffer1D<float, Stride1D.Dense> ToVaeInput(FV packed, int rows, int columns)
+    {
+        EnsureNorm();
+        var o = _acc.Allocate1D<float>(32L * rows * 2 * columns * 2);
+        F2.ToVaeInput(packed, _meanDev!.View, _stdDev!.View, o.View, rows, columns);
+        return o;
     }
 
     /// <summary>
@@ -241,63 +274,35 @@ public sealed class Flux2Pipeline : IDisposable
     /// <summary>Latent cells of overlap between neighbouring tiles (16 = 128 px), feathered linearly so no seam shows.</summary>
     public int VaeTileOverlap { get; set; } = 16;
 
-    private async Task<Flux2Image> DecodeTiledAsync(float[] vaeInput, int latH, int latW, float[]? image)
+    /// <summary>The tiled decode on the device: each tile is gathered, decoded and blended into weighted sums that stay there, and one kernel turns the sums into the picture.</summary>
+    private async Task<Flux2Image> DecodeTiledAsync(FV vaeInput, int latH, int latW, float[]? image)
     {
         int T = VaeTileLatent, O = Math.Min(VaeTileOverlap, T / 2), stride = T - O, tilePx = T * 8, ramp = O * 8;
         int height = latH * 8, width = latW * 8;
-        var sum = new float[3L * height * width]; var wsum = new float[(long)height * width];
+        long pixels = (long)height * width;
         List<int> Starts(int len) { var l = new List<int>(); if (len <= T) { l.Add(0); return l; } for (int x = 0; x + T < len; x += stride) l.Add(x); l.Add(len - T); return l; }
         var ys = Starts(latH); var xs = Starts(latW);
-        var tileIn = new float[32 * T * T];
+        using var sum = _acc.Allocate1D<float>(3 * pixels); using var wsum = _acc.Allocate1D<float>(pixels);
+        using var tileIn = _acc.Allocate1D<float>(32L * T * T);
+        sum.MemSetToZero(); wsum.MemSetToZero();
         foreach (int y0 in ys)
             foreach (int x0 in xs)
             {
-                for (int c = 0; c < 32; c++)
-                    for (int y = 0; y < T; y++)
-                    {
-                        int sy = Math.Min(y0 + y, latH - 1);                                  // a picture smaller than the graph is padded by repeating its last row / column
-                        for (int x = 0; x < T; x++) tileIn[(c * T + y) * T + x] = vaeInput[((long)c * latH + sy) * latW + Math.Min(x0 + x, latW - 1)];
-                    }
-                using var latBuf = _acc.Allocate1D(tileIn);
-                var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(latBuf.View, new[] { 1, 32, T, T }, _vae.InputNames[0]) });
-                var tile = await outputs[_vae.OutputNames[0]].Data.SubView(0, 3L * tilePx * tilePx).CopyToHostAsync();
-                int px0 = x0 * 8, py0 = y0 * 8;
+                F2.TileGather(vaeInput, tileIn.View, latH, latW, y0, x0, T);
+                var outputs = await _vae.RunAsync(new Dictionary<string, Tensor> { [_vae.InputNames[0]] = new Tensor(tileIn.View, new[] { 1, 32, T, T }, _vae.InputNames[0]) });
                 bool firstY = y0 == 0, lastY = latH <= T || y0 == latH - T, firstX = x0 == 0, lastX = latW <= T || x0 == latW - T;
-                for (int y = 0; y < tilePx && py0 + y < height; y++)
-                {
-                    float wy = Feather(y, tilePx, ramp, firstY, lastY);
-                    for (int x = 0; x < tilePx && px0 + x < width; x++)
-                    {
-                        float w = wy * Feather(x, tilePx, ramp, firstX, lastX);
-                        long o = (long)(py0 + y) * width + px0 + x;
-                        wsum[o] += w;
-                        for (int c = 0; c < 3; c++) sum[c * (long)height * width + o] += w * tile[((long)c * tilePx + y) * tilePx + x];
-                    }
-                }
+                int flags = (firstY ? 1 : 0) | (lastY ? 2 : 0) | (firstX ? 4 : 0) | (lastX ? 8 : 0);
+                F2.TileBlend(outputs[_vae.OutputNames[0]].Data.SubView(0, 3L * tilePx * tilePx), sum.View, wsum.View, tilePx, width, height, x0 * 8, y0 * 8, ramp, flags);
             }
-        long pixels = (long)height * width;
+        using var rgbaBuf = _acc.Allocate1D<int>(pixels);
+        using var planes = _acc.Allocate1D<float>(image != null ? 3 * pixels : 1);
+        F2.TileFinalize(sum.View, wsum.View, rgbaBuf.View, planes.View, (int)pixels, image != null ? 1 : 0);
+        await _acc.SynchronizeAsync();
+        var packed = await rgbaBuf.CopyToHostAsync<int>(0, (int)pixels);
         var rgba = new byte[4 * pixels];
-        for (long i = 0; i < pixels; i++)
-        {
-            float inv = 1f / wsum[i];
-            for (int c = 0; c < 3; c++)
-            {
-                float v = sum[c * pixels + i] * inv;
-                if (image != null) image[c * pixels + i] = v;
-                rgba[i * 4 + c] = (byte)Math.Clamp((int)((v + 1f) * 0.5f * 255f + 0.5f), 0, 255);
-            }
-            rgba[i * 4 + 3] = 255;
-        }
+        Buffer.BlockCopy(packed, 0, rgba, 0, 4 * (int)pixels);
+        if (image != null) { var raw = await planes.CopyToHostAsync<float>(0, (int)(3 * pixels)); Array.Copy(raw, image, raw.Length); }
         return new Flux2Image { Width = width, Height = height, Rgba = rgba };
-    }
-
-    /// <summary>Blend weight of pixel <paramref name="i"/> of a tile: a linear ramp over <paramref name="ramp"/> pixels at each side that has a neighbour, 1 elsewhere.</summary>
-    private static float Feather(int i, int n, int ramp, bool first, bool last)
-    {
-        float w = 1f;
-        if (!first && i < ramp) w = Math.Min(w, (i + 1f) / (ramp + 1f));
-        if (!last && n - 1 - i < ramp) w = Math.Min(w, (n - i) / (ramp + 1f));
-        return w;
     }
 
     /// <summary>The most reference pictures one request may carry.</summary>
@@ -325,9 +330,9 @@ public sealed class Flux2Pipeline : IDisposable
         int rows = pxH / 16, cols = pxW / 16, nImg = rows * cols, nTxt = Flux2TextEncoder.SeqLen;
         void Report(string s, int i, int n) => request.Progress?.Invoke(s, i, n);
 
-        // 1. text (the embeddings of the last prompt are kept, so drawing the same prompt again never loads the encoder)
-        float[] embeds;
-        if (_cachedEmbeds != null && _cachedPrompt == request.Prompt) embeds = _cachedEmbeds;
+        // 1. text (the embeddings of the last prompt stay on the device: drawing the same prompt again never loads the encoder, and nothing is uploaded per step)
+        MemoryBuffer1D<float, Stride1D.Dense> embeds;
+        if (_cachedEmbedsDev != null && _cachedPrompt == request.Prompt) embeds = _cachedEmbedsDev;
         else
         {
             Report("text encoder", 0, 1);
@@ -336,10 +341,14 @@ public sealed class Flux2Pipeline : IDisposable
             using (var enc = new Flux2TextEncoder(_acc, w))
             {
                 enc.Encode(ids, real);
+                var kept = _acc.Allocate1D<float>(enc.Output.Length);
+                kept.View.CopyFrom(enc.Output);
                 await _acc.SynchronizeAsync();
-                embeds = await enc.Output.CopyToHostAsync();
+                _cachedEmbedsDev?.Dispose();
+                _cachedEmbedsDev = kept;
             }
-            _cachedPrompt = request.Prompt; _cachedEmbeds = embeds;
+            _cachedPrompt = request.Prompt;
+            embeds = _cachedEmbedsDev!;
         }
 
         // 2. denoise and decode each seed; the transformer stays loaded for all of them
@@ -347,18 +356,16 @@ public sealed class Flux2Pipeline : IDisposable
         var txtIds = TextIds(nTxt);
         // the references: encoded now (the encoder's graph is built per size and freed again), appended to the picture's tokens with their own positions
         var allIds = new List<int>(ImageIds(rows, cols));
-        var refTokens = new List<float[]>(); int nRef = 0;
+        var refTokens = new List<MemoryBuffer1D<float, Stride1D.Dense>>(); int nRef = 0;
         if (refs != null)
             for (int r = 0; r < refs.Count; r++)
             {
                 Report("reference " + (r + 1), r, refs.Count);
-                var (tokens, rr, cc) = await EncodeReferenceAsync(refs[r]);
+                var (tokens, rr, cc) = await EncodeReferenceToDeviceAsync(refs[r]);
                 refTokens.Add(tokens); nRef += rr * cc;
                 allIds.AddRange(ImageIds(rr, cc, 10 + 10 * r));
             }
         var imgIds = allIds.ToArray();
-        var input = new float[(long)(nImg + nRef) * Flux2Transformer.InChannels];            // [the picture's tokens | the references' tokens]
-        { long o = (long)nImg * Flux2Transformer.InChannels; foreach (var t in refTokens) { Array.Copy(t, 0, input, o, t.Length); o += t.Length; } }
         var images = new List<Flux2Image>();
         Flux2Weights tw; Flux2Transformer tr;
         if (_residentTr != null && _residentTokens == nImg + nRef) { tw = _residentWeights!; tr = _residentTr; }
@@ -371,27 +378,33 @@ public sealed class Flux2Pipeline : IDisposable
         }
         try
         {
+        // the transformer's input holds [the picture's tokens | the references' tokens]; the references go in once, the picture's tokens are rewritten by every step
+        tr.SetPositions(imgIds, txtIds);
+        { long o = (long)nImg * Flux2Transformer.InChannels; foreach (var t in refTokens) { tr.InputLatents.SubView(o, t.Length).CopyFrom(t.View); o += t.Length; } }
+        await _acc.SynchronizeAsync();
+        foreach (var t in refTokens) t.Dispose();
+        refTokens.Clear();
+        long nLat = (long)nImg * Flux2Transformer.InChannels;
         for (int n = 0; n < seeds.Length; n++)
         {
-            var latents = request.Noise?.ToArray() ?? GaussianNoise(nImg * Flux2Transformer.InChannels, seeds[n]);
+            tr.InputLatents.SubView(0, nLat).CopyFromCPU(request.Noise?.ToArray() ?? GaussianNoise(nImg * Flux2Transformer.InChannels, seeds[n]));
             for (int i = 0; i < request.Steps; i++)
             {
                 Report(seeds.Length > 1 ? $"denoise {n + 1}/{seeds.Length}" : "denoise", i, request.Steps);
-                Array.Copy(latents, input, latents.Length);
-                tr.Forward(input, embeds, Flux2Scheduler.Timestep(sigmas, i), imgIds, txtIds);
-                await _acc.SynchronizeAsync();
-                var pred = await tr.Output.SubView(0, (long)nImg * Flux2Transformer.InChannels).CopyToHostAsync();
-                float dt = (float)(sigmas[i + 1] - sigmas[i]);
-                for (int k = 0; k < latents.Length; k++) latents[k] += dt * pred[k];
+                tr.Forward(tr.InputLatents, embeds.View, Flux2Scheduler.Timestep(sigmas, i));
+                F2.Euler(tr.InputLatents, tr.Output, (float)(sigmas[i + 1] - sigmas[i]), (int)nLat);      // latents += dt * prediction, where they are
+                await _acc.SynchronizeAsync();                                                           // bounds the queue; nothing crosses to the host
             }
             Report("vae", n, seeds.Length);
-            var image = await DecodeAsync(ToVaeInput(latents, rows, cols), rows, cols);
+            using var vaeIn = ToVaeInput(tr.InputLatents.SubView(0, nLat), rows, cols);
+            var image = await DecodeDeviceAsync(vaeIn.View, rows, cols);
             images.Add(image);
             if (onImage != null) await onImage(n, image);
         }
         }
         finally
         {
+            foreach (var t in refTokens) t.Dispose();
             if (KeepTransformerResident) { _residentWeights = tw; _residentTr = tr; _residentTokens = nImg + nRef; }
             else { if (ReferenceEquals(tr, _residentTr)) { _residentTr = null; _residentWeights = null; } tr.Dispose(); tw.Dispose(); }
         }
@@ -408,9 +421,9 @@ public sealed class Flux2Pipeline : IDisposable
     private Flux2Transformer? _residentTr;
     private int _residentTokens;
     private string? _cachedPrompt;
-    private float[]? _cachedEmbeds;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _cachedEmbedsDev;
 
-    /// <summary>Free the transformer kept by <see cref="KeepTransformerResident"/> (the cached prompt embeddings stay: they are host memory).</summary>
+    /// <summary>Free the transformer kept by <see cref="KeepTransformerResident"/> (the cached prompt embeddings stay: 16 MB on the device).</summary>
     public void ReleaseResident()
     {
         _residentTr?.Dispose(); _residentWeights?.Dispose();
@@ -421,5 +434,5 @@ public sealed class Flux2Pipeline : IDisposable
     private (int Height, int Width) _encoderKey;
 
     /// <summary>Frees the resident VAE decoder and encoder and any kept transformer. The accelerator is not touched.</summary>
-    public void Dispose() { ReleaseResident(); _encoder?.Dispose(); _encoder = null; _vae.Dispose(); _elementWise?.Dispose(); }
+    public void Dispose() { ReleaseResident(); _cachedEmbedsDev?.Dispose(); _cachedEmbedsDev = null; _meanDev?.Dispose(); _stdDev?.Dispose(); _meanDev = _stdDev = null; _encoder?.Dispose(); _encoder = null; _vae.Dispose(); _elementWise?.Dispose(); }
 }

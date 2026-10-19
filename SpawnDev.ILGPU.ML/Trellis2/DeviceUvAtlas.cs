@@ -42,6 +42,9 @@ public sealed class DeviceUvAtlas
     /// <summary>What the last <see cref="UnwrapAsync"/> did, step by step (diagnostic).</summary>
     public List<string> Log { get; } = new();
 
+    /// <summary>Seconds the last <see cref="UnwrapAsync"/> spent loading (compiling) the kernels of its first stage (diagnostic).</summary>
+    public double LoadSeconds { get; private set; }
+
     private const int PS = 16;          // floats per chart: u0 (3), v0 (3), cos, sin, minX, minY, w, h, scale, x, y, -
     private const int Angles = 24;
     private const int Buckets = 512;
@@ -405,6 +408,7 @@ public sealed class DeviceUvAtlas
     {
         options ??= new UvAtlas.Options();
         int nv = vertexCount, nf = faceCount, res = options.Resolution;
+        var loadClock = System.Diagnostics.Stopwatch.StartNew();
         var count = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(GpuMeshSimplifier.CountImpl);
         var fill = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV>(GpuMeshSimplifier.FillImpl);
         var sortList = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(SortListImpl);
@@ -424,6 +428,8 @@ public sealed class DeviceUvAtlas
         var fillInt = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int>(FillIntImpl);
         var badK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV, float>(BadImpl);
         var dissolve = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, IV, float>(DissolveImpl);
+
+        LoadSeconds = loadClock.Elapsed.TotalSeconds;
 
         // the vertex -> faces table
         using var vcount = _acc.Allocate1D<int>(Math.Max(1, nv)); using var vfill = _acc.Allocate1D<int>(Math.Max(1, nv));

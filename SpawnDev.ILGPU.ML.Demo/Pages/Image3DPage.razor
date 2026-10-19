@@ -1,6 +1,8 @@
 @page "/image-to-3d"
 @page "/text-to-3d"
 @using SpawnDev.SpawnJS
+@using global::ILGPU
+@using global::ILGPU.Runtime
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Trellis2
 @using SpawnDev.ILGPU.ML.SkinTokens
@@ -82,7 +84,7 @@
     {
         <ImageDropZone @bind-ImageDataUrl="_imageDataUrl" OnImageLoaded="@HandleImageLoaded" SampleImages="@_samples" />
         <p class="t3d-hint">Best results: one whole object. Images with a transparent background are used as is; others are cut out with RMBG-1.4 first.</p>
-        @if (_imagePixels != null)
+        @if (_imageBytes != null)
         {
             <button class="t3d-btn" @onclick="GenerateFromImage" disabled="@_isRunning">@ButtonLabel</button>
         }
@@ -252,7 +254,9 @@
     private double _modelProgress, _inferenceMs;
     private string _modelStatusText = "TRELLIS.2";
     private string? _error, _imageDataUrl, _sourceImageUrl, _resultInfo, _currentStage;
-    private int[]? _imagePixels;
+    // the dropped picture stays in the browser (the Uint8ClampedArray of its ImageData): it goes to the GPU from there, never through managed memory
+    private SpawnDev.SpawnJS.JSObjects.ImageData? _imageData;
+    private SpawnDev.SpawnJS.JSObjects.TypedArray? _imageBytes;
     private int _imageWidth, _imageHeight;
     private byte[]? _glb;
     private readonly List<(string Name, double Seconds)> _stages = new();
@@ -558,26 +562,31 @@
             }
             // Auto: draw, cut out, and keep the drawing whose cut-out touches the frame least (a cropped drawing becomes a truncated model).
             // SD Turbo is cheap per picture, so it tries one at a time (up to 4); FLUX.2 loads 4 GB of weights per call, so it draws two in one go.
-            int[]? best = null; int bw = 0, bh = 0, usedSeed = _seed; double bestTouch = double.MaxValue; Candidate? bestCandidate = null;
+            MemoryBuffer1D<int, Stride1D.Dense>? best = null; int bw = 0, bh = 0, usedSeed = _seed; double bestTouch = double.MaxValue; Candidate? bestCandidate = null;
             // FLUX 3 takes about two minutes a picture, so it tries two one at a time.
             int[][] rounds = _imageModel == "sd" ? new[] { new[] { _seed }, new[] { _seed + 1 }, new[] { _seed + 2 }, new[] { _seed + 3 } }
                 : _imageModel == "flux3" ? new[] { new[] { _seed }, new[] { _seed + 1 } } : new[] { new[] { _seed, _seed + 1 } };
-            foreach (var seeds in rounds)
+            try
             {
-                var drawn = await DrawAsync(seeds);
-                foreach (var c in drawn)
+                foreach (var seeds in rounds)
                 {
-                    var sw = System.Diagnostics.Stopwatch.StartNew();
-                    _currentStage = $"cutting out seed {c.Seed}"; StateHasChanged();
-                    var cut = await CutOutAsync(ToPixels(c), c.Width, c.Height);
-                    double touch = BorderTouch(cut, c.Width, c.Height);
-                    OnStageDone($"cut-out of seed {c.Seed} (on the frame {touch:P0})", sw.Elapsed.TotalSeconds);
-                    if (touch < bestTouch) { best = cut; bw = c.Width; bh = c.Height; usedSeed = c.Seed; bestTouch = touch; bestCandidate = c; }
+                    var drawn = await DrawAsync(seeds);
+                    foreach (var c in drawn)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        _currentStage = $"cutting out seed {c.Seed}"; StateHasChanged();
+                        var cut = await CutOutAsync(c);
+                        double touch = await SpawnDev.ILGPU.ML.Preprocessing.RgbaStats.BorderTouchAsync(_accelerator!, cut.View, c.Width, c.Height);
+                        OnStageDone($"cut-out of seed {c.Seed} (on the frame {touch:P0})", sw.Elapsed.TotalSeconds);
+                        if (touch < bestTouch) { best?.Dispose(); best = cut; bw = c.Width; bh = c.Height; usedSeed = c.Seed; bestTouch = touch; bestCandidate = c; }
+                        else cut.Dispose();
+                    }
+                    if (bestTouch < 0.005) break;
                 }
-                if (bestTouch < 0.005) break;
+                _sourceImageUrl = bestCandidate!.Url;
+                await RunTrellisAsync(best!.View, bw, bh, total, $"\"{_prompt}\" (image seed {usedSeed})");
             }
-            _sourceImageUrl = bestCandidate!.Url;
-            await RunTrellisAsync(best!, bw, bh, total, $"\"{_prompt}\" (image seed {usedSeed})");
+            finally { best?.Dispose(); }
         }
         catch (Exception ex) { Fail(ex); }
         finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
@@ -610,21 +619,23 @@
             if (!await EnsureAcceleratorAsync()) return;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             _currentStage = $"cutting out seed {c.Seed}"; StateHasChanged();
-            var cut = await CutOutAsync(ToPixels(c), c.Width, c.Height);
+            using var cut = await CutOutAsync(c);
             OnStageDone($"cut-out of seed {c.Seed}", sw.Elapsed.TotalSeconds);
             _sourceImageUrl = c.Url;
-            await RunTrellisAsync(cut, c.Width, c.Height, total, $"\"{_prompt}\" (image seed {c.Seed})");
+            await RunTrellisAsync(cut.View, c.Width, c.Height, total, $"\"{_prompt}\" (image seed {c.Seed})");
         }
         catch (Exception ex) { Fail(ex); }
         finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
     }
 
-    private static int[] ToPixels(Candidate c)
+    /// <summary>The drawn picture on the device with its alpha set opaque (the drawing has no alpha of its own). The bytes are the ones already held for showing the picture (one block copy to ints, no loop; the alpha is set on the device).</summary>
+    private MemoryBuffer1D<int, Stride1D.Dense> UploadCandidate(Candidate c)
     {
         var px = new int[c.Width * c.Height];
-        Buffer.BlockCopy(c.Rgba, 0, px, 0, px.Length * 4);
-        for (int i = 0; i < px.Length; i++) px[i] |= unchecked((int)0xFF000000);
-        return px;
+        Buffer.BlockCopy(c.Rgba, 0, px, 0, px.Length * 4);             // one memory move, no loop
+        var buf = _accelerator!.Allocate1D(px);
+        SpawnDev.ILGPU.ML.Preprocessing.RgbaStats.MakeOpaque(_accelerator!, buf.View, c.Width * c.Height);
+        return buf;
     }
 
     /// <summary>Load the chosen image model on first use (FLUX.2 klein builds only its tokenizer and small VAE here; its two 2 GB stages stream in per draw).</summary>
@@ -730,29 +741,39 @@
 
     private async Task GenerateFromImage()
     {
-        if (_imagePixels == null) return;
+        if (_imageBytes == null) return;
         Begin();
         var total = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             if (!await EnsureAcceleratorAsync()) return;
-            var px = _imagePixels;
-            bool opaque = true;
-            foreach (var p in px) if (((p >> 24) & 255) != 255) { opaque = false; break; }
-            if (opaque)
+            using var source = SpawnDev.ILGPU.ML.Preprocessing.RgbaUpload.FromTypedArray(_accelerator!, _imageBytes, _imageWidth, _imageHeight);
+            MemoryBuffer1D<int, Stride1D.Dense>? cut = null;
+            try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                px = await CutOutAsync(px, _imageWidth, _imageHeight);
-                OnStageDone("background removal (RMBG-1.4)", sw.Elapsed.TotalSeconds);
+                if (await SpawnDev.ILGPU.ML.Preprocessing.RgbaStats.IsFullyOpaqueAsync(_accelerator!, source.View, _imageWidth, _imageHeight))
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    cut = await CutOutAsync(source.View, _imageWidth, _imageHeight);
+                    OnStageDone("background removal (RMBG-1.4)", sw.Elapsed.TotalSeconds);
+                }
+                _sourceImageUrl = _imageDataUrl;
+                await RunTrellisAsync((cut ?? source).View, _imageWidth, _imageHeight, total, "image");
             }
-            _sourceImageUrl = _imageDataUrl;
-            await RunTrellisAsync(px, _imageWidth, _imageHeight, total, "image");
+            finally { cut?.Dispose(); }
         }
         catch (Exception ex) { Fail(ex); }
         finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
     }
 
-    private async Task<int[]> CutOutAsync(int[] px, int w, int h)
+    /// <summary>The drawn picture with its background cut away, on the device (the caller disposes it).</summary>
+    private async Task<MemoryBuffer1D<int, Stride1D.Dense>> CutOutAsync(Candidate c)
+    {
+        using var source = UploadCandidate(c);
+        return await CutOutAsync(source.View, c.Width, c.Height);
+    }
+
+    private async Task<MemoryBuffer1D<int, Stride1D.Dense>> CutOutAsync(ArrayView1D<int, Stride1D.Dense> rgba, int w, int h)
     {
         if (_rmbg == null)
         {
@@ -762,25 +783,12 @@
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.RMBG14, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel, http: Http);
             _rmbg = new SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline(session, _accelerator!);
         }
-        var r = await _rmbg.RemoveBackgroundAsync(px, w, h);
+        var cut = await _rmbg.RemoveBackgroundToDeviceAsync(rgba, w, h);
         _rmbg.ReleaseWorkingMemory();   // its 1024 px feature maps stay parked otherwise, and the next SD decode needs that VRAM
-        return r.ResultPixels;
+        return cut;
     }
 
-    private static double BorderTouch(int[] px, int w, int h)
-    {
-        int ring = 0, hit = 0;
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-            {
-                if (x >= 2 && y >= 2 && x < w - 2 && y < h - 2) continue;
-                ring++;
-                if (((px[y * w + x] >> 24) & 255) > 127) hit++;
-            }
-        return ring == 0 ? 0 : (double)hit / ring;
-    }
-
-    private async Task RunTrellisAsync(int[] px, int w, int h, System.Diagnostics.Stopwatch total, string label)
+    private async Task RunTrellisAsync(ArrayView1D<int, Stride1D.Dense> rgba, int w, int h, System.Diagnostics.Stopwatch total, string label)
     {
         _flux?.ReleaseResident();                                  // FLUX.2's transformer (2.6 GB) must not sit on the GPU while TRELLIS.2 runs
         _flux3?.ReleaseResident();                                 // nor FLUX 3's (3.5 GB)
@@ -789,7 +797,7 @@
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
         _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : _downloadBytes == 0 && !_ready ? "TRELLIS.2 (loading from browser storage)" : "TRELLIS.2";
         _currentStage = "image prep"; StateHasChanged();
-        try { _glb = await _trellis!.GenerateGlbAsync(px, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize }); }
+        try { _glb = await _trellis!.GenerateGlbAsync(rgba, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize }); }
         finally { _trellisPhase = false; }
         _ready = true; _isLoading = false;
         _downloadBytes = _streamedBytes;                          // the planned files are in OPFS now
@@ -821,9 +829,9 @@
             canvas.Width = w; canvas.Height = h;
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
-            using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _imagePixels = data.Read<int>();
+            _imageBytes?.Dispose(); _imageData?.Dispose();
+            _imageData = ctx.GetImageData(0, 0, w, h);
+            _imageBytes = _imageData.Data;
             _imageWidth = w; _imageHeight = h;
         }
         catch (Exception ex) { Fail(ex); }
@@ -857,6 +865,7 @@
         _flux?.Dispose();
         _flux3?.Dispose();
         _rmbg?.Dispose();
+        _imageBytes?.Dispose(); _imageData?.Dispose();
         _trellis?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();

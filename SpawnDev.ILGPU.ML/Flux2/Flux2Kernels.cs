@@ -227,4 +227,107 @@ public sealed class Flux2Kernels
         _dequantRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, UV, ArrayView1D<int, Stride1D.Dense>, FV, int>(DequantRowsImpl);
         _dequantRows(count * K, q, ids, o, K);
     }
+
+    // ───────────────────────────────────────────── the denoising loop and the VAE glue, on the device ──────────────
+
+    private Action<Index1D, FV, FV, float>? _euler;
+    private static void EulerImpl(Index1D k, FV lat, FV pred, float dt) { lat[k] += dt * pred[k]; }
+    /// <summary>lat += dt * pred for the first <paramref name="count"/> elements: one Euler step of the flow, in place.</summary>
+    public void Euler(FV lat, FV pred, float dt, int count)
+    {
+        _euler ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(EulerImpl);
+        _euler(count, lat, pred, dt);
+    }
+
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _toVaeInput;
+    private static void ToVaeInputImpl(Index1D idx, FV packed, FV mean, FV std, FV o, int outH, int outW, int cols)
+    {
+        int xx = idx % outW, rest = idx / outW, yy = rest % outH, c = rest / outH;
+        int y = yy / 2, py = yy % 2, x = xx / 2, px = xx % 2, ch = c * 4 + py * 2 + px, cell = y * cols + x;
+        o[idx] = packed[cell * 128 + ch] * std[ch] + mean[ch];
+    }
+    /// <summary>Packed latents [rows * columns, 128] to the VAE's input [32, 2 * rows, 2 * columns]: undo the batch-norm, then unpatchify.</summary>
+    public void ToVaeInput(FV packed, FV mean, FV std, FV o, int rows, int columns)
+    {
+        _toVaeInput ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(ToVaeInputImpl);
+        _toVaeInput(32 * rows * 2 * columns * 2, packed, mean, std, o, rows * 2, columns * 2, columns);
+    }
+
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _refTokens;
+    private static void RefTokensImpl(Index1D idx, FV lat, FV mean, FV std, FV tokens, int lh, int lw, int cols)
+    {
+        int cell = idx / 128, ch = idx % 128, y = cell / cols, x = cell % cols, c = ch / 4, py = (ch / 2) % 2, px = ch % 2;
+        float v = lat[(c * lh + 2 * y + py) * lw + 2 * x + px];
+        tokens[idx] = (v - mean[ch]) / std[ch];
+    }
+    /// <summary>A VAE-encoded reference [32, lh, lw] to transformer tokens [rows * columns, 128]: patchify 2 x 2 and batch-normalise.</summary>
+    public void RefTokens(FV lat, FV mean, FV std, FV tokens, int lh, int lw)
+    {
+        int rows = lh / 2, cols = lw / 2;
+        _refTokens ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(RefTokensImpl);
+        _refTokens(rows * cols * 128, lat, mean, std, tokens, lh, lw, cols);
+    }
+
+    private Action<Index1D, FV, FV, int, int, int, int, int>? _tileGather;
+    private static void TileGatherImpl(Index1D idx, FV src, FV tile, int latH, int latW, int y0, int x0, int T)
+    {
+        int x = idx % T, rest = idx / T, y = rest % T, c = rest / T;
+        int sy = Math.Min(y0 + y, latH - 1), sx = Math.Min(x0 + x, latW - 1);       // a picture smaller than the graph is padded by repeating its last row / column
+        tile[idx] = src[((long)c * latH + sy) * latW + sx];
+    }
+    /// <summary>The [32, T, T] tile of a [32, latH, latW] latent whose corner is (y0, x0).</summary>
+    public void TileGather(FV src, FV tile, int latH, int latW, int y0, int x0, int T)
+    {
+        _tileGather ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int>(TileGatherImpl);
+        _tileGather(32 * T * T, src, tile, latH, latW, y0, x0, T);
+    }
+
+    private static float Feather(int i, int n, int ramp, int first, int last)
+    {
+        float w = 1f;
+        if (first == 0 && i < ramp) w = MathF.Min(w, (i + 1f) / (ramp + 1f));
+        if (last == 0 && n - 1 - i < ramp) w = MathF.Min(w, (n - i) / (ramp + 1f));
+        return w;
+    }
+
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int>? _tileBlend;
+    private static void TileBlendImpl(Index1D idx, FV tile, FV sum, FV wsum, int tilePx, int width, int height, int px0, int py0, int ramp, int flags)
+    {
+        int x = idx % tilePx, y = idx / tilePx;
+        if (py0 + y >= height || px0 + x >= width) return;
+        float w = Feather(y, tilePx, ramp, flags & 1, (flags >> 1) & 1) * Feather(x, tilePx, ramp, (flags >> 2) & 1, (flags >> 3) & 1);
+        long o = (long)(py0 + y) * width + px0 + x, plane = (long)height * width, tp = (long)tilePx * tilePx;
+        long t0 = (long)y * tilePx + x;
+        wsum[o] += w;
+        sum[o] += w * tile[t0];
+        sum[plane + o] += w * tile[tp + t0];
+        sum[2 * plane + o] += w * tile[2 * tp + t0];
+    }
+    /// <summary>
+    /// Adds a decoded tile [3, tilePx, tilePx] at (py0, px0) into the weighted sums of the picture: each pixel's weight is a linear ramp over <paramref name="ramp"/> pixels at every side that has a neighbour
+    /// (<paramref name="flags"/>: bit 0 first row of tiles, 1 last row, 2 first column, 3 last column). Tiles are added one dispatch at a time, so no two threads touch a pixel at once.
+    /// </summary>
+    public void TileBlend(FV tile, FV sum, FV wsum, int tilePx, int width, int height, int px0, int py0, int ramp, int flags)
+    {
+        _tileBlend ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int>(TileBlendImpl);
+        _tileBlend(tilePx * tilePx, tile, sum, wsum, tilePx, width, height, px0, py0, ramp, flags);
+    }
+
+    private Action<Index1D, FV, FV, IV, FV, int, int>? _tileFinalize;
+    private static void TileFinalizeImpl(Index1D i, FV sum, FV wsum, IV rgba, FV image, int pixels, int writeImage)
+    {
+        float inv = 1f / wsum[i];
+        float v0 = sum[i] * inv, v1 = sum[pixels + i] * inv, v2 = sum[2 * pixels + i] * inv;
+        int b0 = Math.Max(0, Math.Min(255, (int)((v0 + 1f) * 0.5f * 255f + 0.5f)));
+        int b1 = Math.Max(0, Math.Min(255, (int)((v1 + 1f) * 0.5f * 255f + 0.5f)));
+        int b2 = Math.Max(0, Math.Min(255, (int)((v2 + 1f) * 0.5f * 255f + 0.5f)));
+        rgba[i] = b0 | (b1 << 8) | (b2 << 16) | (255 << 24);
+        if (writeImage != 0) { image[i] = v0; image[pixels + i] = v1; image[2 * pixels + i] = v2; }
+    }
+    /// <summary>The blended picture: sum / weight to packed RGBA (alpha 255); the raw [-1, 1] planes go to <paramref name="image"/> when <paramref name="writeImage"/> is non-zero.</summary>
+    public void TileFinalize(FV sum, FV wsum, IV rgba, FV image, int pixels, int writeImage)
+    {
+        _tileFinalize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int>(TileFinalizeImpl);
+        _tileFinalize(pixels, sum, wsum, rgba, image, pixels, writeImage);
+    }
 }

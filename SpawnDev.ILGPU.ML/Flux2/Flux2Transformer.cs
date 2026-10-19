@@ -63,6 +63,22 @@ public sealed class Flux2Transformer : IDisposable
     /// <summary>Device views of the last <see cref="Forward"/> result, [imageTokens, 128].</summary>
     public FV Output => _out.View;
 
+    /// <summary>
+    /// The latents input of <see cref="Forward(FV, FV, float)"/>, [imageTokens, 128]: write the picture's tokens (and, after them, the references' tokens) here and run the device overload, so the loop never crosses to the host.
+    /// </summary>
+    public FV InputLatents => _inLat.View;
+
+    /// <summary>
+    /// Sets the rotary tables for the position ids of this run ([imageTokens, 4] and [textTokens, 4]). The tables are a function of the ids alone, so they are built once per run, not per step
+    /// (in double precision: the same tables the reference is checked against; a float sin/cos on the device is not exact enough for the larger angles and cost the picture 0.3 dB).
+    /// </summary>
+    public void SetPositions(int[] imgIds, int[] txtIds)
+    {
+        var all = new int[_n * 4]; Array.Copy(txtIds, all, _nTxt * 4); Array.Copy(imgIds, 0, all, _nTxt * 4, _nImg * 4);
+        var (cos, sin) = RopeTables(all, _n);
+        _cosT.View.SubView(0, cos.Length).CopyFromCPU(cos); _sinT.View.SubView(0, sin.Length).CopyFromCPU(sin);
+    }
+
     /// <summary>Intermediate checkpoints for tests: name, device view, rows, columns.</summary>
     public Action<string, FV, int, int>? Probe;
 
@@ -113,9 +129,7 @@ public sealed class Flux2Transformer : IDisposable
     {
         _inLat.View.SubView(0, (long)_nImg * InChannels).CopyFromCPU(latents);
         _inTxt.View.SubView(0, (long)_nTxt * JointDim).CopyFromCPU(promptEmbeds);
-        var all = new int[_n * 4]; Array.Copy(txtIds, all, _nTxt * 4); Array.Copy(imgIds, 0, all, _nTxt * 4, _nImg * 4);
-        var (cos, sin) = RopeTables(all, _n);
-        _cosT.View.SubView(0, cos.Length).CopyFromCPU(cos); _sinT.View.SubView(0, sin.Length).CopyFromCPU(sin);
+        SetPositions(imgIds, txtIds);
         Forward(_inLat.View, _inTxt.View, t);
     }
 

@@ -77,7 +77,72 @@ public class BackgroundRemovalPipeline : IDisposable
         float threshold)
     {
         var sw = Stopwatch.StartNew();
+        using var cut = await RemoveBackgroundToDeviceAsync(rgbaPixels, width, height, threshold).ConfigureAwait(false);
+        int pixelCount = width * height;
+        var resultPixels = await cut.View.SubView(0, pixelCount).CopyToHostAsync().ConfigureAwait(false);
+        sw.Stop();
+        return new BackgroundRemovalResult
+        {
+            ResultPixels = resultPixels,
+            Width = width,
+            Height = height,
+            InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
+        };
+    }
 
+    // ---- the mask, applied on the device -------------------------------------------------------------------------------------------------------------
+    private static void RangeCheckImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<int, Stride1D.Dense> flag)
+    {
+        float v = mask[i];
+        if (v < -0.1f || v > 1.1f) Atomic.Max(ref flag[0], 1);
+    }
+
+    /// <summary>
+    /// One output pixel: the source colour and the mask, resized to the picture with bilinear taps (after the sigmoid when the model output logits), rounded to an 8-bit alpha.
+    /// </summary>
+    private static void ApplyMaskImpl(Index1D idx, ArrayView1D<int, Stride1D.Dense> rgba, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<int, Stride1D.Dense> outPixels, int w, int maskW, int maskH, int h, int sigmoid)
+    {
+        int x = idx % w, y = idx / w;
+        float srcX = (x + 0.5f) * maskW / w - 0.5f, srcY = (y + 0.5f) * maskH / h - 0.5f;
+        int x0 = Math.Max(0, Math.Min(maskW - 1, (int)srcX)), y0 = Math.Max(0, Math.Min(maskH - 1, (int)srcY));
+        int x1 = Math.Min(x0 + 1, maskW - 1), y1 = Math.Min(y0 + 1, maskH - 1);
+        float fx = srcX - x0, fy = srcY - y0;
+        float v00 = mask[y0 * maskW + x0], v10 = mask[y0 * maskW + x1], v01 = mask[y1 * maskW + x0], v11 = mask[y1 * maskW + x1];
+        if (sigmoid != 0)
+        {
+            v00 = 1f / (1f + MathF.Exp(-v00)); v10 = 1f / (1f + MathF.Exp(-v10)); v01 = 1f / (1f + MathF.Exp(-v01)); v11 = 1f / (1f + MathF.Exp(-v11));
+        }
+        float v = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) + v01 * (1 - fx) * fy + v11 * fx * fy;
+        int a = (int)(v * 255f + 0.5f);
+        a = Math.Max(0, Math.Min(255, a));
+        outPixels[idx] = (rgba[idx] & 0x00FFFFFF) | (a << 24);
+    }
+
+    /// <summary>
+    /// Puts <paramref name="mask"/> (maskWidth x maskHeight, a probability or a logit: logits are told apart by a value outside [-0.1, 1.1]) into the alpha of <paramref name="rgba"/> (width x height) on the device.
+    /// The caller disposes the returned buffer.
+    /// </summary>
+    public static async Task<MemoryBuffer1D<int, Stride1D.Dense>> ApplyMaskAsync(Accelerator accelerator, ArrayView1D<int, Stride1D.Dense> rgba, ArrayView1D<float, Stride1D.Dense> mask, int maskWidth, int maskHeight, int width, int height)
+    {
+        var rangeCheck = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(RangeCheckImpl);
+        var apply = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int>(ApplyMaskImpl);
+        using var flag = accelerator.Allocate1D<int>(1);
+        flag.MemSetToZero();
+        rangeCheck(maskWidth * maskHeight, mask, flag.View);
+        int sigmoid = (await flag.View.CopyToHostAsync().ConfigureAwait(false))[0];     // one scalar: whether the model output logits
+        var result = accelerator.Allocate1D<int>(width * height);
+        apply(width * height, rgba, mask, result.View, width, maskWidth, maskHeight, height, sigmoid);
+        await accelerator.SynchronizeAsync().ConfigureAwait(false);
+        return result;
+    }
+
+    /// <summary>
+    /// The picture with the background made transparent, as a device buffer (no mask or pixel crosses to the host). <paramref name="rgbaPixels"/> is packed RGBA, width x height. The caller disposes the result.
+    /// </summary>
+    public async Task<MemoryBuffer1D<int, Stride1D.Dense>> RemoveBackgroundToDeviceAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float threshold = 0.5f)
+    {
         // Preprocess: RGBA → NCHW float with RMBG normalization
         // RMBG uses mean=[0.5, 0.5, 0.5], std=[1.0, 1.0, 1.0] → (pixel/255 - 0.5)
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
@@ -85,96 +150,17 @@ public class BackgroundRemovalPipeline : IDisposable
             new[] { 0.5f, 0.5f, 0.5f }, new[] { 1.0f, 1.0f, 1.0f });
 
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
-
-        // Run inference
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         }).ConfigureAwait(false);
 
-        // Read mask output — typically [1, 1, H, W] or [1, H, W]
+        // the mask output is [1, 1, H, W] or [1, H, W]
         var output = outputs[_session.OutputNames[0]];
         int maskSize = output.ElementCount;
-        using var readBuf = _accelerator.Allocate1D<float>(maskSize);
-        new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, maskSize), readBuf.View, maskSize, 1f);
-        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
-        var rawMask = await readBuf.CopyToHostAsync<float>(0, maskSize).ConfigureAwait(false);
-
-        // Determine mask spatial dimensions
         int maskH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
         int maskW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
-
-        // Apply sigmoid if values are logits (not already in [0,1])
-        bool needsSigmoid = rawMask.Any(v => v < -0.1f || v > 1.1f);
-        if (needsSigmoid)
-        {
-            for (int i = 0; i < rawMask.Length; i++)
-                rawMask[i] = 1f / (1f + MathF.Exp(-rawMask[i]));
-        }
-
-        // Resize mask to original image dimensions
-        var resizedMask = ResizeMask(rawMask, maskW, maskH, width, height);
-
-        // Host RGBA for alpha compositing (GPU→GPU CopyFrom + async readback)
-        int pixelCount = width * height;
-        using var rgbaHostBuf = _accelerator.Allocate1D<int>(pixelCount);
-        rgbaHostBuf.View.CopyFrom(rgbaPixels.SubView(0, pixelCount));
-        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
-        var hostRgba = await rgbaHostBuf.CopyToHostAsync<int>(0, pixelCount).ConfigureAwait(false);
-
-        // Apply mask: set alpha channel based on mask value
-        var resultPixels = new int[pixelCount];
-        for (int i = 0; i < pixelCount; i++)
-        {
-            int rgba = hostRgba[i];
-            int r = rgba & 0xFF;
-            int g = (rgba >> 8) & 0xFF;
-            int b = (rgba >> 16) & 0xFF;
-            int a = (int)(resizedMask[i] * 255f + 0.5f);
-            if (a < 0) a = 0; if (a > 255) a = 255;
-            resultPixels[i] = r | (g << 8) | (b << 16) | (a << 24);
-        }
-
-        sw.Stop();
-
-        return new BackgroundRemovalResult
-        {
-            ResultPixels = resultPixels,
-            Mask = resizedMask,
-            Width = width,
-            Height = height,
-            InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
-        };
-    }
-
-    private static float[] ResizeMask(float[] mask, int srcW, int srcH, int dstW, int dstH)
-    {
-        if (srcW == dstW && srcH == dstH) return mask;
-
-        var result = new float[dstW * dstH];
-        for (int y = 0; y < dstH; y++)
-        {
-            for (int x = 0; x < dstW; x++)
-            {
-                float srcX = (x + 0.5f) * srcW / dstW - 0.5f;
-                float srcY = (y + 0.5f) * srcH / dstH - 0.5f;
-                int x0 = Math.Clamp((int)srcX, 0, srcW - 1);
-                int y0 = Math.Clamp((int)srcY, 0, srcH - 1);
-                int x1 = Math.Clamp(x0 + 1, 0, srcW - 1);
-                int y1 = Math.Clamp(y0 + 1, 0, srcH - 1);
-                float fx = srcX - x0;
-                float fy = srcY - y0;
-
-                float v00 = mask[y0 * srcW + x0];
-                float v10 = mask[y0 * srcW + x1];
-                float v01 = mask[y1 * srcW + x0];
-                float v11 = mask[y1 * srcW + x1];
-
-                result[y * dstW + x] = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy)
-                    + v01 * (1 - fx) * fy + v11 * fx * fy;
-            }
-        }
-        return result;
+        return await ApplyMaskAsync(_accelerator, rgbaPixels, output.Data.SubView(0, maskSize), maskW, maskH, width, height).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -197,8 +183,19 @@ public class BackgroundRemovalResult
 {
     /// <summary>RGBA pixels with background made transparent.</summary>
     public int[] ResultPixels { get; init; } = Array.Empty<int>();
-    /// <summary>Foreground mask [0,1] at original resolution.</summary>
-    public float[] Mask { get; init; } = Array.Empty<float>();
+    private float[]? _mask;
+    /// <summary>Foreground mask [0,1] at original resolution: the alpha of <see cref="ResultPixels"/>, worked out when first asked for (the pipeline itself keeps the mask on the device).</summary>
+    public float[] Mask
+    {
+        get
+        {
+            if (_mask != null) return _mask;
+            var m = new float[ResultPixels.Length];
+            for (int i = 0; i < m.Length; i++) m[i] = ((ResultPixels[i] >> 24) & 255) / 255f;
+            return _mask = m;
+        }
+        init => _mask = value;
+    }
     public int Width { get; init; }
     public int Height { get; init; }
     public double InferenceTimeMs { get; init; }
