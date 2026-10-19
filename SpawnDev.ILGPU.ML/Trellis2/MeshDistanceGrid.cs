@@ -11,7 +11,7 @@ using IV = ArrayView1D<int, Stride1D.Dense>;
 /// The mesh lives in a lattice of <see cref="Resolution"/>^3 voxels (grid units). The lattice is cut into cells of <see cref="CellSize"/> voxels; every triangle is listed in every cell its bounding box,
 /// grown by <see cref="Reach"/> voxels, touches. A query reads only its own cell's list, so it finds the nearest triangle whenever that lies within <see cref="Reach"/> voxels, and reports "none" beyond.
 /// </summary>
-public sealed class MeshDistanceGrid : IDisposable
+public sealed partial class MeshDistanceGrid : IDisposable
 {
     /// <summary>Edge of a cell in voxels.</summary>
     public const int CellSize = 8;
