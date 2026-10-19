@@ -25,15 +25,9 @@ public static class ImageDisplayHelper
         using var data = imageData.Data;
 
         // Write pixels — Uint8ClampedArray expects RGBA bytes
+        // a packed RGBA int is R, G, B, A in memory (little endian): one block copy, no per-pixel loop
         var bytes = new byte[width * height * 4];
-        for (int i = 0; i < width * height; i++)
-        {
-            int pixel = rgbaPixels[i];
-            bytes[i * 4] = (byte)(pixel & 0xFF);         // R
-            bytes[i * 4 + 1] = (byte)((pixel >> 8) & 0xFF);  // G
-            bytes[i * 4 + 2] = (byte)((pixel >> 16) & 0xFF); // B
-            bytes[i * 4 + 3] = (byte)((pixel >> 24) & 0xFF); // A
-        }
+        Buffer.BlockCopy(rgbaPixels, 0, bytes, 0, bytes.Length);
         data.WriteBytes(bytes);
 
         ctx.PutImageData(imageData, 0, 0);

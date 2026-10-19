@@ -78,6 +78,49 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ImageDevice_Compositor_MatchesTheHostLoops() => await RunTest(async accelerator =>
+    {
+        int w = 83, h = 61;
+        var rnd = new Random(8);
+        var cut = new int[w * h];
+        for (int i = 0; i < cut.Length; i++) cut[i] = rnd.Next(1 << 24) | (rnd.Next(256) << 24);
+        // host: the box blur and the composite the page ran (alpha from the 8-bit mask)
+        var tmp = new int[w * h]; var blurred = new int[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int r = 0, g = 0, b = 0;
+                for (int k = -2; k <= 2; k++) { int p = cut[y * w + Math.Clamp(x + k, 0, w - 1)]; r += p & 255; g += (p >> 8) & 255; b += (p >> 16) & 255; }
+                tmp[y * w + x] = (r / 5) | ((g / 5) << 8) | ((b / 5) << 16);
+            }
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int r = 0, g = 0, b = 0;
+                for (int k = -2; k <= 2; k++) { int p = tmp[Math.Clamp(y + k, 0, h - 1) * w + x]; r += p & 255; g += (p >> 8) & 255; b += (p >> 16) & 255; }
+                blurred[y * w + x] = (r / 5) | ((g / 5) << 8) | ((b / 5) << 16);
+            }
+        int Over(int p, int bg)
+        {
+            float a = ((p >> 24) & 255) / 255f;
+            int r = (int)((p & 255) * a + (bg & 255) * (1 - a) + 0.5f), g = (int)(((p >> 8) & 255) * a + ((bg >> 8) & 255) * (1 - a) + 0.5f), b = (int)(((p >> 16) & 255) * a + ((bg >> 16) & 255) * (1 - a) + 0.5f);
+            return (r & 255) | ((g & 255) << 8) | ((b & 255) << 16) | (255 << 24);
+        }
+        using var cb = accelerator.Allocate1D(cut);
+        using var white = await ImageCompositor.OverColorAsync(accelerator, cb.View, w, h, 0xFFFFFF);
+        using var blur = await ImageCompositor.OverBlurAsync(accelerator, cb.View, w, h);
+        var gotWhite = await white.View.CopyToHostAsync(); var gotBlur = await blur.View.CopyToHostAsync();
+        int badWhite = 0, badBlur = 0;
+        for (int i = 0; i < cut.Length; i++)
+        {
+            if (gotWhite[i] != Over(cut[i], 0xFFFFFF)) badWhite++;
+            if (gotBlur[i] != Over(cut[i], blurred[i])) badBlur++;
+        }
+        Id_Expect(badWhite <= cut.Length / 500, $"{badWhite} pixels differ from the host's white composite");
+        Id_Expect(badBlur <= cut.Length / 500, $"{badBlur} pixels differ from the host's blurred composite");
+    });
+
+    [TestMethod]
     public async Task ImageDevice_RgbaStats_MatchTheHostLoops() => await RunTest(async accelerator =>
     {
         int w = 101, h = 77;
