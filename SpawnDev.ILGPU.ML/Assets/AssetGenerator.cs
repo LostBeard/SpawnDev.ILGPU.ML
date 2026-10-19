@@ -17,8 +17,6 @@ public enum ImageModel
     Flux2Klein,
     /// <summary>SD-Turbo, one step (Stability AI): faster, smaller, a 2023 look.</summary>
     SdTurbo,
-    /// <summary>The OpenAI Images API (DALL-E 3 / gpt-image-1) through <see cref="OpenAiImageSource"/>: not local, the prompt leaves the machine, billed per picture. Set <see cref="AssetGenerator.OpenAiImages"/>.</summary>
-    OpenAi,
 }
 
 /// <summary>A picture drawn for a prompt.</summary>
@@ -58,8 +56,6 @@ public sealed class AssetGenerator : IDisposable
     public bool KeepImageModelResident { get; set; }
     /// <summary>FLUX.2 weight precision: 4 (default; 4.4 GB download, 2.6 GB on the GPU at a time) or 8 (near lossless; 7.9 GB, 4.4 GB at a time). Set before the first draw.</summary>
     public int ImageModelBits { get; set; } = 4;
-    /// <summary>The OpenAI picture source used when <see cref="ImageModel.OpenAi"/> is asked for (opt in: see <see cref="OpenAiImageSource"/>). The generator does not dispose it.</summary>
-    public OpenAiImageSource? OpenAiImages { get; set; }
     /// <summary>The rig cleanup (<see cref="SkinTokensRigger.BridgeHops"/>): 4 by default, 0 keeps the learned weights and the mesh untouched.</summary>
     public int BridgeHops { get; set; } = 4;
 
@@ -92,16 +88,6 @@ public sealed class AssetGenerator : IDisposable
     {
         var full = addSuffix ? prompt + PromptSuffix : prompt;
         var pictures = new List<AssetPicture>();
-        if (model == ImageModel.OpenAi)
-        {
-            var api = OpenAiImages ?? throw new InvalidOperationException("ImageModel.OpenAi needs AssetGenerator.OpenAiImages (an OpenAiImageSource with your API key).");
-            foreach (var seed in seeds)
-            {
-                var pic = await Timed($"draw picture {seed} (OpenAI)", () => api.DrawAsync(full, seed));
-                pictures.Add(pic); if (onEach != null) await onEach(pic);
-            }
-            return pictures;
-        }
         if (model == ImageModel.SdTurbo)
         {
             _sd ??= await Timed("load SD-Turbo", () => ImageGenerationPipeline.CreateAsync(_acc, _source, ModelHub.KnownModels.SDTurbo, (s, p) => Status?.Invoke($"SD-Turbo {s} {p}%")));

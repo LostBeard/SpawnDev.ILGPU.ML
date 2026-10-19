@@ -3,10 +3,6 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased
-
-- **`OpenAiImageSource` and `ImageModel.OpenAi`: DALL-E 3 (or gpt-image-1) as the picture source of `AssetGenerator`**, opt in: not local, the prompt goes to the OpenAI API with a key the application passes in (never read from the environment by the library, stored or logged). Console: `--image-model openai` with `OPENAI_API_KEY`. Tests with a fake HTTP server; not run against the live service.
-
 ## 5.3.21 - 2026-10-19 - Text to 3D: no more dark dots (the reference's remesh and projected bake)
 
 Requires SpawnDev.ILGPU 5.3.8.
