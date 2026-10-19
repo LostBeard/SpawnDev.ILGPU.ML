@@ -626,6 +626,8 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Simplify on the device (<see cref="GpuMeshSimplifier"/>) instead of the host edge collapse. Default on; env TRELLIS2_HOSTSIMPLIFY=1 forces the host path (A/B).</summary>
     public bool DeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTSIMPLIFY") != "1";
     private GpuMeshSimplifier? _gpuSimplifier;
+    /// <summary>Run the host <see cref="MeshRepair"/> on the device-simplified mesh (splits non-manifold edges, closes the holes that leaves, re-winds). Off by default: the remeshed, simplified surface is already closed and consistently wound, and the repair opens pinholes along the edges it splits. Env TRELLIS2_REPAIR_SIMPLIFIED=1 turns it on (A/B).</summary>
+    public bool RepairAfterDeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_REPAIR_SIMPLIFIED") == "1";
 
     private async Task<byte[]> RemeshGlbAsync(Output output, int textureSize, int dilation, int maxFaces, Stopwatch sw)
     {
@@ -650,7 +652,7 @@ public sealed class Trellis2Pipeline : IDisposable
             var dpos = vn == 0 ? Array.Empty<float>() : await vp.View.SubView(0, (long)vn * 3).CopyToHostAsync();
             var dfaces = fn == 0 ? Array.Empty<int>() : await vf.View.SubView(0, (long)fn * 3).CopyToHostAsync();
             MeshStage?.Invoke("remeshed", dpos, dfaces);
-            if (simplified != null && RepairMesh) { (dpos, dfaces) = Repair("(simplified)", dpos, dfaces, sw); MeshStage?.Invoke("simplified", dpos, dfaces); }
+            if (simplified != null && RepairMesh && RepairAfterDeviceSimplify) { (dpos, dfaces) = Repair("(simplified)", dpos, dfaces, sw); MeshStage?.Invoke("simplified", dpos, dfaces); }
             return await FinishGlbAsync(output, dpos, dfaces, textureSize, dilation, maxFaces, sw, rmd.Source, remeshed: true);
         }
         var verts = await output.Mesh.Vertices.View.CopyToHostAsync();
