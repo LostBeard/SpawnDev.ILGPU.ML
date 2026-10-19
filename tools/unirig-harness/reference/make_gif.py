@@ -81,7 +81,7 @@ def wrap(text, f, width, d):
     return lines + [cur]
 
 
-# opening card: the prompt and the picture SD Turbo drew
+# opening card: the prompt and the picture FLUX.2 klein drew
 intro = Image.new('RGB', (W, H), BG); d = ImageDraw.Draw(intro)
 d.text((20, 18), 'Text to 3D, rigged and animated', font=font(26, True), fill=(235, 238, 245))
 d.text((20, 54), 'on your GPU, in your browser', font=font(18), fill=(140, 155, 180))
@@ -90,12 +90,12 @@ for ln in wrap('"' + prompt + '"', f, W - 250, d): d.text((20, y), ln, font=f, f
 pic = os.path.join(src, 'picture.png')
 if os.path.exists(pic):
     p = Image.open(pic).convert('RGB').resize((200, 200), Image.LANCZOS); intro.paste(p, (W - 220, 100))
-d.text((20, H - 90), 'SD Turbo  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
+d.text((20, H - 90), 'FLUX.2 klein  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 62), 'all on the GPU, all in the browser', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 34), 'SpawnDev.ILGPU.ML', font=font(16, True), fill=(110, 130, 170))
 
 seq = [(intro, 38)]
-A = [card('1', 'Text to 3D', 'SD Turbo draws it, TRELLIS.2 builds the mesh and PBR textures')(im) for im in allf['A']]
+A = [card('1', 'Text to 3D', 'FLUX.2 klein draws it, TRELLIS.2 builds the mesh and PBR textures')(im) for im in allf['A']]
 B = [card('2', 'Rig', 'SkinTokens writes the skeleton and learned skin weights')(im) for im in allf['B']]
 CDE = [card('3', 'Animate', 'Kimodo moves retargeted onto the generated skeleton')(im) for k in 'CDE' for im in allf[k]]
 for im in A + B + CDE: seq.append((im, 1))

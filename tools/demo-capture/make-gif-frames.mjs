@@ -9,7 +9,7 @@ const PROFILE = process.argv[2], OUT = process.argv[3], PROMPT = process.argv[4]
 mkdirSync(OUT, { recursive: true });
 const PORT = 9339, URL_ = 'http://localhost:5088/image-to-3d';
 const chrome = spawn('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  [`--user-data-dir=${PROFILE}`, `--remote-debugging-port=${PORT}`, '--enable-unsafe-webgpu', '--enable-features=Vulkan', '--no-first-run', '--no-default-browser-check', '--window-size=1400,1000', 'about:blank'], { stdio: 'ignore' });
+  [`--user-data-dir=${PROFILE}`, `--remote-debugging-port=${PORT}`, '--enable-unsafe-webgpu', '--no-first-run', '--no-default-browser-check', '--window-size=1400,1000', 'about:blank'], { stdio: 'ignore' });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const t0 = Date.now(); const T = () => ((Date.now() - t0) / 1000).toFixed(0).padStart(5) + 's';
 try {
@@ -23,7 +23,7 @@ try {
   await send('Page.enable'); await send('Runtime.enable'); await send('DOM.enable');
   await send('Page.navigate', { url: URL_ });
   for (let i = 0; i < 120; i++) { if (await ev(`!!document.querySelector('.t3d-prompt')`) === true) break; await sleep(1000); }
-  // image mode: hand the page the picture SD Turbo drew for this prompt (cand_06, seed 23)
+  // image mode: hand the page the picture the text-to-3D page drew for this prompt
   for (let i = 0; i < 180; i++) { if (await ev(`!!document.querySelector('input[type=file]')`) === true) break; await sleep(1000); }
   const doc = (await send('DOM.getDocument')).result; const node = (await send('DOM.querySelector', { nodeId: doc.root.nodeId, selector: 'input[type=file]' })).result.nodeId;
   await send('DOM.setFileInputFiles', { files: [process.argv[6]], nodeId: node });
