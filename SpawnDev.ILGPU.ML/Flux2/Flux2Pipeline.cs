@@ -59,13 +59,13 @@ public sealed class Flux2Pipeline
 {
     private readonly Accelerator _acc;
     private readonly Qwen2Tokenizer _tokenizer;
-    private readonly Func<Task<GpuWeights>> _encoderWeights, _transformerWeights;
+    private readonly Func<Task<Flux2Weights>> _encoderWeights, _transformerWeights;
     private readonly InferenceSession _vae;
     private readonly Flux2VaeNorm _norm;
     private ElementWiseKernels? _elementWise;
     private ElementWiseKernels ElementWise => _elementWise ??= new ElementWiseKernels(_acc);
 
-    public Flux2Pipeline(Accelerator accelerator, Qwen2Tokenizer tokenizer, Func<Task<GpuWeights>> encoderWeights, Func<Task<GpuWeights>> transformerWeights, InferenceSession vaeDecoder, Flux2VaeNorm vaeNorm)
+    public Flux2Pipeline(Accelerator accelerator, Qwen2Tokenizer tokenizer, Func<Task<Flux2Weights>> encoderWeights, Func<Task<Flux2Weights>> transformerWeights, InferenceSession vaeDecoder, Flux2VaeNorm vaeNorm)
     {
         _acc = accelerator; _tokenizer = tokenizer; _encoderWeights = encoderWeights; _transformerWeights = transformerWeights; _vae = vaeDecoder; _norm = vaeNorm;
     }

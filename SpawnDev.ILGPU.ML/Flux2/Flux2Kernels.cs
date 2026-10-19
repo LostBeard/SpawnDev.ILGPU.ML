@@ -4,6 +4,7 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML.Flux2;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
+using UV = ArrayView1D<uint, Stride1D.Dense>;
 
 /// <summary>
 /// The kernels FLUX.2 klein needs beside <see cref="Trellis2.DiTKernels"/> (linear, layer norm, flash attention, residual) and <see cref="SkinTokens.SkinTokensKernels"/> (RMS norm, rotary
@@ -115,5 +116,56 @@ public sealed class Flux2Kernels
     {
         _swigluCols ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int>(SwigluColsImpl);
         _swigluCols(rows * I, src, dst, srcStride, srcOff, dstStride, dstOff, I);
+    }
+
+    // ───────────────────────────────────────────── 4-bit weight blocks ────────────────────────────────
+
+    private static float HalfToFloat(uint h)
+    {
+        uint sign = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+        float r = exp == 0u ? man * (1f / 16777216f)                                      // subnormal: man * 2^-24
+                : exp == 31u ? 65504f                                                    // inf / nan never occur in a scale
+                : Interop.IntAsFloat(((exp + 112u) << 23) | (man << 13));
+        return sign == 1u ? -r : r;
+    }
+    private static uint Bf16Bits(float f)
+    {
+        uint bits = Interop.FloatAsInt(f);
+        return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
+    }
+    private static float DequantOne(UV q, long row, int col, int K)
+    {
+        long b5 = (row * (K / 32) + col / 32) * 5;
+        uint h = q[b5];
+        float d = HalfToFloat(h & 0xFFFFu), m = HalfToFloat(h >> 16);
+        int e = col % 32;
+        return d * ((q[b5 + 1 + e / 8] >> (4 * (e % 8))) & 15u) + m;
+    }
+
+    private Action<Index1D, UV, UV, int>? _dequant;
+    private static void DequantImpl(Index1D i, UV q, UV dst, int K)
+    {
+        long e0 = 2L * i;
+        long row = e0 / K; int col = (int)(e0 % K);
+        dst[i] = Bf16Bits(DequantOne(q, row, col, K)) | (Bf16Bits(DequantOne(q, row, col + 1, K)) << 16);
+    }
+    /// <summary>Dequantise a [N, K] matrix of 4-bit blocks (see tools/unirig-harness/reference/quantize_flux2.py) into bf16 pairs packed in <paramref name="dst"/> (N*K/2 words).</summary>
+    public void DequantQ4(UV q, UV dst, int N, int K)
+    {
+        _dequant ??= _acc.LoadAutoGroupedStreamKernel<Index1D, UV, UV, int>(DequantImpl);
+        _dequant((int)((long)N * K / 2), q, dst, K);
+    }
+
+    private Action<Index1D, UV, ArrayView1D<int, Stride1D.Dense>, FV, int>? _dequantRows;
+    private static void DequantRowsImpl(Index1D i, UV q, ArrayView1D<int, Stride1D.Dense> ids, FV o, int K)
+    {
+        int t = i / K, c = i % K;
+        o[i] = DequantOne(q, ids[t], c, K);
+    }
+    /// <summary>o[t, :] = dequantised row ids[t] of a [N, K] 4-bit matrix (the embedding gather), fp32.</summary>
+    public void DequantRows(UV q, ArrayView1D<int, Stride1D.Dense> ids, FV o, int count, int K)
+    {
+        _dequantRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, UV, ArrayView1D<int, Stride1D.Dense>, FV, int>(DequantRowsImpl);
+        _dequantRows(count * K, q, ids, o, K);
     }
 }

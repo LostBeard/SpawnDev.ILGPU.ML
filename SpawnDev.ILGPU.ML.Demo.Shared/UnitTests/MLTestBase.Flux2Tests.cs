@@ -70,7 +70,7 @@ public abstract partial class MLTestBase
         var (gold, gs) = Ur_Npy<float>(Path.Combine(g, "prompt_embeds.npy"));
         int real = (int)mask.Sum();
         var ids = idsL.Select(v => (int)v).ToArray();
-        using var weights = GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder.safetensors"));
+        using var weights = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder.safetensors")));
         using var enc = new Flux2TextEncoder(accelerator, weights);
         enc.Encode(ids, real);
         var got = await enc.Output.CopyToHostAsync();
@@ -102,7 +102,7 @@ public abstract partial class MLTestBase
         var (ts, _) = Ur_Npy<float>(Path.Combine(g, "timesteps.npy")); var (imgIds64, _) = Ur_Npy<long>(Path.Combine(g, "img_ids.npy")); var (txtIds64, _) = Ur_Npy<long>(Path.Combine(g, "txt_ids.npy"));
         var imgIds = imgIds64.Select(v => (int)v).ToArray(); var txtIds = txtIds64.Select(v => (int)v).ToArray();
         int nImg = imgIds.Length / 4, nTxt = txtIds.Length / 4;
-        using var weights = GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer.safetensors"));
+        using var weights = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer.safetensors")));
         using var tr = new Flux2Transformer(accelerator, weights, nTxt, nImg);
         var seen = new Dictionary<string, float[]>();
         tr.Probe = (name, v, rows, cols) =>
@@ -180,8 +180,8 @@ public abstract partial class MLTestBase
         var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
         using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
         var pipe = new Flux2Pipeline(accelerator, tok,
-            () => Task.FromResult(GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder.safetensors"))),
-            () => Task.FromResult(GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer.safetensors"))), vae, F2_Norm(dir));
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "text_encoder.safetensors")))),
+            () => Task.FromResult(new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, Path.Combine(dir, "weights", "transformer.safetensors")))), vae, F2_Norm(dir));
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var result = await pipe.RunAsync(new Flux2Request { Prompt = "a photo of a cat sitting on a red sofa", Size = 512, Steps = 4, Noise = noise, Progress = (s, i, n) => Console.WriteLine($"[Flux2] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F1} s") });
         double sq = 0, abs = 0; int n = 512 * 512;
@@ -200,5 +200,69 @@ public abstract partial class MLTestBase
             f.Write(rgb);
         }
         Ur_Expect(psnr > 22, $"picture PSNR {psnr:F1} dB vs the reference");
+    });
+
+    /// <summary>The 4-bit block dequantiser against a CPU decode of the same words (bit-identical after bf16 rounding), on a real transformer matrix.</summary>
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task Flux2_Q4Dequant_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator);
+        var path = Path.Combine(dir, "weights", "transformer_q4.safetensors");
+        if (!File.Exists(path)) throw new UnsupportedTestException("transformer_q4.safetensors not found (quantize_flux2.py)");
+        const string name = "single_transformer_blocks.0.attn.to_out.weight";
+        using var weights = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, path, n => n == name));
+        Ur_Expect(weights.IsQuantized(name), "the matrix is stored quantised");
+        var got = weights.Matrix(name).Cast<BFloat16, uint>().GetAsArray1D();
+        // CPU decode of the same words
+        using var raw = GpuWeights.LoadFile(accelerator, path, n => n == name);
+        var words = raw.U32(name).GetAsArray1D(); var shape = raw.Shape(name); int N = shape[0], K = shape[1] / 5 * 32;
+        static float Half(uint h) => (float)BitConverter.UInt16BitsToHalf((ushort)h);
+        static uint Bf16(float f) { uint b = BitConverter.SingleToUInt32Bits(f); return (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16; }
+        int bad = 0;
+        for (int row = 0; row < N && bad == 0; row += 37)
+            for (int col = 0; col < K; col += 2)
+            {
+                uint P(int c) { long b5 = ((long)row * (K / 32) + c / 32) * 5; float d = Half(words[b5] & 0xFFFF), m = Half(words[b5] >> 16); int e = c % 32; return Bf16(d * ((words[b5 + 1 + e / 8] >> (4 * (e % 8))) & 15u) + m); }
+                uint want = P(col) | (P(col + 1) << 16);
+                if (got[((long)row * K + col) / 2] != want) { bad++; Console.WriteLine($"[Flux2] dequant mismatch at row {row} col {col}"); break; }
+            }
+        Console.WriteLine($"[Flux2] Q4 dequant [{N}, {K}] on {accelerator.AcceleratorType}: bit-identical to the CPU decode: {bad == 0}");
+        Ur_Expect(bad == 0, "GPU dequantisation differs from the CPU decode");
+        await Task.CompletedTask;
+    });
+
+    /// <summary>The whole pipeline on the 4-bit exports (whichever exist: transformer_q4 / text_encoder_q4), reference prompt and noise: the picture against the bf16 reference picture.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Flux2_Pipeline_Q4_StaysCloseToTheReference() => await RunTest(async accelerator =>
+    {
+        var dir = F2_Require(accelerator); var g = Path.Combine(dir, "golden", "cat");
+        var enc = Path.Combine(dir, "weights", "text_encoder_q4.safetensors"); var trf = Path.Combine(dir, "weights", "transformer_q4.safetensors");
+        if (!File.Exists(trf)) throw new UnsupportedTestException("transformer_q4.safetensors not found (quantize_flux2.py)");
+        if (!File.Exists(enc)) enc = Path.Combine(dir, "weights", "text_encoder.safetensors");
+        var (noise, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        var tok = new Qwen2Tokenizer(File.ReadAllText(Path.Combine(dir, "klein4b", "tokenizer", "tokenizer.json")));
+        using var vae = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx")), inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        long peak = 0;
+        var pipe = new Flux2Pipeline(accelerator, tok,
+            () => { var w = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, enc)); peak = Math.Max(peak, w.Bytes); return Task.FromResult(w); },
+            () => { var w = new Flux2Weights(accelerator, GpuWeights.LoadFile(accelerator, trf)); peak = Math.Max(peak, w.Bytes); return Task.FromResult(w); }, vae, F2_Norm(dir));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await pipe.RunAsync(new Flux2Request { Prompt = "a photo of a cat sitting on a red sofa", Size = 512, Steps = 4, Noise = noise, Progress = (s, i, n) => Console.WriteLine($"[Flux2] {s} {i}/{n} at {sw.Elapsed.TotalSeconds:F1} s") });
+        double sq = 0, abs = 0; int n = 512 * 512;
+        for (int p = 0; p < n; p++)
+            for (int c = 0; c < 3; c++)
+            {
+                double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255), have = result.Rgba[p * 4 + c];
+                sq += (have - want) * (have - want); abs += Math.Abs(have - want);
+            }
+        double mse = sq / (3.0 * n), psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
+        Console.WriteLine($"[Flux2] Q4 pipeline ({Path.GetFileName(enc)} + {Path.GetFileName(trf)}) on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s, largest stage {peak / 1048576.0:F0} MiB of weights, PSNR {psnr:F1} dB, mean |diff| {abs / (3.0 * n):F2} grey levels vs the bf16 reference picture");
+        using (var f = File.Create(Path.Combine(g, "csharp_q4.ppm")))
+        {
+            f.Write(System.Text.Encoding.ASCII.GetBytes("P6\n512 512\n255\n"));
+            var rgb = new byte[3 * n]; for (int p = 0; p < n; p++) { rgb[p * 3] = result.Rgba[p * 4]; rgb[p * 3 + 1] = result.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = result.Rgba[p * 4 + 2]; }
+            f.Write(rgb);
+        }
+        Ur_Expect(psnr > 15, $"4-bit picture PSNR {psnr:F1} dB vs the reference");
     });
 }

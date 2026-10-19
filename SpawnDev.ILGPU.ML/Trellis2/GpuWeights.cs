@@ -15,6 +15,7 @@ public sealed class GpuWeights : IDisposable
     private readonly Dictionary<string, MemoryBuffer1D<BFloat16, Stride1D.Dense>> _bf16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _f16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _f32 = new();
+    private readonly Dictionary<string, MemoryBuffer1D<uint, Stride1D.Dense>> _u32 = new();   // I32 tensors: packed quantised blocks (FLUX.2 export), reinterpreted as 32-bit words
     private readonly Dictionary<string, int[]> _shapes = new();
 
     /// <summary>The model's JSON config (<c>args</c> object of the checkpoint's sibling .json).</summary>
@@ -59,8 +60,10 @@ public sealed class GpuWeights : IDisposable
                         { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; reader.Upload(t, b.View); break; }
                     case "F32":
                         { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; reader.Upload(t, b.View); break; }
+                    case "I32":
+                        { var b = accelerator.Allocate1D<uint>(n); w._u32[t.Name] = b; reader.Upload(t, b.View); break; }
                     default:
-                        throw new NotSupportedException($"'{safetensorsPath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
+                        throw new NotSupportedException($"'{safetensorsPath}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32/I32 native only");
                 }
                 w._shapes[t.Name] = t.Shape;
                 if (prof) tUp += psw.Elapsed.TotalSeconds;
@@ -113,7 +116,8 @@ public sealed class GpuWeights : IDisposable
                     case "BF16": { var b = accelerator.Allocate1D<BFloat16>(n); w._bf16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
                     case "F16": { var b = accelerator.Allocate1D<global::ILGPU.Half>(n); w._f16[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
                     case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
-                    default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32 native only");
+                    case "I32": { var b = accelerator.Allocate1D<uint>(n); w._u32[t.Name] = b; await UploadAsync(stream, b, n, buf, cancellationToken); break; }
+                    default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32/I32 native only");
                 }
                 pos += t.DataLength;
                 w._shapes[t.Name] = t.Shape;
@@ -151,6 +155,7 @@ public sealed class GpuWeights : IDisposable
         }
     }
 
+    public IEnumerable<string> Names => _shapes.Keys;
     public bool Has(string name) => _shapes.ContainsKey(name);
     public int[] Shape(string name) => _shapes.TryGetValue(name, out var s) ? s : throw new KeyNotFoundException($"weight '{name}' not loaded");
 
@@ -164,18 +169,24 @@ public sealed class GpuWeights : IDisposable
     public ArrayView1D<float, Stride1D.Dense> F32(string name)
         => _f32.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"fp32 weight '{name}' not loaded");
 
+    /// <summary>The 32-bit-word tensor <paramref name="name"/> (an I32 tensor: packed quantised blocks).</summary>
+    public ArrayView1D<uint, Stride1D.Dense> U32(string name)
+        => _u32.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"32-bit word weight '{name}' not loaded");
+    public bool IsU32(string name) => _u32.ContainsKey(name);
+
     /// <summary>True when the tensor was stored (and is held) as fp32.</summary>
     public bool IsF32(string name) => _f32.ContainsKey(name);
     public bool IsF16(string name) => _f16.ContainsKey(name);
 
     /// <summary>Total device bytes held.</summary>
-    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L);
+    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L) + _u32.Values.Sum(b => b.Length * 4L);
 
     public void Dispose()
     {
         foreach (var b in _bf16.Values) b.Dispose();
         foreach (var b in _f16.Values) b.Dispose();
         foreach (var b in _f32.Values) b.Dispose();
-        _bf16.Clear(); _f16.Clear(); _f32.Clear(); _shapes.Clear();
+        foreach (var b in _u32.Values) b.Dispose();
+        _bf16.Clear(); _f16.Clear(); _f32.Clear(); _u32.Clear(); _shapes.Clear();
     }
 }

@@ -28,7 +28,7 @@ public sealed class Flux2Transformer : IDisposable
     public static readonly int[] RopeAxes = { 32, 32, 32, 32 };
 
     private readonly Accelerator _acc;
-    private readonly GpuWeights _w;
+    private readonly Flux2Weights _w;
     private readonly DiTKernels _k;
     private readonly SkinTokensKernels _u;
     private readonly Flux2Kernels _f;
@@ -43,7 +43,7 @@ public sealed class Flux2Transformer : IDisposable
     /// </summary>
     public static bool RoundTimestepToBf16 = true;
 
-    public Flux2Transformer(Accelerator accelerator, GpuWeights weights, int textTokens, int imageTokens)
+    public Flux2Transformer(Accelerator accelerator, Flux2Weights weights, int textTokens, int imageTokens)
     {
         _acc = accelerator; _w = weights; _nTxt = textTokens; _nImg = imageTokens; _n = textTokens + imageTokens;
         _k = new DiTKernels(accelerator); _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator);
@@ -101,8 +101,8 @@ public sealed class Flux2Transformer : IDisposable
     /// <summary>x[rows, K] times w[N, K]^T: the general GEMM, the coalesced GEMV for one row (the timestep).</summary>
     private void Lin(FV x, string weight, FV o, int rows, int K, int N)
     {
-        if (rows == 1) _u.Gemv(x, _w.BF16(weight), null, o, K, N);
-        else _k.Linear(x, _w.BF16(weight), null, o, rows, K, N);
+        if (rows == 1) _u.Gemv(x, _w.Matrix(weight), null, o, K, N);
+        else _k.Linear(x, _w.Matrix(weight), null, o, rows, K, N);
     }
 
     /// <summary>
@@ -181,10 +181,10 @@ public sealed class Flux2Transformer : IDisposable
         Lin(_normT.View, b + "attn.add_qkv.weight", _qkv.View.SubView(0, (long)_nTxt * 3 * Dim), _nTxt, Dim, 3 * Dim);
         Lin(_normI.View, b + "attn.qkv.weight", _qkv.View.SubView((long)_nTxt * 3 * Dim, (long)_nImg * 3 * Dim), _nImg, Dim, 3 * Dim);
         var qkvT = _qkv.View.SubView(0, (long)_nTxt * 3 * Dim); var qkvI = _qkv.View.SubView((long)_nTxt * 3 * Dim, (long)_nImg * 3 * Dim);
-        _u.RmsNormHeads(qkvT, _w.BF16(b + "attn.norm_added_q.weight"), _nTxt, 3 * Dim, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvT, _w.BF16(b + "attn.norm_added_k.weight"), _nTxt, 3 * Dim, Dim, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvI, _w.BF16(b + "attn.norm_q.weight"), _nImg, 3 * Dim, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvI, _w.BF16(b + "attn.norm_k.weight"), _nImg, 3 * Dim, Dim, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(qkvT, _w.Vector(b + "attn.norm_added_q.weight"), _nTxt, 3 * Dim, 0, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(qkvT, _w.Vector(b + "attn.norm_added_k.weight"), _nTxt, 3 * Dim, Dim, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(qkvI, _w.Vector(b + "attn.norm_q.weight"), _nImg, 3 * Dim, 0, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(qkvI, _w.Vector(b + "attn.norm_k.weight"), _nImg, 3 * Dim, Dim, Heads, HeadDim, Eps);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, 0, Heads, HeadDim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, Dim, Heads, HeadDim);
         _k.Attention(_qkv.View, 3 * Dim, 0, _qkv.View, 3 * Dim, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);
@@ -213,8 +213,8 @@ public sealed class Flux2Transformer : IDisposable
         _k.LayerNormModulate(h, _attn.View, _modSingle.View, 0, Dim, _n, Dim, Eps);   // shift, scale, gate
         // fused projection [N, 27648] into _single (viewed N x cols): needs N * cols floats
         Lin(_attn.View, b + "attn.to_qkv_mlp_proj.weight", _single.View, _n, Dim, cols);
-        _u.RmsNormHeads(_single.View, _w.BF16(b + "attn.norm_q.weight"), _n, cols, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(_single.View, _w.BF16(b + "attn.norm_k.weight"), _n, cols, Dim, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(_single.View, _w.Vector(b + "attn.norm_q.weight"), _n, cols, 0, Heads, HeadDim, Eps);
+        _u.RmsNormHeads(_single.View, _w.Vector(b + "attn.norm_k.weight"), _n, cols, Dim, Heads, HeadDim, Eps);
         _f.RopeInterleaved(_single.View, _cosT.View, _sinT.View, _n, cols, 0, Heads, HeadDim);
         _f.RopeInterleaved(_single.View, _cosT.View, _sinT.View, _n, cols, Dim, Heads, HeadDim);
         _k.Attention(_single.View, cols, 0, _single.View, cols, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);

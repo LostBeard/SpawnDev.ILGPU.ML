@@ -29,7 +29,7 @@ public sealed class Flux2TextEncoder : IDisposable
     private static readonly int[] TapAfterLayer = { 9, 18, 27 };
 
     private readonly Accelerator _acc;
-    private readonly GpuWeights _w;
+    private readonly Flux2Weights _w;
     private readonly DiTKernels _k;
     private readonly SkinTokensKernels _u;
     private readonly Flux2Kernels _f;
@@ -43,7 +43,7 @@ public sealed class Flux2TextEncoder : IDisposable
     /// </summary>
     public static bool RoundRopeToBf16 = false;
 
-    public Flux2TextEncoder(Accelerator accelerator, GpuWeights weights)
+    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights)
     {
         _acc = accelerator; _w = weights;
         _k = new DiTKernels(accelerator); _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator);
@@ -79,26 +79,26 @@ public sealed class Flux2TextEncoder : IDisposable
     {
         if (ids.Length != SeqLen) throw new ArgumentException($"{SeqLen} token ids expected");
         _ids.View.CopyFromCPU(ids);
-        _u.Embed(_ids.View, _w.BF16("embed_tokens.weight"), _h.View, SeqLen, Hidden);
+        _w.Embed(_ids.View, "embed_tokens.weight", _h.View, SeqLen, Hidden);
         Probe?.Invoke("embed", _h.View, SeqLen, Hidden);
         int tap = 0;
         for (int l = 0; l < Layers; l++)
         {
             string b = $"layers.{l}.";
-            _u.RmsNorm(_h.View, _hn.View, _w.BF16(b + "input_layernorm.weight"), SeqLen, Hidden, RmsEps);
-            _k.Linear(_hn.View, _w.BF16(b + "self_attn.qkv_proj.weight"), null, _qkv.View, SeqLen, Hidden, QkvCols);
-            _u.RmsNormHeads(_qkv.View, _w.BF16(b + "self_attn.q_norm.weight"), SeqLen, QkvCols, 0, QHeads, HeadDim, RmsEps);
-            _u.RmsNormHeads(_qkv.View, _w.BF16(b + "self_attn.k_norm.weight"), SeqLen, QkvCols, QCols, KvHeads, HeadDim, RmsEps);
+            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), SeqLen, Hidden, RmsEps);
+            _k.Linear(_hn.View, _w.Matrix(b + "self_attn.qkv_proj.weight"), null, _qkv.View, SeqLen, Hidden, QkvCols);
+            _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.q_norm.weight"), SeqLen, QkvCols, 0, QHeads, HeadDim, RmsEps);
+            _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.k_norm.weight"), SeqLen, QkvCols, QCols, KvHeads, HeadDim, RmsEps);
             _u.Rope(_qkv.View, _invFreq.View, SeqLen, QkvCols, 0, QHeads, HeadDim, 0);
             _u.Rope(_qkv.View, _invFreq.View, SeqLen, QkvCols, QCols, KvHeads, HeadDim, 0);
             _u.StoreKv(_qkv.View, _kc.View, _vc.View, 0, SeqLen, QCols, KvCols);
             _f.PaddedCausalGqa(_qkv.View, _kc.View, _vc.View, _scores.View, _attn.View, SeqLen, real, QHeads, HeadDim, Rep);
-            _k.Linear(_attn.View, _w.BF16(b + "self_attn.o_proj.weight"), null, _proj.View, SeqLen, QCols, Hidden);
+            _k.Linear(_attn.View, _w.Matrix(b + "self_attn.o_proj.weight"), null, _proj.View, SeqLen, QCols, Hidden);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, SeqLen * Hidden, Hidden);
-            _u.RmsNorm(_h.View, _hn.View, _w.BF16(b + "post_attention_layernorm.weight"), SeqLen, Hidden, RmsEps);
-            _k.Linear(_hn.View, _w.BF16(b + "mlp.gate_up_proj.weight"), null, _gateUp.View, SeqLen, Hidden, 2 * Inter);
+            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "post_attention_layernorm.weight"), SeqLen, Hidden, RmsEps);
+            _k.Linear(_hn.View, _w.Matrix(b + "mlp.gate_up_proj.weight"), null, _gateUp.View, SeqLen, Hidden, 2 * Inter);
             _u.Swiglu(_gateUp.View, _act.View, SeqLen, Inter);
-            _k.Linear(_act.View, _w.BF16(b + "mlp.down_proj.weight"), null, _proj.View, SeqLen, Inter, Hidden);
+            _k.Linear(_act.View, _w.Matrix(b + "mlp.down_proj.weight"), null, _proj.View, SeqLen, Inter, Hidden);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, SeqLen * Hidden, Hidden);
             Probe?.Invoke($"layer{l + 1}", _h.View, SeqLen, Hidden);
             if (tap < TapAfterLayer.Length && l + 1 == TapAfterLayer[tap])
