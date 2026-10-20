@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.23</Version>
-		<PackageReleaseNotes>v5.3.23 - the TRELLIS.2 export tail on the GPU (remesh, simplify, winding, normals and UV atlas in device kernels; the mesh stays on the device until the file is written), pictures and the FLUX.2 denoising loop stay on the device (no host pixel loops on the 3D, Background Removal, CLIP, Explain, Detect, Face and Pose pages), and SpawnDev.ILGPU 5.3.9 (a loop inside an if no longer loses its result). Full history: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.24</Version>
+		<PackageReleaseNotes>v5.3.24 - fix: drawing several pictures in a row with FLUX 3 no longer loses the WebGPU device (the VAE decoder's 3.2 GB of feature maps are freed after each picture; Flux2Pipeline.ReleaseDecoderMemory), Flux3Pipeline.CreateAsync(vaeTileLatent), a [VRAM] stage trace in the 3D page. Since v5.3.12: FLUX 3 Image Klein and the Qwen3 caption writer, FLUX.2 klein, SkinTokens rigging and Kimodo animation, the TRELLIS.2 export tail on the GPU. Full history: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

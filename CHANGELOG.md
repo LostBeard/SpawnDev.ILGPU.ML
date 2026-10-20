@@ -3,6 +3,18 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
+## 5.3.24 - 2026-10-20 - Fix: drawing several FLUX 3 pictures in a row loses the WebGPU device
+
+Requires SpawnDev.ILGPU 5.3.9.
+
+- **The VAE decoder's feature maps are freed after every picture.** Found running text to 3D with FLUX 3 and the Qwen3 caption writer ("Draw 4") on the deployed 5.3.23 site: the second picture lost the WebGPU device ("A valid external Instance reference no longer exists").
+  A per-stage trace (`[VRAM]`, `WebGPUBufferAccounting`, now in `Image3DPage`) showed the cause: the 512 px decode parks 3.2 GB of feature maps in the decoder session's pool and never gives them back, so the next picture started at 6.9 GB tracked
+  (8.5 GB on the card) beside the resident 3.4 GB transformer, and Chrome drops the device near there. `Flux2Pipeline.ReleaseDecoderMemory()`, called by `Flux3Pipeline.RunAsync` after the decode. MEASURED in the browser (RTX 4070, interpreted dev build):
+  pictures 2, 3 and 4 start at 3.67 GB (was 6.9 GB and growing), four pictures ran through, the whole flow (Qwen3 caption 132 s, 4 pictures, 3D build 168 s, rig 78 s, 22 moves) took 611 s with no device loss; the peak is 8.7 GB on the card at the decode itself.
+- `Flux3Pipeline.CreateAsync(..., vaeTileLatent)` / `VaeTileLatent`: decode in smaller tiles. Test `Flux3_SmallTileVae_MatchesTheWholeDecode` (CUDA, the reference's latents): 32 cells 29.9 dB, 40 cells 31.7, 48 cells 35.7, 56 cells 43.3 against the whole decode (the whole decode is 63.6 dB from the reference picture).
+  Not used by the demo: a 48-cell decoder lost the WebGPU device on Chrome 151 at its first tile in 2 of 2 browser runs (6.5 GB in use) while the 64-cell one ran all four pictures; the cause is not understood yet.
+- README: new GIF (a pirate captain: Qwen3 caption, FLUX 3 Image Klein, TRELLIS.2, SkinTokens, Kimodo); `tools/demo-capture/flux3-text-to-3d-gif.mjs` records it (it closes the profile's restored tabs so the run is the only page on the GPU).
+
 ## 5.3.23 - 2026-10-19 - the TRELLIS.2 mesh tail on the GPU, pictures and the FLUX.2 loop on the device
 
 Requires SpawnDev.ILGPU 5.3.9 (a loop with a compile-time trip count inside an `if` no longer loses its result; the new kernels are also written so 5.3.8 could not hit it).
