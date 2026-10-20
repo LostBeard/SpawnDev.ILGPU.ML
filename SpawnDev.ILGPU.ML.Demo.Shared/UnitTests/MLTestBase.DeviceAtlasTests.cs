@@ -24,6 +24,7 @@ public abstract partial class MLTestBase
 
     private async Task<AtlasOut> Da_Run(Accelerator accelerator, float[] p, int[] f, int res, bool align)
     {
+        RequireAtomicsAndScatter(accelerator);
         using var pb = accelerator.Allocate1D(p); using var fb = accelerator.Allocate1D(f);
         var atlas = new DeviceUvAtlas(accelerator, new SparseKernels(accelerator));
         var sw = System.Diagnostics.Stopwatch.StartNew();

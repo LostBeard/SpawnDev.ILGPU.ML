@@ -15,6 +15,7 @@ public abstract partial class MLTestBase
 
     private async Task Dr_Compare(global::ILGPU.Runtime.Accelerator accelerator, float[] p, int[] f, int resolution, bool dropInnerSkins, string what)
     {
+        RequireAtomicsAndScatter(accelerator);
         using var host = await NarrowBandRemesher.RemeshAsync(accelerator, p, f, resolution, 1f, dropInnerSkins);
         using var pb = accelerator.Allocate1D(p); using var fb = accelerator.Allocate1D(f);
         using var sk = new DeviceRemeshHolder(accelerator);

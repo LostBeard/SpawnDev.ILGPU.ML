@@ -169,6 +169,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Remesh_ProjectsOntoTheOriginalSurface() => await RunTest(async accelerator =>
     {
+        RequireAtomicsAndScatter(accelerator);          // the distance grid is built with atomics
         var (p, f) = Rm_ScaledSphere(3, 0.3f);
         using var r = await NarrowBandRemesher.RemeshAsync(accelerator, p, f, 64, 1f);
         // the remeshed vertices sit a band outside; moved onto the original they must land on the sphere

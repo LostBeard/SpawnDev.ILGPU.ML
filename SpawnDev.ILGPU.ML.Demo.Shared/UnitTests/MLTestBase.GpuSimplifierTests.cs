@@ -40,6 +40,7 @@ public abstract partial class MLTestBase
 
     private async Task<(float[] P, int[] F, int Rounds)> Gs_Simplify(Accelerator accelerator, float[] p, int[] f, int target)
     {
+        RequireAtomicsAndScatter(accelerator);
         using var pb = accelerator.Allocate1D(p); using var fb = accelerator.Allocate1D(f);
         var simplifier = new GpuMeshSimplifier(accelerator, new SparseKernels(accelerator));
         var sw = System.Diagnostics.Stopwatch.StartNew();

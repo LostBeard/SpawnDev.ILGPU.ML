@@ -3,9 +3,9 @@
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 
-## Unreleased (after 5.3.22) - the TRELLIS.2 mesh tail on the GPU
+## 5.3.23 - 2026-10-19 - the TRELLIS.2 mesh tail on the GPU, pictures and the FLUX.2 loop on the device
 
-Requires SpawnDev.ILGPU 5.3.8 (the kernels are written so the loop-inside-an-if bug fixed in the fork after 5.3.8 cannot hit them).
+Requires SpawnDev.ILGPU 5.3.9 (a loop with a compile-time trip count inside an `if` no longer loses its result; the new kernels are also written so 5.3.8 could not hit it).
 
 - **Remesh, simplify, winding, normals and UV atlas run in device kernels; the mesh stays on the GPU until the file is written.** `DeviceRemesher` (parallel narrow-band remesh), `GpuMeshSimplifier` (parallel quadric edge collapse:
   every round takes five matching passes of the cheapest edges that do not touch an earlier pass's; 4,669,548 -> 298,426 faces in 31 rounds on the crown), `DeviceUvAtlas` (charts grown in parallel from seeds inside a normal cone, a chart whose
@@ -25,6 +25,7 @@ Requires SpawnDev.ILGPU 5.3.8 (the kernels are written so the loop-inside-an-if 
   are built once per run instead of once per step (in double precision, on the host: a float sin/cos on the device cost the picture 0.3 dB, 29.3 -> 29.0, so that kernel was removed). Reference pictures are patchified by a kernel (`EncodeReferenceToDeviceAsync`), latents are unpatchified by a kernel (`ToVaeInput(FV, ...)`), and
   the tiled VAE decode gathers, blends and finishes its tiles on the device (`DecodeDeviceAsync`). Host-array overloads remain for tests. Tests `Flux2Device_*` against the old host loops; the reference tests give the same numbers (pipeline 29.3 dB, edit 44.4 dB, 4-bit 18.7 dB on CUDA).
 - MEASURED, the deployed (AOT) browser build, crown on WebGPU: 153 s total; image prep 1.7 s, remesh 5.6 s, simplify 3.4 s, winding + normals + atlas 1.7 s, bake 2.6 s, PNG + GLB 0.3 s, host time inside the flow samplers 0.1-0.3 s: the remaining time is the GPU (the three flows 96 s, weights 19 s). The interpreted dev build is 187 s with the same tail at 25 s image prep, 11 s remesh, 6 s simplify, 6 s atlas, 5 s bake: that was interpreter overhead, not work.
+- Gate: full PMT (default exclusions) 6128 passed; the 15 failures were the device-kernel tests on the WebGL lane (atomics and several stores per thread, which WebGL cannot do): they are now skipped there with the reason (`RequireAtomicsAndScatter`), including the older `Remesh_ProjectsOntoTheOriginalSurface`. SpawnDev.ILGPU 5.3.8 against 5.3.9 on the same lanes: 23:22 against 23:43 for Phase A, same heavy groups: the loop-unrolling fix does not change timings.
 - Not done: the atlas does not run the host version's grid overlap test (a chart whose faces lean more than 65 degrees from its direction is regrown instead, which prevents folds and, in practice, overlaps); the texture bake, PNG and GLB
   writer still run on the host side of the pipeline.
 

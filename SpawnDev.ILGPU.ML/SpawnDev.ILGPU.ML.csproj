@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.3.22</Version>
-		<PackageReleaseNotes>v5.3.22 - FLUX 3 Image Klein 5.6B (text to image, up to 10 reference pictures, prompt upsampler), FLUX.2 reference editing, region / shape editing of generated 3D assets, scenes from a sentence, CLIP picture check, Q4_1 GGUF kernels. Full history: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.3.23</Version>
+		<PackageReleaseNotes>v5.3.23 - the TRELLIS.2 export tail on the GPU (remesh, simplify, winding, normals and UV atlas in device kernels; the mesh stays on the device until the file is written), pictures and the FLUX.2 denoising loop stay on the device (no host pixel loops on the 3D, Background Removal, CLIP, Explain, Detect, Face and Pose pages), and SpawnDev.ILGPU 5.3.9 (a loop inside an if no longer loses its result). Full history: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.3" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.8" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.3.9" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -37,6 +37,7 @@ public abstract partial class MLTestBase
 
     private async Task Id_CheckApply(Accelerator accelerator, bool logits, int w, int h, int maskW, int maskH)
     {
+        RequireAtomicsAndScatter(accelerator);          // the mask's range check is an Atomic.Max
         var rnd = new Random(11);
         var rgba = new int[w * h];
         for (int i = 0; i < rgba.Length; i++) rgba[i] = rnd.Next() | (rnd.Next(256) << 24);
@@ -123,6 +124,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ImageDevice_RgbaStats_MatchTheHostLoops() => await RunTest(async accelerator =>
     {
+        RequireAtomicsAndScatter(accelerator);          // the counters are atomics
         int w = 101, h = 77;
         var rnd = new Random(2);
         var px = new int[w * h];

@@ -83,6 +83,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Flux2Device_TiledBlend_MatchesTheHostBlend() => await RunTest(async accelerator =>
     {
+        RequireAtomicsAndScatter(accelerator);          // the blend writes the sum planes and the weight from one thread
         // a picture of 10 x 12 latent cells in tiles of 8 with an overlap of 3: the old host code, with a stand-in for the VAE (a function of the tile and the pixel)
         int T = 8, O = 3, stride = T - O, tilePx = T * 8, ramp = O * 8, latH = 10, latW = 12, height = latH * 8, width = latW * 8;
         List<int> Starts(int len) { var l = new List<int>(); if (len <= T) { l.Add(0); return l; } for (int x = 0; x + T < len; x += stride) l.Add(x); l.Add(len - T); return l; }
