@@ -147,8 +147,14 @@ namespace PlaywrightMultiTest
         // Status file for diagnosing startup hangs
         private static readonly string StatusFile = Path.Combine(
             AppContext.BaseDirectory, "..", "..", "..", "init_status.log");
+        private static string? _startupBanner;
         private static void LogStatus(string msg)
         {
+            if (_startupBanner != null && msg.StartsWith("Phase A", StringComparison.Ordinal))
+            {
+                var banner = _startupBanner; _startupBanner = null;
+                LogStatus(banner);
+            }
             var tid = Environment.CurrentManagedThreadId;
             var isPool = Thread.CurrentThread.IsThreadPoolThread;
             var line = $"[{DateTime.Now:HH:mm:ss.fff}] [T{tid}{(isPool ? ",pool" : "")}] {msg}";
@@ -194,6 +200,10 @@ namespace PlaywrightMultiTest
             // having run not one DA3 test. From cmd, pass a real non-empty value instead: any name that is
             // not a category, e.g. PMT_EXCLUDE_CATEGORIES=None.
             var activeExclusions = ExcludedCategories();
+            // This early phase's output never reaches a sweep's main log (only the scheduler's lines do): keep the summary and print it with the first scheduler line, loudly when the heavy tests are in
+            _startupBanner = (!activeExclusions.Contains("HeavyModel", StringComparer.OrdinalIgnoreCase)
+                ? $"WARNING: HeavyModel is NOT excluded (excluded: {(activeExclusions.Length == 0 ? "nothing" : string.Join(", ", activeExclusions))}): every HeavyModel test will run too, serialized, one backend at a time. A normal full run excludes them (about 40 minutes); with them it takes hours. Unset PMT_EXCLUDE_CATEGORIES unless you mean this."
+                : $"Excluded categories: {string.Join(", ", activeExclusions)}");
             LogStatus(activeExclusions.Length == 0
                 ? "Excluded categories: NONE - every category will run."
                 : $"Excluded categories: {string.Join(", ", activeExclusions)} "
@@ -1724,6 +1734,9 @@ namespace PlaywrightMultiTest
 
             LogStatus($"Phase A+B complete in {swAll.Elapsed:hh\\:mm\\:ss}. Starting Phase C: {total} heavy "
                     + $"tests across {groups.Count} backend group(s), serialized, one backend at a time.");
+            // a normal full run has about 90 heavy tests (a few minutes); hundreds means the heavy-model categories were switched on (hours)
+            if (total > 200)
+                LogStatus($"WARNING: Phase C has {total} heavy tests; a normal full run has about 90 and takes a few minutes. This run will take hours. Check PMT_EXCLUDE_CATEGORIES (and compare with _TestStats\\<repo>.jsonl).");
 
             foreach (var g in groups
                          .OrderBy(x => HeavyPhaseOrder(x.Key))
