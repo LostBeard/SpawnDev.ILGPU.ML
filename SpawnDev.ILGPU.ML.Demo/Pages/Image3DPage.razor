@@ -660,7 +660,7 @@
             {
                 _modelStatusText = $"FLUX 3 Klein — {stage}"; _modelProgress = pct; _ = InvokeAsync(StateHasChanged);
             });
-            _flux3.KeepTransformerResident = true;      // the next picture reuses it; RunTrellisAsync releases it before TRELLIS.2 needs the memory
+            _flux3.KeepTransformerResident = true;      // the next picture reuses it; RunTrellisAsync releases it before TRELLIS.2 needs the memory (Chrome 151.0.7922.174 killed the GPU process on the third picture with this on: a Chrome bug, fixed in later versions; Plans/chrome-151-resident-flux3-device-loss-2026-10-20.md)
             OnStageDone("image model load", sw.Elapsed.TotalSeconds);
         }
         else if (_imageModel == "flux2" && _flux == null)

@@ -82,7 +82,8 @@ export const scenarios = {
       await h.clickText('.t3d-mode', /Text to 3D/);
       await h.selectValue('select.t3d-select', 'flux3');
       await h.selectValue('select.t3d-select', '4');
-      await h.type('.t3d-prompt', 'a wooden treasure chest with iron bands');
+      // a standing humanoid: the rig and animate steps need one (a chest rigs, but Animate refuses it: "does not look like a standing humanoid")
+      await h.type('.t3d-prompt', 'a knight in plate armor, full body, standing in a relaxed A-pose');
       await h.ev(`(()=>{const c=[...document.querySelectorAll('label')].find(l=>/full caption/.test(l.textContent))?.querySelector('input[type=checkbox]');if(c&&!c.checked)c.click();return !!c;})()`);
       await h.click('.t3d-btn');
       const pics = await h.observe(BAR(), `document.querySelectorAll('.t3d-pick-item').length >= 4 && !document.querySelector('.t3d-stage.running')`, 70 * 60e3);
@@ -123,3 +124,22 @@ export const scenarios = {
     },
   },
 };
+
+// Several pictures in a row on /generate (the transformer stays resident between them): the third picture is where a lost WebGPU device showed up (FLUX 3, 10-20).
+function severalPictures(model, caption) {
+  return {
+    run: async h => {
+      await h.selectValue('select.gen-setting-select', model);
+      await h.selectValue('select.gen-setting-select', '4');
+      await h.type('.gen-prompt-input', 'a red fox standing in fresh snow at sunrise');
+      if (caption) await h.ev(`(()=>{const c=[...document.querySelectorAll('label')].find(l=>/full caption/.test(l.textContent))?.querySelector('input[type=checkbox]');if(c&&!c.checked)c.click();return !!c;})()`);
+      await h.click('.gen-btn');
+      const samples = await h.observe(BAR(), `document.querySelectorAll('.gen-grid-item img').length >= 4 && document.querySelector('.gen-btn')?.innerText.trim() === 'Generate'`, 60 * 60e3);
+      const stats = [];
+      for (let i = 0; i < 4; i++) stats.push(await assertPicture(h, `.gen-grid-item:nth-child(${i + 1}) img`, `picture ${i + 1}`));
+      return { pictures: stats.map(s => `${s.w}x${s.h} std ${s.std}`), barMaxPct: Math.max(...samples.map(s => s.pct)) };
+    },
+  };
+}
+scenarios['/generate#flux3x4'] = severalPictures('flux3', true);
+scenarios['/generate#flux2x4'] = severalPictures('flux2', false);

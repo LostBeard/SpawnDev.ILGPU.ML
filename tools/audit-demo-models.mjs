@@ -60,7 +60,8 @@ const chrome = spawn(CHROME, [`--user-data-dir=${PROFILE}`, `--remote-debugging-
   ...(process.env.AUDIT_CHROME_ARGS ? process.env.AUDIT_CHROME_ARGS.split(' ').filter(Boolean) : []),
   'about:blank'], { stdio: 'ignore' });
 console.log('chrome pid', chrome.pid, '(killed by PID at the end)');
-const killChrome = () => { try { execFileSync('taskkill', ['/PID', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* already gone */ } };
+let keepChrome = false;   // AUDIT_KEEP_ON_FAIL: leave Chrome running after a failure
+const killChrome = () => { if (keepChrome) return; try { execFileSync('taskkill', ['/PID', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* already gone */ } };
 process.on('exit', killChrome);
 
 async function cdpJson(path, init) { const r = await fetch(`http://127.0.0.1:${PORT}${path}`, init); return r.json(); }
@@ -217,6 +218,13 @@ for (const route of routes) {
   res.exceptions.slice(0, 2).forEach(t => console.log('     exc ', t.slice(0, 220)));
 
   writeFileSync(join(OUT, `${route.replace(/\W+/g, '_') || 'home'}.json`), JSON.stringify(res, null, 1));
+  if (process.env.AUDIT_KEEP_ON_FAIL && res.verdict === 'FAIL')
+  {   // stop here with the page, its storage and Chrome as the failure left them, so it can be inspected over CDP (the default moves on and wipes the origin's data)
+    console.log(`\nAUDIT_KEEP_ON_FAIL: stopped at ${route}; Chrome pid ${chrome.pid} left running on CDP port ${PORT} (kill it by PID when done)`);
+    keepChrome = true;
+    browser?.close();
+    await new Promise(() => {});   // stay alive on purpose: a child Chrome does not outlive a driver that exits under a harness that kills the tree; end this process by PID to close both
+  }
   try { await page?.send('Storage.clearDataForOrigin', { origin: new URL(BASE).origin, storageTypes: 'all' }); } catch { /* page gone */ }   // free the disk the models took
   try { page?.close(); await browser?.send('Target.closeTarget', { targetId }); } catch { /* target already gone */ }
   browser?.close();

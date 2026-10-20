@@ -412,7 +412,7 @@
                 {
                     _modelStatusText = $"FLUX 3 Klein — {stage}"; _modelProgress = pct; InvokeAsync(StateHasChanged);
                 });
-                _flux3.KeepTransformerResident = true;
+                _flux3.KeepTransformerResident = true;      // the next picture skips the 3.5 GB reload (Chrome 151.0.7922.174 killed the GPU process on the third picture with this on: a Chrome bug, fixed in later versions; Plans/chrome-151-resident-flux3-device-loss-2026-10-20.md)
                 _modelStatusText = "FLUX 3 Klein";
                 _isModelLoaded = true;
                 return;

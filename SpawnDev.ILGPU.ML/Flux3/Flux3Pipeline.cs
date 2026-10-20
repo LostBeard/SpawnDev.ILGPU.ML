@@ -236,6 +236,10 @@ public sealed class Flux3Pipeline : IDisposable
     /// Keep the transformer's weights on the device after a run, so the next picture skips the load (3.5 GB at 4 bits: about a minute in a browser). Off by default because the weights hold GPU memory until
     /// <see cref="ReleaseResident"/> (or <see cref="Dispose"/>) frees them.
     /// </summary>
+    /// <remarks>
+    /// A Chrome bug to know about when debugging (<c>Plans/chrome-151-resident-flux3-device-loss-2026-10-20.md</c>): MEASURED 2026-10-20, RTX 4070 12 GB, Release (interpreted) demo build, on Chrome 151.0.7922.174 with the weights resident
+    /// the GPU process died ("died due to out of memory", no crash dump) on the FIRST denoise step of the THIRD picture, 5 of 5 runs; the same build passed on Chromium 153.0.8010.12. Update Chrome rather than work around it.
+    /// </remarks>
     public bool KeepTransformerResident { get; set; }
 
     private Flux2Weights? _resident;
