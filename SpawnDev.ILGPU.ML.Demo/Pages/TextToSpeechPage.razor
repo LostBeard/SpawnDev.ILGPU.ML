@@ -217,7 +217,6 @@
 @code {
     private const string KokoroRepo = KokoroVoicePack.VoiceRepoId;
     private const string ZipVoiceRepo = "k2-fsa/ZipVoice";
-    private const string HubBaseUrl = "https://hub.spawndev.com:44365";
     private const string VocoderArchiveUrl =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-zh-en-emilia.tar.bz2";
     private const string VocoderMember = "sherpa-onnx-zipvoice-distill-zh-en-emilia/vocos_24khz.onnx";
@@ -396,25 +395,9 @@
 
     private async Task<InferenceSession> LoadVocoderAsync()
     {
-        var archive = Uri.EscapeDataString(VocoderArchiveUrl);
-        var member = Uri.EscapeDataString(VocoderMember);
-        var warmUrl = $"{HubBaseUrl}/src/warm?url={archive}&member={member}";
-
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        while (clock.Elapsed < TimeSpan.FromMinutes(30))
-        {
-            using var res = await Http.GetAsync(warmUrl);
-            if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
-                throw new Exception("hub has no /src/warm — need a SourceProxy build");
-            if (res.IsSuccessStatusCode && res.StatusCode != System.Net.HttpStatusCode.Accepted) break;
-            if (res.StatusCode != System.Net.HttpStatusCode.Accepted)
-                throw new Exception($"hub could not cache vocoder archive: {(int)res.StatusCode}");
-            _status = "Caching vocoder archive on hub…";
-            StateHasChanged();
-            await Task.Delay(TimeSpan.FromSeconds(5));
-        }
-
-        var memberUrl = $"{HubBaseUrl}/src?url={archive}&member={member}";
+        // vocos_24khz.onnx exists only inside the sherpa-onnx release archive, and an archive cannot be range-read, so the models host keeps the
+        // archive's members as plain files (no server-side extraction, no waiting for a cache to warm).
+        var memberUrl = SpawnDev.ILGPU.ML.Hub.ModelsHost.GetArchiveMemberUrl(VocoderArchiveUrl, VocoderMember);
         // the member is cached in OPFS and read as a JS-side stream: its 54 MB never become a .NET byte[] (the size is verified against a truncated body)
         await using var vocoder = await ModelSource.OpenUrlAsync(memberUrl, ModelSource.CacheKey("bundled", $"zipvoice-vocos-24khz-{VocoderBytes}.onnx"), VocoderBytes);
         return await InferenceSession.CreateFromOnnxStreamAsync(_accelerator!, vocoder);

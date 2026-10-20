@@ -18,6 +18,8 @@ public enum ImageModel
     Flux2Klein,
     /// <summary>SD-Turbo, one step (Stability AI): faster, smaller, a 2023 look.</summary>
     SdTurbo,
+    /// <summary>FLUX 3 Image Klein 5.6B, 16 steps (Black Forest Labs, FLUX Kommunity License: non-commercial): the best pictures, slower. Draws from a full scene caption, which <see cref="AssetGenerator.WriteCaption"/> has a local Qwen3 4B write.</summary>
+    Flux3Klein,
 }
 
 /// <summary>A picture drawn for a prompt.</summary>
@@ -58,6 +60,8 @@ public sealed class AssetGenerator : IDisposable
     private readonly IModelSource _source;
     private readonly Func<string, Task<byte[]>>? _motions;
     private Flux2Pipeline? _flux;
+    private Flux3.Flux3Pipeline? _flux3;
+    private string? _captionFor, _captionText;
     private ImageGenerationPipeline? _sd;
     private BackgroundRemovalPipeline? _rmbg;
     private Trellis2ImageTo3D? _trellis;
@@ -81,6 +85,15 @@ public sealed class AssetGenerator : IDisposable
     /// <summary>How many more batches of pictures are drawn when the best of a batch matches the prompt worse than <see cref="MinPromptMatch"/>.</summary>
     public int LowMatchRetries { get; set; } = 1;
     private PromptMatchScorer? _scorer;
+
+    /// <summary>FLUX 3 draws from a full scene caption (a short prompt gives a generic picture): a local Qwen3 4B (2.4 GB, freed afterwards) writes one from the prompt with Black Forest Labs' upsampler instructions, once per prompt. Default on.</summary>
+    public bool WriteCaption { get; set; } = true;
+    /// <summary>How the caption model's file is opened with download progress (<c>HttpClientModelSource.OpenAsync</c> fits); null = through the model source, silently.</summary>
+    public Flux3.Flux3CaptionWriter.OpenModel? OpenCaptionModel { get; set; }
+    /// <summary>The caption as the language model writes it (the whole text so far).</summary>
+    public Action<string>? CaptionText { get; set; }
+    /// <summary>The caption FLUX 3 last drew from; null when none was written.</summary>
+    public string? UsedCaption { get; private set; }
 
     /// <summary>The rig cleanup (<see cref="SkinTokensRigger.BridgeHops"/>): 4 by default, 0 keeps the learned weights and the mesh untouched.</summary>
     public int BridgeHops { get; set; } = 4;
@@ -125,6 +138,34 @@ public sealed class AssetGenerator : IDisposable
             }
             return pictures;
         }
+        if (model == ImageModel.Flux3Klein)
+        {
+            _flux3 ??= await Timed("load FLUX 3 Image Klein", () => Flux3.Flux3Pipeline.CreateAsync(_acc, _source, ImageGenerator.Flux3Repo, (s, p) => Status?.Invoke($"FLUX 3 Klein {s} {p}%"), default, ImageModelBits));
+            _flux3.KeepTransformerResident = KeepImageModelResident;
+            string caption = full;
+            UsedCaption = null;
+            if (WriteCaption)
+            {
+                if (_captionFor != full || _captionText == null)
+                {
+                    _flux3.ReleaseResident();                          // the transformer must not sit on the GPU beside the language model
+                    _captionText = await Timed("write the caption (Qwen3 4B)", () => Flux3.Flux3CaptionWriter.WriteAsync(_acc,
+                        OpenCaptionModel ?? ((repo, file, _) => _source.OpenAsync(repo, file)), full, size, size, s => Status?.Invoke(s), null, text => CaptionText?.Invoke(text)));
+                    _captionFor = full;
+                }
+                caption = _captionText!; UsedCaption = caption;
+            }
+            foreach (var seed in seeds)
+            {
+                var sw3 = System.Diagnostics.Stopwatch.StartNew();
+                var img = await _flux3.RunAsync(new Flux3.Flux3Request { Caption = caption, Seed = seed, Width = size, Height = size, Progress = (s, i, n) => Status?.Invoke(s.StartsWith("denoise") ? $"FLUX 3 Klein: step {i + 1}/{n}" : $"FLUX 3 Klein: {s}") });
+                var pic = new AssetPicture(seed, img.Width, img.Height, img.Rgba);
+                pictures.Add(pic);
+                StageDone?.Invoke($"draw seed {seed}", sw3.Elapsed.TotalSeconds);
+                if (onEach != null) await onEach(pic);
+            }
+            return pictures;
+        }
         _flux ??= await Timed("load FLUX.2 klein", () => Flux2Pipeline.CreateAsync(_acc, _source, FluxRepo, 512, (s, p) => Status?.Invoke($"FLUX.2 klein {s} {p}%"), default, ImageModelBits));
         _flux.KeepTransformerResident = KeepImageModelResident;
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -155,7 +196,7 @@ public sealed class AssetGenerator : IDisposable
     }
 
     /// <summary>Free the image model's resident transformer (<see cref="KeepImageModelResident"/>) so the 3D stage has the GPU.</summary>
-    public void ReleaseImageModel() => _flux?.ReleaseResident();
+    public void ReleaseImageModel() { _flux?.ReleaseResident(); _flux3?.ReleaseResident(); }
 
     // ───────────────────────────── 2. cut out ─────────────────────────────
 
@@ -356,6 +397,40 @@ public sealed class AssetGenerator : IDisposable
     }
 
     /// <summary>
+    /// Image to 3D, the browser demo's "Image to 3D" mode: a picture you already have (a photo of one whole object) to a textured GLB, rigged and animated if asked. A picture that is not fully
+    /// opaque is used as it is (its alpha is the cut-out); any other has its background removed (RMBG-1.4) first.
+    /// </summary>
+    public async Task<GeneratedAsset> GenerateFromPictureAsync(AssetPicture picture, Trellis2Options? trellis = null, bool rig = true, IEnumerable<string>? moves = null, double armClearanceDegrees = 8)
+    {
+        int[] cut;
+        if (HasTransparency(picture.Rgba))
+        {
+            cut = new int[picture.Width * picture.Height];
+            Buffer.BlockCopy(picture.Rgba, 0, cut, 0, cut.Length * 4);
+        }
+        else cut = (await CutOutAsync(picture)).Pixels;
+        var glb = await BuildModelAsync(cut, picture.Width, picture.Height, trellis ?? new Trellis2Options { Seed = picture.Seed, MaxFaces = DefaultMaxFaces });
+        byte[]? rigged = null, animated = null; var used = new List<string>();
+        if (rig)
+        {
+            rigged = await RigAsync(glb);
+            if (_motions != null)
+            {
+                used.AddRange(moves ?? Array.Empty<string>());
+                if (used.Count > 0) animated = await AnimateAsync(rigged, used, armClearanceDegrees);
+            }
+        }
+        return new GeneratedAsset(picture, cut, glb, rigged, animated, used);
+    }
+
+    /// <summary>True when any pixel's alpha is below 255 (the picture already has a cut-out).</summary>
+    public static bool HasTransparency(byte[] rgba)
+    {
+        for (int i = 3; i < rgba.Length; i += 4) if (rgba[i] < 255) return true;
+        return false;
+    }
+
+    /// <summary>
     /// The best of several drawn pictures: cut each out, and rank by how well it matches <paramref name="prompt"/> (CLIP, when <see cref="ScorePictures"/> and there is a choice) minus 1.5 times the
     /// share of the frame's border its subject touches (a cropped subject makes a truncated model); without scoring, the picture that fits its frame best, as before.
     /// </summary>
@@ -419,7 +494,7 @@ public sealed class AssetGenerator : IDisposable
 
     public void Dispose()
     {
-        _flux?.Dispose(); _sd?.Dispose(); _rmbg?.Dispose(); _scorer?.Dispose();
-        _flux = null; _sd = null; _rmbg = null; _scorer = null; _trellis = null;
+        _flux?.Dispose(); _flux3?.Dispose(); _sd?.Dispose(); _rmbg?.Dispose(); _scorer?.Dispose();
+        _flux = null; _flux3 = null; _sd = null; _rmbg = null; _scorer = null; _trellis = null;
     }
 }

@@ -154,9 +154,10 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     /// needed. An interrupted previous attempt is resumed rather than restarted.
     /// </summary>
     /// <param name="url">
-    /// Source URL. Point this at the hub (<c>/hf/{repoId}/{filePath}</c>) rather than at huggingface.co
-    /// directly - the hub is what supplies the CORS headers a browser will accept, caches the file, and keeps
-    /// us out of HuggingFace's rate limiter.
+    /// Source URL. Point this at the models host (<see cref="HuggingFaceClient.GetDownloadUrl"/>, i.e.
+    /// <c>https://models.spawndev.com/{repoId}/resolve/main/{filePath}</c>) rather than at huggingface.co: it serves the CORS headers a
+    /// browser accepts and answers Range with a 206 from the first byte, and the download falls back to Hugging Face by itself
+    /// (same path layout) when the host cannot give the file.
     /// </param>
     /// <param name="cacheKey">Explicit cache key; derived from the URL path when omitted.</param>
     /// <param name="progress">Optional progress sink, throttled by <see cref="ProgressIntervalMs"/>.</param>

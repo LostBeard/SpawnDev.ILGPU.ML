@@ -1,7 +1,7 @@
 namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
-/// Serves models over HTTP from the SpawnDev hub into an <see cref="IResumableModelStore"/>, using
+/// Serves models over HTTP from the SpawnDev models host (Hugging Face as the fallback) into an <see cref="IResumableModelStore"/>, using
 /// <see cref="HttpClient"/> - the desktop counterpart to <see cref="HubModelSource"/>.
 /// </summary>
 /// <remarks>
@@ -12,8 +12,8 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// no WebTorrent and no browser.
 /// </para>
 /// <para>
-/// ⚠️ Always the hub, never huggingface.co directly - it caches, and it keeps us out of HuggingFace's rate
-/// limiter.
+/// ⚠️ The models host first, never huggingface.co directly: it keeps us out of HuggingFace's rate limiter, and the
+/// download falls back to Hugging Face by itself when the host cannot give a file (<see cref="ModelsHost"/>).
 /// </para>
 /// </remarks>
 public class HttpClientModelSource : ICachingModelSource
@@ -31,7 +31,7 @@ public class HttpClientModelSource : ICachingModelSource
     /// <summary>Minimum gap between progress reports. The final report is always sent.</summary>
     public int ProgressIntervalMs { get; set; } = 100;
 
-    /// <summary>Git revision requested from the hub.</summary>
+    /// <summary>Git revision requested (only <c>main</c> is on the models host; any other comes from Hugging Face).</summary>
     public string Revision { get; set; } = "main";
 
     /// <summary>The store being filled, for listing, sizing and eviction.</summary>
@@ -122,7 +122,7 @@ public class HttpClientModelSource : ICachingModelSource
 
         // ResponseHeadersRead: do not buffer the body. Without it HttpClient reads the WHOLE model into
         // memory before this method sees a single byte, which defeats streaming entirely.
-        using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        using var res = await ModelsHost.SendAsync(_http, req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         if (!res.IsSuccessStatusCode)
             throw new HttpRequestException(
                 $"Model download failed: {(int)res.StatusCode} {res.ReasonPhrase} for {url}");

@@ -325,6 +325,83 @@ public abstract partial class MLTestBase
         Ur_Expect(Flux3PromptUpsampler.Clean("```\nA caption.\n```") == "A caption.", "code fence removed");
     });
 
+    /// <summary>The caption can be shown as it is written: the upsampler hands the pipeline's token callback the CLEANED text so far (no reasoning block, no quotes), never when the caller did not ask, and the answer it returns is unchanged.</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task Flux3_PromptUpsampler_StreamsTheCleanedCaptionAndReturnsTheSameAnswer() => await RunTest(async accelerator =>
+    {
+        const string full = "<think>plan the scene</think>\n\"Full-color outdoor photograph of a red fox on snow, frame-left.\"\n";
+        bool askedForTokens = false;
+        var up = new Flux3PromptUpsampler(async (system, user, onToken) =>
+        {
+            askedForTokens = onToken != null;
+            if (onToken != null)
+                for (int n = 1, i = 10; i < full.Length; n++, i += 6) await onToken(n, full[..i]);   // a model writing it in pieces (the first piece already holds the whole <think> tag: a tokenizer emits it as one token)
+            return full;
+        });
+
+        var seen = new List<(int Tokens, string Text)>();
+        var streamed = await up.ExpandAsync("a red fox in the snow", 512, 384, (tokens, text) => { seen.Add((tokens, text)); return Task.CompletedTask; });
+        Ur_Expect(askedForTokens, "the token callback reaches the model when the caller wants the text");
+        Ur_Expect(seen.Count >= 8, $"the text arrived in pieces ({seen.Count})");
+        Ur_Expect(seen.Zip(seen.Skip(1), (a, b) => b.Tokens > a.Tokens).All(ok => ok), "tokens count up");
+        // While the model is still reasoning, the text so far shows its <think> block growing (a progress cue the demo keeps on purpose). The moment </think> has
+        // arrived, the reasoning is dropped and the CAPTION streams: from then on the text never contains the reasoning and only grows.
+        int firstAnswer = seen.FindIndex(s => !s.Text.Contains("<think>"));
+        Ur_Expect(firstAnswer > 0, $"the reasoning was visible first ({firstAnswer})");
+        var thinking = seen.Take(firstAnswer).ToList();
+        Ur_Expect(thinking.Zip(thinking.Skip(1), (a, b) => b.Text.Length >= a.Text.Length).All(ok => ok), "the reasoning grows while it is written");
+        var answer = seen.Skip(firstAnswer).ToList();
+        Ur_Expect(answer.Count >= 3, $"the caption arrived in pieces ({answer.Count})");
+        Ur_Expect(answer.All(s => !s.Text.Contains("<think>") && !s.Text.Contains("plan the scene")), "once the reasoning has closed it is never shown again");
+        Ur_Expect(answer.Zip(answer.Skip(1), (a, b) => b.Text.Length >= a.Text.Length).All(ok => ok), "the caption only grows");
+        // (this fixture quotes its answer, and a piece shows the opening quote until the closing one arrives; the real system prompt says "no quotes around it")
+        Ur_Expect(seen[^1].Text.TrimStart('"').StartsWith("Full-color outdoor photograph of a red fox"), $"the last piece is the caption's start: {seen[^1].Text}");
+
+        var plain = await up.ExpandAsync("a red fox in the snow", 512, 384);
+        Ur_Expect(!askedForTokens, "no token callback is passed when the caller did not ask");
+        Ur_Expect(streamed == plain && plain == "Full-color outdoor photograph of a red fox on snow, frame-left.", $"streaming does not change the answer: '{streamed}' vs '{plain}'");
+    });
+
+    /// <summary>
+    /// The real thing: a real GGUF model (Qwen2.5 0.5B, the one the chat tests use) writes a caption through <see cref="Flux3PromptUpsampler.FromPipeline"/> and the text arrives while it is being written, growing, ending as the returned caption.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task Flux3_PromptUpsampler_WithARealModel_StreamsTheCaptionAsItIsWritten() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU && accelerator.AcceleratorType != AcceleratorType.Cuda)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: the streamed-caption check runs on the campaign target (WebGPU) + desktop reference (CUDA)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var client = new ModelsHostStreamLoader(http);
+        try
+        {
+            var hub = client;
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
+            var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, model.Stream, maxSeqLen: 2048, ct: cts.Token))
+            {
+                var seen = new List<(int Tokens, string Text)>();
+                var caption = await Flux3PromptUpsampler.FromPipeline(pipe, maxNewTokens: 48)
+                    .ExpandAsync("a red fox in the snow", 512, 512, (tokens, text) => { seen.Add((tokens, text)); return Task.CompletedTask; });
+                Ur_Expect(!string.IsNullOrWhiteSpace(caption), "the model wrote a caption");
+                Ur_Expect(seen.Count >= 8, $"the caption arrived token by token, not at the end ({seen.Count} callbacks)");
+                Ur_Expect(seen.Zip(seen.Skip(1), (a, b) => b.Tokens > a.Tokens).All(ok => ok), "token counts increase");
+                Ur_Expect(seen[0].Text.Length < caption.Length, $"the first piece ({seen[0].Text.Length} chars) is shorter than the finished caption ({caption.Length})");
+                Ur_Expect(seen[^1].Text == caption || caption.StartsWith(seen[^1].Text) || seen[^1].Text.StartsWith(caption), "the last streamed piece is the caption (the final token may be an end marker)");
+                Console.WriteLine($"[Flux3 streamed caption][{accelerator.AcceleratorType}] {seen.Count} pieces, {caption.Length} chars: {caption}");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     /// <summary>
     /// Where one denoising step goes: the real transformer (F3_BITS weights) at a 512 px picture's size (1024 image tokens + 80 text), every stage timed with a device sync on either side. Prints the table; asserts nothing
     /// but that the step ran. CUDA uses the tensor-core GEMM; OpenCL runs the portable tiled GEMM and flash attention the browser's WebGPU lane runs.

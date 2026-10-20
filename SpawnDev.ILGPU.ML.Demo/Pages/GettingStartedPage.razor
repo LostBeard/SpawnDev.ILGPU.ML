@@ -47,7 +47,7 @@ dotnet add package SpawnDev.SpawnJS</code></pre>
             <div class="step-content">
                 <h3>Load a model</h3>
                 <p class="step-desc">
-                    Prefer streaming weights through the hub into OPFS — never materialize a large model as a
+                    Prefer streaming weights from the models host into OPFS — never materialize a large model as a
                     <code>byte[]</code> on the WASM heap. <code>HubModelSource</code> is the default (plain HTTP + OPFS).
                     <code>CreateFromStreamAsync</code> auto-detects ONNX / GGUF / TFLite / … from magic bytes
                     (same prefix as the Model Inspector). Optional P2P delivery is a separate package:
@@ -68,7 +68,7 @@ dotnet add package SpawnDev.SpawnJS</code></pre>
 <span class="kw">var</span> session2 = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromHuggingFaceAsync</span>(
     accelerator, hub, <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
 
-<span class="cm">// Desktop / small files: URL through the hub (CORS + cache). Avoid for large browser weights.</span>
+<span class="cm">// Desktop / small files: URL on the models host (CORS, Range, Hugging Face fallback). Avoid for large browser weights.</span>
 <span class="kw">var</span> url = <span class="ty">HuggingFaceClient</span>.<span class="fn">GetDownloadUrl</span>(
     <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.SqueezeNet, <span class="st">"squeezenet1.1-7.onnx"</span>);
 <span class="kw">var</span> session3 = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromFileAsync</span>(accelerator, httpClient, url);</code></pre>

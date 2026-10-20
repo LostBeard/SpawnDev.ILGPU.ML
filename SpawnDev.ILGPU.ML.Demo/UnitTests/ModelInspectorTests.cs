@@ -622,49 +622,41 @@ public class ModelInspectorTests
             throw new Exception("Expected an applicable ONNX compatibility result with ops");
     }
 
-    // ── Inspect-by-URL via the live SpawnDev hub (the original #1 goal) ──
+    // ── Inspect-by-URL via the SpawnDev models host (the original #1 goal) ──
 
     /// <summary>
-    /// Inspect a HuggingFace model BY URL via the live SpawnDev hub (hub.spawndev.com):
-    /// HubModelSource.OpenForInspectionAsync opens a ranged HTTP stream — no WebTorrent, no magnet, no
-    /// swarm — and the inspector seeks past every weight blob, so only the bytes it actually touches cross
+    /// Inspect a HuggingFace model BY URL on the SpawnDev models host (models.spawndev.com):
+    /// HubModelSource.OpenForInspectionAsync opens a ranged HTTP stream - no WebTorrent, no magnet, no
+    /// swarm - and the inspector seeks past every weight blob, so only the bytes it actually touches cross
     /// the wire. Asserts (a) a meaningful architecture parsed, and (b) it fetched a small fraction of the
-    /// file rather than the weights. This is the production inspect-by-URL path the demo exposes; requires
-    /// internet (cold hub cache → generous timeout).
-    /// </summary>
-    /// <summary>
-    /// Structure-only inspection over OUR hub's <c>/hf</c> web seed - plain HTTP range requests, no
-    /// WebTorrent, no magnet, no swarm.
+    /// file rather than the weights. This is the production inspect-by-URL path the demo exposes; requires internet.
     /// </summary>
     /// <remarks>
-    /// WHY THIS EXISTS ALONGSIDE the torrent test below. That one is the production inspect-by-URL path and
-    /// is worth keeping, but it can fail for reasons that are not ours: a cold hub cache has to fetch from
-    /// HuggingFace first, and the torrent layer adds metadata resolution and peer discovery on top. When it
-    /// goes red you cannot tell "our hub is broken" from "HuggingFace was slow" - and it was the ONLY
-    /// remaining failure in the full sweep, which is exactly the ambiguity you do not want in a gate.
+    /// This narrows the surface to the single thing WE control and operate: does the models host answer a
+    /// byte-range request, and does the inspector parse a real architecture out of it. (Before 2026-10-20 the
+    /// source was the SpawnDev hub's <c>/hf</c> web seed; the hub no longer serves models.) Failures from
+    /// Hugging Face directly are acceptable, failures from our own host are not, which is why the fallback
+    /// to Hugging Face is NOT what this test exercises: the file is mirrored, so a pass means the models host
+    /// answered.
     ///
-    /// This one narrows the surface to the single thing WE control and operate: does hub.spawndev.com answer
-    /// a byte-range request, and does the inspector parse a real architecture out of it. TJ's point, and it
-    /// is right: failures from HuggingFace directly are acceptable, failures from our own hub are not.
-    ///
-    /// It also asserts the thing that actually matters and that the torrent test can only assert indirectly:
-    /// <see cref="HttpRangeStream.BytesFetched"/> against the file size. "Structure only" is a claim about
-    /// how much came over the wire, and a regression that silently starts reading weight blobs still returns
-    /// perfectly correct structure - so without this the gate would stay green while the feature died.
+    /// It also asserts the thing that actually matters: <see cref="HttpRangeStream.BytesFetched"/> against the
+    /// file size. "Structure only" is a claim about how much came over the wire, and a regression that
+    /// silently starts reading weight blobs still returns perfectly correct structure - so without this the
+    /// gate would stay green while the feature died.
     /// </remarks>
     [TestMethod(Timeout = 120000, RetryCount = 2, Category = "HeavyCpu")]
-    public async Task ModelInspector_SpawnDevHub_WebSeed_StructureOnly()
+    public async Task ModelInspector_ModelsHost_StructureOnly()
     {
         const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";
         const string filePath = "onnx/model.onnx";
 
-        // HubModelSource + OpenForInspectionAsync: ranged HTTP against the hub, no WebTorrent, and
+        // HubModelSource + OpenForInspectionAsync: ranged HTTP against the models host, no WebTorrent, and
         // deliberately NOT the caching OpenAsync - inspecting a model must not download and store it.
         using var source = new HubModelSource(SpawnDev.SpawnJS.SpawnJSRuntime.Instance!, _http);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
         await using var stream = await source.OpenForInspectionAsync(repoId, filePath, cts.Token);
-        if (stream.Length <= 0) throw new Exception($"hub web seed reported length={stream.Length}");
+        if (stream.Length <= 0) throw new Exception($"models host reported length={stream.Length}");
 
         var r = await ModelInspectorHelper.InspectAsync(stream, cts.Token);
 
@@ -677,16 +669,16 @@ public class ModelInspectorTests
         // it should touch a small fraction of the file. Half is a deliberately loose bar - the point is to
         // catch "it started downloading the weights", which would sit at ~100%, not to police the exact
         // ratio (that moves with piece layout and read-ahead).
-        // MEASURED against the live hub: 1,533,463 of 10,204,519 bytes = 15.0%. Not vacuous, and nowhere
+        // MEASURED against the old hub (2026-09): 1,533,463 of 10,204,519 bytes = 15.0% (same file, same reader). Not vacuous, and nowhere
         // near the bar - confirmed by temporarily inverting this check and reading the reported numbers.
         if (stream.BytesFetched >= stream.Length / 2)
             throw new Exception(
                 $"structure-only inspection fetched {stream.BytesFetched} of {stream.Length} bytes " +
                 $"({100.0 * stream.BytesFetched / stream.Length:F1}%) - it is reading weights, not just structure.");
 
-        Console.WriteLine($"[hub web seed] {r.NodeCount} nodes, {r.TotalParameters:N0} params, fetched "
+        Console.WriteLine($"[models host] {r.NodeCount} nodes, {r.TotalParameters:N0} params, fetched "
                         + $"{stream.BytesFetched:N0} of {stream.Length:N0} bytes "
-                        + $"({100.0 * stream.BytesFetched / stream.Length:F1}%) from hub.spawndev.com");
+                        + $"({100.0 * stream.BytesFetched / stream.Length:F1}%) from {ModelsHost.BaseUrl}");
     }
 
     /// <summary>
@@ -694,7 +686,7 @@ public class ModelInspectorTests
     /// </summary>
     /// <remarks>
     /// This replaces a test that asserted the same "structure only" property over a DESELECTED torrent.
-    /// That property is now covered by ModelInspector_SpawnDevHub_WebSeed_StructureOnly over ranged HTTP,
+    /// That property is now covered by ModelInspector_ModelsHost_StructureOnly over ranged HTTP,
     /// so repeating it here would be duplication. The property worth guarding instead is the one the HTTP
     /// path can newly get WRONG: HubModelSource.OpenAsync downloads and stores the whole model, and routing
     /// inspection through it would pull gigabytes to read a graph and fill the model cache with models

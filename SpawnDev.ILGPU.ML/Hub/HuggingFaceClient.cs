@@ -138,47 +138,44 @@ public class HuggingFaceClient
     //  Download
     // ═══════════════════════════════════════════════════════════
 
-    /// <summary>The HuggingFace origin. Only the hub itself should fetch from here.</summary>
-    public const string HuggingFaceOrigin = "https://huggingface.co";
+    /// <summary>The HuggingFace origin: the fallback source, with the same path layout as <see cref="ModelsHost"/>.</summary>
+    public const string HuggingFaceOrigin = ModelsHost.HuggingFaceBaseUrl;
+
+    /// <summary>The base URL downloads use (<see cref="ModelsHost.BaseUrl"/>: https://models.spawndev.com by default).</summary>
+    public static string ModelsBaseUrl { get => ModelsHost.BaseUrl; set => ModelsHost.BaseUrl = value; }
+
+    /// <summary>https://models.spawndev.com, where every model we host lives (<see cref="ModelsHost.DefaultBaseUrl"/>).</summary>
+    public const string DefaultModelsBaseUrl = ModelsHost.DefaultBaseUrl;
+
+    /// <summary>The SpawnDev hub no longer serves models (2026-10-20): use <see cref="ModelsBaseUrl"/>. The hub keeps the WebTorrent tracker only.</summary>
+    [Obsolete("The SpawnDev hub no longer serves models; downloads use ModelsBaseUrl (ModelsHost.DefaultBaseUrl). The hub keeps the WebTorrent tracker only.", error: true)]
+    public static string HubBaseUrl { get; set; } = "";
+
+    /// <summary>The SpawnDev hub no longer serves models (2026-10-20): use <see cref="DefaultModelsBaseUrl"/>.</summary>
+    [Obsolete("The SpawnDev hub no longer serves models; use DefaultModelsBaseUrl (ModelsHost.DefaultBaseUrl).", error: true)]
+    public const string DefaultHubBaseUrl = "";
 
     /// <summary>
-    /// Our hub, which proxies and CACHES HuggingFace files. Every download goes through it by default.
-    /// </summary>
-    /// <remarks>
-    /// 🔴 DO NOT REQUEST ANYTHING FROM HUGGINGFACE DIRECTLY - not from tests, not from clients. The hub
-    /// exists precisely to prevent that: it caches, it fixes CORS, and it removes us from HF's rate limiter.
-    /// MEASURED 2026-09-08: a sweep row failed with
-    /// <c>HttpRequestException: Response status code does not indicate success: 429 (Too Many Requests)</c>
-    /// purely because it built an huggingface.co URL itself.
-    /// </remarks>
-    public static string HubBaseUrl { get; set; } = DefaultHubBaseUrl;
-
-    /// <summary>
-    /// The public SpawnDev hub running the HuggingFace + Ollama proxies.
-    /// </summary>
-    /// <remarks>
-    /// Lives here rather than on a delivery class: the hub is where models come from regardless of how they
-    /// are fetched. It used to be <c>HubModelStream.DefaultHubBaseUrl</c>, which meant the base URL for
-    /// plain HTTP delivery was defined by the WebTorrent adapter - so ML could not stop referencing
-    /// WebTorrent without losing the address of its own hub.
-    /// </remarks>
-    public const string DefaultHubBaseUrl = "https://hub.spawndev.com:44365";
-
-    /// <summary>
-    /// Get a download URL for a file in a HuggingFace repository, THROUGH THE HUB.
+    /// Get a download URL for a file in a HuggingFace repository, on the SpawnDev models host
+    /// (<c>https://models.spawndev.com/{repo}/resolve/main/{file}</c>: static files, free egress, CORS open, Range works).
     /// This URL can be passed directly to <see cref="InferenceSession.CreateFromFileAsync"/>.
     /// </summary>
     /// <param name="repoId">Repository ID (e.g., "onnx-community/squeezenet1.1-7")</param>
     /// <param name="filename">File path within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
-    /// <param name="revision">Git revision (default: "main"). Anything other than "main" cannot be served
-    /// by the hub's <c>/hf</c> route and falls back to the origin.</param>
-    /// <param name="baseUrl">Pass a value ONLY to force a specific origin (the hub's own fetcher, or a
-    /// deliberate origin test). Leaving it null is what routes through the hub.</param>
+    /// <param name="revision">Git revision (default: "main"). Only <c>main</c> is mirrored on the models host; any other revision is
+    /// requested from Hugging Face.</param>
+    /// <param name="baseUrl">Pass a value ONLY to force a specific host with the same layout (a deliberate origin test). Leaving it null uses
+    /// the models host.</param>
     /// <remarks>
+    /// The transports (<see cref="HubModelSource"/>, <see cref="HttpModelDownloader"/>, <see cref="FetchRangeStream"/>, <see cref="ModelsHost.SendAsync"/>)
+    /// fall back to Hugging Face by themselves when the models host cannot give the file, because the two share one layout
+    /// (<see cref="ModelsHost.GetFallbackUrl"/>): callers build the models-host URL and nothing else.
+    /// <para>
     /// ⚠️ This returns a URL, so a caller can still pull a multi-GB file into a <c>byte[]</c> with it. That
     /// is the wrong shape for weights in a browser - the managed WASM heap is small and the bytes belong in
-    /// JS. Use <see cref="HubModelStream.OpenAsync"/> for weights (seekable, on-demand, torrent-backed) and
+    /// JS. Use <see cref="HubModelSource"/> (OPFS cache) or <see cref="RangeStreamModelSource"/> for weights and
     /// keep this for KB-scale files.
+    /// </para>
     /// </remarks>
     public static string GetDownloadUrl(string repoId, string filename, string revision = "main", string? baseUrl = null)
     {
@@ -186,7 +183,7 @@ public class HuggingFaceClient
             return $"{baseUrl}/{repoId}/resolve/{revision}/{filename}";
         if (!string.Equals(revision, "main", StringComparison.Ordinal))
             return $"{HuggingFaceOrigin}/{repoId}/resolve/{revision}/{filename}";
-        return $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filename.TrimStart('/')}";
+        return ModelsHost.GetUrl(repoId, filename);
     }
 
     /// <summary>
@@ -200,8 +197,9 @@ public class HuggingFaceClient
     public async Task<byte[]> DownloadFileAsync(string repoId, string filename, string revision = "main",
         Action<long, long>? onProgress = null)
     {
-        // ⚠️ No baseUrl argument - that is what routes this through the hub. Passing BaseUrl here (which it
-        // used to do) forced the huggingface.co origin and put every caller straight into HF's rate limiter.
+        // ⚠️ No baseUrl argument - that is what routes this to the models host (HF only as the fallback).
+        // Passing BaseUrl here (which it used to do) forced the huggingface.co origin and put every caller
+        // straight into HF's rate limiter.
         var url = GetDownloadUrl(repoId, filename, revision);
         return await DownloadAsync(url, onProgress);
     }
@@ -212,11 +210,13 @@ public class HuggingFaceClient
     public async Task<byte[]> DownloadAsync(string url, Action<long, long>? onProgress = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        // Only add auth header when token is set — avoids CORS preflight in browsers
-        if (!string.IsNullOrEmpty(AuthToken))
-            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", AuthToken);
+        // Only add auth header when token is set — avoids CORS preflight in browsers. The token is Hugging Face's: it goes to
+        // huggingface.co (the request itself, or the fallback below), never to the models host.
+        var auth = string.IsNullOrEmpty(AuthToken) ? null : new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", AuthToken);
+        if (auth != null && request.RequestUri!.Host.EndsWith("huggingface.co", StringComparison.OrdinalIgnoreCase))
+            request.Headers.Authorization = auth;
 
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        using var response = await ModelsHost.SendAsync(_http, request, HttpCompletionOption.ResponseHeadersRead, fallbackAuthorization: auth);
         response.EnsureSuccessStatusCode();
 
         var totalBytes = response.Content.Headers.ContentLength ?? -1;

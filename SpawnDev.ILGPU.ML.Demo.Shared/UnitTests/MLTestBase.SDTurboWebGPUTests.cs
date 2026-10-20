@@ -33,13 +33,8 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // OPFS-backed pieces, COLD (the DA-gate lesson, mirrored from SDTurbo_Generate_E2E): wipe the torrent
-        // dir, then a FRESH client over the same IAsyncFS so no restored state pulls pieces into the .NET heap.
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        // The weights are read with HTTP range requests from the models host (no torrent store to clean first).
+        var client = new ModelsHostStreamLoader(http);
 
         // Diagnostic: name any under-pressure reclaim fire (node + MiB). Reset the process-cumulative counters
         // so the numbers below are THIS test's. Restored in finally so we leave no cross-test global state.
@@ -50,7 +45,7 @@ public abstract partial class MLTestBase
         BufferPool.ResetReclaimTrace();
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
@@ -160,11 +155,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
 
         bool _savedTrace = BufferPool.TraceReclaim;
         int _savedForce = BufferPool.ForceReclaimEveryNRents;
@@ -172,7 +163,7 @@ public abstract partial class MLTestBase
         BufferPool.ResetReclaimTrace();
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
@@ -242,14 +233,10 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
@@ -321,11 +308,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
 
         bool _savedTrace = BufferPool.TraceReclaim, _savedPeaks = BufferPool.TrackPeaks;
         int _savedForce = BufferPool.ForceReclaimEveryNRents;
@@ -335,7 +318,7 @@ public abstract partial class MLTestBase
         BufferPool.ResetReclaimTrace();
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
@@ -417,14 +400,10 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));

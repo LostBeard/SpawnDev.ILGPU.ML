@@ -31,13 +31,10 @@ public abstract partial class MLTestBase
         // Wipe the torrent dir for a CLEAN download (a stale/partial torrent gives "resolved metadata but
         // exposes no files"). The profiling window is RunAsync only (download/load lives in CreateAsync),
         // so a cold download doesn't pollute the gen split.
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub, Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
             using (pipe)
@@ -105,14 +102,10 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only per-op profile");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub, Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
             using (pipe)
@@ -183,16 +176,12 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only elide A/B");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         bool prevElide = SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch;
         bool prevFold = SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled;
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub, Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
             using (pipe)

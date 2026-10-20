@@ -468,12 +468,13 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
     var text = args.Length > 1 ? args[1] : "The capital of France is Paris.";
     var voiceName = args.Length > 2 ? args[2] : "af_heart";
     var backend = args.Length > 3 ? args[3].ToUpperInvariant() : "CUDA";
-    const string HubBase = "https://hub.spawndev.com:44365/hf/onnx-community/Kokoro-82M-v1.0-ONNX";
+    const string KokoroRepo = "onnx-community/Kokoro-82M-v1.0-ONNX";
 
     using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-    Console.WriteLine($"KOKOROSPEAK: fetching the model through the hub ({backend})");
-    var modelBytes = await http.GetByteArrayAsync($"{HubBase}/onnx/model.onnx");
-    var voiceBytes = await http.GetByteArrayAsync($"{HubBase}/voices/{voiceName}.bin");
+    Console.WriteLine($"KOKOROSPEAK: fetching the model from the models host ({backend})");
+    var models = new SpawnDev.ILGPU.ML.Hub.HuggingFaceClient(http);   // the models host, Hugging Face as the fallback
+    var modelBytes = await models.DownloadFileAsync(KokoroRepo, "onnx/model.onnx");
+    var voiceBytes = await models.DownloadFileAsync(KokoroRepo, $"voices/{voiceName}.bin");
     Console.WriteLine($"  model {modelBytes.Length / 1048576.0:F1} MB, voice {voiceBytes.Length} bytes");
 
     var pack = SpawnDev.ILGPU.ML.Pipelines.KokoroVoicePack.FromBytes(voiceName, voiceBytes);

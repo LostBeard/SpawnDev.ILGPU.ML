@@ -54,4 +54,4 @@ On "a red fox in the snow" qwen3:8b wrote a clean 187-word caption (medium, scen
 
 ## In the browser
 
-The Image Generation page runs FLUX 3 from the hosted export through the hub source (OPFS cache). Chrome WebGPU, RTX 4070, 4-bit, cold start including all downloads (about 6 GB): 512 x 384 with one reference picture in 12.6 minutes. The over-HTTP test (`Flux3_OverHttp_DrawsAPicture`, local file server, no download wait): text to image 512 px 257 s with the weights loading, the next picture with a reference 164 s.
+The Image Generation page runs FLUX 3 from the hosted export (models.spawndev.com, Hugging Face as the fallback) through the OPFS-cached model source. Chrome WebGPU, RTX 4070, 4-bit, cold start including all downloads (about 6 GB): 512 x 384 with one reference picture in 12.6 minutes. The over-HTTP test (`Flux3_OverHttp_DrawsAPicture`, local file server, no download wait): text to image 512 px 257 s with the weights loading, the next picture with a reference 164 s.

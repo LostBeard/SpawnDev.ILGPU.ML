@@ -84,7 +84,6 @@ public abstract partial class MLTestBase
             http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/fm_decoder_int8.onnx"));
         var tokensBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/tokens.txt"));
-        await WarmArchiveAsync(http, VocoderArchive);
         var vocoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, ArchiveMemberUrl(VocoderArchive, VocoderMember));
         if (vocoderBytes.Length != 54_157_409)

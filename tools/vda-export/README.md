@@ -13,7 +13,7 @@ new_cache_0..7 [P_i, 1, C_i]
 
 Needs a checkout of https://github.com/DepthAnything/Video-Depth-Anything (`VDA_REPO`, default
 `../../../_research/Video-Depth-Anything`) and the weights `video_depth_anything_vits.pth`
-(HF `depth-anything/Video-Depth-Anything-Small`; fetch through hub.spawndev.com, never huggingface.co directly).
+(HF `depth-anything/Video-Depth-Anything-Small`; fetch it with `HuggingFaceClient.GetDownloadUrl` (the models host, Hugging Face as the fallback), not a hand-written Hugging Face URL).
 
 | script | does |
 |---|---|

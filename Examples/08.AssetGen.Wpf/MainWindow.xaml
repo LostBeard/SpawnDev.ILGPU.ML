@@ -2,59 +2,95 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
-        Title="SpawnDev.ILGPU.ML - Asset Generator" Width="1280" Height="820" Background="{StaticResource Bg}" Foreground="{StaticResource Fg}">
+        Title="SpawnDev.ILGPU.ML - Text &amp; Image to 3D" Width="1320" Height="900" Background="{StaticResource Bg}" Foreground="{StaticResource Fg}">
     <Grid Margin="14">
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="480" />
+            <ColumnDefinition Width="500" />
             <ColumnDefinition Width="14" />
             <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
 
-        <!-- left: prompt, pictures, log -->
+        <!-- left: the same settings the browser demo's Text and Image to 3D page offers, the pictures, the log -->
         <Grid Grid.Column="0">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
-                <RowDefinition Height="170" />
+                <RowDefinition Height="150" />
             </Grid.RowDefinitions>
 
             <StackPanel Grid.Row="0">
-                <TextBlock Text="Describe a character or object" Margin="0,0,0,4" />
-                <TextBox x:Name="PromptBox" Text="a knight in plate armor, full body, standing in a relaxed A-pose" TextWrapping="Wrap" AcceptsReturn="False" Height="56" Padding="6"
-                         Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
-                <WrapPanel Margin="0,10,0,0">
-                    <TextBlock Text="Image model" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="ModelBox" Width="170" SelectedIndex="0" Margin="0,0,12,0">
-                        <ComboBoxItem Content="FLUX.2 klein 4B" />
-                        <ComboBoxItem Content="SD-Turbo" />
-                    </ComboBox>
-                    <TextBlock Text="Pictures" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="CountBox" Width="56" SelectedIndex="2" Margin="0,0,12,0">
-                        <ComboBoxItem Content="1" /><ComboBoxItem Content="2" /><ComboBoxItem Content="4" /><ComboBoxItem Content="8" />
-                    </ComboBox>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <RadioButton x:Name="TextMode" Content="Text to 3D" IsChecked="True" GroupName="mode" Checked="ModeChanged" Foreground="{StaticResource Fg}" Margin="0,0,16,0" />
+                    <RadioButton x:Name="ImageMode" Content="Image to 3D" GroupName="mode" Checked="ModeChanged" Foreground="{StaticResource Fg}" />
+                </StackPanel>
+
+                <StackPanel x:Name="TextPanel">
+                    <TextBlock Text="Describe a character or object" Margin="0,0,0,4" />
+                    <TextBox x:Name="PromptBox" Text="a knight in plate armor, full body, standing in a relaxed A-pose" TextWrapping="Wrap" AcceptsReturn="False" Height="56" Padding="6"
+                             Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
+                    <WrapPanel Margin="0,10,0,0">
+                        <TextBlock Text="Image model" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="ModelBox" Width="300" SelectedIndex="1" Margin="0,0,12,0" SelectionChanged="ModelChanged">
+                            <ComboBoxItem Content="FLUX 3 Image Klein 5.6B (best, slower; non-commercial)" />
+                            <ComboBoxItem Content="FLUX.2 klein 4B (sharper)" />
+                            <ComboBoxItem Content="SD-Turbo (faster)" />
+                        </ComboBox>
+                    </WrapPanel>
+                    <CheckBox x:Name="CaptionBox" Content="Write the full caption for me (Qwen3 4B, 2.4 GB)" IsChecked="True" Margin="0,8,0,0" Visibility="Collapsed"
+                              ToolTip="FLUX 3 draws from a full scene caption. A small local language model writes one from your prompt with Black Forest Labs' own upsampler instructions, then leaves the GPU." />
+                    <WrapPanel Margin="0,8,0,0">
+                        <TextBlock Text="Pictures" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="CountBox" Width="170" SelectedIndex="0" Margin="0,0,12,0">
+                            <ComboBoxItem Content="Auto-pick the best fit" Tag="0" />
+                            <ComboBoxItem Content="Draw 4, I pick" Tag="4" />
+                            <ComboBoxItem Content="Draw 8, I pick" Tag="8" />
+                        </ComboBox>
+                        <TextBlock Text="Size" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="SizeBox" Width="78" SelectedIndex="0">
+                            <ComboBoxItem Content="512" /><ComboBoxItem Content="768" /><ComboBoxItem Content="1024" />
+                        </ComboBox>
+                    </WrapPanel>
+                </StackPanel>
+
+                <StackPanel x:Name="ImagePanel" Visibility="Collapsed">
+                    <StackPanel Orientation="Horizontal">
+                        <Button x:Name="ChooseImageButton" Content="Choose picture..." Click="ChooseImageClick" Background="#334155" />
+                        <TextBlock x:Name="ImageName" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Width="260" />
+                    </StackPanel>
+                    <TextBlock Text="Best results: one whole object. A picture with a transparent background is used as is; any other is cut out with RMBG-1.4 first." TextWrapping="Wrap" FontSize="11" Margin="0,6,0,0" />
+                </StackPanel>
+
+                <WrapPanel Margin="0,8,0,0">
                     <TextBlock Text="Seed" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <TextBox x:Name="SeedBox" Text="11" Width="60" Margin="0,0,12,0" Padding="2" />
+                    <TextBlock Text="Triangles" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="FacesBox" Width="110" SelectedIndex="3" Margin="0,0,12,0">
+                        <ComboBoxItem Content="50k (light)" Tag="50000" /><ComboBoxItem Content="100k" Tag="100000" /><ComboBoxItem Content="150k" Tag="150000" /><ComboBoxItem Content="300k (default)" Tag="300000" />
+                    </ComboBox>
+                    <TextBlock Text="Texture" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="TextureBox" Width="70" SelectedIndex="1">
+                        <ComboBoxItem Content="1024" /><ComboBoxItem Content="2048" />
+                    </ComboBox>
                 </WrapPanel>
                 <WrapPanel Margin="0,8,0,0">
-                    <TextBlock Text="FLUX weights" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBlock Text="Image weights" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="BitsBox" Width="120" SelectedIndex="0" Margin="0,0,12,0">
                         <ComboBoxItem Content="4-bit (2.6 GB)" />
                         <ComboBoxItem Content="8-bit (4.4 GB)" />
                     </ComboBox>
-                    <TextBlock Text="Size" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="SizeBox" Width="78" SelectedIndex="0">
-                        <ComboBoxItem Content="512" /><ComboBoxItem Content="768" /><ComboBoxItem Content="1024" />
-                    </ComboBox>
                 </WrapPanel>
                 <StackPanel Orientation="Horizontal" Margin="0,12,0,8">
-                    <Button x:Name="DrawButton" Content="Draw pictures" Click="DrawClick" />
+                    <Button x:Name="DrawButton" Content="Generate" Click="GenerateClick" />
+                    <Button x:Name="MoreButton" Content="Draw 4 more" Click="MoreClick" Background="#334155" IsEnabled="False" />
                     <Button x:Name="CacheButton" Content="Model folder..." Click="CacheClick" Background="#334155" />
                 </StackPanel>
                 <TextBlock x:Name="CacheText" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                <Expander x:Name="CaptionExpander" Header="Caption" Foreground="{StaticResource Muted}" Visibility="Collapsed">
+                    <TextBlock x:Name="CaptionText" TextWrapping="Wrap" FontSize="12" MaxHeight="130" Margin="0,4,0,0" />
+                </Expander>
             </StackPanel>
 
-            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Margin="0,4,0,8">
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,4,0,8">
                 <ItemsControl x:Name="Pictures">
                     <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
@@ -69,7 +105,7 @@
                 </ItemsControl>
             </ScrollViewer>
 
-            <TextBox Grid.Row="3" x:Name="LogBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11" TextWrapping="NoWrap"
+            <TextBox Grid.Row="2" x:Name="LogBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11" TextWrapping="NoWrap"
                      Background="{StaticResource Panel}" Foreground="{StaticResource Muted}" BorderThickness="0" Padding="6" />
         </Grid>
 
@@ -83,21 +119,23 @@
             <Border Background="#0F141F" BorderBrush="#243049" BorderThickness="1" CornerRadius="6">
                 <wv2:WebView2 x:Name="Viewer" />
             </Border>
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,0">
+            <WrapPanel Grid.Row="1" Margin="0,10,0,0">
                 <Button x:Name="RigButton" Content="Rig this model" Click="RigClick" IsEnabled="False" />
                 <TextBlock Text="Move" VerticalAlignment="Center" Margin="8,0,6,0" />
                 <ComboBox x:Name="MoveBox" Width="150" IsEnabled="False" SelectionChanged="MoveChanged" Margin="0,0,10,0" />
                 <CheckBox x:Name="InPlaceBox" Content="in place" IsChecked="True" VerticalAlignment="Center" Margin="0,0,12,0" Click="MoveChanged" />
                 <TextBlock Text="Arm clearance" VerticalAlignment="Center" Margin="0,0,6,0" />
-                <ComboBox x:Name="ClearBox" Width="60" SelectedIndex="1" IsEnabled="False">
-                    <ComboBoxItem Content="0" /><ComboBoxItem Content="8" /><ComboBoxItem Content="12" /><ComboBoxItem Content="18" />
+                <ComboBox x:Name="ClearBox" Width="60" SelectedIndex="2" IsEnabled="False" SelectionChanged="ClearanceChanged">
+                    <ComboBoxItem Content="0" /><ComboBoxItem Content="5" /><ComboBoxItem Content="8" /><ComboBoxItem Content="12" /><ComboBoxItem Content="18" />
                 </ComboBox>
-            </StackPanel>
-            <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
-                <Button x:Name="AnimateButton" Content="Animate" Click="AnimateClick" IsEnabled="False" />
+            </WrapPanel>
+            <WrapPanel Grid.Row="2" Margin="0,10,0,0">
+                <Button x:Name="AnimateButton" Content="Animate (22 moves)" Click="AnimateClick" IsEnabled="False" />
                 <Button x:Name="SaveButton" Content="Save .glb..." Click="SaveClick" IsEnabled="False" Background="#334155" />
+                <Button x:Name="SaveRiggedButton" Content="Save rigged .glb..." Click="SaveRiggedClick" IsEnabled="False" Background="#334155" />
+                <Button x:Name="SaveAnimatedButton" Content="Save animated .glb..." Click="SaveAnimatedClick" IsEnabled="False" Background="#334155" />
                 <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="8,0,0,0" TextTrimming="CharacterEllipsis" />
-            </StackPanel>
+            </WrapPanel>
         </Grid>
     </Grid>
 </Window>

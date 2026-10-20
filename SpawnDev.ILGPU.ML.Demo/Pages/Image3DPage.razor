@@ -60,7 +60,7 @@
         </div>
         @if (!string.IsNullOrEmpty(_usedCaption))
         {
-            <details class="t3d-hint"><summary>Caption used</summary><p style="white-space:pre-wrap;margin:0.4rem 0 0">@_usedCaption</p></details>
+            <details class="t3d-hint" open="@_writingCaption"><summary>@(_writingCaption ? "Writing the caption" : "Caption used")</summary><p style="white-space:pre-wrap;margin:0.4rem 0 0">@_usedCaption</p></details>
         }
         @if (_candidates.Count > 0 && _picking)
         {
@@ -285,6 +285,7 @@
     private const string Flux3Repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
     private bool _expandPrompt = true;                  // FLUX 3: a local LLM writes the full scene caption first (once per prompt)
     private string? _usedCaption, _captionFor;
+    private bool _writingCaption;                       // the caption is shown growing, as the language model writes it
     private string _imageModel = "flux2";               // "flux3" | "flux2" | "sd"
     private int _pictures = 1;                          // 1 = auto-pick the best fit; 4 / 8 = draw that many and let the user pick
     private bool _picking;
@@ -722,8 +723,17 @@
                     // the transformer must not sit on the GPU beside the language model
                     _flux3!.ReleaseResident();
                     var cw = System.Diagnostics.Stopwatch.StartNew();
-                    _currentStage = "writing the caption (Qwen3 4B)"; StateHasChanged();
-                    _usedCaption = await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, caption, 512, 512, text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); });
+                    _currentStage = "writing the caption (Qwen3 4B)";
+                    // the header bar follows the language model's download and load (Qwen3 reported only text before: TRELLIS and FLUX moved the bar, this did not), and the caption appears as it is written
+                    _writingCaption = true; _usedCaption = ""; _modelProgress = 0; _modelSizeMb = 2450; _isLoading = true; StateHasChanged();
+                    try
+                    {
+                        _usedCaption = await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, caption, 512, 512,
+                            text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); },
+                            pct => { _modelProgress = pct; _isLoading = pct < 100; _ = InvokeAsync(StateHasChanged); },
+                            partial => { _usedCaption = partial; _ = InvokeAsync(StateHasChanged); });
+                    }
+                    finally { _writingCaption = false; _isLoading = false; }
                     _captionFor = _prompt;
                     OnStageDone("caption (Qwen3 4B)", cw.Elapsed.TotalSeconds);
                 }

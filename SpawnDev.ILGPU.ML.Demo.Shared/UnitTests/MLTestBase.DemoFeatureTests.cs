@@ -343,8 +343,8 @@ public abstract partial class MLTestBase
             throw new Exception($"Stream TextGeneration WRONG continuation '{result.GeneratedText}' — expected to start with ' floor'.");
     });
 
-    // EXACT /text-gen page path: load DistilGPT-2 from OUR live hub (hub.spawndev.com) over a SEEKABLE
-    // torrent stream and load it via InferenceSession.CreateFromOnnxStreamAsync — the model is never held
+    // EXACT /text-gen page path: load DistilGPT-2 from the models host (models.spawndev.com) over a SEEKABLE
+    // range stream and load it via InferenceSession.CreateFromOnnxStreamAsync — the model is never held
     // whole in CPU memory (each weight is seeked + chunk-uploaded straight to GPU). Then run real
     // autoregressive generation. This proves the demo's hub+stream wiring end to end, not just inspection.
     // HeavyModel: full ~330MB model fetched via torrent + GPU compile + decode — gated out of the fast loop.
@@ -355,10 +355,10 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         const string repoId = "Xenova/distilgpt2";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(5));
 
             // Open the model file as a seekable stream (deselect:false → we need the weights).
@@ -417,10 +417,10 @@ public abstract partial class MLTestBase
 
         const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
@@ -461,7 +461,7 @@ public abstract partial class MLTestBase
     });
 
     // EXACT /ai-chat page path: stream a real GGUF LLM (qwen2.5:0.5b-instruct q8_0) from OUR live hub
-    // (hub.spawndev.com → HF repo, seekable torrent / web-seed) and load it via the architecture-agnostic
+    // (models.spawndev.com, seekable HTTP range stream) and load it via the architecture-agnostic
     // GgufTextGenerationPipeline.CreateFromStreamAsync — weights stream straight to the GPU, never held whole in
     // memory. Then run a real chat turn and assert the answer. This is the in-browser PROOF (runs on WebGPU in the
     // PMT browser lane) that the demo's hub-delivery + load + generate path works BEFORE TJ touches the demo — the
@@ -475,10 +475,10 @@ public abstract partial class MLTestBase
 
         const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
 
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
@@ -529,10 +529,10 @@ public abstract partial class MLTestBase
 
         const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
 
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
@@ -655,7 +655,7 @@ public abstract partial class MLTestBase
     // ═══════════════════════════════════════════════════════════
 
     // SD-TURBO TEXT-TO-IMAGE E2E — proves ImageGenerationPipeline end to end. Streams the 3 sub-models
-    // (~2.5GB: CLIP text-encoder 681MB + UNet 1.7GB + VAE decoder 99MB) from OUR hub via the part-2a
+    // (~2.5GB: CLIP text-encoder 681MB + UNet 1.7GB + VAE decoder 99MB) from the models host via the part-2a
     // CreateFromOnnxStreamAsync path — each weight seeked + chunk-uploaded straight to GPU, NEVER a whole
     // byte[] (the 1.7GB UNet byte[] OOMed Blazor WASM — why /generate never ran). Then RunAsync the
     // single-step diffusion: CLIP encode → UNet denoise (1 step, no guidance) → VAE decode → RGBA.
@@ -676,18 +676,11 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // OPFS-backed pieces, COLD (the DA-gate lesson): the app's SHARED client restores torrent
-        // state at startup, so deleting the OPFS dir under it yields "piece verified but data not
-        // in store" (hit here 2026-07-03). Clean the dir, then a FRESH client over the same IAsyncFS
-        // - no restored state, pieces stay out of the .NET heap.
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        // The weights are read with HTTP range requests from the models host (no torrent store to clean first).
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new Hub.HubModelStream(client, http);
+            var hub = client;
             var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
                 Hub.ModelHub.KnownModels.SDTurbo,
                 onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));

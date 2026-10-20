@@ -58,24 +58,15 @@ public partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // OPFS-backed pieces, COLD: a bare in-memory client holds every fetched piece in the WASM
-        // heap - a 0.5B (531MB) fits, the 1.5B (1.1GB) OOMs in WebConn's coalesced fetch. And the
-        // app's SHARED client restores torrent state at startup, so deleting the OPFS dir under it
-        // yields "piece verified but data not in store". The cold pattern (per WebTorrentTests):
-        // clean the OPFS dir, then a FRESH client over the same IAsyncFS - no restored state, no
-        // heap-resident pieces.
-        var fs = GetAsyncFS();
-        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
-        var client = fs != null
-            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
-            : new SpawnDev.WebTorrent.WebTorrentClient();
+        // The weights are read with HTTP range requests from the models host (no torrent store to clean first).
+        var client = new ModelsHostStreamLoader(http);
         bool prevPrefix = GgufGenerator.EnablePrefixCache;
         bool prevGemv = FusedDequantMatMul.EnableWebGPUGemv;
         GgufGenerator.EnablePrefixCache = false;
         FusedDequantMatMul.EnableWebGPUGemv = enableGemv;
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(18));
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
@@ -154,7 +145,7 @@ public partial class MLTestBase
 
         const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         bool prevPrefix = GgufGenerator.EnablePrefixCache;
         bool prevGemv = FusedDequantMatMul.EnableWebGPUGemv;
         GgufGenerator.EnablePrefixCache = false;   // force identical full prefills for A and B
@@ -164,7 +155,7 @@ public partial class MLTestBase
         FusedDequantMatMul.EnableWebGPUGemv = true;
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
@@ -230,10 +221,10 @@ public partial class MLTestBase
 
         const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)

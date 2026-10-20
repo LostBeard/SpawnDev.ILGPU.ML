@@ -3221,7 +3221,7 @@ public class InferenceSession : IDisposable
             // ignore an unknown option, so this is a no-op on desktop.
             request.Options.Set(new HttpRequestOptionsKey<bool>("WebAssemblyEnableStreamingResponse"), true);
 
-            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await Hub.ModelsHost.SendAsync(http, request, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
             var contentLength = response.Content.Headers.ContentLength;
@@ -3305,7 +3305,7 @@ public class InferenceSession : IDisposable
             NoCache = true,
             NoStore = true,
         };
-        using var fallbackResponse = await http.SendAsync(fallbackRequest);
+        using var fallbackResponse = await Hub.ModelsHost.SendAsync(http, fallbackRequest);
         fallbackResponse.EnsureSuccessStatusCode();
         var bytes = await fallbackResponse.Content.ReadAsByteArrayAsync();
         var fallbackCl = fallbackResponse.Content.Headers.ContentLength ?? expectedLength;

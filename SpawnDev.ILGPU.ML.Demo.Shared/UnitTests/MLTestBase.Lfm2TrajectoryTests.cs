@@ -284,12 +284,12 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         bool prevPrefix = SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache;
         SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = true;
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
             var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false, cts.Token);
             await using (model.Stream)
@@ -365,12 +365,12 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         bool prevPrefix = SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache;
         SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = true;   // the demo's default
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
@@ -432,10 +432,10 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
             var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
 
@@ -530,10 +530,10 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(20));
             var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
 
@@ -632,10 +632,10 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
             var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
 
@@ -732,10 +732,10 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
             var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
 

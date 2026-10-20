@@ -316,7 +316,7 @@
 
         try
         {
-            // Ranged HTTP against the hub - no WebTorrent, no magnet, no swarm. The inspector seeks past
+            // Ranged HTTP against the models host - no WebTorrent, no magnet, no swarm. The inspector seeks past
             // every weight blob, so only the bytes it actually reads are fetched and a multi-GB checkpoint
             // inspects from a few hundred KB.
             // ⚠️ OpenForInspectionAsync, NOT OpenAsync: OpenAsync would download and CACHE the whole model

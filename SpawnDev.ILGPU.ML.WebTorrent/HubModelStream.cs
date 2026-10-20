@@ -8,8 +8,8 @@ namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
 /// Opens a <b>seekable</b> <see cref="Stream"/> over a HuggingFace model file served by a SpawnDev
-/// WebTorrent hub (the public <c>hub.spawndev.com</c> or your own <c>SpawnDev.WebTorrent.Server.HuggingFace</c>
-/// deployment) — <b>without downloading the whole model</b>.
+/// WebTorrent hub (your own <c>SpawnDev.WebTorrent.Server.HuggingFace</c> deployment: the public
+/// <c>hub.spawndev.com</c> is the tracker only since 2026-10-20, see <see cref="DefaultHubBaseUrl"/>) — <b>without downloading the whole model</b>.
 /// <para>
 /// Flow: ask the hub for a magnet (<c>GET /magnet/{repoId}/{filePath}</c>, which blocks server-side
 /// only until the file is fetched + torrented once), add it to the <see cref="WebTorrentClient"/>,
@@ -52,11 +52,14 @@ public class HubModelStream : IModelSource
     Task<byte[]> IModelSource.FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken)
         => FetchBytesAsync(repoId, filePath, cancellationToken);
 
-    /// <summary>The public SpawnDev hub running the HuggingFace proxy.</summary>
-    /// <remarks>Now defined by <see cref="HuggingFaceClient"/> - the hub is where models come from
-    /// regardless of transport, so the address must not live in the WebTorrent adapter. Kept as an alias so
-    /// existing callers of <c>HubModelStream.DefaultHubBaseUrl</c> keep compiling.</remarks>
-    public const string DefaultHubBaseUrl = HuggingFaceClient.DefaultHubBaseUrl;
+    /// <summary>The public SpawnDev WebTorrent hub.</summary>
+    /// <remarks>
+    /// ⚠️ Since 2026-10-20 the public hub is the WebTorrent TRACKER and no longer serves models: plain downloads come from
+    /// <see cref="ModelsHost"/> (https://models.spawndev.com). This torrent transport needs a hub that builds torrents from
+    /// Hugging Face files on demand (<c>GET /magnet</c>), which the public hub no longer does for new requests, so point
+    /// <see cref="HubBaseUrl"/> at your own <c>SpawnDev.WebTorrent.Server.HuggingFace</c> deployment to use it. The SpawnDev demos do not.
+    /// </remarks>
+    public const string DefaultHubBaseUrl = "https://hub.spawndev.com:44365";
 
     private readonly WebTorrentClient _client;
     private readonly HttpClient _http;

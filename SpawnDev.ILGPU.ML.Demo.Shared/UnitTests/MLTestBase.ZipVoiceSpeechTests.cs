@@ -42,7 +42,7 @@ public abstract partial class MLTestBase
     private const string ZipVoiceRepo = "k2-fsa/ZipVoice";
 
     /// <summary>
-    /// ZipVoice's vocoder - mel spectrogram back to a waveform - reached through the hub's source proxy.
+    /// ZipVoice's vocoder - mel spectrogram back to a waveform - served by the models host as a plain file.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -55,51 +55,21 @@ public abstract partial class MLTestBase
     /// ⚠️ The vocoder is published ONLY inside a sherpa-onnx release tarball, and it must be the <b>fp32</b>
     /// package: the int8 package ships an encoder, a decoder and tokens.txt and <b>no vocoder at all</b>
     /// (verified by listing it - 3 members, none of them a vocoder). A <c>.tar.bz2</c> cannot be seeked
-    /// into, so the whole archive must be fetched and decompressed by somebody; the hub does it once, on the
-    /// machine with the disk, instead of every visitor doing it in a browser tab.
+    /// into, so the whole archive must be fetched and decompressed by somebody; that was done ONCE, when the
+    /// models host was filled (every member stored as a plain file and verified against the archive), instead of
+    /// every visitor doing it in a browser tab.
     /// </para>
     /// </remarks>
     private const string VocoderArchive =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-zh-en-emilia.tar.bz2";
     private const string VocoderMember = "sherpa-onnx-zipvoice-distill-zh-en-emilia/vocos_24khz.onnx";
-    private const string SourceProxyBaseUrl = "https://hub.spawndev.com:44365";
-
-    /// <summary>The hub URL that serves one file out of a remote archive as if it were a plain file.</summary>
-    private static string ArchiveMemberUrl(string archiveUrl, string member)
-        => $"{SourceProxyBaseUrl}/src?url={Uri.EscapeDataString(archiveUrl)}"
-         + $"&member={Uri.EscapeDataString(member)}";
 
     /// <summary>
-    /// Ask the hub to cache an archive, and wait until it has, without holding a request open.
+    /// Where the models host keeps one member of a remote archive: as a plain file (the archive cannot be range-read, so its members were
+    /// extracted once, checked against the archive, and stored under the archive's URL minus the extension).
     /// </summary>
-    /// <remarks>
-    /// ⚠️ Do NOT simply request the member and wait. First contact with this archive means the hub fetches
-    /// 634 MB and bzip2-decompresses it, which takes minutes - and the gateway in front of the hub answers
-    /// <b>504 at 25 seconds</b> while the hub is still working perfectly. A test written the obvious way
-    /// fails with a timeout that looks like a broken server and is not one. <c>/src/warm</c> returns 202
-    /// immediately and 200 once cached, so waiting happens between requests instead of inside one.
-    /// </remarks>
-    private static async Task WarmArchiveAsync(HttpClient http, string archiveUrl)
-    {
-        var warmUrl = $"{SourceProxyBaseUrl}/src/warm?url={Uri.EscapeDataString(archiveUrl)}";
-        var sw = Stopwatch.StartNew();
-        while (sw.Elapsed < TimeSpan.FromMinutes(25))
-        {
-            var res = await http.GetAsync(warmUrl);
-            if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
-                throw new UnsupportedTestException(
-                    "the deployed hub has no /src/warm yet - redeploy the hub to arm this test");
-            if (res.IsSuccessStatusCode && res.StatusCode != System.Net.HttpStatusCode.Accepted)
-                return;                                     // 200: cached and ready
-            if (res.StatusCode != System.Net.HttpStatusCode.Accepted)
-                throw new Exception($"the hub could not cache the archive: {(int)res.StatusCode} "
-                                  + await res.Content.ReadAsStringAsync());
-            Console.WriteLine($"[ZipVoice] hub still caching the vocoder archive "
-                            + $"({sw.Elapsed.TotalSeconds:F0}s): {await res.Content.ReadAsStringAsync()}");
-            await Task.Delay(TimeSpan.FromSeconds(10));
-        }
-        throw new Exception("the hub did not finish caching the vocoder archive within 25 minutes");
-    }
+    private static string ArchiveMemberUrl(string archiveUrl, string member)
+        => SpawnDev.ILGPU.ML.Hub.ModelsHost.GetArchiveMemberUrl(archiveUrl, member);
 
     /// <summary>The librivox fixture's transcript, as WE know it independently of any recogniser.</summary>
     /// <remarks>
@@ -152,7 +122,6 @@ public abstract partial class MLTestBase
             http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/text_encoder_int8.onnx"));
         var decoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/fm_decoder_int8.onnx"));
-        await WarmArchiveAsync(http, VocoderArchive);
         var vocoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, ArchiveMemberUrl(VocoderArchive, VocoderMember));
         var tokensBytes = await InferenceSession.DownloadBytesChunkedAsync(
@@ -230,8 +199,6 @@ public abstract partial class MLTestBase
         var decoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/fm_decoder_int8.onnx"));
         // Through the hub rather than from HuggingFace: this file exists nowhere as a standalone download.
-        // Warmed first so the member request itself is always a warm, fast one - see WarmArchiveAsync.
-        await WarmArchiveAsync(http, VocoderArchive);
         var vocoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, ArchiveMemberUrl(VocoderArchive, VocoderMember));
         // The vocoder is 54,157,409 bytes. Checked explicitly because the failure this guards against is a

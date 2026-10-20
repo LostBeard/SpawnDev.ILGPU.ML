@@ -13,7 +13,8 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// </summary>
 public sealed class FetchRangeStream : Stream, IJSReadStream
 {
-    private readonly string _url;
+    private string _url;
+    private bool _fellBack;
     private readonly long _length;
     private long _position;
 
@@ -125,6 +126,15 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
                 last = ex;
+                // The models host could not give this range: switch to the Hugging Face twin for the rest of the stream. Safe mid-file because no
+                // validator is sent here and both hosts serve identical bytes (every mirrored file was checked sha256 against Hugging Face).
+                if (!_fellBack && ModelsHost.GetFallbackUrl(_url) is { } alt)
+                {
+                    _fellBack = true;
+                    ModelsHost.ReportFallback(_url, alt, ex.Message);
+                    _url = alt;
+                    continue;
+                }
                 if (attempt < Attempts) await Task.Delay(1000 * attempt, ct);
             }
         }

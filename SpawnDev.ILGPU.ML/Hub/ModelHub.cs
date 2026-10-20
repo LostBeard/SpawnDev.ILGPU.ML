@@ -71,9 +71,9 @@ public class ModelHub : IDisposable
     /// <summary>
     /// HuggingFace Hub base URL. Default: https://huggingface.co
     /// </summary>
-    [Obsolete("Downloads go through the hub (HuggingFaceClient.HubBaseUrl / GetDownloadUrl), which caches, "
-            + "supplies CORS headers and keeps us out of HuggingFace's rate limiter. This property no longer "
-            + "builds download URLs. Point HuggingFaceClient.HubBaseUrl at your own hub instead.")]
+    [Obsolete("Downloads come from the models host (HuggingFaceClient.ModelsBaseUrl / GetDownloadUrl: ModelsHost.DefaultBaseUrl, "
+            + "Hugging Face as the fallback). This property no longer builds download URLs. "
+            + "Point HuggingFaceClient.ModelsBaseUrl at your own copy of the layout instead.")]
     public string HuggingFaceBaseUrl { get; set; } = HuggingFaceClient.HuggingFaceOrigin;
 
     /// <summary>
@@ -98,8 +98,8 @@ public class ModelHub : IDisposable
     [Obsolete("Model WEIGHTS must be delivered by OpenStreamAsync (or HubModelSource), which streams from the OPFS cache so each weight goes JS->GPU without entering the managed heap. This materialises the WHOLE model as a byte[] on the single-threaded WASM heap, which is what makes large loads OOM. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public async Task<byte[]> LoadAsync(string repoId, string filename, string revision = "main")
     {
-        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
-        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        // From the models host - it answers with CORS headers a browser accepts and keeps us out of
+        // HuggingFace's rate limiter (HF is only the fallback). See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         return await LoadFromUrlAsync(url, CacheKey(repoId, filename, revision)).ConfigureAwait(false);
     }
@@ -167,8 +167,8 @@ public class ModelHub : IDisposable
     /// <returns>A seekable JS-side stream, or null when OPFS is unavailable. Caller disposes it.</returns>
     public async Task<Stream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
     {
-        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
-        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        // From the models host - it answers with CORS headers a browser accepts and keeps us out of
+        // HuggingFace's rate limiter (HF is only the fallback). See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
         return await OpenStreamFromUrlAsync(url, cacheKey).ConfigureAwait(false);
@@ -225,8 +225,8 @@ public class ModelHub : IDisposable
     /// <returns>The file's bytes.</returns>
     public Task<byte[]> LoadSmallFileAsync(string repoId, string filename, string revision = "main")
     {
-        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
-        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        // From the models host - it answers with CORS headers a browser accepts and keeps us out of
+        // HuggingFace's rate limiter (HF is only the fallback). See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         return ReadAllBytesAsync(url, CacheKey(repoId, filename, revision));
     }
@@ -348,8 +348,8 @@ public class ModelHub : IDisposable
         // ── Face Detection ──
         /// <summary>BlazeFace — MediaPipe face detector, TFLite format (228 KB)</summary>
         /// <remarks>
-        /// Demo pages load <c>wwwroot/models/blaze-face/model.tflite</c> first: hub.spawndev.com has been
-        /// returning 502 for this repo (2026-09-26). Prefer the local copy for demos; hub when mirrored.
+        /// Demo pages load <c>wwwroot/models/blaze-face/model.tflite</c> first: the old hub returned
+        /// 502 for this repo (2026-09-26) and it is not on the models host. Prefer the local copy for demos.
         /// </remarks>
         public const string BlazeFace = "litert-community/blaze-face";
 

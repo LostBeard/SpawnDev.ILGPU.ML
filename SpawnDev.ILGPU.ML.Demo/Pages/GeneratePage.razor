@@ -124,6 +124,11 @@
         </div>
     }
 
+    @if (_writingCaption)
+    {
+        <details class="gen-caption" open><summary>Writing the caption</summary><p style="white-space:pre-wrap">@_liveCaption</p></details>
+    }
+
     @if (_generatedImageUrl != null)
     {
         <div class="gen-result">
@@ -333,8 +338,20 @@
     private async Task<string> ExpandPromptAsync(int width, int height)
     {
         _flux3!.ReleaseResident();
-        return await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, _prompt, width, height, text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); });
+        // the header bar follows the language model's download and load, and the caption appears as it is written
+        _writingCaption = true; _liveCaption = ""; _modelProgress = 0; _isModelLoading = true; StateHasChanged();
+        try
+        {
+            return await Services.CaptionWriter.WriteAsync(_accelerator!, ModelSource, _prompt, width, height,
+                text => { _modelStatusText = text; _ = InvokeAsync(StateHasChanged); },
+                pct => { _modelProgress = pct; _isModelLoading = pct < 100; _ = InvokeAsync(StateHasChanged); },
+                partial => { _liveCaption = partial; _ = InvokeAsync(StateHasChanged); });
+        }
+        finally { _writingCaption = false; _isModelLoading = false; }
     }
+
+    private bool _writingCaption;
+    private string _liveCaption = "";
 
     private void ModelChanged()
     {

@@ -11,14 +11,17 @@ namespace SpawnDev.ILGPU.ML.Flux3;
 /// </summary>
 public sealed class Flux3PromptUpsampler
 {
-    private readonly Func<string, string, Task<string>> _chat;
+    private readonly Func<string, string, Func<int, string, Task>?, Task<string>> _chat;
 
-    public Flux3PromptUpsampler(Func<string, string, Task<string>> chat) => _chat = chat;
+    public Flux3PromptUpsampler(Func<string, string, Task<string>> chat) : this((system, user, _) => chat(system, user)) { }
+
+    /// <summary>A chat that can stream: the third argument, when not null, is called with (tokens so far, the answer so far) as the model writes.</summary>
+    public Flux3PromptUpsampler(Func<string, string, Func<int, string, Task>?, Task<string>> chat) => _chat = chat;
 
     /// <summary>An upsampler on a loaded GGUF model (greedy, reasoning off, capped at 1200 new tokens: captions run 100 to 350 words).</summary>
     public static Flux3PromptUpsampler FromPipeline(GgufTextGenerationPipeline pipeline, int maxNewTokens = 1200)
-        => new((system, user) => pipeline.GenerateAsync(new List<(string, string)> { ("system", system), ("user", user) },
-            new GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" }, thinking: false));
+        => new((system, user, onToken) => pipeline.GenerateAsync(new List<(string, string)> { ("system", system), ("user", user) },
+            new GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" }, thinking: false, onToken: onToken));
 
     /// <summary>Black Forest Labs' text-to-image upsampler system prompt (Apache-2.0).</summary>
     public const string TextToImagePrompt = """
@@ -32,10 +35,14 @@ Output only the caption.
 """;
 
     /// <summary>The caption for <paramref name="request"/>. With a canvas size the prompt composes for it (its "TARGET CANVAS: W:H" line, as the reference code writes it).</summary>
-    public async Task<string> ExpandAsync(string request, int width = 0, int height = 0)
+    /// <param name="onText">Called as the caption is written with (tokens so far, the answer so far, <see cref="Clean"/>ed), so a page can show it growing. The model's final answer is returned as before.
+    /// While the model is still REASONING, the text so far is its <c>&lt;think&gt;</c> block growing (a progress cue the demo keeps on purpose, TJ 2026-10-20); the moment
+    /// <c>&lt;/think&gt;</c> arrives <see cref="Clean"/> drops the reasoning, the text is REPLACED by the caption, and from then on it only grows.</param>
+    public async Task<string> ExpandAsync(string request, int width = 0, int height = 0, Func<int, string, Task>? onText = null)
     {
         string user = width > 0 && height > 0 ? $"TARGET CANVAS: {width}:{height}\n{request}" : request;
-        return Clean(await _chat(TextToImagePrompt, user));
+        Func<int, string, Task>? onToken = onText == null ? null : (count, soFar) => onText(count, Clean(soFar));
+        return Clean(await _chat(TextToImagePrompt, user, onToken));
     }
 
     /// <summary>The model's answer as one caption: reasoning blocks, code fences and surrounding quotes removed.</summary>

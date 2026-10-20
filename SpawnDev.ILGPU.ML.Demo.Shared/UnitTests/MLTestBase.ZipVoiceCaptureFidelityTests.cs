@@ -116,7 +116,6 @@ public abstract partial class MLTestBase
         // ⚠️ The vocoder is loaded but never RUN. Nothing here turns a mel into audio - the comparison is on
         // the decoder's own output tensor - but IlgpuZipVoiceGraphs owns three sessions and constructs all
         // three, so an empty byte[] here is a parse failure, not a saving.
-        await WarmArchiveAsync(http, VocoderArchive);
         var vocoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
             http, ArchiveMemberUrl(VocoderArchive, VocoderMember));
         using var graphs = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);

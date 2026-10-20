@@ -37,10 +37,10 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        var client = new ModelsHostStreamLoader(http);
         try
         {
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            var hub = client;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
 
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);

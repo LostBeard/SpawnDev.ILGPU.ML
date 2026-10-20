@@ -40,7 +40,7 @@ public abstract partial class MLTestBase
         var samples = WavDecoder.DecodeWavFile(await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav"))
             ?? throw new Exception("could not decode test-audio/librivox-public-domain.wav");
 
-        // The default HttpClient timeout is 100 s: a 2.4 GB first download through the hub takes longer, so it gets its own client.
+        // The default HttpClient timeout is 100 s: a 2.4 GB first download takes longer, so it gets its own client.
         using var modelHttp = new System.Net.Http.HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         var source = new HttpClientModelSource(modelHttp);
         async Task<InferenceSession> Open(string file, string? dataFile = null)

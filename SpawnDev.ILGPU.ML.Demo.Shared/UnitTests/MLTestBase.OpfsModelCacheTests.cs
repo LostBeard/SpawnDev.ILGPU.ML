@@ -11,13 +11,13 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 /// <remarks>
 /// These are browser-lane tests: OPFS does not exist on the desktop lanes, which skip via
-/// <see cref="UnsupportedTestException"/>. The source is the SpawnDev hub, not huggingface.co - the hub is
-/// what supplies CORS, caches the file, and keeps us out of HuggingFace's rate limiter.
+/// <see cref="UnsupportedTestException"/>. The source is the SpawnDev models host, not huggingface.co - it
+/// supplies CORS, answers Range from the first byte, and falls back to Hugging Face by itself.
 /// </remarks>
 public abstract partial class MLTestBase
 {
-    /// <summary>A real hub-served file, big enough to arrive in many chunks and to make a resume meaningful.</summary>
-    private const string OpfsCacheTestUrl = "https://hub.spawndev.com:44365/hf/Xenova/distilgpt2/tokenizer.json";
+    /// <summary>A real models-host file, big enough to arrive in many chunks and to make a resume meaningful.</summary>
+    private static readonly string OpfsCacheTestUrl = HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json");
 
     /// <summary>Browser-lane guard shared by every test here.</summary>
     private static SpawnJSRuntime RequireBrowserRuntime()
@@ -249,7 +249,7 @@ public abstract partial class MLTestBase
         if (!await cache.IsAvailableAsync())
             throw new UnsupportedTestException("OPFS unavailable in this context");
 
-        const string badUrl = "https://hub.spawndev.com:44365/hf/Xenova/distilgpt2/definitely-not-a-real-file.bin";
+        var badUrl = HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "definitely-not-a-real-file.bin");
         var key = OpfsModelCache.UrlToCacheKey(badUrl);
         await cache.RemoveAsync(key);
 

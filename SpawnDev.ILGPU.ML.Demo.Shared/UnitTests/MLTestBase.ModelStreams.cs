@@ -168,8 +168,8 @@ public abstract partial class MLTestBase
 
     /// <summary>Content-Length of <paramref name="url"/>, or -1 when the server does not report one.</summary>
     /// <remarks>
-    /// ⚠️ Do NOT reduce this back to a bare <c>HEAD</c>. The hub answered HEAD with <b>405 Method Not
-    /// Allowed</b> until the proxy fix deployed 2026-09-14, and every model URL here routes through the hub
+    /// ⚠️ Do NOT reduce this back to a bare <c>HEAD</c>. The old hub answered HEAD with <b>405 Method Not
+    /// Allowed</b> until the proxy fix deployed 2026-09-14, and every model URL here is built for the models host
     /// via <see cref="HuggingFaceClient.GetDownloadUrl"/>. HEAD-only therefore returned -1 for every model,
     /// which made <see cref="IsComplete"/> fall back to its "existence is all we have" branch - silently
     /// retiring the truncation check that is the entire reason the expected length is passed around. A

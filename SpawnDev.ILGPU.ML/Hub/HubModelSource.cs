@@ -3,18 +3,19 @@ using SpawnDev.SpawnJS;
 namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
-/// Serves models over plain HTTP from the SpawnDev hub, cached in OPFS - <b>no WebTorrent</b>.
+/// Serves models over plain HTTP from the SpawnDev models host (<see cref="ModelsHost"/>: https://models.spawndev.com), cached in OPFS - <b>no WebTorrent</b>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The default <see cref="IModelSource"/>. A model is fetched once through the hub's <c>/hf</c> web seed
+/// The default <see cref="IModelSource"/>. A model is fetched once from the models host
 /// straight into OPFS (see <see cref="OpfsModelCache"/>: the payload never enters the .NET/WASM managed
 /// heap), and every later open is served from that cache with no network at all. Interrupted downloads
 /// resume; truncated ones are never served.
 /// </para>
 /// <para>
-/// ⚠️ Always the hub, never huggingface.co directly. The hub caches, supplies the CORS headers a browser
-/// will accept, and keeps us out of HuggingFace's rate limiter.
+/// The models host is static files on Cloudflare R2 (free egress, CORS open, Range works). Hugging Face is the fallback: it uses the same path
+/// layout, so when the models host cannot give a file (not mirrored yet, an outage) the transports retry the twin URL on huggingface.co by themselves
+/// (<see cref="ModelsHost.GetFallbackUrl"/>). The old hub (hub.spawndev.com) no longer serves models.
 /// </para>
 /// <code>
 /// var source = new HubModelSource(js);
@@ -182,7 +183,7 @@ public class HubModelSource : ICachingModelSource, IDisposable
     public async Task<Stream> OpenOllamaAsync(string model, string tag, string layer,
         IProgress<ModelDownloadProgress>? progress, CancellationToken cancellationToken = default)
     {
-        var url = $"{HuggingFaceClient.HubBaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
+        var url = ModelsHost.GetOllamaUrl(model, tag, layer);
         return await _cache.OpenOrDownloadAsync(url, OllamaCacheKey(model, tag, layer), Combine(progress), cancellationToken)
             .ConfigureAwait(false);
     }
@@ -238,29 +239,7 @@ public class HubModelSource : ICachingModelSource, IDisposable
     /// There is nothing to gain by trying the narrower probe first, and a 405 costs a wasted round trip plus
     /// a console error on every inspection. HEAD remains the fallback for an origin that refuses ranges.
     /// </remarks>
-    private static async Task<long> ProbeSizeAsync(HttpClient http, string url, CancellationToken ct)
-    {
-        try
-        {
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
-            using var res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-            if (res.IsSuccessStatusCode)
-            {
-                // A 206's Content-Length is the PART (1 byte) - only Content-Range carries the file size.
-                var total = res.Content.Headers.ContentRange?.Length;
-                if (total is > 0) return total.Value;
-                if (res.StatusCode == System.Net.HttpStatusCode.OK && res.Content.Headers.ContentLength is > 0 and var full)
-                    return full;
-            }
-        }
-        catch (HttpRequestException) { /* fall through to HEAD */ }
-
-        using var head = new HttpRequestMessage(HttpMethod.Head, url);
-        using var headRes = await http.SendAsync(head, ct).ConfigureAwait(false);
-        headRes.EnsureSuccessStatusCode();
-        return headRes.Content.Headers.ContentLength ?? -1;
-    }
+    private static Task<long> ProbeSizeAsync(HttpClient http, string url, CancellationToken ct) => ModelsHost.ProbeSizeAsync(http, url, ct);
 
     /// <summary>The OPFS cache key for a repo file. Stable across runs, and distinct per revision.</summary>
     public string CacheKey(string repoId, string filePath)

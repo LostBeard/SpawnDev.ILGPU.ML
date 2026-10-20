@@ -51,8 +51,8 @@ public abstract partial class MLTestBase
         byte[] modelBytes, voiceBytes;
         try
         {
-            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
-            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+            modelBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/voices/af_heart.bin");
         }
         catch (HttpRequestException ex)
         {
@@ -160,8 +160,8 @@ public abstract partial class MLTestBase
         byte[] modelBytes, voiceBytes;
         try
         {
-            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
-            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+            modelBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/voices/af_heart.bin");
         }
         catch (HttpRequestException ex)
         {

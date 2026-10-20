@@ -19,7 +19,7 @@ public abstract partial class MLTestBase
     /// <see cref="TurboQuant_DistilGPT2_KVCacheAutoDetected"/> for why the plain decoder cannot be used.
     /// </summary>
     // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
-    // routes through our hub, and a method call is not a compile-time constant.
+    // is built for the models host, and a method call is not a compile-time constant.
     private static readonly string DistilGpt2WithPastUrl =
         HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_with_past_model.onnx");
 
@@ -28,7 +28,7 @@ public abstract partial class MLTestBase
 
     /// <summary>The base decoder: <c>present.*</c> outputs but NO <c>past_key_values.*</c> inputs.</summary>
     // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
-    // routes through our hub, and a method call is not a compile-time constant.
+    // is built for the models host, and a method call is not a compile-time constant.
     private static readonly string DistilGpt2BaseUrl =
         HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx");
 
@@ -1129,7 +1129,7 @@ public abstract partial class MLTestBase
 
     /// <summary>The Whisper export that carries a KV cache interface (17 inputs / 9 outputs).</summary>
     // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
-    // routes through our hub, and a method call is not a compile-time constant.
+    // is built for the models host, and a method call is not a compile-time constant.
     private static readonly string WhisperTinyWithPastUrl =
         HuggingFaceClient.GetDownloadUrl("onnx-community/whisper-tiny", "onnx/decoder_with_past_model.onnx");
 

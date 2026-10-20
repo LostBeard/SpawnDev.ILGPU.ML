@@ -37,7 +37,7 @@ builder.Services.AddSingleton<WebTorrentClient>(sp =>
     return client;
 });
 
-// Model delivery: plain HTTP through the hub, cached in OPFS. No WebTorrent.
+// Model delivery: plain HTTP from the models host (models.spawndev.com, Hugging Face as the fallback), cached in OPFS. No WebTorrent.
 // One instance so every demo AND the cache-management page see the same cached models.
 // ⚠️ MUST be a singleton, and demos must INJECT it rather than newing their own. Two reasons:
 //   1. The cache page reports downloads in flight (HubModelSource.ActiveDownloads). A per-page source only

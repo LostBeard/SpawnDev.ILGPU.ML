@@ -130,7 +130,7 @@
     private double _modelProgress, _inferenceMs;
     private string? _loadError;
 
-    // DistilGPT-2 on HuggingFace, served through OUR hub (hub.spawndev.com) as a seekable torrent stream.
+    // DistilGPT-2 on HuggingFace, served from our models host (models.spawndev.com) over plain HTTP and cached in OPFS.
     private const string HubRepoId = "Xenova/distilgpt2";
     private const string ModelFile = "onnx/decoder_model.onnx";
     private const string TokenizerFile = "tokenizer.json";
@@ -170,7 +170,7 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            // Open the model file as a SEEKABLE stream from our hub, then stream it straight to the GPU.
+            // Open the model file as a SEEKABLE stream from the models host, then stream it straight to the GPU.
             // CreateFromOnnxStreamAsync seeks past + chunk-uploads each weight, so the ~330MB model is never
             // materialized whole in CPU memory. Plain HTTP cached in OPFS - no WebTorrent.
             _modelProgress = 15;

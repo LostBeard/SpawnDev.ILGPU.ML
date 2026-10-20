@@ -10,7 +10,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <see cref="IModelStore"/> split.
 /// </summary>
 /// <remarks>
-/// These construct <see cref="HubModelSource"/> (plain HTTP through the hub, cached in OPFS) and never
+/// These construct <see cref="HubModelSource"/> (plain HTTP from the models host, cached in OPFS) and never
 /// touch <c>WebTorrentClient</c>, <c>HubModelStream</c> or a magnet. If the pipelines ever get re-welded to
 /// the torrent transport, these stop compiling or stop passing.
 /// </remarks>

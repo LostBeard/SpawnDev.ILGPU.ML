@@ -414,20 +414,45 @@ public class HttpModelDownloader
 
         // Fetch from the RUNTIME, not from `window`: there is no `window` in a worker, and a model SHOULD be
         // loadable from a worker. SpawnJSRuntime.Fetch calls fetch() on whatever the global scope is.
-        Response response;
+        async Task<Response> FetchFirstAsync(string from) => await _js.Fetch(from, new FetchOptions
+        {
+            Headers = headers.Count > 0 ? headers : null,
+            Signal = abortSignal,
+        }).ConfigureAwait(false);
+
+        Response? response = null;
+        string? fallbackUrl = ModelsHost.GetFallbackUrl(url);
+        string? failure = null;
         try
         {
-            response = await _js.Fetch(url, new FetchOptions
+            response = await FetchFirstAsync(url).ConfigureAwait(false);
+            if (fallbackUrl != null && !response.Ok && ModelsHost.ShouldFallBack((System.Net.HttpStatusCode)(int)response.Status))
             {
-                Headers = headers.Count > 0 ? headers : null,
-                Signal = abortSignal,
-            }).ConfigureAwait(false);
+                failure = $"HTTP {(int)response.Status}";
+                response.Dispose(); response = null;
+            }
         }
         catch (Exception ex) when (ct.IsCancellationRequested)
         {
             // An aborted fetch surfaces as a JS AbortError. Callers cancel with a token and expect the
             // token's exception, so translate rather than leaking the transport's error type.
             throw new OperationCanceledException($"Model download cancelled: {url}", ex, ct);
+        }
+        catch (Exception ex) when (fallbackUrl != null)
+        {
+            failure = ex.Message;   // fetch() rejects on a network error, a CORS refusal or a TLS failure; Hugging Face is a second chance
+        }
+        if (response == null)
+        {
+            // The models host could not give the file. Hugging Face has the same path layout, so try its twin, ONCE and only here at the
+            // start: a later segment carries validators (If-Range) of the first source, so a download never changes source half way.
+            ModelsHost.ReportFallback(url, fallbackUrl!, failure ?? "no response");
+            url = fallbackUrl!;
+            try { response = await FetchFirstAsync(url).ConfigureAwait(false); }
+            catch (Exception ex) when (ct.IsCancellationRequested)
+            {
+                throw new OperationCanceledException($"Model download cancelled: {url}", ex, ct);
+            }
         }
         using var _response = response;
 

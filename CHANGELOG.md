@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **Models come from `https://models.spawndev.com` (a Cloudflare R2 bucket: free egress, plain static files, CORS open, Range answered 206 on the first request), with Hugging Face as the fallback.** The SpawnDev hub no longer serves models (it keeps the WebTorrent tracker and redirects its old `/hf`, `/ollama` and `/src`
+  endpoints to the new host for clients already in the wild). New `ModelsHost` (`GetUrl`, `GetOllamaUrl`, `GetArchiveMemberUrl`, `GetFallbackUrl`, `SendAsync` with the fallback, `ProbeSizeAsync`, a `Fallback` event); the same path layout as Hugging Face, so the fallback is a host swap. Wired into every transport:
+  `HttpModelDownloader`, `FetchRangeStream`, `HttpRangeStream`, `HttpClientModelSource`, `HubModelSource`, `InferenceSession`'s chunked download. A Hugging Face token is sent only to Hugging Face, never to the models host.
+  `HuggingFaceClient.HubBaseUrl` / `DefaultHubBaseUrl` are now `[Obsolete(error: true)]` (use `ModelsBaseUrl`). Release-archive members (the ZipVoice vocoder) are plain files on the models host, so the hub's `/src` warm-up loop is gone from the TTS page.
+  Gate `tools/check-model-urls.cs` replaces `check-no-direct-huggingface.cs`: `huggingface.co`, `models.spawndev.com` and the hub's address may appear only in allowlisted files.
+- **Streaming caption.** `Flux3PromptUpsampler.ExpandAsync(..., onText)` and `CaptionWriter.WriteAsync(..., captionText)` hand the caption to the page as it is written (the model's `<think>` text first, then replaced by the caption), and the Image Generation and Text to 3D pages drive the header bar from the Qwen3 download and show the caption growing.
+- **`ImageGenerator`** (library): FLUX 3 Image Klein (with the Qwen3 caption writer), FLUX.2 klein or SD-Turbo behind one call, with reference images, 1-N pictures, sizes, 4-bit or 8-bit FLUX weights and SD-Turbo's steps / guidance / negative prompt: the browser Image Generation page's pipeline for any host.
+  `Flux3CaptionWriter` moved into the library (the demo's `CaptionWriter` delegates to it). `AssetGenerator` draws with FLUX 3 (`ImageModel.Flux3Klein`, `WriteCaption`, `UsedCaption`) and builds from a picture you already have (`GenerateFromPictureAsync`: a transparent picture is used as is, any other is cut out first).
+- **Examples.** `03.ImageGen.Console` is the `/generate` page on the command line (`--model flux3|flux2|sd`, `--ref` reference images, `--pictures`, `--size`, `--bits`, SD-Turbo options, `.png` output, interactive commands). New `10.ImageGen.Wpf`: the same page as a Windows app.
+  `07.AssetGen.Console` and `08.AssetGen.Wpf` gain FLUX 3 with the caption writer, image to 3D from your own picture (`--image` / "Image to 3D"), auto-pick or draw 4 / 8 and pick (and draw more), triangle and texture choices, arm clearance and separate saves of the model, the rig and the animation. `--out` with a long path is no longer cut to 40 characters.
+- Tests: `ModelsHost_*`, `Flux3_PromptUpsampler_StreamsTheCleanedCaptionAndReturnsTheSameAnswer`, `ImageGenerator_*`, `AssetGenerator_HasTransparencyMeansAnyPixelBelowFullAlpha` (each red-checked); the test sites that streamed models from the hub use `ModelsHostStreamLoader`.
+- New `tools/audit-demo-models.mjs` + `tools/audit-scenarios/`: drives every demo route in a real Chrome with its storage cleared and passes a route only if it rendered a real result with no request to the hub or to huggingface.co and no failed request or console error.
+
 
 ## 5.3.24 - 2026-10-20 - Fix: drawing several FLUX 3 pictures in a row loses the WebGPU device
 

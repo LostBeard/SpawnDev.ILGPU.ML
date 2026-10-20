@@ -154,7 +154,7 @@ public abstract partial class MLTestBase
             using var res = await http.SendAsync(req);
             expectedHead = await res.Content.ReadAsByteArrayAsync();
         }
-        if (!head.AsSpan().SequenceEqual(expectedHead)) throw new Exception("streamed bytes differ from the hub's first 64 bytes");
+        if (!head.AsSpan().SequenceEqual(expectedHead)) throw new Exception("streamed bytes differ from the first 64 bytes served by the models host");
         if (await hub.Store.ExistsAsync(hub.CacheKey(Rs_Repo, "tokenizer.json"))) throw new Exception("the refused file left an OPFS entry behind");
         if (ranged.CacheFiles.Contains($"{Rs_Repo}/tokenizer.json")) throw new Exception("the refused file is still planned for the cache");
         if (fallbacks.Count != 1 || fallbacks[0] != $"{Rs_Repo}/tokenizer.json") throw new Exception($"CacheFallback fired {fallbacks.Count}x: [{string.Join(", ", fallbacks)}]");

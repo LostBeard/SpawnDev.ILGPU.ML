@@ -29,7 +29,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// Exp without ever decorrelating the signal.
 /// </para>
 /// <para>
-/// ⚠️ <b>HeavyModel</b>: fetches ~326 MB of model through the hub, so it is excluded from every sweep by
+/// ⚠️ <b>HeavyModel</b>: fetches ~326 MB of model from the models host, so it is excluded from every sweep by
 /// default and runs when asked for:
 /// <c>PMT_EXCLUDE_CATEGORIES= PMT_FILTER=Pipeline_Kokoro dotnet test PlaywrightMultiTest/...</c>
 /// </para>
@@ -43,8 +43,8 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </remarks>
 public abstract partial class MLTestBase
 {
-    private const string KokoroHubBase =
-        "https://hub.spawndev.com:44365/hf/onnx-community/Kokoro-82M-v1.0-ONNX";
+    private static readonly string KokoroModelsBase =
+        SpawnDev.ILGPU.ML.Hub.HuggingFaceClient.GetDownloadUrl("onnx-community/Kokoro-82M-v1.0-ONNX", "").TrimEnd('/');
 
     /// <summary>The line the reference waveform was rendered from, and its exact phoneme tokens.</summary>
     /// <remarks>
@@ -71,8 +71,8 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // The reference is served from the demo's wwwroot; the model comes through the hub, which is the
-        // ONLY route to a Hugging Face artefact in this project.
+        // The reference is served from the demo's wwwroot; the model comes from the models host (Hugging Face is
+        // only its fallback), the ONLY route to a Hugging Face artefact in this project.
         float[] reference;
         try
         {
@@ -91,8 +91,8 @@ public abstract partial class MLTestBase
         byte[] modelBytes, voiceBytes;
         try
         {
-            modelBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/onnx/model.onnx");
-            voiceBytes = await http.GetByteArrayAsync($"{KokoroHubBase}/voices/af_heart.bin");
+            modelBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/onnx/model.onnx");
+            voiceBytes = await http.GetByteArrayAsync($"{KokoroModelsBase}/voices/af_heart.bin");
         }
         catch (HttpRequestException ex)
         {

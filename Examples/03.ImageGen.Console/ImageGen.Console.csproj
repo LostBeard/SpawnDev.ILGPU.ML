@@ -11,9 +11,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The ML library brings the diffusion pipeline + the hub model stream (and SpawnDev.WebTorrent
-         transitively). The accelerator is created here (the app owns it) and runs SD-Turbo on the GPU. -->
+    <!-- The ML library brings the image pipelines (FLUX 3, FLUX.2, SD-Turbo) and the models-host downloader. The accelerator is
+         created here (the app owns it) and runs them on the GPU. -->
     <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+    <!-- Pure-managed, cross-platform image decode for reference pictures (PNG/JPEG/...). Example-only dependency. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
   </ItemGroup>
 
 </Project>

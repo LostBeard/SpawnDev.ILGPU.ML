@@ -274,8 +274,8 @@
             _modelProgress = 40;
             StateHasChanged();
 
-            // Bundled demo copy only — do NOT fall through to hub.spawndev.com.
-            // litert-community/blaze-face returns 502 on the hub (2026-09-26); a hub fallback just
+            // Bundled demo copy only — do NOT fall through to the models host.
+            // litert-community/blaze-face is not mirrored there (it returned 502 on the old hub, 2026-09-26); a remote fallback just
             // threw after a working (or almost-working) local path and looked like the demo was broken.
             //
             // Known size + cache-bust: CreateFromFileAsync/DownloadBytesChunkedAsync could "succeed" at

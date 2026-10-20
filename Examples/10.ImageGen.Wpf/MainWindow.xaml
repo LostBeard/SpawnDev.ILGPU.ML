@@ -1,0 +1,135 @@
+<Window x:Class="SpawnDev.ILGPU.ML.Examples.ImageGenWpf.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SpawnDev.ILGPU.ML - Image Generation" Width="1280" Height="860" Background="{StaticResource Bg}" Foreground="{StaticResource Fg}">
+    <Grid Margin="14">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="500" />
+            <ColumnDefinition Width="14" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- left: the same settings the browser demo's Image Generation page offers -->
+        <Grid Grid.Column="0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="150" />
+            </Grid.RowDefinitions>
+
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <TextBlock Text="Prompt" Margin="0,0,0,4" />
+                    <TextBox x:Name="PromptBox" Text="a red fox standing in fresh snow at sunrise" TextWrapping="Wrap" AcceptsReturn="True" Height="92" Padding="6" VerticalScrollBarVisibility="Auto"
+                             Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
+
+                    <WrapPanel Margin="0,10,0,0">
+                        <TextBlock Text="Model" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="ModelBox" Width="330" SelectedIndex="1" SelectionChanged="ModelChanged">
+                            <ComboBoxItem Content="FLUX 3 Image Klein 5.6B (best, non-commercial licence)" />
+                            <ComboBoxItem Content="FLUX.2 klein 4B (sharper)" />
+                            <ComboBoxItem Content="SD Turbo (faster, smaller)" />
+                        </ComboBox>
+                    </WrapPanel>
+
+                    <WrapPanel Margin="0,8,0,0">
+                        <TextBlock x:Name="SizeLabel" Text="Size" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="SizeBox" Width="90" Margin="0,0,14,0" />
+                        <TextBlock Text="Pictures" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="CountBox" Width="52" SelectedIndex="0" Margin="0,0,14,0">
+                            <ComboBoxItem Content="1" /><ComboBoxItem Content="4" /><ComboBoxItem Content="8" />
+                        </ComboBox>
+                        <TextBlock Text="Seed" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="SeedBox" Width="90" Padding="2" ToolTip="Blank = random" />
+                    </WrapPanel>
+
+                    <WrapPanel x:Name="FluxPanel" Margin="0,8,0,0">
+                        <TextBlock Text="Weights" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="BitsBox" Width="150" SelectedIndex="0" SelectionChanged="ModelChanged" ToolTip="4-bit is what the browser loads; 8-bit is near lossless and needs a bigger GPU">
+                            <ComboBoxItem Content="4-bit (smaller)" />
+                            <ComboBoxItem Content="8-bit (near lossless)" />
+                        </ComboBox>
+                        <CheckBox x:Name="CaptionBox" Content="Write the full caption for me (Qwen3 4B, 2.4 GB)" Margin="14,0,0,0" VerticalAlignment="Center" IsChecked="True"
+                                  ToolTip="FLUX 3 draws from a full scene caption. A small local language model writes one from your prompt with Black Forest Labs' own upsampler instructions, then leaves the GPU." />
+                    </WrapPanel>
+
+                    <WrapPanel x:Name="SdPanel" Margin="0,8,0,0" Visibility="Collapsed">
+                        <TextBlock Text="Steps" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="StepsBox" Text="1" Width="40" Padding="2" Margin="0,0,14,0" />
+                        <TextBlock Text="Guidance" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="GuidanceBox" Text="0" Width="40" Padding="2" Margin="0,0,14,0" ToolTip="SD-Turbo is designed for guidance 0" />
+                        <TextBlock Text="Negative prompt" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="NegativeBox" Width="220" Padding="2" />
+                    </WrapPanel>
+
+                    <!-- reference images: edit or combine your own pictures (FLUX only) -->
+                    <StackPanel x:Name="RefPanel" Margin="0,12,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Reference images (up to 10): the prompt says what to do with them" VerticalAlignment="Center" Margin="0,0,10,0" TextWrapping="Wrap" Width="300" />
+                            <Button x:Name="AddRefButton" Content="Add..." Click="AddRefClick" Background="#334155" />
+                        </StackPanel>
+                        <ItemsControl x:Name="Refs" Margin="0,6,0,0">
+                            <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="0,0,8,8" Width="72">
+                                        <Image Source="{Binding Image}" Width="72" Height="72" Stretch="Uniform" />
+                                        <Button Content="Remove" Tag="{Binding}" Click="RemoveRefClick" Margin="0,2,0,0" Padding="2,2" FontSize="11" Background="#334155" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,8">
+                        <Button x:Name="GenerateButton" Content="Generate" Click="GenerateClick" />
+                        <Button x:Name="ClearButton" Content="New generation" Click="ClearClick" Background="#334155" />
+                        <Button x:Name="CacheButton" Content="Model folder..." Click="CacheClick" Background="#334155" />
+                    </StackPanel>
+                    <TextBlock x:Name="CacheText" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                    <TextBlock x:Name="LicenceText" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <TextBox Grid.Row="1" x:Name="LogBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11" TextWrapping="NoWrap"
+                     Background="{StaticResource Panel}" Foreground="{StaticResource Muted}" BorderThickness="0" Padding="6" Margin="0,8,0,0" />
+        </Grid>
+
+        <!-- right: progress, the live caption, the pictures -->
+        <Grid Grid.Column="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel>
+                <TextBlock x:Name="StatusText" TextTrimming="CharacterEllipsis" Margin="0,0,0,4" />
+                <ProgressBar x:Name="Bar" Height="8" Minimum="0" Maximum="100" Foreground="{StaticResource Accent}" Background="{StaticResource Panel}" BorderThickness="0" />
+            </StackPanel>
+
+            <Expander Grid.Row="1" x:Name="CaptionExpander" Header="Caption" Foreground="{StaticResource Muted}" Margin="0,8,0,0" Visibility="Collapsed">
+                <TextBlock x:Name="CaptionText" TextWrapping="Wrap" FontSize="12" MaxHeight="150" Margin="0,4,0,0" />
+            </Expander>
+
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Margin="0,10,0,8">
+                <ItemsControl x:Name="Pictures">
+                    <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Margin="0,0,10,10" Width="{Binding DisplayWidth}">
+                                <Image Source="{Binding Image}" Width="{Binding DisplayWidth}" Stretch="Uniform" />
+                                <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                    <Button Content="Save..." Tag="{Binding}" Click="SaveClick" Padding="8,3" FontSize="12" />
+                                    <TextBlock Text="{Binding Caption}" VerticalAlignment="Center" FontSize="11" />
+                                </StackPanel>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <TextBlock Grid.Row="3" x:Name="InfoText" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" />
+        </Grid>
+    </Grid>
+</Window>

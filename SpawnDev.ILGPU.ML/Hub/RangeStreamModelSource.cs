@@ -22,7 +22,7 @@ public class RangeStreamModelSource : IModelSource
     /// <param name="hub">A hub source constructed WITH an HttpClient (size probes and desktop range requests go through it).</param>
     public RangeStreamModelSource(HubModelSource hub) => _hub = hub ?? throw new ArgumentNullException(nameof(hub));
 
-    /// <summary>(bytes read so far, file length) while a file streams, for a progress display. Cached downloads report through the hub's OnProgress.</summary>
+    /// <summary>(bytes read so far, file length) while a file streams, for a progress display. Cached downloads report through the source's OnProgress.</summary>
     public event Action<long, long>? OnProgress;
 
     /// <summary>"repo/path" of the files that are downloaded into the hub cache instead of streamed.</summary>

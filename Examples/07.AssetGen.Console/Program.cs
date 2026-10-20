@@ -10,17 +10,21 @@
 //    dotnet run -- "a friendly robot" --pictures 4 --pick                   # draw 4, look at them, choose one
 //    dotnet run -- "a pirate" --out pirate --seed 11 --moves walk,dance,wave --arm-clearance 10
 //    dotnet run -- "a dragon" --image-model sd                              # SD-Turbo instead of FLUX.2 (smaller, faster, older look)
+//    dotnet run -- "a dragon" --image-model flux3                           # FLUX 3 Image Klein 5.6B, with Qwen3 writing the full caption first (best pictures, slower)
+//    dotnet run -- --image crown.png --no-rig                               # image to 3D: your own picture of one whole object (a transparent background is used as is, any other is cut out)
 //    dotnet run -- --ci                                                     # short fixed run that asserts files were written
 //
 //  Options:
 //    --out <name>              output name prefix / folder (default: from the prompt)
 //    --seed <N>                first seed (default 1); --pictures <N> draws N seeds (default 2) and keeps the one that fits its frame best
-//    --pick                    show the drawn pictures (PNG files) and ask which to build
-//    --size <px>               picture side for FLUX.2, a multiple of 16 (default 512)
+//    --pick                    show the drawn pictures (PNG files) and ask which to build; answer "m" to draw N more (the browser demo's "Draw 4 more")
+//    --image <file>            image to 3D: build this picture instead of drawing one (no prompt needed); any format ImageSharp reads
+//    --no-caption              FLUX 3: do not let Qwen3 4B write the full scene caption (FLUX 3 sent a short prompt as typed draws a generic picture)
+//    --size <px>               picture side for FLUX.2 and FLUX 3, a multiple of 16: 512, 768 or 1024 (default 512)
 //    --edit-picture p.png|"a prompt" --edit-region "z>0.1"   after the model is built, re-texture that REGION (generator frame: x right, y depth, z up; the model fills [-0.5,0.5]^3; also box:x0,y0,z0,x1,y1,z1 and sphere:cx,cy,cz,r)
 //                              (--edit-shape: change the SHAPE there too, geometry can be added or removed) from another picture (RGBA with a cut-out alpha, or any picture: it is cut out), keeping the rest; writes <name>_edited.glb. No rig / animation in this mode.
 //    --edit-instruction "give the knight a red plume"   like --edit-picture, but the edit picture is made by FLUX.2 klein EDITING the picture the model was built from (reference-image mode); it keeps what the instruction does not mention
-//    --image-model flux2|sd    default flux2             --quality 4|8   FLUX.2 weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
+//    --image-model flux3|flux2|sd   default flux2        --quality 4|8   FLUX weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
 //    --no-rig                  stop after the 3D model          --no-animate  stop after the rig
@@ -28,7 +32,8 @@
 //    --arm-clearance <deg>     swing the upper arms away from the body for bulky characters (default 8)
 //    --cache <dir>             where models are cached (default: your user profile; ~25 GB in all: put it on a big drive)
 //
-//  First run downloads the models (about 4.6 GB FLUX.2 + 11 GB TRELLIS.2 + 1.2 GB SkinTokens + small ones) and resumes if interrupted; every later run reads the cache.
+//  First run downloads the models (about 4.6 GB FLUX.2 + 11 GB TRELLIS.2 + 1.2 GB SkinTokens + small ones; FLUX 3 is 5.7 GB + 2.4 GB for the caption writer) and resumes if interrupted; every later run reads the cache.
+//  FLUX 3 weights are under the FLUX Kommunity License (non-commercial use).
 //  Needs a GPU with about 8 GB free (the models load one at a time). Outputs: <name>.png (the chosen picture), <name>.glb, <name>_rigged.glb, <name>_animated.glb.
 //
 //  Self-contained on purpose: the accelerator is created here (the app owns it); everything else is SpawnDev.ILGPU.ML's AssetGenerator.
@@ -43,11 +48,13 @@ using SpawnDev.ILGPU.ML.Animation;
 using SpawnDev.ILGPU.ML.Assets;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Trellis2;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
 
-bool ci = false, pick = false, rig = true, animate = true;
+bool ci = false, pick = false, rig = true, animate = true, caption = true;
 int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4;
 double clearance = 8;
-string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null, editInstruction = null; bool editShape = false; var model = ImageModel.Flux2Klein;
+string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null, editInstruction = null, imagePath = null; bool editShape = false; var model = ImageModel.Flux2Klein;
 var words = new List<string>();
 for (int i = 0; i < args.Length; i++)
 {
@@ -72,15 +79,21 @@ for (int i = 0; i < args.Length; i++)
         case "--edit-region" when i + 1 < args.Length: editRegion = args[++i]; break;
         case "--edit-shape": editShape = true; break;
         case "--edit-instruction" when i + 1 < args.Length: editInstruction = args[++i]; break;
-        case "--image-model" when i + 1 < args.Length: model = args[++i].ToLowerInvariant() is "sd" or "sdturbo" ? ImageModel.SdTurbo : ImageModel.Flux2Klein; break;
+        case "--image-model" when i + 1 < args.Length: model = args[++i].ToLowerInvariant() switch { "sd" or "sdturbo" => ImageModel.SdTurbo, "flux3" or "flux-3" => ImageModel.Flux3Klein, _ => ImageModel.Flux2Klein }; break;
+        case "--image" when i + 1 < args.Length: imagePath = args[++i]; break;
+        case "--no-caption": caption = false; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
 string prompt = string.Join(' ', words);
 if (ci) { if (prompt == "") prompt = "a wooden treasure chest with iron bands"; pictures = 1; rig = false; texture = 1024; faces = 50_000; }
-if (prompt == "") { Console.Error.WriteLine("Usage: AssetGen.Console \"<prompt>\" [--out name] [--pictures N] [--pick] [--no-rig] [--moves a,b] ...   (see the header of Program.cs)"); return 2; }
-outName ??= new string(prompt.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
-if (outName.Length > 40) outName = outName[..40];
+if (prompt == "" && imagePath == null) { Console.Error.WriteLine("Usage: AssetGen.Console \"<prompt>\" | --image <file> [--out name] [--pictures N] [--pick] [--no-rig] [--moves a,b] ...   (see the header of Program.cs)"); return 2; }
+if (imagePath != null && !File.Exists(imagePath)) { Console.Error.WriteLine($"--image: no such file '{imagePath}'"); return 2; }
+if (outName == null)
+{   // a name made from the prompt (or the picture's file name) is shortened; one given with --out is used as given
+    outName = imagePath != null ? Path.GetFileNameWithoutExtension(imagePath) : new string(prompt.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
+    if (outName.Length > 40) outName = outName[..40];
+}
 
 try { return await Run(); }
 catch (Exception ex) { Console.Error.WriteLine($"Generation failed: {ex}"); return 1; }
@@ -102,21 +115,18 @@ async Task<int> Run()
     var moves = movesArg != null ? movesArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() : ids.ToList();
     foreach (var m in moves) if (!ids.Contains(m)) { Console.Error.WriteLine($"unknown move '{m}'; available: {string.Join(", ", ids)}"); return 2; }
 
-    using var gen = new AssetGenerator(accelerator, source, loader) { ImageModelBits = quality, BridgeHops = bridgeHops };
+    using var gen = new AssetGenerator(accelerator, source, loader)
+    {
+        ImageModelBits = quality, BridgeHops = bridgeHops, WriteCaption = caption,
+        OpenCaptionModel = (repo, file, progress) => source.OpenAsync(repo, file, progress),
+        KeepImageModelResident = pick,                         // "draw more" reuses the transformer; the 3D stage releases it
+    };
     var total = System.Diagnostics.Stopwatch.StartNew();
     gen.StageDone = (stage, s) => Console.WriteLine($"  {stage,-44} {s,7:F1} s   (total {total.Elapsed.TotalSeconds:F0} s)");
     gen.Status = s => { if (s.Contains('%')) Console.Write($"\r  {s,-70}"); };
 
-    Console.WriteLine($"Prompt: \"{prompt}\"  ({model}, {pictures} picture{(pictures == 1 ? "" : "s")} from seed {seed})");
-    Func<IReadOnlyList<AssetPicture>, Task<int>>? choose = null;
-    if (pick)
-        choose = async drawn =>
-        {
-            for (int i = 0; i < drawn.Count; i++) { var f = $"{outName}_candidate{i}.png"; await File.WriteAllBytesAsync(f, AssetGenerator.EncodePng(drawn[i].Rgba, drawn[i].Width, drawn[i].Height)); Console.WriteLine($"  [{i}] {f}  (seed {drawn[i].Seed})"); }
-            if (Console.IsInputRedirected) return 0;
-            Console.Write("Build which picture? [0] ");
-            return int.TryParse(Console.ReadLine(), out int n) ? n : 0;
-        };
+    if (imagePath != null) Console.WriteLine($"Image to 3D from {imagePath}");
+    else Console.WriteLine($"Prompt: \"{prompt}\"  ({model}, {pictures} picture{(pictures == 1 ? "" : "s")} from seed {seed})");
 
     if (editPicture != null || editInstruction != null)
     {
@@ -162,8 +172,39 @@ async Task<int> Run()
         return 0;
     }
 
-    var asset = await gen.GenerateAsync(prompt, seed, pictures, model, size, new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture },
-        rig, animate ? moves : null, clearance, choose);
+    var trellisOptions = new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture };
+    GeneratedAsset asset;
+    if (imagePath != null)
+    {   // image to 3D: a transparent picture is used as is, any other is cut out first
+        var photo = LoadPicture(imagePath, seed);
+        asset = await gen.GenerateFromPictureAsync(photo, trellisOptions, rig, animate ? moves : null, clearance);
+    }
+    else if (pick)
+    {   // draw, look at the pictures, choose one or ask for more
+        var all = new List<AssetPicture>(); int next = seed; int index = 0;
+        while (true)
+        {
+            var batch = await gen.DrawAsync(prompt, Enumerable.Range(next, pictures).ToArray(), model, size);
+            next += pictures;
+            foreach (var p in batch)
+            {
+                var f = $"{outName}_candidate{all.Count}.png"; await File.WriteAllBytesAsync(f, AssetGenerator.EncodePng(p.Rgba, p.Width, p.Height));
+                Console.WriteLine($"  [{all.Count}] {f}  (seed {p.Seed})"); all.Add(p);
+            }
+            if (gen.UsedCaption != null) Console.WriteLine($"  caption used: {gen.UsedCaption}");
+            if (Console.IsInputRedirected) break;
+            Console.Write($"Build which picture? [0], or m to draw {pictures} more: ");
+            var answer = Console.ReadLine()?.Trim();
+            if (string.Equals(answer, "m", StringComparison.OrdinalIgnoreCase)) continue;
+            index = int.TryParse(answer, out int n) ? Math.Clamp(n, 0, all.Count - 1) : 0;
+            break;
+        }
+        gen.ReleaseImageModel();
+        asset = await gen.GenerateFromPictureAsync(all[index], trellisOptions, rig, animate ? moves : null, clearance);
+    }
+    else
+        asset = await gen.GenerateAsync(prompt, seed, pictures, model, size, trellisOptions, rig, animate ? moves : null, clearance);
+    if (gen.UsedCaption != null && !pick) Console.WriteLine($"Caption used: {gen.UsedCaption}");
 
     await File.WriteAllBytesAsync(outName + ".png", AssetGenerator.EncodePng(asset.Picture.Rgba, asset.Picture.Width, asset.Picture.Height));
     await File.WriteAllBytesAsync(outName + ".glb", asset.Glb);
@@ -174,4 +215,13 @@ async Task<int> Run()
 
     if (ci && (!File.Exists(outName + ".glb") || new FileInfo(outName + ".glb").Length < 100_000)) { Console.Error.WriteLine("CI check failed: the GLB is missing or tiny"); return 1; }
     return 0;
+}
+
+// A picture file as RGBA (any format ImageSharp reads; a transparent background is kept: the 3D stage then uses it as the cut-out).
+static AssetPicture LoadPicture(string path, int seed)
+{
+    using var img = Image.Load<Rgba32>(path);
+    var rgba = new byte[img.Width * img.Height * 4];
+    img.CopyPixelDataTo(rgba);
+    return new AssetPicture(seed, img.Width, img.Height, rgba);
 }

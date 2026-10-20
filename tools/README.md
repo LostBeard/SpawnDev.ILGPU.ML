@@ -290,3 +290,20 @@ one GPU.
 default set", which is `{ "HeavyModel" }` - so the heavy run silently schedules ZERO heavy tests and
 reports a fast trivial pass. The script sets a non-null sentinel (`=none`) instead and echoes every env
 value into the log. **Confirm scoping by test COUNT, never by a green tally.**
+
+## Do the demos work, and where do they get their models?
+
+| tool | answers |
+|---|---|
+| `audit-demo-models.mjs` + `audit-scenarios/*.mjs` | **Does every demo page work in a real browser, and does EVERY model request go to the models host?** Drives each route of a served build to a real, rendered result (a scenario per route) in its OWN browser context (empty OPFS and HTTP cache, so every model really downloads), and records every request, failed request, console error and exception. A route passes only with a real result AND zero requests to `hub.spawndev.com` AND zero to `huggingface.co` (a request there means a file is missing from the models host and the fallback served it: the URL is printed so it can be mirrored) AND zero failures. A route with no scenario is reported `LOAD-ONLY`, never as a pass. Red-checked with scenarios that must fail for each reason (hub, Hugging Face, a failed request, a throwing scenario). |
+
+```
+dotnet publish SpawnDev.ILGPU.ML.Demo/SpawnDev.ILGPU.ML.Demo.csproj -c Release -o publish-demo-audit      # (AOT is not needed to check delivery)
+node tools/serve-demo.mjs "$PWD/publish-demo-audit/wwwroot" 5071                                         # static server with COOP/COEP, as PMT uses
+node tools/audit-demo-models.mjs http://127.0.0.1:5071 "$PWD/_scratch/demo-audit" [/route,/route,...]   # no routes = every route
+```
+
+A real Chrome (`CHROME_EXE`), its own profile (`AUDIT_PROFILE`) and CDP port (`AUDIT_CDP_PORT`, default 9355), killed by PID at the end: never by image name,
+the user's own browser is running. Microphone/webcam demos: `AUDIT_CHROME_ARGS='--use-fake-device-for-media-stream --use-fake-ui-for-media-stream --use-file-for-fake-audio-capture=<wav>'`.
+Scenarios: one file per group in `audit-scenarios/` (`_routes.mjs` holds the route list and the scenario contract). Output per route: `<outDir>/<route>.json` and a screenshot,
+plus `_summary.json`. The exit code is the number of failed routes. Run it before any release that touches model delivery or a demo page.

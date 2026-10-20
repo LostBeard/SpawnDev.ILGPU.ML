@@ -1105,15 +1105,14 @@ public abstract partial class MLTestBase
         // `System.OutOfMemoryException at HttpContent.LimitArrayPoolWriteStream.GrowAndWrite`. Nothing about
         // CLIP was wrong; the delivery shape was.
         //
-        // HubModelStream.OpenAsync adds the file as a LAZY-HASH torrent through our hub: random-access
-        // streaming, pieces cached to OPFS under a stable key and restored on reload, seeded to peers, and
-        // the bytes stay JS-side - .NET only ever sees the graph structure and each weight on its way to the
-        // GPU. It also removes the last direct HuggingFace request from this test.
-        var torrents = new SpawnDev.WebTorrent.WebTorrentClient();
+        // ModelsHostStreamLoader opens a seekable range stream over the file from the models host: random-access
+        // reads, and in the browser the bytes stay JS-side (FetchRangeStream) - .NET only ever sees the graph
+        // structure and each weight on its way to the GPU.
+        var torrents = new ModelsHostStreamLoader(http);
         InferenceSession session;
         try
         {
-            var hub = new Hub.HubModelStream(torrents, http);
+            var hub = torrents;
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(8));
             var model = await hub.OpenAsync(
                 Hub.ModelHub.KnownModels.CLIPVitB32, Hub.ModelHub.KnownFiles.OnnxVisionModel,

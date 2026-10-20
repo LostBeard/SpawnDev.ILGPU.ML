@@ -61,7 +61,7 @@ public sealed class HttpRangeStream : Stream
         long end = Math.Min(_position + buffer.Length, _length) - 1;   // clamp to EOF (RFC 7233)
         using var req = new HttpRequestMessage(HttpMethod.Get, _url);
         req.Headers.Range = new RangeHeaderValue(_position, end);
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        using var resp = await ModelsHost.SendAsync(_http, req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
         var bytes = await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
         int n = Math.Min(bytes.Length, buffer.Length);
