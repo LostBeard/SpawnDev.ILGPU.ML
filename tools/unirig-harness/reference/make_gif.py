@@ -1,6 +1,6 @@
 """Assemble the README GIF from the frames make-gif-frames.mjs captured from the demo page.
 
-  python -I make_gif.py <frames_dir> <out.gif> "<prompt>" [width=480] [fps=15]
+  python -I make_gif.py <frames_dir> <out.gif> "<prompt>" [width=480] [fps=15] ["FLUX.2 klein" footer label] ["FLUX.2 (1024 px) draws it" first-stage caption]
 
 Stages (file prefixes): A = the generated model turning, B = the skeleton over the model, C / D / E = dance, wave, walk. A card with the prompt and the picture opens it.
 Each frame is cropped to the subject, captioned, and the whole GIF shares one adaptive palette so it stays small.
@@ -11,6 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 src, out, prompt = sys.argv[1], sys.argv[2], sys.argv[3]
 W = int(sys.argv[4]) if len(sys.argv) > 4 else 480
 FPS = int(sys.argv[5]) if len(sys.argv) > 5 else 15
+IMG_CHAIN = sys.argv[6] if len(sys.argv) > 6 else 'FLUX.2 klein'                                    # the picture stage in the footer chain
+IMG_DRAWS = sys.argv[7] if len(sys.argv) > 7 else 'FLUX.2 (1024 px) draws it'                       # and in the first stage's caption
 BG = (15, 20, 31)          # the viewer clears to this (0.06, 0.08, 0.12); frames are tested against it
 
 
@@ -109,12 +111,12 @@ for ln in wrap('"' + prompt + '"', f, W - 290, d): d.text((20, y), ln, font=f, f
 pic = os.path.join(src, 'picture.png')
 if os.path.exists(pic):
     p = Image.open(pic).convert('RGB').resize((240, 240), Image.LANCZOS); intro.paste(p, (W - 260, 90))
-d.text((20, H - 90), 'FLUX.2 klein  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
+d.text((20, H - 90), f'{IMG_CHAIN}  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 62), 'all on the GPU, all in the browser', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 34), 'SpawnDev.ILGPU.ML', font=font(16, True), fill=(110, 130, 170))
 
 seq = [(intro, 38)]
-A = [card('1', 'Text to 3D', 'FLUX.2 (1024 px) draws it, TRELLIS.2 builds mesh + PBR textures')(im) for im in allf['A']]
+A = [card('1', 'Text to 3D', f'{IMG_DRAWS}, TRELLIS.2 builds mesh + PBR textures')(im) for im in allf['A']]
 B = [card('2', 'Rig', 'SkinTokens writes the skeleton and learned skin weights')(im) for im in allf['B']]
 CDE = [card('3', 'Animate', 'Kimodo moves retargeted onto the generated skeleton')(im) for k in 'CDE' for im in allf[k]]
 for im in A + B + CDE: seq.append((im, 1))

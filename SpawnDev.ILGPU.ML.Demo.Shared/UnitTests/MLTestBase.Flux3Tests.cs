@@ -105,6 +105,57 @@ public abstract partial class MLTestBase
 
     private static Flux2VaeNorm F3_Norm(string dir) => Flux2VaeNorm.FromJson(File.ReadAllText(Path.Combine(dir, "weights", "vae_norm.json")));
 
+    /// <summary>
+    /// The decoder built for 32 x 32 latent cells (256 px tiles, 0.8 GB of feature maps instead of 3.2 GB: what lets a browser tab keep the transformer resident beside it; Chrome drops the WebGPU device at ~70% of the card's memory)
+    /// against the decoder built for the whole 64 x 64 latent, on the real latents of the reference run (the start noise integrated along the reference's per-step velocities), and the whole decode against the reference picture.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Flux3_SmallTileVae_MatchesTheWholeDecode() => await RunTest(async accelerator =>
+    {
+        var dir = F3_RequireReal(accelerator); var g = Path.Combine(dir, "golden", "t2i");
+        var meta = JsonDocument.Parse(File.ReadAllText(Path.Combine(g, "meta.json"))).RootElement;
+        int steps = meta.GetProperty("steps").GetInt32(), size = meta.GetProperty("size").GetInt32(), cells = size / 16;
+        var (latents, _) = Ur_Npy<float>(Path.Combine(g, "noise.npy")); var (image, _) = Ur_Npy<float>(Path.Combine(g, "image.npy"));
+        var schedule = Flux3Pipeline.Schedule(steps, meta.GetProperty("alpha").GetDouble());
+        for (int i = 0; i < steps; i++)
+        {
+            var (pred, _) = Ur_Npy<float>(Path.Combine(g, $"pred_{i}.npy")); float dt = (float)(schedule[i + 1] - schedule[i]);
+            for (int k = 0; k < latents.Length; k++) latents[k] += dt * pred[k];
+        }
+        var bytes = File.ReadAllBytes(Path.Combine(dir, "weights", "vae_decoder.onnx"));
+        using var whole = InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } });
+        var norm = F3_Norm(dir);
+        var wholePipe = new Flux2Pipeline(accelerator, null!, null!, null!, whole, norm);
+        var a = await wholePipe.DecodeAsync(wholePipe.ToVaeInput(latents, cells, cells), cells, cells);
+        int n = size * size; double sqRef = 0;
+        for (int p = 0; p < n; p++)
+            for (int c = 0; c < 3; c++)
+            {
+                double want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255);
+                sqRef += (a.Rgba[p * 4 + c] - want) * (a.Rgba[p * 4 + c] - want);
+            }
+        double psnrRef = 10 * Math.Log10(255.0 * 255.0 / Math.Max(sqRef / (3.0 * n), 1e-9));
+        Console.WriteLine($"[Flux3] VAE on {accelerator.AcceleratorType}: whole decode {psnrRef:F1} dB against the reference picture");
+        Ur_Expect(psnrRef > 25, $"the integrated latents decode to the reference picture ({psnrRef:F1} dB): the test's latents are right");
+        foreach (var (tile, overlap) in new[] { (32, 16), (40, 16), (48, 16), (56, 16) })
+        {
+            using var small = InferenceSession.CreateFromFile(accelerator, bytes, inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, tile, tile } });
+            var tiledPipe = new Flux2Pipeline(accelerator, null!, null!, null!, small, norm) { VaeTileLatent = tile, VaeTileOverlap = overlap };
+            var b = await tiledPipe.DecodeAsync(tiledPipe.ToVaeInput(latents, cells, cells), cells, cells);
+            double sq = 0, sqTile = 0;
+            for (int p = 0; p < n; p++)
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = a.Rgba[p * 4 + c] - b.Rgba[p * 4 + c], want = Math.Clamp(Math.Round((image[c * n + p] / 2 + 0.5) * 255), 0, 255);
+                    sq += d * d; sqTile += (b.Rgba[p * 4 + c] - want) * (b.Rgba[p * 4 + c] - want);
+                }
+            double psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(sq / (3.0 * n), 1e-9));
+            Console.WriteLine($"[Flux3] VAE tiles of {tile} cells ({tile * 8} px), {overlap} overlap: {psnr:F1} dB against the whole decode, {10 * Math.Log10(255.0 * 255.0 / Math.Max(sqTile / (3.0 * n), 1e-9)):F1} dB against the reference picture");
+            // measured on this latent: 32 cells 29.9 dB, 40 cells 31.7, 48 cells 35.7, 56 cells 43.3 (the 4-bit weights themselves are ~19 dB from the reference picture); the demo's 48 must stay above 33
+            if (tile == 48) Ur_Expect(psnr > 33, $"48-cell tile decode PSNR {psnr:F1} dB against the whole decode");
+        }
+    });
+
     /// <summary>The whole text to image from the reference's caption and start noise: text encoder, 16 flow-map steps (8-bit transformer), VAE; the picture against the reference's.</summary>
     [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
     public async Task Flux3_Pipeline_MatchesTheReference() => await RunTest(async accelerator =>

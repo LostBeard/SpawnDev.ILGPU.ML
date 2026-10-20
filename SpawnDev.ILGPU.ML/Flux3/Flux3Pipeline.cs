@@ -49,6 +49,13 @@ public sealed class Flux3Pipeline : IDisposable
     public const int MaxReferences = 10;
 
     /// <summary>Builds the VAE encoder's session for a picture of (height, width) pixels (the graph is fixed-shape): needed for <see cref="Flux3Request.References"/>. <see cref="CreateAsync"/> sets it; null = references unsupported.</summary>
+    /// <summary>
+    /// Side of the latent square the decoder's graph is built for (<see cref="CreateAsync"/>'s <c>vaeTileLatent</c>); larger pictures decode in overlapping tiles of it. The decoder's working memory is about 3.2 GB for a
+    /// 64-cell tile (a 512 px picture in one piece) and falls with the tile's area: 48 cells = 1.8 GB (35.7 dB from the whole decode on CUDA, measured), 32 cells = 0.8 GB (29.9 dB), at the cost of overlap work.
+    /// NOT understood yet: a 48-cell decoder lost the WebGPU device on Chrome 151 at the first tile (2 of 2 runs, 6.5 GB in use, a 64-cell decoder ran through 4 pictures), so the browser demo keeps 64.
+    /// </summary>
+    public int VaeTileLatent { get => _vae.VaeTileLatent; set => _vae.VaeTileLatent = value; }
+
     public Func<int, int, Task<InferenceSession>>? VaeEncoderFactory { get => _vae.VaeEncoderFactory; set => _vae.VaeEncoderFactory = value; }
 
     public const string TokenizerFile = "tokenizer.json", NormFile = "vae_norm.json", VaeFile = "vae_decoder.onnx", VaeEncoderFile = "vae_encoder.onnx";
@@ -67,8 +74,9 @@ public sealed class Flux3Pipeline : IDisposable
     /// Build the pipeline from a model source holding the export (<c>LostBeard/flux-3-image-klein-q4-ILGPU</c> layout: the stage files, <see cref="VaeFile"/>, <see cref="NormFile"/>, <see cref="TokenizerFile"/>).
     /// Only the tokenizer, the batch-norm statistics and the small decoder are loaded now (the decoder stays resident, ~200 MB); the two big stages stream in when a run needs them and leave when it is done with them.
     /// </summary>
-    public static async Task<Flux3Pipeline> CreateAsync(Accelerator accelerator, IModelSource source, string repo, Action<string, int>? onProgress = null, CancellationToken cancellationToken = default, int bits = 4)
+    public static async Task<Flux3Pipeline> CreateAsync(Accelerator accelerator, IModelSource source, string repo, Action<string, int>? onProgress = null, CancellationToken cancellationToken = default, int bits = 4, int vaeTileLatent = 64)
     {
+        if (vaeTileLatent < 16 || vaeTileLatent > 64 || vaeTileLatent % 2 != 0) throw new ArgumentOutOfRangeException(nameof(vaeTileLatent), "An even tile of 16 to 64 latent cells");
         onProgress?.Invoke("tokenizer", 0);
         var tok = new Qwen2Tokenizer(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, TokenizerFile, cancellationToken)));
         var norm = Flux2VaeNorm.FromJson(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, NormFile, cancellationToken)));
@@ -76,11 +84,12 @@ public sealed class Flux3Pipeline : IDisposable
         InferenceSession vae;
         await using (var s = await source.OpenAsync(repo, VaeFile, cancellationToken))
             vae = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, s, onProgress: (st, pct) => onProgress?.Invoke("vae:" + st, pct),
-                inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, 64, 64 } }, ct: cancellationToken);
+                inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, vaeTileLatent, vaeTileLatent } }, ct: cancellationToken);
         var (encoderFile, transformerFile) = StageFiles(bits);
         var pipe = new Flux3Pipeline(accelerator, tok,
             () => Flux2Weights.LoadAsync(accelerator, source, repo, encoderFile, cancellationToken),
             () => Flux2Weights.LoadAsync(accelerator, source, repo, transformerFile, cancellationToken), vae, norm);
+        pipe.VaeTileLatent = vaeTileLatent;
         pipe.VaeEncoderFactory = async (h, w) =>
         {
             await using var es = await source.OpenAsync(repo, VaeEncoderFile, cancellationToken);
@@ -214,6 +223,7 @@ public sealed class Flux3Pipeline : IDisposable
         }
         Report("vae", 0, 1);
         var picture = await _vae.DecodeAsync(_vae.ToVaeInput(latents, rows, cols), rows, cols);
+        _vae.ReleaseDecoderMemory();                                     // the decoder's feature maps would stay parked beside the next picture's transformer
         Lap("vae decode");
         LastTimings = timings;
         return picture;

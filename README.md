@@ -16,9 +16,9 @@
 >
 > **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
 >
-> ![A knight drawn by FLUX.2 klein at 1024 px, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-19_TextTo3D-Rig-Animate-Knight-FLUX2-1024.gif)
+> ![A pirate captain: the prompt is expanded by Qwen3, drawn by FLUX 3 Image Klein, built by TRELLIS.2, rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-20_TextTo3D-Rig-Animate-Pirate-FLUX3-Qwen3.gif)
 >
-> *A prompt becomes a 3D character that is rigged and dances, entirely on your GPU in your browser: FLUX.2 klein -> TRELLIS.2 -> SkinTokens -> Kimodo clips.*
+> *A prompt becomes a 3D character that is rigged and dances, entirely on your GPU in your browser: Qwen3 writes the caption -> FLUX 3 Image Klein draws it -> TRELLIS.2 -> SkinTokens -> Kimodo clips.*
 >
 > **5.3.15: [Rig this model](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A generated character gets a skeleton and learned skin weights on your GPU: `SkinTokensRigger` (VAST AI's SkinTokens, MIT, re-implemented on ILGPU) turns a GLB into a rigged GLB in ~6 s on CUDA, and the Image-to-3D demo has a **Rig this model** button (1.15 GB, cached in your browser). Checked against the real PyTorch model: 295 of 296 generated tokens identical, skin weights to 5.7e-5. [How it works →](Docs/rigging.md)
 >

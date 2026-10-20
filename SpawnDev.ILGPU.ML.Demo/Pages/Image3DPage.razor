@@ -676,6 +676,21 @@
         _isLoading = false;
     }
 
+    private string? _lastVramStage;
+    /// <summary>One console line per stage change: who holds the WebGPU memory (a lost device shows up in the page only as "A valid external Instance reference no longer exists").</summary>
+    private void TraceVram(string stage)
+    {
+        if (stage == _lastVramStage) return;
+        _lastVramStage = stage;
+        try
+        {
+            var top = new System.Text.StringBuilder();
+            foreach (var (label, bytes) in SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LargestLiveBuffers(5)) top.Append($" {label} {bytes / 1048576} MiB;");
+            Console.WriteLine($"[VRAM] {stage}: storage {SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveStorageBytes / 1048576} MiB in {SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount} buffers, staging {SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveStagingBytes / 1048576} MiB; largest:{top}");
+        }
+        catch { }
+    }
+
     /// <summary>Draw one picture per seed with the chosen model, adding each to the candidate list as it finishes.</summary>
     private async Task<List<Candidate>> DrawAsync(int[] seeds)
     {
@@ -721,7 +736,7 @@
                 var img = await _flux3!.RunAsync(new SpawnDev.ILGPU.ML.Flux3.Flux3Request
                 {
                     Caption = caption, Seed = seed, Width = 512, Height = 512,
-                    Progress = (stage, i, n) => { _currentStage = stage.StartsWith("denoise") ? $"drawing: step {i + 1} / {n} (seed {seed})" : $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
+                    Progress = (stage, i, n) => { TraceVram(stage); _currentStage = stage.StartsWith("denoise") ? $"drawing: step {i + 1} / {n} (seed {seed})" : $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
                 });
                 foreach (var (stage, seconds) in _flux3.LastTimings) OnStageDone("    " + stage, seconds);
                 await Add(seed, img.Width, img.Height, img.Rgba);
@@ -733,7 +748,7 @@
             await _flux!.RunManyAsync(new SpawnDev.ILGPU.ML.Flux2.Flux2Request
             {
                 Prompt = _prompt + PromptSuffix, Size = 512, Steps = 4,
-                Progress = (stage, i, n) => { _currentStage = $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
+                Progress = (stage, i, n) => { TraceVram(stage); _currentStage = $"drawing: {stage}"; _ = InvokeAsync(StateHasChanged); },
             }, seeds, (i, img) => Add(seeds[i], img.Width, img.Height, img.Rgba));
         }
         return drawn;

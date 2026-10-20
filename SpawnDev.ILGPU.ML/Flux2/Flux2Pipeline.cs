@@ -222,6 +222,9 @@ public sealed class Flux2Pipeline : IDisposable
         return (tokens, rows, cols);
     }
 
+    /// <summary>Free the decoder's parked feature maps (3.2 GB after a 512 px picture); the next decode allocates them again. Returns the bytes freed.</summary>
+    public long ReleaseDecoderMemory() => _vae.ReleaseWorkingMemory();
+
     /// <summary>Decode VAE input latents [32, 2*side, 2*side] (<see cref="ToVaeInput(float[], int)"/>) to RGBA; <paramref name="image"/> also receives the raw [-1, 1] planes when given.</summary>
     public Task<Flux2Image> DecodeAsync(float[] vaeInput, int side, float[]? image = null) => DecodeAsync(vaeInput, side, side, image);
 
