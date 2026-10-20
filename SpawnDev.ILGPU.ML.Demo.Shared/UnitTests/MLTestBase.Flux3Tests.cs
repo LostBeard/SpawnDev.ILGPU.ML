@@ -3,6 +3,7 @@ using BBP = global::SpawnDev.ILGPU.BrowserBufferPolicy;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Flux2;
 using SpawnDev.ILGPU.ML.Flux3;
+using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.ILGPU.ML.Trellis2;
 using SpawnDev.UnitTesting;
 
@@ -356,6 +357,51 @@ public abstract partial class MLTestBase
         foreach (var (name, (calls, ms)) in tr.Profile.OrderByDescending(kv => kv.Value.Ms))
             Console.WriteLine($"[Flux3Profile]   {name,-20} {calls,4} calls {ms,8:F1} ms {100 * ms / sum,5:F1} %");
         Ur_Expect(plainMs > 0, "a step ran");
+    });
+
+    /// <summary>
+    /// The FLUX 3 VAE decoder (from the hub, OPFS cache) built for several tile sizes and run on random latents in the browser: every size must finish with a finite picture and the device must survive.
+    /// Found in the 3D page: a decoder built for 48 x 48 latent cells lost the WebGPU device at its first tile (Chrome 151, 2 of 2 runs) while 64 x 64 ran; this is the quick repro (no transformer, no text encoder).
+    /// </summary>
+    [TestMethod(Timeout = 1_800_000, Category = "HeavyModel")]
+    public async Task Flux3_Browser_VaeTileSizes_FinishOnWebGPU() => await RunTest(async accelerator =>
+    {
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js == null || !js.IsBrowser) throw new UnsupportedTestException("browser-only (OPFS)");
+        if (accelerator.AcceleratorType.ToString().IndexOf("WebGPU", StringComparison.OrdinalIgnoreCase) < 0) throw new UnsupportedTestException($"WebGPU only; this lane is {accelerator.AcceleratorType}");
+        using var source = new SpawnDev.ILGPU.ML.Hub.HubModelSource(js);
+        const string repo = "LostBeard/flux-3-image-klein-q4-ILGPU";
+        var rng = new Random(11);
+        foreach (int tile in new[] { 64, 48, 56, 40, 32 })
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using var vae = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, await source.OpenAsync(repo, Flux3Pipeline.VaeFile),
+                inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, tile, tile } });
+            double build = sw.Elapsed.TotalSeconds; sw.Restart();
+            var lat = new float[32 * tile * tile]; for (int i = 0; i < lat.Length; i++) lat[i] = (float)((rng.NextDouble() * 2 - 1) * 0.8);
+            using var latBuf = accelerator.Allocate1D(lat);
+            var outputs = await vae.RunAsync(new Dictionary<string, Tensor> { [vae.InputNames[0]] = new Tensor(latBuf.View, new[] { 1, 32, tile, tile }, vae.InputNames[0]) });
+            var o = outputs[vae.OutputNames[0]];
+            var px = await o.Data.SubView(0, 3L * (tile * 8) * (tile * 8)).CopyToHostAsync();
+            int bad = 0; double sum = 0; foreach (var v in px) { if (!float.IsFinite(v)) bad++; else sum += Math.Abs(v); }
+            Console.WriteLine($"[Flux3Vae] tile {tile} cells ({tile * 8} px): build {build:F1} s, decode {sw.Elapsed.TotalSeconds:F1} s, {bad} non-finite of {px.Length}, mean |value| {sum / px.Length:F3}");
+            Ur_Expect(bad == 0, $"tile {tile}: {bad} non-finite values in the decoded picture");
+        }
+
+        // the pipeline's own decode of a 512 px picture's latents: tile 64 is the whole picture in one run, smaller tiles go through the gather / blend / finalize kernels
+        var norm = Flux2VaeNorm.FromJson(System.Text.Encoding.UTF8.GetString(await source.FetchBytesAsync(repo, Flux3Pipeline.NormFile)));
+        var packed = new float[32 * 32 * Flux3Config.InChannels]; for (int i = 0; i < packed.Length; i++) packed[i] = (float)((rng.NextDouble() * 2 - 1) * 0.8);
+        foreach (int tile in new[] { 64, 48, 32 })
+        {
+            using var vae = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, await source.OpenAsync(repo, Flux3Pipeline.VaeFile),
+                inputShapes: new Dictionary<string, int[]> { ["latents"] = new[] { 1, 32, tile, tile } });
+            var pipe = new Flux2Pipeline(accelerator, null!, null!, null!, vae, norm) { VaeTileLatent = tile };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var picture = await pipe.DecodeAsync(pipe.ToVaeInput(packed, 32, 32), 32, 32);
+            int distinct = picture.Rgba.Take(4096).Distinct().Count();
+            Console.WriteLine($"[Flux3Vae] pipeline decode, tile {tile} cells: {picture.Width}x{picture.Height} in {sw.Elapsed.TotalSeconds:F1} s, {distinct} distinct byte values in the first 4096");
+            Ur_Expect(picture.Width == 512 && distinct > 8, $"tile {tile}: the picture is not flat");
+        }
     });
 
     /// <summary>
