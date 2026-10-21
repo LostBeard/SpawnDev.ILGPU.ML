@@ -487,6 +487,15 @@ public sealed class Trellis2Pipeline : IDisposable
             result.Coords = _acc.Allocate1D<int>((long)tex.Count * 3);
             result.Coords.View.CopyFrom(tex.Coords.View.SubView(0, (long)tex.Count * 3));
             result.VoxelCount = tex.Count;
+            // TRELLIS2_DUMP_ATTRS=<dir>: the per-voxel PBR attributes (coords [N,3] int32, attrs [N,6] float32: base colour rgb, metallic, roughness, alpha) for comparing with the reference's mesh.attrs (development aid)
+            var dumpDir = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_ATTRS");
+            if (!string.IsNullOrEmpty(dumpDir))
+            {
+                Directory.CreateDirectory(dumpDir);
+                var dc = await result.Coords.View.CopyToHostAsync(); var da = await result.Attributes.View.CopyToHostAsync();
+                File.WriteAllBytes(Path.Combine(dumpDir, "attrs_coords.i32"), System.Runtime.InteropServices.MemoryMarshal.AsBytes(dc.AsSpan()).ToArray());
+                File.WriteAllBytes(Path.Combine(dumpDir, "attrs.f32"), System.Runtime.InteropServices.MemoryMarshal.AsBytes(da.AsSpan()).ToArray());
+            }
             await StageAsync("tex decode", sw);
         }
         shapeDec.Dispose();
@@ -920,7 +929,10 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Passes and range (degrees) of the normal smoothing; env TRELLIS2_NORMAL_ITERS / TRELLIS2_NORMAL_SIGMA for experiments.</summary>
     public static int NormalSmoothingIterations { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_NORMAL_ITERS"), out var ni) && ni > 0 ? ni : 3;
     public static double NormalSmoothingDegrees { get; set; } = double.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_NORMAL_SIGMA"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ns) && ns > 0 ? ns : 30;
-    private UvAtlas.Options AtlasOptions(int textureSize) => new() { Resolution = textureSize, NormalSmoothingIterations = SmoothNormals ? NormalSmoothingIterations : 0, NormalSmoothingDegrees = NormalSmoothingDegrees };
+    /// <summary>Passes of normal filtering the UV charts are grown from (0 = raw face normals, the reference-like clustering input); env TRELLIS2_CHART_SMOOTH for experiments.</summary>
+    public static int ChartNormalSmoothingPasses { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_CHART_SMOOTH"), out var cs) && cs >= 0 ? cs : 3;
+    public static double ChartFold { get; set; } = double.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_CHART_FOLD"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cf) && cf > 0 ? cf : 80;
+    private UvAtlas.Options AtlasOptions(int textureSize) => new() { Resolution = textureSize, NormalSmoothingIterations = SmoothNormals ? NormalSmoothingIterations : 0, NormalSmoothingDegrees = NormalSmoothingDegrees, ChartNormalSmoothingIterations = ChartNormalSmoothingPasses, ChartNormalSmoothingDegrees = 30, ChartFoldDegrees = ChartFold };
 
     private (float[], int[]) Repair(string stage, float[] positions, int[] faces, Stopwatch sw)
     {
@@ -942,7 +954,7 @@ public sealed class Trellis2Pipeline : IDisposable
         if (MeshStage != null)
             MeshStage("atlas", await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync(), await atlas.Faces.View.SubView(0, (long)atlas.FaceCount * 3).CopyToHostAsync());
 
-        var tex = await new TextureBaker(_acc, _sk).BakeAsync(atlas.Positions.View, atlas.Uvs.View, atlas.Faces.View, atlas.FaceCount, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation, project);
+        var tex = await new TextureBaker(_acc, _sk).BakeAsync(atlas.Positions.View, atlas.Uvs.View, atlas.Faces.View, atlas.FaceCount, output.Coords.View, output.Attributes.View, output.VoxelCount, output.Grid, textureSize, dilation, Environment.GetEnvironmentVariable("TRELLIS2_NO_PROJECT") == "1" ? null : project);   // TRELLIS2_NO_PROJECT=1: read each texel where it lies on the mesh, not on the nearest point of the original (experiment)
         StageDone?.Invoke("texture bake", sw.Elapsed.TotalSeconds); sw.Restart();
 
         var outPositions = await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync();

@@ -307,6 +307,32 @@ public sealed class DeviceUvAtlas
     }
 
     /// <summary>Faces of a bad chart become unlabelled with a tighter cone; every other chart is frozen so nothing joins it any more.</summary>
+    /// <summary>The fold test of the filtered-normal mode, per FACE: a face on its own raw normal this far from its chart's direction is marked (the chart's root face is never marked: it names the chart).</summary>
+    private static void BadFaceImpl(Index1D f, IV label, FV fnRaw, IV sumN, IV bad, float cosBad)
+    {
+        int c = label[f];
+        if (c < 0 || c == f) return;
+        float sx = sumN[c * 3], sy = sumN[c * 3 + 1], sz = sumN[c * 3 + 2];
+        float l = MathF.Sqrt(sx * sx + sy * sy + sz * sz);
+        float d = l > 0f ? (fnRaw[f * 3] * sx + fnRaw[f * 3 + 1] * sy + fnRaw[f * 3 + 2] * sz) / l : 1f;
+        if (d < cosBad) bad[f] = 1;
+    }
+    /// <summary>Filtered-normal mode: only the marked faces leave their chart (to be regrown with the tighter cone: most join a neighbour, a few become small charts of their own); every chart is frozen, so the rest of it stays as it is.</summary>
+    private static void DissolveFacesImpl(Index1D f, IV label, IV bad, IV frozen, FV cone, IV counter, float newCone)
+    {
+        int c = label[f];
+        if (c < 0) return;
+        frozen[c] = 1;
+        if (bad[f] != 0) { label[f] = -1; cone[f] = newCone; Atomic.Add(ref counter[0], 1); }
+    }
+    /// <summary>A face that is still folded in its chart's projection becomes a chart of its own (projected along its own normal it cannot fold).</summary>
+    private static void SingletonImpl(Index1D f, IV label, IV bad, FV fnRaw, IV sumN)
+    {
+        if (bad[f] == 0) return;
+        label[f] = f;
+        const int w = 1 << 16;                                  // a fixed weight, not the face's area weight: a sliver's weight rounds to 0 and its direction would fall back to the filtered normal
+        sumN[f * 3] = (int)MathF.Floor(fnRaw[f * 3] * w + 0.5f); sumN[f * 3 + 1] = (int)MathF.Floor(fnRaw[f * 3 + 1] * w + 0.5f); sumN[f * 3 + 2] = (int)MathF.Floor(fnRaw[f * 3 + 2] * w + 0.5f);
+    }
     private static void DissolveImpl(Index1D f, IV label, IV bad, IV frozen, FV cone, IV counter, float newCone)
     {
         int c = label[f];
@@ -514,6 +540,9 @@ public sealed class DeviceUvAtlas
         var fillInt = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int>(FillIntImpl);
         var badK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV, float>(BadImpl);
         var dissolve = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, IV, float>(DissolveImpl);
+        var badFaceK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, IV, float>(BadFaceImpl);
+        var dissolveFaces = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, IV, float>(DissolveFacesImpl);
+        var singleton = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, FV, IV>(SingletonImpl);
 
         LoadSeconds = loadClock.Elapsed.TotalSeconds;
 
@@ -550,6 +579,23 @@ public sealed class DeviceUvAtlas
         faceWeight(nf, area.View, amax.View, wq.View);
         using var adj = _acc.Allocate1D<int>(Math.Max(3L, (long)nf * 3));
         adjacency(nf, faces, vstart.View, vfaces.View, adj.View);
+        // charts grow from bilaterally filtered face normals (options.ChartNormalSmoothingIterations): bumps on a smooth surface no longer split it into tiny charts. The raw normals are kept for the fold test below.
+        int chartPasses = options.ChartNormalSmoothingIterations;
+        using var fnRaw = _acc.Allocate1D<float>(chartPasses > 0 ? Math.Max(3L, (long)nf * 3) : 3);
+        if (chartPasses > 0)
+        {
+            fnRaw.View.CopyFrom(fn.View);
+            var filter = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, FV, FV, float>(BilateralFaceImpl);
+            float sg = (float)(options.ChartNormalSmoothingDegrees * Math.PI / 180), inv = 1f / (sg * sg);
+            using var fn2 = _acc.Allocate1D<float>(Math.Max(3L, (long)nf * 3));
+            for (int it = 0; it < chartPasses; it++)
+            {
+                if ((it & 1) == 0) filter(nf, faces, vstart.View, vfaces.View, fn.View, area.View, fn2.View, inv);
+                else filter(nf, faces, vstart.View, vfaces.View, fn2.View, area.View, fn.View, inv);
+            }
+            if ((chartPasses & 1) == 1) fn.View.CopyFrom(fn2.View);
+            await _acc.SynchronizeAsync();
+        }
 
         // charts
         var label = _acc.Allocate1D<int>(Math.Max(1, nf)); var newLabel = _acc.Allocate1D<int>(Math.Max(1, nf));
@@ -599,13 +645,22 @@ public sealed class DeviceUvAtlas
                 if (depth >= options.MaxSplitDepth) break;
                 // charts whose faces lean too far from the chart's own direction fold in the projection: grow them again, tighter
                 bad.MemSetToZero();
-                badK(nf, label.View, fn.View, sumN.View, bad.View, (float)Math.Cos(65 * Math.PI / 180));
+                if (chartPasses > 0) badFaceK(nf, label.View, fnRaw.View, sumN.View, bad.View, (float)Math.Cos(options.ChartFoldDegrees * Math.PI / 180));   // a face folds in its chart's projection past 90 degrees from the chart direction; with filtered chart directions each face is judged on its raw normal
+                else badK(nf, label.View, fn.View, sumN.View, bad.View, (float)Math.Cos(65 * Math.PI / 180));
                 cnt.MemSetToZero();
                 coneDeg = Math.Max(coneDeg * 0.6, 3.0);
-                dissolve(nf, label.View, bad.View, frozen.View, cone.View, cnt.View, (float)Math.Cos(coneDeg * Math.PI / 180));
+                if (chartPasses > 0) dissolveFaces(nf, label.View, bad.View, frozen.View, cone.View, cnt.View, (float)Math.Cos(coneDeg * Math.PI / 180));
+                else dissolve(nf, label.View, bad.View, frozen.View, cone.View, cnt.View, (float)Math.Cos(coneDeg * Math.PI / 180));
                 int dissolved = (await cnt.View.CopyToHostAsync())[0];
                 Log.Add($"depth {depth}: {dissolved} faces dissolved, cone now {coneDeg:F1}");
                 if (dissolved == 0) break;
+            }
+
+            if (chartPasses > 0)
+            {   // what still folds (more than 88 degrees from its chart's direction on its own raw normal) after the regrowing rounds gets a chart of its own: no UV triangle is left wound the other way
+                bad.MemSetToZero();
+                badFaceK(nf, label.View, fnRaw.View, sumN.View, bad.View, (float)Math.Cos(88 * Math.PI / 180));
+                singleton(nf, label.View, bad.View, fnRaw.View, sumN.View);
             }
 
             // chart ids, basis, bounding rectangles

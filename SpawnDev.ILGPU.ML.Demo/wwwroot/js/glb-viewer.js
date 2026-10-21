@@ -166,6 +166,26 @@
         if (s.anim >= 0) select(s, s.anim, s.inPlace);
         return true;
     }
+    // Base colour only (no lights, no reflections): what the texture itself looks like, apart from the shading. unlit(canvas, "mr") shows the metallic-roughness texture instead (G = roughness, B = metallic); unlit(canvas, false) brings the materials back.
+    function unlit(canvas, on) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s) return false;
+        s.model.traverse(o => {
+            if (!o.isMesh) return;
+            if (on) { if (!o.userData.litMaterial) { o.userData.litMaterial = o.material; o.material = new s.T.THREE.MeshBasicMaterial({ map: on === "mr" ? o.material.metalnessMap : o.material.map, side: o.material.side, vertexColors: false }); } }
+            else if (o.userData.litMaterial) { o.material.dispose(); o.material = o.userData.litMaterial; delete o.userData.litMaterial; }
+        });
+        return true;
+    }
+    // The key light's shadows on or off (to tell shadow artefacts from the surface).
+    function shadows(canvas, on) {
+        if (typeof canvas === "string") canvas = document.getElementById(canvas);
+        const s = viewers.get(canvas); if (!s) return false;
+        s.key.castShadow = !!on; s.renderer.shadowMap.enabled = !!on;
+        s.model.traverse(o => { if (o.isMesh) { o.receiveShadow = !!on; o.castShadow = !!on; const ms = Array.isArray(o.material) ? o.material : [o.material]; for (const m of ms) m.needsUpdate = true; } });
+        s.floor && (s.floor.receiveShadow = !!on);
+        return true;
+    }
     function skeleton(canvas, on) {
         if (typeof canvas === "string") canvas = document.getElementById(canvas);
         const s = viewers.get(canvas); if (!s) return false;
@@ -195,5 +215,5 @@
         viewers.delete(canvas);      // (the renderer stays: the same canvas gets its WebGL context back on the next show)
     }
 
-    window.glbViewer = { show, dispose, play, animations, pose, resume, skeleton };
+    window.glbViewer = { show, dispose, play, animations, pose, resume, skeleton, unlit, shadows };
 })();

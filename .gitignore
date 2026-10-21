@@ -409,3 +409,5 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/*
 # Audio written by DemoConsole KOKOROSPEAK / ZipVoice runs, into whatever the working directory was
 kokoro-*.wav
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-base.en/
+
+PlaywrightMultiTest/WGSLDumps/

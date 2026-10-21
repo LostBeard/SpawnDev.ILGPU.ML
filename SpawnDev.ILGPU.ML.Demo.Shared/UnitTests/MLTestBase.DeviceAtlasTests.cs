@@ -22,13 +22,13 @@ public abstract partial class MLTestBase
         public double Ms;
     }
 
-    private async Task<AtlasOut> Da_Run(Accelerator accelerator, float[] p, int[] f, int res, bool align)
+    private async Task<AtlasOut> Da_Run(Accelerator accelerator, float[] p, int[] f, int res, bool align, UvAtlas.Options? options = null)
     {
         RequireAtomicsAndScatter(accelerator);
         using var pb = accelerator.Allocate1D(p); using var fb = accelerator.Allocate1D(f);
         var atlas = new DeviceUvAtlas(accelerator, new SparseKernels(accelerator));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        using var r = await atlas.UnwrapAsync(pb.View, p.Length / 3, fb.View, f.Length / 3, new UvAtlas.Options { Resolution = res }, align);
+        using var r = await atlas.UnwrapAsync(pb.View, p.Length / 3, fb.View, f.Length / 3, options ?? new UvAtlas.Options { Resolution = res }, align);
         foreach (var line in atlas.Log) Console.WriteLine($"[DeviceAtlas] {line}");
         var o = new AtlasOut { Ms = sw.Elapsed.TotalMilliseconds, Charts = r.ChartCount, Flipped = r.Flipped, Utilization = r.Utilization, Density = r.TexelsPerUnit };
         o.P = await r.Positions.View.SubView(0, (long)r.VertexCount * 3).CopyToHostAsync();
@@ -102,6 +102,22 @@ public abstract partial class MLTestBase
         // a face is projected along its chart's direction: its UV area is its area times the cosine to that direction, so the ratio is at most the chart growth and at least cos(65 deg)
         Da_Expect(ratios[ratios.Count / 2] > 0.7 && ratios[ratios.Count / 2] < 1.1, $"{what}: median texel density ratio {ratios[ratios.Count / 2]:F3} (1 = every chart at the atlas density)");
     }
+
+    /// <summary>
+    /// Charts grown from filtered normals (the gold-visor atlas: 31,000 tiny charts for a smooth dome with voxel-scale bumps): on a bumpy sphere the same mesh needs far fewer charts, and the atlas
+    /// is still valid (no UV triangle folded or overlapping, every corner where it was).
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DeviceAtlas_BumpySphere_FilteredChartNormalsMakeFewerCharts() => await RunTest(async accelerator =>
+    {
+        var (p, f) = NoisySphere(0.02, 7);
+        var plain = await Da_Run(accelerator, p, f, 1024, true);
+        var smooth = await Da_Run(accelerator, p, f, 1024, true, new UvAtlas.Options { Resolution = 1024, ChartNormalSmoothingIterations = 3, ChartNormalSmoothingDegrees = 30 });
+        Da_CheckAtlas(plain, p, f, "bumpy sphere, raw chart normals", 1024);
+        Da_CheckAtlas(smooth, p, f, "bumpy sphere, filtered chart normals", 1024);
+        Da_Expect(smooth.Charts * 2 < plain.Charts, $"filtered chart normals gave {smooth.Charts} charts against {plain.Charts} raw: not at least 2x fewer");
+        return $"bumpy sphere (5120 faces): charts {plain.Charts} -> {smooth.Charts}, utilization {plain.Utilization:P0} -> {smooth.Utilization:P0}";
+    });
 
     [TestMethod]
     public async Task DeviceAtlas_Sphere_ValidAndAsTightAsTheHost() => await RunTest(async accelerator =>

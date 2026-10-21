@@ -38,6 +38,16 @@ public static class UvAtlas
         public int NormalSmoothingIterations = 0;
         /// <summary>The range weight of the filtering: faces whose normals differ by about this angle count for a third; a 90 degree edge counts for nothing, so hard edges stay hard.</summary>
         public double NormalSmoothingDegrees = 30;
+        /// <summary>
+        /// Passes of bilateral filtering over the face normals the CHARTS are grown from (the same filter as <see cref="NormalSmoothingIterations"/>); 0 = grow from the raw face normals. On a surface with voxel-scale bumps the raw
+        /// normals differ by 20 degrees and more from face to face, so a smooth dome breaks into thousands of tiny charts (31,000 on a 1M-face astronaut): each only a few texels wide and mostly padding. Grown from the
+        /// filtered normals the same mesh needs a third of the charts and packs tighter. A face's fold in the projection is still judged on its own raw normal.
+        /// </summary>
+        public int ChartNormalSmoothingIterations = 0;
+        /// <summary>The range weight of the chart-normal filtering (degrees).</summary>
+        public double ChartNormalSmoothingDegrees = 30;
+        /// <summary>With filtered chart normals: a chart is regrown tighter when a face of it lies more than this many degrees from the chart direction on its own raw normal (90 is where a face folds in the projection).</summary>
+        public double ChartFoldDegrees = 80;
     }
 
     public sealed class Result

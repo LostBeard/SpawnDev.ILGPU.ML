@@ -62,6 +62,8 @@ for (let i = 0; i < glbs.length; i++) {
   if (r.result?.exceptionDetails) { console.error(name + ': ' + JSON.stringify(r.result.exceptionDetails).slice(0, 300)); continue; }
   console.log(name, r.result?.result?.value);
   for (const yaw of YAWS) {
+    if (process.env.RENDER_NOSHADOW === '1') await send('Runtime.evaluate', { expression: "glbViewer.shadows('c', false)" });   // RENDER_NOSHADOW=1: no shadows
+    if (process.env.RENDER_UNLIT === '1') await send('Runtime.evaluate', { expression: `glbViewer.unlit('c', ${JSON.stringify(process.env.RENDER_UNLIT_MODE === 'mr' ? 'mr' : true)})` });   // RENDER_UNLIT=1: the base colour texture only
     await send('Runtime.evaluate', { expression: `glbViewer.pose('c', ${ANIM}, ${ANIM_T}, ${(yaw * Math.PI / 180).toFixed(4)}, true)` });
     await sleep(700);
     const side = SIZE / ZOOM, s = await send('Page.captureScreenshot', { format: 'png', clip: { x: (SIZE - side) / 2, y: (SIZE - side) / 2, width: side, height: side, scale: ZOOM } });
