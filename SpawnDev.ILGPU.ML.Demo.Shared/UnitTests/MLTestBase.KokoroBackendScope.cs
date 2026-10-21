@@ -42,7 +42,7 @@ public abstract partial class MLTestBase
     /// </remarks>
     private static void RequireShippableTtsBackend(Accelerator accelerator)
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException(
                 "the ILGPU CPU accelerator is a DEBUGGING device (\"it will not be faster than even a "
               + "simple Parallel.For\"), so running a 326 MB TTS model on it at ~260 s per pass measures "

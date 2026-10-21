@@ -47,7 +47,7 @@ using var accel = want switch
     // Device-first, the way CudaTests/CPUTests in the demo console do it.
     "cuda" => mlCtx.GetCudaDevices()[0].CreateCudaAccelerator(mlCtx),
     "opencl" => mlCtx.GetCLDevices()[0].CreateCLAccelerator(mlCtx),
-    "cpu" => mlCtx.GetCPUDevices()[0].CreateCPUAccelerator(mlCtx),
+    "cpu" => MLContext.CreateCpuAccelerator(mlCtx),
     _ => await mlCtx.CreatePreferredAcceleratorAsync()
          ?? throw new InvalidOperationException("no accelerator"),
 };

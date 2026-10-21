@@ -450,7 +450,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 120000)]
     public async Task Reference_ESPCN_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("ESPCN too slow on CPU");
 
         await RunReferenceComparisonGpu(accelerator,

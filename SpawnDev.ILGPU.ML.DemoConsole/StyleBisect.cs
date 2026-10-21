@@ -178,7 +178,7 @@ public static class StyleBisect
         try
         {
             context = MLContext.CreateContext();
-            acc = context.CreateCPUAccelerator(0);
+            acc = MLContext.CreateCpuAccelerator(context);
             GraphExecutor.VerboseLogging = true; // autoflushed per-node => last line before native crash = culprit
             using var session = InferenceSession.CreateFromFile(acc, modelBytes);
             Console.WriteLine($"[BlazeFaceCpu] session created. inputs=[{string.Join(",", session.InputNames)}] outputs=[{string.Join(",", session.OutputNames)}]");
@@ -228,7 +228,7 @@ public static class StyleBisect
             try
             {
                 context = MLContext.CreateContext();
-                acc = context.CreateCPUAccelerator(0);
+                acc = MLContext.CreateCpuAccelerator(context);
                 var modelBytes = File.ReadAllBytes(modelPath);
                 var inputFloats = ReadFloats(inputPath);
                 var expected = ReadFloats(expectedPath);
@@ -452,7 +452,7 @@ public static class StyleBisect
             else
             {
                 context = MLContext.CreateContext();
-                acc = context.CreateCPUAccelerator(0);
+                acc = MLContext.CreateCpuAccelerator(context);
             }
 
             GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();

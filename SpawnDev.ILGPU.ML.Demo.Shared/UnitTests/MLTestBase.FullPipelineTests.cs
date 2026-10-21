@@ -63,7 +63,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task WebModel_SuperResolution_ESPCN() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("ESPCN too slow on CPU (224x224 compiled shapes) — skipped to prevent timeout");
 
         var http = GetHttpClient();
@@ -150,7 +150,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task WebModel_StyleTransfer_CatImage() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("Style transfer too slow on CPU — skipped to prevent timeout");
 
         var http = GetHttpClient();
@@ -192,7 +192,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 120000)]
     public async Task WebModel_SuperResolution_CatImage() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("ESPCN too slow on CPU (224x224 compiled shapes) — skipped to prevent timeout");
 
         var http = GetHttpClient();

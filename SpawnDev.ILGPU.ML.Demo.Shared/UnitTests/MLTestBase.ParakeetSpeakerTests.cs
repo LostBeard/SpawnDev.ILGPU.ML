@@ -99,7 +99,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task Pipeline_SpeakerEmbedding_MatchesOnnxRuntimeAndSeparatesVoices() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity or AcceleratorType.WebGL or AcceleratorType.Wasm)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: speaker embedding is gated on the fast backends");
         var assets = GetHttpClient();
         if (assets == null) throw new UnsupportedTestException("HttpClient not available");

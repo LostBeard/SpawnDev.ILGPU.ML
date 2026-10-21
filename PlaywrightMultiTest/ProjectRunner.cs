@@ -1333,6 +1333,7 @@ namespace PlaywrightMultiTest
             "cpu" => EnvInt("PMT_CPU_PARALLELISM", 1),
             "cuda" => EnvInt("PMT_CUDA_PARALLELISM", 1),
             "opencl" => EnvInt("PMT_OPENCL_PARALLELISM", 1),
+            "velocity" => EnvInt("PMT_VELOCITY_PARALLELISM", 1),   // like the CPU lane, one Velocity process already uses every core
             _ => EnvInt("PMT_DESKTOP_PARALLELISM", 4),
         };
 
@@ -1557,6 +1558,7 @@ namespace PlaywrightMultiTest
         {
             "CudaTests" or "CuRandTests" or "NvJpegTests" => "cuda",
             "OpenCLTests" => "opencl",
+            "VelocityTests" => "velocity",   // the SIMD CPU backend (the default CPU in ILGPU 5.4); CPUTests is the plain interpreting accelerator
             _ => "cpu", // CPUTests + capability/logic test classes (fast, CPU-bound)
         };
 
@@ -1784,9 +1786,10 @@ namespace PlaywrightMultiTest
             "cuda" => 0,
             "opencl" => 1,
             "WebGPUTests" => 2,
-            "cpu" => 3,
-            "WebGLTests" => 4,
-            _ => 5,   // Wasm, and anything unrecognised, last
+            "velocity" => 3,
+            "cpu" => 4,
+            "WebGLTests" => 5,
+            _ => 6,   // Wasm, and anything unrecognised, last
         };
 
         private async Task RunLaneSequentialAsync(List<ProjectTest> tests, IPage page)

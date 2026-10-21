@@ -594,7 +594,7 @@ public abstract partial class MLTestBase
         using var w = accelerator.Allocate1D(Enumerable.Range(0, Mlp * C).Select(i => BFloat16.FromRawBits((ushort)(0x3C00 + (i % 255)))).ToArray());
         using var o = accelerator.Allocate1D<float>((long)T * Math.Max(Mlp, 3 * C));
         var report = new List<string>();
-        bool slow = accelerator.AcceleratorType == AcceleratorType.CPU;
+        bool slow = accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity;
         async Task<double> Time(Action op, int reps = 10)
         {
             if (slow) reps = 1;

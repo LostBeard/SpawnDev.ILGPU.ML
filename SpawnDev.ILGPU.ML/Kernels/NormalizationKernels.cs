@@ -651,7 +651,7 @@ public class NormalizationKernels : IDisposable
         // ⚠️ The pattern: the cooperative kernel pays off where threads hide MEMORY LATENCY - a real GPU.
         // Where "threads" are OS threads or WASM workers, the barriers cost more than the parallelism buys.
         var accType = _accelerator.AcceleratorType;
-        if (accType is AcceleratorType.WebGL or AcceleratorType.CPU or AcceleratorType.Wasm) return false;
+        if (accType is AcceleratorType.WebGL or AcceleratorType.CPU or AcceleratorType.Velocity or AcceleratorType.Wasm) return false;
         int T = _iNormCoopGroup != 0 ? _iNormCoopGroup
             : (_iNormCoopGroup = Math.Min(MaxINormGroup, (int)_accelerator.MaxNumThreadsPerGroup));
         if (T < 32) return false;                                 // group too small — keep the serial kernel

@@ -82,7 +82,7 @@ using var accel = want switch
 {
     "cuda" => mlCtx.GetCudaDevices()[0].CreateCudaAccelerator(mlCtx),
     "opencl" => mlCtx.GetCLDevices()[0].CreateCLAccelerator(mlCtx),
-    "cpu" => mlCtx.GetCPUDevices()[0].CreateCPUAccelerator(mlCtx),
+    "cpu" => MLContext.CreateCpuAccelerator(mlCtx),
     _ => await mlCtx.CreatePreferredAcceleratorAsync() ?? throw new InvalidOperationException("no accelerator"),
 };
 Console.WriteLine($"device    : {accel.AcceleratorType} {accel.Name}\n");

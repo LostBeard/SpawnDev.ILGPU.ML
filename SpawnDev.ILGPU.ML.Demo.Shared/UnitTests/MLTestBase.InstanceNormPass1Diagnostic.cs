@@ -129,7 +129,7 @@ public partial class MLTestBase
             // GPU. Where "threads" are OS threads or WASM workers, the barriers cost more than they buy.
             var t = accelerator.AcceleratorType;
             bool mustBeCooperative = t is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU;
-            bool mustBeSerial = t is AcceleratorType.CPU or AcceleratorType.WebGL or AcceleratorType.Wasm;
+            bool mustBeSerial = t is AcceleratorType.CPU or AcceleratorType.Velocity or AcceleratorType.WebGL or AcceleratorType.Wasm;
 
             if (spatial >= 50176 && mustBeCooperative && !coop)
                 throw new Exception(

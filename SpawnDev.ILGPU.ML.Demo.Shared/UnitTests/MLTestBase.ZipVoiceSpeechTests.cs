@@ -179,7 +179,7 @@ public abstract partial class MLTestBase
         // end-to-end render is not.
         //
         // To run it deliberately: PMT_CONSOLE_TIMEOUT_MS=3600000 with a name filter.
-        if (accelerator.AcceleratorType == AcceleratorType.CPU
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity
             && Environment.GetEnvironmentVariable("ZIPVOICE_ALLOW_CPU") != "1")
             throw new UnsupportedTestException(
                 "the ILGPU CPU backend exceeds PMT's 600s outer console cap for this model (measured >600s "

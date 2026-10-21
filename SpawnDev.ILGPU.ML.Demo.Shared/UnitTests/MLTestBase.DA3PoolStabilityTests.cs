@@ -19,7 +19,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task<string> DA3_WarmForward_AllocatesNothing() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: DAv3 runs on CUDA/OpenCL/WebGPU");
 
         var (http, manifest) = await Da3Manifest();

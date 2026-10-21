@@ -34,7 +34,7 @@ public class IntegrationTests
 
         // Compile with CPU accelerator
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
         var compiler = new GraphCompiler(registry);
 
@@ -74,7 +74,7 @@ public class IntegrationTests
         Console.WriteLine($"[Integration] SqueezeNet: {graph.Nodes.Count} nodes");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
         var compiled = new GraphCompiler(registry).Compile(graph);
 
@@ -98,7 +98,7 @@ public class IntegrationTests
         Console.WriteLine($"[Integration] ESPCN: {graph.Nodes.Count} nodes");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
         var compiled = new GraphCompiler(registry).Compile(graph);
 
@@ -118,7 +118,7 @@ public class IntegrationTests
         Console.WriteLine($"[Integration] Mosaic Style: {graph.Nodes.Count} nodes");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
 
         try
@@ -156,7 +156,7 @@ public class IntegrationTests
 
         // Create accelerator
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         // Load weights manually (WeightLoader needs HttpClient which we don't have in console)
         var manifestJson = await File.ReadAllTextAsync(manifestPath);
@@ -258,7 +258,7 @@ public class IntegrationTests
         Console.WriteLine($"[FullExec] SqueezeNet: {graph.Nodes.Count} nodes");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         var manifestJson = await File.ReadAllTextAsync(manifestPath);
         var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(manifestJson)!;
@@ -337,7 +337,7 @@ public class IntegrationTests
         var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
             await File.ReadAllTextAsync(manifestPath))!;
@@ -427,7 +427,7 @@ public class IntegrationTests
         var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         // Load weights
         var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
@@ -498,7 +498,7 @@ public class IntegrationTests
         var blob = await File.ReadAllBytesAsync(Path.Combine(modelDir, "weights_fp16.bin"));
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         using var pool = new BufferPool(accelerator);
 
         var weights = new Dictionary<string, Tensor>();
@@ -584,7 +584,7 @@ public class IntegrationTests
         var blob = await File.ReadAllBytesAsync(Path.Combine(modelDir, "weights_fp16.bin"));
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         using var pool = new BufferPool(accelerator);
 
         var weights = new Dictionary<string, Tensor>();
@@ -672,7 +672,7 @@ public class IntegrationTests
 
         // Parse and create session directly from .onnx
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             (stage, pct) => Console.WriteLine($"[DirectOnnx] {stage}: {pct}%"));
@@ -735,7 +735,7 @@ public class IntegrationTests
         Console.WriteLine($"[DirectOnnxCat] ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
         Console.WriteLine($"[DirectOnnxCat] {session}");
 
@@ -773,7 +773,7 @@ public class IntegrationTests
         Console.WriteLine($"[DirectOnnxStyle] ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
         Console.WriteLine($"[DirectOnnxStyle] {session}");
@@ -882,7 +882,7 @@ public class IntegrationTests
 
         // Try compile
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
 
         // Verify all operators are supported by compiling the graph
         var graph = InferenceSession.ConvertToModelGraph(modelInfo);
@@ -1000,7 +1000,7 @@ public class IntegrationTests
         Console.WriteLine($"[MoveNet] Ops: {string.Join(", ", ops)}");
 
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
         var unsupported = ops.Where(op => !registry.IsSupported(op)).ToList();
         if (unsupported.Count > 0)
@@ -1140,7 +1140,7 @@ public class IntegrationTests
 
         // Try to compile
         using var context = MLContext.CreateContext();
-        using var accelerator = context.CreateCPUAccelerator(0);
+        using var accelerator = MLContext.CreateCpuAccelerator(context);
         var registry = new OperatorRegistry(accelerator);
 
         var unsupported = graph.Nodes.Select(n => n.OpType).Distinct()

@@ -21,7 +21,7 @@ if (args.Length >= 1 && (args[0] == "FACEDETECT" || args[0] == "DETECTPROBE"))
     var backend = args.Length > 1 ? args[1].ToUpperInvariant() : "CUDA";
     using var ctx = MLContext.Create().ToContext();
     using Accelerator acc = backend == "CPU"
-        ? ctx.CreateCPUAccelerator(0)
+        ? MLContext.CreateCpuAccelerator(ctx)
         : ctx.CreateCudaAccelerator(0);
     Console.WriteLine($"{mode} backend={acc.AcceleratorType}");
 
@@ -172,7 +172,7 @@ if (args.Length >= 1 && args[0] == "BLAZEDIFF")
     else
     {
         ctx = MLContext.Create().ToContext();
-        acc = ctx.CreateCPUAccelerator(0);
+        acc = MLContext.CreateCpuAccelerator(ctx);
     }
     using (ctx)
     using (acc)
@@ -301,7 +301,7 @@ if (args.Length > 1 && args[0] == "ONNXDIFF")
             var od = octx.GetCudaDevices();
             if (od.Count == 0) { octx.Dispose(); octx = null; } else oacc = od[0].CreateCudaAccelerator(octx);
         }
-        if (oacc == null) { octx ??= MLContext.CreateContext(); oacc = octx.CreateCPUAccelerator(0); }
+        if (oacc == null) { octx ??= MLContext.CreateContext(); oacc = MLContext.CreateCpuAccelerator(octx); }
 
         // ⚠️ CreateFromOnnx, not CreateFromFile: the format sniffer mis-detects a MINIMAL one-node model as
         // CoreML and dies in the wrong parser ("Unknown wire type: 3"). The file is known-ONNX here, so
@@ -375,7 +375,7 @@ if (args.Length > 6 && args[0] == "CT1DDIFF")
     var dExp = LoadF32(Path.Combine(dir, "expected.f32"));
 
     using var dctx = MLContext.CreateContext();
-    using var dacc = dctx.CreateCPUAccelerator(0);
+    using var dacc = MLContext.CreateCpuAccelerator(dctx);
     using var dxBuf = dacc.Allocate1D<float>(dx.Length); dxBuf.View.CopyFromCPU(dx);
     using var dwBuf = dacc.Allocate1D<float>(dw.Length); dwBuf.View.CopyFromCPU(dw);
     using var dbBuf = dacc.Allocate1D<float>(1);
@@ -568,7 +568,7 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         if (kacc == null)
         {
             kctx ??= MLContext.CreateContext();
-            kacc = kctx.CreateCPUAccelerator(0);
+            kacc = MLContext.CreateCpuAccelerator(kctx);
         }
         Console.WriteLine($"  accelerator: {kacc.AcceleratorType} {kacc.Name}");
 
@@ -924,7 +924,7 @@ if (args.Length > 0 && args[0] == "SNAKEPROF")
     {
         "Cuda" => ctx.CreateCudaAccelerator(0),
         "OpenCL" => ILGPU.Runtime.OpenCL.CLContextExtensions.CreateCLAccelerator(ctx, 0),
-        _ => ctx.CreateCPUAccelerator(0),
+        _ => MLContext.CreateCpuAccelerator(ctx),
     };
     using var head = SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake.SnakeSystemOneSpec.CreateHead(acc);
     var (inputs, labels, count) = SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake.SnakeSystemOneTrainer.CollectDataset(1024, seed: 7);

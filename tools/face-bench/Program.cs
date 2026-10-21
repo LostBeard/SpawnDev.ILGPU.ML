@@ -21,7 +21,7 @@ await builder.AllAcceleratorsAsync();
 var context = builder.ToContext();
 Accelerator accelerator = args.Contains("--cuda")
     ? await context.CreatePreferredAcceleratorAsync() ?? throw new Exception("no accelerator")
-    : context.Devices.First(d => d.AcceleratorType == AcceleratorType.CPU).CreateAccelerator(context);
+    : MLContext.CreateCpuAccelerator(context);
 Console.WriteLine($"device : {accelerator.AcceleratorType} {accelerator.Name}");
 
 async Task<InferenceSession> Load(string file, Dictionary<string, int[]> shapes)

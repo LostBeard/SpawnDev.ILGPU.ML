@@ -1114,7 +1114,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task DA3Small_MultiView_N2_ProducesDepthAndExtrinsics() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: DAv3 multi-view gate targets CUDA/OpenCL/WebGPU (CPU exceeds HeavyModel console cap)");
 
         var http = GetHttpClient();

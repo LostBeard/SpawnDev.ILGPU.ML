@@ -50,7 +50,7 @@ public abstract partial class MLTestBase
         var assets = GetHttpClient();
         if (assets == null) throw new UnsupportedTestException("HttpClient not available");
 
-        if (accelerator.AcceleratorType == AcceleratorType.CPU
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity
             && Environment.GetEnvironmentVariable("ZIPVOICE_ALLOW_CPU") != "1")
             throw new UnsupportedTestException(
                 "the ILGPU CPU backend exceeds PMT's 600s outer console cap for ZipVoice's decoder alone; "

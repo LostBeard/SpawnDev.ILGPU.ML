@@ -200,7 +200,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 120000)]
     public async Task CreateFromFile_SuperResolution_ESPCN() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("ESPCN too slow on CPU — skipped");
 
         var http = GetHttpClient();
@@ -388,7 +388,7 @@ public abstract partial class MLTestBase
         // GPU lanes only: the gate runs the 95MB model TWICE (host + raw paths) - on the serialized
         // CPU lane that exceeds every timeout and starves the rest of the depth family (measured:
         // 4 downstream CPU timeouts). CPU EstimateAsync correctness is covered by the other gates.
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("CPU too slow for the double-run cross-path gate");
         // Capture variant: CUDA graphs + WebGPU dispatch plans only (no-op elsewhere) - run it
         // where it exists so the gate is meaningful, skip the rest.
@@ -1014,7 +1014,7 @@ public abstract partial class MLTestBase
         // operators that needs deeper investigation. Tracked as follow-up. NOT marked
         // as "expected" — the skip exists because the underlying bug is unidentified,
         // not because CPU is incapable.
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException(
                 "Tracked follow-up: CPU subprocess crashes during MoveNet inference without " +
                 "emitting a TEST result. WebGPU/WebGL/Wasm/CUDA/OpenCL all pass. Investigate " +

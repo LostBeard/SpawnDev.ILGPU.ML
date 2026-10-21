@@ -118,7 +118,7 @@ public abstract partial class MLTestBase
     {
         // Heavy multi-second-per-forward model: the fast lanes carry correctness (ML CLAUDE.md,
         // backend priority). The Wasm/WebGL/CPU lanes are the same kernels at 10-100x the wall time.
-        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU)
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: DAv3 ORT parity runs on CUDA/OpenCL/WebGPU");
 
         var (http, manifest) = await Da3Manifest();

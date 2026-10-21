@@ -15,7 +15,7 @@ public class CPUTests : MLTestBase
 
     protected override Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var context = MLContext.CreateContext();
+        var context = MLContext.CreatePlainCpuContext();      // MLContext.CreateContext() registers Velocity as the CPU backend (VelocityTests); this lane is the plain interpreting CPU accelerator
         var accelerator = context.CreateCPUAccelerator(0);
         return Task.FromResult((context, (Accelerator)accelerator));
     }

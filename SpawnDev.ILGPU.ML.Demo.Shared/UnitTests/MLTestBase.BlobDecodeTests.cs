@@ -43,7 +43,7 @@ public abstract partial class MLTestBase
         var js = SpawnJSRuntime.Instance;
         if (js == null || !js.IsBrowser)
             throw new UnsupportedTestException("browser-only: decodes through createImageBitmap + OffscreenCanvas");
-        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Cuda or AcceleratorType.OpenCL)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity or AcceleratorType.Cuda or AcceleratorType.OpenCL)
             throw new UnsupportedTestException("browser accelerators only (UploadToDevice)");
 
         using var png = await QuadrantPngAsync(200, 100);
@@ -73,7 +73,7 @@ public abstract partial class MLTestBase
         var js = SpawnJSRuntime.Instance;
         if (js == null || !js.IsBrowser)
             throw new UnsupportedTestException("browser-only: there is no JS heap to keep pixels in on a desktop lane");
-        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Cuda or AcceleratorType.OpenCL)
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.Velocity or AcceleratorType.Cuda or AcceleratorType.OpenCL)
             throw new UnsupportedTestException("browser accelerators only (UploadToDevice)");
 
         // A 12 MP phone-photo-sized image: 4000x3000 RGBA is 48 MB.
