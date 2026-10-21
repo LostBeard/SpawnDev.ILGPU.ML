@@ -161,6 +161,123 @@ public abstract partial class MLTestBase
         return $"sphere {nf} -> {outF} faces, {outV} vertices, max deviation {maxDev:F3} voxels, area {area / want:P2}";
     });
 
+    /// <summary>An icosphere (radius 1, 4 subdivisions: 2562 vertices) whose vertices are pushed along the radius by up to +-jitter: voxel-scale bumps on a smooth curved surface. Outward winding.</summary>
+    private static (float[] Positions, int[] Faces) NoisySphere(double jitter, int seed)
+    {
+        double g = (1 + Math.Sqrt(5)) / 2;
+        var v = new List<double[]>
+        {
+            new[] { -1, g, 0 }, new[] { 1, g, 0 }, new[] { -1, -g, 0 }, new[] { 1, -g, 0 }, new[] { 0, -1, g }, new[] { 0, 1, g },
+            new[] { 0, -1, -g }, new[] { 0, 1, -g }, new[] { g, 0, -1 }, new[] { g, 0, 1 }, new[] { -g, 0, -1 }, new[] { -g, 0, 1 },
+        };
+        var f = new List<int[]>
+        {
+            new[] { 0, 11, 5 }, new[] { 0, 5, 1 }, new[] { 0, 1, 7 }, new[] { 0, 7, 10 }, new[] { 0, 10, 11 }, new[] { 1, 5, 9 }, new[] { 5, 11, 4 }, new[] { 11, 10, 2 }, new[] { 10, 7, 6 }, new[] { 7, 1, 8 },
+            new[] { 3, 9, 4 }, new[] { 3, 4, 2 }, new[] { 3, 2, 6 }, new[] { 3, 6, 8 }, new[] { 3, 8, 9 }, new[] { 4, 9, 5 }, new[] { 2, 4, 11 }, new[] { 6, 2, 10 }, new[] { 8, 6, 7 }, new[] { 9, 8, 1 },
+        };
+        for (int s = 0; s < 4; s++)
+        {
+            var mid = new Dictionary<long, int>(); var nf = new List<int[]>();
+            int Mid(int a, int b)
+            {
+                long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+                if (mid.TryGetValue(key, out int m)) return m;
+                v.Add(new[] { (v[a][0] + v[b][0]) / 2, (v[a][1] + v[b][1]) / 2, (v[a][2] + v[b][2]) / 2 }); return mid[key] = v.Count - 1;
+            }
+            foreach (var tri in f) { int a = Mid(tri[0], tri[1]), b = Mid(tri[1], tri[2]), c = Mid(tri[2], tri[0]); nf.Add(new[] { tri[0], a, c }); nf.Add(new[] { tri[1], b, a }); nf.Add(new[] { tri[2], c, b }); nf.Add(new[] { a, b, c }); }
+            f = nf;
+        }
+        var rng = new Random(seed); var pos = new float[v.Count * 3];
+        for (int i = 0; i < v.Count; i++)
+        {
+            double l = Math.Sqrt(v[i][0] * v[i][0] + v[i][1] * v[i][1] + v[i][2] * v[i][2]), r = 1 + jitter * (rng.NextDouble() * 2 - 1);
+            for (int k = 0; k < 3; k++) pos[i * 3 + k] = (float)(v[i][k] / l * r);
+        }
+        return (pos, f.SelectMany(x => x).ToArray());
+    }
+
+    /// <summary>A cube [-1,1]^3 with n x n quads per side, welded along the edges, outward winding: sharp 90 degree edges between flat sides.</summary>
+    private static (float[] Positions, int[] Faces) GridCube(int n)
+    {
+        var index = new Dictionary<(int, int, int), int>(); var pos = new List<float>(); var faces = new List<int>();
+        int Vert(int x, int y, int z)
+        {
+            if (index.TryGetValue((x, y, z), out int i)) return i;
+            index[(x, y, z)] = pos.Count / 3; pos.Add(-1f + 2f * x / n); pos.Add(-1f + 2f * y / n); pos.Add(-1f + 2f * z / n); return index[(x, y, z)];
+        }
+        for (int axis = 0; axis < 3; axis++)
+            foreach (int side in new[] { 0, n })
+                for (int a = 0; a < n; a++)
+                    for (int b = 0; b < n; b++)
+                    {
+                        int[] P(int da, int db) { var c = new int[3]; c[axis] = side; c[(axis + 1) % 3] = a + da; c[(axis + 2) % 3] = b + db; return c; }
+                        var q = new[] { P(0, 0), P(1, 0), P(1, 1), P(0, 1) }.Select(c => Vert(c[0], c[1], c[2])).ToArray();
+                        faces.AddRange(new[] { q[0], q[1], q[2], q[0], q[2], q[3] });
+                    }
+        var p = pos.ToArray(); var fa = faces.ToArray();
+        for (int f = 0; f < fa.Length / 3; f++)      // outward: the face normal must point away from the centre
+        {
+            int a = fa[f * 3], b = fa[f * 3 + 1], c = fa[f * 3 + 2];
+            double ux = p[b * 3] - p[a * 3], uy = p[b * 3 + 1] - p[a * 3 + 1], uz = p[b * 3 + 2] - p[a * 3 + 2], vx = p[c * 3] - p[a * 3], vy = p[c * 3 + 1] - p[a * 3 + 1], vz = p[c * 3 + 2] - p[a * 3 + 2];
+            double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            double mx = (p[a * 3] + p[b * 3] + p[c * 3]) / 3, my = (p[a * 3 + 1] + p[b * 3 + 1] + p[c * 3 + 1]) / 3, mz = (p[a * 3 + 2] + p[b * 3 + 2] + p[c * 3 + 2]) / 3;
+            if (nx * mx + ny * my + nz * mz < 0) (fa[f * 3 + 1], fa[f * 3 + 2]) = (fa[f * 3 + 2], fa[f * 3 + 1]);
+        }
+        return (p, fa);
+    }
+
+    /// <summary>Mean angle (degrees) between each vertex normal and the exact normal of the sphere it should lie on (the radial direction of its position).</summary>
+    private static double MeanAngleToRadialDegrees(float[] positions, float[] normals)
+    {
+        double sum = 0; int nv = positions.Length / 3;
+        for (int v = 0; v < nv; v++)
+        {
+            double l = Math.Sqrt(positions[v * 3] * positions[v * 3] + positions[v * 3 + 1] * positions[v * 3 + 1] + positions[v * 3 + 2] * positions[v * 3 + 2]);
+            double d = (normals[v * 3] * positions[v * 3] + normals[v * 3 + 1] * positions[v * 3 + 1] + normals[v * 3 + 2] * positions[v * 3 + 2]) / l;
+            sum += Math.Acos(Math.Clamp(d, -1, 1)) * 180 / Math.PI;
+        }
+        return sum / nv;
+    }
+
+    /// <summary>
+    /// Feature-preserving vertex-normal smoothing (the gold-visor facets): on a bumpy sphere the normals come back to the exact sphere normals (2x closer or better), on a cube the sharp 90 degree
+    /// edges stay sharp (flat sides keep their exact normal; the edge vertices keep theirs), and the device kernel gives the host's numbers.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Trellis2_NormalSmoothing_RemovesNoiseKeepsEdges() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        var atlas = new DeviceUvAtlas(accelerator, new SparseKernels(accelerator));
+        // 1. a bumpy sphere: +-2 % radius noise on 0.075-long edges (the true normals change 4.3 degrees per edge; the bumps add far more)
+        var (sp, sf) = NoisySphere(0.02, 7);
+        var n0 = PbrGlbWriter.VertexNormals(sp, sf);
+        var n1 = PbrGlbWriter.BilateralVertexNormals(sp, sf, Trellis2Pipeline.NormalSmoothingIterations, Trellis2Pipeline.NormalSmoothingDegrees);
+        double j0 = MeanAngleToRadialDegrees(sp, n0), j1 = MeanAngleToRadialDegrees(sp, n1);
+        if (!(j0 > 4)) throw new Exception($"the test sphere is not bumpy enough: its normals are {j0:F1} degrees off the exact ones");
+        if (!(j1 < j0 / 2 && j1 < 3)) throw new Exception($"smoothing did not calm the bumps: normals {j0:F1} -> {j1:F1} degrees off the exact sphere normals");
+        // 2. a cube: flat sides keep their normal exactly, the edge vertices keep theirs
+        var (cp, cf) = GridCube(8);
+        var c0 = PbrGlbWriter.VertexNormals(cp, cf);
+        var c1 = PbrGlbWriter.BilateralVertexNormals(cp, cf, Trellis2Pipeline.NormalSmoothingIterations, Trellis2Pipeline.NormalSmoothingDegrees);
+        int flat = 0, edge = 0; double worstFlat = 0, worstEdge = 0;
+        for (int v = 0; v < cp.Length / 3; v++)
+        {
+            int onFace = 0; for (int k = 0; k < 3; k++) if (Math.Abs(Math.Abs(cp[v * 3 + k]) - 1) < 1e-4) onFace++;
+            double d = c0[v * 3] * c1[v * 3] + c0[v * 3 + 1] * c1[v * 3 + 1] + c0[v * 3 + 2] * c1[v * 3 + 2], deg = Math.Acos(Math.Clamp(d, -1, 1)) * 180 / Math.PI;
+            if (onFace == 1) { flat++; worstFlat = Math.Max(worstFlat, deg); } else { edge++; worstEdge = Math.Max(worstEdge, deg); }
+        }
+        if (worstFlat > 2.0) throw new Exception($"a flat side's normal moved by {worstFlat:F2} degrees: the smoothing crossed a sharp edge ({flat} flat vertices)");
+        if (worstEdge > 3) throw new Exception($"an edge vertex's normal moved by {worstEdge:F2} degrees ({edge} edge/corner vertices)");
+        // 3. the device kernel is the same arithmetic
+        foreach (var (name, pp, ff, host) in new[] { ("sphere", sp, sf, n1), ("cube", cp, cf, c1) })
+        {
+            var dev = await atlas.SmoothedVertexNormalsAsync(pp, ff, Trellis2Pipeline.NormalSmoothingIterations, Trellis2Pipeline.NormalSmoothingDegrees);
+            double worst = 0; for (int i = 0; i < host.Length; i++) worst = Math.Max(worst, Math.Abs(dev[i] - host[i]));
+            if (worst > 2e-3) throw new Exception($"device smoothed normals of the {name} differ from the host's by {worst:E2} on {accelerator.AcceleratorType}");
+        }
+        return $"bumpy sphere: normals {j0:F1} -> {j1:F1} degrees off the exact ones; cube: {flat} flat vertices moved at most {worstFlat:F3}, {edge} edge vertices at most {worstEdge:F2} degrees; device == host";
+    });
+
     private static void SamplerTestModelImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> v, float a, float b) => v[i] = a * x[i] + b;
 
     /// <summary>

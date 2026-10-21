@@ -127,6 +127,9 @@
                 <option value="4096">4096 (the reference's default; more GPU memory)</option>
             </select>
         </label>
+        <label title="Smooths the surface normals of the finished mesh (bilateral filtering of the face normals: voxel-scale bumps average out, hard edges stay hard). A decimated mirror-like surface, a gold visor, shows those bumps as facets otherwise. Off writes the reference's plain normals.">
+            <input type="checkbox" @bind="_smoothNormals" disabled="@_isRunning" /> Smooth shading
+        </label>
     </div>
 
     @if (_stages.Count > 0 || (_isRunning && _currentStage != null))
@@ -273,6 +276,7 @@
     private int _textureSize = 2048;
     private int _resolution = 512;                  // TRELLIS.2 pipeline: 512 (default), 1024, or the cascades 1024c / 1536c (the reference's pipeline types)
     private bool _cascade;
+    private bool _smoothNormals = true;                 // Trellis2Options.SmoothNormals: feature-preserving normal smoothing, on by default
     private string Detail
     {
         get => _resolution + (_cascade ? "c" : "");
@@ -926,7 +930,7 @@
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
         _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : _downloadBytes == 0 && !_ready ? "TRELLIS.2 (loading from browser storage)" : "TRELLIS.2";
         _currentStage = "image prep"; StateHasChanged();
-        try { _glb = await _trellis!.GenerateGlbAsync(rgba, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize, Resolution = _resolution, Cascade = _cascade }); }
+        try { _glb = await _trellis!.GenerateGlbAsync(rgba, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize, Resolution = _resolution, Cascade = _cascade, SmoothNormals = _smoothNormals }); }
         finally { _trellisPhase = false; }
         _ready = true; _isLoading = false;
         _downloadBytes = _streamedBytes;                          // the planned files are in OPFS now

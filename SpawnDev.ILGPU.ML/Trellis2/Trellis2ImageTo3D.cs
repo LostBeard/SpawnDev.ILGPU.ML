@@ -46,6 +46,11 @@ public sealed class Trellis2Options
     /// 227k non-manifold edges, 730k orientation conflicts). Costs a few seconds of host time on a multi-million face mesh.
     /// </summary>
     public bool RepairMesh { get; init; } = true;
+    /// <summary>
+    /// Smooth the exported mesh's normals, feature-preserving (3 bilateral passes over the face normals, range 30 degrees; <see cref="PbrGlbWriter.BilateralVertexNormals"/>). The reference writes the plain area-weighted normals; on a mirror-like
+    /// surface (a gold visor) the voxel-scale bumps of a decimated mesh then show as facets. On by default; off = the reference's normals.
+    /// </summary>
+    public bool SmoothNormals { get; init; } = true;
     /// <summary>Rebuild the mesh as a closed shell by narrow-band dual contouring and bake colour from the original surface, as the reference's to_glb(remesh=True) does (<see cref="NarrowBandRemesher"/>). Default on.</summary>
     public bool Remesh { get; init; } = true;
 }
@@ -87,6 +92,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
         options ??= new Trellis2Options();
         var (output, pipe) = await GenerateAsync(rgba, width, height, options, ct);
         pipe.RepairMesh = options.RepairMesh;
+        pipe.SmoothNormals = options.SmoothNormals;
         pipe.Remesh = options.Remesh;
         using (output) return await pipe.ToGlbAsync(output, options.TextureSize, maxFaces: options.MaxFaces);
     }

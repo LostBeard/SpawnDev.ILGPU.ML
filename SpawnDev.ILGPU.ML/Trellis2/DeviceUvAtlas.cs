@@ -83,6 +83,92 @@ public sealed class DeviceUvAtlas
         vn[v * 3] = sx / l; vn[v * 3 + 1] = sy / l; vn[v * 3 + 2] = sz / l;
     }
 
+    // ---- bilateral normal filtering (see PbrGlbWriter.BilateralVertexNormals: the same arithmetic) ----------------------------------------------------------
+    private static void FaceNormalAreaImpl(Index1D f, FV pos, IV faces, FV fn, FV area)
+    {
+        int a = faces[f * 3], b = faces[f * 3 + 1], c = faces[f * 3 + 2];
+        float ax = pos[b * 3] - pos[a * 3], ay = pos[b * 3 + 1] - pos[a * 3 + 1], az = pos[b * 3 + 2] - pos[a * 3 + 2];
+        float bx = pos[c * 3] - pos[a * 3], by = pos[c * 3 + 1] - pos[a * 3 + 1], bz = pos[c * 3 + 2] - pos[a * 3 + 2];
+        float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx, l = MathF.Sqrt(nx * nx + ny * ny + nz * nz);
+        area[f] = l * 0.5f;
+        if (l > 1e-20f) { fn[f * 3] = nx / l; fn[f * 3 + 1] = ny / l; fn[f * 3 + 2] = nz / l; }
+        else { fn[f * 3] = 0f; fn[f * 3 + 1] = 0f; fn[f * 3 + 2] = 1f; }
+    }
+
+    private static void BilateralFaceImpl(Index1D f, IV faces, IV vstart, IV vfaces, FV src, FV area, FV dst, float invSigma2)
+    {
+        float nx = src[f * 3], ny = src[f * 3 + 1], nz = src[f * 3 + 2], sx = 0f, sy = 0f, sz = 0f;
+        for (int k = 0; k < 3; k++)
+        {
+            int v = faces[f * 3 + k];
+            for (int i = vstart[v]; i < vstart[v + 1]; i++)
+            {
+                int g = vfaces[i];
+                float gx = src[g * 3], gy = src[g * 3 + 1], gz = src[g * 3 + 2], w = area[g] * MathF.Exp(-(1f - (gx * nx + gy * ny + gz * nz)) * invSigma2);
+                sx += w * gx; sy += w * gy; sz += w * gz;
+            }
+        }
+        float l = MathF.Sqrt(sx * sx + sy * sy + sz * sz);
+        if (l < 1e-20f) { dst[f * 3] = nx; dst[f * 3 + 1] = ny; dst[f * 3 + 2] = nz; return; }
+        dst[f * 3] = sx / l; dst[f * 3 + 1] = sy / l; dst[f * 3 + 2] = sz / l;
+    }
+
+    private static void VertexFromFacesImpl(Index1D v, IV vstart, IV vfaces, FV fn, FV area, FV vn)
+    {
+        float sx = 0f, sy = 0f, sz = 0f;
+        for (int i = vstart[v]; i < vstart[v + 1]; i++) { int g = vfaces[i]; sx += area[g] * fn[g * 3]; sy += area[g] * fn[g * 3 + 1]; sz += area[g] * fn[g * 3 + 2]; }
+        float l = MathF.Sqrt(sx * sx + sy * sy + sz * sz);
+        if (l < 1e-20f) { vn[v * 3] = 0f; vn[v * 3 + 1] = 0f; vn[v * 3 + 2] = 1f; return; }
+        vn[v * 3] = sx / l; vn[v * 3 + 1] = sy / l; vn[v * 3 + 2] = sz / l;
+    }
+
+    /// <summary>
+    /// Replaces <paramref name="vn"/> by the vertex normals of the bilaterally filtered face normals (<see cref="PbrGlbWriter.BilateralVertexNormals"/>): <paramref name="iterations"/> passes with a range
+    /// weight of <paramref name="sigmaDegrees"/>; 0 passes leaves <paramref name="vn"/> as it is.
+    /// </summary>
+    private async Task SmoothNormalsAsync(FV vn, FV positions, IV faces, IV vstart, IV vfaces, int nv, int nf, int iterations, double sigmaDegrees)
+    {
+        if (iterations <= 0 || nf == 0) return;
+        var faceK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, FV>(FaceNormalAreaImpl);
+        var filter = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, FV, FV, FV, float>(BilateralFaceImpl);
+        var vertexK = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, FV, FV, FV>(VertexFromFacesImpl);
+        float sigma = (float)(sigmaDegrees * Math.PI / 180), invSigma2 = 1f / (sigma * sigma);
+        using var fa = _acc.Allocate1D<float>(Math.Max(3L, (long)nf * 3)); using var fb = _acc.Allocate1D<float>(Math.Max(3L, (long)nf * 3)); using var area = _acc.Allocate1D<float>(Math.Max(1, nf));
+        faceK(nf, positions, faces, fa.View, area.View);
+        for (int it = 0; it < iterations; it++)
+        {
+            if ((it & 1) == 0) filter(nf, faces, vstart, vfaces, fa.View, area.View, fb.View, invSigma2);
+            else filter(nf, faces, vstart, vfaces, fb.View, area.View, fa.View, invSigma2);
+        }
+        vertexK(nv, vstart, vfaces, (iterations & 1) == 1 ? fb.View : fa.View, area.View, vn);
+        await _acc.SynchronizeAsync();                       // the temporaries are freed on return
+    }
+
+    /// <summary>
+    /// The area-weighted vertex normals of a mesh, then <paramref name="iterations"/> bilateral passes over the face normals, all on the device (the same steps the atlas runs before it splits the seams);
+    /// the host twin is <see cref="PbrGlbWriter.BilateralVertexNormals"/>. For tests and tools.
+    /// </summary>
+    public async Task<float[]> SmoothedVertexNormalsAsync(float[] positions, int[] faces, int iterations, double sigmaDegrees)
+    {
+        int nv = positions.Length / 3, nf = faces.Length / 3;
+        var count = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(GpuMeshSimplifier.CountImpl);
+        var fill = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, IV>(GpuMeshSimplifier.FillImpl);
+        var sortList = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV>(SortListImpl);
+        var vnormals = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, IV, FV>(VertexNormalsImpl);
+        using var pos = _acc.Allocate1D(positions); using var fc = _acc.Allocate1D(faces);
+        using var vcount = _acc.Allocate1D<int>(Math.Max(1, nv)); using var vfill = _acc.Allocate1D<int>(Math.Max(1, nv));
+        using var vstart = _acc.Allocate1D<int>(nv + 1L); using var vfaces = _acc.Allocate1D<int>(Math.Max(3L, (long)nf * 3));
+        vcount.MemSetToZero(); vfill.MemSetToZero();
+        count(nf, fc.View, vcount.View);
+        await _sk.ExclusiveScanAsync(vcount.View, nv, vstart.View);
+        fill(nf, fc.View, vstart.View, vfill.View, vfaces.View);
+        sortList(nv, vstart.View, vfaces.View);
+        using var vn = _acc.Allocate1D<float>(Math.Max(3L, (long)nv * 3));
+        vnormals(nv, pos.View, fc.View, vstart.View, vfaces.View, vn.View);
+        await SmoothNormalsAsync(vn.View, pos.View, fc.View, vstart.View, vfaces.View, nv, nf, iterations, sigmaDegrees);
+        return (await vn.View.CopyToHostAsync()).AsSpan(0, nv * 3).ToArray();
+    }
+
     /// <summary>A triangle whose own normal opposes the sum of its corners' normals by more than cos = -0.2 is wound the wrong way: swap two corners (as <see cref="MeshRepair.AlignWindingToNormals"/>).</summary>
     private static void AlignFlipImpl(Index1D t, FV pos, IV faces, FV vn, IV counter)
     {
@@ -454,6 +540,7 @@ public sealed class DeviceUvAtlas
             if (got == 0) break;
         }
         vnormals(nv, positions, faces, vstart.View, vfaces.View, vn.View);
+        await SmoothNormalsAsync(vn.View, positions, faces, vstart.View, vfaces.View, nv, nf, options.NormalSmoothingIterations, options.NormalSmoothingDegrees);
 
         // face data
         using var fn = _acc.Allocate1D<float>(Math.Max(3L, (long)nf * 3)); using var area = _acc.Allocate1D<float>(Math.Max(1, nf));

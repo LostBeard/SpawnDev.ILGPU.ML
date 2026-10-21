@@ -25,6 +25,7 @@
 //                              (--edit-shape: change the SHAPE there too, geometry can be added or removed) from another picture (RGBA with a cut-out alpha, or any picture: it is cut out), keeping the rest; writes <name>_edited.glb. No rig / animation in this mode.
 //    --edit-instruction "give the knight a red plume"   like --edit-picture, but the edit picture is made by FLUX.2 klein EDITING the picture the model was built from (reference-image mode); it keeps what the instruction does not mention
 //    --image-model flux3|flux2|sd   default flux2        --quality 4|8   FLUX weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
+//    --no-smooth-normals       write the reference's plain vertex normals (default: bilateral-filtered face normals, which take the voxel-scale facets off glossy surfaces and keep hard edges)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
 //    --resolution 512|1024|1024c|1536c   TRELLIS.2 pipeline (the reference's types): 512 (default), 1024, or the cascades 1024c (the reference's own default) and 1536c (the finest the released model does); finer detail, slower, more GPU memory
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
@@ -53,7 +54,7 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
 bool ci = false, pick = false, rig = true, animate = true, caption = true;
-int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4, resolution = 512; bool cascade = false;
+int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4, resolution = 512; bool cascade = false, smoothNormals = true;
 double clearance = 8;
 string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null, editInstruction = null, imagePath = null; bool editShape = false; var model = ImageModel.Flux2Klein;
 var words = new List<string>();
@@ -64,6 +65,7 @@ for (int i = 0; i < args.Length; i++)
         case "--ci": ci = true; break;
         case "--pick": pick = true; break;
         case "--no-rig": rig = false; break;
+        case "--no-smooth-normals": smoothNormals = false; break;
         case "--bridge-hops" when i + 1 < args.Length: bridgeHops = int.Parse(args[++i]); break;
         case "--no-animate": animate = false; break;
         case "--seed" when i + 1 < args.Length: seed = int.Parse(args[++i]); break;
@@ -177,7 +179,7 @@ async Task<int> Run()
         return 0;
     }
 
-    var trellisOptions = new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture, Resolution = resolution, Cascade = cascade };
+    var trellisOptions = new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture, Resolution = resolution, Cascade = cascade, SmoothNormals = smoothNormals };
     GeneratedAsset asset;
     if (imagePath != null)
     {   // image to 3D: a transparent picture is used as is, any other is cut out first

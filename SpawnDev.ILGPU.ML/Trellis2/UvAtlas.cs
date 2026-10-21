@@ -31,6 +31,13 @@ public static class UvAtlas
         public int MinChartTexels = 3;
         /// <summary>How many times an overlapping chart may be split with a tighter cone.</summary>
         public int MaxSplitDepth = 8;
+        /// <summary>
+        /// Passes of bilateral filtering over the face normals before the vertex normals are taken (<see cref="PbrGlbWriter.BilateralVertexNormals"/>); 0 = the plain area-weighted normals the reference writes.
+        /// A decimated mirror-like surface (a gold visor) shows its voxel-scale bumps as facets otherwise.
+        /// </summary>
+        public int NormalSmoothingIterations = 0;
+        /// <summary>The range weight of the filtering: faces whose normals differ by about this angle count for a third; a 90 degree edge counts for nothing, so hard edges stay hard.</summary>
+        public double NormalSmoothingDegrees = 30;
     }
 
     public sealed class Result

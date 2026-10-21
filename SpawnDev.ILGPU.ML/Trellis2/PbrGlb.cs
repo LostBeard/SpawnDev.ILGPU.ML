@@ -144,6 +144,64 @@ public static class PbrGlbWriter
         return glb.ToArray();
     }
 
+    /// <summary>
+    /// Vertex normals from BILATERALLY filtered face normals (Zheng et al. 2011, "Bilateral normal filtering for mesh denoising"): each pass sets a face's normal to the area-weighted sum of the normals of the faces
+    /// that share a vertex with it, each weighted by exp(-(1 - cos angle) / sigma^2) against the face's own normal, so faces on the same smooth surface average out (the voxel-scale bumps of a decimated mesh,
+    /// which a mirror-like surface shows as facets) while a face across a sharp edge counts for nothing (90 degrees at sigma 20 degrees: weight 3e-4) and flat sides keep their exact normal.
+    /// The vertex normals are then the area-weighted sums of their faces' filtered normals; 0 iterations = <see cref="VertexNormals"/>. The device version is <c>DeviceUvAtlas</c>'s (same arithmetic).
+    /// </summary>
+    public static float[] BilateralVertexNormals(float[] positions, int[] faces, int iterations, double sigmaDegrees)
+    {
+        if (iterations <= 0) return VertexNormals(positions, faces);
+        int nv = positions.Length / 3, nf = faces.Length / 3;
+        var start = new int[nv + 1];
+        for (int i = 0; i < faces.Length; i++) start[faces[i] + 1]++;
+        for (int v = 0; v < nv; v++) start[v + 1] += start[v];
+        var fill = new int[nv]; var list = new int[faces.Length];
+        for (int f = 0; f < nf; f++) for (int k = 0; k < 3; k++) { int v = faces[f * 3 + k]; list[start[v] + fill[v]++] = f; }
+        var src = new float[nf * 3]; var area = new float[nf]; var dst = new float[nf * 3];
+        for (int f = 0; f < nf; f++)
+        {
+            int a = faces[f * 3], b = faces[f * 3 + 1], c = faces[f * 3 + 2];
+            float ax = positions[b * 3] - positions[a * 3], ay = positions[b * 3 + 1] - positions[a * 3 + 1], az = positions[b * 3 + 2] - positions[a * 3 + 2];
+            float bx = positions[c * 3] - positions[a * 3], by = positions[c * 3 + 1] - positions[a * 3 + 1], bz = positions[c * 3 + 2] - positions[a * 3 + 2];
+            float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx, l = MathF.Sqrt(nx * nx + ny * ny + nz * nz);
+            area[f] = l * 0.5f;
+            if (l > 1e-20f) { src[f * 3] = nx / l; src[f * 3 + 1] = ny / l; src[f * 3 + 2] = nz / l; } else { src[f * 3 + 2] = 1f; }
+        }
+        float sigma = (float)(sigmaDegrees * Math.PI / 180), invSigma2 = 1f / (sigma * sigma);
+        for (int it = 0; it < iterations; it++)
+        {
+            for (int f = 0; f < nf; f++)
+            {
+                float nx = src[f * 3], ny = src[f * 3 + 1], nz = src[f * 3 + 2], sx = 0, sy = 0, sz = 0;
+                for (int k = 0; k < 3; k++)
+                {
+                    int v = faces[f * 3 + k];
+                    for (int i = start[v]; i < start[v + 1]; i++)
+                    {
+                        int g = list[i];
+                        float gx = src[g * 3], gy = src[g * 3 + 1], gz = src[g * 3 + 2], w = area[g] * MathF.Exp(-(1f - (gx * nx + gy * ny + gz * nz)) * invSigma2);
+                        sx += w * gx; sy += w * gy; sz += w * gz;
+                    }
+                }
+                float l = MathF.Sqrt(sx * sx + sy * sy + sz * sz);
+                if (l < 1e-20f) { dst[f * 3] = nx; dst[f * 3 + 1] = ny; dst[f * 3 + 2] = nz; } else { dst[f * 3] = sx / l; dst[f * 3 + 1] = sy / l; dst[f * 3 + 2] = sz / l; }
+            }
+            (src, dst) = (dst, src);
+        }
+        var r = new float[positions.Length];
+        for (int v = 0; v < nv; v++)
+        {
+            float sx = 0, sy = 0, sz = 0;
+            for (int i = start[v]; i < start[v + 1]; i++) { int g = list[i]; sx += area[g] * src[g * 3]; sy += area[g] * src[g * 3 + 1]; sz += area[g] * src[g * 3 + 2]; }
+            float l = MathF.Sqrt(sx * sx + sy * sy + sz * sz);
+            if (l < 1e-20f) { r[v * 3 + 2] = 1f; continue; }
+            r[v * 3] = sx / l; r[v * 3 + 1] = sy / l; r[v * 3 + 2] = sz / l;
+        }
+        return r;
+    }
+
     /// <summary>Area-weighted vertex normals of an indexed triangle mesh.</summary>
     public static float[] VertexNormals(float[] positions, int[] faces)
     {

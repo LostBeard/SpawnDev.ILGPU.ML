@@ -312,7 +312,13 @@ public abstract partial class MLTestBase
             foreach (var c in channels) Ur_Expect(c!["target"]!["node"]!.GetValue<int>() < root["nodes"]!.AsArray().Count, "channel targets exist");
         }
         Ur_Expect(RiggedGlb.ReadMesh(animated).Positions.SequenceEqual(RiggedGlb.ReadMesh(glb).Positions), "the mesh is untouched");
-        File.WriteAllBytes(Path.Combine(dir, "..", "tmp", "skintokens_animated_humanoid.glb"), animated);      // for the glTF validator and a viewer
+        // for the glTF validator and a viewer; every backend lane runs this test at once, so each writes its own file and moves it into place (a plain write raced: "being used by another process")
+        try
+        {
+            var target = Path.Combine(dir, "..", "tmp", "skintokens_animated_humanoid.glb"); var temp = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllBytes(temp, animated); File.Move(temp, target, overwrite: true);
+        }
+        catch (IOException) { /* another lane is replacing the same file: the content is identical */ }
         await Task.CompletedTask;
     });
 }

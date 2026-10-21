@@ -915,6 +915,13 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Run <see cref="MeshRepair"/> before and after the edge collapse (default on; <see cref="Trellis2Options.RepairMesh"/>).</summary>
     public bool RepairMesh { get; set; } = true;
 
+    /// <summary>Smooth the vertex normals of the exported mesh, feature-preserving (default on; <see cref="Trellis2Options.SmoothNormals"/>).</summary>
+    public bool SmoothNormals { get; set; } = true;
+    /// <summary>Passes and range (degrees) of the normal smoothing; env TRELLIS2_NORMAL_ITERS / TRELLIS2_NORMAL_SIGMA for experiments.</summary>
+    public static int NormalSmoothingIterations { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_NORMAL_ITERS"), out var ni) && ni > 0 ? ni : 3;
+    public static double NormalSmoothingDegrees { get; set; } = double.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_NORMAL_SIGMA"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ns) && ns > 0 ? ns : 30;
+    private UvAtlas.Options AtlasOptions(int textureSize) => new() { Resolution = textureSize, NormalSmoothingIterations = SmoothNormals ? NormalSmoothingIterations : 0, NormalSmoothingDegrees = NormalSmoothingDegrees };
+
     private (float[], int[]) Repair(string stage, float[] positions, int[] faces, Stopwatch sw)
     {
         var (p, f, r) = MeshRepair.Repair(positions, faces);
@@ -930,7 +937,7 @@ public sealed class Trellis2Pipeline : IDisposable
     private async Task<byte[]> FinishGlbOnDeviceAsync(Output output, ArrayView1D<float, Stride1D.Dense> positions, int vertexCount, ArrayView1D<int, Stride1D.Dense> faces, int faceCount, int textureSize, int dilation, Stopwatch sw, MeshDistanceGrid? project)
     {
         _deviceAtlas ??= new DeviceUvAtlas(_acc, _sk);
-        using var atlas = await _deviceAtlas.UnwrapAsync(positions, vertexCount, faces, faceCount, new UvAtlas.Options { Resolution = textureSize }, alignWinding: RepairMesh);
+        using var atlas = await _deviceAtlas.UnwrapAsync(positions, vertexCount, faces, faceCount, AtlasOptions(textureSize), alignWinding: RepairMesh);
         StageDone?.Invoke($"winding, normals and uv atlas on the device ({atlas.ChartCount} charts, {atlas.Utilization:P0}; {atlas.Flipped} triangles flipped; first kernels loaded in {_deviceAtlas.LoadSeconds:F1} s)", sw.Elapsed.TotalSeconds); sw.Restart();
         if (MeshStage != null)
             MeshStage("atlas", await atlas.Positions.View.SubView(0, (long)atlas.VertexCount * 3).CopyToHostAsync(), await atlas.Faces.View.SubView(0, (long)atlas.FaceCount * 3).CopyToHostAsync());
@@ -968,6 +975,7 @@ public sealed class Trellis2Pipeline : IDisposable
             StageDone?.Invoke($"winding aligned to the normals: {realigned} triangles flipped", sw.Elapsed.TotalSeconds); sw.Restart();
         }
         var normals = PbrGlbWriter.VertexNormals(positions, faces);
+        if (SmoothNormals) normals = PbrGlbWriter.BilateralVertexNormals(positions, faces, NormalSmoothingIterations, NormalSmoothingDegrees);
         StageDone?.Invoke("mesh read + normals", sw.Elapsed.TotalSeconds); sw.Restart();
 
         var atlas = UvAtlas.Unwrap(positions, faces, new UvAtlas.Options { Resolution = textureSize });
