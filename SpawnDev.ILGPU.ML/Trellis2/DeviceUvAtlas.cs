@@ -54,7 +54,7 @@ public sealed class DeviceUvAtlas
 
     // ---- the vertex -> faces table -------------------------------------------------------------------------------------------------------------------
     /// <summary>Each vertex's list in ascending face order, so every later choice made from it is the same on every run.</summary>
-    private static void SortListImpl(Index1D v, IV vstart, IV vfaces)
+    internal static void SortListImpl(Index1D v, IV vstart, IV vfaces)
     {
         int s = vstart[v], e = vstart[v + 1];
         for (int i = s + 1; i < e; i++)
@@ -84,7 +84,7 @@ public sealed class DeviceUvAtlas
     }
 
     // ---- bilateral normal filtering (see PbrGlbWriter.BilateralVertexNormals: the same arithmetic) ----------------------------------------------------------
-    private static void FaceNormalAreaImpl(Index1D f, FV pos, IV faces, FV fn, FV area)
+    internal static void FaceNormalAreaImpl(Index1D f, FV pos, IV faces, FV fn, FV area)
     {
         int a = faces[f * 3], b = faces[f * 3 + 1], c = faces[f * 3 + 2];
         float ax = pos[b * 3] - pos[a * 3], ay = pos[b * 3 + 1] - pos[a * 3 + 1], az = pos[b * 3 + 2] - pos[a * 3 + 2];
@@ -95,7 +95,7 @@ public sealed class DeviceUvAtlas
         else { fn[f * 3] = 0f; fn[f * 3 + 1] = 0f; fn[f * 3 + 2] = 1f; }
     }
 
-    private static void BilateralFaceImpl(Index1D f, IV faces, IV vstart, IV vfaces, FV src, FV area, FV dst, float invSigma2)
+    internal static void BilateralFaceImpl(Index1D f, IV faces, IV vstart, IV vfaces, FV src, FV area, FV dst, float invSigma2)
     {
         float nx = src[f * 3], ny = src[f * 3 + 1], nz = src[f * 3 + 2], sx = 0f, sy = 0f, sz = 0f;
         for (int k = 0; k < 3; k++)

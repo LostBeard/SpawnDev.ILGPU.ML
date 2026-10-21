@@ -279,6 +279,50 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Device mesh denoising (the gold-visor facets): the radial scatter of a bumpy sphere's vertices drops to under half without the sphere shrinking much, the vertices of a cube's flat sides stay where they are
+    /// and its sharp edges stay sharp (the edge vertices barely move). Red check: with the range weight opened to 180 degrees the same filter rounds the cube's edges, so the cube bound can fail.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Trellis2_MeshDenoiser_SmoothsBumpsKeepsEdges() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        var sk = new SparseKernels(accelerator);
+        async Task<float[]> Run(float[] p, int[] f, double sigma)
+        {
+            using var pos = accelerator.Allocate1D(p); using var faces = accelerator.Allocate1D(f);
+            await new DeviceMeshDenoiser(accelerator, sk) { SigmaDegrees = sigma }.DenoiseAsync(pos.View, p.Length / 3, faces.View, f.Length / 3);
+            return await pos.View.CopyToHostAsync();
+        }
+        // 1. the bumpy sphere: +-2 % radius noise
+        var (sp, sf) = NoisySphere(0.02, 7);
+        var sd = await Run(sp, sf, Trellis2Pipeline.DenoiseSigmaDegrees);
+        static (double Mean, double Std) Radii(float[] p)
+        {
+            int n = p.Length / 3; double s = 0, s2 = 0;
+            for (int v = 0; v < n; v++) { double r = Math.Sqrt(p[v * 3] * p[v * 3] + p[v * 3 + 1] * p[v * 3 + 1] + p[v * 3 + 2] * p[v * 3 + 2]); s += r; s2 += r * r; }
+            double m = s / n; return (m, Math.Sqrt(Math.Max(0, s2 / n - m * m)));
+        }
+        var (m0, s0) = Radii(sp); var (m1, s1) = Radii(sd);
+        if (!(s0 > 0.008)) throw new Exception($"the test sphere is not bumpy enough: radius std {s0:F4}");
+        if (!(s1 < s0 / 2)) throw new Exception($"denoising did not calm the bumps: radius std {s0:F4} -> {s1:F4}");
+        if (!(m1 > m0 * 0.97)) throw new Exception($"the sphere shrank: mean radius {m0:F4} -> {m1:F4}");
+        // 2. the cube: flat sides stay flat and in place, the edges stay sharp
+        var (cp, cf) = GridCube(8);
+        var cd = await Run(cp, cf, Trellis2Pipeline.DenoiseSigmaDegrees);
+        double worstFlat = 0, worstEdge = 0; int flat = 0, edge = 0;
+        for (int v = 0; v < cp.Length / 3; v++)
+        {
+            int onFace = 0; for (int k = 0; k < 3; k++) if (Math.Abs(Math.Abs(cp[v * 3 + k]) - 1) < 1e-4) onFace++;
+            double d = Math.Sqrt(Math.Pow(cd[v * 3] - cp[v * 3], 2) + Math.Pow(cd[v * 3 + 1] - cp[v * 3 + 1], 2) + Math.Pow(cd[v * 3 + 2] - cp[v * 3 + 2], 2));
+            if (onFace == 1) { flat++; worstFlat = Math.Max(worstFlat, d); } else { edge++; worstEdge = Math.Max(worstEdge, d); }
+        }
+        const double cell = 0.25;      // the cube's grid cell: 2 / 8
+        // measured 0.084 / 0.311 cells with the default range weight, 0.528 / 1.208 with it opened to 180 degrees (the red check)
+        if (worstFlat > 0.2 * cell || worstEdge > 0.6 * cell) throw new Exception($"cube moved: flat vertices at most {worstFlat / cell:F3} cells ({flat}), edge vertices at most {worstEdge / cell:F3} cells ({edge})");
+        return $"bumpy sphere: radius std {s0:F4} -> {s1:F4}, mean radius {m0:F4} -> {m1:F4}; cube: flat vertices moved at most {worstFlat:E1}, edge vertices {worstEdge / cell:F3} cells";
+    });
+
+    /// <summary>
     /// Diagnostic: the WGSL the WebGPU backend generates for the DiT's two big kernels (portable flash attention at head width 128, the bf16 tiled GEMM), printed as "WGSL_DUMP name" + source
     /// so PlaywrightMultiTest writes them to PlaywrightMultiTest/WGSLDumps/browser_console.log (PMT_CONSOLE_LOG=WGSL_DUMP). For reading the shader, not a gate.
     /// </summary>

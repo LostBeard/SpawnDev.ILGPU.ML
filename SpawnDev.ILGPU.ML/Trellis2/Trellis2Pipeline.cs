@@ -844,6 +844,12 @@ public sealed class Trellis2Pipeline : IDisposable
     /// <summary>Run the remesh in device kernels (<see cref="DeviceRemesher"/>: the mesh never leaves the GPU, no host repair first) instead of the host topology (<see cref="NarrowBandRemesher"/>). Default on; env TRELLIS2_HOSTREMESH=1 forces the host path (A/B).</summary>
     public bool DeviceRemesh { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTREMESH") != "1";
     private DeviceRemesher? _deviceRemesher;
+    private DeviceMeshDenoiser? _denoiser;
+    /// <summary>Rounds / normal passes / vertex passes / range (degrees) of the mesh denoising between the remesh and the simplifier (0 rounds = off); env TRELLIS2_DENOISE_ROUNDS / _NORMALS / _VERTS / _SIGMA for experiments.</summary>
+    public static int DenoiseRounds { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_DENOISE_ROUNDS"), out var dr) && dr >= 0 ? dr : 4;
+    public static int DenoiseNormalPasses { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_DENOISE_NORMALS"), out var dn) && dn > 0 ? dn : 5;
+    public static int DenoiseVertexPasses { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_DENOISE_VERTS"), out var dv) && dv > 0 ? dv : 12;
+    public static double DenoiseSigmaDegrees { get; set; } = double.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_DENOISE_SIGMA"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ds) && ds > 0 ? ds : 30;
     /// <summary>Simplify on the device (<see cref="GpuMeshSimplifier"/>) instead of the host edge collapse. Default on; env TRELLIS2_HOSTSIMPLIFY=1 forces the host path (A/B).</summary>
     public bool DeviceSimplify { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_HOSTSIMPLIFY") != "1";
     private GpuMeshSimplifier? _gpuSimplifier;
@@ -860,6 +866,13 @@ public sealed class Trellis2Pipeline : IDisposable
             _deviceRemesher ??= new DeviceRemesher(_acc, _sk);
             using var rmd = await _deviceRemesher.RemeshAsync(output.Mesh.Vertices.View, output.Mesh.VertexCount, output.Mesh.Faces.View, output.Mesh.FaceCount, output.Grid, RemeshBand);
             StageDone?.Invoke($"remesh on the device: {rmd.ActiveVoxels} band voxels, {rmd.GridVertices} corners -> {rmd.FaceCount} faces", sw.Elapsed.TotalSeconds); sw.Restart();
+            if (SmoothNormals && DenoiseRounds > 0)
+            {   // the remeshed surface has voxel-scale bumps (about 0.2 voxel): a mirror-like material shows them as facets; smoothed here, before the simplifier, where they still are bumps
+                _denoiser ??= new DeviceMeshDenoiser(_acc, _sk);
+                _denoiser.Rounds = DenoiseRounds; _denoiser.NormalPasses = DenoiseNormalPasses; _denoiser.VertexPasses = DenoiseVertexPasses; _denoiser.SigmaDegrees = DenoiseSigmaDegrees;
+                await _denoiser.DenoiseAsync(rmd.Positions.View, rmd.VertexCount, rmd.Faces.View, rmd.FaceCount);
+                StageDone?.Invoke($"mesh denoised on the device ({DenoiseRounds} rounds)", sw.Elapsed.TotalSeconds); sw.Restart();
+            }
             DeviceTriMesh? simplified = null;
             if (DeviceSimplify && maxFaces > 0 && rmd.FaceCount > maxFaces)
             {
