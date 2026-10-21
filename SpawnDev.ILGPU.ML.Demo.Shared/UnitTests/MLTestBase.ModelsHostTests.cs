@@ -149,6 +149,55 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    /// <summary>
+    /// 🔴 A relative request URI (the Blazor pattern: an HttpClient with a BaseAddress and "models/x.onnx" paths, which the whole CreateFromFile test family uses) is resolved
+    /// against BaseAddress, not rejected: a relative URI on a foreign host goes through untouched, one that resolves onto the models host still falls back to its
+    /// Hugging Face twin. Offline and deterministic: a stub handler answers instead of the network (it is not an HttpClientHandler, so it runs in the browser too).
+    /// This crashed with "This operation is not supported for a relative URI" in ModelsHost.SendAsync and took 22 tests down on every lane.
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task ModelsHost_RelativeRequestUriIsResolvedAgainstTheBaseAddress() => await RunTest(async accelerator =>
+    {
+        var seen = new List<string>();
+        var stub = new StubHandler(r =>
+        {
+            seen.Add(r.RequestUri!.AbsoluteUri);
+            return new HttpResponseMessage(r.RequestUri.Host.Contains("models") ? HttpStatusCode.NotFound : HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[] { 1, 2, 3 }) };
+        });
+
+        // 1. foreign host: untouched, one request, answered as is
+        using (var http = new HttpClient(stub) { BaseAddress = new Uri("https://app.example.test/") })
+        using (var req = new HttpRequestMessage(HttpMethod.Get, "models/squeezenet/model.onnx"))
+        using (var res = await ModelsHost.SendAsync(http, req))
+        {
+            Ur_Expect(res.StatusCode == HttpStatusCode.OK, $"a relative url on a foreign host goes through ({(int)res.StatusCode})");
+            Ur_Expect(seen.Count == 1 && seen[0] == "https://app.example.test/models/squeezenet/model.onnx", $"one request, resolved against the base address: {string.Join(", ", seen)}");
+        }
+
+        // 2. resolves onto the models host: 404 there, falls back to the Hugging Face twin
+        seen.Clear();
+        var fallbacks = new List<(string Failed, string Tried)>();
+        void OnFallback(string failed, string tried, string why) { lock (fallbacks) fallbacks.Add((failed, tried)); }
+        var modelsBase = new Uri(ModelsHost.BaseUrl.TrimEnd('/') + "/");
+        ModelsHost.Fallback += OnFallback;
+        try
+        {
+            using var http = new HttpClient(stub) { BaseAddress = modelsBase };
+            using var req = new HttpRequestMessage(HttpMethod.Get, "Xenova/distilgpt2/resolve/main/generation_config.json");
+            using var res = await ModelsHost.SendAsync(http, req);
+            Ur_Expect(res.StatusCode == HttpStatusCode.OK, $"the fallback answered ({(int)res.StatusCode})");
+            Ur_Expect(seen.Count == 2 && seen[1] == "https://huggingface.co/Xenova/distilgpt2/resolve/main/generation_config.json", $"models host first, then the Hugging Face twin: {string.Join(", ", seen)}");
+            Ur_Expect(fallbacks.Count == 1 && fallbacks[0].Failed == modelsBase + "Xenova/distilgpt2/resolve/main/generation_config.json", $"the fallback event carries the resolved url: {string.Join("; ", fallbacks.Select(f => f.Failed))}");
+        }
+        finally { ModelsHost.Fallback -= OnFallback; }
+        await Task.CompletedTask;
+    });
+
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> answer) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(answer(request));
+    }
+
     private sealed class RequestSpy(HttpMessageHandler inner) : DelegatingHandler(inner)
     {
         public readonly List<(string Host, bool HasAuthorization)> Requests = new();

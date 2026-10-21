@@ -156,9 +156,11 @@ public class ModelInspectorTests
     {
         // SqueezeNet uses only supported ops → fully compatible. Streamed (CheckCompatibilityAsync reads
         // only the graph structure; weights are skipped).
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         using (var sqStream = await _http.GetStreamAsync("models/squeezenet/model.onnx"))
         {
             var sq = await ModelInspectorHelper.CheckCompatibilityAsync(sqStream);
+            Console.WriteLine($"[ModelInspector] compat SqueezeNet done at {sw.Elapsed.TotalSeconds:F1} s");
             if (!sq.Applicable) throw new Exception("ONNX compat must be Applicable");
             if (sq.TotalOpsUsed <= 0) throw new Exception("Expected ops");
             if (sq.SupportedOps.Length + sq.UnsupportedOps.Length != sq.TotalOpsUsed)
@@ -174,7 +176,9 @@ public class ModelInspectorTests
         // guard for the user-facing deliverable: GPT-2 == 100% compatible.
         using (var gpt2Stream = await _http.GetStreamAsync("models/gpt2/model.onnx"))
         {
+            Console.WriteLine($"[ModelInspector] compat GPT-2 response headers at {sw.Elapsed.TotalSeconds:F1} s");
             var gpt2 = await ModelInspectorHelper.CheckCompatibilityAsync(gpt2Stream);
+            Console.WriteLine($"[ModelInspector] compat GPT-2 done at {sw.Elapsed.TotalSeconds:F1} s");
             if (gpt2.SupportedOps.Length + gpt2.UnsupportedOps.Length != gpt2.TotalOpsUsed)
                 throw new Exception("GPT-2 op partition mismatch");
             if (gpt2.CompatibilityPercent < 0 || gpt2.CompatibilityPercent > 100)

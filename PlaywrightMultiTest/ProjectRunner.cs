@@ -1435,6 +1435,14 @@ namespace PlaywrightMultiTest
                 "--allow-file-access-from-files"
             };
 
+            // PMT_CHROMIUM_ARGS="--flag-a --flag-b": extra launch arguments for an A/B (nothing is added by default).
+            var extra = Environment.GetEnvironmentVariable("PMT_CHROMIUM_ARGS");
+            if (!string.IsNullOrWhiteSpace(extra))
+            {
+                args.AddRange(extra.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                LogStatus($"[PMT_CHROMIUM_ARGS] extra Chromium arguments: {extra}");
+            }
+
             if (Environment.GetEnvironmentVariable("PMT_DAWN_DUMP") == "1")
             {
                 var logFile = Environment.GetEnvironmentVariable("PMT_DAWN_LOG")

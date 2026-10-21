@@ -123,7 +123,10 @@ public static class ModelsHost
         HttpCompletionOption completion = HttpCompletionOption.ResponseContentRead, CancellationToken cancellationToken = default,
         System.Net.Http.Headers.AuthenticationHeaderValue? fallbackAuthorization = null)
     {
-        var alt = request.RequestUri is { } uri ? GetFallbackUrl(uri.AbsoluteUri) : null;
+        // A relative request URI is resolved by HttpClient against its BaseAddress (the Blazor pattern, and the tests' "models/..." paths): resolve it the same way
+        // to decide whether it is on the models host; one that stays relative has no Hugging Face twin and goes through untouched.
+        var requestUri = request.RequestUri is { IsAbsoluteUri: false } rel && http.BaseAddress != null ? new Uri(http.BaseAddress, rel) : request.RequestUri;
+        var alt = requestUri is { IsAbsoluteUri: true } uri ? GetFallbackUrl(uri.AbsoluteUri) : null;
         if (alt == null) return await http.SendAsync(request, completion, cancellationToken).ConfigureAwait(false);
 
         string reason;
@@ -138,7 +141,7 @@ public static class ModelsHost
         {
             reason = ex.GetType().Name + ": " + ex.Message;
         }
-        ReportFallback(request.RequestUri!.AbsoluteUri, alt, reason);
+        ReportFallback(requestUri!.AbsoluteUri, alt, reason);
         var second = new HttpRequestMessage(request.Method, alt);   // not disposed here: the returned response may still reference it
         foreach (var h in request.Headers) second.Headers.TryAddWithoutValidation(h.Key, h.Value);
         if (fallbackAuthorization != null) second.Headers.Authorization = fallbackAuthorization;
