@@ -5,7 +5,7 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<Version>5.4.0</Version>
-		<PackageReleaseNotes>v5.4.0 - on SpawnDev.ILGPU 5.4.1: Velocity is the CPU backend (MLContext.CreateCpuAccelerator, CreatePlainCpuContext), WebGPU shaders are smaller and compile faster and attention runs about 10% faster. Models come from models.spawndev.com with a Hugging Face fallback (ModelsHost). TRELLIS.2 1024 and 1536 cascade pipelines (desktop and browser), smooth shading (bilateral normals and mesh denoising), better UV charts, FLUX picture editing ("Change this picture"), ImageGenerator, new image examples. Since v5.3.24: see CHANGELOG.md.</PackageReleaseNotes>
+		<PackageReleaseNotes>v5.4.0 - on SpawnDev.ILGPU 5.4.1: Velocity is the CPU backend, WebGPU shaders compile faster and attention runs ~10% faster; models come from models.spawndev.com (Hugging Face fallback); TRELLIS.2 1024/1536 cascade, smooth shading, FLUX picture editing. Details: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
