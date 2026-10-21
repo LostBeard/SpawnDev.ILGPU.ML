@@ -1,0 +1,30 @@
+@* "Change this picture": a line for what to change and a button. The page does the editing (SpawnDev.ILGPU.ML.Pipelines.PictureEditor: FLUX reference-image editing) and shows the result.
+   Shared by the Text to 3D / Image to 3D page and the Image Generation page. *@
+<div class="pic-edit">
+    <input class="pic-edit-input" type="text" placeholder="@Placeholder" value="@_text" disabled="@Disabled" title="@Title"
+           @oninput="e => _text = e.Value?.ToString() ?? string.Empty" @onkeydown="OnKeyDown" />
+    <button class="pic-edit-btn" disabled="@(Disabled || string.IsNullOrWhiteSpace(_text))" @onclick="ApplyAsync">@ButtonText</button>
+</div>
+
+@code {
+    /// <summary>No edit while something else is running (the pipelines share one GPU).</summary>
+    [Parameter] public bool Disabled { get; set; }
+    [Parameter] public string Placeholder { get; set; } = "change something, e.g. arms further from the body";
+    [Parameter] public string ButtonText { get; set; } = "Change this picture";
+    [Parameter] public string Title { get; set; } = "Tell the image model what to change in this picture (FLUX reference-image editing): the picture is kept and the change is drawn as a new picture next to it.";
+    /// <summary>Called with the typed instruction (trimmed, never empty), by the button or the Enter key.</summary>
+    [Parameter] public EventCallback<string> OnApply { get; set; }
+
+    private string _text = "";
+
+    private async Task ApplyAsync()
+    {
+        var text = _text.Trim();
+        if (text.Length > 0 && !Disabled) await OnApply.InvokeAsync(text);
+    }
+
+    private async Task OnKeyDown(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await ApplyAsync();
+    }
+}

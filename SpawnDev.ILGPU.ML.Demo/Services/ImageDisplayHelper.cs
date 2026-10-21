@@ -50,4 +50,25 @@ public static class ImageDisplayHelper
         ctx.PutImageData(imageData, 0, 0);
         return canvas.ToDataURL("image/png");
     }
+
+    /// <summary>
+    /// An encoded picture (PNG, JPEG, WebP ...) decoded to RGBA bytes by the browser, shrunk so its longer side is at most <paramref name="maxSide"/> pixels (never below 16).
+    /// FLUX reference images cost transformer tokens in proportion to their area, so the edit steps and the reference-image list shrink pictures the same way.
+    /// </summary>
+    public static async Task<(int Width, int Height, byte[] Rgba)> DecodeAsync(SpawnJSRuntime js, byte[] imageBytes, int maxSide = 768)
+    {
+        using var blob = new Blob(new[] { imageBytes });
+        using var window = js.Get<Window>("window");
+        using var bitmap = await window.CreateImageBitmap(blob);
+        int w = (int)bitmap.Width, h = (int)bitmap.Height;
+        double shrink = Math.Min(1.0, (double)maxSide / Math.Max(w, h));
+        int nw = Math.Max(16, (int)Math.Round(w * shrink)), nh = Math.Max(16, (int)Math.Round(h * shrink));
+        using var canvas = new HTMLCanvasElement();
+        canvas.Width = nw; canvas.Height = nh;
+        using var ctx = canvas.Get2DContext();
+        ctx.DrawImage(bitmap, 0, 0, nw, nh);
+        using var imageData = ctx.GetImageData(0, 0, nw, nh);
+        using var data = imageData.Data;
+        return (nw, nh, data.ReadBytes());
+    }
 }

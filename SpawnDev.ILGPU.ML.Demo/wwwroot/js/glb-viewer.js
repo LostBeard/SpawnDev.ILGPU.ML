@@ -4,7 +4,7 @@
 //
 //   glbViewer.show(canvas, glbBytes)  -> Promise<{ vertices, triangles, animations: [names] }>      load and show (drag to orbit, wheel to zoom, slow auto-rotate until you drag)
 //   glbViewer.play(canvas, which, inPlace)     play an animation by index or name (null / -1 = the bind pose); inPlace (default true) drops the hips' travel along the ground
-//   glbViewer.pose(canvas, which, seconds, yaw, inPlace)    freeze at one pose for capturing frames: animation `which` at `seconds`, the model turned `yaw` radians
+//   glbViewer.pose(canvas, which, seconds, yaw, inPlace, dist)    freeze at one pose for capturing frames: animation `which` at `seconds`, the model turned `yaw` radians, the camera `dist` away (optional; default 1.8)
 //   glbViewer.resume(canvas)  real-time playback and auto-rotation again        glbViewer.skeleton(canvas, on)  draw the bones        glbViewer.animations(canvas)  names
 //   glbViewer.dispose(canvas)
 (function () {
@@ -152,10 +152,10 @@
     }
     // Freeze the viewer at one pose, for capturing frames at exact times: animation `which` (index, name or -1 for the bind pose) at `seconds`, the model turned `yaw` radians.
     // `resume(canvas)` goes back to real-time playback and auto-rotation.
-    function pose(canvas, which, seconds, yaw, inPlace) {
+    function pose(canvas, which, seconds, yaw, inPlace, dist) {
         if (typeof canvas === "string") canvas = document.getElementById(canvas);
         const s = viewers.get(canvas); if (!s) return false;
-        s.auto = false; s.yaw = yaw; s.fixedT = seconds;
+        s.auto = false; s.yaw = yaw; s.fixedT = seconds; if (dist > 0) s.dist = dist;
         if (select(s, which, inPlace)) { const a = s.mixer.clipAction(s.inPlace ? inPlaceClip(s.T, s.clips[s.anim], s.model, s.cache) : s.clips[s.anim]); a.time = seconds; a.paused = true; s.mixer.update(0); }
         return true;
     }

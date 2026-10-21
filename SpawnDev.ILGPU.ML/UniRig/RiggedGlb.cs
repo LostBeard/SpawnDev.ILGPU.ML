@@ -190,6 +190,6 @@ public static class RiggedGlb
         U32(0x46546C67); U32(2); U32((uint)total);
         U32((uint)json.Length); U32(0x4E4F534A); o2.Write(json.GetBuffer().AsSpan(0, (int)json.Length));
         U32((uint)data.Length); U32(0x004E4942); o2.Write(data.GetBuffer().AsSpan(0, (int)data.Length));
-        return o2.ToArray();
+        return o2.Length == o2.Capacity ? o2.GetBuffer() : o2.ToArray();     // sized exactly: no second copy of a 100 MB file
     }
 }

@@ -86,19 +86,8 @@
 
     private async Task<Flux2ReferenceImage> DecodeAsync(byte[] imageBytes)
     {
-        using var blob = new Blob(new[] { imageBytes });
-        using var window = JS.Get<Window>("window");
-        using var bitmap = await window.CreateImageBitmap(blob);
-        int w = (int)bitmap.Width, h = (int)bitmap.Height;
-        double shrink = Math.Min(1.0, (double)MaxSide / Math.Max(w, h));
-        int nw = Math.Max(16, (int)Math.Round(w * shrink)), nh = Math.Max(16, (int)Math.Round(h * shrink));
-        using var canvas = new HTMLCanvasElement();
-        canvas.Width = nw; canvas.Height = nh;
-        using var ctx = canvas.Get2DContext();
-        ctx.DrawImage(bitmap, 0, 0, nw, nh);
-        using var imageData = ctx.GetImageData(0, 0, nw, nh);
-        using var data = imageData.Data;
-        return new Flux2ReferenceImage(nw, nh, data.ReadBytes());
+        var (w, h, rgba) = await SpawnDev.ILGPU.ML.Demo.Services.ImageDisplayHelper.DecodeAsync(JS, imageBytes, MaxSide);
+        return new Flux2ReferenceImage(w, h, rgba);
     }
 }
 

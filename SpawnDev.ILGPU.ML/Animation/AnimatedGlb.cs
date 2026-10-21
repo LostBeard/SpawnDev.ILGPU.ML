@@ -27,7 +27,11 @@ public static class AnimatedGlb
         foreach (int n in joints) if (nodes[n]!["children"] is JsonArray ch) foreach (var c in ch) childOf.Add(c!.GetValue<int>());
         int rootJoint = Array.FindIndex(joints, n => !childOf.Contains(n));
 
-        var data = new MemoryStream(); data.Write(bin);
+        // Sized for everything that gets appended, so the stream never grows: a growing MemoryStream asks for double its size in one piece, and in the browser's
+        // fragmented 32-bit heap a 90 MB binary chunk (a 1M-triangle model with a 4096 texture) could not get its 180 MB ("Out of memory" in MemoryStream.set_Capacity).
+        long extra = 4;
+        foreach (var clip in clips) extra += (long)clip.Frames * (4 + J * 16 + 12) + 4L * (J + 2);
+        var data = new MemoryStream(checked((int)(bin.Length + extra))); data.Write(bin);
         int AddView(ReadOnlySpan<byte> bytes)
         {
             while (data.Length % 4 != 0) data.WriteByte(0);

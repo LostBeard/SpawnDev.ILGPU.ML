@@ -72,7 +72,11 @@
                         <div class="t3d-pick-item">
                             <img src="@c.Url" alt="seed @c.Seed" />
                             <button class="t3d-btn small" @onclick="() => MakeFromAsync(c)" disabled="@_isRunning">Make 3D from this</button>
-                            <span class="t3d-hint">seed @c.Seed</span>
+                            @if (_imageModel != "sd")
+                            {
+                                <PictureEditBox Disabled="@_isRunning" OnApply="@(text => EditCandidateAsync(c, text))" />
+                            }
+                            <span class="t3d-hint">seed @c.Seed@(c.Note == null ? "" : " · " + c.Note)</span>
                         </div>
                     }
                 </div>
@@ -86,6 +90,12 @@
         <p class="t3d-hint">Best results: one whole object. Images with a transparent background are used as is; others are cut out with RMBG-1.4 first.</p>
         @if (_imageBytes != null)
         {
+            <PictureEditBox Disabled="@_isRunning" OnApply="EditUploadedImageAsync" Placeholder="change something in this picture first, e.g. arms further from the body"
+                            Title="Tell the image model what to change in your picture before it is built in 3D (FLUX reference-image editing; the first change downloads FLUX.2 klein, 4.6 GB, if it is not loaded yet)." />
+            @if (_beforeEdit != null)
+            {
+                <button class="t3d-btn small" @onclick="RestoreOriginalImageAsync" disabled="@_isRunning">Restore the original picture</button>
+            }
             <button class="t3d-btn" @onclick="GenerateFromImage" disabled="@_isRunning">@ButtonLabel</button>
         }
     }
@@ -276,6 +286,8 @@
     private SpawnDev.SpawnJS.JSObjects.ImageData? _imageData;
     private SpawnDev.SpawnJS.JSObjects.TypedArray? _imageBytes;
     private int _imageWidth, _imageHeight;
+    private byte[]? _imageEncoded;                      // the picture as the browser loaded it (PNG / JPEG ...), what "Change this picture" starts from
+    private (byte[] Encoded, string Url)? _beforeEdit;  // the picture before its first change: "Restore the original picture"
     private byte[]? _glb;
     private readonly List<(string Name, double Seconds)> _stages = new();
 
@@ -308,7 +320,7 @@
     private int _pictures = 1;                          // 1 = auto-pick the best fit; 4 / 8 = draw that many and let the user pick
     private bool _picking;
     private readonly List<Candidate> _candidates = new();
-    private sealed record Candidate(int Seed, int Width, int Height, byte[] Rgba, string Url);
+    private sealed record Candidate(int Seed, int Width, int Height, byte[] Rgba, string Url, string? Note = null);
     private SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline? _rmbg;
     private Trellis2ImageTo3D? _trellis;
 
@@ -642,6 +654,66 @@
         finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
     }
 
+    /// <summary>
+    /// "Change this picture": the image model edits the picture it drew (<see cref="SpawnDev.ILGPU.ML.Pipelines.PictureEditor"/>: FLUX reference-image editing) and the result is added as a new candidate
+    /// right after it, so a picture that is nearly right (an arm in the way, a prop in the hands, the wrong colour) is fixed instead of re-rolled. SD Turbo has no reference images.
+    /// </summary>
+    private async Task EditCandidateAsync(Candidate c, string instruction)
+    {
+        if (string.IsNullOrWhiteSpace(instruction) || _imageModel == "sd" || _isRunning) return;
+        Begin();
+        try
+        {
+            if (!await EnsureAcceleratorAsync()) return;
+            await EnsureImageModelAsync();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int seed = _nextSeed++;
+            _currentStage = $"changing the picture (seed {c.Seed}): {instruction}"; StateHasChanged();
+            var (w, h, rgba) = await EditPictureAsync(instruction, c.Width, c.Height, c.Rgba, seed);
+            var edited = new Candidate(seed, w, h, rgba, Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h), $"changed from seed {c.Seed}: {(instruction.Length > 60 ? instruction[..60] + "…" : instruction)}");
+            _candidates.Insert(Math.Min(_candidates.IndexOf(c) + 1, _candidates.Count), edited);
+            OnStageDone($"change of seed {c.Seed}", sw.Elapsed.TotalSeconds);
+        }
+        catch (Exception ex) { Fail(ex); }
+        finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
+    }
+
+    /// <summary>One edit with the page's FLUX model (the one that is loaded and chosen).</summary>
+    private Task<(int Width, int Height, byte[] Rgba)> EditPictureAsync(string instruction, int width, int height, byte[] rgba, int seed)
+        => SpawnDev.ILGPU.ML.Pipelines.PictureEditor.EditAsync(_imageModel == "flux3" ? _flux3 : null, _imageModel == "flux2" ? _flux : null, instruction, width, height, rgba, seed,
+            (stage, i, n) => { TraceVram(stage); _currentStage = stage.StartsWith("denoise") ? $"changing the picture: step {i + 1} / {n}" : $"changing the picture: {stage}"; _ = InvokeAsync(StateHasChanged); });
+
+    /// <summary>Image to 3D: change the picture you dropped before it is built (the same FLUX editing; FLUX.2 klein unless FLUX 3 was chosen on the Text to 3D tab).</summary>
+    private async Task EditUploadedImageAsync(string instruction)
+    {
+        if (_imageEncoded == null || string.IsNullOrWhiteSpace(instruction) || _isRunning) return;
+        Begin();
+        try
+        {
+            if (!await EnsureAcceleratorAsync()) return;
+            if (_imageModel == "sd") _imageModel = "flux2";          // SD Turbo has no reference images; this tab has no model choice
+            await EnsureImageModelAsync();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _currentStage = $"changing the picture: {instruction}"; StateHasChanged();
+            var (w, h, rgba) = await Services.ImageDisplayHelper.DecodeAsync(JS, _imageEncoded, 768);
+            var (ew, eh, edited) = await EditPictureAsync(instruction, w, h, rgba, _nextSeed++);
+            var url = Services.ImageDisplayHelper.ToDataUrl(JS, edited, ew, eh);
+            _beforeEdit ??= (_imageEncoded, _imageDataUrl ?? "");
+            _imageDataUrl = url;
+            await ApplyImageAsync(Convert.FromBase64String(url[(url.IndexOf(',') + 1)..]));
+            OnStageDone("change of the picture", sw.Elapsed.TotalSeconds);
+        }
+        catch (Exception ex) { Fail(ex); }
+        finally { _isRunning = false; _isLoading = false; _currentStage = null; StateHasChanged(); }
+    }
+
+    private async Task RestoreOriginalImageAsync()
+    {
+        if (_beforeEdit is not { } before) return;
+        _beforeEdit = null; _imageDataUrl = before.Url;
+        await ApplyImageAsync(before.Encoded);
+    }
+
     private async Task MakeFromAsync(Candidate c)
     {
         Begin();
@@ -875,7 +947,13 @@
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
-        _error = null;
+        _beforeEdit = null;                             // a new picture from the drop zone: nothing to restore
+        await ApplyImageAsync(imageBytes);
+    }
+
+    private async Task ApplyImageAsync(byte[] imageBytes)
+    {
+        _error = null; _imageEncoded = imageBytes;
         try
         {
             using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(new[] { imageBytes });

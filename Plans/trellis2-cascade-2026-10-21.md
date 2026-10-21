@@ -33,3 +33,18 @@ Ubuntu, user zed, no sudo; micromamba env `~/t2` (py3.10, torch 2.6.0+cu124, fla
 - 1536 in a browser (segmented tensors or fp16 last level); desktop 1536 peaks at 11.9 GB, so a 12 GB card with a busy desktop is at the edge (an OOM-driven step-down would help).
 - Re-run the heavy CPU group and the rest of the PMT gate before a release (not run for this batch).
 - Offer the examples from the 72 official images.
+
+## The faceted gold visor (astronaut GIF), measured against the reference
+
+The astronaut's mirror-gold visor shows square facets in the GIF. Same input (the astronaut cut-out), same seed 21, same `1024_cascade`, 1M-face target; helmet region = the top 12 % of the model; "normal jump" = the angle between the vertex normals at the two ends of an edge (a smooth sphere of the visor's radius would give about 1.4 degrees at 2.6 voxels):
+
+| | edge length | normal jump, mean / p90 | face vs vertex normal, mean |
+|---|---|---|---|
+| ours, 1M faces | 2.63 voxels | 16.7 / 46.5 deg | 8.8 deg |
+| reference, 963k faces | 2.60 voxels | 11.7 / 33.6 deg | 5.8 deg |
+| ours, NOT simplified (7.9M faces) | 0.96 voxels | 6.6 / 15.9 deg | 3.4 deg |
+| reference, NOT simplified | 0.95 voxels | 4.2 / 10.6 deg | 2.2 deg |
+
+- Mesh density is the same as the reference's at equal face count, and normals are computed on the welded mesh before the UV split in both (reference: `mesh.compute_vertex_normals()` before `uv_unwrap`). Neither GLB has a normal map.
+- The roughness is already in the un-simplified surface (voxel-scale bumps, about 4 degrees in the reference and 6.6 in ours) and grows with the edge length, so simplification (8x) only makes it visible. Ours is about 1.5x rougher than the reference at both stages, but the two runs draw different noise (different RNG), so one pair cannot tell implementation from sample. To settle it: several images/seeds, or feed the reference's remesher our decoder mesh.
+- Options, in order of cost: (1) feature-preserving smoothing of the vertex normals (average with neighbours within about 35 degrees; a tiny device kernel next to `VertexNormalsImpl`), which removes the facets on glossy surfaces without touching the geometry; (2) a higher face target (2M) when a model is mostly smooth gloss; (3) a tangent-space normal map baked from the 7.9M-face remeshed surface onto the simplified UV mesh (the bake already has a "read from the original mesh" path): restores curvature lost to the decimation, but a normal map cannot come from the latent (it holds colour, metal, roughness, alpha, not normals). None of these is the reference's behaviour (parity); (1) is the cheap one.

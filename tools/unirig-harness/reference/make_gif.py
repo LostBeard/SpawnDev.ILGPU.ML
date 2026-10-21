@@ -1,6 +1,6 @@
 """Assemble the README GIF from the frames make-gif-frames.mjs captured from the demo page.
 
-  python -I make_gif.py <frames_dir> <out.gif> "<prompt>" [width=480] [fps=15] ["FLUX.2 klein" footer label] ["FLUX.2 (1024 px) draws it" first-stage caption]
+  python -I make_gif.py <frames_dir> <out.gif> "<prompt>" [width=480] [fps=15] ["FLUX.2 klein" footer label] ["FLUX.2 (1024 px) draws it" first-stage caption] ["TRELLIS.2" 3D stage name] [palette colors=96]
 
 Stages (file prefixes): A = the generated model turning, B = the skeleton over the model, C / D / E = dance, wave, walk. A card with the prompt and the picture opens it.
 Each frame is cropped to the subject, captioned, and the whole GIF shares one adaptive palette so it stays small.
@@ -13,6 +13,8 @@ W = int(sys.argv[4]) if len(sys.argv) > 4 else 480
 FPS = int(sys.argv[5]) if len(sys.argv) > 5 else 15
 IMG_CHAIN = sys.argv[6] if len(sys.argv) > 6 else 'FLUX.2 klein'                                    # the picture stage in the footer chain
 IMG_DRAWS = sys.argv[7] if len(sys.argv) > 7 else 'FLUX.2 (1024 px) draws it'                       # and in the first stage's caption
+T3D = sys.argv[8] if len(sys.argv) > 8 else 'TRELLIS.2'                                              # the 3D stage's name in the footer chain and the caption (e.g. 'TRELLIS.2 1024 cascade')
+COLORS = int(sys.argv[9]) if len(sys.argv) > 9 else 96                                                # shared palette size (up to 256)
 BG = (15, 20, 31)          # the viewer clears to this (0.06, 0.08, 0.12); frames are tested against it
 
 
@@ -111,12 +113,12 @@ for ln in wrap('"' + prompt + '"', f, W - 290, d): d.text((20, y), ln, font=f, f
 pic = os.path.join(src, 'picture.png')
 if os.path.exists(pic):
     p = Image.open(pic).convert('RGB').resize((240, 240), Image.LANCZOS); intro.paste(p, (W - 260, 90))
-d.text((20, H - 90), f'{IMG_CHAIN}  >  TRELLIS.2  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
+d.text((20, H - 90), f'{IMG_CHAIN}  >  {T3D}  >  SkinTokens  >  Kimodo', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 62), 'all on the GPU, all in the browser', font=font(15), fill=(140, 155, 180))
 d.text((20, H - 34), 'SpawnDev.ILGPU.ML', font=font(16, True), fill=(110, 130, 170))
 
 seq = [(intro, 38)]
-A = [card('1', 'Text to 3D', f'{IMG_DRAWS}, TRELLIS.2 builds mesh + PBR textures')(im) for im in allf['A']]
+A = [card('1', 'Text to 3D', f'{IMG_DRAWS}, {T3D} builds mesh + PBR textures')(im) for im in allf['A']]
 B = [card('2', 'Rig', 'SkinTokens writes the skeleton and learned skin weights')(im) for im in allf['B']]
 CDE = [card('3', 'Animate', 'Kimodo moves retargeted onto the generated skeleton')(im) for k in 'CDE' for im in allf[k]]
 for im in A + B + CDE: seq.append((im, 1))
@@ -125,7 +127,7 @@ durations = [int(1000 / FPS) * n if n == 1 else int(1000 / FPS) * n for im, n in
 # one shared palette: quantise a montage of sample frames, then map every frame onto it
 sample = Image.new('RGB', (W, H * 6)); step = max(1, len(images) // 6)
 for i in range(6): sample.paste(images[min(i * step, len(images) - 1)], (0, i * H))
-pal = sample.quantize(colors=96, method=Image.Quantize.MEDIANCUT)
+pal = sample.quantize(colors=COLORS, method=Image.Quantize.MEDIANCUT)
 q = [im.quantize(palette=pal, dither=Image.Dither.NONE) for im in images]
 q[0].save(out, save_all=True, append_images=q[1:], duration=durations, loop=0, optimize=True, disposal=1)
 print(len(q), 'frames', (W, H), round(os.path.getsize(out) / 1e6, 2), 'MB ->', out)

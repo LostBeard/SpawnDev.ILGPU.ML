@@ -28,6 +28,9 @@ try {
   const send = (method, params = {}) => new Promise(r => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
   const ev = async expr => { const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true, timeout: 120000 }); return r.result?.exceptionDetails ? 'EXC ' + JSON.stringify(r.result.exceptionDetails.exception?.description ?? r.result.exceptionDetails.text) : r.result?.result?.value; };
   await send('Page.enable'); await send('Runtime.enable');
+  // sharp frames: the page is laid out at 1400 x 1100 but rendered at GIF_DSF x the pixels (the viewer's renderer follows devicePixelRatio, up to 2), and each frame is a whole-viewport screenshot (a clip of the canvas comes out blank: the WebGL canvas is not captured through a clip) that make_gif.py crops by rect.json
+  const DSF = Number(process.env.GIF_DSF ?? 2), DIST = Number(process.env.GIF_DIST ?? 1.45);   // GIF_DIST: the camera distance (the viewer's default 1.8 leaves a standing figure at half the frame)
+  await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 1100, deviceScaleFactor: DSF, mobile: false });
   // log WebGPU device-lost reasons (a lost device shows up in the page only as "A valid external Instance reference no longer exists")
   await send('Page.addScriptToEvaluateOnNewDocument', { source: `(()=>{const orig=GPUAdapter.prototype.requestDevice;GPUAdapter.prototype.requestDevice=async function(...a){const d=await orig.apply(this,a);d.lost.then(i=>console.error('[device.lost] reason='+i.reason+' message='+i.message));d.addEventListener('uncapturederror',e=>console.error('[uncapturederror] '+(e.error&&e.error.message)));return d;};})()` });
   await send('Page.navigate', { url: URL_ });
@@ -35,6 +38,8 @@ try {
   const shot = async name => { const r = await send('Page.captureScreenshot', { format: 'png' }); writeFileSync(join(OUT, name), Buffer.from(r.result.data, 'base64')); };
   const setSel = (valueMatch, v) => ev(`(()=>{const s=[...document.querySelectorAll('select.t3d-select')].find(x=>[...x.options].some(o=>o.value==='${valueMatch}'));if(!s)return 'nosel';s.value='${v}';s.dispatchEvent(new Event('change',{bubbles:true}));return s.value})()`);
   console.log('image model', await setSel('flux3', 'flux3'), '| pictures', await setSel('8', PICS));
+  // the 3D quality (GIF_DETAIL 512 | 1024 | 1024c | 1536c, GIF_FACES, GIF_TEXTURE; defaults: the best the browser runs: the 1024 cascade, 1M triangles, a 4096 texture)
+  console.log('detail', await setSel('1024c', process.env.GIF_DETAIL ?? '1024c'), '| triangles', await setSel('1000000', process.env.GIF_FACES ?? '1000000'), '| texture', await setSel('4096', process.env.GIF_TEXTURE ?? '4096'));
   await ev(`(()=>{const p=document.querySelector('.t3d-prompt');p.value=${JSON.stringify(PROMPT)};p.dispatchEvent(new Event('input',{bubbles:true}));const s=document.querySelector('.t3d-num');s.value='${SEED}';s.dispatchEvent(new Event('input',{bubbles:true}));s.dispatchEvent(new Event('change',{bubbles:true}))})()`);
   // the caption writer: make sure its box is ticked
   console.log('caption writer ticked:', await ev(`(()=>{const c=[...document.querySelectorAll('label')].find(l=>/full caption/.test(l.textContent))?.querySelector('input[type=checkbox]');if(!c)return 'nobox';if(!c.checked)c.click();return c.checked})()`));
@@ -71,10 +76,10 @@ try {
   }
   await ev(`document.getElementById('t3d-canvas').scrollIntoView({block:'center'})`); await sleep(1200);
   const rect = JSON.parse(await ev(`JSON.stringify(document.getElementById('t3d-canvas').getBoundingClientRect())`));
-  writeFileSync(join(OUT, 'rect.json'), JSON.stringify(rect)); console.log('canvas', JSON.stringify(rect));
+  writeFileSync(join(OUT, 'rect.json'), JSON.stringify({ x: Math.round(rect.x * DSF), y: Math.round(rect.y * DSF), width: Math.round(rect.width * DSF), height: Math.round(rect.height * DSF) })); console.log('canvas', JSON.stringify(rect));   // in the pixels of the (DSF x) screenshots
   await shot('S3_model.png');
   const frame = async name => { await sleep(110); await shot(name); };
-  const pose = (which, t, yaw, skel) => ev(`(()=>{glbViewer.skeleton('t3d-canvas', ${skel});return glbViewer.pose('t3d-canvas', ${JSON.stringify(which)}, ${t}, ${yaw}, true)})()`);
+  const pose = (which, t, yaw, skel) => ev(`(()=>{glbViewer.skeleton('t3d-canvas', ${skel});return glbViewer.pose('t3d-canvas', ${JSON.stringify(which)}, ${t}, ${yaw}, true, ${DIST})})()`);
   const TAU = Math.PI * 2;
   const waitFor = async (what, cond, maxS) => { for (let i = 0; i < maxS / 3; i++) { await sleep(3000); const v = await ev(cond); if (v && v !== 'false') return v; const err = await ev(`document.querySelector('.error-banner')?.innerText ?? ''`); if (err) { console.log('ERROR while waiting for', what, err.slice(0, 400)); return null; } } console.log('timeout waiting for', what); return null; };
   for (let k = 0; k < 36; k++) { await pose(-1, 0, 0.5 + TAU * k / 36, false); await frame(`A_${String(k).padStart(3, '0')}.png`); }

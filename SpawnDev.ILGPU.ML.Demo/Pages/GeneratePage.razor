@@ -139,8 +139,12 @@
                     {
                         <div class="gen-grid-item">
                             <img src="@item.Url" alt="Generated image, seed @item.Seed" />
-                            <span class="gen-info-item">seed @item.Seed</span>
+                            <span class="gen-info-item">seed @item.Seed@(item.Note == null ? "" : " · " + item.Note)</span>
                             <button class="action-btn download-btn" @onclick="() => DownloadPicture(item)">Download</button>
+                            @if (_model != "sd")
+                            {
+                                <PictureEditBox Disabled="@(_isRunning || _isModelLoading)" OnApply="@(text => EditPictureAsync(item, text))" />
+                            }
                         </div>
                     }
                 </div>
@@ -148,6 +152,10 @@
             else
             {
                 <img src="@_generatedImageUrl" alt="Generated image" class="gen-result-img" />
+                @if (_model != "sd" && _gallery.Count == 1)
+                {
+                    <div style="max-width: 420px; margin: 0.6rem auto 0;"><PictureEditBox Disabled="@(_isRunning || _isModelLoading)" OnApply="@(text => EditPictureAsync(_gallery[0], text))" /></div>
+                }
             }
             <div class="gen-result-info">
                 <span class="gen-info-item">@_inferenceMs.ToString("F0")ms</span>
@@ -316,7 +324,7 @@
     private bool _expandPrompt;                         // FLUX 3: a local LLM writes the full scene caption first
     private string? _usedCaption, _timings;
     private int _pictures = 1;                          // 1, 4 or 8 pictures of the prompt (consecutive seeds), shown together
-    private sealed record GalleryItem(int Seed, string Url);
+    private sealed record GalleryItem(int Seed, string Url, int Width, int Height, byte[] Rgba, string? Note = null);
     private readonly List<GalleryItem> _gallery = new();
     private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
 
@@ -547,7 +555,7 @@
                     finally { _pipeline.OnProgress -= OnPipelineProgress; }
                 }
                 var url = Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h);
-                _gallery.Add(new GalleryItem(seed, url));
+                _gallery.Add(new GalleryItem(seed, url, w, h, rgba));
                 _generatedImageUrl = url; _usedSeed = seed; _resultWidth = w; _resultHeight = h;
                 _inferenceMs = total.Elapsed.TotalMilliseconds;
                 await InvokeAsync(StateHasChanged);
@@ -560,6 +568,41 @@
             Console.WriteLine($"[Generate] Error: {ex}");
         }
 
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// "Change this picture": FLUX reference-image editing of one of the pictures on the page (<see cref="SpawnDev.ILGPU.ML.Pipelines.PictureEditor"/>): the picture is the reference, the instruction says what to change,
+    /// and the result is added right after it (a picture that is nearly right is fixed instead of re-rolled; edit the edit to keep going). SD Turbo has no reference images.
+    /// </summary>
+    private async Task EditPictureAsync(GalleryItem item, string instruction)
+    {
+        if (_isRunning || string.IsNullOrWhiteSpace(instruction) || _model == "sd") return;
+        var flux3 = _model == "flux3" ? _flux3 : null; var flux2 = _model == "flux2" ? _flux : null;
+        if (flux3 == null && flux2 == null) return;
+        _error = null; _isRunning = true; _currentStep = 0; StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            var total = System.Diagnostics.Stopwatch.StartNew();
+            int seed = _gallery.Max(g => g.Seed) + 1;
+            _numSteps = flux3 != null ? 16 : 4;
+            var (w, h, rgba) = await SpawnDev.ILGPU.ML.Pipelines.PictureEditor.EditAsync(flux3, flux2, instruction, item.Width, item.Height, item.Rgba, seed,
+                (stage, i, c) => { _modelStatusText = $"{ModelLabel} — changing the picture: {stage}"; _currentStep = stage.StartsWith("denoise") ? i + 1 : 0; _ = InvokeAsync(StateHasChanged); });
+            var url = Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h);
+            var edited = new GalleryItem(seed, url, w, h, rgba, $"changed from seed {item.Seed}: {(instruction.Length > 60 ? instruction[..60] + "…" : instruction)}");
+            _gallery.Insert(Math.Min(_gallery.IndexOf(item) + 1, _gallery.Count), edited);
+            _generatedImageUrl = url; _usedSeed = seed; _resultWidth = w; _resultHeight = h; _inferenceMs = total.Elapsed.TotalMilliseconds;
+            _usedCaption = null;
+            if (flux3 != null) _timings = string.Join(" · ", flux3.LastTimings.Select(x => $"{x.Stage} {x.Seconds:F1} s"));
+            _modelStatusText = ModelLabel;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            Console.WriteLine($"[Generate] Edit error: {ex}");
+        }
         _isRunning = false;
         StateHasChanged();
     }
