@@ -124,12 +124,7 @@ public sealed class FlowSampler
     /// </summary>
     public void Sample(Model model, FV x, int count, Options o, Action<int, int>? progress = null, Action<int, double>? afterStep = null)
     {
-        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
-        _cfg ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(CfgImpl);
-        _partial ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, DV, int, float, float>(PartialImpl);
-        _finish ??= _acc.LoadAutoGroupedStreamKernel<Index1D, DV, FV, int>(FinishImpl);
-        _rescale ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float, float, float>(RescaleImpl);
-
+        LoadKernels();
         using var vPos = _acc.Allocate1D<float>(count);
         using var vNeg = _acc.Allocate1D<float>(count);
         using var pred = _acc.Allocate1D<float>(count);
@@ -137,32 +132,73 @@ public sealed class FlowSampler
         using var stds = _acc.Allocate1D<float>(2);
 
         var steps = Schedule(o.Steps, o.RescaleT);
-        float sigma = o.SigmaMin;
         for (int step = 0; step < steps.Length; step++)
         {
             var (t, tPrev) = steps[step];
-            float t1000 = (float)(1000 * t);
-            if (!UsesGuidance(o, t))
-            {
-                model(x, t1000, true, pred.View);
-            }
-            else
-            {
-                model(x, t1000, true, vPos.View);
-                model(x, t1000, false, vNeg.View);
-                _cfg(count, vPos.View, vNeg.View, pred.View, o.GuidanceStrength);
-                if (o.GuidanceRescale > 0f)
-                {
-                    float tf = (float)t;
-                    _partial(Slices, x, vPos.View, pred.View, sums.View, count, 1f - sigma, sigma + (1f - sigma) * tf);
-                    _finish(1, sums.View, stds.View, count);
-                    _rescale(count, x, pred.View, stds.View, sigma, tf, o.GuidanceRescale);
-                }
-            }
-            _axpy(count, x, pred.View, (float)(t - tPrev));
+            Step(model, x, count, o, t, tPrev, vPos.View, vNeg.View, pred.View, sums.View, stds.View);
             afterStep?.Invoke(step, tPrev);                     // x is now at time tPrev: RePaint-style editing puts the known part back here
             _acc.Fence();
             progress?.Invoke(step + 1, steps.Length);
         }
+    }
+
+    /// <summary>
+    /// <see cref="Sample"/> that waits for the device after every step (browser: a real <c>SynchronizeAsync</c>, so the page can repaint and
+    /// the queue never holds more than one step). <see cref="Sample"/> only flushes: a 20k-token flow (25 s of GPU time per model call) then
+    /// had all of its 12 steps queued within a fraction of a second, and the browser lost the WebGPU device (DXGI_ERROR_DEVICE_HUNG) seconds in.
+    /// </summary>
+    public async Task SampleAsync(Model model, FV x, int count, Options o, Action<int, int>? progress = null, Action<int, double>? afterStep = null, CancellationToken ct = default)
+    {
+        LoadKernels();
+        using var vPos = _acc.Allocate1D<float>(count);
+        using var vNeg = _acc.Allocate1D<float>(count);
+        using var pred = _acc.Allocate1D<float>(count);
+        using var sums = _acc.Allocate1D<double>(Slices * 4);
+        using var stds = _acc.Allocate1D<float>(2);
+
+        var steps = Schedule(o.Steps, o.RescaleT);
+        for (int step = 0; step < steps.Length; step++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var (t, tPrev) = steps[step];
+            Step(model, x, count, o, t, tPrev, vPos.View, vNeg.View, pred.View, sums.View, stds.View);
+            afterStep?.Invoke(step, tPrev);
+            await _acc.WaitAsync();
+            progress?.Invoke(step + 1, steps.Length);
+        }
+    }
+
+    private void LoadKernels()
+    {
+        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
+        _cfg ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(CfgImpl);
+        _partial ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, DV, int, float, float>(PartialImpl);
+        _finish ??= _acc.LoadAutoGroupedStreamKernel<Index1D, DV, FV, int>(FinishImpl);
+        _rescale ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float, float, float>(RescaleImpl);
+    }
+
+    /// <summary>One Euler step: the velocity (guided or not), then x = x - (t - t_prev) * v. Queues the work; the caller fences or waits.</summary>
+    private void Step(Model model, FV x, int count, Options o, double t, double tPrev, FV vPos, FV vNeg, FV pred, DV sums, FV stds)
+    {
+        float sigma = o.SigmaMin;
+        float t1000 = (float)(1000 * t);
+        if (!UsesGuidance(o, t))
+        {
+            model(x, t1000, true, pred);
+        }
+        else
+        {
+            model(x, t1000, true, vPos);
+            model(x, t1000, false, vNeg);
+            _cfg!(count, vPos, vNeg, pred, o.GuidanceStrength);
+            if (o.GuidanceRescale > 0f)
+            {
+                float tf = (float)t;
+                _partial!(Slices, x, vPos, pred, sums, count, 1f - sigma, sigma + (1f - sigma) * tf);
+                _finish!(1, sums, stds, count);
+                _rescale!(count, x, pred, stds, sigma, tf, o.GuidanceRescale);
+            }
+        }
+        _axpy!(count, x, pred, (float)(t - tPrev));
     }
 }

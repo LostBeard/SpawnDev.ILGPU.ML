@@ -33,6 +33,11 @@ public sealed class Trellis2Options
     /// out paler: use 512 for colour fidelity, 1024 for fine geometry.
     /// </summary>
     public int Resolution { get; init; } = 512;
+    /// <summary>
+    /// The reference's CASCADE pipelines (<c>1024_cascade</c>, its default, and <c>1536_cascade</c>): the coarse shape from the 512 model, its decoder's upsampling as the high-resolution token set, then the 1024 models on it, decoded at
+    /// <see cref="Resolution"/> (1024 or 1536; the token cap can lower 1536 to 1408, 1280 or 1024). Without it, 1024 is the plain <c>1024</c> pipeline (the structure at 64^3). 1536 needs the cascade.
+    /// </summary>
+    public bool Cascade { get; init; }
     /// <summary>The mesh is simplified to about this many triangles before the UV unwrap (0 keeps the full dual-grid mesh, 1-2.5M triangles). Measured on the official crown: 120k looks the same as 300k; at 40-50k thin sheets shred and texels go missing.</summary>
     public int MaxFaces { get; init; } = 150_000;
     /// <summary>
@@ -163,7 +168,9 @@ public sealed class Trellis2ImageTo3D : IDisposable
     public async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> GenerateAsync(IV rgba, int width, int height, Trellis2Options? options, CancellationToken ct = default)
     {
         options ??= new Trellis2Options();
-        if (options.Resolution != 512 && options.Resolution != 1024) throw new ArgumentException("Resolution must be 512 or 1024");
+        if (options.Resolution != 512 && options.Resolution != 1024 && options.Resolution != 1536) throw new ArgumentException("Resolution must be 512, 1024 or 1536");
+        if (options.Resolution == 1536 && !options.Cascade) throw new ArgumentException("Resolution 1536 is the 1536_cascade pipeline: set Cascade");
+        if (options.Cascade && options.Resolution == 512) throw new ArgumentException("A cascade runs at 1024 or 1536");
         var sw = Stopwatch.StartNew();
         // WebGPU: the large kernels' pipelines build in the background, in parallel, while the image is prepared and DINOv3 loads
         _precompile ??= Task.WhenAll(_dk.PrecompileAsync(), _sk.PrecompileAsync());
@@ -184,7 +191,7 @@ public sealed class Trellis2ImageTo3D : IDisposable
                 await _precompile;                           // a launch while its pipeline is still building would compile it a second time
                 using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
                 dino.Extract(image.View, 512, cond.View);
-                if (options.Resolution == 1024)
+                if (options.Resolution >= 1024)
                 {
                     // the same preprocessed image resampled to 1024 px for the shape / texture flows
                     using var image1024 = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 1024);
@@ -203,6 +210,8 @@ public sealed class Trellis2ImageTo3D : IDisposable
 
             var output = options.Resolution == 512
                 ? await pipeline.Run512Async(cond.View, tokens, options.Seed, ct)
+                : options.Cascade
+                ? await pipeline.RunCascadeAsync(options.Resolution, cond.View, tokens, cond1024!.View, tokens1024, options.Seed, ct: ct)
                 : (Environment.GetEnvironmentVariable("TRELLIS2_EXP_COND512") == "1"
                     ? await pipeline.Run1024Async(cond.View, tokens, cond.View, tokens, options.Seed, ct)
                     : await pipeline.Run1024Async(cond.View, tokens, cond1024!.View, tokens1024, options.Seed, ct));

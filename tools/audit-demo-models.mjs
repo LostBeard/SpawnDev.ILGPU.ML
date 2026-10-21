@@ -112,7 +112,7 @@ for (const route of routes) {
         if (!p.canceled) failed.push({ url: r?.url ?? '?', error: p.errorText, cors: p.corsErrorStatus?.corsError, blocked: p.blockedReason, type: p.type });
       } else if (m.method === 'Runtime.consoleAPICalled') {
         const text = p.args.map(a => a.value ?? a.description ?? '').join(' ');
-        if (p.type === 'error') consoleErrors.push(text.slice(0, 400)); else if (/\[VRAM\]|device lost|fallback/i.test(text)) info.push(text.slice(0, 300));
+        if (p.type === 'error') consoleErrors.push(text.slice(0, 400)); else if (/\[VRAM\]|\[FlowDiag\]|device lost|fallback/i.test(text)) info.push(`t=${(p.timestamp / 1000 % 10000).toFixed(1)} ` + text.slice(0, 300));
       } else if (m.method === 'Runtime.exceptionThrown') {
         exceptions.push((p.exceptionDetails.exception?.description ?? p.exceptionDetails.text ?? '').slice(0, 500));
       } else if (m.method === 'Log.entryAdded' && p.entry.level === 'error') {
@@ -157,13 +157,29 @@ for (const route of routes) {
       async typeNth(sel, n, text) { const ok = await ev(`(()=>{const e=document.querySelectorAll(${JSON.stringify(sel)})[${n}];if(!e)return false;e.focus();e.value=${JSON.stringify(text)};e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return true;})()`); if (!ok) throw new Error(`no input #${n}: ${sel}`); },
       async count(sel) { return ev(`document.querySelectorAll(${JSON.stringify(sel)}).length`); },
       async text(sel) { return ev(`(document.querySelector(${JSON.stringify(sel)})?.innerText ?? '').replace(/\\s+/g,' ').trim()`); },
+      // Click a button whose page code downloads a blob (an <a download href=blob:> click) and save those bytes to outPath: how a scenario gets the file the user would get.
+      async saveDownload(buttonSel, buttonRe, outPath) {
+        await ev(`(()=>{window.__cap=null;if(!window.__origAClick){window.__origAClick=HTMLAnchorElement.prototype.click;HTMLAnchorElement.prototype.click=function(){if((this.href||'').startsWith('blob:')){window.__cap=this.href;return;}return window.__origAClick.call(this);};}})()`);
+        await this.clickText(buttonSel, buttonRe);
+        await this.waitFor('window.__cap', 30000, 'the download link');
+        // read the blob in small slices: one 28 MB evaluate result never came back over CDP
+        const size = await ev('(async()=>{window.__blob=await (await fetch(window.__cap)).blob();return window.__blob.size;})()');
+        const parts = [];
+        for (let off = 0; off < size; off += 524288) {
+          const b64 = await ev(`(async()=>{const b=new Uint8Array(await window.__blob.slice(${off},${Math.min(off + 524288, size)}).arrayBuffer());let s='';for(let i=0;i<b.length;i+=0x4000)s+=String.fromCharCode.apply(null,b.subarray(i,i+0x4000));return btoa(s);})()`);
+          parts.push(Buffer.from(b64, 'base64'));
+        }
+        mkdirSync(join(outPath, '..'), { recursive: true });
+        writeFileSync(outPath, Buffer.concat(parts));
+        return outPath;
+      },
       async upload(sel, file) { const doc = await page.send('DOM.getDocument', { depth: 0 }); const q = await page.send('DOM.querySelector', { nodeId: doc.root.nodeId, selector: sel }); if (!q.nodeId) throw new Error('no file input: ' + sel); await page.send('DOM.setFileInputFiles', { nodeId: q.nodeId, files: [resolve(file)] }); },
       async shot(name) { const r = await page.send('Page.captureScreenshot', { format: 'png' }); const f = join(OUT, `${route.replace(/\W+/g, '_') || 'home'}_${name}.png`); writeFileSync(f, Buffer.from(r.data, 'base64')); return f; },
       async mounted() { await h.waitFor(`(document.querySelector('#app')?.children.length ?? 0) > 0 && document.body.innerText.trim().length > 40`, 120000, 'Blazor mounted'); },
     };
 
     console.log(`\n--- ${route} ${spec ? '' : '(load-only: no scenario yet)'}`);
-    await page.send('Page.navigate', { url: BASE + route.split('#')[0] });   // '/generate#flux3' = the /generate page, the 'flux3' scenario variant
+    await page.send('Page.navigate', { url: BASE + route.split('#')[0] + (process.env.AUDIT_QUERY ? '?' + process.env.AUDIT_QUERY : '') });   // '/generate#flux3' = the /generate page, the 'flux3' scenario variant
     await h.mounted();
     await sleep(1500);
     if (spec?.run) res.evidence = await spec.run(h);

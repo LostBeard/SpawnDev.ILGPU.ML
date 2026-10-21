@@ -43,6 +43,9 @@ public sealed class SparseVaeDecoder : IDisposable
     private readonly int _latentCh, _outCh;
     private readonly bool _predSubdiv;
 
+    /// <summary>Floats of the upsample conv's output held at a time (the rest of the decoder's buffers are at most one voxel tensor each): 128 Mi floats = 512 MB.</summary>
+    public static long ChunkFloats { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_C2S_CHUNK_FLOATS"), out var cf) && cf > 0 ? cf : 128L << 20;   // env: tests and A/B runs
+
     public int LatentChannels => _latentCh;
     public int OutChannels => _outCh;
     public bool PredictsSubdivision => _predSubdiv;
@@ -74,8 +77,8 @@ public sealed class SparseVaeDecoder : IDisposable
     public Result Decode(FV latent, IV coords0, int n0, int grid0, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide = null, bool keepSubdivisions = false, bool forceGuide = false)
         => Task.Run(() => DecodeAsync(latent, coords0, n0, grid0, guide, keepSubdivisions, forceGuide)).GetAwaiter().GetResult();
 
-    /// <summary><see cref="Decode"/>, browser-safe (the child counts are awaited readbacks).</summary>
-    public async Task<Result> DecodeAsync(FV latent, IV coords0, int n0, int grid0, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide = null, bool keepSubdivisions = false, bool forceGuide = false)
+    /// <summary><see cref="Decode"/>, browser-safe (the child counts are awaited readbacks). <paramref name="stopAfterUpsamples"/> &gt; 0 returns after that many channel-to-spatial upsamples with only <see cref="Result.Coords"/> set (a pred_subdiv decoder).</summary>
+    public async Task<Result> DecodeAsync(FV latent, IV coords0, int n0, int grid0, IReadOnlyList<(MemoryBuffer1D<float, Stride1D.Dense> Logits, int Count)>? guide = null, bool keepSubdivisions = false, bool forceGuide = false, int stopAfterUpsamples = 0)
     {
         // forceGuide (tests): a pred_subdiv decoder still computes its own logits (tapped as "level{i}_subdiv") but takes the
         // STRUCTURE from the guide, so a low-precision run cannot diverge from the reference voxel sets by one flipped logit.
@@ -96,14 +99,21 @@ public sealed class SparseVaeDecoder : IDisposable
             int C = _channels[i];
             if (_numBlocks[i] > 0)
             {
-                var y = F((long)n * C); var z = F((long)n * C); var hid = F((long)n * 4 * C);
+                // The MLP's hidden tensor [n, 4C] is the largest of the block (3.7 GB at 1024: more than the 2 GiB a WebGPU buffer can be), so the
+                // MLP runs over chunks of rows (a multiple of 64 so every chunk starts on a 256-byte boundary): hid holds one chunk.
+                int mlpRows = (int)Math.Min(n, Math.Max(64L, ChunkFloats / (4L * C) / 64 * 64));
+                var y = F((long)n * C); var z = F((long)n * C); var hid = F((long)mlpRows * 4 * C);
                 for (int j = 0; j < _numBlocks[i]; j++)
                 {
                     string p = $"blocks.{i}.{j}.";
                     _sk.Conv3(x.View, nbr.View, _w.F16(p + "conv.weight"), _w.F16(p + "conv.bias"), y.View, n, C, C);
                     _sk.LayerNorm(y.View, z.View, _w.F16(p + "norm.weight"), _w.F16(p + "norm.bias"), n, C, 1e-6f);
-                    _sk.Linear(z.View, _w.F16(p + "mlp.0.weight"), _w.F16(p + "mlp.0.bias"), hid.View, n, C, 4 * C, act: 1);
-                    _sk.Linear(hid.View, _w.F16(p + "mlp.2.weight"), _w.F16(p + "mlp.2.bias"), y.View, n, 4 * C, C, res: x.View);
+                    for (int r0 = 0; r0 < n; r0 += mlpRows)
+                    {
+                        int rows = Math.Min(mlpRows, n - r0);
+                        _sk.Linear(z.View.SubView((long)r0 * C, (long)rows * C), _w.F16(p + "mlp.0.weight"), _w.F16(p + "mlp.0.bias"), hid.View, rows, C, 4 * C, act: 1);
+                        _sk.Linear(hid.View, _w.F16(p + "mlp.2.weight"), _w.F16(p + "mlp.2.bias"), y.View.SubView((long)r0 * C, (long)rows * C), rows, 4 * C, C, res: x.View.SubView((long)r0 * C, (long)rows * C));
+                    }
                     (x, y) = (y, x);                        // y now holds the old x, reused as scratch
                 }
                 y.Dispose(); z.Dispose(); hid.Dispose();
@@ -134,17 +144,27 @@ public sealed class SparseVaeDecoder : IDisposable
             var xn = F((long)n * C);
             _sk.LayerNorm(x.View, xn.View, _w.F16(u + "norm1.weight"), _w.F16(u + "norm1.bias"), n, C, 1e-6f);
             _sk.SiluInPlace(xn.View, n * C);
-            var hc = F((long)n * outC * 8);
-            _sk.Conv3(xn.View, nbr.View, _w.F16(u + "conv1.weight"), _w.F16(u + "conv1.bias"), hc.View, n, C, outC * 8);
-            xn.Dispose();
-
+            // The children are counted first, then the conv that gives each parent its 8 children's channels runs over CHUNKS of parents and each chunk is scattered straight into the children's tensor: the [n, 8 * outC]
+            // conv output is never held whole (at 1024 it is 3.9 GB, more than the 2 GiB a WebGPU buffer can be, and it is the largest buffer of the decoder).
             using var offsets = I(n + 1);
             int m = await _sk.CountChildrenAsync(subdiv.View, n, offsets.View);
             var newCoords = I((long)m * 3); using var parent = I(m); using var slot = I(m);
             _sk.WriteChildren(subdiv.View, offsets.View, coords.View, n, newCoords.View, parent.View, slot.View);
             var h2 = F((long)m * outC);
-            _sk.Channel2Spatial(hc.View, parent.View, slot.View, h2.View, m, outC);
-            hc.Dispose();
+            {
+                long chunkRows = Math.Max(1, ChunkFloats / ((long)outC * 8));
+                var offHost = await offsets.View.CopyToHostAsync();
+                using var hc = F(Math.Min(chunkRows, n) * outC * 8);
+                for (int r0 = 0; r0 < n; r0 += (int)chunkRows)
+                {
+                    int rows = (int)Math.Min(chunkRows, n - r0);
+                    _sk.Conv3(xn.View, nbr.View.SubView((long)r0 * 27, (long)rows * 27), _w.F16(u + "conv1.weight"), _w.F16(u + "conv1.bias"), hc.View, rows, C, outC * 8);
+                    int c0 = offHost[r0], c1 = offHost[r0 + rows];
+                    if (c1 > c0) _sk.Channel2SpatialChunk(hc.View, parent.View.SubView(c0, c1 - c0), slot.View.SubView(c0, c1 - c0), h2.View.SubView((long)c0 * outC, (long)(c1 - c0) * outC), c1 - c0, outC, r0);
+                }
+                await _acc.SynchronizeAsync();                       // the chunk buffer and xn are reused / freed below: a real drain on the browser
+            }
+            xn.Dispose();
             using var xs = F((long)m * cc8);
             _sk.Channel2Spatial(x.View, parent.View, slot.View, xs.View, m, cc8);
             grid *= 2;
@@ -165,6 +185,12 @@ public sealed class SparseVaeDecoder : IDisposable
             x.Dispose(); coords.Dispose(); nbr.Dispose();
             x = h4; coords = newCoords; nbr = nbr2; n = m;
             Tap?.Invoke($"level{i}_up", x.View, coords.View, n, outC);
+            if (stopAfterUpsamples > 0 && i + 1 == stopAfterUpsamples)
+            {   // the reference decoder's upsample(x, times): only the coordinates after that many subdivisions, no output layer (the cascade pipelines' high-resolution token set)
+                x.Dispose(); nbr.Dispose(); _acc.Fence();
+                result.Coords = coords; result.Count = n; result.Grid = grid;
+                return result;
+            }
         }
         nbr.Dispose();
 

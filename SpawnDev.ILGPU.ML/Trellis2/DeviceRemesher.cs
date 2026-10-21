@@ -280,7 +280,7 @@ public sealed class DeviceRemesher
 
         // ---- unique corners of the active voxels, and the distance at each ---------------------------------------------------------------------
         int v1 = resolution + 1;
-        if ((long)v1 * v1 * v1 >= int.MaxValue) throw new ArgumentOutOfRangeException(nameof(resolution));
+        if ((long)v1 * v1 * v1 >= uint.MaxValue) throw new ArgumentOutOfRangeException(nameof(resolution));        // corner keys are 32-bit bit patterns (wrapping arithmetic), exact while v1^3 < 2^32 - 1: 1537^3 = 3.6e9 fits
         using var voxHash = _sk.BuildHash(coords.View, nv, resolution);
         MemoryBuffer1D<int, Stride1D.Dense> cornerKeys;
         int cap = 64, bits = 6;

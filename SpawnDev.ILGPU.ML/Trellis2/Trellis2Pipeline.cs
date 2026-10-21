@@ -167,51 +167,7 @@ public sealed class Trellis2Pipeline : IDisposable
         _zero((int)ssNeg.Length, ssNeg.View);
 
         // ---- 1. sparse structure ------------------------------------------------------------------------
-        MemoryBuffer1D<int, Stride1D.Dense> coords32;
-        int n0;
-        float[] ssLatent = Array.Empty<float>(); int ssRes = 0;
-        {
-            using var w = await _weights.LoadCheckpointAsync(_acc, "ss_flow_img_dit_1_3B_64_bf16", ct);
-            await StageAsync("ss flow weights", sw);
-            using var flow = new SparseStructureFlow(_acc, _dk, w);
-            int cells = flow.Resolution * flow.Resolution * flow.Resolution, count = flow.InChannels * cells;
-            using var x = _acc.Allocate1D<float>(count);
-            _sampler.Randn(x.View, count, (ulong)seed * 7919UL + 1);
-            string dumpDir = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_SS") ?? "";
-            if (dumpDir.Length > 0)
-            {   // debug: noise, condition and the sampled latent, to rerun the same stage in the reference
-                Directory.CreateDirectory(dumpDir);
-                void Dump(string name, FV v, int n) { var a = v.SubView(0, n).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, name), b); }
-                Dump("noise.f32", x.View, count); Dump("cond.f32", ssCond, ssTokens * 1024);
-            }
-            await StageAsync("ss flow load", sw);
-            _weights.Prefetch(new[] { "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16", "shape_dec_next_dc_f16c32_fp16" }, includeSsDecoder: true);
-            _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts);
-            await StageAsync($"ss flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
-            if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
-            ssLatent = await x.View.SubView(0, count).CopyToHostAsync(); ssRes = flow.Resolution;
-            w.Dispose();
-            using var dw = await _weights.LoadSsDecoderAsync(_acc, ct);
-            using var dec = new SparseStructureDecoder(_acc, _sk, _dk, dw);
-            using var logits = dec.Decode(x.View, flow.Resolution);
-            (coords32, n0) = await _sk.OccupancyAsync(logits.View, flow.Resolution * 4, slatGrid);
-            await StageAsync($"ss decode ({n0} cells of {slatGrid}^3)", sw);
-        }
-        if (n0 == 0) throw new InvalidOperationException("the sparse structure is empty");
-        if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SS") == "1")
-        {
-            // debug: the occupied 32^3 cells as ASCII layers along z (the sparse structure BEFORE the shape stage)
-            var c = coords32.View.SubView(0, (long)n0 * 3).GetAsArray1D();
-            var grid = new bool[slatGrid, slatGrid, slatGrid];
-            for (int i = 0; i < n0; i++) grid[c[i * 3], c[i * 3 + 1], c[i * 3 + 2]] = true;
-            for (int z = 0; z < slatGrid; z++)
-            {
-                int cnt = 0; for (int x = 0; x < slatGrid; x++) for (int y = 0; y < slatGrid; y++) if (grid[x, y, z]) cnt++;
-                Console.WriteLine($"z={z,2} cells={cnt}");
-                if (cnt > 0 && z % 3 == 0)
-                    for (int y = 0; y < slatGrid; y++) { var sb = new System.Text.StringBuilder(); for (int x = 0; x < slatGrid; x++) sb.Append(grid[x, y, z] ? '#' : '.'); Console.WriteLine("   " + sb); }
-            }
-        }
+        var (coords32, n0, ssLatent, ssRes) = await SampleStructureAsync(ssCond, ssNeg.View, ssTokens, slatGrid, seed, suffix, sw, ct);
 
         // ---- 2. shape latent ---------------------------------------------------------------------------
         MemoryBuffer1D<float, Stride1D.Dense> shapeSlat;       // the sampler output (normalised space): conditions the texture flow
@@ -225,7 +181,7 @@ public sealed class Trellis2Pipeline : IDisposable
             _sampler.Randn(shapeSlat.View, count, (ulong)seed * 7919UL + 2);
             await StageAsync("shape flow load", sw);
             _weights.Prefetch(new[] { "slat_flow_imgshape2tex_dit_1_3B_" + suffix + "_bf16", "tex_dec_next_dc_f16c32_fp16" });
-            _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts);
             await StageAsync($"shape flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
             if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SLAT") == "1") Console.WriteLine($"  [slat] shape: {Moments(shapeSlat.View, count)}");
         }
@@ -267,7 +223,7 @@ public sealed class Trellis2Pipeline : IDisposable
                 DumpF("noise.f32", texSlat.View, count); DumpF("shape_slat.f32", shapeSlat.View, (long)n0 * 32); DumpF("cond.f32", cond, (long)condTokens * 1024);
             }
             // the model sees [x_t | shape slat] (sparse_cat([x, concat_cond])); only the first 32 channels are integrated
-            _sampler.Sample((xv, t1000, useCond, v) =>
+            await _sampler.SampleAsync((xv, t1000, useCond, v) =>
             {
                 _concat(n0 * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
                 dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);
@@ -302,6 +258,262 @@ public sealed class Trellis2Pipeline : IDisposable
         shapeDec.Dispose();
         coords32.Dispose();
         return result;
+    }
+
+    /// <summary>Stage 1 of every pipeline: the sparse structure flow (64^3 latent) and its decoder, then the occupied cells on the <paramref name="slatGrid"/>^3 token grid. <paramref name="suffix"/> names the shape/texture checkpoints prefetched next.</summary>
+    private async Task<(MemoryBuffer1D<int, Stride1D.Dense> Coords, int Count, float[] SsLatent, int SsRes)> SampleStructureAsync(FV ssCond, FV ssNegView, int ssTokens, int slatGrid, int seed, string suffix, Stopwatch sw, CancellationToken ct)
+    {
+        MemoryBuffer1D<int, Stride1D.Dense> coords32;
+        int n0;
+        float[] ssLatent = Array.Empty<float>(); int ssRes = 0;
+        {
+            using var w = await _weights.LoadCheckpointAsync(_acc, "ss_flow_img_dit_1_3B_64_bf16", ct);
+            await StageAsync("ss flow weights", sw);
+            using var flow = new SparseStructureFlow(_acc, _dk, w);
+            int cells = flow.Resolution * flow.Resolution * flow.Resolution, count = flow.InChannels * cells;
+            using var x = _acc.Allocate1D<float>(count);
+            _sampler.Randn(x.View, count, (ulong)seed * 7919UL + 1);
+            string dumpDir = Environment.GetEnvironmentVariable("TRELLIS2_DUMP_SS") ?? "";
+            if (dumpDir.Length > 0)
+            {   // debug: noise, condition and the sampled latent, to rerun the same stage in the reference
+                Directory.CreateDirectory(dumpDir);
+                void Dump(string name, FV v, int n) { var a = v.SubView(0, n).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, name), b); }
+                Dump("noise.f32", x.View, count); Dump("cond.f32", ssCond, ssTokens * 1024);
+            }
+            await StageAsync("ss flow load", sw);
+            _weights.Prefetch(new[] { "slat_flow_img2shape_dit_1_3B_" + suffix + "_bf16", "shape_dec_next_dc_f16c32_fp16" }, includeSsDecoder: true);
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNegView, ssTokens, v), x.View, count, _ssOpts);
+            await StageAsync($"ss flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
+            if (dumpDir.Length > 0) { var a = x.View.SubView(0, count).GetAsArray1D(); var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(Path.Combine(dumpDir, "zs.f32"), b); }
+            ssLatent = await x.View.SubView(0, count).CopyToHostAsync(); ssRes = flow.Resolution;
+            w.Dispose();
+            using var dw = await _weights.LoadSsDecoderAsync(_acc, ct);
+            using var dec = new SparseStructureDecoder(_acc, _sk, _dk, dw);
+            using var logits = dec.Decode(x.View, flow.Resolution);
+            (coords32, n0) = await _sk.OccupancyAsync(logits.View, flow.Resolution * 4, slatGrid);
+            await StageAsync($"ss decode ({n0} cells of {slatGrid}^3)", sw);
+        }
+        if (n0 == 0) throw new InvalidOperationException("the sparse structure is empty");
+        if (Environment.GetEnvironmentVariable("TRELLIS2_DEBUG_SS") == "1")
+        {
+            // debug: the occupied 32^3 cells as ASCII layers along z (the sparse structure BEFORE the shape stage)
+            var c = coords32.View.SubView(0, (long)n0 * 3).GetAsArray1D();
+            var grid = new bool[slatGrid, slatGrid, slatGrid];
+            for (int i = 0; i < n0; i++) grid[c[i * 3], c[i * 3 + 1], c[i * 3 + 2]] = true;
+            for (int z = 0; z < slatGrid; z++)
+            {
+                int cnt = 0; for (int x = 0; x < slatGrid; x++) for (int y = 0; y < slatGrid; y++) if (grid[x, y, z]) cnt++;
+                Console.WriteLine($"z={z,2} cells={cnt}");
+                if (cnt > 0 && z % 3 == 0)
+                    for (int y = 0; y < slatGrid; y++) { var sb = new System.Text.StringBuilder(); for (int x = 0; x < slatGrid; x++) sb.Append(grid[x, y, z] ? '#' : '.'); Console.WriteLine("   " + sb); }
+            }
+        }
+        return (coords32, n0, ssLatent, ssRes);
+    }
+
+    /// <summary>
+    /// The reference's token cap (<c>max_num_tokens</c> 49152), lowered where one buffer cannot hold the finest decoder level: the decoder's last level is a
+    /// [voxels, 64] tensor with about 360 voxels per token (measured 361 at 1024, 345 at 1536), and a WebGPU buffer is at most <c>maxBufferSize</c> (2 GiB on this
+    /// adapter: 20,971 tokens at 400 voxels per token with a margin). The resolution then steps down 128 at a time, as the reference does for its own cap.
+    /// </summary>
+    private int DefaultMaxTokens()
+        => _acc.AcceleratorType == global::ILGPU.Runtime.AcceleratorType.WebGPU ? (int)Math.Min(49152L, _acc.MemorySize / (400L * 64 * 4)) : 49152;
+
+    /// <summary>
+    /// The CASCADE pipelines of TRELLIS.2 (<c>1024_cascade</c>, <c>1536_cascade</c>; the reference's default is <c>1024_cascade</c>): the sparse structure at 32^3 and the shape latent from the 512 checkpoint on the 512 px
+    /// features, then the shape decoder's own upsampling turns the coarse tokens into the high-resolution token set (their cells quantised to the <paramref name="targetRes"/> / 16 grid, duplicates removed, and the
+    /// resolution lowered by 128 until fewer than <paramref name="maxTokens"/> tokens remain, never below 1024), and the 1024 checkpoints' shape and texture flows run on those tokens with the 1024 px features
+    /// (<paramref name="cond1024"/>); the decoders then go up to <c>Output.Grid</c> = the resolution that was reached (1536 for 1536_cascade unless the token cap lowered it). Ported from
+    /// <c>Trellis2ImageTo3DPipeline.sample_shape_slat_cascade</c>. The result carries no <see cref="Output.Edit"/> state (region editing is for the 512 and 1024 pipelines).
+    /// </summary>
+    public async Task<Output> RunCascadeAsync(int targetRes, FV cond512, int tokens512, FV cond1024, int tokens1024, int seed = 42, int maxTokens = 0, CancellationToken ct = default)
+    {
+        if (maxTokens <= 0) maxTokens = DefaultMaxTokens();
+        if (targetRes != 1024 && targetRes != 1536) throw new ArgumentException("A cascade targets 1024 or 1536");
+        _affine ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int>(AffineImpl);
+        _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
+        _halfShift ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(HalfShiftImpl);
+        _zero ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV>(ZeroImpl);
+        // TRELLIS2_CASCADE_CACHE=<dir>: the sampled latents (the minutes-long part) are kept there and reused, so the decoders, mesh and export can be worked on without re-sampling (development aid)
+        string cacheDir = Environment.GetEnvironmentVariable("TRELLIS2_CASCADE_CACHE") ?? "";
+        string stem = cacheDir.Length > 0 ? Path.Combine(cacheDir, $"cascade_{targetRes}_s{seed}") : "";
+        CascadeLatents lat;
+        if (stem.Length > 0 && File.Exists(stem + ".json")) lat = LoadCascade(stem);
+        else
+        {
+            lat = await SampleCascadeAsync(targetRes, cond512, tokens512, cond1024, tokens1024, seed, maxTokens, ct);
+            if (stem.Length > 0) { Directory.CreateDirectory(cacheDir); SaveCascade(stem, lat); }
+        }
+        return await DecodeCascadeAsync(lat, ct);
+    }
+
+    /// <summary>What the cascade's samplers produce: the token cells on the (HrRes / 16)^3 grid and the shape and texture latents (normalised space) on them.</summary>
+    private sealed record CascadeLatents(int HrRes, int Tokens, int[] Coords, float[] ShapeSlat, float[] TexSlat);
+
+    private static void SaveCascade(string stem, CascadeLatents l)
+    {
+        static void Raw(string p, Array a) { var b = new byte[Buffer.ByteLength(a)]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(p, b); }
+        Raw(stem + ".coords.i32", l.Coords); Raw(stem + ".shape.f32", l.ShapeSlat); Raw(stem + ".tex.f32", l.TexSlat);
+        File.WriteAllText(stem + ".json", $"{{\"hrRes\":{l.HrRes},\"tokens\":{l.Tokens}}}");
+    }
+
+    private static CascadeLatents LoadCascade(string stem)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(stem + ".json"));
+        int hrRes = doc.RootElement.GetProperty("hrRes").GetInt32(), n = doc.RootElement.GetProperty("tokens").GetInt32();
+        static T[] Read<T>(string p) where T : struct { var b = File.ReadAllBytes(p); var a = new T[b.Length / System.Runtime.InteropServices.Marshal.SizeOf<T>()]; Buffer.BlockCopy(b, 0, a, 0, b.Length); return a; }
+        return new CascadeLatents(hrRes, n, Read<int>(stem + ".coords.i32"), Read<float>(stem + ".shape.f32"), Read<float>(stem + ".tex.f32"));
+    }
+
+    private async Task<CascadeLatents> SampleCascadeAsync(int targetRes, FV cond512, int tokens512, FV cond1024, int tokens1024, int seed, int maxTokens, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        using var neg512 = _acc.Allocate1D<float>((long)tokens512 * 1024); _zero!((int)neg512.Length, neg512.View);
+        using var neg1024 = _acc.Allocate1D<float>((long)tokens1024 * 1024); _zero((int)neg1024.Length, neg1024.View);
+
+        // ---- 1. sparse structure at 32^3 (the same stage as the 512 pipeline) ----------------------------
+        var (coords32, n0, _, _) = await SampleStructureAsync(cond512, neg512.View, tokens512, 32, seed, "512", sw, ct);
+
+        // ---- 2. low-resolution shape latent: the 512 checkpoint on the 512 px features ----------------------
+        MemoryBuffer1D<float, Stride1D.Dense> lrSlat;
+        {
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_img2shape_dit_1_3B_512_bf16", ct);
+            await StageAsync("shape flow (512) weights", sw);
+            using var dit = new FlowDiT(_acc, _dk, w);
+            dit.SetTokens(coords32.View, n0);
+            int count = n0 * dit.OutChannels;
+            lrSlat = _acc.Allocate1D<float>(count);
+            _sampler.Randn(lrSlat.View, count, (ulong)seed * 7919UL + 2);
+            _weights.Prefetch(new[] { "shape_dec_next_dc_f16c32_fp16", "slat_flow_img2shape_dit_1_3B_1024_bf16" });
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond512 : neg512.View, tokens512, v), lrSlat.View, count, _shapeOpts);
+            await StageAsync($"shape flow (512) sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
+        }
+
+        // ---- 3. the decoder's own upsampling: the high-resolution token set ---------------------------------
+        int[] hrHost; int hrCount;
+        {
+            using var sm = Upload(_shapeMean); using var ss = Upload(_shapeStd);
+            using var lat = _acc.Allocate1D<float>(lrSlat.Length);
+            _affine!((int)lrSlat.Length, lrSlat.View, sm.View, ss.View, lat.View, 32);
+            using var w = await _weights.LoadCheckpointAsync(_acc, "shape_dec_next_dc_f16c32_fp16", ct);
+            var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
+            using var up = await dec.DecodeAsync(lat.View, coords32.View, n0, 32, stopAfterUpsamples: 4);     // 4 subdivisions: the 512^3 voxels of the coarse shape
+            hrCount = up.Count;
+            hrHost = await up.Coords.View.SubView(0, (long)hrCount * 3).CopyToHostAsync();
+            await StageAsync($"upsample ({hrCount} voxels at {up.Grid}^3)", sw);
+        }
+        lrSlat.Dispose(); coords32.Dispose();
+        int hrRes = targetRes; int[] tokens; int nTok;
+        while (true)
+        {
+            (tokens, nTok) = QuantizeUnique(hrHost, hrCount, 512, hrRes);
+            if (nTok < maxTokens || hrRes == 1024) break;
+            hrRes -= 128;
+        }
+        if (hrRes != targetRes) Console.WriteLine($"Due to the limited number of tokens, the resolution is reduced to {hrRes}.");
+        using var hrCoords = _acc.Allocate1D<int>((long)nTok * 3);
+        hrCoords.View.CopyFromCPU(tokens);
+        StageDone?.Invoke($"high-resolution tokens ({nTok} at {hrRes / 16}^3, target {hrRes})", sw.Elapsed.TotalSeconds); sw.Restart();
+
+        // ---- 4. high-resolution shape latent: the 1024 checkpoint on the 1024 px features -------------------
+        using var shapeSlat = _acc.Allocate1D<float>(nTok * 32L);
+        {
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_img2shape_dit_1_3B_1024_bf16", ct);
+            await StageAsync("shape flow (1024) weights", sw);
+            using var dit = new FlowDiT(_acc, _dk, w);
+            dit.SetTokens(hrCoords.View, nTok);
+            int count = nTok * dit.OutChannels;
+            _sampler.Randn(shapeSlat.View, count, (ulong)seed * 7919UL + 4);
+            _weights.Prefetch(new[] { "slat_flow_imgshape2tex_dit_1_3B_1024_bf16", "tex_dec_next_dc_f16c32_fp16" });
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond1024 : neg1024.View, tokens1024, v), shapeSlat.View, count, _shapeOpts, ct: ct);
+            await StageAsync($"shape flow (1024) sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
+        }
+
+        // ---- 5. texture latent (1024 checkpoint, conditioned on the shape latent) ----------------------------------
+        using var texSlat = _acc.Allocate1D<float>(nTok * 32L);
+        {
+            using var w = await _weights.LoadCheckpointAsync(_acc, "slat_flow_imgshape2tex_dit_1_3B_1024_bf16", ct);
+            using var dit = new FlowDiT(_acc, _dk, w);
+            dit.SetTokens(hrCoords.View, nTok);
+            int ch = dit.OutChannels, count = nTok * ch;
+            _sampler.Randn(texSlat.View, count, (ulong)seed * 7919UL + 3);
+            using var modelIn = _acc.Allocate1D<float>((long)nTok * dit.InChannels);
+            await StageAsync("tex flow load", sw);
+            await _sampler.SampleAsync((xv, t1000, useCond, v) =>
+            {
+                _concat!(nTok * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
+                dit.Forward(modelIn.View, t1000, useCond ? cond1024 : neg1024.View, tokens1024, v);
+            }, texSlat.View, count, _texOpts, ct: ct);
+            await StageAsync($"tex flow sample (host {sw.Elapsed.TotalSeconds:F1} s)", sw);
+        }
+        return new CascadeLatents(hrRes, nTok, tokens, await shapeSlat.View.CopyToHostAsync(), await texSlat.View.CopyToHostAsync());
+    }
+
+    /// <summary>The cascade's decoders: the shape decoder to the mesh (at <c>HrRes</c>^3 voxels), the texture decoder, guided by the shape decoder's subdivisions, to the per-voxel PBR attributes.</summary>
+    private async Task<Output> DecodeCascadeAsync(CascadeLatents l, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        int nTok = l.Tokens, grid = l.HrRes / 16;
+        using var hrCoords = _acc.Allocate1D<int>((long)nTok * 3);
+        hrCoords.View.CopyFromCPU(l.Coords);
+        var result = new Output { Grid = l.HrRes };
+
+        // ---- shape decoder -> mesh ------------------------------------------------------------------------
+        SparseVaeDecoder.Result shapeDec;
+        {
+            using var shapeSlat = _acc.Allocate1D<float>(l.ShapeSlat);
+            using var sm = Upload(_shapeMean); using var ss = Upload(_shapeStd);
+            using var lat = _acc.Allocate1D<float>(shapeSlat.Length);
+            _affine!((int)shapeSlat.Length, shapeSlat.View, sm.View, ss.View, lat.View, 32);
+            using var w = await _weights.LoadCheckpointAsync(_acc, "shape_dec_next_dc_f16c32_fp16", ct);
+            var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
+            await StageAsync("shape decoder load", sw);
+            shapeDec = await dec.DecodeAsync(lat.View, hrCoords.View, nTok, grid, keepSubdivisions: true);
+            result.Mesh = await _mesher.ExtractAsync(shapeDec.Feats.View, shapeDec.Coords.View, shapeDec.Count, shapeDec.Grid);
+            await StageAsync($"shape decode + mesh ({shapeDec.Count} voxels, {result.Mesh.FaceCount} triangles)", sw);
+        }
+
+        // ---- texture decoder -> PBR voxels -----------------------------------------------------------------
+        {
+            using var texSlat = _acc.Allocate1D<float>(l.TexSlat);
+            using var tm = Upload(_texMean); using var ts = Upload(_texStd);
+            using var lat = _acc.Allocate1D<float>(texSlat.Length);
+            _affine((int)texSlat.Length, texSlat.View, tm.View, ts.View, lat.View, 32);
+            using var w = await _weights.LoadCheckpointAsync(_acc, "tex_dec_next_dc_f16c32_fp16", ct);
+            var dec = new SparseVaeDecoder(_acc, _sk, _dk, w);
+            using var tex = await dec.DecodeAsync(lat.View, hrCoords.View, nTok, grid, guide: shapeDec.Subdivisions);
+            result.Attributes = _acc.Allocate1D<float>(tex.Feats.Length);
+            _halfShift!((int)tex.Feats.Length, tex.Feats.View, result.Attributes.View);
+            result.Coords = _acc.Allocate1D<int>((long)tex.Count * 3);
+            result.Coords.View.CopyFrom(tex.Coords.View.SubView(0, (long)tex.Count * 3));
+            result.VoxelCount = tex.Count;
+            await StageAsync("tex decode", sw);
+        }
+        shapeDec.Dispose();
+        return result;
+    }
+
+    /// <summary>
+    /// The reference's <c>quant_coords = ((hr_coords + 0.5) / lr_resolution * (hr_resolution // 16)).int()</c> then <c>unique(dim=0)</c> (rows sorted ascending by x, y, z): the high-resolution token cells, in float32 as torch does it.
+    /// </summary>
+    internal static (int[] Coords, int Count) QuantizeUnique(int[] coords, int n, int lrRes, int hrRes)
+    {
+        float scale = hrRes / 16;
+        var keys = new long[n];
+        for (int i = 0; i < n; i++)
+        {
+            long x = (int)((coords[i * 3] + 0.5f) / lrRes * scale), y = (int)((coords[i * 3 + 1] + 0.5f) / lrRes * scale), z = (int)((coords[i * 3 + 2] + 0.5f) / lrRes * scale);
+            keys[i] = (x << 40) | (y << 20) | z;
+        }
+        Array.Sort(keys);
+        var outCoords = new int[n * 3]; int m = 0; long prev = -1;
+        foreach (var k in keys)
+        {
+            if (k == prev) continue;
+            prev = k;
+            outCoords[m * 3] = (int)(k >> 40); outCoords[m * 3 + 1] = (int)((k >> 20) & 0xFFFFF); outCoords[m * 3 + 2] = (int)(k & 0xFFFFF); m++;
+        }
+        return (outCoords.AsSpan(0, m * 3).ToArray(), m);
     }
 
     // ---- region editing (training-free, RePaint-style) ---------------------------------------------------------------
@@ -375,7 +587,7 @@ public sealed class Trellis2Pipeline : IDisposable
             using var modelIn = _acc.Allocate1D<float>((long)n0 * dit.InChannels);
             float sigma = _texOpts.SigmaMin;
             await StageAsync("edit: tex flow load", sw);
-            _sampler.Sample((xv, t1000, useCond, v) =>
+            await _sampler.SampleAsync((xv, t1000, useCond, v) =>
             {
                 _concat(n0 * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
                 dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);
@@ -459,7 +671,7 @@ public sealed class Trellis2Pipeline : IDisposable
             x.View.CopyFrom(eps.View);
             float sigma = _ssOpts.SigmaMin;
             await StageAsync("edit shape: structure flow load", sw);
-            _sampler.Sample((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts, null,
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => flow.Forward(xv, t1000, useCond ? ssCond : ssNeg.View, ssTokens, v), x.View, count, _ssOpts, null,
                 (step, tPrev) => _repaintCells(count, x.View, known.View, eps.View, keepCell.View, cells, (float)(1.0 - tPrev), (float)(sigma + (1.0 - sigma) * tPrev)));
             newSs = await x.View.SubView(0, count).CopyToHostAsync();
             await StageAsync($"edit shape: structure flow sample ({regenCells} of {cells} cells regenerated)", sw);
@@ -509,7 +721,7 @@ public sealed class Trellis2Pipeline : IDisposable
             shapeSlat.View.CopyFrom(eps.View);
             float sigma = _shapeOpts.SigmaMin;
             await StageAsync("edit shape: shape flow load", sw);
-            _sampler.Sample((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts, null,
+            await _sampler.SampleAsync((xv, t1000, useCond, v) => dit.Forward(xv, t1000, useCond ? cond : neg.View, condTokens, v), shapeSlat.View, count, _shapeOpts, null,
                 (step, tPrev) => _repaint(count, shapeSlat.View, known.View, eps.View, keep.View, ch, (float)(1.0 - tPrev), (float)(sigma + (1.0 - sigma) * tPrev)));
             await StageAsync($"edit shape: shape flow sample ({n1 - kept} of {n1} tokens regenerated)", sw);
         }
@@ -545,7 +757,7 @@ public sealed class Trellis2Pipeline : IDisposable
             using var modelIn = _acc.Allocate1D<float>((long)n1 * dit.InChannels);
             float sigma = _texOpts.SigmaMin;
             await StageAsync("edit shape: tex flow load", sw);
-            _sampler.Sample((xv, t1000, useCond, v) =>
+            await _sampler.SampleAsync((xv, t1000, useCond, v) =>
             {
                 _concat(n1 * dit.InChannels, xv, shapeSlat.View, modelIn.View, ch, 32);
                 dit.Forward(modelIn.View, t1000, useCond ? cond : neg.View, condTokens, v);

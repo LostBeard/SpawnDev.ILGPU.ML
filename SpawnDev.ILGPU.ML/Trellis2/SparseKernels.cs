@@ -74,12 +74,13 @@ public sealed class SparseKernels
         public void Dispose() { Keys?.Dispose(); Vals?.Dispose(); }
     }
 
-    /// <summary>Build the hash of <paramref name="n"/> voxels on a <paramref name="grid"/>^3 lattice (grid^3 must fit an int).</summary>
+    /// <summary>Build the hash of <paramref name="n"/> voxels on a <paramref name="grid"/>^3 lattice (grid^3 must fit a 32-bit key).</summary>
     public VoxelHash BuildHash(IV coords, int n, int grid)
     {
         _hashInsert ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV, int, int, int>(HashInsertImpl);
         _fillMinus1 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV>(FillMinus1Impl);
-        if ((long)grid * grid * grid >= int.MaxValue) throw new ArgumentOutOfRangeException(nameof(grid), "grid^3 must fit an int key");
+        // the key (x*grid + y)*grid + z is computed with wrapping 32-bit arithmetic and compared as a bit pattern, so it is exact while grid^3 < 2^32 - 1 (grid <= 1625: 1536^3 is 3.6e9); -1 (all bits set) never occurs and marks an empty slot
+        if ((long)grid * grid * grid >= uint.MaxValue) throw new ArgumentOutOfRangeException(nameof(grid), "grid^3 must fit a 32-bit key (grid <= 1625)");
         int cap = 64, bits = 6;
         while (cap < 2L * n) { cap <<= 1; bits++; }
         var h = new VoxelHash { Keys = _acc.Allocate1D<int>(cap), Vals = _acc.Allocate1D<int>(cap), Grid = grid, Mask = cap - 1, Shift = 32 - bits };
@@ -90,7 +91,7 @@ public sealed class SparseKernels
 
     /// <summary>
     /// Build the 27-neighbour table for <paramref name="n"/> voxels on a <paramref name="grid"/>^3 lattice
-    /// (grid^3 must fit an int: grid &lt;= 1290). <paramref name="nbr"/> holds n*27 ints.
+    /// (grid^3 must fit a 32-bit key: grid &lt;= 1625). <paramref name="nbr"/> holds n*27 ints.
     /// </summary>
     public void BuildNeighbors(IV coords, int n, int grid, IV nbr)
     {
@@ -563,6 +564,19 @@ public sealed class SparseKernels
     {
         _c2s ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(C2sImpl);
         _c2s(m * cc, x, parent, slot, o, cc);
+    }
+
+    // The same gather for a CHUNK of parents: `x` holds only the rows [parentBase, parentBase + rows) of the parents (their conv output), `parent` and `slot` are the sub-ranges of the children of those parents.
+    private Action<Index1D, FV, IV, IV, FV, int, int>? _c2sChunk;
+    private static void C2sChunkImpl(Index1D idx, FV x, IV parent, IV slot, FV o, int cc, int parentBase)
+    {
+        int m = idx / cc, c = idx % cc;
+        o[idx] = x[(long)(parent[m] - parentBase) * (8 * cc) + slot[m] * cc + c];
+    }
+    public void Channel2SpatialChunk(FV x, IV parent, IV slot, FV o, int m, int cc, int parentBase)
+    {
+        _c2sChunk ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int, int>(C2sChunkImpl);
+        _c2sChunk(m * cc, x, parent, slot, o, cc, parentBase);
     }
 
     // h[m, c] += skip[m, c / r]      (skip_connection = repeat_interleave(out / (C / 8)) followed by the residual add)

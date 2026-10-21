@@ -17,9 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The 3D preview is the demo's own WebGL viewer (skinning + glTF animation) hosted in WebView2. -->
+    <!-- The 3D preview is the demo's own viewer (three.js, vendored: PBR, skinning, glTF animation) hosted in WebView2. -->
     <None Include="viewer\viewer.html" Link="viewer\viewer.html" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\SpawnDev.ILGPU.ML.Demo\wwwroot\js\glb-viewer.js" Link="viewer\glb-viewer.js" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\SpawnDev.ILGPU.ML.Demo\wwwroot\js\lib\**\*" Link="viewer\lib\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <!-- The 22 bundled Kimodo clips (NVIDIA, see motions/NOTICE.md). -->
     <None Include="..\..\SpawnDev.ILGPU.ML.Demo\wwwroot\motions\*.bin" Link="motions\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\SpawnDev.ILGPU.ML.Demo\wwwroot\motions\NOTICE.md" Link="motions\NOTICE.md" CopyToOutputDirectory="PreserveNewest" />

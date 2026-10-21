@@ -114,7 +114,7 @@ export const scenarios = {
     run: async h => {
       await h.clickText('.t3d-mode', /Image to 3D/);
       await h.clickText('.sample-btn', /Crown/);
-      await h.waitFor(`document.querySelector('.t3d-btn')`, 60000, 'the Generate button after choosing the sample');
+      await h.waitFor(`!!document.querySelector('.t3d-btn')`, 60000, 'the Generate button after choosing the sample');
       await h.click('.t3d-btn');
       await h.observe(BAR(), `(document.querySelector('.t3d-result-info')?.innerText ?? '').includes('GLB')`, 60 * 60e3);
       const info = await h.text('.t3d-result-info');

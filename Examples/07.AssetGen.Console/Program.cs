@@ -26,6 +26,7 @@
 //    --edit-instruction "give the knight a red plume"   like --edit-picture, but the edit picture is made by FLUX.2 klein EDITING the picture the model was built from (reference-image mode); it keeps what the instruction does not mention
 //    --image-model flux3|flux2|sd   default flux2        --quality 4|8   FLUX weights: 4-bit (default, 2.6 GB on the GPU) or 8-bit (near lossless, 4.4 GB)
 //    --faces <N> --texture <N> mesh triangle budget (default 300000) and texture size (default 2048)
+//    --resolution 512|1024|1024c|1536c   TRELLIS.2 pipeline (the reference's types): 512 (default), 1024, or the cascades 1024c (the reference's own default) and 1536c (the finest the released model does); finer detail, slower, more GPU memory
 //    --bridge-hops <N>         rig cleanup: drop skin influences from bones N+ hops from a vertex's own and cut triangles joining parts further apart (default 4; 0 = off)
 //    --no-rig                  stop after the 3D model          --no-animate  stop after the rig
 //    --moves a,b,c             clips to bake in (default: all 22; names are the files in motions/)
@@ -52,7 +53,7 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
 bool ci = false, pick = false, rig = true, animate = true, caption = true;
-int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4;
+int seed = 1, pictures = 2, size = 512, faces = 300_000, texture = 2048, quality = 4, bridgeHops = 4, resolution = 512; bool cascade = false;
 double clearance = 8;
 string? outName = null, cacheDir = null, movesArg = null, editPicture = null, editRegion = null, editInstruction = null, imagePath = null; bool editShape = false; var model = ImageModel.Flux2Klein;
 var words = new List<string>();
@@ -68,6 +69,10 @@ for (int i = 0; i < args.Length; i++)
         case "--seed" when i + 1 < args.Length: seed = int.Parse(args[++i]); break;
         case "--pictures" when i + 1 < args.Length: pictures = Math.Max(1, int.Parse(args[++i])); break;
         case "--quality" when i + 1 < args.Length: quality = int.Parse(args[++i]) == 8 ? 8 : 4; break;
+        case "--resolution" when i + 1 < args.Length:
+            {   // 512 | 1024 | 1024c | 1536c (the reference's pipeline types; "c" = the cascade)
+                var r = args[++i].Trim().ToLowerInvariant(); cascade = r.EndsWith('c'); resolution = int.Parse(cascade ? r[..^1] : r); break;
+            }
         case "--size" when i + 1 < args.Length: size = int.Parse(args[++i]); break;
         case "--faces" when i + 1 < args.Length: faces = int.Parse(args[++i]); break;
         case "--texture" when i + 1 < args.Length: texture = int.Parse(args[++i]); break;
@@ -172,7 +177,7 @@ async Task<int> Run()
         return 0;
     }
 
-    var trellisOptions = new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture };
+    var trellisOptions = new Trellis2Options { Seed = seed, MaxFaces = faces, TextureSize = texture, Resolution = resolution, Cascade = cascade };
     GeneratedAsset asset;
     if (imagePath != null)
     {   // image to 3D: a transparent picture is used as is, any other is cut out first
@@ -208,7 +213,10 @@ async Task<int> Run()
 
     await File.WriteAllBytesAsync(outName + ".png", AssetGenerator.EncodePng(asset.Picture.Rgba, asset.Picture.Width, asset.Picture.Height));
     await File.WriteAllBytesAsync(outName + ".glb", asset.Glb);
-    Console.WriteLine($"\nWrote {outName}.png (seed {asset.Picture.Seed}) and {outName}.glb ({asset.Glb.Length / 1048576.0:F1} MB)");
+    // what the 3D stage actually saw: the picture with its background removed (the alpha is the cut-out). A bad cut-out is a bad model, so it is always written.
+    var cutBytes = new byte[asset.CutOut.Length * 4]; Buffer.BlockCopy(asset.CutOut, 0, cutBytes, 0, cutBytes.Length);
+    await File.WriteAllBytesAsync(outName + "_cutout.png", AssetGenerator.EncodePng(cutBytes, asset.Picture.Width, asset.Picture.Height));
+    Console.WriteLine($"\nWrote {outName}.png (seed {asset.Picture.Seed}), {outName}_cutout.png and {outName}.glb ({asset.Glb.Length / 1048576.0:F1} MB)");
     if (asset.RiggedGlb != null) { await File.WriteAllBytesAsync(outName + "_rigged.glb", asset.RiggedGlb); Console.WriteLine($"Wrote {outName}_rigged.glb ({asset.RiggedGlb.Length / 1048576.0:F1} MB)"); }
     if (asset.AnimatedGlb != null) { await File.WriteAllBytesAsync(outName + "_animated.glb", asset.AnimatedGlb); Console.WriteLine($"Wrote {outName}_animated.glb ({asset.AnimatedGlb.Length / 1048576.0:F1} MB, {asset.Moves.Count} moves)"); }
     Console.WriteLine($"Done in {total.Elapsed.TotalSeconds:F0} s. View a .glb at https://gltf-viewer.donmccurdy.com/ or in any glTF viewer (Blender, Windows 3D Viewer).");

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>three.js GLB viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f141f; overflow: hidden; font: 13px Segoe UI, system-ui, sans-serif; color: #cbd5e1; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #ui { position: fixed; top: 10px; left: 10px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: rgba(15,20,31,.78); padding: 8px 10px; border-radius: 8px; backdrop-filter: blur(6px); }
+  #ui select, #ui input[type=range] { max-width: 260px; }
+  #info { position: fixed; bottom: 8px; left: 10px; color: #64748b; }
+  body.shot #ui, body.shot #info { display: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="ui">
+  <label>Model <select id="list"></select></label>
+  <label>or file <input id="file" type="file" accept=".glb,.gltf" /></label>
+  <label><input id="rotate" type="checkbox" /> auto-rotate</label>
+  <label><input id="wire" type="checkbox" /> wireframe</label>
+  <label>exposure <input id="exposure" type="range" min="0.3" max="2.5" step="0.05" value="1.0" /></label>
+</div>
+<div id="info">three.js r170 · GLTFLoader · OrbitControls · RoomEnvironment (IBL) · ACES · shadow map · drag to orbit, wheel to zoom</div>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>

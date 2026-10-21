@@ -59,7 +59,14 @@ public partial class MainWindow : Window
         try
         {
             Directory.CreateDirectory(_viewerDir);
-            foreach (var f in new[] { "viewer.html", "glb-viewer.js" }) File.Copy(Path.Combine(AppContext.BaseDirectory, "viewer", f), Path.Combine(_viewerDir, f), true);
+            // the viewer page, glb-viewer.js and the three.js files it imports (viewer/lib/...): the whole folder, so the relative module imports resolve
+            var source = Path.Combine(AppContext.BaseDirectory, "viewer");
+            foreach (var f in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+            {
+                var target = Path.Combine(_viewerDir, Path.GetRelativePath(source, f));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.Copy(f, target, true);
+            }
             Viewer.CreationProperties = new CoreWebView2CreationProperties { UserDataFolder = Path.Combine(Path.GetTempPath(), "AssetGen.Wpf", "webview") };
             await Viewer.EnsureCoreWebView2Async();
             Viewer.CoreWebView2.SetVirtualHostNameToFolderMapping("assets.local", _viewerDir, CoreWebView2HostResourceAccessKind.Allow);

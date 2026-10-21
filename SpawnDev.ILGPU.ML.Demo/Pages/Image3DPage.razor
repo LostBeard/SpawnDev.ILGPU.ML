@@ -92,18 +92,29 @@
 
     <div class="t3d-settings">
         <label>Seed <input type="number" @bind="_seed" class="t3d-num" disabled="@_isRunning" /></label>
+        <label>Detail
+            <select @bind="Detail" class="t3d-select" disabled="@_isRunning" title="The TRELLIS.2 pipeline type (the reference's own names). 1024 builds the structure and the surface at twice the resolution: crisper gears, text and thin parts, but it downloads two more 2.5 GB models and takes several times as long. The cascades (the reference's default is 1024_cascade) sample the structure at 512 first and then only the occupied space at the finer resolution: the finest detail, the most time and GPU memory.">
+                <option value="512">Standard (512)</option>
+                <option value="1024">High (1024: finer detail, slower)</option>
+                <option value="1024c">Ultra (1024 cascade, the reference's default)</option>
+                <option value="1536c">Max (1536 cascade: the finest, needs a large GPU)</option>
+            </select>
+        </label>
         <label>Triangles
             <select @bind="_maxFaces" class="t3d-select" disabled="@_isRunning">
                 <option value="50000">50k (light)</option>
                 <option value="100000">100k</option>
                 <option value="150000">150k</option>
                 <option value="300000">300k (default)</option>
+                <option value="500000">500k</option>
+                <option value="1000000">1M (the reference's default; sharper fine detail, bigger file)</option>
             </select>
         </label>
         <label>Texture
             <select @bind="_textureSize" class="t3d-select" disabled="@_isRunning">
                 <option value="1024">1024</option>
                 <option value="2048">2048</option>
+                <option value="4096">4096 (the reference's default; more GPU memory)</option>
             </select>
         </label>
     </div>
@@ -250,6 +261,13 @@
     private int _seed = 42;
     private int _maxFaces = 300_000;               // thin armour and cloth lose pieces at 150k (flecks and cracks); 300k keeps them
     private int _textureSize = 2048;
+    private int _resolution = 512;                  // TRELLIS.2 pipeline: 512 (default), 1024, or the cascades 1024c / 1536c (the reference's pipeline types)
+    private bool _cascade;
+    private string Detail
+    {
+        get => _resolution + (_cascade ? "c" : "");
+        set { _cascade = value.EndsWith('c'); _resolution = int.Parse(_cascade ? value[..^1] : value); }
+    }
     private bool _isRunning, _isLoading, _ready;
     private double _modelProgress, _inferenceMs;
     private string _modelStatusText = "TRELLIS.2";
@@ -304,7 +322,11 @@
 
     private async Task<bool> EnsureAcceleratorAsync()
     {
-        if (_accelerator != null) return true;
+        if (_accelerator != null)
+        {
+            if (_plannedDetail != Detail) await PlanWeightsAsync();        // the quality setting changed: other checkpoints
+            return true;
+        }
         var builder = MLContext.Create();
         await builder.AllAcceleratorsAsync();
         _context = builder.ToContext();
@@ -314,6 +336,16 @@
             _error = "This demo needs WebGPU (Chrome or Edge on a desktop GPU).";
             return false;
         }
+        await PlanWeightsAsync();
+        return true;
+    }
+
+    private string _plannedDetail = "512";
+
+    /// <summary>Plan the storage of the TRELLIS.2 checkpoints for the chosen quality (512, 1024 or a cascade: each has its own shape and texture flow models) and create the pipeline object that streams them.</summary>
+    private async Task PlanWeightsAsync()
+    {
+        _plannedDetail = Detail;
         // Per file: cache the TRELLIS.2 checkpoints in OPFS, stream from the hub with range requests (on every run) only what the browser has no
         // room for. navigator.storage.estimate() is NOT a limit: Chrome 151 reports usage + 10 GiB however much it would really take (measured:
         // 14 GiB written against a 10 GiB "quota"), so the plan believes only an exact headroom (BrowserStorageEstimate) and a write the browser
@@ -327,7 +359,7 @@
             _storageNote = "The browser refused to store all of the TRELLIS.2 weights, so part of them stream from the hub on every run.";
             _ = InvokeAsync(StateHasChanged);
         };
-        var (cachedBytes, streamedBytes) = await ranged.PlanCacheAsync(Trellis2Weights.HubWeightFiles(), estimate);
+        var (cachedBytes, streamedBytes) = await ranged.PlanCacheAsync(Trellis2Weights.HubWeightFiles(_resolution, cascade: _cascade), estimate);
         _streamWeights = streamedBytes > 0;
         _downloadBytes = streamedBytes + await UncachedBytesAsync(ranged);   // what the next run transfers
         _streamedBytes = streamedBytes;
@@ -335,14 +367,13 @@
             _storageNote = $"This browser reports room for {e.Headroom / 1073741824.0:F1} GB more: {cachedBytes / 1073741824.0:F1} GB of the TRELLIS.2 weights are cached, "
                 + $"the other {streamedBytes / 1073741824.0:F1} GB stream from the hub on every run.";
         _trellis = new Trellis2ImageTo3D(_accelerator, Trellis2Weights.FromModelSource(ranged)) { StageDone = OnStageDone };
-        return true;
     }
 
     // bytes of the planned-for-cache files that are not in OPFS yet (they download once, on the next run)
     private async Task<long> UncachedBytesAsync(SpawnDev.ILGPU.ML.Hub.RangeStreamModelSource ranged)
     {
         long sum = 0;
-        foreach (var (repo, path) in Trellis2Weights.HubWeightFiles())
+        foreach (var (repo, path) in Trellis2Weights.HubWeightFiles(_resolution, cascade: _cascade))
         {
             if (!ranged.CacheFiles.Contains(repo + "/" + path) || await ModelSource.Store.ExistsAsync(ModelSource.CacheKey(repo, path))) continue;
             using var probe = await ModelSource.OpenForInspectionAsync(repo, path);
@@ -381,6 +412,7 @@
     private void OnStageDone(string name, double seconds)
     {
         _downloadText = null;
+        TraceVram(name);
         _stages.Add((name, seconds));
         _currentStage = NextStageHint(name);
         if (_streamWeights) _currentStage = _currentStage?.Replace("first run: ", "");   // part of the weights streams on every run: no "first run" promise
@@ -822,7 +854,7 @@
         _finishedBytes = _lastDone = _lastTotal = 0; _trellisPhase = true;
         _modelStatusText = _streamWeights ? "TRELLIS.2 (streaming)" : _downloadBytes == 0 && !_ready ? "TRELLIS.2 (loading from browser storage)" : "TRELLIS.2";
         _currentStage = "image prep"; StateHasChanged();
-        try { _glb = await _trellis!.GenerateGlbAsync(rgba, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize }); }
+        try { _glb = await _trellis!.GenerateGlbAsync(rgba, w, h, new Trellis2Options { Seed = _seed, MaxFaces = _maxFaces, TextureSize = _textureSize, Resolution = _resolution, Cascade = _cascade }); }
         finally { _trellisPhase = false; }
         _ready = true; _isLoading = false;
         _downloadBytes = _streamedBytes;                          // the planned files are in OPFS now

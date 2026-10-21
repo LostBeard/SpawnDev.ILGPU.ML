@@ -161,6 +161,42 @@ public abstract partial class MLTestBase
         return $"sphere {nf} -> {outF} faces, {outV} vertices, max deviation {maxDev:F3} voxels, area {area / want:P2}";
     });
 
+    private static void SamplerTestModelImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> v, float a, float b) => v[i] = a * x[i] + b;
+
+    /// <summary>
+    /// <see cref="FlowSampler.SampleAsync"/> (a real device wait after every step: what keeps a 25 s-per-call flow from queueing all its steps in the
+    /// browser) runs the same steps as <see cref="FlowSampler.Sample"/>: identical numbers, guidance + rescale included, and the sample really moved.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Trellis2_FlowSampler_AsyncMatchesSync() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        const int Count = 5000;
+        var sampler = new FlowSampler(accelerator);
+        var model = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(SamplerTestModelImpl);
+        FlowSampler.Model m = (x, t1000, useCond, v) => model(Count, x, v, useCond ? 0.7f : 0.2f, t1000 * (useCond ? 1e-3f : -1e-3f));
+        var o = new FlowSampler.Options(Steps: 6, GuidanceStrength: 3f, GuidanceRescale: 0.5f, IntervalLo: 0.1, IntervalHi: 0.9, RescaleT: 3.0);
+        using var noise = accelerator.Allocate1D<float>(Count);
+        sampler.Randn(noise.View, Count, 1234UL);
+        using var a = accelerator.Allocate1D<float>(Count); a.View.CopyFrom(noise.View);
+        using var b = accelerator.Allocate1D<float>(Count); b.View.CopyFrom(noise.View);
+        int stepsA = 0, stepsB = 0;
+        sampler.Sample(m, a.View, Count, o, (s, n) => stepsA = s);
+        await accelerator.SynchronizeAsync();
+        await sampler.SampleAsync(m, b.View, Count, o, (s, n) => stepsB = s);
+        var ha = await a.View.CopyToHostAsync(); var hb = await b.View.CopyToHostAsync(); var h0 = await noise.View.CopyToHostAsync();
+        if (stepsA != 6 || stepsB != 6) throw new Exception($"steps reported {stepsA} / {stepsB}, want 6");
+        double moved = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            if (!float.IsFinite(hb[i])) throw new Exception($"non-finite sample at {i}");
+            if (ha[i] != hb[i]) throw new Exception($"async sampler differs at {i}: {hb[i]} vs {ha[i]} on {accelerator.AcceleratorType}");
+            moved += Math.Abs(hb[i] - h0[i]);
+        }
+        if (moved / Count < 1e-3) throw new Exception($"the sample did not move ({moved / Count:E2} per element)");
+        return $"{Count} elements, 6 steps with guidance and rescale: async == sync, mean move {moved / Count:F3}";
+    });
+
     [TestMethod(Timeout = 120000)]
     public async Task Trellis2_FlashAttention_MatchesHostReference() => await RunTest(async accelerator =>
     {
@@ -207,6 +243,20 @@ public abstract partial class MLTestBase
                 // CUDA at D = 128 runs the bf16 tensor-core kernel (inputs rounded to bf16); every other case is the fp32 portable kernel
                 double tol = accelerator.AcceleratorType == AcceleratorType.Cuda && D == 128 && DiTKernels.EnableTensorCores ? 3e-2 : 1e-4;
                 if (maxErr > tol) throw new Exception($"flash attention D={D} {(packed ? "self" : "cross")} max |err| {maxErr:E2} on {accelerator.AcceleratorType}");
+                // The same attention split into one-group dispatches (what a 20k-token attention does so no single dispatch runs into the GPU watchdog): the same numbers, bit for bit.
+                if (!(accelerator.AcceleratorType == AcceleratorType.Cuda && D == 128 && DiTKernels.EnableTensorCores))     // the tensor-core kernel is not chunked
+                {
+                    long was = DiTKernels.MaxAttentionPairsPerDispatch;
+                    DiTKernels.MaxAttentionPairsPerDispatch = 1;
+                    try
+                    {
+                        using var o2 = accelerator.Allocate1D<float>((long)Nq * C);
+                        dk.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o2.View, Nq, Nk, H, D);
+                        var got2 = await o2.View.CopyToHostAsync();
+                        for (int i = 0; i < got.Length; i++) if (got[i] != got2[i]) throw new Exception($"chunked flash attention D={D} {(packed ? "self" : "cross")} differs at {i}: {got2[i]} vs {got[i]} on {accelerator.AcceleratorType}");
+                    }
+                    finally { DiTKernels.MaxAttentionPairsPerDispatch = was; }
+                }
                 report.Add($"D{D} {(packed ? "self" : "cross")} {maxErr:E1}");
             }
         }
@@ -265,6 +315,69 @@ public abstract partial class MLTestBase
         return line;
         }
         finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = prevHook; }
+    });
+
+    /// <summary>
+    /// The 1024-resolution flow runs ~20k tokens: how long each op of one block takes at that size, and a whole block / several blocks queued without a
+    /// sync (the browser lost the device with DXGI_ERROR_DEVICE_HUNG, a GPU watchdog kill, on the first forward). Prints "[Benchmark] Trellis2 20k ...".
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Trellis2_Flow20kTokens_OpTimes() => await RunTest(async accelerator =>
+    {
+        RequireTrellisBackend(accelerator);
+        const int T = 19786, C = 1536, H = 12, D = 128, Mlp = 6144;
+        var dk = new DiTKernels(accelerator);
+        using var x = accelerator.Allocate1D(Enumerable.Range(0, T * C).Select(i => (float)Math.Sin(i * 0.37) * 0.5f).ToArray());
+        using var w = accelerator.Allocate1D(Enumerable.Range(0, Mlp * C).Select(i => BFloat16.FromRawBits((ushort)(0x3C00 + (i % 255)))).ToArray());
+        using var qkv = accelerator.Allocate1D(Enumerable.Range(0, T * 3 * C).Select(i => (float)Math.Cos(i * 0.11) * 0.5f).ToArray());
+        using var att = accelerator.Allocate1D<float>((long)T * C);
+        using var mlp = accelerator.Allocate1D<float>((long)T * Mlp);
+        using var outq = accelerator.Allocate1D<float>((long)T * 3 * C);
+        var report = new List<string>();
+        async Task<double> Time(string name, Action op)
+        {
+            op(); await accelerator.SynchronizeAsync();                       // compile
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            op(); await accelerator.SynchronizeAsync();
+            double ms = sw.Elapsed.TotalMilliseconds; report.Add($"{name} {ms:F0} ms"); Console.WriteLine($"[Benchmark] Trellis2 20k {name} {ms:F0} ms"); return ms;
+        }
+        Action linQkv = () => dk.Linear(x.View, w.View.SubView(0, 3L * C * C), null, outq.View, T, C, 3 * C);
+        Action self = () => dk.Attention(qkv.View, 3 * C, 0, qkv.View, 3 * C, C, 2 * C, default, att.View, T, T, H, D);
+        Action mlp1 = () => dk.Linear(x.View, w.View, null, mlp.View, T, C, Mlp);
+        Action mlp2 = () => dk.Linear(mlp.View, w.View, null, att.View, T, Mlp, C);
+        const int CondTokens = 4101;                                           // the 1024 px DINOv3 features: 64 x 64 patches + 5 register / class tokens
+        using var kv = accelerator.Allocate1D(Enumerable.Range(0, CondTokens * 2 * C).Select(i => (float)Math.Sin(i * 0.07) * 0.5f).ToArray());
+        Action cross = () => dk.Attention(x.View, C, 0, kv.View, 2 * C, 0, C, default, att.View, T, CondTokens, H, D);
+        // element-wise ops over N * C = 30M elements: 118k workgroups of 256, more than the 65535 a WebGPU dispatch has per dimension
+        using var modv = accelerator.Allocate1D(Enumerable.Range(0, 6 * C).Select(i => 0.5f).ToArray());
+        using var resid = accelerator.Allocate1D<float>((long)T * C);
+        await Time("gate residual (30M elements)", () => dk.GateResidual(resid.View, x.View, modv.View, 2 * C, T * C, C));
+        await Time("silu (30M elements)", () => dk.Silu(x.View, resid.View, T * C));
+        await Time("layer norm modulate", () => dk.LayerNormModulate(x.View, resid.View, modv.View, 0, C, T, C, 1e-6f));
+        {   // the residual really was updated at the far end of the range (a dispatch that covers only part of it would leave that tail untouched)
+            using var probe = accelerator.Allocate1D<float>((long)T * C);
+            dk.GateResidual(probe.View, x.View, modv.View, 2 * C, T * C, C); await accelerator.SynchronizeAsync();
+            var tail = await probe.View.SubView((long)T * C - 4, 4).CopyToHostAsync();
+            var xt = await x.View.SubView((long)T * C - 4, 4).CopyToHostAsync();
+            for (int i = 0; i < 4; i++) if (Math.Abs(tail[i] - 0.5f * xt[i]) > 1e-5) throw new Exception($"gate residual left the tail of 30M elements wrong: [{i}] {tail[i]} vs {0.5f * xt[i]}");
+        }
+        await Time("cross attention", cross);
+        // the remaining GEMM shapes of the flow (each one is a different tile / K path)
+        await Time("input layer 32 -> 1536", () => dk.Linear(x.View.SubView(0, (long)T * 32), w.View.SubView(0, 32L * C), null, outq.View.SubView(0, (long)T * C), T, 32, C));
+        await Time("input layer 64 -> 1536", () => dk.Linear(x.View.SubView(0, (long)T * 64), w.View.SubView(0, 64L * C), null, outq.View.SubView(0, (long)T * C), T, 64, C));
+        await Time("linear q / out 1536 -> 1536", () => dk.Linear(x.View, w.View.SubView(0, (long)C * C), null, outq.View.SubView(0, (long)T * C), T, C, C));
+        await Time("linear kv 1024 -> 3072 (4101 tokens)", () => dk.Linear(x.View.SubView(0, 4101L * 1024), w.View.SubView(0, 1024L * 2 * C), null, outq.View.SubView(0, 4101L * 2 * C), 4101, 1024, 2 * C));
+        await Time("out layer 1536 -> 32", () => dk.Linear(x.View, w.View.SubView(0, 32L * C), null, outq.View.SubView(0, (long)T * 32), T, C, 32));
+        await Time("linear qkv", linQkv);
+        await Time("self attention", self);
+        await Time("linear mlp1", mlp1);
+        await Time("linear mlp2", mlp2);
+        await Time("one block queued", () => { linQkv(); self(); mlp1(); mlp2(); });
+        await Time("five blocks queued", () => { for (int b = 0; b < 5; b++) { linQkv(); self(); mlp1(); mlp2(); } });
+        await Time("thirty blocks queued (one flow forward)", () => { for (int b = 0; b < 30; b++) { linQkv(); self(); cross(); mlp1(); mlp2(); } });
+        // a sampler step: forwards flushed one after another with no wait between them (FlowDiT.Forward ends with Fence = Flush on the browser), the way the real flow runs
+        await Time("six forwards flushed back to back, one wait", () => { for (int f = 0; f < 6; f++) { for (int b = 0; b < 30; b++) { linQkv(); self(); cross(); mlp1(); mlp2(); } accelerator.Flush(); } });
+        return "20k tokens: " + string.Join(", ", report);
     });
 
     /// <summary>

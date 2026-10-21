@@ -417,6 +417,9 @@ public sealed class DiTKernels
     }
     private static void ToBf16PairsImpl(Index1D i, FV src, UV dst) => dst[i] = Bf16Bits(src[2 * i]) | (Bf16Bits(src[2 * i + 1]) << 16);
 
+    /// <summary>The most query x key x head products one portable-attention dispatch covers (default 2^28: ~1.4e11 flops at head width 128, a fraction of a second even on a slow GPU); larger attentions run as several dispatches. Settable for tests.</summary>
+    public static long MaxAttentionPairsPerDispatch { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_ATTN_PAIRS"), out var ap) && ap > 0 ? ap : 1L << 28;
+
     /// <summary>True when <see cref="Attention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core one or the portable one.</summary>
     public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesTiledAttention(headDim);
     private bool UsesMmaAttention(int headDim)
@@ -520,15 +523,22 @@ public sealed class DiTKernels
             bool self = qv.Buffer == kvv.Buffer;
             if (self && qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
             int key = (D == 128 ? 0 : 2) + (self ? 1 : 0);
-            if (self)
+            Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>? selfK = null;
+            Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>? crossK = null;
+            if (self) selfK = SelfKernel(key); else crossK = CrossKernel(key);     // resolves _shuffleOk, which sets the queries per group
+            // One dispatch costs Nq * Nk * H * D * 4 flops: at 20k tokens that is 2.4 TFLOP, seconds on a portable kernel, and Windows kills a GPU
+            // dispatch that runs past ~2 s (the browser then loses the device: DXGI_ERROR_DEVICE_HUNG). The queries are split into dispatches
+            // of at most MaxAttentionPairsPerDispatch (query x key x head) each; every query's result is the same computation as in one dispatch.
+            int qpg = _shuffleOk == true ? TiledAttention.QueriesPerGroup : TiledAttention.QueriesPerGroupSmem;
+            long perRow = Math.Max(1L, (long)Nk * H);
+            int chunk = (int)Math.Min(Nq, Math.Max(qpg, MaxAttentionPairsPerDispatch / perRow / qpg * qpg));
+            for (int r0 = 0; r0 < Nq; r0 += chunk)
             {
-                var k = SelfKernel(key);                                    // resolves _shuffleOk, which sets the queries per group
-                k(Cfg(Nq, H), q, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);   // q and k/v are slices of one buffer: one binding
-            }
-            else
-            {
-                var k = CrossKernel(key);
-                k(Cfg(Nq, H), q, kv, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+                int rows = Math.Min(chunk, Nq - r0);
+                var oc = r0 == 0 && rows == Nq ? o : o.SubView((long)r0 * H * D, (long)rows * H * D);
+                int qo = qOff + r0 * qStride;                                       // the kernel reads query i at q[i * qStride + qOff + h * D]: rows start at r0
+                if (self) selfK!(Cfg(rows, H), q, oc, rows, Nk, H, qStride, qo, kvStride, kOff, vOff);   // q and k/v are slices of one buffer: one binding
+                else crossK!(Cfg(rows, H), q, kv, oc, rows, Nk, H, qStride, qo, kvStride, kOff, vOff);
             }
             return;
         }
