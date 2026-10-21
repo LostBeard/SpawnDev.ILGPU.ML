@@ -14,10 +14,12 @@ Requires K % 8 == 0 (and K even for the word reads); M and N are arbitrary.
 Epilogue: v = act(acc + bias); hasRes 1 adds Res[m, n], hasRes 2 adds the value already in C (an in-place residual without binding the
 same buffer twice, which WebGPU forbids).
 """
+import os
 import sys
 
 BM = BN = 128
 BK = 8
+KU = int(os.environ.get("GEMM_KU", "1"))   # inner k steps emitted per loop iteration (1 = the plain 8-trip loop, 8 = fully unrolled)
 TH = 256
 LD = 132          # shared row stride (floats): 132 % 32 = 4 -> the transposed stores are conflict free
 
@@ -88,16 +90,38 @@ def kernel(name, BK):
         for r in range(NB):
             w(f"{sp}        pb{r} = {loadB(r, 'kn')};")
         w(f"{sp}    }}")
-        w(f"{sp}    for (int kk = 0; kk < {BK}; kk++)")
-        w(f"{sp}    {{")
-        w(f"{sp}        int ab = kk * {LD} + ty, bb = kk * {LD} + tx;")
-        for i in range(8):
-            w(f"{sp}        float a{i} = As[ab + {16 * i}];")
-        for j in range(8):
-            w(f"{sp}        float b{j} = Bs[bb + {16 * j}];")
-        for i in range(8):
-            w(f"{sp}        " + " ".join(f"c{i}{j} += a{i} * b{j};" for j in range(8)))
-        w(f"{sp}    }}")
+        # KU = k steps per iteration of the inner loop, emitted with constant offsets (GEMM_KU=8 removes the loop). MEASURED 2026-10-21 on WebGPU
+        # (RTX 4070, Chrome 156, SpawnDev.ILGPU 5.4.1-local.2, 4096x1536 -> 6144): NO GAIN from source-level unrolling, so the default stays 1.
+        #   KU   qkv / mlp-up / mlp-down TFLOPS   GEMM WGSL   cold first launch
+        #    1   7.9 / 8.0 / 7.4                  331 KB      1.25 s
+        #    2   8.0 / 7.8 / 7.5                  370 KB      2.2 s
+        #    4   8.2 / 8.2 / 7.8 (inside the +-0.4 noise)  447 KB   2.1 s
+        #    8   7.3 / 7.2 / 7.1 (about 9 % SLOWER)        559 KB   2.5 s
+        # (Data measured +12 % with ILGPU's own LoopUnrolling raised to unroll this loop in a copy of this kernel; the two results are not
+        # reconciled. This kernel holds three k-loops (gather / f16 / bf16) in one shader, so unrolling triples the unrolled code.)
+        ku = min(KU, BK)
+        body_indent = sp + "    "
+        if ku < BK:
+            w(f"{sp}    for (int kk = 0; kk < {BK}; kk{'++' if ku == 1 else f' += {ku}'})")
+            w(f"{sp}    {{")
+            w(f"{sp}        int ab = kk * {LD} + ty, bb = kk * {LD} + tx;")
+            body_indent = sp + "        "
+        else:
+            w(f"{sp}    int ab = ty, bb = tx;")
+        for s in range(ku):
+            if ku > 1:
+                w(f"{body_indent}{{")
+            ind = body_indent + ("    " if ku > 1 else "")
+            for i in range(8):
+                w(f"{ind}float a{i} = As[ab + {s * LD + 16 * i}];")
+            for j in range(8):
+                w(f"{ind}float b{j} = Bs[bb + {s * LD + 16 * j}];")
+            for i in range(8):
+                w(f"{ind}" + " ".join(f"c{i}{j} += a{i} * b{j};" for j in range(8)))
+            if ku > 1:
+                w(f"{body_indent}}}")
+        if ku < BK:
+            w(f"{sp}    }}")
         w(f"{sp}    Group.Barrier();")
         w(f"{sp}}}")
     w("        if (gather)")
