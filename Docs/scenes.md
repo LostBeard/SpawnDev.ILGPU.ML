@@ -10,6 +10,9 @@ dotnet run --project Examples/09.SceneGen.Console -- "a blacksmith's workshop" -
 dotnet run --project Examples/09.SceneGen.Console -- --layout workshop_layout.json --out workshop    # build the layout you edited
 ```
 
+Options: `--llm <ollama name | file.gguf>` (default `qwen3:14b`), `--objects N` (about how many kinds of object, default 6, 1 to 12), `--pictures N` (pictures drawn per object, the cleanest cut-out is built, default 2), `--faces N` (per-object triangle budget, default 80,000), `--texture N` (default 1024), `--seed N`, `--out name`, `--cache dir` (model cache), `--plan-only` and `--layout file.json`.
+Outputs: `<name>.glb` (the scene), `<name>_layout.json` (editable) and `<name>_<object>.glb` (each object).
+
 ## How it works
 
 1. **`SceneLayoutPlanner`** asks a local LLM (an Ollama model name such as `qwen3:14b`, or a `.gguf` file; any `GgufTextGenerationPipeline`) for a **`SceneLayout`** as JSON: a ground, and objects with a prompt for ONE object alone, a height in metres and one or more instances (x, z, rotation, scale). The answer is parsed tolerantly (code fences, prose, a reasoning model's think block, trailing commas, numbers as strings), clamped to sane limits, and when it is unusable the model is asked again with the reason (up to 3 tries).

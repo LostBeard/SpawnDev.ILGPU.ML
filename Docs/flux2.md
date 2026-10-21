@@ -1,7 +1,7 @@
 # FLUX.2 klein 4B text to image (`SpawnDev.ILGPU.ML.Flux2`)
 
 FLUX.2 [klein] 4B (Black Forest Labs, Apache-2.0) re-implemented on ILGPU: the same C# kernels run it on CUDA, OpenCL and WebGPU, so it draws in a browser tab with no server.
-It replaces SD Turbo (2023) as the picture stage of the text-to-3D demo: sharper, far better anatomy (hands, faces, armour), and it follows long prompts.
+It replaces SD Turbo (2023) as the default picture stage of the text-to-3D demo: sharper, far better anatomy (hands, faces, armour), and it follows long prompts. FLUX 3 Image Klein ([flux3.md](flux3.md), non-commercial weights) is the larger, slower option, and `ImageGenerator` runs either behind one call.
 
 ```csharp
 var pipe = await Flux2Pipeline.CreateAsync(accelerator, modelSource, "LostBeard/FLUX.2-klein-4B-q4-ILGPU");

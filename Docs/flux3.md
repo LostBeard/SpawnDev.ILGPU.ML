@@ -50,8 +50,16 @@ The transformer is also gated on a small random-weight copy against the referenc
 
 FLUX 3 Image Klein is trained on full scene captions (medium and style, scene, lighting and camera, every subject with colours, materials and position): a short prompt gives a generic picture. Black Forest Labs' own pipeline always runs a prompt upsampler first (their 9B `flux-3-image-klein-pup`, or any LLM with their system prompt).
 `Flux3Request.Caption` is the caption the transformer sees, unchanged. `Flux3PromptUpsampler` writes one from a short request with any local LLM and BFL's text-to-image system prompt (Apache-2.0, embedded): `Flux3PromptUpsampler.FromPipeline(ggufPipeline).ExpandAsync("a red fox in the snow", 512, 512)`.
-On "a red fox in the snow" qwen3:8b wrote a clean 187-word caption (medium, scene, lighting, subject, depth of field); gemma3:4b wrote 330 words with an invented sign. The Image Generation page offers it as a checkbox backed by Qwen3 4B (Q4_K_M, 2.5 GB, freed before FLUX 3 loads). Text to image only: the edit prompt needs a vision-language model that sees the references.
+On "a red fox in the snow" qwen3:8b wrote a clean 187-word caption (medium, scene, lighting, subject, depth of field); gemma3:4b wrote 330 words with an invented sign. The Image Generation page offers it as a checkbox backed by `Flux3CaptionWriter` (Qwen3 4B, `unsloth/Qwen3-4B-GGUF` `Qwen3-4B-Q4_0.gguf`, 2.4 GB, freed before FLUX 3 loads); the caption streams to the page as it is written (`onText`), the model's `<think>` text first and then the caption. Text to image only: the edit prompt needs a vision-language model that sees the references.
+
+## One call for any host: `ImageGenerator`
+
+`SpawnDev.ILGPU.ML.Pipelines.ImageGenerator` puts FLUX 3 (with the caption writer), FLUX.2 klein and SD Turbo behind one `GenerateAsync(ImageGenerationRequest)`: reference pictures, 1 to N pictures on consecutive seeds, sizes, 4-bit or 8-bit FLUX weights (`FluxBits`) and SD Turbo's steps, guidance and negative prompt. It is the Image Generation page's pipeline for any host;
+`Examples/03.ImageGen.Console` and `Examples/10.ImageGen.Wpf` are thin shells over it. `PictureEditor.EditAsync(flux3, flux2, instruction, width, height, rgba, seed)` is the "Change this picture" step the demos share: the picture goes in as the reference and the instruction becomes the caption (FLUX 3) or prompt (FLUX.2).
 
 ## In the browser
 
 The Image Generation page runs FLUX 3 from the hosted export (models.spawndev.com, Hugging Face as the fallback) through the OPFS-cached model source. Chrome WebGPU, RTX 4070, 4-bit, cold start including all downloads (about 6 GB): 512 x 384 with one reference picture in 12.6 minutes. The over-HTTP test (`Flux3_OverHttp_DrawsAPicture`, local file server, no download wait): text to image 512 px 257 s with the weights loading, the next picture with a reference 164 s.
+
+**Known upstream bug (no workaround here): installed Chrome 151.0.7922.174 kills the GPU process on the third FLUX 3 picture** when the 5.6B transformer stays resident (Image Generation "Pictures: 4", Text to 3D "Draw 4"; 5 of 5 runs, "The GPU process died due to out of memory").
+The same build passes on Chromium 153 and on Chrome 156.0.8078.48 (Image Generation x4 in 393 s, the Text to 3D knight chain in 737 s): update Chrome. Measurements: `Plans/chrome-151-resident-flux3-device-loss-2026-10-20.md`.

@@ -10,7 +10,7 @@ Two riggers ship, both re-implemented on ILGPU from the published checkpoints' t
 | Model | VAST AI Research **SkinTokens / TokenRig** (MIT), the successor to UniRig | VAST AI Research **UniRig** (MIT) skeleton stage |
 | Skeleton | generated in the same token sequence as the skin | OPT-350m decoder under a grammar |
 | Skin weights | **learned** (an FSQ skin VAE decodes 4 tokens per bone into weights at every surface sample) | UniRig's skinning *prior* only (geodesic voxel binding), not the learned network |
-| Weights file | 1.15 GB bf16 (`LostBeard/SkinTokens-bf16` on the hub) | 0.7 GB bf16 (export it yourself, see below) |
+| Weights file | 1.15 GB bf16 (`LostBeard/SkinTokens-bf16` on the models host) | 0.7 GB bf16 (export it yourself, see below) |
 | Use it | the default | a smaller, faster fallback with a hand-built skin prior |
 
 The demo's **Rig this model** button (`/text-to-3d`, `/image-to-3d`) uses SkinTokens.
@@ -20,7 +20,7 @@ The demo's **Rig this model** button (`/text-to-3d`, `/image-to-3d`) uses SkinTo
 ```csharp
 // desktop (CUDA / OpenCL): from a local file
 using var weights = GpuWeights.LoadFile(accelerator, "skintokens.safetensors");
-// browser or desktop: stream it from the hub / any IModelSource (cached in OPFS by the demo's RangeStreamModelSource)
+// browser or desktop: stream it from the models host / any IModelSource (cached in OPFS by the demo's RangeStreamModelSource)
 using var weights = await SkinTokensWeights.LoadAsync(accelerator, modelSource, "LostBeard/SkinTokens-bf16");
 
 using var rigger = new SkinTokensRigger(accelerator, weights);
@@ -55,7 +55,7 @@ All against the real PyTorch reference classes in float32 (`tools/unirig-harness
 | Fast kernels (CUDA tensor cores, bf16 matmul inputs) | same 35 bones; activations drift ~1e-2 relRMS over 8-28 layers (2e-4 with the fast paths off), so near-tie tokens may differ from the reference |
 | Rig time, CUDA | **5.8 s warm**, 7.1 s cold (mesh encoder 0.03, cond 0.05, prefill 0.2, 154 skeleton tokens 1.7, 140 skin tokens 1.7, skin decode 35 bones x 54,000 points 2.2) |
 | Browser (WebGPU, test host) | same 35 bones; 26.6 s cold of which 12.4 s is first-use shader compilation |
-| Demo page, real Chrome | TRELLIS.2 witch sample: weights 87 s first download through the hub, **59 joints in 40 s**, rigged GLB passes the glTF validator with 0 errors |
+| Demo page, real Chrome | TRELLIS.2 witch sample: weights 87 s first download (measured when the SpawnDev hub still served models), **59 joints in 40 s**, rigged GLB passes the glTF validator with 0 errors |
 | TRELLIS.2 humanoid GLB | 42 joints; posing the right shoulder moves 18,082 of 67,186 vertices, none on the left half, 16 on the torso |
 
 A single-token step is a coalesced GEMV (`SkinTokensKernels.Gemv`: one 128-thread group per output, bf16 pairs as coalesced 32-bit loads): the general GEMM launches too few blocks at M = 1 (43 -> 11 ms per token).
@@ -90,8 +90,10 @@ File.WriteAllBytes("animated.glb", AnimatedGlb.Add(riggedGlb, new[] { walk, wave
 - **Retargeting** (`HumanoidRetargeter`): each bone's world rotation is SOMA's turn of its joint (clips store rotations away from SOMA's T-pose, in world space), re-expressed in the rig's axes, applied to the rig's rest after
   **rest alignment**: generated characters rarely stand in a clean T-pose, so every limb bone with one child is first swung to point where SOMA's matching bone points. The hips' travel is scaled by the ratio of hip heights
   so a short character does not moonwalk.
-- **Not included:** the upstream project also pushes arms out of the body using the skinned mesh as a collision proxy, and has a "stiff fingers" mode for hands whose weights bleed; neither is ported, so a bulky character
-  can put a hand through its body and a hand with leaky weights can spike when it curls. There is no foot IK: a feet-planted walk is only as clean as the clip.
+- **Arm clearance** (`Retarget(clip, speed, armClearanceDegrees)`, 5.3.19): generated characters (armour, coats) are bulkier than Kimodo's slim body, so both upper arms are swung that many degrees away from the body, about the torso's forward axis
+  (it follows the body however it turns). The default is 0 (the reference's behaviour); `AssetGenerator.AnimateAsync` defaults to 8 degrees, the demo has a selector, and the console has `--arm-clearance`.
+- **Not included:** the upstream project pushes arms out of the body by using the skinned mesh as a collision proxy; this port uses the fixed swing above instead, so a very bulky character can still put a hand through its body. The upstream "stiff fingers" mode for hands whose
+  weights bleed is not ported either, so a hand with leaky weights can spike when it curls. There is no foot IK: a feet-planted walk is only as clean as the clip.
 - **Clips:** `MotionClip.FromNpz` reads the packed format (quats, joints0, hips, fps). The demo bundles the 22 preset moves of image-to-3dlab (`SpawnDev.ILGPU.ML.Demo/wwwroot/motions`, `.bin` files that are `.npz` archives;
   NOTICE.md there): made with NVIDIA Kimodo (code Apache-2.0, model under the NVIDIA Open Model License; NVIDIA claims no ownership of its outputs). Check those licences before commercial use.
 - **Credit:** the approach (SOMA mapping by tree shape, world-space retargeting, rest alignment, hip scaling) is that of [image-to-3dlab](https://github.com/Bingeljell/image-to-3dlab) (Apache-2.0) `scripts/kimodo_retarget.py`;
@@ -110,7 +112,7 @@ vertices follow bones that far apart are removed. On a knight whose hands touch 
 
 ## Weights and tooling
 
-- SkinTokens weights: `LostBeard/SkinTokens-bf16` (public, MIT, converted from VAST-AI/SkinTokens `grpo_1400.ckpt`; served by the hub at `/hf/LostBeard/SkinTokens-bf16/skintokens.safetensors`).
+- SkinTokens weights: `LostBeard/SkinTokens-bf16` (public, MIT, converted from VAST-AI/SkinTokens `grpo_1400.ckpt`; served by the SpawnDev models host, `https://models.spawndev.com/LostBeard/SkinTokens-bf16/resolve/main/skintokens.safetensors`, with Hugging Face as the fallback).
   Rebuild with `tools/unirig-harness/reference/export_weights.py skintokens` (fuses Qwen q/k/v and gate/up, regroups the Michelangelo and Tripo2 attention rows; the model card lists every change).
 - UniRig weights: `export_weights.py skeleton`. `tools/unirig-harness/` holds the golden scripts (`golden_skintokens.py`, `golden_skeleton.py`, `golden_voxel_skin.py`), the reference environments
   (`st_env.py`, `ref_env.py`) and `serve-files.mjs`, a CORS + range file server for running the browser-lane tests against local weights.

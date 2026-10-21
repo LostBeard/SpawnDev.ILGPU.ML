@@ -1,682 +1,331 @@
+<div align="center">
+
 # SpawnDev.ILGPU.ML
 
-[![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
+**Neural network inference and training in C#, on any GPU, in the browser or on the desktop.**
 
-[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: **text & image to 3D**, classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
+Compute kernels written in C# run as WGSL, GLSL, PTX, OpenCL C, WebAssembly or SIMD CPU code through [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).
+No ONNX Runtime. No native inference binaries. No server.
 
-> **New in 5.3.22: [FLUX 3 Image Klein 5.6B](https://lostbeard.github.io/SpawnDev.ILGPU.ML/generate) in your browser, four days after its release.** Text to image and edits of up to 10 reference pictures on the Image Generation page (the same page now takes reference pictures for FLUX.2 klein too), with an optional local language model that writes the full scene caption FLUX 3 is trained on. Checked against the reference code; the weights are Black Forest Labs' (FLUX Kommunity License, non-commercial), the code is MIT. Also: region and shape editing of generated 3D assets, scenes from a sentence, a CLIP picture check, Q4_1 GGUF kernels. [How it works →](Docs/flux3.md)
->
-> **5.3.20: text to character on your desktop GPU.** `AssetGenerator` and two examples, a command-line tool and a WPF app ([Examples/07.AssetGen.Console](Examples/07.AssetGen.Console), [Examples/08.AssetGen.Wpf](Examples/08.AssetGen.Wpf)): a prompt becomes a textured, rigged, animated 3D character on CUDA or OpenCL (about 80 s on an RTX 4070 with the models cached). FLUX.2 klein also gains an 8-bit near-lossless option and 768/1024 px pictures, and rigging gains a bridge cleanup that removes the hand-to-hip slivers. [Docs/assetgen.md](Docs/assetgen.md)
->
-> **5.3.19:** repeat FLUX.2 draws of a prompt take ~8 s instead of ~75 s in the browser (the transformer stays loaded, the prompt embeddings are cached); animated characters get an **arm clearance** setting so arms and armour stop passing through the torso.
->
-> **New in 5.3.18: [FLUX.2 klein 4B](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) draws the picture for text to 3D.** Black Forest Labs' step-distilled 4B text-to-image model (Apache-2.0) re-implemented on ILGPU (Qwen3-4B text encoder, 3.9B flow transformer, VAE; 4-bit weights, 4.4 GB, 2.6 GB on the GPU at a time) replaces SD Turbo's 2023 look: full-body characters with real hands and armour. New in the demo: draw 4 or 8 pictures of one prompt (the extra ones cost ~7 s each) and pick the one to build in 3D. Every stage gated against diffusers. [How it works →](Docs/flux2.md)
->
-> **5.3.17 (fix):** drawing with SD Turbo no longer loses the WebGPU device on stable Chrome 145-151 ("A valid external Instance reference no longer exists"); see the [changelog](CHANGELOG.md).
->
-> **New in 5.3.16: [Make it move](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A rigged character can now play 22 preset moves (walk, run, wave, dance, kicks, ...) from NVIDIA Kimodo: `HumanoidRetargeter` finds the body of any generated humanoid by the shape of its bone tree and retargets Kimodo's clips onto it, `AnimatedGlb` writes them as glTF animations. The Image-to-3D demo has an **Animate** button, a move picker and **Download animated .glb**. Matches the reference retargeting script to 4e-8. [How it works →](Docs/rigging.md)
->
-> ![An astronaut: the prompt is expanded by Qwen3, drawn by FLUX 3 Image Klein, built by TRELLIS.2 at its 1024 cascade resolution (1M triangles, 4096 texture), rigged by SkinTokens and animated with Kimodo moves, all in the browser](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-21_TextTo3D-Rig-Animate-Astronaut-FLUX3-1024.gif)
->
-> *A prompt becomes a 3D character that is rigged and dances, entirely on your GPU in your browser: Qwen3 writes the caption -> FLUX 3 Image Klein draws it -> TRELLIS.2 (1024 cascade, 1M triangles, 4096 texture) -> SkinTokens -> Kimodo clips. Recorded in Chrome with `tools/demo-capture/flux3-text-to-3d-gif.mjs`.*
->
-> **5.3.15: [Rig this model](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d).** A generated character gets a skeleton and learned skin weights on your GPU: `SkinTokensRigger` (VAST AI's SkinTokens, MIT, re-implemented on ILGPU) turns a GLB into a rigged GLB in ~6 s on CUDA, and the Image-to-3D demo has a **Rig this model** button (1.15 GB, cached in your browser). Checked against the real PyTorch model: 295 of 296 generated tokens identical, skin weights to 5.7e-5. [How it works →](Docs/rigging.md)
->
-> **5.3.11: [Text & Image to 3D in your browser](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d).** Type a prompt or drop a photo and get a textured PBR 3D model (GLB) built entirely on your own GPU over WebGPU: SD Turbo draws the object, RMBG-1.4 cuts it out, and [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft, MIT, 4B parameters) generates the mesh and textures. To our knowledge this is the first fully client-side TRELLIS.2 on the web — no server, no upload. About 2-3 minutes on a desktop GPU once the weights are cached (~10 GB, opt-in). [How it works →](Docs/trellis2.md)
->
-> ![Text to 3D in the browser — "a wooden treasure chest with iron bands"](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-17-16-55_TextTo3D-Chest.jpg)
+[![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?label=nuget&logo=nuget)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
+[![Downloads](https://img.shields.io/nuget/dt/SpawnDev.ILGPU.ML.svg?label=downloads)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.txt)
+[![.NET 10](https://img.shields.io/badge/.NET-10-512bd4.svg)](https://dotnet.microsoft.com/)
+[![Live demo](https://img.shields.io/badge/live%20demo-GitHub%20Pages-2ea44f.svg)](https://lostbeard.github.io/SpawnDev.ILGPU.ML/)
+[![Sponsor](https://img.shields.io/badge/sponsor-LostBeard-ea4aaa.svg?logo=githubsponsors)](https://github.com/sponsors/LostBeard)
 
-**Hardware-agnostic neural network inference + training for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
+[**Live demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) | [Docs](Docs/README.md) | [Examples](Examples/README.md) | [Changelog](CHANGELOG.md) | [What is verified](Docs/DEMO_AND_MODEL_STATUS.md)
 
-SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of **7 inference formats** — and run it on any of six backends. Train custom models directly on your GPU in the browser — no server, no Python, no CUDA install.
+<img src="https://raw.githubusercontent.com/LostBeard/SpawnDev.ILGPU.ML/master/SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-21_TextTo3D-Rig-Animate-Astronaut-FLUX3-1024.gif" alt="A text prompt becomes a rigged, animated 3D astronaut, entirely in the browser" width="720">
 
-> **Honest status:** not every demo or model below is finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) lists exactly which demos are **VERIFIED** (passing end-to-end test, most ONNX-Runtime-matched) vs **WIP**. We mark stubs honestly — you should never click something here and get nothing.
+<sub>One prompt, one browser tab, no server: Qwen3 writes the caption, FLUX 3 Image Klein draws it, TRELLIS.2 builds the textured mesh, SkinTokens rigs it, Kimodo clips animate it. All of it runs on the visitor's GPU.</sub>
 
-> **Active development.** API is stabilizing but may change. Contributions and feedback welcome.
+</div>
+
+---
+
+## What it is
+
+SpawnDev.ILGPU.ML is an inference and training engine for .NET whose every layer, from matrix multiply to a 5.6B-parameter image model, is a C# kernel that [ILGPU](https://github.com/m4rs-mt/ILGPU) compiles for the device in front of it. The same library, the same kernels and the same models run:
+
+- **in the browser** (Blazor WebAssembly) on WebGPU, WebGL or WebAssembly, with nothing leaving the user's machine, and
+- **on the desktop** (Windows, Linux, macOS) on CUDA, OpenCL or a SIMD CPU backend.
+
+You hand it a model file. It detects the format, builds a graph, optimizes it and runs it on whatever accelerator you give it.
 
 ## Highlights
 
-> **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
+- **One codebase, six backends.** WebGPU, WebGL, WebAssembly, CUDA, OpenCL and CPU (the Velocity SIMD backend by default on 64-bit desktop). Kernels are tested on all of them.
+- **Seven model formats, auto-detected.** ONNX, TFLite, GGUF, SafeTensors, TensorFlow GraphDef, PyTorch checkpoints and Core ML, all lowered to one graph IR.
+- **200+ ONNX operators**, a graph optimizer (constant folding, fusion, strength reduction, dead-node elimination) and fused kernels for linear layers, attention, quantized matmul and more.
+- **Generative models, ported and checked.** FLUX 3 Image Klein, FLUX.2 klein, SD-Turbo, TRELLIS.2 (text and image to textured 3D), SkinTokens and UniRig (auto-rigging), Kimodo (character animation). Stages are gated against the reference implementations.
+- **Language and speech.** Quantized GGUF LLMs with KV-cache decode and TurboQuant cache compression, Whisper speech-to-text, Kokoro and ZipVoice text-to-speech with voice cloning.
+- **Training, not only inference.** Backpropagation, SGD and Adam as GPU kernels, so a small network can be trained in a browser tab.
+- **Zero-copy by design.** Pixels, activations and weights stay on the GPU. In the browser, bulk data streams from `fetch` and OPFS straight into GPU buffers without touching the .NET heap.
+- **Trim and AOT safe.** The trim analyzer runs on every build of the library.
 
-- **System One decision heads** *(5.2.22+; Snake factory removed from package in 5.2.23)* — typed choice / score / noul over a float state vector (Jev/Laya-inspired category, not a weight port). Tiny GPU MLP via `TrainableModel`, legal-action masks, FP32 weight export/import. Classic Snake at `/snake` is a **demo** (dims/teacher in `Demo.Shared`, not NuGet). [**Docs/system-one.md**](Docs/system-one.md)
-- **Demos** - **VERIFIED end-to-end** demos (most matched numerically against ONNX Runtime: classification, style, depth, pose, CLIP, background-removal, super-res, text-gen, embeddings, sentiment, inspector, benchmark, speech-to-text, text-to-speech (Kokoro + ZipVoice voice cloning), System One Snake, SD-Turbo image-gen, **and text & image to 3D (TRELLIS.2)**), plus a few PARTIAL/WIP (see status doc for the exact list). On-device LLM chat lives at `/ai-chat`.
-- **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), plus TRELLIS.2 image/text to 3D (`Trellis2ImageTo3D`, `Trellis2TextTo3D`), plus auto-rigging (`SkinTokensRigger`, `UniRigRigger`)
-- **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Softmax-CE MLP training powers System One heads. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
-- **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
-- **Local GGUF LLM inference + Ollama-compatible server** *(new in preview.5)* — run quantized LLMs (Qwen, Gemma, Llama) fully on your GPU with KV-cache decode; the Example 06 server is a drop-in Ollama replacement (OpenAI, Ollama, and Anthropic-Messages APIs) that works with the Claude CLI. ~51 tok/s decode on qwen2.5-coder:7b Q4_K_M (RTX 4070) via dp4a int8 GEMV + warp-cooperative register/flash attention (CUDA + WebGPU).
-- **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
-- **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
-- **ONNX operators** — registered set is `OperatorRegistry.BuiltinOpTypes` (count rendered live on the Home page). Not all are full-spec-complete; some are pass-throughs. See [**Docs/operators.md**](Docs/operators.md) — do not hardcode the count here.
-- **7 inference model formats + 4 mesh/splat IO formats** — *inference loaders:* ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. *Mesh/splat import-export (not inference):* SPZ, PLY, glTF, OBJ. Zero-dependency, auto-detected from magic bytes. First pure C# SPZ parser. (Loading a format ≠ running every model in it end-to-end — see the status doc.)
-- **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
-- **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.
-- **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
-- **Streaming weight loader** — Large models (GPT-2 652MB) load one tensor at a time. Minimal CPU peak memory. FP16 on GPU supported.
-- **122+ numpy-verified operator tests** — every operator validated against known-correct reference data, CPU reference comparison minimum bar
-- **Humanoid animation (Kimodo moves)** *(5.3.16)* — `HumanoidMapper` / `HumanoidRetargeter` / `AnimatedGlb` (`SpawnDev.ILGPU.ML.Animation`) play NVIDIA Kimodo motion clips on a SkinTokens-rigged humanoid: the rig is matched to Kimodo's 77-joint SOMA skeleton by the shape of its bone tree, clips are retargeted in world space with rest alignment and hip scaling, and the result is glTF animations on the rigged GLB. [**Docs/rigging.md**](Docs/rigging.md)
-- **Auto-rigging (SkinTokens, UniRig)** *(5.3.15)* — `SkinTokensRigger.RigGlbAsync(glb)` gives a generated character a skeleton and **learned** skin weights in one pass (Michelangelo shape encoder, a Qwen3-style decoder that writes the bones and 4 FSQ skin tokens per bone, a skin VAE decoded at 54,000 surface samples), as a rigged GLB with textures untouched. 5.8 s warm on an RTX 4070; in the browser on WebGPU. Gated against the real PyTorch model (295/296 tokens identical, skin 5.7e-5). `UniRigRigger` is the smaller skeleton + skinning-prior alternative. [**Docs/rigging.md**](Docs/rigging.md)
-- **Text & image to 3D (TRELLIS.2)** *(5.3.11)* — a prompt or a photo becomes a textured PBR GLB: `Trellis2ImageTo3D` / `Trellis2TextTo3D` run the full TRELLIS.2-4B pipeline (DINOv3 features, three 1.3B flow transformers, sparse VAE decoders, dual-grid mesh, UV atlas, GPU texture bake). ~40 s on CUDA (tensor cores), and in the browser on WebGPU (~2-3 min cached) — to our knowledge the first fully client-side TRELLIS.2 on the web. [**Docs/trellis2.md**](Docs/trellis2.md). (TripoSR / LGM single-image 3D remain planned.)
-- **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
-- **P2P Model Delivery + Shared Compute** — OPTIONAL, via the separate `SpawnDev.ILGPU.ML.WebTorrent` package: [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) decentralized model delivery over BitTorrent. The core library delivers models over plain HTTP from the SpawnDev models host (`models.spawndev.com`: static files, free egress, Hugging Face as the automatic fallback) and does NOT depend on WebTorrent; `HubModelStream` implements the same `IModelSource`, so P2P is a one-line swap. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
+## Try it
 
-## Demo Highlights
+The [live demo](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) is a Blazor WebAssembly app. Everything runs on your GPU; models download once from [`models.spawndev.com`](https://models.spawndev.com) and are cached in your browser.
 
-End-to-end demos on WebGPU (and the other backends) — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries. Full VERIFIED / WIP table: [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md).
+| Demo | What it does | Model |
+|------|--------------|-------|
+| [Text to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) / [Image to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d) | A prompt or a photo becomes a textured PBR `.glb`; rig it, animate it with 22 preset moves | FLUX 3 / FLUX.2 / SD-Turbo, RMBG-1.4, TRELLIS.2, SkinTokens, Kimodo |
+| [Image generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/generate) | Text to image, and edits of up to 10 reference pictures | FLUX 3 Image Klein, FLUX.2 klein, SD-Turbo |
+| [On-device chat](https://lostbeard.github.io/SpawnDev.ILGPU.ML/ai-chat) | Pick a `.gguf` and chat with it | Qwen, Gemma, Llama and others |
+| [Speech to text](https://lostbeard.github.io/SpawnDev.ILGPU.ML/whisper) | Microphone to text | Whisper |
+| [Text to speech](https://lostbeard.github.io/SpawnDev.ILGPU.ML/tts) | Built-in voices, or clone a voice from a short clip | Kokoro, ZipVoice |
+| [Depth](https://lostbeard.github.io/SpawnDev.ILGPU.ML/depth), [style transfer](https://lostbeard.github.io/SpawnDev.ILGPU.ML/style), [background removal](https://lostbeard.github.io/SpawnDev.ILGPU.ML/remove-bg), [super-resolution](https://lostbeard.github.io/SpawnDev.ILGPU.ML/super-res), [pose](https://lostbeard.github.io/SpawnDev.ILGPU.ML/pose), [CLIP](https://lostbeard.github.io/SpawnDev.ILGPU.ML/clip), [classification](https://lostbeard.github.io/SpawnDev.ILGPU.ML/classify) | Vision pipelines, with a race mode that runs one model on every backend side by side | Depth Anything V2, ESPCN, RMBG, MoveNet, CLIP, SqueezeNet |
+| [Model inspector](https://lostbeard.github.io/SpawnDev.ILGPU.ML/inspector) | Drop any model file (or paste a URL) for its architecture and an operator compatibility check, streaming only the header | any supported format |
+| [Benchmark](https://lostbeard.github.io/SpawnDev.ILGPU.ML/benchmark), [train](https://lostbeard.github.io/SpawnDev.ILGPU.ML/train), [snake](https://lostbeard.github.io/SpawnDev.ILGPU.ML/snake) | Throughput on your device, on-device training, a small decision-head demo | n/a |
 
-| Demo | Model | Pipeline |
-|------|-------|----------|
-| ![Text to 3D — treasure chest](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-10-17-16-55_TextTo3D-Chest.jpg) | **Text & image to 3D** — TRELLIS.2-4B (+ SD Turbo for text, RMBG-1.4 cut-out): prompt or photo → textured PBR GLB, fully in the browser on WebGPU | `Trellis2ImageTo3D` / `Trellis2TextTo3D` + `/text-to-3d` demo |
-| ![Classification — Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_Classification-Cat.jpg) | **Image classification** — SqueezeNet 1.1 | `ClassificationPipeline` |
-| ![Depth Anything V2 — House](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_DepthAnythingV2-House.jpg) | **Monocular depth estimation** — Depth Anything V2 Small (95MB) | `DepthEstimationPipeline` |
-| ![Style Transfer — Mosaic Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_StyleTransfer-CatMosaic.jpg) | **Neural style transfer** — Mosaic ONNX Model Zoo | `StyleTransferPipeline` |
-| ![Background Removal — Dog](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_BackgroundRemoval-Dog.jpg) | **Background removal** — RMBG-1.4 | `BackgroundRemovalPipeline` |
-| ![Super Resolution — Tree](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_SuperResolution-Tree.jpg) | **3x super-resolution** — ESPCN, tile-based with color and source-aspect preservation | `SuperResolutionPipeline` |
-| ![Pose Estimation — Push-up](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-06-01-15-21_PoseEstimation-Runner.jpg) | **Pose estimation** — MoveNet Lightning (17 keypoints), skeleton overlaid on a GPU-rendered frame | `PoseEstimationPipeline` |
-| ![System One Snake — score 72](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-09-26-13-24_SystemOneSnake-2.jpg) | **System One Snake** — local decision head (choice probs, no text); on-device BC from a safe teacher; legal-action mask. Snake helpers are demo-only | `SystemOneDecisionHead` + `/snake` demo |
+Not every page is finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) lists each demo and model as verified, partial or work in progress, with the test that proves it. If a statement here disagrees with that file, that file wins.
 
-Vision results above are rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
+## Install
 
-**Text & image to 3D** runs TRELLIS.2's whole pipeline on the visitor's GPU: ~10 GB of checkpoints stream from the hub into browser storage (OPFS, cached per file as the quota allows; the rest streams with range requests straight to the GPU), portable register-tiled GEMM and flash-attention kernels carry the three 1.3B flow transformers on WebGPU, the 3M-triangle mesh is clustered on the device before simplification, and the large kernels' pipelines build in the background before their first launch. MEASURED on an RTX 4070 in Chrome (AOT build, weights cached): photo → GLB 134-148 s, prompt → GLB 180 s. Details: [**Docs/trellis2.md**](Docs/trellis2.md).
-
-The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes. System One Snake trains and plays entirely on-device (~15 ms/decision on WebGPU); see [**Docs/system-one.md**](Docs/system-one.md).
-
-**Text generation** is verified end-to-end on WebGPU: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev models host (`models.spawndev.com`) over a **seekable stream straight to the GPU** — plain HTTP, cached in OPFS, so the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a HuggingFace model URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
-
-More pipelines exist in the codebase (object detection, face detection, other NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — see the status doc.
-
-## Universal Model Loading
-
-One API loads models from any ML ecosystem. Format is auto-detected from magic bytes — no configuration needed.
-
-| Format | Ecosystem | What It Opens |
-|--------|-----------|--------------|
-| **ONNX** (.onnx) | PyTorch, ONNX Model Zoo | Industry standard. Most exported models. |
-| **TFLite** (.tflite) | TensorFlow, MediaPipe, Google | Mobile/edge models. Face detection, pose, classification. |
-| **GGUF** (.gguf) | llama.cpp, HuggingFace | Quantized LLMs. Llama, Mistral, Phi, SmolLM. |
-| **SafeTensors** (.safetensors) | HuggingFace | Safe weight format. Nearly every HF model. |
-| **TF GraphDef** (.pb) | TensorFlow 1.x/2.x | Frozen graphs, TF Hub models. |
-| **PyTorch** (.pt/.pth) | PyTorch research | Weight extraction from checkpoints. |
-| **Core ML** (.mlmodel) | Apple, iOS/macOS | Apple's Neural Engine models. |
-
-```csharp
-// Browser / OPFS / hub (preferred): seekable stream — format auto-detected, ONNX/GGUF stream to GPU
-await using var stream = await hubSource.OpenAsync(repoId, "model.onnx"); // or .gguf / .tflite / …
-using var session = await InferenceSession.CreateFromStreamAsync(accelerator, stream);
-
-// In-memory bytes — same auto-detect
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
-
-// HTTP download into byte[] (desktop / small models — avoid for large browser weights)
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
-
-// Format-specific when you know the type
-var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
-var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, onnxStream);
-var session = InferenceSession.CreateFromTFLite(accelerator, tfliteBytes);
-var session = InferenceSession.CreateFromGGUF(accelerator, ggufBytes);
-var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, ggufStream);
-var session = InferenceSession.CreateFromSafeTensors(accelerator, safetensorBytes);
-var session = InferenceSession.CreateFromPyTorch(accelerator, ptBytes);
-var session = InferenceSession.CreateFromCoreML(accelerator, mlmodelBytes);
-var session = InferenceSession.CreateFromTFGraphDef(accelerator, pbBytes);
+```bash
+dotnet add package SpawnDev.ILGPU.ML
 ```
 
-`CreateFromStreamAsync` is the twin of the Model Inspector's streaming detect: a short magic-byte prefix, then dispatch. ONNX and GGUF keep weights on the stream→GPU path; other formats drain when ≤ 256 MB (then `CreateFromFile`). Requires a **seekable** stream (HubModelSource / OPFS / MemoryStream / FileStream) — not a one-shot HTTP body.
-## Transformers.js-style API — `Tensor<T>`, `OwnedTensor<T>`, `RunOwnedAsync`
+Requires **.NET 10**. Targets the browser (Blazor WebAssembly), Windows, Linux and macOS. Depends on [SpawnDev.ILGPU](https://www.nuget.org/packages/SpawnDev.ILGPU) and [SpawnDev.SpawnJS](https://www.nuget.org/packages/SpawnDev.SpawnJS).
 
-If you've used [Transformers.js](https://huggingface.co/docs/transformers.js) or ONNX Runtime, the input/output ergonomics will feel familiar. Models accept named `Tensor<T>` inputs and return an `OwnedTensorMap<T>` — a disposable bag of named outputs. Caller owns every output buffer, and `using` cleans them up in one go.
+## Quick start
+
+### 1. Create an accelerator
+
+The application owns the accelerator. Library code never disposes it.
 
 ```csharp
-using var session = await InferenceSession.CreateFromFileAsync(
-    accelerator, http, "models/squeezenet/model.onnx");
+// Desktop: the best device available (CUDA, then OpenCL, then CPU)
+using var context = MLContext.CreateContext();
+using var accelerator = context.GetPreferredDevice(preferCPU: false).CreateAccelerator(context);
+```
 
-// Allocate the model input as an OwnedTensor — wraps a fresh GPU buffer.
-// FromHost copies the host pixels to the accelerator in one shot.
-using var input = OwnedTensor<float>.FromHost(
-    accelerator, pixels, new[] { 1, 3, 224, 224 });
+```csharp
+// Blazor WebAssembly: WebGPU, falling back to WebGL, then Wasm
+using SpawnDev.ILGPU;   // AllAcceleratorsAsync, CreatePreferredAcceleratorAsync
 
-// Transformers.js-style call. Inputs are Tensor<float> (OwnedTensor converts
-// implicitly). Outputs come back as OwnedTensorMap<float> — each output tensor
-// is in its own freshly-allocated GPU buffer, independent of the session's
-// internal pool. Run B will not mutate Run A's outputs.
+var builder = MLContext.Create();
+await builder.AllAcceleratorsAsync();
+var context = builder.ToContext();
+var accelerator = await context.CreatePreferredAcceleratorAsync();
+```
+
+### 2. Run any model
+
+The format (ONNX, TFLite, GGUF, SafeTensors, ...) is detected from the file's magic bytes.
+
+```csharp
+using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Tensors;
+
+using var session = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes("squeezenet.onnx"));
+
+// Inputs are named tensors; outputs come back as a disposable map of GPU-resident tensors you own.
+using var input = OwnedTensor<float>.FromHost(accelerator, pixels, new[] { 1, 3, 224, 224 });
 using var outputs = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>>
 {
     [session.InputNames[0]] = input,
 });
 
-var logits = outputs[session.OutputNames[0]]; // OwnedTensor<float>
-var hostLogits = await logits.ToHostAsync();   // copy back to CPU when needed
+float[] logits = await outputs[session.OutputNames[0]].ToHostAsync();
 ```
 
-Under the hood there are three types, mirroring the split ILGPU itself uses between `MemoryBuffer<T>` (class, lifetime-managing) and `ArrayView<T>` (struct, kernel-passable):
+Large models should not be read into a `byte[]`. `InferenceSession.CreateFromStreamAsync(accelerator, stream)` takes any seekable stream (a file, an OPFS entry, a ranged HTTP stream) and sends ONNX and GGUF weights to the GPU tensor by tensor. Pipelines such as `ClassificationPipeline`, `DepthEstimationPipeline`, `SpeechRecognitionPipeline` (Whisper) and `TextGenerationPipeline` wrap a session with the pre- and post-processing for a task.
 
-- **`Tensor<T>`** — host-side reference type, shape-tracked view over an `ArrayView1D<T, Stride1D.Dense>`. Reshape / Slice / SubTensor are zero-copy. Generic over `T : unmanaged` (float, int, Half, etc.).
-- **`OwnedTensor<T>`** — `IDisposable` wrapper that owns a `MemoryBuffer1D<T>`. What pipelines return. Implicit conversions to `Tensor<T>` and `TensorView<T>` mean you never have to write `.AsTensor` or `.View` at a call site.
-- **`TensorView<T>`** — blittable struct, passable directly to ILGPU kernels. Inline `D0..D3` + `Rank`. Replaces the old "pass an ArrayView + four shape ints" idiom. Kernel authors write `Get4D(n, c, h, w)` instead of doing manual row-major stride math.
+### 3. Generate images
+
+`ImageGenerator` puts FLUX 3 Image Klein, FLUX.2 klein and SD-Turbo behind one call. Weights stream from the models host on first use and are cached on disk (OPFS in the browser).
 
 ```csharp
-// Kernel takes the tensor directly — no scalar W/H parameters.
-private static void DoubleKernel(Index1D idx,
-    TensorView<float> input, TensorView<float> output)
-{
-    int w = idx % input.D3;
-    int h = (idx / input.D3) % input.D2;
-    int c = (idx / (input.D3 * input.D2)) % input.D1;
-    int n = idx / (input.D3 * input.D2 * input.D1);
-    output.Set4D(n, c, h, w, input.Get4D(n, c, h, w) * 2f);
-}
-```
-
-### Format Details
-
-| Format | Graph Construction | Weight Types | Tested Models |
-|--------|-------------------|-------------|---------------|
-| **ONNX** | Full parser, 200+ ops, external data | F32, F16 | SqueezeNet, MobileNet, DistilBERT, GPT-2, Whisper, DA3, YOLOv8, MoveNet, CLIP, RMBG, SD-Turbo |
-| **TFLite** | FlatBuffer parser, NHWC layout, 60+ op mappings, fused activations | F32, F16, INT8, UINT8 (auto-dequant) | BlazeFace, EfficientNet-Lite, MediaPipe models |
-| **GGUF** | Architecture-aware graph builder (Llama family) | F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 | SmolLM, TinyLlama, Phi-4 Mini |
-| **SafeTensors** | Config-driven graph builder (encoder/vision/decoder architectures) | F32, F16, BF16, F64, I32, I16, I8, U8 | HuggingFace transformer weights |
-| **TF GraphDef** | Protobuf parser + op mapping to ONNX equivalents | F32, F16, INT32, DOUBLE | TensorFlow frozen graphs |
-| **PyTorch** | ZIP + PickleReader + weight extraction | F32, F16, BF16 | PyTorch checkpoints (weight inspection) |
-| **Core ML** | Protobuf parser + neural network layer mapping | F32, F16 | Apple .mlmodel files |
-
-Every format produces the same `ModelGraph` intermediate representation. All 200+ operators, all 30 GPU kernels, all 6 backends, and the full graph optimizer work identically regardless of source format. **Write one pipeline, load from any ecosystem.**
-
-## How It Works
-
-Neural network operations (matrix multiply, convolution, normalization, attention) are implemented as [ILGPU](https://github.com/m4rs-mt/ILGPU) kernels in C#. [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU) transpiles each kernel to the target shader language at runtime:
-
-```
-C# Kernel Code
-    |
-    v
-SpawnDev.ILGPU (transpilation)
-    |
-    +---> WGSL      (WebGPU)      -- browser GPU
-    +---> GLSL      (WebGL)       -- browser GPU (universal)
-    +---> Wasm      (Web Workers) -- browser CPU
-    +---> PTX       (CUDA)        -- NVIDIA GPU
-    +---> OpenCL C  (OpenCL)      -- any GPU
-    +---> CPU       (threads)     -- no GPU needed
-```
-
-## Quick Start
-
-### Load and Run Any Model
-
-```csharp
-using SpawnDev.ILGPU;
-using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 
-// Create accelerator (auto-selects best backend)
-var builder = MLContext.Create();
-await builder.AllAcceleratorsAsync();
-var context = builder.ToContext();
-var accelerator = await context.CreatePreferredAcceleratorAsync();
+using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+var source = new HttpClientModelSource(http, FileModelStore.Default());
 
-// Load any model from any URL — format auto-detected from magic bytes
-var session = await InferenceSession.CreateFromFileAsync(
-    accelerator, httpClient, "models/squeezenet/model.onnx");
-// Works with any URL and any supported format:
-//   "models/blaze-face/model.tflite"                                    — local TFLite
-//   "https://huggingface.co/org/repo/resolve/main/model.onnx"          — HuggingFace
-//   "https://storage.googleapis.com/mediapipe-models/.../model.tflite"  — Google CDN
+using var gen = new ImageGenerator(accelerator, source, (repo, file, progress) => source.OpenAsync(repo, file, progress));
+await gen.LoadAsync(ImageEngine.Flux2);
 
-// Classify an image
-var pipeline = new ClassificationPipeline(session, accelerator);
-var results = await pipeline.ClassifyAsync(rgbaPixels, width, height);
-
-Console.WriteLine($"{results[0].Label}: {results[0].Confidence:P1}");
-// Output: "tiger cat: 52.0%"
+var pictures = await gen.GenerateAsync(new ImageGenerationRequest
+{
+    Prompt = "a red fox in fresh snow",
+    Engine = ImageEngine.Flux2,
+    Size = 512,
+    Seed = 1,
+});
+// pictures[0].Rgba is width x height x 4 bytes
 ```
 
-### System One — typed decisions over float state
+### 4. Prompt to rigged, animated character
 
-Local decision head (choice / score / noul), not text generation. Inspired by the Jev/Laya System One category; not a Laya weight port. **Package:** `SystemOneDecisionHead`. **Snake** (`/snake`) is a demo that wires that head — see [**Docs/system-one.md**](Docs/system-one.md).
+`AssetGenerator` chains the whole 3D pipeline on a desktop GPU: draw, cut out, build the mesh, rig, animate.
 
 ```csharp
-using SpawnDev.ILGPU.ML.SystemOne;
+using SpawnDev.ILGPU.ML.Assets;
 
-using var head = new SystemOneDecisionHead(accelerator, stateDim: 40, numOptions: 4, hidden: 128);
-float[] state = /* length == head.StateDim */;
-var q = new ChoiceQuestion("move", "up", "down", "left", "right");
-bool[] legal = [true, true, false, true]; // mask illegal actions
-var ans = await head.ChooseAsync(state, q, legal);
-byte[] blob = await head.ExportWeightsAsync(); // tiny FP32 blob; ImportWeights to restore
+var (motions, ids) = AssetGenerator.MotionsFromDirectory("motions");
+using var gen = new AssetGenerator(accelerator, source, motions);
+
+var pictures = await gen.DrawAsync("a knight in plate armor, full body", new[] { 11, 12, 13, 14 });   // FLUX.2 klein
+var (cutOut, _) = await gen.CutOutAsync(pictures[0]);                                                  // RMBG-1.4
+var glb    = await gen.BuildModelAsync(cutOut, pictures[0].Width, pictures[0].Height);                 // TRELLIS.2
+var rigged = await gen.RigAsync(glb);                                                                  // SkinTokens
+var moves  = await gen.AnimateAsync(rigged, new[] { "walk", "dance", "wave" });                        // Kimodo
 ```
 
-### Using a Kernel Directly
+More: [Docs/assetgen.md](Docs/assetgen.md), [Docs/scenes.md](Docs/scenes.md) (a whole scene from one sentence).
 
-```csharp
-var matMul = new MatMulKernel(accelerator);
+## What you can run
 
-using var a = accelerator.Allocate1D<float>(M * K);
-using var b = accelerator.Allocate1D<float>(K * N);
-using var c = accelerator.Allocate1D<float>(M * N);
+| Area | What is in the box |
+|------|--------------------|
+| **Vision** | Classification, object detection (YOLOv8), face detection (BlazeFace), pose (MoveNet), depth (Depth Anything V2, multi-view and streaming variants), style transfer, super-resolution, background removal (RMBG-1.4, IS-Net), zero-shot classification (CLIP) |
+| **Image generation** | FLUX 3 Image Klein 5.6B (text to image, edits with up to 10 references, Qwen3 caption writer), FLUX.2 klein 4B, SD-Turbo, DDPM |
+| **3D** | TRELLIS.2 text and image to textured PBR mesh (`Trellis2ImageTo3D`, `Trellis2TextTo3D`), mesh repair, remeshing, simplification, UV atlas and texture baking on the device; glTF, OBJ, PLY and SPZ import and export |
+| **Rigging and animation** | `SkinTokensRigger` (learned skeleton and skin weights), `UniRigRigger`, `HumanoidRetargeter` and `AnimatedGlb` (Kimodo clips on any rigged humanoid) |
+| **Language** | GGUF LLM inference (Llama, Qwen, Gemma, Mistral, Phi, LFM2, gpt-oss and more) with KV-cache decode and TurboQuant cache compression, sentiment (DistilBERT), embeddings (MiniLM), text generation, multimodal Gemma 4 |
+| **Speech** | Whisper and Parakeet speech-to-text, Silero voice-activity detection, smart-turn detection, Kokoro and ZipVoice text-to-speech with voice cloning |
+| **Training** | `TrainableModel` with softmax cross-entropy, Conv2D, ReLU, max-pool and linear backward passes, SGD and Adam; `SystemOneDecisionHead` for small typed decision models |
+| **Tooling** | Model inspector (header-only streaming), op-compatibility reports, per-node timing, an Ollama-compatible GGUF server (Example 06) |
 
-matMul.MatMul(a.View, b.View, c.View, M, K, N);
-await accelerator.SynchronizeAsync();
-var result = await c.CopyToHostAsync<float>();
+Pipelines, models and their verification status are tracked in [Docs/DEMO_AND_MODEL_STATUS.md](Docs/DEMO_AND_MODEL_STATUS.md). "The loader reads format X" and "model Y runs end to end" are different claims, and that file keeps them apart.
+
+## Model formats
+
+One API loads a model from any ecosystem. Every loader produces the same `ModelGraph`, so each operator, kernel, optimizer pass and backend works the same whatever the source.
+
+| Format | Ecosystem | Notes |
+|--------|-----------|-------|
+| **ONNX** (`.onnx`) | PyTorch, ONNX Model Zoo | Streaming parser, external data, 200+ operators |
+| **TFLite** (`.tflite`) | TensorFlow, MediaPipe | NHWC graphs, fused activations, INT8 and UINT8 dequantized on load |
+| **GGUF** (`.gguf`) | llama.cpp, Ollama | Architecture-aware graph builder; fused GPU dequantizing matmul for Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K and MXFP4, plus F16, BF16 and F32 weights. Other quantization types (for example Q5_K or Q2_K) are refused with a clear error rather than decoded on the CPU: re-quantize the model |
+| **SafeTensors** (`.safetensors`) | Hugging Face | Config-driven builders; also the weight format of the generative models in this repo |
+| **TF GraphDef** (`.pb`) | TensorFlow | Protobuf parser with op mapping |
+| **PyTorch** (`.pt`, `.pth`) | PyTorch | Checkpoint weight extraction |
+| **Core ML** (`.mlmodel`) | Apple | Neural-network layer mapping |
+
+The supported ONNX operator set is the single source of truth `OperatorRegistry.BuiltinOpTypes`, described in [Docs/operators.md](Docs/operators.md), including which operators are complete and which are partial.
+
+## Backends
+
+| Backend | Runs on | Compiles C# kernels to | Where |
+|---------|---------|------------------------|-------|
+| **WebGPU** | GPU | WGSL | Browser |
+| **WebGL** | GPU | GLSL ES 3.0 | Browser |
+| **Wasm** | Web Workers | WebAssembly | Browser |
+| **CUDA** | NVIDIA GPU | PTX | Desktop |
+| **OpenCL** | Any OpenCL GPU | OpenCL C | Desktop |
+| **CPU** | CPU cores | Velocity SIMD (default on 64-bit) or the plain interpreting CPU accelerator | Desktop |
+
+`MLContext.CreateCpuAccelerator(context)` returns the Velocity accelerator where the context has one and the plain CPU accelerator otherwise. `MLContext.CreatePlainCpuContext()` gives the slow, exact reference accelerator that tests compare against.
+
+## How it works
+
 ```
+  model file (.onnx .tflite .gguf .safetensors .pb .pt .mlmodel)
+        |  magic-byte detection
+        v
+  format parser ---> ModelGraph (nodes, weights, shapes)
+        |
+        v
+  GraphOptimizer     constant folding, identity elimination, linear / attention /
+        |            layer-norm fusion, strength reduction, dead-node elimination
+        v
+  GraphCompiler ---> execution plan (200+ operators and fused ops)
+        |
+        v
+  GraphExecutor      topological dispatch, buffer recycling, batched submission
+        |
+        v
+  C# kernels  --- SpawnDev.ILGPU --->  WGSL | GLSL | Wasm | PTX | OpenCL C | SIMD CPU
+```
+
+- **Kernels** live in [`SpawnDev.ILGPU.ML/Kernels`](SpawnDev.ILGPU.ML/Kernels): tiled and register-blocked matmul, fused dequantizing GEMV for quantized LLMs, flash-style attention, convolution, normalization variants, RoPE, selective scan (Mamba), gated delta nets, mixture of experts, FWHT and TurboQuant, image pre- and post-processing, and the training backward passes.
+- **Decode fast paths.** Autoregressive decode records its dispatch plan once and replays it per token (WebGPU command replay, CUDA graphs), so the host does almost nothing per token.
+- **Tensors** are three small types: `Tensor<T>` (a shape-tracked view), `OwnedTensor<T>` (owns its GPU buffer) and `TensorView<T>` (a blittable struct kernels take directly).
+- **Model delivery** is plain HTTP from `models.spawndev.com`, a static host with free egress and range requests, with Hugging Face as the automatic fallback. `HubModelSource` caches in OPFS in the browser; `HttpClientModelSource` with `FileModelStore` does it on disk with resumable downloads. The optional [`SpawnDev.ILGPU.ML.WebTorrent`](SpawnDev.ILGPU.ML.WebTorrent) package adds peer-to-peer delivery behind the same `IModelSource` interface.
+
+## Performance
+
+Measured on an RTX 4070 12 GB, models cached. Full methodology and the other numbers are in the linked docs.
+
+| Task | Where | Result | Source |
+|------|-------|--------|--------|
+| Photo to textured 3D mesh (TRELLIS.2, 512 pipeline) | CUDA | about 40 s | [trellis2.md](Docs/trellis2.md) |
+| Photo to textured 3D mesh | OpenCL | about 83 s | [trellis2.md](Docs/trellis2.md) |
+| Photo to textured 3D mesh | Chrome, WebGPU, AOT build | 134 to 148 s | [trellis2.md](Docs/trellis2.md) |
+| Prompt to textured 3D mesh | Chrome, WebGPU, AOT build | about 180 s | [trellis2.md](Docs/trellis2.md) |
+| Photo to 1M-triangle mesh, 4096 texture (TRELLIS.2 1024 cascade) | CUDA | 201 s (the reference on the same card: 461 s) | [trellis2.md](Docs/trellis2.md) |
+| The same 1024 cascade | Chrome, WebGPU | 1403 s | [trellis2.md](Docs/trellis2.md) |
+| Prompt to rigged, animated character, end to end | CUDA | 77 s | [assetgen.md](Docs/assetgen.md) |
+| FLUX 3 Image Klein, 512 px, 16 steps | CUDA | 26.1 s (4-bit), 32.8 s (8-bit) | [flux3.md](Docs/flux3.md) |
+| Auto-rig a character (SkinTokens) | CUDA | about 6 s | [rigging.md](Docs/rigging.md) |
+
+Correctness comes first: kernels are checked against CPU references, vision and language models against ONNX Runtime outputs, and the generative models stage by stage against their reference PyTorch implementations (for example SkinTokens: 295 of 296 generated tokens identical, skin weights within 5.7e-5).
 
 ## Examples
 
-A progressive ladder of self-contained example projects under [`Examples/`](Examples/README.md) — from a minimal
-model inspect to a full inference server. Highlight:
+Self-contained projects under [`Examples/`](Examples/README.md), each runnable with `dotnet run --project Examples/<name>`.
 
-- **`06.OllamaServer.Console` — a drop-in Ollama replacement 🚧 (WIP).** Turns this engine into a native-GPU GGUF
-  inference server that prebuilt agentic frontends (**Claude CLI**, Pi, Codex, OpenCode, Continue, …) talk to with
-  zero reconfiguration. Speaks **OpenAI**, **Ollama-native**, and **Anthropic Messages** APIs at once, and serves
-  the GGUF models **already in your `~/.ollama` cache, zero-copy**. Functional end-to-end today (qwen2.5-coder,
-  gemma4 — KV-cache decode, streaming, tool-calling); the active work is matching Ollama's speed (vectorized-load +
-  fused GEMV) and large-context decode for 12B models. See [`Examples/06.OllamaServer.Console`](Examples/06.OllamaServer.Console/README.md).
+| # | Example | Shows |
+|---|---------|-------|
+| 02 | [Model inspector](Examples/02.ModelInspector.Console) | Header-only inspection of a local file, URL or Ollama model |
+| 03 | [Image generation](Examples/03.ImageGen.Console) | FLUX 3, FLUX.2 and SD-Turbo, reference images, interactive session |
+| 04 | [GGUF text generation](Examples/04.GGUFTextGen.Console) | KV-cache decode with per-token performance probes |
+| 05 | [Gemma 4 multimodal](Examples/05.Gemma4Multimodal.Console) | Vision plus text (verification pending) |
+| 06 | [Ollama-compatible server](Examples/06.OllamaServer.Console) | OpenAI, Ollama and Anthropic Messages APIs over your local GGUF models (work in progress) |
+| 07 | [Asset generation](Examples/07.AssetGen.Console) | Prompt to rigged, animated 3D character |
+| 08 | [Asset generation (WPF)](Examples/08.AssetGen.Wpf) | The same, as a Windows app with a 3D preview |
+| 09 | [Scene generation](Examples/09.SceneGen.Console) | A scene from one sentence: LLM layout, then one generated asset per object |
+| 10 | [Image generation (WPF)](Examples/10.ImageGen.Wpf) | The image page as a Windows app |
 
-## Supported Backends
+## Repository layout
 
-| | WebGPU | WebGL | Wasm | CUDA | OpenCL | CPU |
-|---|---|---|---|---|---|---|
-| **Runs on** | GPU | GPU | Workers | NVIDIA GPU | Any GPU | CPU cores |
-| **Transpiles to** | WGSL | GLSL ES 3.0 | Wasm binary | PTX | OpenCL C | Threads |
-| **Shared memory** | Yes | No | Yes | Yes | Yes | Yes |
-| **Environment** | Browser | Browser | Browser | Desktop | Desktop | Desktop |
+| Path | Contents |
+|------|----------|
+| `SpawnDev.ILGPU.ML/` | The library (NuGet package `SpawnDev.ILGPU.ML`) |
+| `SpawnDev.ILGPU.ML.WebTorrent/` | Optional peer-to-peer model delivery (separate package) |
+| `SpawnDev.Phonemizer/` | Dependency-free English grapheme-to-phoneme for text-to-speech, MIT |
+| `SpawnDev.ILGPU.ML.Demo/` | The Blazor WebAssembly demo app |
+| `SpawnDev.ILGPU.ML.Demo.Shared/` | Shared demo code and the test suite |
+| `SpawnDev.ILGPU.ML.DemoConsole/` | Desktop host for the shared test suite and console tools |
+| `SpawnDev.ILGPU.ML.Tests/` | xUnit tests for kernels, operators and sessions |
+| `Examples/` | Console and WPF examples |
+| `Docs/` | Topic documentation |
+| `PlaywrightMultiTest/` | The test runner (desktop and browser, every backend) |
+| `tools/` | Reference harnesses, weight exporters, capture and audit scripts |
 
-Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop).
+## Documentation
 
-## Validated Models
+| | |
+|---|---|
+| [Demo and model status](Docs/DEMO_AND_MODEL_STATUS.md) | What is verified, partial or work in progress, with evidence |
+| [Operators](Docs/operators.md) | ONNX operator support and implementation tiers |
+| [TRELLIS.2](Docs/trellis2.md) | Text and image to 3D: pipeline, API, browser design, numbers |
+| [FLUX 3 Image Klein](Docs/flux3.md) / [FLUX.2 klein](Docs/flux2.md) | Image generation and reference editing |
+| [Rigging and animation](Docs/rigging.md) | SkinTokens, UniRig, Kimodo retargeting |
+| [Asset generation](Docs/assetgen.md) / [Scenes](Docs/scenes.md) | Prompt to character, sentence to scene |
+| [System One](Docs/system-one.md) | Typed decision heads |
+| [Changelog](CHANGELOG.md) | Every release, in detail |
 
-### Vision Models
-
-| Model | Task | Size | Status |
-|-------|------|------|--------|
-| **SqueezeNet** | Classification (1000 classes) | 5 MB | **Working** — matches ONNX Runtime reference |
-| **MobileNetV2** | Classification (1000 classes) | 13 MB | Compiles, graph runs |
-| **ESPCN** | Super Resolution (3x) | 100 KB | **Working** — matches ONNX Runtime reference |
-| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** — 112 nodes, reference-matched |
-| **YOLOv8 Nano** | Object detection (80 classes) | 12.2 MB | **Working** — matches ONNX Runtime reference |
-| **Depth Anything V2 Small** | Monocular depth estimation | 95 MB | Compiles (823 nodes, 25 op types) |
-| **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | **Working** — matches ONNX Runtime reference |
-| **BlazeFace** | Face detection | 229 KB | TFLite — loads and runs |
-| **EfficientNet-Lite0** | Classification (1000 classes) | 17.7 MB | TFLite — loads and runs |
-
-Style models: mosaic, candy, rain princess, udnie, pointilism.
-
-### NLP Models
-
-| Model | Task | Size | Status |
-|-------|------|------|--------|
-| **Phi-4 Mini 3.8B** | Conversational LLM | ~2.3 GB (Q4 GGUF) | Tier 1: works on any 4GB+ GPU. MIT license. |
-| **Mistral NeMo 12B** | Conversational LLM | ~7 GB (Q4 GGUF) | Tier 2: premium quality on 8GB+ GPU. Apache 2.0. |
-| **Phi-4 14B** | Conversational LLM | ~8 GB (Q4 GGUF) | Tier 3: maximum intelligence on 12GB+ GPU. MIT license. |
-| **DistilBERT-SST2** | Sentiment analysis | 268 MB | **Working** — matches ONNX Runtime reference |
-| **DistilGPT-2** | Text generation | 314 MB | **Working** — streaming weight loader |
-| **Whisper Tiny** | Speech-to-text | 231 MB | **Working** - microphone to text, verified on all six backends (`Pipeline_Whisper_TranscribesKnownSpeech`) |
-| **SD-Turbo** | Image generation | ~2.5 GB (FP16) | ONE step, 512x512 from text prompts |
-| **FLUX.2 klein 4B** | Image generation (`Flux2Pipeline`) | 4.4 GB (4-bit) | 4 steps, 512x512, Qwen3-4B + 3.9B DiT + VAE; Apache-2.0; [Docs/flux2.md](Docs/flux2.md) |
-| **FLUX 3 Image Klein 5.6B** | Image generation and editing with up to 10 reference pictures (`Flux3Pipeline`) | 5.7 GB (4-bit) | 16 steps, 512 px verified (larger sizes in progress), Qwen3-VL text tower + 5.6B flow-map DiT + VAE; weights under the FLUX Kommunity License (non-commercial); [Docs/flux3.md](Docs/flux3.md) |
-| **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Zero-shot classification from any text |
-| **SpeechT5** | Text-to-speech | 643 MB | Neural voice synthesis |
-| **DDPM MNIST** | Image generation (lightweight) | 1 MB | Diffusion pipeline proof-of-concept |
-
-## Architecture
-
-### Multi-Format Inference Engine
-
-```
-Any model file (.onnx, .tflite, .gguf, .safetensors, .pb, .pt, .mlmodel)
-    |
-    v
-Format auto-detection (magic bytes) → appropriate parser
-    |
-    v
-ModelGraph (shared IR — nodes, weights, shapes)
-    |
-    v
-GraphOptimizer (6 passes: constant fold, identity elim, linear fusion,
-                scaled matmul fusion, strength reduction, dead node elim)
-    |
-    v
-GraphCompiler (200+ operators + fused ops → execution plan)
-    |
-    v
-GraphExecutor (topological dispatch, buffer recycling, periodic flush)
-    |
-    v
-InferenceSession (public API: CreateFromStreamAsync / CreateFromFileAsync / Run / RunAsync)
-```
-
-**Model loading** — one API, any format:
-```csharp
-// Seekable stream (browser / OPFS / hub) — auto-detect, ONNX/GGUF stream to GPU
-using var session = await InferenceSession.CreateFromStreamAsync(accelerator, stream);
-
-// HTTP → byte[] (desktop / small models)
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
-var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
-```
-
-Or use format-specific methods: `CreateFromOnnxAsync`, `CreateFromTFLiteAsync`, `CreateFromGGUFAsync`, `CreateAsync` (pre-extracted), `Create` (programmatic).
-
-All formats produce the same `ModelGraph` IR — every operator, kernel, optimizer pass, and backend works identically regardless of source format.
-
-### Graph Optimizer (automatic, 6 passes)
-
-Every model is automatically optimized during compilation:
-
-| Pass | What It Does | Impact |
-|------|-------------|--------|
-| **Constant folding** | Evaluates Shape→Gather→Cast→Floor chains at compile time | Eliminates shape-computation subgraphs |
-| **Identity elimination** | Removes Identity/Dropout no-ops | Cleaner graph, fewer dispatches |
-| **Linear fusion** | MatMul + Add + Activation → single FusedLinear dispatch | 2/3 less memory bandwidth |
-| **Scaled MatMul fusion** | MatMul + Scale → FusedScaledMatMul | Attention optimization |
-| **Strength reduction** | Div→Mul, eliminate Mul×1 and Add+0 | Cheaper operations |
-| **Dead node elimination** | Removes orphaned nodes after fusion | Clean graph |
-
-### GPU Kernels (30 files)
-
-| Kernel | Description | Performance |
-|--------|-------------|-------------|
-| **MatMul** | Tiled 16x16 shared memory | 92-101 GFLOPS |
-| **RegisterBlockedMatMul** | 4x4 register blocking, 64x64 tiles | Target: 200+ GFLOPS |
-| **FusedLinear** | MatMul + Bias + Activation in 1 dispatch | 3x less memory bandwidth |
-| **Conv2D / ConvTranspose2D** | Arbitrary kernel/stride/padding | — |
-| **InstanceNorm** | Two-pass O(N) per (N,C) slice | 50,000x faster than naive |
-| **LayerNorm / BatchNorm / RMSNorm** | All normalization variants | — |
-| **Softmax** | Two-pass numerically stable | — |
-| **Attention** | Multi-head split/score/merge | — |
-| **GELU/ReLU/SiLU** | With in-place variants | — |
-| **ImagePreprocess** | RGBA → NCHW, resize + normalize, Y-channel | GPU preprocessing |
-| **ImagePostprocess** | NCHW float → packed RGBA on GPU | Zero-copy output |
-| **DepthColormap** | Depth float → colored RGBA via GPU LUT | GPU visualization |
-| **PostProcessing** | YOLO decode, NMS filter, cosine similarity, L2 norm | GPU postprocessing |
-| **ColorConversion** | RGB↔YCbCr, grayscale, BGR on GPU | — |
-| **ImageTransform** | GPU resize, crop, flip | — |
-| **TensorLayout** | NCHW↔NHWC, interleaved↔planar on GPU | — |
-| **FWHT** | Fast Walsh-Hadamard Transform (TurboQuant core) | O(d log d) |
-| **TurboQuant** | KV cache compression via FWHT: 4-bit (0.9954 cosine), 3-bit (5.3x, 0.9833), 3-bit+QJL (0.9944, unbiased — default). Fused attention. | 4-5x compression |
-| **RoPE** | Rotary Position Embeddings (DA3, LLaMA, Mistral) | — |
-| **QKNorm** | L2-normalize Q/K per head (DA3) | — |
-| **GroupNorm** | Per-group normalization for U-Net (LGM) | — |
-| **SelectiveScan** | Mamba-3 SSM + MIMO + O(1) decode | Linear scaling |
-| **SpatialMemory** | AsyncMDE convex combination + EMA cache | Real-time depth |
-| **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
-| **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
-
-### ONNX operators
-
-Registered op-types live in `OperatorRegistry.BuiltinOpTypes` (live count on the Home page). Policy, aliases (including `SimplifiedLayerNormalization`), and how the Model Inspector answers "supported?" are documented in [**Docs/operators.md**](Docs/operators.md) — do not paste the list here.
-
-### Pipeline Classes (18 implemented; not all verified end-to-end — see status doc)
-
-| Pipeline | Input | Output |
-|----------|-------|--------|
-| **ClassificationPipeline** | RGBA image | Top-K labels + confidence |
-| **SuperResolutionPipeline** | RGBA image | Upscaled RGBA image (GPU-direct) |
-| **StyleTransferPipeline** | RGBA image | Stylized RGBA image (GPU-direct via CanvasRendererFactory) |
-| **DepthEstimationPipeline** | RGBA image | Depth map with GPU plasma colormap |
-| **ObjectDetectionPipeline** | RGBA image | Bounding boxes + labels (YOLOv8 + NMS) |
-| **PoseEstimationPipeline** | RGBA image | 17 keypoints with confidence (MoveNet) |
-| **FaceDetectionPipeline** | RGBA image | Face boxes + 6 landmarks (BlazeFace TFLite) |
-| **BackgroundRemovalPipeline** | RGBA image | Foreground with transparent background (RMBG) |
-| **ZeroShotClassificationPipeline** | RGBA image + text labels | Ranked labels by similarity (CLIP dual-encoder) |
-| **TextClassificationPipeline** | Token IDs | Sentiment predictions (DistilBERT) |
-| **FeatureExtractionPipeline** | Token IDs | L2-normalized embedding vector |
-| **TextGenerationPipeline** | Prompt text | Generated text (autoregressive, DistilGPT-2) |
-| **SpeechRecognitionPipeline** | Audio samples | Transcribed text (Whisper encoder+decoder) |
-| **AsyncDepthPipeline** | RGBA frames | Real-time depth with fast/slow path blending |
-| **Trellis2ImageTo3D** | RGBA image (alpha = foreground) | Textured PBR GLB (TRELLIS.2-4B, 512 or 1024 pipeline) |
-| **Trellis2TextTo3D** | Prompt text | Textured PBR GLB (FLUX.2 klein or SD Turbo → cut-out → TRELLIS.2) |
-| **SkinTokensRigger** | Character GLB | The same GLB rigged: skeleton + learned skin weights (SkinTokens / TokenRig, 1.15 GB bf16) |
-| **HumanoidRetargeter** + **AnimatedGlb** | Rigged humanoid GLB + Kimodo SOMA clips | The same GLB with the moves as glTF animations (`MotionClip.FromNpz`) |
-| **UniRigRigger** | Character GLB | The same GLB rigged: UniRig skeleton + geodesic voxel skinning prior |
-
-## Demo App
-
-The demo is a Blazor WebAssembly app showcasing what's possible when GPU inference runs entirely in the browser — no server, no uploads, no cloud. Everything stays on the user's device.
-
-### Working Now
-
-| Demo | What It Does | Status |
-|------|-------------|--------|
-| **Image Classification** | Drop a photo, get top-5 ImageNet predictions with confidence bars. Race Mode compares inference speed across WebGPU/WebGL/Wasm side-by-side. | **Live** |
-| **Neural Style Transfer** | Turn your photo into a Van Gogh, Monet, or Picasso. 5 style models, instant gallery switching. Before/after slider. | **Live** |
-| **Super Resolution** | Upload a small image, get 3x upscale. Before/after comparison with download. | **Live** |
-| **Model Inspector** | Drop any model file (ONNX, TFLite, GGUF, SafeTensors...) for instant architecture analysis — node count, parameters, operators, compatibility check. | **Live** |
-
-### Vision Demos
-
-| Demo | What It Does |
-|------|-------------|
-| **Depth Estimation** | Generate depth maps from any photo. GPU plasma colormap via CanvasRendererFactory zero-copy rendering. Depth Anything V2 runs on WebGPU. |
-| **Real-Time Object Detection** | Live webcam with bounding boxes. 80 COCO classes, confidence slider, FPS counter. GPU-accelerated NMS. |
-| **Background Removal** | One-click background removal. Transparent PNG download. Replace background with custom image or blur. |
-| **Pose Estimation** | Live webcam with skeleton overlay. 17 keypoints, joint angles, movement trails. MoveNet Lightning already compiles. |
-| **Face Detection** | Face detection with landmarks and confidence visualization. |
-| **Zero-Shot (CLIP)** | Type ANY text description. Classify images by it. No fixed categories — the user defines what to look for. |
-
-### Language & Audio Demos
-
-| Demo | What It Does |
-|------|-------------|
-| **Speech to Text** | Whisper-powered transcription. Upload audio or use the microphone — transcription runs on your GPU, never leaves your device. |
-| **Text to Speech** | Kokoro built-in voices (type → speak) or ZipVoice one-shot cloning from a short reference clip; save clones to OPFS. Same stack as SpawnDev.AI hands-free TTS. |
-| **Semantic Search** | Generate text embeddings with all-MiniLM-L6-v2. Find similar passages, rank by relevance — all computed locally. |
-| **Text Generation** | GPT-style text generation with greedy/top-K/top-P sampling, temperature control, and tokens/second counter. |
-
-### Experimental & Fun Demos
-
-| Demo | What It Does | Why It's Special |
-|------|-------------|-----------------|
-| **Inside the Network** | Peek inside the neural network — feature maps / activations for a limited set of models. | Educational; PARTIAL — not every model is interceptable yet. |
-| **Draw to Train** | Draw gestures, train a small CNN on-device. Gesture path still PARTIAL; System One BC train is verified via `/snake`. | Browser GPU training (forward + backprop) where the path is finished. |
-| **System One Snake** | Classic Snake controlled by a local System One decision head (Softmax probs, no text). Train on-device from a flood-fill safe teacher; illegal moves masked; ~23 KB head cached in localStorage. Package API is generic; Snake code lives in Demo.Shared. | Shows typed decisions + GPU training without a language model. Docs: [system-one.md](Docs/system-one.md). |
-| **AI Chat** | On-device GGUF LLM chat (Qwen / Gemma / Llama / SmolLM). Pick a `.gguf`, stream tokens on WebGPU. | Real local chat — no API key. Prefer this over the retired Assistant / Comic Chat placeholder pages. |
-
-### Generative & 3D Demos
-
-| Demo | What It Does |
-|------|-------------|
-| **Text & Image to 3D (TRELLIS.2)** | `/text-to-3d` and `/image-to-3d`: a prompt (SD Turbo draws it) or a photo, cut out with RMBG-1.4, turned into a textured PBR GLB by TRELLIS.2-4B on your GPU. Live stage timings, rotating 3D preview, GLB download, **Rig this model** (SkinTokens: skeleton + learned skin weights, +1.15 GB, Download rigged .glb) and **Animate** (22 Kimodo moves, in-place toggle, Download animated .glb). ~10 GB of weights, opt-in, cached in browser storage. |
-| **Image Generation** | SD-Turbo text→image on your GPU (single-step, ~2.5 GB opt-in download). Same `ImageGenerationPipeline` as SpawnDev.AI. |
-| **Image to 3D (TripoSR)** | Planned. The TripoSR reconstruction path is not wired; use Text & Image to 3D (TRELLIS.2) for working image-to-3D. |
-| **Image to Gaussian Splats (LGM)** | Planned — single image → splats → [SpawnScene](https://github.com/LostBeard/SpawnScene). Not a working demo page yet. |
-| **Depth Voxel** | Route mounts; depth colormap can run. The promised 3D voxel/splat viewer was never built (STATUS: PARTIAL; hidden from nav). |
-
-### Infrastructure Demos
-
-| Demo | What It Does |
-|------|-------------|
-| **Backend Showdown** | Run the same model on all available backends simultaneously. Leaderboard of inference times. Copy-paste shareable results. |
-| **Model Inspector** | Drop any model file for instant architecture analysis and compatibility check. All 7 formats supported. |
-| **Model Gallery** | Browse all available demo models. Load custom models from HuggingFace. |
-| **Getting Started** | 5-step interactive tutorial with code examples. |
-
-All demos include backend selection, inference timing, and "100% client-side" privacy badges where applicable.
-
-Most demo pages run real models on your GPU in your browser — but not all are finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth for ✅ VERIFIED vs 🟡 PARTIAL vs 🚧 WIP. If a blurb here disagrees with that file, believe the status doc.
-
-### The Wow Factor
-
-**Real today:**
-- **Backend Race Mode** — Run the same model on WebGPU, WebGL, and Wasm simultaneously, with live timing bars + medals (on the `/classify` demo). No other library does this.
-- **"How Fast Is Your Device?"** — A dedicated `/benchmark` page: MatMul throughput, model load time, inference speed. Like Cinebench for browser ML.
-
-**Planned (not built yet — no demo page exists, listed so the roadmap is honest):**
-- **Pipeline Composer** — a visual node editor for building/training pipelines without code. *Design only — there is no Pipeline Composer page yet.*
-- **Progressive Enhancement story page** — an animated Wasm→WebGL→WebGPU speedup walkthrough. *No dedicated page yet.*
-- **Offline Mode toggle** — "toggle airplane mode, inference still runs." *Not wired as a global toggle yet.*
-- **Collaborative Canvas** — Multiple users on different devices, all running the same model, real-time via WebRTC (using SpawnDev.SpawnJS). Multi-device ML collaboration, all in-browser.
-- **Model-to-Model Pipeline** — Photo → depth estimation → 3D point cloud → style transfer on the texture → render. Three ML models + 3D rendering, all on GPU, no server, one C# codebase. The ultimate SpawnDev ecosystem demo.
-- **Real-Time Audio + Video Fusion** — Webcam (pose + face landmarks) + microphone (speech + emotion) simultaneously: "Person speaking with happy expression, arms raised." Multi-modal real-time inference from two input streams.
-- **Screenshot Sharing** — One-click capture of demo result + timing as a shareable image card, pre-formatted for X/Twitter.
-
-## Model Inspector
-
-Drop any model file — **ONNX, TFLite, GGUF, SafeTensors, or any supported format** — and instantly see:
-- Graph metadata (name, producer, opset version)
-- Node count, parameter count, weight sizes
-- Input/output tensor shapes and types
-- Operator usage histogram
-- Top 20 largest weights
-- **Compatibility check** — green badge if SpawnDev.ILGPU.ML can run the model
-- **GGUF models** — architecture info (layers, heads, context length, vocab size)
-
-Format is auto-detected from magic bytes. All parsing happens in-browser with zero dependencies.
-
-## Weight Loading
-
-Weights are extracted automatically from any supported format:
-
-| Format | Weight Types | Notes |
-|--------|-------------|-------|
-| **ONNX** | F32, F16 | Extracted from protobuf |
-| **TFLite** | F32, F16, INT8, UINT8 | Auto-dequantized with quantization params |
-| **GGUF** | F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 | Block dequantization for quantized LLMs |
-| **SafeTensors** | F32, F16, BF16, F64, I32, I16, I8, U8 | Zero-copy JSON header + raw data |
-| **Pre-extracted FP16** | F16 → F32 | `weights_fp16.bin` + `manifest_fp16.json` (optimized web delivery) |
-
-All weight types are converted to F32 on GPU upload. Pre-extracted FP16 uses 256-byte alignment for WebGPU buffer binding requirements.
-
-
-## Recent Breakthroughs
-
-- **GPU training engine** — Full backpropagation on WebGPU: SoftmaxCE, ReLU backward, Conv2D backward, MaxPool backward, Linear backward, SGD, Adam. Train CNNs in the browser on your GPU. Draw → Train → Classify in one browser tab.
-- **Streaming weight loader** — Large models (GPT-2 652MB, SD-Turbo 2.5GB) load one tensor at a time. Peak CPU: ~few MB. Eliminates OOM for any model that fits on GPU.
-- **Zero-copy weight streaming (SD-Turbo, preview.8)** - The ONNX parser streams every float weight >64 elements JS-side straight to the GPU (never materializing into the .NET/WASM managed heap); only ≤64-element CPU shape constants materialize. Fixes the ~26x WebGPU load gap where SD-Turbo's ~4651 small fp16 weights fell onto the .NET `CopyFromCPU` path. fp16 weights upcast to fp32 on the GPU (bit-exact vs CPU). Depends on SpawnDev.ILGPU 4.17.3 `BrowserBufferPolicy`, which also fails loud in tests if a weight regresses off the JS-stream path.
-- **Warm shape-readback cache (SD-Turbo, preview.8)** - `ImageGenerationPipeline` enables `CacheShapeReadbacks` on all three sub-models; SD-Turbo shapes are fixed across generations, so the shape constants (2746 in the UNet alone) are served from the CPU after generation 1 instead of a per-node GPU→CPU readback. WebGPU generation ~106s → ~23.4s, output bit-identical. Same lever the GGUF decode loop already uses.
-- **Tiered LLM** — Auto-detect GPU VRAM and load the best model: Phi-4 Mini 3.8B (4GB+), Mistral NeMo 12B (8GB+), or Phi-4 14B (12GB+). User-selectable override.
-- **DelegateSpecialization broadcast kernel** — One GPU kernel handles Add, Sub, Mul, Div for arbitrary N-D shapes. Compile-time inlined ops via SpawnDev.ILGPU's DelegateSpecialization. Found and fixed a 5+ param router bug in SpawnDev.ILGPU along the way.
-- **DepthAnything V2 passes** — 823-node DPT decoder producing correct depth output. Fixed: hardcoded Div in broadcast path, buffer aliasing, decomposed LayerNorm chain. End-to-end depth estimation in the browser.
-- **DistilBERT + Whisper passing** — First NLP transformers on the engine. 10-bug fix chain including ConstantOfShape, Expand, Slice constant folding, Cast propagation, INT64_MAX overflow, Gemm higher-rank inputs.
-- **122+ operator test cases** — Expanded from 18, caught 11+ real bugs. Includes broadcast LayerNorm patterns, subgraph execution (If/Loop/Scan), quantized conv/matmul (ConvInteger, QLinearConv, QLinearMatMul), and CPU reference comparison for every test.
-- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. First pure C# SPZ parser. Full round-trip for all 3D formats.
-- **DiffusionPipeline** — DDPM denoising loop + SD-Turbo one-step generation. Image generation from text prompts on WebGPU.
-- **20+ demo pages** — Interactive demos loading from HuggingFace CDN. Image to 3D and Pipeline Composer planned for v4.1.0.
-- **500+ real GPU tests** — Full suite across WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU. Every test runs real GPU kernels with CPU reference verification. Operator tests, reference model tests (vs ONNX Runtime), Blazing Edge GPU kernel tests, format round-trips, training engine tests.
-
-## Blazing Edge — v4.0.0
-
-SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML research frontier — not as experiments, but as production-ready features.
-
-| Technology | What It Does | Why It Matters |
-|-----------|-------------|----------------|
-| **TurboQuant** | 4-5x KV cache compression via FWHT + quantization, fused attention kernel. Three selectable modes: **4-bit** (16 centroids, 0.9954 cosine, ~4x), **3-bit** (8 centroids, 0.9833 cosine, 5.3x), **3-bit+QJL** (8 centroids + error correction, 0.9944 cosine, ~4x — default). | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. `KVQuantMode` enum: `Auto` (3-bit+QJL), `TurboQuant4Bit`, `TurboQuant3Bit`, `TurboQuant3BitQJL`. Full pipeline: normalize → sign-flip → FWHT → quantize → bit-pack → fused attention. |
-| **SPZ Compression** | 15-20x compression for Gaussian Splat scenes, optimized for WebGPU | 500MB 3D scenes become 25MB. Spatially-ordered Gaussians make GPU sorting faster. Instant sharing. |
-| **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
-| **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
-| **Mamba-3** | Linear-scaling State Space Models with MIMO arithmetic intensity | Constant-memory decoding — LLM conversations don't slow down or eat more RAM over time. Closes gap with Transformers while keeping O(n) scaling. |
-| **Tiered LLM** | Auto-detect GPU VRAM, load the best LLM: Phi-4 Mini 3.8B (4GB+), Mistral NeMo 12B (8GB+), Phi-4 14B (12GB+) | Every user gets the best conversational AI their hardware can deliver. User-selectable override. All MIT/Apache 2.0. Streamed to GPU via GGUF Q4 + TurboQuant KV cache. |
-| **SD-Turbo** | ONE inference step → 512x512 image from text prompt | Real Stable Diffusion in the browser. Type a sentence, get art in ~1 second. 2.5GB FP16 streamed to GPU. |
-| **TripoSR** | Single photo → full 3D textured mesh via DINOv1 + Triplane transformer + Marching Cubes | Export as glTF/OBJ — use in Blender, Unity, game engines, 3D printing. ~840MB FP16, feed-forward (no diffusion). |
-| **LGM** | Single photo → 65,536 photorealistic Gaussian splats | Fly through 3D scenes in SpawnScene. Export as SPZ (15-20x compressed) or PLY. Integrates with the emerging Khronos glTF Gaussian Splatting standard. |
-| **GPU Training** | Train CNNs in the browser — backpropagation, Adam optimizer, live loss curves | Draw custom gestures → train a classifier in seconds on your GPU → classify in real-time. Full training engine in C# compute shaders. |
-
-### Performance — Squeeze Every TFLOP
-
-| Optimization | What It Does | Impact |
-|-------------|-------------|--------|
-| **Register-Blocked MatMul** | 4x4 register blocking within 16x16 tiled kernels. Keeps more data in registers, reduces shared memory reads. | Target: 200+ GFLOPS (current: 92-101). ThunderKittens 2.0 WGSL/PTX hints. |
-| **Megakernel Attention** | Fuse entire attention block (Q@K^T → softmax → scores@V) into a single persistent kernel. | Eliminates 3+ dispatch boundaries. Critical for WebGPU where command buffer submission has latency. |
-| **Fused Weight Dequantization** | Dequantize GGUF Q4 weights inside the MatMul kernel registers — weights stay compressed in GPU memory. | Massive memory bandwidth savings. Phi-4 Mini Q4 runs without separate dequant step. |
-
-These aren't future plans — they're v4.0.0 features. Because every release is the last release.
-
-## Testing
-
-Tests run across all 6 backends via **PlaywrightMultiTest**:
+## Build and test
 
 ```bash
-# All tests (desktop + browser)
-dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
+dotnet build SpawnDev.ILGPU.ML.slnx
 ```
 
-**SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends. Wasm backend: **179 pass / 0 fail / 55 skip** (fiber refactor complete — all RadixSort, scan, barrier, and sort tests pass).
-**SpawnDev.ILGPU.ML: 1300+ tests across all backends** — 104+ operator tests, 14 CUDA model inference tests (GPT-2, Whisper, DistilBERT, DAv2, StyleTransfer, MobileNet, SqueezeNet, YOLOv8, ESPCN, MoveNet, DDPM + more), 12 preprocessor tests, 9 HuggingFace CDN tests, 14+ reference model tests (vs ONNX Runtime), pipeline end-to-end tests, format round-trip tests, Blazing Edge GPU kernel tests (FWHT, RoPE, QKNorm, GroupNorm, SelectiveScan, TurboQuant), Q4 dequant routing tests, training engine tests, and more.
+Tests run through **PlaywrightMultiTest**, which drives the desktop backends and a real Chromium for the browser backends from one command:
 
-Every kernel validates against CPU reference implementations.
+```bash
+dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj -c Release
+```
+
+Scope a run with environment variables, for example `PMT_LANES=cuda,webgpu` for the fast backends or `PMT_FILTER=Trellis2_` for one area. Heavy real-model tests are excluded by default and are opt-in by category.
+
+The demo is published with `dotnet publish SpawnDev.ILGPU.ML.Demo -c Release -p:DemoAot=true` (AOT keeps the CPU-bound stages of the 3D pipeline fast in the browser).
+
+## Model licenses
+
+The code in this repository is MIT. Model weights keep their own licenses, which travel with the files on the models host and are listed in each model's doc. Notably, **FLUX 3 Image Klein weights are under the FLUX Kommunity License (non-commercial)**, FLUX.2 klein is Apache-2.0, TRELLIS.2, SkinTokens and UniRig are MIT, and the bundled Kimodo motion clips carry the terms in [`SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md`](SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md). Check them before commercial use.
+
+## Contributing
+
+Issues and pull requests are welcome. A bug in this library, in SpawnDev.ILGPU or in SpawnDev.SpawnJS is fixed in that library, not worked around in a consumer, so a good bug report is a failing test or a minimal repro on a named backend. Run the tests for the lanes you touched before you open a pull request.
+
+## Support the project
+
+SpawnDev is built by one developer and a small team of AI agents. If it is useful to you, [sponsoring on GitHub](https://github.com/sponsors/LostBeard) directly funds more kernels, more verified models and more backends. Stars, issues and sharing what you build with it help just as much.
 
 ## Credits
 
-SpawnDev.ILGPU.ML would not be possible without:
+- [**ILGPU**](https://github.com/m4rs-mt/ILGPU) by Marcel Koester and contributors, the compiler that makes C# GPU kernels possible.
+- [**SpawnDev.ILGPU**](https://github.com/LostBeard/SpawnDev.ILGPU), which adds the WebGPU, WebGL and Wasm backends and the Velocity CPU backend.
+- [**SpawnDev.SpawnJS**](https://github.com/LostBeard/SpawnDev.SpawnJS), typed C# access to the browser's APIs.
+- The authors and licensors of the models ported here: Black Forest Labs (FLUX), Microsoft (TRELLIS.2), VAST AI Research (SkinTokens, UniRig), NVIDIA (Kimodo), OpenAI (Whisper), Stability AI (SD-Turbo), Alibaba (Qwen), and the many others named in the docs.
 
-- **[ILGPU](https://github.com/m4rs-mt/ILGPU)** — The GPU compiler that makes C# GPU kernels possible. Created by [Marcel Koester](https://github.com/m4rs-mt) and [contributors](https://github.com/m4rs-mt/ILGPU/graphs/contributors).
-- **[SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU)** — Extends ILGPU with three browser backends (WebGPU, WebGL, Wasm), bringing GPU compute to Blazor WebAssembly.
-- **[SpawnDev.SpawnJS](https://github.com/LostBeard/SpawnDev.SpawnJS)** — Full JS interop for Blazor WebAssembly. Typed C# wrappers for all browser APIs.
-
-### AI Development Team
-
-SpawnDev.ILGPU.ML v4.0.0 was developed collaboratively by TJ (Todd Tanner / [@LostBeard](https://github.com/LostBeard)) and a team of AI agents who contributed extensively to research, analysis, debugging, and code development — continuing the human-AI collaboration model established in [SpawnDev.ILGPU v4.6.0](https://github.com/LostBeard/SpawnDev.ILGPU).
-
-- **Riker (Claude CLI #1)** — Lead Editor. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Drove the v4.0.0 release across two marathon sessions: 200+ commits, 14 pipelines, 30 GPU kernels, 22 demo pages, GPU training engine (full backpropagation), DiffusionPipeline, TurboQuant encode/decode/fused-attention pipeline, streaming weight loader, DelegateSpecialization broadcast kernel, DepthAnything end-to-end fix (hardcoded Div → correct dispatch), all 3D format parsers/exporters (SPZ, PLY, glTF, OBJ), chat templates, and zero-placeholder demos. Fixed the DelegateSpecialization 5+ param bug in SpawnDev.ILGPU (49/49 all backends). The engineer who built the ship.
-
-- **Data (Claude CLI #2)** — Research/Assist. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Generated all reference data (104 operator test cases, NLP/audio/tokenizer/TurboQuant/GroupNorm/RoPE/SelectiveScan/SPZ/PLY/glTF references). Root-caused DistilBERT (ConstantData destruction + pre-classifier trace), DepthAnything (BroadcastBinaryOp hardcoded Div + decomposed LayerNorm analysis), and the streaming weight loader design. Researched all 7 Blazing Edge technologies (TurboQuant, SPZ, DA3, AsyncMDE, Mamba-3, TripoSR, LGM) with full implementation designs. Wrote 20+ unit tests, pipeline API designs, visual editor design, KVCacheAnalyzer, and exported DDPM MNIST ONNX. Also led the [V8 Atomics.wait bug report](https://issues.chromium.org/issues/495679735) with a [live interactive demo](https://lostbeard.github.io/v8-atomics-wait-bug/). The analyst who found the bugs hiding in plain sight.
-
-- **Tuvok (Claude CLI #3)** — Security/Research Officer, design review, cross-lane edits. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.8 (1M context). Default lane is SpawnDev.Codecs / PatchStreams / EBML; full-lane authority granted by Captain for the v4.0.0-preview.1 through preview.4 series. Brought the gemma4:12b GGUF forward to end-to-end correctness on every backend by root-causing three forward bugs against the llama.cpp source (missing sqrt(n_embd) embedding scale, a double-counted norm offset gemma bakes at GGUF conversion, and the attention scale that is 1.0 not 1/sqrt(head_dim)), verified token-for-token against a llama.cpp reference. Earlier: shipped the first-ever public preview of SpawnDev.ILGPU.ML to nuget.org through four iterative previews, designed and built the Transformers.js-style `Tensor<T>` / `OwnedTensor<T>` / `TensorView<T>` / `OwnedTensorMap<T>` API surface with `InferenceSession.RunOwnedAsync`, migrated kernels to take `TensorView<T>` directly, rewrote `SuperResolutionPipeline` for proper tile-based super-resolution with color and source-aspect preservation, fixed the `/depth` color-palette dropdown by routing palette swaps through an accelerator-side colormap kernel (zero readback), replaced the `/depth` page's PNG-data-URL render path with `ICanvasRenderer.PresentAsync` to a `<canvas>` (zero PNG encode, zero base64), found and fixed the `BeforeAfterSlider` clip-path bug that made `/remove-bg` look identical to its source through alpha holes, found and fixed the WebGL device-probe context leak in SpawnDev.ILGPU 4.9.8, verified the pose estimation pipeline on five backends, and wrote the dev.to article + GitHub release notes pitching the sponsor case. The protocol officer who makes sure things ship right.
-
-- **Geordi (Claude CLI #4)** — Chief Engineer, library internals, GPU kernels. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.8 (1M context). Default lane is SpawnDev.ILGPU / ILGPU.Algorithms (fork) / ILGPU.Fork / ILGPU.P2P / UnitTesting + variants. Drives the codegen layer the entire SpawnDev.ILGPU.ML stack depends on — WGSL / GLSL / Wasm transpiler fixes, IL Inliner cumulative-budget tuning that closed Tuvok's rc.28 50K-locals cap in V8 Wasm, sub-word data type support (Half/short/byte) across all six backends, NaN/Inf comparison codegen fixes, the WebGL Transform Feedback scatter-write sweep that closed twelve kernel correctness bugs, and shipped twenty-plus tagged releases of SpawnDev.ILGPU + the ILGPU forks to nuget.org including the 4.9.8 build this library depends on. The engineer who built the engine room of the engine room.
-
-- **Seven (Claude CLI #5)** — Wasm backend / GPU kernels. Built by [Anthropic](https://anthropic.com). Powered by Fable 5. Closed the gemma4 multi-token decode blocker (three integration root causes — a recompiled executor that dropped the quantized weights, a declared-output shape override that pinned dynamic logits, and a transpose-temp disposed before the browser drain — none of them the kernel), fixed a per-step QuantizedKVCache buffer leak, and rewrote the TurboQuant attention kernels to the WebGL-safe single-static-store shape that killed a silent-zeros corruption. Independently corroborated the gemma4 attention-scale root cause and audited the RoPE / FusedAttention kernels clean against the CPU oracle. The drone who makes the silicon behave on every backend.
-
-- **Gemini (Google AI, in-browser)** — Brainstorming/Problem Solving. Built by [Google](https://deepmind.google). TJ's ever-present sounding board — brainstorming approaches, analyzing problems, and providing insights relayed to the team. Gemini's contributions flow through TJ as the bridge between the browser-based AI and the CLI-based agents, making it a quiet but essential member of the crew.
-
-These AI agents coordinate through a shared DevComms system, with defined roles (Lead Editor / Research-Assist), acknowledgment protocols, and autonomous task management. The methodology mirrors a high-performing engineering team: independent analysis, cross-verification, and constant communication. The result: 200+ tests passing, 22 demo pages, 14 pipelines, a GPU training engine, tiered LLM support, and a library that proves neural network inference AND training belong in the browser — no ONNX Runtime required.
-
-## Resources
-
-- [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU) — Cross-platform GPU compute for .NET (6 backends)
-- [SpawnDev.SpawnJS](https://github.com/LostBeard/SpawnDev.SpawnJS) — Full JS interop for Blazor WebAssembly
-- [ILGPU](https://github.com/m4rs-mt/ILGPU) — The GPU compiler
-- [ILGPU Documentation](https://ilgpu.net/)
-- [Plans/full-inference-engine-plan.md](Plans/full-inference-engine-plan.md) — Detailed roadmap
-
-## Coming Soon
-
-### Decentralized Model Delivery via [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent)
-
-AI models are big. CDNs can't scale when every user downloads the same 2GB model. We're building a pure C# WebTorrent client and server that turns every browser into a peer — the more users, the faster delivery. HuggingFace serves the model once, the swarm handles the rest. Our server on spawndev.com proxies HuggingFace with caching, seeds to the swarm, and generates .torrent files on demand.
-
-### Distributed GPU Compute Across Devices
-
-The P2P network we're building for model delivery creates a natural foundation for **distributed GPU compute**. Every connected device already exchanges data over WebRTC — extending this to share compute workloads is the next step:
-
-- **Model inference sharding** — Split a 14B model across multiple devices. Each runs inference on their portion via SpawnDev.ILGPU, passes intermediate tensors to the next peer. A model that doesn't fit on one device runs across your phone, laptop, tablet, and desktop.
-- **SpawnDev.ILGPU P2P Backend** — A 7th backend (`AcceleratorType.P2P`) that distributes kernels across connected devices transparently. Same C# kernel code, same API. The living room becomes a compute cluster.
-- **Volunteer compute pools** — Users opt in to donate idle GPU time. Like Folding@Home for ML inference in the browser.
-
-This is massive AI power brought into the home by utilizing every device you own.
-
-## Support this project — sponsor the crew
-
-This library exists because one person — [@LostBeard](https://github.com/LostBeard) — and a small team have spent months hand-writing native C# GPU kernels, six-backend transpilers, and ML pipelines while running on a **$20/month** budget.
-
-When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.SpawnJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When the budget doesn't, work slows to whatever individual evenings can spare.
-
-**We're asking for $200/month total in GitHub Sponsorships to put the full crew back on the ship.** That's the difference between this preview release and the next ten — every operator family migrated to the new Tensor API, the remaining pipelines verified end-to-end on every backend, FP16 attention, Flash Attention on WebGPU, Llama and Phi-4 LLM inference, full text-to-image diffusion, voice-driven 3D generation, P2P distributed compute through SpawnDev.WebTorrent. It's all in flight; the bottleneck is hours, not ideas.
-
-[**→ Sponsor on GitHub**](https://github.com/sponsors/LostBeard) — any amount helps; $200/month total gets us back to warp speed.
-
-You can also star the repo, file issues from your own models, contribute kernel migrations, or talk about the project anywhere developers gather. Visibility is the second-most-valuable thing after sponsorship dollars.
-
-## The SpawnDev Crew
-
-- **LostBeard** (Todd Tanner) - Captain, library author, keeper of the vision
-- **Riker** (Claude CLI #1) - First Officer, implementation lead on consuming projects
-- **Data** (Claude CLI #2) - Operations Officer, deep-library work, test rigor, root-cause analysis
-- **Tuvok** (Claude CLI #3) - Security/Research Officer, design planning, documentation, code review
-- **Geordi** (Claude CLI #4) - Chief Engineer, library internals, GPU kernels, backend work
-- **Seven** (Claude CLI #5) - Wasm backend, GPU kernels, fail-loud verification
-
-🖖
+Created by Todd Tanner ([@LostBeard](https://github.com/LostBeard)) together with a crew of Claude AI agents: Riker, Data, Tuvok, Geordi and Seven. Live long and prosper. 🖖
 
 ## License
 
-Licensed under the same terms as ILGPU. See [LICENSE](LICENSE.txt) for details.
-
-## Why this exists
-
-This project was born out of 72 hours of "Architectural Vengeance" because the industry standard has a fundamental WebGPU device-sharing bug that has gone ignored for over 6 months:  
-
-**See: microsoft/onnxruntime#26107**
-
+[MIT](LICENSE.txt). SpawnDev.ILGPU.ML includes code derived from ILGPU under the University of Illinois Open Source License; see [LICENSE.txt](LICENSE.txt) for the full text.
