@@ -33,13 +33,14 @@ public sealed class UmT5Encoder : IDisposable
     private readonly WanKernels _wk;
     public const int Dim = 4096, Heads = 64, HeadDim = 64, FfnDim = 10240, DefaultLayers = 24;
     private readonly int _layers;
+    private readonly bool _sharedBias;                           // T5 v1.1 (LTX-Video): ONE relative-position table, in block 0, used by every layer; umT5 (Wan) has one per layer
 
     /// <summary>Test hook: (stage name, activation view, element count), valid only during the call; names "embedding", "layer_N", "final" (the first sequence of a call).</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
-    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers)
+    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias)
     {
-        _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers;
+        _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers; _sharedBias = sharedBias;
         _k = new DiTKernels(accelerator); _wk = new WanKernels(accelerator);
     }
 
@@ -62,7 +63,7 @@ public sealed class UmT5Encoder : IDisposable
             var info = tensors.FirstOrDefault(t => t.Name == "token_embedding.weight") ?? throw new InvalidDataException($"'{file}' has no token_embedding.weight");
             bool quantized = info.DType == "I32";
             if (quantized && !(metadata.GetValueOrDefault("quant") ?? "").StartsWith("q8", StringComparison.Ordinal)) throw new NotSupportedException("the quantised umT5 embedding table must be 8-bit blocks");
-            return new UmT5Encoder(accelerator, source, repo, file, stream, info, quantized, int.Parse(metadata.GetValueOrDefault("num_layers", "24")));
+            return new UmT5Encoder(accelerator, source, repo, file, stream, info, quantized, int.Parse(metadata.GetValueOrDefault("num_layers", "24")), metadata.GetValueOrDefault("shared_bias", "0") == "1");
         }
         catch { stream.Dispose(); throw; }
     }
@@ -133,6 +134,8 @@ public sealed class UmT5Encoder : IDisposable
             using var gate = _acc.Allocate1D<float>((long)total * FfnDim);
             using var fc1 = _acc.Allocate1D<float>((long)total * FfnDim);
             using var scores = _acc.Allocate1D<float>((long)Heads * maxL * maxL);
+            const string SharedBiasName = "blocks.0.pos_embedding.embedding.weight";
+            using var sharedBias = _sharedBias ? await LoadLayerAsync(name => name == SharedBiasName, ct) : null;       // [32, 64] bf16, kept for every layer
             for (int b = 0; b < _layers; b++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -146,7 +149,7 @@ public sealed class UmT5Encoder : IDisposable
                 for (int s = 0; s < count; s++)
                 {
                     int L = sequences[s].Length, off = offsets[s];
-                    _wk.T5Attention(qkv.View.SubView((long)off * 3 * Dim, (long)L * 3 * Dim), w.BF16(p + "pos_embedding.embedding.weight"), buckets[s].View, scores.View,
+                    _wk.T5Attention(qkv.View.SubView((long)off * 3 * Dim, (long)L * 3 * Dim), _sharedBias ? sharedBias!.BF16(SharedBiasName) : w.BF16(p + "pos_embedding.embedding.weight"), buckets[s].View, scores.View,
                         att.View.SubView((long)off * Dim, (long)L * Dim), L, Heads, HeadDim);
                 }
                 _k.Linear(att.View, fw.Matrix(p + "attn.o.weight"), null, proj.View, total, Dim, Dim);
