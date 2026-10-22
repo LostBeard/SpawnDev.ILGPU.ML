@@ -38,6 +38,40 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The Unigram tokenizer against the reference's token ids (Hugging Face tokenizers, google/umt5-xxl) for the three dumped prompts: two English sentences and the 126-token
+    /// Chinese default negative prompt (full-width punctuation, no spaces: every position is a segmentation choice). Host only; reads tokenizer.json from WAN_DIR.
+    /// Red check: a tokenizer that ignores the Metaspace prefix produces different ids.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Wan_UnigramTokenizer_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm) throw new UnsupportedTestException("reads the reference fixtures from disk");
+        var tokPath = Path.Combine(WanDir, "google", "umt5-xxl", "tokenizer.json");
+        if (!File.Exists(tokPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var fs = File.OpenRead(tokPath);
+        var tok = Preprocessing.UnigramTokenizer.FromTokenizerJson(fs);
+        var report = new List<string>();
+        foreach (var name in new[] { "0", "1", "neg" })
+        {
+            using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"t5_{name}.npz"));
+            var (ids, _) = WanNpz(fx, "ids"); var (mask, _) = WanNpz(fx, "mask");
+            int n = (int)mask.Sum();
+            var textEntry = fx.GetEntry("text.npy")!; using var ts = textEntry.Open(); using var tms = new MemoryStream(); ts.CopyTo(tms);
+            // a numpy unicode scalar: a header, then UCS-4 code points
+            var raw = tms.ToArray(); int hlen = BitConverter.ToUInt16(raw, 8); var bytes = raw.AsSpan(10 + hlen);
+            var sb = new System.Text.StringBuilder(); for (int i = 0; i + 3 < bytes.Length; i += 4) { int cp = BitConverter.ToInt32(bytes.Slice(i, 4)); if (cp == 0) break; sb.Append(char.ConvertFromUtf32(cp)); }
+            var got = tok.Encode(Preprocessing.UnigramTokenizer.CleanWhitespace(sb.ToString()));
+            var want = ids.Take(n).Select(v => (int)v).ToArray();
+            bool same = got.SequenceEqual(want);
+            report.Add($"prompt {name}: {n} reference tokens, ours {got.Length}, {(same ? "identical" : "DIFFERENT at " + Enumerable.Range(0, Math.Min(got.Length, want.Length)).FirstOrDefault(i => got[i] != want[i]))}");
+            if (!same) throw new Exception("tokenizer mismatch: " + string.Join("; ", report) + $" ours: [{string.Join(",", got.Take(40))}] reference: [{string.Join(",", want.Take(40))}]");
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] tokenizer vs reference: " + line);
+        await Task.CompletedTask;
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The Wan 2.2 VAE decoder (chunked, causal, cached convolutions, fp16 weights) against the reference's float32 decode of the same small latent [48, 3, 8, 12] -> video
     /// [3, 9, 128, 192]: every stage tap (conv2, conv1, middle, the four up-blocks, the head) and the final clamped frames. Desktop device (the taps read back).
     /// </summary>

@@ -74,6 +74,8 @@ public sealed class MotionClip
             case "<f2": for (int i = 0; i < n; i++) data[i] = (float)BitConverter.ToHalf(b, off + i * 2); break;
             case "<f4": for (int i = 0; i < n; i++) data[i] = BitConverter.ToSingle(b, off + i * 4); break;
             case "<f8": for (int i = 0; i < n; i++) data[i] = (float)BitConverter.ToDouble(b, off + i * 8); break;
+            case "<i8": for (int i = 0; i < n; i++) data[i] = BitConverter.ToInt64(b, off + i * 8); break;      // token ids and the like: exact in a float below 2^24
+            case "<i4": for (int i = 0; i < n; i++) data[i] = BitConverter.ToInt32(b, off + i * 4); break;
             default: throw new InvalidDataException($"unsupported dtype {descr}");
         }
         return (data, shape);
