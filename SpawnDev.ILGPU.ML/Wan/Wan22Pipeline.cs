@@ -49,6 +49,7 @@ public sealed class WanRequest
     /// <summary>Frame count, 4n + 1 (121 = five seconds at 24 fps).</summary>
     public int Frames { get; init; } = 121;
     public int Steps { get; init; } = 50;
+    /// <summary>Classifier-free guidance scale. 1 (or less) runs ONE DiT forward per step and never encodes the negative prompt: what a guidance-distilled model (Wan2.2-TI2V-5B-Turbo) wants.</summary>
     public double GuidanceScale { get; init; } = 5.0;
     public double Shift { get; init; } = 5.0;
     public long Seed { get; init; } = 42;
@@ -194,12 +195,14 @@ public sealed class Wan22Pipeline
         // 1. text: the prompt and the negative prompt through umT5, one layer of its weights on the device at a time
         Report("text", 0, "encoding the prompt");
         float[] ctx, ctxNeg; int ctxRows, ctxNegRows;
-        var ids = await TokenizeAsync(req.Prompt, ct); var nids = await TokenizeAsync(req.NegativePrompt ?? DefaultNegativePrompt, ct);
+        bool guided = req.GuidanceScale > 1.0 + 1e-9;                                      // guidance 1 = the conditional prediction alone (no negative prompt, one forward per step)
+        var ids = await TokenizeAsync(req.Prompt, ct);
+        var nids = guided ? await TokenizeAsync(req.NegativePrompt ?? DefaultNegativePrompt, ct) : Array.Empty<int>();
         ctxRows = ids.Length; ctxNegRows = nids.Length;
         using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
         {
-            var both = await t5.EncodeManyAsync(new[] { ids, nids }, ct);                  // one pass over the layers for both prompts
-            ctx = both[0]; ctxNeg = both[1];
+            var both = await t5.EncodeManyAsync(guided ? new[] { ids, nids } : new[] { ids }, ct);          // one pass over the layers for both prompts
+            ctx = both[0]; ctxNeg = guided ? both[1] : Array.Empty<float>();
         }
         Report("text", 1, $"{ctxRows} + {ctxNegRows} tokens");
 
@@ -225,7 +228,7 @@ public sealed class Wan22Pipeline
         using (var dit = new WanDiT(_acc, new DiTKernels(_acc), dw))
         {
             dit.SetGrid(Fz, h, w);
-            dit.SetContext(0, ctx, ctxRows); dit.SetContext(1, ctxNeg, ctxNegRows);
+            dit.SetContext(0, ctx, ctxRows); if (guided) dit.SetContext(1, ctxNeg, ctxNegRows);
             var sched = new FlowUniPCScheduler(); sched.SetTimesteps(req.Steps, req.Shift);
             using var lIn = _acc.Allocate1D<float>(latent.Length); using var lOut = _acc.Allocate1D<float>(latent.Length);
             for (int s = 0; s < req.Steps; s++)
@@ -233,9 +236,12 @@ public sealed class Wan22Pipeline
                 ct.ThrowIfCancellationRequested();
                 lIn.View.CopyFromCPU(latent);
                 dit.Forward(lIn.View, sched.Timesteps[s], i2v, 0, lOut.View); var nc = await lOut.View.CopyToHostAsync();
-                dit.Forward(lIn.View, sched.Timesteps[s], i2v, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
-                float g = (float)req.GuidanceScale;
-                for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + g * (nc[i] - nu[i]);           // classifier-free guidance, in place
+                if (guided)
+                {
+                    dit.Forward(lIn.View, sched.Timesteps[s], i2v, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
+                    float g = (float)req.GuidanceScale;
+                    for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + g * (nc[i] - nu[i]);       // classifier-free guidance, in place
+                }
                 latent = sched.Step(nc, latent);
                 PutPicture(latent);
                 Report("denoise", (s + 1.0) / req.Steps, $"step {s + 1} of {req.Steps}");

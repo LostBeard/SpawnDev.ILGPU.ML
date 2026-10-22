@@ -8,7 +8,10 @@ and the patch embedding Conv3d (kernel = stride = (1,2,2)) is stored as the line
 patch flattened (channel, kh, kw), plus `modulation` tables as [6, C] / [2, C]. Everything else keeps its reference name.
 The output is written TENSOR BY TENSOR (the header is computed first): WSL has 7.8 GB of RAM and the export is 10 GB.
 
-  python export_dit_bf16.py OUT.safetensors
+  python export_dit_bf16.py OUT.safetensors [SRC.safetensors]
+
+With SRC (one SafeTensors file in the original Wan key names, e.g. the community Wan2.2-TI2V-5B-Turbo fp16 checkpoint) the tensors are read from it instead of the reference shards;
+a "model." / "model.diffusion_model." key prefix is stripped.
 """
 import json
 import os
@@ -24,20 +27,37 @@ CKPT = os.path.expanduser("~/wan/ckpt")
 
 def main():
     out_path = sys.argv[1]
-    index = json.load(open(os.path.join(CKPT, "diffusion_pytorch_model.safetensors.index.json")))["weight_map"]
-    handles = {s: safe_open(os.path.join(CKPT, s), framework="pt", device="cpu") for s in sorted(set(index.values()))}
+    if len(sys.argv) > 2:
+        src = sys.argv[2]
+        single = safe_open(src, framework="pt", device="cpu")
+        raw_keys = list(single.keys())
+        prefix = next((p for p in ("model.diffusion_model.", "model.", "diffusion_model.") if all(k.startswith(p) for k in raw_keys if k.startswith("blocks") or k.startswith(p))
+                       and any(k.startswith(p + "blocks.") for k in raw_keys)), "")
+        index = {k[len(prefix):]: "single" for k in raw_keys if k.startswith(prefix)}
+        handles = {"single": single}
+        rename = {k[len(prefix):]: k for k in raw_keys if k.startswith(prefix)}
+        print("source", src, "tensors", len(index), "key prefix", repr(prefix))
 
-    def get(name):
-        return handles[index[name]].get_tensor(name)
+        def get(name):
+            return single.get_tensor(rename[name])
+
+        def shape_of(name):
+            return list(single.get_slice(rename[name]).get_shape())
+    else:
+        index = json.load(open(os.path.join(CKPT, "diffusion_pytorch_model.safetensors.index.json")))["weight_map"]
+        handles = {s: safe_open(os.path.join(CKPT, s), framework="pt", device="cpu") for s in sorted(set(index.values()))}
+
+        def get(name):
+            return handles[index[name]].get_tensor(name)
+
+        def shape_of(name):
+            return list(handles[index[name]].get_slice(name).get_shape())
 
     # (output name, shape, producer) in the order they are written
     entries = []
 
     def add(name, shape, fn):
         entries.append((name, list(shape), fn))
-
-    def shape_of(name):
-        return list(handles[index[name]].get_slice(name).get_shape())
 
     names = set(index.keys())
     nblocks = 1 + max(int(n.split(".")[1]) for n in names if n.startswith("blocks."))
