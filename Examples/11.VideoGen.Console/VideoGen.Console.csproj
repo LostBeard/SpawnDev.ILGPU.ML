@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>VideoGen.Console</AssemblyName>
+    <RootNamespace>SpawnDev.ILGPU.ML.Examples.VideoGenConsole</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The ML library brings the Wan 2.2 video pipeline and the models-host downloader. The accelerator is created here (the app owns it). -->
+    <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+    <!-- Pure-managed image decode (the first frame) and animated WebP encode. Example-only dependency. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+  </ItemGroup>
+
+</Project>

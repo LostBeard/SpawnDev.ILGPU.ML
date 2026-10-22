@@ -22,6 +22,7 @@ assert BITS in (4, 8)
 LEVELS = 15 if BITS == 4 else 255
 WORDS = 5 if BITS == 4 else 9
 MIN_ELEMENTS = 1_000_000
+CHUNK_ROWS = 4096
 
 
 def quantise(w):
@@ -86,10 +87,16 @@ def main():
             for key, dt, shape, quant in plan:
                 t = f.get_tensor(key)
                 if quant:
-                    qw = quantise(t)
-                    err = float((dequantise(qw, t.shape[1]) - t.float()).pow(2).sum().sqrt() / t.float().pow(2).sum().sqrt())
+                    # in row chunks: the umT5 embedding table (250112 x 4096) would need ~20 GB of temporaries in one piece
+                    se, sr = 0.0, 0.0
+                    for r0 in range(0, t.shape[0], CHUNK_ROWS):
+                        piece = t[r0:r0 + CHUNK_ROWS]
+                        qw = quantise(piece)
+                        d = dequantise(qw, piece.shape[1]) - piece.float()
+                        se += float(d.pow(2).sum()); sr += float(piece.float().pow(2).sum())
+                        out.write(qw.numpy().astype("<i4").tobytes())
+                    err = (se / max(sr, 1e-30)) ** 0.5
                     worst = max(worst, err); count += 1
-                    out.write(qw.numpy().astype("<i4").tobytes())
                     if count % 20 == 1:
                         print(f"{key} {tuple(t.shape)} relRMS {err:.4f}", flush=True)
                 else:

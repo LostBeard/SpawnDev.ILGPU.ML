@@ -302,7 +302,7 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("desktop GPU");
-        var paths = Wan22Paths.InFolder(WanDir); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        var paths = Wan22Paths.InFolder(WanDir, textEncoder: Wan22Paths.TextEncoderFile(Environment.GetEnvironmentVariable("WAN_TEXT") ?? "bf16")); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
         if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
         string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
         const string prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.";       // t5_0's text
@@ -362,11 +362,17 @@ public abstract partial class MLTestBase
     /// fed the reference's own token ids: relative RMS of the context [n, 4096] and the peak VRAM of the run (one layer's weights, not 11 GB). Desktop device.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Wan_UmT5_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Wan_UmT5_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, "umt5_xxl_enc_bf16.safetensors", 0.05, 0.015));
+
+    /// <summary>The same check on the 8-bit block export (6.4 GB): the matrices and the embedding rows are quantised, so the error against the exact math is the quantisation's on top of the rounding.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_UmT5_Quantized_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, "umt5_xxl_enc_q8.safetensors", 0.06, 0.04));
+
+    private async Task<string> WanUmT5Check(Accelerator accelerator, string file, double boundBf16, double boundExact)
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
-            throw new UnsupportedTestException("the layer-streaming encoder test reads the 11 GB export from disk on a desktop GPU");
-        var path = Path.Combine(WanDir, "umt5_xxl_enc_bf16.safetensors");
+            throw new UnsupportedTestException("the layer-streaming encoder test reads the export from disk on a desktop GPU");
+        var path = Path.Combine(WanDir, file);
         if (!File.Exists(path)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
         using var enc = await UmT5Encoder.CreateAsync(accelerator, path);
         var report = new List<string>();
@@ -393,9 +399,9 @@ public abstract partial class MLTestBase
         foreach (var line in report) Console.WriteLine("[Wan] umT5 vs reference: " + line);
         // vs the bf16 reference: its own bf16 rounding (2.2e-2 to 2.8e-2 from exact math on these prompts). vs exact math on the same weights: float rounding with the fp32 GEMM
         // (4e-6 MEASURED with TRELLIS2_MMA=0 and on OpenCL), 5e-3 to 7.5e-3 with the CUDA tensor cores (they round the activations to bf16, as the reference does)
-        if (!(worstBf16 < 0.05 && worstExact < 0.015)) throw new Exception("umT5 deviates from the reference: " + string.Join("; ", report));
+        if (!(worstBf16 < boundBf16 && worstExact < boundExact)) throw new Exception("umT5 deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
 
     /// <summary>
     /// The Unigram tokenizer against the reference's token ids (Hugging Face tokenizers, google/umt5-xxl) for the three dumped prompts: two English sentences and the 126-token

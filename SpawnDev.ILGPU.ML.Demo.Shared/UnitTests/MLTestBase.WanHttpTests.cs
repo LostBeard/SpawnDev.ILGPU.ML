@@ -44,7 +44,7 @@ public abstract partial class MLTestBase
         try { noiseRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/noise_t2v30.f32"); wantRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/final_t2v30.f32"); }
         catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
         var noise = WanFloats(noiseRaw); var want = WanFloats(wantRaw);
-        var pipe = new Wan22Pipeline(accelerator, new WanRangeSource(http), "", Wan22Paths.InRepo());
+        var pipe = new Wan22Pipeline(accelerator, new WanRangeSource(http), "", Wan22Paths.InRepo(textEncoder: Wan22Paths.TextEncoderFile("q8")));
         var sw = System.Diagnostics.Stopwatch.StartNew();
         string last = "";
         var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; Console.WriteLine($"[Wan] browser stage {p.Stage} at {sw.Elapsed.TotalSeconds:F0} s ({p.Message})"); } });

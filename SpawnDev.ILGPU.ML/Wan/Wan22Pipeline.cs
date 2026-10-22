@@ -19,15 +19,20 @@ public sealed class Wan22Paths
     public required string Tokenizer { get; init; }
 
     /// <summary>The file names the exporters write and a model repo holds (relative, forward slashes).</summary>
-    public static Wan22Paths InRepo(string dit = "wan22_ti2v_5b_dit_q8.safetensors") => new()
+    public static Wan22Paths InRepo(string dit = "wan22_ti2v_5b_dit_q8.safetensors", string textEncoder = "umt5_xxl_enc_bf16.safetensors") => new()
     {
-        Dit = dit, Vae = "wan22_vae_f16.safetensors", TextEncoder = "umt5_xxl_enc_bf16.safetensors", Tokenizer = "google/umt5-xxl/tokenizer.json",
+        Dit = dit, Vae = "wan22_vae_f16.safetensors", TextEncoder = textEncoder, Tokenizer = "google/umt5-xxl/tokenizer.json",
     };
 
+    /// <summary>The DiT file for a precision: "bf16" (10 GB), "q8" (5.6 GB, lossless in practice) or "q4" (3.1 GB).</summary>
+    public static string DitFile(string precision) => $"wan22_ti2v_5b_dit_{precision}.safetensors";
+    /// <summary>The umT5 file for a precision: "bf16" (11.4 GB) or "q8" (6.4 GB).</summary>
+    public static string TextEncoderFile(string precision) => $"umt5_xxl_enc_{precision}.safetensors";
+
     /// <summary>The conventional layout of one folder on disk: the file names the exporters write.</summary>
-    public static Wan22Paths InFolder(string folder, string dit = "wan22_ti2v_5b_dit_q8.safetensors") => new()
+    public static Wan22Paths InFolder(string folder, string dit = "wan22_ti2v_5b_dit_q8.safetensors", string textEncoder = "umt5_xxl_enc_bf16.safetensors") => new()
     {
-        Dit = Path.Combine(folder, dit), Vae = Path.Combine(folder, "wan22_vae_f16.safetensors"), TextEncoder = Path.Combine(folder, "umt5_xxl_enc_bf16.safetensors"),
+        Dit = Path.Combine(folder, dit), Vae = Path.Combine(folder, "wan22_vae_f16.safetensors"), TextEncoder = Path.Combine(folder, textEncoder),
         Tokenizer = Path.Combine(folder, "google", "umt5-xxl", "tokenizer.json"),
     };
 }
@@ -106,6 +111,9 @@ public sealed class Wan22Pipeline
     public const string DefaultNegativePrompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
     /// <summary>Files from a model source (the hub with its OPFS cache or range streaming in the browser, a local folder on the desktop): <paramref name="paths"/> are names within <paramref name="repo"/>.</summary>
+    /// <summary>The model repo the SpawnDev models host serves the exports from (https://models.spawndev.com/&lt;repo&gt;/resolve/main/&lt;file&gt;).</summary>
+    public const string DefaultRepo = "LostBeard/Wan2.2-TI2V-5B-ILGPU";
+
     public Wan22Pipeline(Accelerator accelerator, IModelSource source, string repo, Wan22Paths paths) { _acc = accelerator; _source = source; _repo = repo; _paths = paths; }
 
     /// <summary>Files on disk: <paramref name="paths"/> are file paths (<see cref="Wan22Paths.InFolder"/>).</summary>
