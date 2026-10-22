@@ -185,11 +185,17 @@ public abstract partial class MLTestBase
     /// projection, patch projection, blocks 0 / 1 / 14 / 27, the head). Desktop GPU or WebGPU.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Ltx_DiT_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Ltx_DiT_MatchesReference() => await RunTest(accelerator => LtxDitCheck(accelerator, "t2v"));
+
+    /// <summary>The same check at production size: 480x320, 121 frames = 2400 tokens (the first pass of a 704x480 clip), where the flash attention runs several query chunks (fixtures: ref_dit_dump.py --size 480x320 --frames 121 --tag big).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_DiT_ProductionScale_MatchesReference() => await RunTest(accelerator => LtxDitCheck(accelerator, "big"));
+
+    private async Task<string> LtxDitCheck(Accelerator accelerator, string fixtureTag)
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
-        var weightsPath = Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "dit_t2v.npz");
+        var weightsPath = Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}.npz");
         if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
         using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath);
         var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
@@ -209,7 +215,7 @@ public abstract partial class MLTestBase
         var report = new List<string>();
         // two references on the same inputs: the exact math (float32 on the same bf16 weights) and the pipeline as it runs (bf16 activations, which is itself far from the exact math here)
         double[] worst = new double[2];
-        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", "dit_t2v_fp32.npz"), (1, "bf16 reference", "dit_t2v.npz") })
+        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", $"dit_{fixtureTag}_fp32.npz"), (1, "bf16 reference", $"dit_{fixtureTag}.npz") })
         {
             var refPath = Path.Combine(LtxDir, "ref", file);
             if (!File.Exists(refPath)) { report.Add($"{tag}: fixture {file} missing"); worst[idx] = double.MaxValue; continue; }
@@ -228,16 +234,16 @@ public abstract partial class MLTestBase
             worst[idx] = mp.RelRms;
         }
         // the bf16 pipeline against its own exact math, for the record
-        if (File.Exists(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")))
+        if (File.Exists(Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}_fp32.npz")))
         {
-            using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")); using var a16 = ZipFile.OpenRead(fxPath);
+            using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}_fp32.npz")); using var a16 = ZipFile.OpenRead(fxPath);
             var floor = WanCompare(WanNpz(a16, "step0_pred").Data, WanNpz(a32, "step0_pred").Data);
             report.Add($"the bf16 reference vs the fp32 reference (its own rounding): relRMS {floor.RelRms:E2}");
         }
         // The port itself, free of precision noise: the same forward with the bf16 tensor cores OFF (fp32 GEMMs) must sit on the exact math. The tensor-core forward above rounds
         // every activation to bf16 (as the reference does), which around the model's 2500-sized outlier activations in the middle blocks costs ~1.5e-2; a LOGIC error would not vanish here.
         double exactRel = double.NaN;
-        if (accelerator.AcceleratorType == AcceleratorType.Cuda && File.Exists(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")))
+        if (accelerator.AcceleratorType == AcceleratorType.Cuda && File.Exists(Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}_fp32.npz")))
         {
             bool saved = DiTKernels.EnableTensorCores;
             try
@@ -248,16 +254,16 @@ public abstract partial class MLTestBase
                 dit2.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
                 dit2.Forward(lIn.View, tArr[0], 0, lOut.View);
                 var exact = await lOut.View.CopyToHostAsync();
-                using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz"));
+                using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}_fp32.npz"));
                 exactRel = WanCompare(exact, WanNpz(a32, "step0_pred").Data).RelRms;
                 report.Add($"with the tensor cores off (fp32 GEMMs) vs the fp32 reference: prediction relRMS {exactRel:E2}");
             }
             finally { DiTKernels.EnableTensorCores = saved; }
         }
-        LtxLog("DiT", report);
+        LtxLog("DiT " + fixtureTag, report);
         if (!(worst[0] < 0.02 && worst[1] < 0.15) || !(double.IsNaN(exactRel) || exactRel < 2e-3)) throw new Exception("the DiT deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
 
     /// <summary>Print the lines and append them to LTX_DIR\out\ltx_tests.log (the PMT summary hides the console output of a passing desktop test).</summary>
     private static void LtxLog(string what, IEnumerable<string> lines)
@@ -277,11 +283,17 @@ public abstract partial class MLTestBase
     /// (the update is exact arithmetic on the DiT output, so the error is one bf16 DiT call). Desktop GPU or WebGPU.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Ltx_SamplerLoop_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Ltx_SamplerLoop_MatchesReference() => await RunTest(accelerator => LtxSamplerCheck(accelerator, "t2v"));
+
+    /// <summary>The sampler loop at production size (480x320, 121 frames, 2400 tokens).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_SamplerLoop_ProductionScale_MatchesReference() => await RunTest(accelerator => LtxSamplerCheck(accelerator, "big"));
+
+    private async Task<string> LtxSamplerCheck(Accelerator accelerator, string fixtureTag)
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
-        var weightsPath = Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "dit_t2v.npz");
+        var weightsPath = Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", $"dit_{fixtureTag}.npz");
         if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
         using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath);
         var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
@@ -297,7 +309,7 @@ public abstract partial class MLTestBase
         var report = new List<string>();
         double[] worstForced = new double[2];
         // against the exact math (float32 reference, the bound) and against the bf16 reference as it runs (recorded; the bf16 reference is itself far from the exact math at the low-noise steps)
-        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", "dit_t2v_fp32.npz"), (1, "bf16 reference", "dit_t2v.npz") })
+        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", $"dit_{fixtureTag}_fp32.npz"), (1, "bf16 reference", $"dit_{fixtureTag}.npz") })
         {
             var refPath = Path.Combine(LtxDir, "ref", file);
             if (!File.Exists(refPath)) { report.Add($"{tag}: fixture {file} missing"); worstForced[idx] = double.MaxValue; continue; }
@@ -320,8 +332,8 @@ public abstract partial class MLTestBase
                 worstForced[idx] = Math.Max(worstForced[idx], mf.RelRms);
             }
         }
-        LtxLog("SamplerLoop", report);
+        LtxLog("SamplerLoop " + fixtureTag, report);
         if (!(worstForced[0] < 0.01 && worstForced[1] < 0.15)) throw new Exception("a teacher-forced sampler step deviates from the reference: " + string.Join("; ", report));
         return $"worst teacher-forced error {worstForced[0]:E2} (fp32 reference), {worstForced[1]:E2} (bf16 reference) over {sigmas.Length - 1} steps";
-    });
+    }
 }
