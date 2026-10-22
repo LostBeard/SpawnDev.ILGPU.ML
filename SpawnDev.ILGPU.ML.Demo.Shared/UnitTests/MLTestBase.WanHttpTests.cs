@@ -116,4 +116,27 @@ public abstract partial class MLTestBase
         }
         return $"largest size that decoded: {last}";
     });
+
+    /// <summary>The largest video the /video page offers, end to end in the browser: 832x480, 33 frames, 8 steps (a draft: only the memory and the stage times matter), seed 3; the video must be finite and not flat.</summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_OverHttp_Large() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser pipeline test");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var source = new WanRangeSource(http);
+        try { await using var probe = await source.OpenAsync("", "wan22_vae_f16.safetensors"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        var pipe = new Wan22Pipeline(accelerator, source, "", Wan22Paths.InRepo(textEncoder: Wan22Paths.TextEncoderFile("q8")));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string last = "";
+        var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; Console.WriteLine($"[Wan] browser large stage {p.Stage} at {sw.Elapsed.TotalSeconds:F0} s"); } });
+        var video = await pipe.GenerateAsync(new WanRequest { Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly.", Width = 832, Height = 480, Frames = 33, Steps = 8, Seed = 3 }, progress);
+        double sum = 0, sum2 = 0;
+        foreach (var v in video.Data) { if (!float.IsFinite(v)) throw new Exception("a pixel is not finite"); sum += v; sum2 += (double)v * v; }
+        double mean = sum / video.Data.Length, std = Math.Sqrt(sum2 / video.Data.Length - mean * mean);
+        Console.WriteLine($"[Wan] browser large: {video.Frames} frames {video.Width}x{video.Height} in {sw.Elapsed.TotalSeconds:F0} s, pixel std {std:F3}");
+        if (!(std > 0.02)) throw new Exception($"the video is flat (std {std:F4})");
+        return $"{sw.Elapsed.TotalSeconds:F0} s";
+    });
 }
