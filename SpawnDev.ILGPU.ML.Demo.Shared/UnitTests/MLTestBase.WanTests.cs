@@ -38,6 +38,52 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The UniPC flow sampler against the reference scheduler: set_timesteps(4, shift 5) gives the reference's integer timesteps and float32 sigmas exactly, and
+    /// each step, fed the reference's own guidance-combined prediction and sample, returns the reference's next sample (predictor, corrector, the final order-1 step).
+    /// Host math: no device involved. Red check: a wrong shift moves the sigmas, which the exact timestep comparison catches.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Wan_UniPC_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm) throw new UnsupportedTestException("reads the reference fixture from disk");
+        var path = Path.Combine(WanDir, "dump", "dit_t2v_640x352_f33.npz");
+        if (!File.Exists(path)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var fx = ZipFile.OpenRead(path);
+        var (ts, _) = WanNpz(fx, "timesteps"); var (sg, _) = WanNpz(fx, "sigmas");
+        var report = new List<string>();
+        var results = new List<string>();
+        // The reference calls the scheduler inside torch.autocast(bfloat16): its einsum (the UniP / UniC weights applied to the model-output differences) runs in bf16, and its
+        // scalars are float32. With EmulateReference the port must agree with the reference to float rounding (that proves the algorithm, step for step); the double-precision
+        // default is the more accurate arithmetic and must stay within the reference's own bf16 rounding (about 1e-4 relative on a latent).
+        foreach (var (emulate, limit) in new[] { (true, 5e-6), (false, 3e-4) })
+        {
+            var sched = new FlowUniPCScheduler { EmulateReference = emulate };
+            sched.SetTimesteps(ts.Length, 5.0);
+            for (int i = 0; i < ts.Length; i++)
+                if (sched.Timesteps[i] != (long)ts[i]) throw new Exception($"timestep {i}: {sched.Timesteps[i]} against the reference's {ts[i]}");
+            for (int i = 0; i < sg.Length; i++)
+                if (Math.Abs(sched.Sigmas[i] - sg[i]) > 1e-6f) throw new Exception($"sigma {i}: {sched.Sigmas[i]} against the reference's {sg[i]}");
+            double worst = 0;
+            for (int s = 0; s < ts.Length; s++)
+            {
+                var (lin, _) = WanNpz(fx, $"step{s}_latent_in"); var (nc, _) = WanNpz(fx, $"step{s}_noise_cond"); var (nu, _) = WanNpz(fx, $"step{s}_noise_uncond");
+                var (lout, _) = WanNpz(fx, $"step{s}_latent_out");
+                var pred = new float[nc.Length];
+                for (int i = 0; i < pred.Length; i++) pred[i] = nu[i] + 5.0f * (nc[i] - nu[i]);            // classifier-free guidance, scale 5
+                var got = sched.Step(pred, lin);
+                var m = WanCompare(got, lout);
+                report.Add($"{(emulate ? "reference arithmetic" : "double scalars")}, step {s}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:E2} of {m.RefMaxAbs:F2}");
+                worst = Math.Max(worst, m.RelRms);
+            }
+            results.Add($"{(emulate ? "reference arithmetic" : "double scalars")} worst {worst:E2} (limit {limit:E0})");
+            if (!(worst < limit)) { foreach (var line in report) Console.WriteLine("[Wan] UniPC vs reference: " + line); throw new Exception("UniPC deviates from the reference: " + string.Join("; ", report)); }
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] UniPC vs reference: " + line);
+        await Task.CompletedTask;
+        return "4 steps; " + string.Join("; ", results);
+    });
+
+    /// <summary>
     /// The Wan DiT on the reference's step-0 inputs: the stage taps (patch embedding, time embedding and projection, text embedding, blocks 0 / 1 / 14 / 29, head)
     /// and both noise predictions (conditional and the default negative prompt), with and without a clean first latent frame (the TI2V image conditioning, per-token timesteps).
     /// The reference runs in bf16 (activations too); ours keeps fp32 activations with bf16 weights, so the comparison is a relative RMS against bf16 noise, printed per stage.
