@@ -318,6 +318,44 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Image to video through the pipeline: the picture (a frame our VAE decoded from the reference trajectory, WAN_OUT/reference_t2v30s8_8.png, written by Wan_DecodeReferenceTrajectory) is encoded,
+    /// held as the first latent frame at every step, and the video that comes out must start from it (frame 0 close to the picture: it went through encode, the DiT's per-token timesteps and decode)
+    /// and move (the last frame is not the first).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_ImageToVideo() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("desktop GPU");
+        var paths = Wan22Paths.InFolder(WanDir);
+        string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out");
+        string picture = Path.Combine(outDir, "reference_t2v30s8_8.png");
+        if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder) || !File.Exists(picture)) throw new UnsupportedTestException($"Wan files or {picture} not found");
+        var png = File.ReadAllBytes(picture); var info = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.GetInfo(png); var rgba = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.DecodePixels(png) ?? throw new Exception("PNG decode failed");
+        int ch = rgba.Length / (info.Width * info.Height); var rgb = new byte[info.Width * info.Height * 3];
+        for (int p = 0; p < info.Width * info.Height; p++) for (int c = 0; c < 3; c++) rgb[p * 3 + c] = rgba[p * ch + Math.Min(c, ch - 1)];
+        var pipe = new Wan22Pipeline(accelerator, paths);
+        var video = await pipe.GenerateAsync(new WanRequest
+        {
+            Prompt = "A red fox walks forward through fresh snow, the camera follows it slowly.", Width = info.Width, Height = info.Height, Frames = 17, Steps = 30, Seed = 3,
+            ImageRgb = rgb, ImageWidth = info.Width, ImageHeight = info.Height,
+        });
+        var first = video.GetFrameRgba(0); var last = video.GetFrameRgba(video.Frames - 1);
+        double se = 0, sr = 0, moved = 0;
+        for (int p = 0; p < info.Width * info.Height; p++) for (int c = 0; c < 3; c++)
+        {
+            double a = first[p * 4 + c] / 127.5 - 1, b = rgb[p * 3 + c] / 127.5 - 1, l = last[p * 4 + c] / 127.5 - 1;
+            se += (a - b) * (a - b); sr += b * b; moved += (l - a) * (l - a);
+        }
+        double rel = Math.Sqrt(se / sr), motion = Math.Sqrt(moved / (info.Width * info.Height * 3));
+        foreach (int f in new[] { 0, video.Frames / 2, video.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"i2v_{f}.png"), Assets.AssetGenerator.EncodePng(video.GetFrameRgba(f), video.Width, video.Height));
+        Console.WriteLine($"[Wan] pipeline i2v: first frame vs picture relRMS {rel:F3}, last vs first RMS {motion:F3}");
+        if (!(rel < 0.25)) throw new Exception($"the video does not start from the picture: relRMS {rel:F3}");
+        if (!(motion > 0.01)) throw new Exception($"the video does not move: last frame vs first RMS {motion:F4}");
+        return $"first frame relRMS {rel:F3}, motion {motion:F3}";
+    });
+
+    /// <summary>
     /// The umT5-XXL encoder (streamed layer by layer, rows of the embedding table read from the file) against the reference's bf16 encoder output for the three dumped prompts,
     /// fed the reference's own token ids: relative RMS of the context [n, 4096] and the peak VRAM of the run (one layer's weights, not 11 GB). Desktop device.
     /// </summary>
