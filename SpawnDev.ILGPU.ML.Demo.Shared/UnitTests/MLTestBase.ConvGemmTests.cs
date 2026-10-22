@@ -15,7 +15,14 @@ public abstract partial class MLTestBase
     /// forgets the padding or the batch offset is off by far more.
     /// </summary>
     [TestMethod(Timeout = 600000)]
-    public async Task Conv2DGemm_MatchesCpuReference() => await RunTest(async accelerator =>
+    public async Task Conv2DGemm_MatchesCpuReference() => await RunTest(accelerator => Conv2DGemmCheck(accelerator, false));
+
+    /// <summary>The same shapes with fp32 WEIGHTS (the other vision models): the weight is split into a high and a low fp16 half and the convolution is two tiled GEMMs on fp32 activations, so it must match the float64 reference on the
+    /// UNROUNDED weights to float precision: relative RMS below 2e-5 with fp32 activations (below 2e-3 with fp16 activations, whose rounding is the error then).</summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task Conv2DGemm_Fp32Weights_MatchesCpuReference() => await RunTest(accelerator => Conv2DGemmCheck(accelerator, true));
+
+    private async Task<string> Conv2DGemmCheck(Accelerator accelerator, bool f32Weights)
     {
         using var conv = new Conv2DGemm(accelerator);
         var cases = new (string Name, int N, int C, int H, int W, int O, int KH, int KW, int SH, int SW, int PT, int PL, int PB, int PR, int DH, int DW)[]
@@ -33,7 +40,7 @@ public abstract partial class MLTestBase
         {
             int taps = c.KH * c.KW, effKH = c.DH * (c.KH - 1) + 1, effKW = c.DW * (c.KW - 1) + 1;
             int outH = (c.H + c.PT + c.PB - effKH) / c.SH + 1, outW = (c.W + c.PL + c.PR - effKW) / c.SW + 1;
-            if (!conv.Supports(c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, outH, outW)) continue;
+            if (!(f32Weights ? conv.SupportsExact(c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, outH, outW) : conv.Supports(c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, outH, outW))) continue;
             ran++;
             var x = new float[(long)c.N * c.C * c.H * c.W]; for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
             var w = new float[(long)c.O * c.C * taps]; for (int i = 0; i < w.Length; i++) w[i] = (float)((rng.NextDouble() * 2 - 1) * 0.1);
@@ -43,7 +50,7 @@ public abstract partial class MLTestBase
             var cvt = new PrecisionConvertKernels(accelerator);
             cvt.FloatToHalf(wBuf.View, wHalf.View, w.Length);
             // the weights the GEMM sees: fp16-rounded
-            var wRounded = new float[w.Length]; for (int i = 0; i < w.Length; i++) wRounded[i] = (float)(System.Half)w[i];
+            var wRounded = new float[w.Length]; for (int i = 0; i < w.Length; i++) wRounded[i] = f32Weights ? w[i] : (float)(System.Half)w[i];
             var xHalfRounded = new float[x.Length]; for (int i = 0; i < x.Length; i++) xHalfRounded[i] = (float)(System.Half)x[i];
 
             foreach (bool halfAct in new[] { false, true })
@@ -72,7 +79,7 @@ public abstract partial class MLTestBase
                 if (!halfAct)
                 {
                     using var xBuf = accelerator.Allocate1D(x); using var yBuf = accelerator.Allocate1D<float>(want.Length);
-                    conv.Run<float>(xBuf.View, wHalf.View, biasBuf.View, yBuf.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW);
+                    if (f32Weights) conv.RunF32<float>(xBuf.View, wBuf.View, biasBuf.View, yBuf.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW); else conv.Run<float>(xBuf.View, wHalf.View, biasBuf.View, yBuf.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW);
                     got = await yBuf.View.CopyToHostAsync();
                 }
                 else
@@ -80,18 +87,18 @@ public abstract partial class MLTestBase
                     using var xf = accelerator.Allocate1D(x); using var xh = accelerator.Allocate1D<global::ILGPU.Half>(x.Length); using var yh = accelerator.Allocate1D<global::ILGPU.Half>(want.Length);
                     using var yf = accelerator.Allocate1D<float>(want.Length);
                     cvt.FloatToHalf(xf.View, xh.View, x.Length);
-                    conv.Run<global::ILGPU.Half>(xh.View, wHalf.View, biasBuf.View, yh.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW);
+                    if (f32Weights) conv.RunF32<global::ILGPU.Half>(xh.View, wBuf.View, biasBuf.View, yh.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW); else conv.Run<global::ILGPU.Half>(xh.View, wHalf.View, biasBuf.View, yh.View, c.N, c.C, c.H, c.W, c.O, c.KH, c.KW, c.SH, c.SW, c.PT, c.PL, c.DH, c.DW, outH, outW);
                     cvt.HalfToFloat(yh.View, yf.View, want.Length);
                     got = await yf.View.CopyToHostAsync();
                 }
                 double se = 0, sr = 0; for (int i = 0; i < want.Length; i++) { double d = got[i] - want[i]; se += d * d; sr += (double)want[i] * want[i]; }
                 double rel = Math.Sqrt(se / Math.Max(1e-30, sr));
                 report.Add($"{c.Name} {(halfAct ? "fp16" : "fp32")} activations: relRMS {rel:E2}");
-                if (!(rel < (halfAct ? 6e-3 : 3e-3))) throw new Exception($"{c.Name} ({(halfAct ? "fp16" : "fp32")} activations) on {accelerator.AcceleratorType}: relRMS {rel:E2}");
+                if (!(rel < (f32Weights ? (halfAct ? 2e-3 : 2e-5) : (halfAct ? 6e-3 : 3e-3)))) throw new Exception($"{c.Name} ({(halfAct ? "fp16" : "fp32")} activations) on {accelerator.AcceleratorType}: relRMS {rel:E2}");
             }
         }
         if (ran == 0) throw new UnsupportedTestException($"no GEMM path for these convolutions on {accelerator.AcceleratorType}");
-        Console.WriteLine($"[ConvGemm] {accelerator.AcceleratorType}: {string.Join("; ", report)}");
+        Console.WriteLine($"[ConvGemm] {(f32Weights ? "fp32 weights " : "")}{accelerator.AcceleratorType}: {string.Join("; ", report)}");
         return $"{ran} convolutions";
-    });
+    }
 }

@@ -249,6 +249,22 @@ public sealed class SparseKernels
         _permuteTapsF16(cout * taps * cin, src, dst, cin, taps, 0);
     }
 
+    /// <summary>True when <see cref="ConvTapsExact"/> can run (the portable tiled GEMM, never the tensor-core path, which rounds the activations to fp16).</summary>
+    public bool ConvTapsExactOk(int M, int taps, int cin, int cout, long xRows) => UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
+
+    /// <summary>
+    /// <see cref="ConvTaps"/> on the portable tiled GEMM with fp32 activations all the way (no tensor cores). <paramref name="addToOutput"/> adds the product to what <paramref name="o"/> already
+    /// holds; no bias either way (the caller adds an fp32 one): two calls with the high and the low fp16 halves of an fp32 weight give a convolution with the weight's full 22-bit mantissa.
+    /// </summary>
+    public void ConvTapsExact(FV x, IV nbr, HV weight, FV o, int M, int cin, int cout, int taps, bool addToOutput)
+    {
+        _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
+        EnsureTiledDummies();
+        int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
+        _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
+            M, taps * cin, cout, cin, 0, 0, addToOutput ? 2 : 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
+    }
+
     /// <summary>True when <see cref="ConvTaps"/> would run a GEMM (tensor cores or the tiled kernel) for these sizes instead of its naive loop.</summary>
     public bool ConvTapsIsGemm(int M, int taps, int cin, int cout, long xRows)
         => (Cuda && cin % MmaGemm.BK == 0 && cout % 2 == 0) || (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin));

@@ -523,6 +523,17 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 return true;
             }
         }
+        if (!wIn.Float.IsHalf && halfBatch == 1 && !LowPWeightDispatch.IsLowP(wIn.Float))
+        {
+            int gOutH = (inH + padTop + padBottom - (dilationH * (kH - 1) + 1)) / stride + 1, gOutW = (inW + padLeft + padRight - (dilationW * (kW - 1) + 1)) / strideW + 1;
+            if (gOutH > 0 && gOutW > 0 && reg.ConvGemm.SupportsExact(1, inC, inH, inW, outC, kH, kW, gOutH, gOutW))
+            {
+                // fp32 weights: split into two fp16 halves, two tiled GEMMs with fp32 activations (float precision)
+                reg.ConvGemm.RunF32<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.Data, bias, output.Data, 1, inC, inH, inW, outC, kH, kW, stride, strideW,
+                    padTop, padLeft, dilationH, dilationW, gOutH, gOutW);
+                return true;
+            }
+        }
         if (wIn.Float.IsHalf)
             pak.Conv2DHalfWeight<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.HalfData, bias, output.Data,
                 inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
@@ -682,6 +693,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else if (w.IsHalf && ctx.Outputs[0].Shape.Length == 4 && reg.ConvGemm.Supports(batchN, inC, inH, inW, outC, kH, kW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]))
                     reg.ConvGemm.Run<float>(x.Data, w.HalfData, bias, ctx.Outputs[0].Data, batchN, inC, inH, inW, outC, kH, kW, stride, strideW,
+                        padTop, padLeft, dilationH, dilationW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]);
+                else if (!LowPWeightDispatch.IsLowP(w) && ctx.Outputs[0].Shape.Length == 4 && reg.ConvGemm.SupportsExact(batchN, inC, inH, inW, outC, kH, kW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]))
+                    reg.ConvGemm.RunF32<float>(x.Data, w.Data, bias, ctx.Outputs[0].Data, batchN, inC, inH, inW, outC, kH, kW, stride, strideW,
                         padTop, padLeft, dilationH, dilationW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]);
                 else if (LowPWeightDispatch.IsLowP(w)) // native low-p weight (NCHW group-1) -> generic low-p kernel, fp32 accumulate
                     LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
