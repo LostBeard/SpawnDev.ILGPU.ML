@@ -280,7 +280,7 @@ public sealed class WanVae : IDisposable
                 var next = DownBlock(s, cur, ref T, ref Hc, ref Wc, stages[s].Item1, stages[s].Item2, stages[s].Item3, stages[s].Item4);
                 Drop(cur); cur = next;
                 Tap?.Invoke($"enc_down{s}", cur.View, T, Hc, Wc, stages[s].Item2);
-                Flush();
+                Flush(); await _acc.SynchronizeAsync();                    // a flush is not a wait: bound the queue to one block (browser WebGPU loses the device when seconds of work are queued)
             }
             var m0 = ResBlock("encoder.middle.0.", cur, T, Hc, Wc, 640, 640); Drop(cur);
             var m1 = Attention("encoder.middle.1.", m0, T, Hc, Wc, 640); Drop(m0);
@@ -340,7 +340,7 @@ public sealed class WanVae : IDisposable
                 var next = UpBlock(s, cur, ref T, ref H, ref W, stages[s].Item1, stages[s].Item2, stages[s].Item3, stages[s].Item4, i == 0);
                 Drop(cur); cur = next;
                 Tap?.Invoke($"dec_up{s}", cur.View, T, H, W, stages[s].Item2);
-                Flush();
+                Flush(); await _acc.SynchronizeAsync();
             }
             var hn = NormSilu(cur, "decoder.head.0.gamma", T * H * W, 256); Drop(cur);
             var hc = ConvCausal("decoder.head.2", hn, T, H, W, 256, 12); Drop(hn);
@@ -348,7 +348,7 @@ public sealed class WanVae : IDisposable
             head.View.SubView((long)writtenFrames * H * W * 12, (long)T * H * W * 12).CopyFrom(hc.View.SubView(0, (long)T * H * W * 12));
             writtenFrames += T;
             Drop(hc);
-            Flush();
+            Flush(); await _acc.SynchronizeAsync();
         }
         if (writtenFrames != totalFrames) throw new InvalidOperationException($"decoded {writtenFrames} frames, expected {totalFrames}");
         var video = _acc.Allocate1D<float>(3L * totalFrames * H8 * W8);
