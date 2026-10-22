@@ -366,7 +366,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("the layer-streaming encoder test reads the 11 GB export from disk on a desktop GPU");
         var path = Path.Combine(WanDir, "umt5_xxl_enc_bf16.safetensors");
         if (!File.Exists(path)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
-        using var enc = new UmT5Encoder(accelerator, path);
+        using var enc = await UmT5Encoder.CreateAsync(accelerator, path);
         var report = new List<string>();
         double worstBf16 = 0, worstExact = 0;
         foreach (var name in new[] { "0", "1", "neg" })

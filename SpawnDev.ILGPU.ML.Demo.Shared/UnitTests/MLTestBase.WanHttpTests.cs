@@ -1,0 +1,64 @@
+using ILGPU;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Wan;
+using SpawnDev.UnitTesting;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+
+/// <summary>
+/// Wan 2.2 TI2V-5B in the BROWSER: the whole pipeline fed by HTTP range requests from a local file server, the way the demo is fed from the model host (the 5.6 GB DiT, the 1.4 GB VAE and
+/// the 11.4 GB umT5 never sit in the page memory: each tensor goes from the fetch to the GPU). Serve the folder first:
+/// <c>node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767</c>, then <c>PMT_EXCLUDE_CATEGORIES= PMT_FILTER=Wan_Pipeline_OverHttp PMT_LANES=webgpu PMT_CONSOLE_LOG=Wan</c>.
+/// </summary>
+public abstract partial class MLTestBase
+{
+    private const string WanServer = "http://127.0.0.1:8767/";
+
+    /// <summary>The local file server as a model source: every repo is the server root; files stream by Range requests that stay in JS (<see cref="FetchRangeStream"/>).</summary>
+    private sealed class WanRangeSource(HttpClient http) : IModelSource
+    {
+        public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+        {
+            using var head = await http.SendAsync(new HttpRequestMessage(HttpMethod.Head, WanServer + filePath), cancellationToken);
+            head.EnsureSuccessStatusCode();
+            return new FetchRangeStream(WanServer + filePath, head.Content.Headers.ContentLength ?? throw new InvalidDataException($"{filePath}: the server gave no length"));
+        }
+        public Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => http.GetByteArrayAsync(WanServer + filePath, cancellationToken);
+    }
+
+    private static float[] WanFloats(byte[] raw) { var f = new float[raw.Length / 4]; Buffer.BlockCopy(raw, 0, f, 0, raw.Length); return f; }
+
+    /// <summary>
+    /// The pipeline in the browser against the reference 30-step trajectory (the same prompt and starting noise as Wan_Pipeline_MatchesReference; the fixtures are small files exported next to the
+    /// models): the final latent must be as close to the reference as the desktop run (relRMS about 0.1 to 0.2: the reference's own sensitivity), the video finite and not constant.
+    /// Stage timings go to the console.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_OverHttp_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser pipeline test (the desktop runs Wan_Pipeline_MatchesReference)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] noiseRaw, wantRaw;
+        try { noiseRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/noise_t2v30.f32"); wantRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/final_t2v30.f32"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        var noise = WanFloats(noiseRaw); var want = WanFloats(wantRaw);
+        var pipe = new Wan22Pipeline(accelerator, new WanRangeSource(http), "", Wan22Paths.InRepo());
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string last = "";
+        var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; Console.WriteLine($"[Wan] browser stage {p.Stage} at {sw.Elapsed.TotalSeconds:F0} s ({p.Message})"); } });
+        var video = await pipe.GenerateAsync(new WanRequest
+        {
+            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = 640, Height = 352, Frames = 17, Steps = 30, InitialNoise = noise,
+        }, progress);
+        double se = 0, sr = 0, min = double.MaxValue, max = double.MinValue;
+        for (int i = 0; i < want.Length; i++) { double d = video.Latent![i] - want[i]; se += d * d; sr += (double)want[i] * want[i]; }
+        foreach (var v in video.Data) { if (!float.IsFinite(v)) throw new Exception("a pixel is not finite"); min = Math.Min(min, v); max = Math.Max(max, v); }
+        double rel = Math.Sqrt(se / sr);
+        Console.WriteLine($"[Wan] browser pipeline on {accelerator.AcceleratorType}: {video.Frames} frames {video.Width}x{video.Height} in {sw.Elapsed.TotalSeconds:F0} s, final latent relRMS {rel:F3} vs the reference, pixels {min:F2}..{max:F2}");
+        if (!(rel < 0.4)) throw new Exception($"the browser pipeline's final latent is not the reference's: relRMS {rel:F3}");
+        if (max > 1.0001 || min < -1.0001 || !(max - min > 0.5)) throw new Exception($"the video is out of range or flat: {min}..{max}");
+        return $"relRMS {rel:F3} in {sw.Elapsed.TotalSeconds:F0} s";
+    });
+}

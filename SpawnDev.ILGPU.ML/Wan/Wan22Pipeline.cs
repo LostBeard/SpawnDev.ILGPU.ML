@@ -1,11 +1,12 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Trellis2;
 
 namespace SpawnDev.ILGPU.ML.Wan;
 
-/// <summary>Where the Wan 2.2 TI2V-5B files are (the exports of tools/wan-harness/reference: DiT bf16 / 8-bit / 4-bit, VAE fp16, umT5 bf16, the tokenizer).</summary>
+/// <summary>The Wan 2.2 TI2V-5B files (the exports of tools/wan-harness/reference: DiT bf16 / 8-bit / 4-bit, VAE fp16, umT5 bf16, the tokenizer), as names the pipeline model source resolves: paths on disk for a local folder, file names within the repo for the hub.</summary>
 public sealed class Wan22Paths
 {
     /// <summary><c>wan22_ti2v_5b_dit_bf16.safetensors</c> (10 GB), <c>..._q8</c> (5.6 GB, lossless in practice) or <c>..._q4</c> (3.1 GB).</summary>
@@ -17,7 +18,13 @@ public sealed class Wan22Paths
     /// <summary>The umT5 <c>tokenizer.json</c>.</summary>
     public required string Tokenizer { get; init; }
 
-    /// <summary>The conventional layout of one folder: the file names the exporters write.</summary>
+    /// <summary>The file names the exporters write and a model repo holds (relative, forward slashes).</summary>
+    public static Wan22Paths InRepo(string dit = "wan22_ti2v_5b_dit_q8.safetensors") => new()
+    {
+        Dit = dit, Vae = "wan22_vae_f16.safetensors", TextEncoder = "umt5_xxl_enc_bf16.safetensors", Tokenizer = "google/umt5-xxl/tokenizer.json",
+    };
+
+    /// <summary>The conventional layout of one folder on disk: the file names the exporters write.</summary>
     public static Wan22Paths InFolder(string folder, string dit = "wan22_ti2v_5b_dit_q8.safetensors") => new()
     {
         Dit = Path.Combine(folder, dit), Vae = Path.Combine(folder, "wan22_vae_f16.safetensors"), TextEncoder = Path.Combine(folder, "umt5_xxl_enc_bf16.safetensors"),
@@ -55,6 +62,8 @@ public sealed class WanVideo
     public required int Width { get; init; }
     public required int Height { get; init; }
     public required int Frames { get; init; }
+    /// <summary>The denoised latent the video was decoded from, [48, F/4 + 1, H/16, W/16] (small; for tests and for re-decoding).</summary>
+    public float[]? Latent { get; init; }
 
     /// <summary>One frame as RGBA bytes (alpha 255).</summary>
     public byte[] GetFrameRgba(int frame)
@@ -87,16 +96,29 @@ public sealed class Wan22Pipeline
 {
     private readonly Accelerator _acc;
     private readonly Wan22Paths _paths;
+    private readonly IModelSource _source;
+    private readonly string _repo;
     private UnigramTokenizer? _tok;
 
     /// <summary>The reference's default negative prompt (Chinese; it lists the usual video defects).</summary>
     public const string DefaultNegativePrompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
-    public Wan22Pipeline(Accelerator accelerator, Wan22Paths paths) { _acc = accelerator; _paths = paths; }
+    /// <summary>Files from a model source (the hub with its OPFS cache or range streaming in the browser, a local folder on the desktop): <paramref name="paths"/> are names within <paramref name="repo"/>.</summary>
+    public Wan22Pipeline(Accelerator accelerator, IModelSource source, string repo, Wan22Paths paths) { _acc = accelerator; _source = source; _repo = repo; _paths = paths; }
 
-    private int[] Tokenize(string text)
+    /// <summary>Files on disk: <paramref name="paths"/> are file paths (<see cref="Wan22Paths.InFolder"/>).</summary>
+    public Wan22Pipeline(Accelerator accelerator, Wan22Paths paths) : this(accelerator, new LocalFolderModelSource(""), "", paths) { }
+
+    private async Task<GpuWeights> LoadWeightsAsync(string file, CancellationToken ct)
     {
-        if (_tok == null) { using var fs = File.OpenRead(_paths.Tokenizer); _tok = UnigramTokenizer.FromTokenizerJson(fs); }
+        await using var stream = await _source.OpenAsync(_repo, file, ct);
+        using var empty = System.Text.Json.JsonDocument.Parse("{}");
+        return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, file, cancellationToken: ct);
+    }
+
+    private async Task<int[]> TokenizeAsync(string text, CancellationToken ct)
+    {
+        if (_tok == null) { using var ms = new MemoryStream(await _source.FetchBytesAsync(_repo, _paths.Tokenizer, ct)); _tok = UnigramTokenizer.FromTokenizerJson(ms); }
         var ids = _tok.Encode(UnigramTokenizer.CleanWhitespace(text));
         return ids.Length > WanDiT_TextLength ? ids[..WanDiT_TextLength] : ids;         // the reference truncates to 512 tokens
     }
@@ -162,12 +184,12 @@ public sealed class Wan22Pipeline
         // 1. text: the prompt and the negative prompt through umT5, one layer of its weights on the device at a time
         Report("text", 0, "encoding the prompt");
         float[] ctx, ctxNeg; int ctxRows, ctxNegRows;
-        using (var t5 = new UmT5Encoder(_acc, _paths.TextEncoder))
+        var ids = await TokenizeAsync(req.Prompt, ct); var nids = await TokenizeAsync(req.NegativePrompt ?? DefaultNegativePrompt, ct);
+        ctxRows = ids.Length; ctxNegRows = nids.Length;
+        using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
         {
-            var ids = Tokenize(req.Prompt); ctxRows = ids.Length; ctx = await t5.EncodeAsync(ids);
-            ct.ThrowIfCancellationRequested();
-            Report("text", 0.5, "encoding the negative prompt");
-            var nids = Tokenize(req.NegativePrompt ?? DefaultNegativePrompt); ctxNegRows = nids.Length; ctxNeg = await t5.EncodeAsync(nids);
+            var both = await t5.EncodeManyAsync(new[] { ids, nids }, ct);                  // one pass over the layers for both prompts
+            ctx = both[0]; ctxNeg = both[1];
         }
         Report("text", 1, $"{ctxRows} + {ctxNegRows} tokens");
 
@@ -177,7 +199,7 @@ public sealed class Wan22Pipeline
         {
             Report("image", 0, "encoding the picture");
             var img = PrepareImage(req.ImageRgb!, req.ImageWidth, req.ImageHeight, req.Width, req.Height);
-            using var vw = GpuWeights.LoadFile(_acc, _paths.Vae);
+            using var vw = await LoadWeightsAsync(_paths.Vae, ct);
             using var vae = new WanVae(_acc, vw);
             z0 = await vae.EncodeImageAsync(img, req.Height, req.Width);        // [48, 1, h, w]
             Report("image", 1, "done");
@@ -189,7 +211,7 @@ public sealed class Wan22Pipeline
         void PutPicture(float[] l) { if (z0 != null) for (int c = 0; c < 48; c++) Array.Copy(z0, (long)c * per, l, (long)c * Fz * per, per); }
         PutPicture(latent);
         Report("denoise", 0, "loading the transformer");
-        using (var dw = GpuWeights.LoadFile(_acc, _paths.Dit))
+        using (var dw = await LoadWeightsAsync(_paths.Dit, ct))
         using (var dit = new WanDiT(_acc, new DiTKernels(_acc), dw))
         {
             dit.SetGrid(Fz, h, w);
@@ -213,10 +235,10 @@ public sealed class Wan22Pipeline
         // 4. decode
         Report("decode", 0, "decoding the video");
         float[] video;
-        using (var vw = GpuWeights.LoadFile(_acc, _paths.Vae))
+        using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
             video = await vae.DecodeAsync(latent, Fz, h, w);
         Report("decode", 1, "done");
-        return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3 };
+        return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
     }
 }
