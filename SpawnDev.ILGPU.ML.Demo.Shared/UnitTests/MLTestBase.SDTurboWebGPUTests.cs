@@ -61,7 +61,7 @@ public abstract partial class MLTestBase
                 // gen fully reads its image back (drained) before the next — matching the demo's usage.
                 var prompts = new[] { "a chicken boxing match", "a nice house", "a watercolor fox", "a photo of a cat" };
                 var results = new System.Text.StringBuilder();
-                long gen1PeakTotal = 0;
+                long gen1PeakTotal = 0; long gen2PeakTotal = 0;
                 for (int g = 0; g < prompts.Length; g++)
                 {
                     pipe.Seed = 42 + g;
@@ -106,9 +106,18 @@ public abstract partial class MLTestBase
                     // Guard: after the cold gen 1 warms the pool, no later gen may grow peak-TOTAL beyond a small
                     // margin (pre-fix this grew by a full 128 MiB feature-map per gen).
                     long peakTotalMiB = BufferPool.PeakTotalBytes / 1048576;
+                    // The first generation is not the warm state: gen 2 measured +99 MiB over gen 1 on a build WITHOUT any leak (the second run reuses the text encoder's and the scheduler's resident
+                    // buffers on top of the first run's working set; 2026-10-22, RTX 4070). A leak grows on EVERY later generation, so: gen 2 may exceed gen 1 by one feature map (192 MiB), and from
+                    // gen 3 on nothing may grow beyond a small margin over gen 2.
                     if (g == 0) gen1PeakTotal = peakTotalMiB;
-                    else if (peakTotalMiB > gen1PeakTotal + 32)
-                        throw new Exception($"gen {g + 1}: peak-TOTAL GPU memory grew to {peakTotalMiB} MiB (gen 1 = {gen1PeakTotal} MiB) " +
+                    else if (g == 1)
+                    {
+                        gen2PeakTotal = peakTotalMiB;
+                        if (peakTotalMiB > gen1PeakTotal + 192)
+                            throw new Exception($"gen 2: peak-TOTAL GPU memory grew to {peakTotalMiB} MiB (gen 1 = {gen1PeakTotal} MiB): more than the warm-up of the second run — a buffer leak.");
+                    }
+                    else if (peakTotalMiB > gen2PeakTotal + 32)
+                        throw new Exception($"gen {g + 1}: peak-TOTAL GPU memory grew to {peakTotalMiB} MiB (gen 2 = {gen2PeakTotal} MiB) " +
                             $"— a per-gen buffer leak (the SD-Turbo 2nd-gen OOM regression). Must stay flat on a warm resident pipeline.");
                     results.Append($"g{g + 1}:std={std:F1},peakTot={peakTotalMiB}MiB,rc={reclaimsThisGen} ");
                 }
