@@ -141,31 +141,8 @@ public sealed class Wan22Pipeline
     }
     private const int WanDiT_TextLength = 512;
 
-    /// <summary>
-    /// Standard normal samples, seeded: xoshiro256** (seeded through splitmix64, so the same on every platform and runtime) and Box-Muller. Not torch's generator, so a seed here is not a seed there;
-    /// <see cref="WanRequest.InitialNoise"/> takes another implementation's noise to reproduce its run.
-    /// </summary>
-    public static float[] Gaussian(long count, long seed)
-    {
-        ulong sm = unchecked((ulong)seed);
-        ulong SplitMix() { sm += 0x9E3779B97F4A7C15UL; ulong z = sm; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL; return z ^ (z >> 31); }
-        ulong s0 = SplitMix(), s1 = SplitMix(), s2 = SplitMix(), s3 = SplitMix();
-        static ulong Rotl(ulong x, int k) => (x << k) | (x >> (64 - k));
-        double Next()                                                                  // uniform in (0, 1]
-        {
-            ulong r = Rotl(s1 * 5, 7) * 9, t = s1 << 17;
-            s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t; s3 = Rotl(s3, 45);
-            return ((r >> 11) + 1) * (1.0 / 9007199254740992.0);
-        }
-        var x = new float[count];
-        for (long i = 0; i < count; i += 2)
-        {
-            double u1 = Next(), u2 = Next(), r = Math.Sqrt(-2.0 * Math.Log(u1));
-            x[i] = (float)(r * Math.Cos(2 * Math.PI * u2));
-            if (i + 1 < count) x[i + 1] = (float)(r * Math.Sin(2 * Math.PI * u2));
-        }
-        return x;
-    }
+    /// <summary>Standard normal samples, seeded (<see cref="SeededNoise"/>): the starting noise [48, F, h, w]. Not torch's generator, so a seed here is not a seed there; <see cref="WanRequest.InitialNoise"/> takes another implementation's noise.</summary>
+    public static float[] Gaussian(long count, long seed) => SeededNoise.Gaussian(count, seed);
 
     /// <summary>
     /// The picture as the VAE wants it: scaled until it covers the output (the larger of the two ratios), centre-cropped, bilinear, channel-first [3, 1, H, W] in [-1, 1].

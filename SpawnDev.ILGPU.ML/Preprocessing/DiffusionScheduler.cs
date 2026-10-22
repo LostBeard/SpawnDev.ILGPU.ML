@@ -190,13 +190,8 @@ public static class DiffusionScheduler
     /// </summary>
     public static float[] GenerateNoise(int channels, int height, int width, int? seed = null)
     {
-        var rng = seed.HasValue ? new Random(seed.Value) : new Random();
-        var noise = new float[channels * height * width];
-        for (int i = 0; i < noise.Length; i++)
-        {
-            noise[i] = (float)NormalRandom(rng);
-        }
-        return noise;
+        // SeededNoise, not new Random(seed): the legacy generator's streams for neighbouring seeds are correlated (see SeededNoise)
+        return SeededNoise.Gaussian((long)channels * height * width, seed ?? Random.Shared.Next());
     }
 
     /// <summary>
