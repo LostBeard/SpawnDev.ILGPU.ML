@@ -16,7 +16,7 @@
     <meta property="og:description" content="GPU-accelerated ML inference in C#. Style transfer, image classification, super resolution — all running in your browser via WebGPU. No server needed." />
     <meta property="og:type" content="website" />
     <title>SpawnDev.ILGPU.ML</title>
-    <link href="_framework/dotnet.zd31yv466x.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-mTrC8j44TIDOBhvPCHO/QwF09KhBhYgL7IIssV2N4xM=" />
+    <link href="_framework/dotnet.7ba7eq1ib8.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-Dcr0GIFGZoPSKrzUuSESonlmcoJunrM44l7CyOyWarU=" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
     <link rel="stylesheet" href="css/app.css" />
     <link rel="icon" type="image/png" href="favicon.png" />
@@ -24,20 +24,20 @@
     <script type="importmap">{
   "imports": {
     "./_framework/blazor.webassembly.js": "./_framework/blazor.webassembly.w3qd1tpl0e.js",
-    "./_framework/dotnet.native.js": "./_framework/dotnet.native.0wb6sr1ybe.js",
-    "./_framework/dotnet.runtime.js": "./_framework/dotnet.runtime.azrfhwb804.js",
-    "./_framework/dotnet.js": "./_framework/dotnet.zd31yv466x.js"
+    "./_framework/dotnet.js": "./_framework/dotnet.7ba7eq1ib8.js",
+    "./_framework/dotnet.native.js": "./_framework/dotnet.native.ldquy9m8hb.js",
+    "./_framework/dotnet.runtime.js": "./_framework/dotnet.runtime.azrfhwb804.js"
   },
   "scopes": {},
   "integrity": {
     "./_framework/blazor.webassembly.js": "sha256-lDXsDYFgm62F+YUvxES7IOTCXYpiHpU3uR45YdC6mq4=",
     "./_framework/blazor.webassembly.w3qd1tpl0e.js": "sha256-lDXsDYFgm62F+YUvxES7IOTCXYpiHpU3uR45YdC6mq4=",
-    "./_framework/dotnet.js": "sha256-mTrC8j44TIDOBhvPCHO/QwF09KhBhYgL7IIssV2N4xM=",
-    "./_framework/dotnet.native.0wb6sr1ybe.js": "sha256-sPknOiyb+9wsiHZ4hDnPn+5ENiKF7lE620fbYbjvzew=",
-    "./_framework/dotnet.native.js": "sha256-sPknOiyb+9wsiHZ4hDnPn+5ENiKF7lE620fbYbjvzew=",
+    "./_framework/dotnet.7ba7eq1ib8.js": "sha256-Dcr0GIFGZoPSKrzUuSESonlmcoJunrM44l7CyOyWarU=",
+    "./_framework/dotnet.js": "sha256-Dcr0GIFGZoPSKrzUuSESonlmcoJunrM44l7CyOyWarU=",
+    "./_framework/dotnet.native.js": "sha256-95i46wcPAAv4+KY5yoROFZEfoERNrYRHf8qBSrYWnho=",
+    "./_framework/dotnet.native.ldquy9m8hb.js": "sha256-95i46wcPAAv4+KY5yoROFZEfoERNrYRHf8qBSrYWnho=",
     "./_framework/dotnet.runtime.azrfhwb804.js": "sha256-muN076HgyOCoAaid7zD7a2/GN7aQ7tmK/BzdnKgw78g=",
-    "./_framework/dotnet.runtime.js": "sha256-muN076HgyOCoAaid7zD7a2/GN7aQ7tmK/BzdnKgw78g=",
-    "./_framework/dotnet.zd31yv466x.js": "sha256-mTrC8j44TIDOBhvPCHO/QwF09KhBhYgL7IIssV2N4xM="
+    "./_framework/dotnet.runtime.js": "sha256-muN076HgyOCoAaid7zD7a2/GN7aQ7tmK/BzdnKgw78g="
   }
 }</script>
 </head>
@@ -64,6 +64,7 @@
          5.2.27: unregister-all + arrayBuffer wrap (5.2.26 bypass alone left old SW controlling). -->
     <script src="blazor-coi-serviceworker.js?v=5.2.31"></script>
     <script src="js/glb-viewer.js"></script>
+    <script src="js/video-player.js"></script>
     <script src="_framework/blazor.webassembly.w3qd1tpl0e.js" autostart="false"></script>
     <script>
         // GitHub Pages serves files exactly as stored and its branch refuses files over 100 MB: the AOT runtime (dotnet.native.wasm, ~130 MB)
