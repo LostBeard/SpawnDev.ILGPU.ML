@@ -111,6 +111,15 @@ public sealed class TiledVaeUpDecoder : IDisposable
             if (gamma.Length == 0 || beta.Length == 0) continue;
             _normWeights[scope] = (gamma, beta);
         }
+        // The graph optimiser fuses the decomposition into one GroupNormalization node (x, gamma, beta) whose output keeps the scope of the Add it replaced
+        const string fusedSuffix = "/Add_output_0";
+        for (int i = 0; i < n; i++)
+        {
+            if (nodes[i].op != "GroupNormalization" || nodes[i].outs.Length == 0 || nodes[i].ins.Length < 3) continue;
+            string o = nodes[i].outs[0];
+            if (!o.EndsWith(fusedSuffix)) continue;
+            _normWeights[o[..^fusedSuffix.Length]] = (nodes[i].ins[1], nodes[i].ins[2]);
+        }
     }
 
     private (string gamma, string beta) NormW(string scope) =>
@@ -137,13 +146,17 @@ public sealed class TiledVaeUpDecoder : IDisposable
     // ── forward ─────────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>Phase B: run up_blocks 0-3 + conv_norm_out + conv_out tiled, starting from the mid-block output
-    /// [512,64,64] (packed C,H,W). Returns the decoded image [3,512,512] (packed C,H,W). The tile grid is
+    /// [512,<paramref name="height"/>,<paramref name="width"/>] (packed C,H,W: the latent's spatial size, 64x64 for a 512x512 picture, 32x32 for 256x256).
+    /// Returns the decoded image [3,8*height,8*width] (packed C,H,W). The tile grid is
     /// rows×cols; more tiles = lower GPU peak (bounded by one tile) at more per-tile overhead.</summary>
-    public async Task<float[]> DecodeUpBlocksAsync(float[] midOut, int rows, int cols)
+    public async Task<float[]> DecodeUpBlocksAsync(float[] midOut, int rows, int cols, int height = 64, int width = 64)
     {
-        const int C = 512, H = 64, W = 64;
+        const int C = 512;
+        int H = height, W = width;
         if (midOut.Length != (long)C * H * W)
-            throw new ArgumentException($"mid-block output must be {C}x{H}x{W}={C * H * W}, got {midOut.Length}.");
+            throw new ArgumentException($"mid-block output must be {C}x{H}x{W}={C * H * W} (the latent is {H}x{W}), got {midOut.Length}.");
+        if (rows < 1 || cols < 1 || rows > H || cols > W)
+            throw new ArgumentException($"tile grid {rows}x{cols} does not fit a {H}x{W} latent.");
 
         var x = TiledFeatureMap.FromFull(midOut, C, H, W, rows, cols, Halo);
         for (int b = 0; b <= 3; b++)
@@ -168,7 +181,7 @@ public sealed class TiledVaeUpDecoder : IDisposable
         var convOut = Weight("decoder.conv_out.weight");
         int outCh = convOut.Shape[0];                 // 3
         x = await _ops.Conv3x3(x, convOut, await F32Async("decoder.conv_out.bias"), headC, outCh);
-        return x.ToFull();                            // [3,512,512]
+        return x.ToFull();                            // [3,8H,8W]
     }
 
     /// <summary>One VAE resnet block (tiled): norm1 → SiLU → conv1 → norm2 → SiLU → conv2 → + residual

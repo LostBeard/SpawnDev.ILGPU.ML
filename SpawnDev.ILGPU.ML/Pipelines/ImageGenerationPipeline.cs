@@ -60,11 +60,9 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
     /// <summary>Random seed for reproducible generation. Null = random.</summary>
     public int? Seed { get; set; }
 
-    /// <summary>Seam-free tiled VAE decode grid (NxN). 0 = auto (tile 2x2 when the output is >=512 on a side, so
-    /// the decode's GPU peak stays bounded by one tile instead of the full-res up_blocks intermediates). -1 =
-    /// force the full single-pass decode. Set explicitly to override. Added 2026-07-07 (Tuvok): the full 512x512
-    /// VAE decode's peak resident set OOM-kills the GPU process at up_blocks.3 on constrained machines; tiling the
-    /// up-blocks avoids the 256MiB full-res intermediates entirely. The VAE_TILE_EXACT env var still overrides.</summary>
+    /// <summary>VAE decode mode. 0 (the default) and -1 = the full single-pass decode, GPU-resident (its peak is bounded on the browser backends by proactive buffer reclaim).
+    /// N &gt; 0 = the exact seam-free tiled decode on an NxN tile grid (global GroupNorm statistics, halo-refreshed convolutions: the result matches the full decode to float rounding at a GPU
+    /// peak bounded by one tile); it works for any picture size whose latent (size / 8) holds the grid, 256x256 and 512x512 included. The VAE_TILE_EXACT env var overrides.</summary>
     public int VaeTileGrid { get; set; } = 0;
 
     /// <summary>Scheduler type: "ddim" or "euler".</summary>
@@ -584,7 +582,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
                     for (int i = 0; i < n; i++) { double d = Math.Abs((double)cur[i] - refv[i]); if (d > mx) mx = d; sm += d; }
                     Console.WriteLine($"[VAE_EXACT]   stage {name} [{cur.Length}]: maxAbs={mx:E3} meanAbs={sm / n:E3}");
                 };
-            tiled = await dec.DecodeUpBlocksAsync(mid, grid, grid);
+            tiled = await dec.DecodeUpBlocksAsync(mid, grid, grid, latent.Shape[^2], latent.Shape[^1]);
         }
 
         if (verify && full != null)
