@@ -27,9 +27,15 @@ public sealed class Flux2Weights : IDisposable
     /// <summary>4 or 8: the bits per quantised weight of this stage (0 when it holds no quantised matrix).</summary>
     public int QuantBits { get; }
 
-    /// <summary>Wrap a loaded stage. Disposing this disposes <paramref name="weights"/> too.</summary>
-    public Flux2Weights(Accelerator accelerator, GpuWeights weights)
+    private readonly bool _owns;
+
+    /// <summary>
+    /// Wrap a loaded stage. Disposing this disposes <paramref name="weights"/> too, unless <paramref name="ownsWeights"/> is false (a model that keeps the <see cref="GpuWeights"/> itself and only
+    /// borrows the block dequantisation: the Wan 2.2 DiT reads bf16, 8-bit and 4-bit exports through it).
+    /// </summary>
+    public Flux2Weights(Accelerator accelerator, GpuWeights weights, bool ownsWeights = true)
     {
+        _owns = ownsWeights;
         _w = weights; _f = new Flux2Kernels(accelerator); _u = new SkinTokensKernels(accelerator);
         weights.Metadata.TryGetValue("quant", out var quant);
         QuantBits = quant != null && quant.StartsWith("q8", StringComparison.Ordinal) ? 8 : 4;
@@ -75,6 +81,6 @@ public sealed class Flux2Weights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
-        _w.Dispose();
+        if (_owns) _w.Dispose();
     }
 }

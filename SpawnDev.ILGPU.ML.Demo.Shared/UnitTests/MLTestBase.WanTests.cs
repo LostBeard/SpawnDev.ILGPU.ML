@@ -38,6 +38,46 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The DiT from its 8-bit and 4-bit block exports (5.6 GB and 3.1 GB instead of 10 GB; <c>quantize_streaming.py</c>, the FLUX.2 block format, dequantised a matrix at a time into a shared
+    /// scratch before the normal GEMM) against the reference's bf16 noise predictions on the same inputs, text-to-video and with a clean first frame. Prints the error per format so
+    /// the cost of the quantisation is on record; the bound is loose for 4-bit (visible differences are expected).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_DiT_Quantized_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the DiT runs on a desktop GPU or WebGPU");
+        var files = new[] { ("q8", "wan22_ti2v_5b_dit_q8.safetensors", 0.05), ("q4", "wan22_ti2v_5b_dit_q4.safetensors", 0.25) };
+        if (!files.All(f => File.Exists(Path.Combine(WanDir, f.Item2)))) throw new UnsupportedTestException($"Wan quantised exports not found in {WanDir}");
+        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz")); using var t5n = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_neg.npz"));
+        var (ctx0, cs0) = WanNpz(t50, "context"); var (ctxN, csN) = WanNpz(t5n, "context");
+        var report = new List<string>();
+        foreach (var (tag, file, bound) in files)
+        {
+            long before = accelerator.MemorySize;
+            using var weights = GpuWeights.LoadFile(accelerator, Path.Combine(WanDir, file));
+            using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
+            foreach (var (mode, firstFrame) in new[] { ("t2v", false), ("i2v", true) })
+            {
+                using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"dit_{mode}_640x352_f33.npz"));
+                var (lat, ls) = WanNpz(fx, "step0_latent_in"); var (tArr, _) = WanNpz(fx, "step0_t");
+                dit.SetGrid(ls[1], ls[2], ls[3]); dit.SetContext(0, ctx0, cs0[0]); dit.SetContext(1, ctxN, csN[0]);
+                using var lIn = accelerator.Allocate1D(lat); using var lOut = accelerator.Allocate1D<float>(lat.Length);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                dit.Forward(lIn.View, tArr[0], firstFrame, 0, lOut.View); var cond = await lOut.View.CopyToHostAsync();
+                double ms = sw.Elapsed.TotalMilliseconds;
+                dit.Forward(lIn.View, tArr[0], firstFrame, 1, lOut.View); var uncond = await lOut.View.CopyToHostAsync();
+                var (nc, _) = WanNpz(fx, "step0_noise_cond"); var (nu, _) = WanNpz(fx, "step0_noise_uncond");
+                var mc = WanCompare(cond, nc); var mu = WanCompare(uncond, nu);
+                report.Add($"{tag} {mode}: noise_cond relRMS {mc.RelRms:E2}, noise_uncond {mu.RelRms:E2}; weights {weights.Bytes / 1e9:F2} GB on the device; first forward {ms:F0} ms");
+                if (!(mc.RelRms < bound && mu.RelRms < bound)) throw new Exception($"the {tag} DiT deviates from the reference beyond its bound {bound}: " + string.Join("; ", report));
+            }
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] quantised DiT vs reference: " + line);
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The Wan 2.2 VAE ENCODER for the image-to-video conditioning (one picture, the first chunk of the reference's chunked encode): a random picture [3, 1, 128, 192] to the normalised
     /// latent mean [48, 1, 8, 12], every stage tapped (conv1, the four down-blocks with their stride-2 resamples and average-pooling shortcuts, the middle, the head) against the float32 reference.
     /// </summary>
