@@ -1,0 +1,277 @@
+@page "/video"
+@using SpawnDev.SpawnJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Wan
+@implements IDisposable
+
+<PageTitle>Video Generation - SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Video Generation"
+            Description="Generate a short video from text, or animate your own picture, on your GPU: Wan 2.2 TI2V-5B (a 5B-parameter diffusion transformer with a 4x16x16 video VAE and the umT5 text encoder), the 8-bit exports streamed from the SpawnDev models host. Everything runs in this tab on WebGPU; nothing leaves your machine."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="@_modelStatusText"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="@(_dit == "q4" ? 10900 : 13400)">
+
+    <div class="vid-prompt-section">
+        <label class="vid-label">Prompt:</label>
+        <div class="vid-prompt-row">
+            <textarea class="vid-prompt-input" rows="3" @bind="_prompt" @bind:event="oninput"
+                      placeholder="Describe the scene and the motion: a red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field."
+                      disabled="@(_isModelLoading || _isRunning)"></textarea>
+            <button class="vid-btn" @onclick="GenerateVideo"
+                    disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isModelLoading || _isRunning)">
+                @(_isRunning ? "Generating..." : _isModelLoading ? "Loading..." : "Generate")
+            </button>
+        </div>
+
+        <div class="vid-settings">
+            <div class="vid-setting">
+                <label>Size:</label>
+                <select @bind="_size" class="vid-select" disabled="@_isRunning" title="The model was trained at 1280x704 (720p); small sizes are fast but show its limits, and some seeds fail at small sizes. The decoder and the 5B transformer need GPU memory in proportion to the size.">
+                    <option value="512x288">512x288 (fastest)</option>
+                    <option value="640x352">640x352</option>
+                    <option value="832x480">832x480</option>
+                </select>
+            </div>
+            <div class="vid-setting">
+                <label>Frames:</label>
+                <select @bind="_frames" class="vid-select" disabled="@_isRunning" title="24 frames per second; 4n + 1 frames">
+                    <option value="9">9 (0.4 s)</option>
+                    <option value="17">17 (0.7 s)</option>
+                    <option value="25">25 (1 s)</option>
+                    <option value="33">33 (1.4 s)</option>
+                    <option value="49">49 (2 s)</option>
+                </select>
+            </div>
+            <div class="vid-setting">
+                <label>Steps:</label>
+                <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The reference uses 50; 20 to 30 is usually fine">
+                    <option value="12">12 (draft)</option>
+                    <option value="20">20</option>
+                    <option value="30">30</option>
+                    <option value="50">50 (reference)</option>
+                </select>
+            </div>
+            <div class="vid-setting">
+                <label>Guidance:</label>
+                <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@_isRunning" />
+            </div>
+            <div class="vid-setting">
+                <label>Seed:</label>
+                <input type="number" @bind="_seed" class="vid-input" placeholder="random" disabled="@_isRunning" />
+            </div>
+            <div class="vid-setting">
+                <label>Transformer:</label>
+                <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer.">
+                    <option value="q8">8-bit (5.6 GB)</option>
+                    <option value="q4">4-bit (3.1 GB)</option>
+                </select>
+            </div>
+        </div>
+
+        <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
+        <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
+
+        <details class="vid-advanced">
+            <summary>Advanced</summary>
+            <label class="vid-label">Negative prompt (empty = the model's default list of video defects):</label>
+            <input type="text" class="vid-prompt-input" @bind="_negative" disabled="@_isRunning" />
+            <label class="vid-label">Model server (empty = models.spawndev.com):</label>
+            <input type="text" class="vid-prompt-input" @bind="_modelServer" disabled="@(_isRunning || _isModelLoading)" placeholder="http://127.0.0.1:8767" />
+        </details>
+    </div>
+
+    @if (_isRunning)
+    {
+        <div class="vid-progress">
+            <div class="vid-progress-bar"><div class="vid-progress-fill" style="width: @(_fraction * 100)%"></div></div>
+            <span class="vid-progress-text">@_stage @_stageMessage</span>
+        </div>
+    }
+
+    @if (_error != null)
+    {
+        <div class="vid-error">@_error</div>
+    }
+
+    <div class="vid-result" style="@(_hasVideo ? "" : "display:none")">
+        <img id="vid-player" class="vid-player" alt="the generated video" />
+        <div class="vid-info">
+            <span class="vid-info-item">@_resultInfo</span>
+        </div>
+        <div class="vid-actions">
+            <button class="vid-action" @onclick="ReplayAsync">Replay</button>
+            <button class="vid-action vid-download" @onclick="DownloadAsync" disabled="@_recording">@(_recording ? "Encoding..." : "Download WebM")</button>
+        </div>
+    </div>
+</DemoLayout>
+
+<style>
+    .vid-prompt-section { margin-bottom: 1rem; }
+    .vid-label { display: block; color: #94a3b8; font-size: 0.85rem; margin: 0.4rem 0; }
+    .vid-prompt-row { display: flex; gap: 0.5rem; align-items: stretch; }
+    .vid-prompt-input { flex: 1; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.95rem; width: 100%; }
+    .vid-prompt-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .vid-btn { padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .vid-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .vid-settings { display: flex; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .vid-setting { display: flex; align-items: center; gap: 0.3rem; }
+    .vid-setting label { color: #64748b; font-size: 0.8rem; }
+    .vid-input { width: 80px; padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.8rem; text-align: center; }
+    .vid-select { padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.8rem; }
+    .vid-select option { background: #1e293b; }
+    .vid-hint { color: #64748b; font-size: 0.8rem; margin: 0.4rem 0; }
+    .vid-advanced { margin-top: 0.5rem; color: #94a3b8; font-size: 0.85rem; }
+    .vid-progress { margin: 1rem 0; }
+    .vid-progress-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+    .vid-progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius: 4px; transition: width 0.3s; }
+    .vid-progress-text { color: #94a3b8; font-size: 0.8rem; margin-top: 0.25rem; display: block; }
+    .vid-result { text-align: center; margin: 1.5rem 0; }
+    .vid-player { max-width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); }
+    .vid-info { margin-top: 0.75rem; }
+    .vid-info-item { color: #64748b; font-size: 0.8rem; font-family: monospace; }
+    .vid-actions { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: center; }
+    .vid-action { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .vid-download { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .vid-error { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; color: #fca5a5; font-size: 0.85rem; white-space: pre-wrap; }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.";
+    private string _negative = "";
+    private string _size = "640x352";
+    private int _frames = 17, _steps = 30;
+    private double _guidance = 5.0;
+    private long? _seed;
+    private string _dit = "q8";                         // "q8" | "q4"
+    private string _modelServer = "";
+    private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
+    private double _modelProgress, _inferenceMs, _fraction;
+    private string _modelStatusText = "Wan 2.2 TI2V-5B", _stage = "", _stageMessage = "", _resultInfo = "";
+    private string? _error;
+    private ReferenceImages? _refs;
+    private IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> _references = Array.Empty<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage>();
+    private int _frameCount, _fps = 24;
+
+    private readonly List<BackendSelector.BackendInfo> _backends = new() { new() { Id = "WebGPU", DisplayName = "WebGPU" } };
+
+    [Inject] SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource { get; set; } = default!;
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private Wan22Pipeline? _pipeline;
+
+    private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+
+    private void PrecisionChanged() { _pipeline = null; _isModelLoaded = false; }
+
+    private async Task EnsureAcceleratorAsync()
+    {
+        if (_accelerator != null) return;
+        if (_context == null)
+        {
+            var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+            await builder.AllAcceleratorsAsync();
+            _context = builder.ToContext();
+        }
+        _accelerator = await _context.CreatePreferredAcceleratorAsync() ?? throw new InvalidOperationException("No GPU accelerator available (this page needs WebGPU).");
+    }
+
+    private async Task GenerateVideo()
+    {
+        _error = null; _isRunning = true; _hasVideo = false; _fraction = 0; _stage = "starting"; _stageMessage = "";
+        StateHasChanged();
+        var total = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            await EnsureAcceleratorAsync();
+            if (!string.IsNullOrWhiteSpace(_modelServer)) SpawnDev.ILGPU.ML.Hub.ModelsHost.BaseUrl = _modelServer.Trim().TrimEnd('/');
+            _pipeline ??= new Wan22Pipeline(_accelerator!, ModelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo(Wan22Paths.DitFile(_dit), Wan22Paths.TextEncoderFile("q8")));
+            var parts = _size.Split('x');
+            int width = int.Parse(parts[0]), height = int.Parse(parts[1]);
+            var request = new WanRequest
+            {
+                Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
+                GuidanceScale = _guidance, Seed = _seed ?? Random.Shared.NextInt64(1, int.MaxValue),
+            };
+            if (_references.Count > 0)
+            {
+                var pic = _references[0];
+                var rgb = new byte[pic.Width * pic.Height * 3];
+                for (int p = 0; p < pic.Width * pic.Height; p++) { rgb[p * 3] = pic.Rgba[p * 4]; rgb[p * 3 + 1] = pic.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = pic.Rgba[p * 4 + 2]; }
+                request = new WanRequest
+                {
+                    Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = _guidance, Seed = request.Seed,
+                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height,
+                };
+            }
+            var progress = new Progress<WanProgress>(p =>
+            {
+                _stage = p.Stage; _stageMessage = p.Message;
+                // the transformer's steps are most of the time: text 0-10 %, loading + steps 10-90 %, decode 90-100 %
+                _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
+                _modelStatusText = $"Wan 2.2 - {p.Stage}";
+                _ = InvokeAsync(StateHasChanged);
+            });
+            var video = await _pipeline.GenerateAsync(request, progress);
+            _stage = "showing"; _stageMessage = "the frames"; StateHasChanged();
+            await Task.Yield();
+            using var player = JS.Get<SpawnJSObject>("videoPlayer");
+            player.JSRef!.CallVoid("clear", "vid-player");
+            for (int f = 0; f < video.Frames; f++)
+                player.JSRef!.CallVoid("addFrame", "vid-player", Services.ImageDisplayHelper.ToDataUrl(JS, video.GetFrameRgba(f), video.Width, video.Height));
+            _frameCount = video.Frames;
+            _hasVideo = true; _isModelLoaded = true;
+            _inferenceMs = total.Elapsed.TotalMilliseconds;
+            _resultInfo = $"{video.Frames} frames {video.Width}x{video.Height} at {_fps} fps, seed {request.Seed}, {total.Elapsed.TotalSeconds:F0} s total";
+            _modelStatusText = "Wan 2.2 TI2V-5B";
+            StateHasChanged();
+            await Task.Yield();
+            player.JSRef!.CallVoid("play", "vid-player", _fps);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            Console.WriteLine($"[Video] Error: {ex}");
+        }
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private async Task ReplayAsync()
+    {
+        using var player = JS.Get<SpawnJSObject>("videoPlayer");
+        player.JSRef!.CallVoid("play", "vid-player", _fps);
+        await Task.CompletedTask;
+    }
+
+    private async Task DownloadAsync()
+    {
+        _recording = true; StateHasChanged();
+        try
+        {
+            using var player = JS.Get<SpawnJSObject>("videoPlayer");
+            await player.JSRef!.CallVoidAsync("download", "vid-player", _fps, "video.webm");
+        }
+        catch (Exception ex) { _error = ex.Message; }
+        _recording = false; StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        try { using var player = JS.Get<SpawnJSObject>("videoPlayer"); player.JSRef!.CallVoid("stop", "vid-player"); } catch { }
+        _accelerator?.Dispose(); _accelerator = null;
+    }
+}
