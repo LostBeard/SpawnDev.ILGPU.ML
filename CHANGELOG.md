@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.5.0 - 2026-10-22 - on SpawnDev.ILGPU 5.4.2: video generation (Wan 2.2), the Conv implicit GEMM, SpawnGen fixes
 
 - **Video generation: Wan 2.2 TI2V-5B** (`Wan22Pipeline`, namespace `SpawnDev.ILGPU.ML.Wan`; [Docs/video.md](Docs/video.md)): text to video and image to video on CUDA / OpenCL and in the browser on WebGPU. The umT5-XXL text encoder (streamed layer by layer, the prompt and the negative prompt in one pass), the 5B DiT with classifier-free guidance and the UniPC flow sampler, and the Wan2.2 video VAE (decoder and the encoder for the first frame), all gated stage by stage against the reference implementation. 8-bit exports of the DiT (5.6 GB) and the text encoder (6.4 GB) match the 16-bit models within their own rounding. `Wan22Pipeline` reads its files from an `IModelSource`; new `LocalFolderModelSource`. Browser, 640x352 17 frames 30 steps: 176 s on an RTX 4070. New `/video` demo page, `Examples/11.VideoGen.Console` and `Examples/12.VideoGen.Wpf`. The files are on the models host (`LostBeard/Wan2.2-TI2V-5B-ILGPU`: 8-bit and 4-bit DiT, VAE, 8-bit umT5, tokenizer; 16.6 GB).
 - **Wan2.2-TI2V-5B-Turbo** (step-distilled, 4 steps, no guidance) is the default of the `/video` page and the examples (`--turbo`): `WanRequest.Sampler = WanSampler.FewStep` (x0 prediction, fresh-noise re-noising) and `GuidanceScale <= 1` (one forward per step, the negative prompt is not encoded). 1280x704 x33 frames in 79 s on an RTX 4070; in the browser 832x480 x33 in 131 s and 1280x704 x17 in 166 s. `export_dit_bf16.py` reads a single source checkpoint.

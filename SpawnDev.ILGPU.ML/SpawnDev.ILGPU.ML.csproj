@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.4.0</Version>
+		<Version>5.5.0</Version>
 		<PackageReleaseNotes>v5.4.0 - on SpawnDev.ILGPU 5.4.1: Velocity is the CPU backend, WebGPU shaders compile faster and attention runs ~10% faster; models come from models.spawndev.com (Hugging Face fallback); TRELLIS.2 1024/1536 cascade, smooth shading, FLUX picture editing. Details: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
