@@ -54,8 +54,10 @@ Desktop CUDA, `Examples/11.VideoGen.Console --ci` (320x192, 9 frames, 8 steps): 
 
 ## Limits
 
-- **Memory.** The VAE decoder keeps two frames of input per causal convolution (the reference's feature cache), so its memory grows with the picture: 640x352 is comfortable on 12 GB and in the
-  browser; 1280x704 with 121 frames runs the DiT but runs out of memory in the decoder on a 12 GB card. Fp16 activations and spatial tiling are the planned fixes.
+- **Memory.** The model's own size, 1280x704 with 121 frames (5 s), runs on a 12 GB card: 2 steps took 224 s (text 23 s, DiT 85 s, about 21 s per forward at 27,280 tokens, VAE decode 116 s), so a
+  50-step video is about 35 minutes of DiT. What makes it fit: the decoder keeps its causal caches (two input frames per convolution) as fp16 pairs, decodes the last two stages a frame at a time
+  when a chunk is big (`WanVae.MaxSliceBytes`; identical output, tested), and assembles the picture on the host chunk by chunk. VAE decode of 1280x704 x17 frames went from 175 s (VRAM spill) to 17 s.
+  In the browser the transformer's time is the limit (about 7 s per forward at 832x480 x33), not memory.
 - **Seeds.** At small sizes the model itself gives good clips for some seeds and garbage for others (the reference does too: seed 9 at 640x352 is noise-like where seeds 7 and 8 draw a fox). Judge the
   pipeline only with the reference's noise (`WanRequest.InitialNoise`), as the tests do.
 - Our noise is not torch's generator, so a seed here is not a seed there.
