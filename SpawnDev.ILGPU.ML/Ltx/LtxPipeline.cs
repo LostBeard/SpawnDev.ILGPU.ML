@@ -19,6 +19,11 @@ public sealed class LtxPaths
     /// <summary>The <c>tokenizer.json</c> of google/t5-v1_1-xxl.</summary>
     public required string Tokenizer { get; init; }
 
+    /// <summary>The DiT file for a precision: "bf16" (3.6 GB) or "q8" (2.0 GB).</summary>
+    public static string DitFile(string precision) => $"ltx_dit_{precision}.safetensors";
+    /// <summary>The T5 file for a precision: "bf16" (8.9 GB) or "q8" (5.0 GB).</summary>
+    public static string TextEncoderFile(string precision) => $"t5_xxl_enc_{precision}.safetensors";
+
     /// <summary>The file names the exporters write and a model repo holds (relative, forward slashes).</summary>
     public static LtxPaths InRepo(string dit = "ltx_dit_bf16.safetensors", string textEncoder = "t5_xxl_enc_bf16.safetensors") => new()
     {

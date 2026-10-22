@@ -144,17 +144,18 @@ IProgress<WanProgress> ConsoleProgress(System.Diagnostics.Stopwatch sw)
 // LTX-Video 2B 0.9.8 distilled (text to video): T5-v1.1-XXL streamed, the 2B DiT with the 7-step distilled sampler, the timestep-conditioned VAE decode
 async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, Options o)
 {
+    string ditFile = LtxPaths.DitFile(args.Contains("--dit") ? o.Dit : "bf16"), textFile = LtxPaths.TextEncoderFile(o.Text);       // LTX: --dit bf16|q8 (3.6 / 2.0 GB), --text bf16|q8 (8.9 / 5.0 GB)
     LtxPipeline pipe;
     if (o.Models != null)
     {
-        Console.WriteLine($"Models: {o.Models}");
-        pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(o.Models));
+        Console.WriteLine($"Models: {o.Models} ({ditFile}, {textFile})");
+        pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(o.Models, ditFile, textFile));
     }
     else
     {
         var store = o.Cache != null ? new FileModelStore(o.Cache) : FileModelStore.Default();
         Console.WriteLine($"Model cache: {store.RootDirectory} (first run downloads the DiT, the VAE and the text encoder from the models host)");
-        pipe = new LtxPipeline(accelerator, new HttpClientModelSource(http, store), LtxPipeline.DefaultRepo, LtxPaths.InRepo());
+        pipe = new LtxPipeline(accelerator, new HttpClientModelSource(http, store), LtxPipeline.DefaultRepo, LtxPaths.InRepo(ditFile, textFile));
     }
     var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps };
     var sw = System.Diagnostics.Stopwatch.StartNew();

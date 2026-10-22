@@ -2,12 +2,13 @@
 @using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Wan
+@using SpawnDev.ILGPU.ML.Ltx
 @implements IDisposable
 
 <PageTitle>Video Generation - SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Video Generation"
-            Description="Generate a short video from text, or animate your own picture, on your GPU: Wan 2.2 TI2V-5B (a 5B-parameter diffusion transformer with a 4x16x16 video VAE and the umT5 text encoder), the 8-bit exports streamed from the SpawnDev models host. Everything runs in this tab on WebGPU; nothing leaves your machine."
+            Description="Generate a short video from text, or animate your own picture, on your GPU: Wan 2.2 TI2V-5B (a 5B-parameter diffusion transformer with a 4x16x16 video VAE and the umT5 text encoder) or LTX-Video 2B (a 2B transformer with a 32x32x8 video VAE and the T5 text encoder, 7 steps), the 8-bit exports streamed from the SpawnDev models host. Everything runs in this tab on WebGPU; nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -19,7 +20,7 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="@(_dit == "q4" ? 10900 : 13400)">
+            ModelSizeMB="@(Ltx ? 8100 : _dit == "q4" ? 10900 : 13400)">
 
     <div class="vid-prompt-section">
         <label class="vid-label">Prompt:</label>
@@ -35,23 +36,53 @@
 
         <div class="vid-settings">
             <div class="vid-setting">
+                <label>Model:</label>
+                <select @bind="_model" @bind:after="ModelChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Wan 2.2 TI2V-5B: text to video and image to video, sharper, 4 to 50 steps. LTX-Video 2B: text to video only, 7 steps, a much smaller transformer and a heavily compressed video, so clips are fast and cheap on memory.">
+                    <option value="wan">Wan 2.2 TI2V-5B</option>
+                    <option value="ltx">LTX-Video 2B (distilled, 7 steps)</option>
+                </select>
+            </div>
+            <div class="vid-setting">
                 <label>Size:</label>
-                <select @bind="_size" class="vid-select" disabled="@_isRunning" title="The model was trained at 1280x704 (720p); small sizes are fast but show its limits, and some seeds fail at small sizes. The decoder and the 5B transformer need GPU memory in proportion to the size.">
-                    <option value="512x288">512x288 (fastest)</option>
-                    <option value="640x352">640x352</option>
-                    <option value="832x480">832x480</option>
+                <select @bind="_size" class="vid-select" disabled="@_isRunning" title="@(Ltx ? "Multiples of 32. The model is native at 704x480; 480x320 is the first pass of its two-pass recipe and the fastest." : "The model was trained at 1280x704 (720p); small sizes are fast but show its limits, and some seeds fail at small sizes. The decoder and the 5B transformer need GPU memory in proportion to the size.")">
+                    @if (Ltx)
+                    {
+                        <option value="480x320">480x320 (fastest)</option>
+                        <option value="640x384">640x384</option>
+                        <option value="704x480">704x480 (native)</option>
+                    }
+                    else
+                    {
+                        <option value="512x288">512x288 (fastest)</option>
+                        <option value="640x352">640x352</option>
+                        <option value="832x480">832x480</option>
+                    }
                 </select>
             </div>
             <div class="vid-setting">
                 <label>Frames:</label>
-                <select @bind="_frames" class="vid-select" disabled="@_isRunning" title="24 frames per second; 4n + 1 frames">
-                    <option value="9">9 (0.4 s)</option>
-                    <option value="17">17 (0.7 s)</option>
-                    <option value="25">25 (1 s)</option>
-                    <option value="33">33 (1.4 s)</option>
-                    <option value="49">49 (2 s)</option>
+                <select @bind="_frames" class="vid-select" disabled="@_isRunning" title="@(Ltx ? "24 frames per second; 8n + 1 frames" : "24 frames per second; 4n + 1 frames")">
+                    @if (Ltx)
+                    {
+                        <option value="9">9 (0.4 s)</option>
+                        <option value="17">17 (0.7 s)</option>
+                        <option value="33">33 (1.4 s)</option>
+                        <option value="49">49 (2 s)</option>
+                        <option value="65">65 (2.7 s)</option>
+                        <option value="97">97 (4 s)</option>
+                    }
+                    else
+                    {
+                        <option value="9">9 (0.4 s)</option>
+                        <option value="17">17 (0.7 s)</option>
+                        <option value="25">25 (1 s)</option>
+                        <option value="33">33 (1.4 s)</option>
+                        <option value="49">49 (2 s)</option>
+                    }
                 </select>
             </div>
+            @if (!Ltx)
+            {
             <div class="vid-setting">
                 <label>Steps:</label>
                 <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The Turbo transformer is distilled for 4 steps. The standard one uses 50 in the reference; 20 to 30 is usually fine">
@@ -67,10 +98,13 @@
                 <label>Guidance:</label>
                 <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@(_isRunning || _dit == "turbo")" title="@(_dit == "turbo" ? "Turbo has the guidance built in (1): one transformer pass per step" : "classifier-free guidance scale, the reference uses 5")" />
             </div>
+            }
             <div class="vid-setting">
                 <label>Seed:</label>
                 <input type="number" @bind="_seed" class="vid-input" placeholder="random" disabled="@_isRunning" />
             </div>
+            @if (!Ltx)
+            {
             <div class="vid-setting">
                 <label>Transformer:</label>
                 <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Turbo: Wan2.2-TI2V-5B-Turbo, a step-distilled version that draws a clip in 4 steps with one pass each (about 8x faster than the standard 30 steps with guidance, and sharper at 720p). Standard 8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer.">
@@ -79,15 +113,26 @@
                     <option value="q4">Standard 4-bit (3.1 GB)</option>
                 </select>
             </div>
+            }
         </div>
 
-        <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
-        <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
+        @if (!Ltx)
+        {
+            <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
+            <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
+        }
+        else
+        {
+            <p class="vid-hint">LTX-Video 2B here is text to video (image to video is not wired up yet). Weights under the LTXV Open Weights License (free below $10M annual revenue, use restrictions apply).</p>
+        }
 
         <details class="vid-advanced">
             <summary>Advanced</summary>
-            <label class="vid-label">Negative prompt (standard transformer only: Turbo has no guidance; empty = the model's default list of video defects):</label>
-            <input type="text" class="vid-prompt-input" @bind="_negative" disabled="@_isRunning" />
+            @if (!Ltx)
+            {
+                <label class="vid-label">Negative prompt (standard transformer only: Turbo has no guidance; empty = the model's default list of video defects):</label>
+                <input type="text" class="vid-prompt-input" @bind="_negative" disabled="@_isRunning" />
+            }
             <label class="vid-label">Model server (empty = models.spawndev.com):</label>
             <input type="text" class="vid-prompt-input" @bind="_modelServer" disabled="@(_isRunning || _isModelLoading)" placeholder="http://127.0.0.1:8767" />
         </details>
@@ -157,6 +202,9 @@
     private double _guidance = 1.0;
     private long? _seed;
     private string _dit = "turbo";                      // "turbo" | "q8" | "q4"
+    private string _model = "wan";                      // "wan" | "ltx"
+    private bool Ltx => _model == "ltx";
+    private LtxPipeline? _ltxPipeline;
     private string _modelServer = "";
     private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
     private double _modelProgress, _inferenceMs, _fraction;
@@ -177,6 +225,14 @@
     private void OnReferencesChanged(IReadOnlyList<SpawnDev.ILGPU.ML.Flux2.Flux2ReferenceImage> references) { _references = references; StateHasChanged(); }
 
     private Task HandleBackendChange(string backend) => Task.CompletedTask;
+
+    private void ModelChanged()
+    {
+        _pipeline = null; _ltxPipeline = null; _isModelLoaded = false;
+        _modelStatusText = Ltx ? "LTX-Video 2B" : "Wan 2.2 TI2V-5B";
+        if (Ltx) { _size = "480x320"; _frames = 49; }              // the first pass of LTX's recipe: fast; 8n + 1 frames
+        else { _size = "640x352"; _frames = 17; }
+    }
 
     private void PrecisionChanged()
     {
@@ -205,16 +261,22 @@
         {
             await EnsureAcceleratorAsync();
             if (!string.IsNullOrWhiteSpace(_modelServer)) SpawnDev.ILGPU.ML.Hub.ModelsHost.BaseUrl = _modelServer.Trim().TrimEnd('/');
-            _pipeline ??= new Wan22Pipeline(_accelerator!, ModelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo(Wan22Paths.DitFile(_dit == "turbo" ? "turbo_q8" : _dit), Wan22Paths.TextEncoderFile("q8")));
             var parts = _size.Split('x');
             int width = int.Parse(parts[0]), height = int.Parse(parts[1]);
-            var request = new WanRequest
+            long seed = _seed ?? Random.Shared.NextInt64(1, int.MaxValue);
+            var request = new WanRequest { Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed };     // replaced below for Wan; only the common fields matter for LTX
+            if (Ltx) _ltxPipeline ??= new LtxPipeline(_accelerator!, ModelSource, LtxPipeline.DefaultRepo, LtxPaths.InRepo(LtxPaths.DitFile("q8"), LtxPaths.TextEncoderFile("q8")));
+            else
             {
-                Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
-                GuidanceScale = _dit == "turbo" ? 1.0 : _guidance, Seed = _seed ?? Random.Shared.NextInt64(1, int.MaxValue),
-                Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC,
-            };
-            if (_references.Count > 0)
+                _pipeline ??= new Wan22Pipeline(_accelerator!, ModelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo(Wan22Paths.DitFile(_dit == "turbo" ? "turbo_q8" : _dit), Wan22Paths.TextEncoderFile("q8")));
+                request = new WanRequest
+                {
+                    Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
+                    GuidanceScale = _dit == "turbo" ? 1.0 : _guidance, Seed = seed,
+                    Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC,
+                };
+            }
+            if (!Ltx && _references.Count > 0)
             {
                 var pic = _references[0];
                 var rgb = new byte[pic.Width * pic.Height * 3];
@@ -230,10 +292,12 @@
                 _stage = p.Stage; _stageMessage = p.Message;
                 // the transformer's steps are most of the time: text 0-10 %, loading + steps 10-90 %, decode 90-100 %
                 _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
-                _modelStatusText = $"Wan 2.2 - {p.Stage}";
+                _modelStatusText = $"{(Ltx ? "LTX-Video" : "Wan 2.2")} - {p.Stage}";
                 _ = InvokeAsync(StateHasChanged);
             });
-            var video = await _pipeline.GenerateAsync(request, progress);
+            var video = Ltx
+                ? await _ltxPipeline!.GenerateAsync(new LtxRequest { Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps }, progress)
+                : await _pipeline!.GenerateAsync(request, progress);
             _stage = "showing"; _stageMessage = "the frames"; StateHasChanged();
             await Task.Yield();
             using var player = JS.Get<SpawnJSObject>("videoPlayer");
@@ -244,7 +308,7 @@
             _hasVideo = true; _isModelLoaded = true;
             _inferenceMs = total.Elapsed.TotalMilliseconds;
             _resultInfo = $"{video.Frames} frames {video.Width}x{video.Height} at {_fps} fps, seed {request.Seed}, {total.Elapsed.TotalSeconds:F0} s total";
-            _modelStatusText = "Wan 2.2 TI2V-5B";
+            _modelStatusText = Ltx ? "LTX-Video 2B" : "Wan 2.2 TI2V-5B";
             StateHasChanged();
             await Task.Yield();
             player.JSRef!.CallVoid("play", "vid-player", _fps);

@@ -110,11 +110,17 @@ public abstract partial class MLTestBase
     /// prompts, fed the reference's own token ids. Desktop device.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Ltx_T5_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Ltx_T5_MatchesReference() => await RunTest(accelerator => LtxT5Check(accelerator, "t5_xxl_enc_bf16.safetensors", 0.05));
+
+    /// <summary>The same check on the 8-bit block export (5.0 GB instead of 8.9 GB): the quantisation's error on top of the bf16 rounding.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_T5_Quantized_MatchesReference() => await RunTest(accelerator => LtxT5Check(accelerator, "t5_xxl_enc_q8.safetensors", 0.07));
+
+    private async Task<string> LtxT5Check(Accelerator accelerator, string file, double bound)
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the layer-streaming encoder test reads the export from disk on a desktop GPU");
-        var path = Path.Combine(LtxDir, "t5_xxl_enc_bf16.safetensors");
+        var path = Path.Combine(LtxDir, file);
         if (!File.Exists(path)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
         using var enc = await UmT5Encoder.CreateAsync(accelerator, path);
         var report = new List<string>();
@@ -130,10 +136,10 @@ public abstract partial class MLTestBase
             report.Add($"prompt {name} ({n} tokens): relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalSeconds:F1} s");
             worst = Math.Max(worst, m.RelRms);
         }
-        LtxLog("T5", report);
-        if (!(worst < 0.05)) throw new Exception("the T5 encoder deviates from the reference: " + string.Join("; ", report));
+        LtxLog("T5 " + file, report);
+        if (!(worst < bound)) throw new Exception("the T5 encoder deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
 
     /// <summary>
     /// The VAE decoder (fp16 weights, fp32 activations, replicate-padded 3x3x3 convolutions as gather GEMMs, timestep-conditioned resnets, residual upsamplers) against the reference's
@@ -264,6 +270,37 @@ public abstract partial class MLTestBase
         if (!(worst[0] < 0.02 && worst[1] < 0.15) || !(double.IsNaN(exactRel) || exactRel < 2e-3)) throw new Exception("the DiT deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     }
+
+    /// <summary>
+    /// The 8-bit DiT export (2.0 GB instead of 3.6 GB; <c>quantize_streaming.py</c>, the FLUX.2 block format, dequantised a matrix at a time into a shared scratch) against the fp32
+    /// reference's velocity prediction at production size, and the cost of the quantisation on record. Desktop GPU or WebGPU.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_DiT_Quantized_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the DiT runs on a desktop GPU or WebGPU");
+        var weightsPath = Path.Combine(LtxDir, "ltx_dit_q8.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "dit_big.npz"); var fx32Path = Path.Combine(LtxDir, "ref", "dit_big_fp32.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath) || !File.Exists(fx32Path)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath); using var fx32 = ZipFile.OpenRead(fx32Path);
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        var (lat, ls) = WanNpz(fx, "step0_latent_in"); var (tArr, _) = WanNpz(fx, "step0_t");
+        long before = accelerator.MemorySize;
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var dit = new LtxDiT(accelerator, new DiTKernels(accelerator), weights);
+        dit.SetGrid(ls[1], ls[2], ls[3], 8f / LtxFrameRate, 32f, 32f);
+        dit.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
+        using var lIn = accelerator.Allocate1D(lat); using var lOut = accelerator.Allocate1D<float>(lat.Length);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dit.Forward(lIn.View, tArr[0], 0, lOut.View);
+        var got = await lOut.View.CopyToHostAsync();
+        double ms = sw.Elapsed.TotalMilliseconds;
+        var m32 = WanCompare(got, WanNpz(fx32, "step0_pred").Data); var m16 = WanCompare(got, WanNpz(fx, "step0_pred").Data);
+        var lines = new[] { $"q8 DiT prediction [128, {ls[1]}, {ls[2]}, {ls[3]}]: vs the fp32 reference relRMS {m32.RelRms:E2}, vs the bf16 reference {m16.RelRms:E2}; weights {weights.Bytes / 1e9:F2} GB on the device; first forward {ms:F0} ms" };
+        LtxLog("DiT q8", lines);
+        if (!(m32.RelRms < 0.06 && m16.RelRms < 0.15)) throw new Exception("the 8-bit DiT deviates from the reference beyond its bound: " + string.Join("; ", lines));
+        return string.Join("; ", lines);
+    });
 
     /// <summary>Print the lines and append them to LTX_DIR\out\ltx_tests.log (the PMT summary hides the console output of a passing desktop test).</summary>
     private static void LtxLog(string what, IEnumerable<string> lines)
