@@ -7,7 +7,7 @@ import path from 'node:path';
 
 const root = path.resolve(process.argv[2] ?? '.');
 const port = Number(process.argv[3] ?? 8765);
-const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Range', 'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges', 'Accept-Ranges': 'bytes' };
+const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges', 'Accept-Ranges': 'bytes' };
 
 http.createServer((req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
