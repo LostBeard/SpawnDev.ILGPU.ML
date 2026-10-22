@@ -103,7 +103,7 @@ public class ObjectDetectionPipeline : IDisposable
         _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
             mean: new[] { 0f, 0f, 0f },
             std: new[] { 1f, 1f, 1f },
-            preserveAspect: true);
+            preserveAspect: true, padValue: 114f / 255f);          // ultralytics letterbox: grey 114 padding (replicated edge pixels smear partly visible people into tall thin boxes)
 
         // Run inference
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });

@@ -100,6 +100,11 @@ public partial class ImagePreprocessKernel : IDisposable
         if (lx < 0) lx = 0; if (lx >= contentW) lx = contentW - 1;
         if (ly < 0) ly = 0; if (ly >= contentH) ly = contentH - 1;
 
+        // padValue >= 0: the padding is a constant (YOLO's letterbox pads with 114/255 grey) instead of the replicated border: a person cut off by the picture edge would otherwise be
+        // smeared across the whole pad band and read as a tall thin object
+        float padValue = p[14];
+        bool inPad = padValue >= 0f && (dx < padX || dx >= padX + contentW || dy < padY || dy >= padY + contentH);
+
         // Bilinear sample coordinates (half-pixel centered)
         float fy = ((ly + 0.5f) * srcH / contentH) - 0.5f;
         float fx = ((lx + 0.5f) * srcW / contentW) - 0.5f;
@@ -125,6 +130,7 @@ public partial class ImagePreprocessKernel : IDisposable
         // Bilinear interpolation
         float pixel = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
                     + v10 * ty * (1f - tx) + v11 * ty * tx;
+        if (inPad) pixel = padValue;
 
         // Normalize: (pixel - mean) / std = (pixel - mean) * invStd
         float mean = p[4 + c];     // meanR, meanG, meanB
@@ -145,12 +151,16 @@ public partial class ImagePreprocessKernel : IDisposable
     /// not - see <see cref="Letterbox"/>. When on, the caller must crop the model's output back
     /// to the content rect, which <see cref="Letterbox"/> also returns.
     /// </param>
+    /// <param name="padValue">
+    /// With <paramref name="preserveAspect"/>: the constant (in [0, 1], before mean/std) the padding is filled with. Negative (the default) replicates the border pixels, which is right for models
+    /// that must not see an invented edge (depth) and wrong for YOLO, which was trained with grey 114/255 padding.
+    /// </param>
     public void Forward(
         ArrayView1D<int, Stride1D.Dense> rgba,
         ArrayView1D<float, Stride1D.Dense> output,
         int srcW, int srcH, int dstW, int dstH,
         float[]? mean = null, float[]? std = null,
-        bool preserveAspect = false)
+        bool preserveAspect = false, float padValue = -1f)
     {
         EnsureLoaded();
 
@@ -164,7 +174,7 @@ public partial class ImagePreprocessKernel : IDisposable
             srcW, srcH, dstW, dstH,
             mean[0], mean[1], mean[2],
             1f / std[0], 1f / std[1], 1f / std[2],
-            px, py, cw, ch
+            px, py, cw, ch, padValue
         });
 
         int totalOutput = 3 * dstH * dstW;
