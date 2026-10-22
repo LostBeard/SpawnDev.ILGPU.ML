@@ -9,14 +9,14 @@ using IV = ArrayView1D<int, Stride1D.Dense>;
 using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 
 /// <summary>
-/// The Wan 2.2 VAE decoder (<c>Wan2_2_VAE.decode</c>): the latent [48, Fz, h, w] becomes video [3, 4 Fz - 3, 16 h, 16 w] in [-1, 1].
+/// The Wan 2.2 VAE (<c>Wan2_2_VAE</c>): <see cref="EncodeImageAsync"/> for the image conditioning and the decoder (<c>Wan2_2_VAE.decode</c>): the latent [48, Fz, h, w] becomes video [3, 4 Fz - 3, 16 h, 16 w] in [-1, 1].
 /// The reference decodes ONE latent frame per chunk through causal 3-D convolutions that keep the last two input frames of every convolution as a cache (so a chunk sees
 /// its history without recomputing it); the first chunk decodes to one video frame, every later one to four. This port keeps the same chunking and caches, with
 /// channel-last fp32 activations [voxels, C], fp16 weights, and every convolution as a gathered-row implicit GEMM (<see cref="SparseKernels.ConvTaps"/>, tensor cores on CUDA):
 /// the neighbour tables of the dense grids (a 3x3x3 causal kernel, a (3,1,1) temporal one, and nearest x2 + 3x3) are built on the device and shared by all convolutions of a shape.
 /// Weights: the export of tools/wan-harness/reference/export_vae_f16.py.
 /// </summary>
-public sealed class WanVaeDecoder : IDisposable
+public sealed class WanVae : IDisposable
 {
     private readonly Accelerator _acc;
     private readonly GpuWeights _w;
@@ -27,6 +27,7 @@ public sealed class WanVaeDecoder : IDisposable
     private readonly Dictionary<(int Kind, int T, int H, int W, int Cnt), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private readonly Dictionary<string, Cache> _caches = new();
     private Buf? _scores;
+    private bool _cacheEnabled = true;     // the encoder sees one frame: nothing to cache for a later chunk
 
     /// <summary>The last (up to) two input frames of a causal convolution, channel-last [frames * H * W, C]; <see cref="Rep"/> = the "Rep" marker of upsample3d's first call.</summary>
     private sealed class Cache { public Buf? Buf; public int Frames; public bool Rep; }
@@ -34,7 +35,7 @@ public sealed class WanVaeDecoder : IDisposable
     /// <summary>Test hook: (stage name, activation view, frames, height, width, channels), called per chunk; valid only during the call.</summary>
     public Action<string, FV, int, int, int, int>? Tap { get; set; }
 
-    public WanVaeDecoder(Accelerator accelerator, GpuWeights weights)
+    public WanVae(Accelerator accelerator, GpuWeights weights)
     {
         _acc = accelerator; _w = weights; _sk = new SparseKernels(accelerator); _wk = new WanKernels(accelerator); _dk = new DiTKernels(accelerator);
     }
@@ -55,14 +56,16 @@ public sealed class WanVaeDecoder : IDisposable
 
     private MemoryBuffer1D<int, Stride1D.Dense> Table(int kind, int T, int H, int W, int cnt)
     {
-        var key = (kind, T, H, W, kind == 2 ? 0 : cnt);
+        var key = (kind, T, H, W, kind >= 2 ? 0 : cnt);
         if (_tables.TryGetValue(key, out var t)) return t;
-        t = _acc.Allocate1D<int>((long)T * H * W * (kind == 2 ? 4 : 1) * 27);
+        long rows = kind == 2 ? 4L * T * H * W : kind == 3 ? (long)T * (H / 2) * (W / 2) : (long)T * H * W;
+        t = _acc.Allocate1D<int>(rows * 27);
         switch (kind)
         {
             case 0: _wk.CausalTable(t.View, T, H, W, cnt); break;          // 3x3x3 causal, output [T, H, W]
             case 1: _wk.TimeTable(t.View, T, H, W, cnt); break;            // (3,1,1) causal, output [T, H, W]
             case 2: _wk.UpTable(t.View, T, H, W); break;                   // nearest x2 + 3x3, input [T, H, W], output [T, 2H, 2W]
+            case 3: _wk.DownTable(t.View, T, H, W); break;                 // zero pad right / bottom, 3x3 stride 2, input [T, H, W], output [T, H/2, W/2]
         }
         _tables[key] = t;
         return t;
@@ -94,7 +97,7 @@ public sealed class WanVaeDecoder : IDisposable
         _caches.TryGetValue(name, out var c);
         int cnt = c?.Frames ?? 0;
         var xcat = Concat(c, cnt, x, T, hw, cin);
-        StoreCache(name, xcat, cnt + T, hw, cin);
+        if (_cacheEnabled) StoreCache(name, xcat, cnt + T, hw, cin);
         var y = Tmp((long)T * hw * cout);
         _sk.ConvTaps(xcat.View, Table(0, T, H, W, cnt).View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), y.View, T * hw, cin, cout, 27);
         if (!ReferenceEquals(xcat, x)) Drop(xcat);
@@ -218,6 +221,84 @@ public sealed class WanVaeDecoder : IDisposable
         }
         Flush();
         return cur;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // encoder (image conditioning): one frame, the first chunk of the reference's chunked encode
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
+    /// <summary>Resample "downsample2d" / "downsample3d" for a single frame: pad right and bottom, 3x3 convolution of stride 2 (the temporal convolution of downsample3d is skipped on the first chunk).</summary>
+    private Buf Downsample(string p, Buf x, int T, int H, int W, int C)
+    {
+        var y = Tmp((long)T * (H / 2) * (W / 2) * C);
+        _sk.ConvTaps(x.View, Table(3, T, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T * (H / 2) * (W / 2), C, C, 9);
+        return y;
+    }
+
+    private Buf DownBlock(int i, Buf x, ref int T, ref int H, ref int W, int cin, int cout, bool temporal, bool down)
+    {
+        string p = $"encoder.downsamples.{i}.";
+        int T0 = T, H0 = H, W0 = W;
+        var cur = x; int c = cin;
+        for (int j = 0; j < 2; j++)
+        {
+            var next = ResBlock($"{p}downsamples.{j}.", cur, T, H, W, c, cout);
+            if (!ReferenceEquals(cur, x)) Drop(cur);
+            cur = next; c = cout;
+        }
+        if (down) { var next = Downsample($"{p}downsamples.2.", cur, T, H, W, cout); Drop(cur); cur = next; H /= 2; W /= 2; }
+        int ft = temporal ? 2 : 1, fs = down ? 2 : 1;
+        var sc = Tmp((long)((T0 + (ft - T0 % ft) % ft) / ft) * (H0 / fs) * (W0 / fs) * cout);
+        _wk.AvgDown(x.View, sc.View, T0, H0, W0, cin, cout, ft, fs);
+        if (temporal) T = (T0 + (ft - T0 % ft) % ft) / ft;
+        _dk.GateResidual(cur.View, sc.View, default, -1, (int)cur.Length, cout);
+        Drop(sc);
+        Flush();
+        return cur;
+    }
+
+    /// <summary>
+    /// Encode ONE picture (<c>Wan2_2_VAE.encode</c> of a single frame, the image-to-video conditioning): <paramref name="image"/> is [3, 1, H, W] channel-first in [-1, 1] (H and W multiples of 16);
+    /// returns the normalised latent mean [48, 1, H/16, W/16], channel-first, ready to replace the first latent frame.
+    /// </summary>
+    public async Task<float[]> EncodeImageAsync(float[] image, int H, int W)
+    {
+        if (H % 16 != 0 || W % 16 != 0) throw new ArgumentException("the picture size must be a multiple of 16");
+        _caches.Clear(); _cacheEnabled = false;
+        try
+        {
+            using var img = _acc.Allocate1D(image);
+            int h2 = H / 2, w2 = W / 2;
+            var x0 = Tmp((long)h2 * w2 * 12);
+            _wk.PatchifyImage(img.View, x0.View, 1, H, W);
+            int T = 1, Hc = h2, Wc = w2;
+            var cur = ConvCausal("encoder.conv1", x0, T, Hc, Wc, 12, 160); Drop(x0);
+            Tap?.Invoke("enc_conv1", cur.View, T, Hc, Wc, 160);
+            var stages = new[] { (160, 160, false, true), (160, 320, true, true), (320, 640, true, true), (640, 640, false, false) };
+            for (int s = 0; s < 4; s++)
+            {
+                var next = DownBlock(s, cur, ref T, ref Hc, ref Wc, stages[s].Item1, stages[s].Item2, stages[s].Item3, stages[s].Item4);
+                Drop(cur); cur = next;
+                Tap?.Invoke($"enc_down{s}", cur.View, T, Hc, Wc, stages[s].Item2);
+                Flush();
+            }
+            var m0 = ResBlock("encoder.middle.0.", cur, T, Hc, Wc, 640, 640); Drop(cur);
+            var m1 = Attention("encoder.middle.1.", m0, T, Hc, Wc, 640); Drop(m0);
+            var m2 = ResBlock("encoder.middle.2.", m1, T, Hc, Wc, 640, 640); Drop(m1);
+            Tap?.Invoke("enc_middle", m2.View, T, Hc, Wc, 640);
+            var hn = NormSilu(m2, "encoder.head.0.gamma", T * Hc * Wc, 640); Drop(m2);
+            var hc = ConvCausal("encoder.head.2", hn, T, Hc, Wc, 640, 96); Drop(hn);
+            Tap?.Invoke("enc_head", hc.View, T, Hc, Wc, 96);
+            var moments = Pointwise("conv1", hc, T * Hc * Wc, 96, 96); Drop(hc);        // WanVAE_.conv1: 1x1, then the first 48 channels are mu
+            var host = await moments.View.CopyToHostAsync();
+            Drop(moments); Flush();
+            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+            int hw = Hc * Wc;
+            var z = new float[48L * hw];                                                 // (mu - mean) / std, channel-first [48, 1, h, w]
+            for (int c = 0; c < 48; c++) for (int p = 0; p < hw; p++) z[(long)c * hw + p] = (host[(long)p * 96 + c] - mean[c]) / std[c];
+            return z;
+        }
+        finally { _cacheEnabled = true; }
     }
 
     /// <summary>

@@ -284,6 +284,67 @@ public sealed class WanKernels
         _attnOut(N * D, scores, qkv, o, N, D);
     }
 
+    // ---- encoder side ----------------------------------------------------------------------------------------------------------------
+
+    // Resample downsample2d: ZeroPad2d((0, 1, 0, 1)) then a 3x3 convolution of stride 2: output (i, j) taps input rows 2i + kh, columns 2j + kw (kk = kh * 3 + kw), a tap past the edge is the zero pad
+    private Action<Index1D, IV, int, int>? _downTable;
+    private static void DownTableImpl(Index1D m, IV nbr, int Hin, int Win)
+    {
+        int Ho = Hin / 2, Wo = Win / 2, hw = Ho * Wo, t = m / hw, p = m % hw, i = p / Wo, j = p % Wo;
+        for (int kk = 0; kk < 9; kk++)
+        {
+            int r = 2 * i + kk / 3, c = 2 * j + kk % 3;
+            nbr[m * 27 + kk] = r < Hin && c < Win ? (t * Hin + r) * Win + c : -1;
+        }
+    }
+    /// <summary>Stride-2 3x3 convolution table (9 taps): input [T, Hin, Win], output [T, Hin/2, Win/2].</summary>
+    public void DownTable(IV nbr, int T, int Hin, int Win)
+    {
+        _downTable ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int>(DownTableImpl);
+        _downTable(T * (Hin / 2) * (Win / 2), nbr, Hin, Win);
+    }
+
+    // AvgDown3D (the down-block shortcut): x [T, H, W, cin] channel-last; the temporal axis is padded with padT zero frames in front, then every (ft x fs x fs) cell is flattened into the channels
+    // (merged channel (c * ft + a) * fs * fs + b * fs + d) and groups of `group` consecutive merged channels are averaged: output [T', H/fs, W/fs, cout], T' = (T + padT) / ft.
+    private Action<Index1D, FV, FV, int, int, int, int, int, int, int, int, int>? _avgDown;
+    private static void AvgDownImpl(Index1D i, FV x, FV o, int T, int H, int W, int cin, int cout, int ft, int fs, int padT, int group)
+    {
+        int Ho = H / fs, Wo = W / fs, oc = i % cout, rest = i / cout;
+        int j = rest % Wo; rest /= Wo;
+        int r = rest % Ho; int tp = rest / Ho;
+        int factor = ft * fs * fs;
+        float acc = 0f;
+        for (int g = 0; g < group; g++)
+        {
+            int mc = oc * group + g, c = mc / factor, q = mc % factor;
+            int a = q / (fs * fs), b = (q / fs) % fs, d = q % fs;
+            int f = tp * ft + a - padT;
+            if (f >= 0) acc += x[(((long)f * H + r * fs + b) * W + j * fs + d) * cin + c];
+        }
+        o[i] = acc / group;
+    }
+    public void AvgDown(FV x, FV o, int T, int H, int W, int cin, int cout, int ft, int fs)
+    {
+        _avgDown ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int, int, int, int>(AvgDownImpl);
+        int padT = (ft - T % ft) % ft, group = cin * ft * fs * fs / cout, Tp = (T + padT) / ft;
+        _avgDown(Tp * (H / fs) * (W / fs) * cout, x, o, T, H, W, cin, cout, ft, fs, padT, group);
+    }
+
+    // the encoder's first step: image [3, F, H, W] channel-first -> [F * H/2 * W/2, 12] channel-last, channel c * 4 + r * 2 + q (q: row subpixel, r: column subpixel)
+    private Action<Index1D, FV, FV, int, int, int>? _patchifyImage;
+    private static void PatchifyImageImpl(Index1D i, FV img, FV o, int F, int H, int W)
+    {
+        int ch = i % 12, p = i / 12, Wh = W / 2, Hh = H / 2;
+        int j = p % Wh, ii = (p / Wh) % Hh, f = p / (Wh * Hh);
+        int c = ch / 4, r = (ch % 4) / 2, q = ch % 2;
+        o[i] = img[(((long)c * F + f) * H + 2 * ii + q) * W + 2 * j + r];
+    }
+    public void PatchifyImage(FV img, FV o, int F, int H, int W)
+    {
+        _patchifyImage ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(PatchifyImageImpl);
+        _patchifyImage(F * (H / 2) * (W / 2) * 12, img, o, F, H, W);
+    }
+
     // the decoder's last step: head output [F*H*W, 12] (channel c * 4 + r * 2 + q) -> video [3, F, 2H, 2W] channel-first, clamped to [-1, 1]
     private Action<Index1D, FV, FV, int, int, int>? _unpatchVideo;
     private static void UnpatchVideoImpl(Index1D i, FV head, FV video, int F, int H, int W)

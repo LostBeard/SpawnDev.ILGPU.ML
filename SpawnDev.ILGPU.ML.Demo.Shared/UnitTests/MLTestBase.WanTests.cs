@@ -38,6 +38,46 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The Wan 2.2 VAE ENCODER for the image-to-video conditioning (one picture, the first chunk of the reference's chunked encode): a random picture [3, 1, 128, 192] to the normalised
+    /// latent mean [48, 1, 8, 12], every stage tapped (conv1, the four down-blocks with their stride-2 resamples and average-pooling shortcuts, the middle, the head) against the float32 reference.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_VaeEncode_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the taps read back to the host: a desktop GPU");
+        var weightsPath = Path.Combine(WanDir, "wan22_vae_f16.safetensors"); var fxPath = Path.Combine(WanDir, "dump", "vae.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (img, ims) = WanNpz(fx, "img");                         // [3, 1, H, W]
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var vae = new WanVae(accelerator, weights);
+        var taps = new Dictionary<string, float[]>();
+        vae.Tap = (name, view, T, H, W, C) => { accelerator.Synchronize(); var a = new float[(long)T * H * W * C]; view.SubView(0, a.Length).CopyToCPU(a); taps[name] = a; };
+        var mu = await vae.EncodeImageAsync(img, ims[2], ims[3]);
+        vae.Tap = null;
+        var report = new List<string>();
+        double worst = 0;
+        foreach (var name in new[] { "enc_conv1", "enc_down0", "enc_down1", "enc_down2", "enc_down3", "enc_middle", "enc_head" })
+        {
+            var (rf, rs) = WanNpz(fx, name);                      // [1, C, 1, H, W] channel-first
+            int C = rs[1], HW = rs[3] * rs[4];
+            var t = new float[rf.Length];
+            for (int c = 0; c < C; c++) for (int p = 0; p < HW; p++) t[(long)p * C + c] = rf[(long)c * HW + p];
+            var m = WanCompare(taps[name], t);
+            report.Add($"{name} [{C}, 1, {rs[3]}, {rs[4]}]: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            worst = Math.Max(worst, m.RelRms);
+        }
+        var (want, _) = WanNpz(fx, "mu");
+        var mm = WanCompare(mu, want);
+        report.Add($"mu [48, 1, 8, 12]: relRMS {mm.RelRms:E2}, maxAbs {mm.MaxAbs:F3} of {mm.RefMaxAbs:F2}");
+        worst = Math.Max(worst, mm.RelRms);
+        foreach (var line in report) Console.WriteLine("[Wan] VAE encode vs reference: " + line);
+        if (!(worst < 0.05)) throw new Exception("the VAE encode deviates from the reference: " + string.Join("; ", report));
+        return $"worst relRMS {worst:E2} over {report.Count} comparisons";
+    });
+
+    /// <summary>
     /// The denoising loop end to end, two ways. TEACHER-FORCED: at every step our DiT (conditional and negative prompt) and our UniPC sampler get the reference's own latent, so errors
     /// do not compound: each step must reproduce the reference's next latent to the level of one bf16 DiT call. FREE-RUNNING: our own trajectory from the reference's noise (and
     /// conditioning latent for image-to-video). The sampler is sensitive: ref_sensitivity.py measured the REFERENCE diverging from a copy of itself started 1.3e-3 away by 1.8e-3,
@@ -190,7 +230,7 @@ public abstract partial class MLTestBase
         using var fx = ZipFile.OpenRead(fxPath);
         var (z, zs) = WanNpz(fx, "z");
         using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
-        using var dec = new WanVaeDecoder(accelerator, weights);
+        using var dec = new WanVae(accelerator, weights);
         var taps = new Dictionary<string, List<float[]>>();
         var dims = new Dictionary<string, (int C, int H, int W)>();
         dec.Tap = (name, view, T, H, W, C) =>
