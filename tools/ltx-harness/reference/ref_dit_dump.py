@@ -31,7 +31,9 @@ def main():
     ap.add_argument("--frame-rate", type=float, default=25.0)
     ap.add_argument("--prompt", default="0")
     ap.add_argument("--tag", default="t2v")
+    ap.add_argument("--fp32", action="store_true", help="run the DiT in float32 (7.7 GB): the exact math on the same bf16 weights, to separate the reference's own bf16 rounding from a port error")
     a = ap.parse_args()
+    dtype = torch.float32 if a.fp32 else torch.bfloat16
     os.makedirs(a.out_dir, exist_ok=True)
     W, H = (int(v) for v in a.size.split("x"))
     Fz, h, w = (a.frames - 1) // 8 + 1, H // 32, W // 32
@@ -39,10 +41,10 @@ def main():
     print(f"size {W}x{H}, {a.frames} frames -> latent [128, {Fz}, {h}, {w}], {N} tokens")
 
     z = np.load(os.path.join(a.t5_dir, f"t5_{a.prompt}.npz"))
-    ctx = torch.from_numpy(z["context"]).to("cuda", torch.bfloat16)[None]            # [1, 128, 4096], padding rows included
+    ctx = torch.from_numpy(z["context"]).to("cuda", dtype)[None]                     # [1, 128, 4096], padding rows included
     mask = torch.from_numpy(z["mask"]).to("cuda")[None]                              # [1, 128]
 
-    model = LTXVideoTransformer3DModel.from_single_file(a.ckpt, torch_dtype=torch.bfloat16).to("cuda").eval().requires_grad_(False)
+    model = LTXVideoTransformer3DModel.from_single_file(a.ckpt, torch_dtype=dtype).to("cuda").eval().requires_grad_(False)
     print("dit loaded", sum(p.numel() for p in model.parameters()) / 1e9, "B params; heads", model.config.num_attention_heads, "head dim", model.config.attention_head_dim, "layers", model.config.num_layers)
 
     keep = {}
@@ -81,13 +83,13 @@ def main():
 
     rope_scale = (8 / a.frame_rate, 32, 32)
     latent = pack(noise)
-    cos, sin = model.rope(latent.to(torch.bfloat16), Fz, h, w, rope_scale)             # [1, N, 2048] float32 each, the table the blocks use
+    cos, sin = model.rope(latent.to(dtype), Fz, h, w, rope_scale)                      # [1, N, 2048] float32 each, the table the blocks use
     out["rope_cos"] = cos[0].float().cpu().numpy()
     out["rope_sin"] = sin[0].float().cpu().numpy()
     with torch.no_grad():
         for step, t in enumerate(sched.timesteps):
             capture["on"] = step == 0
-            v = model(hidden_states=latent.to(torch.bfloat16), encoder_hidden_states=ctx, timestep=t.expand(1), encoder_attention_mask=mask,
+            v = model(hidden_states=latent.to(dtype), encoder_hidden_states=ctx, timestep=t.expand(1), encoder_attention_mask=mask,
                       num_frames=Fz, height=h, width=w, rope_interpolation_scale=rope_scale, return_dict=False)[0].float()
             capture["on"] = False
             nxt = sched.step(v, t, latent, return_dict=False)[0]

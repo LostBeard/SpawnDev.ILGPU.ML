@@ -72,10 +72,37 @@ public abstract partial class MLTestBase
             if (cos[n * dim + 2 * p] != cos[n * dim + 2 * p + 1]) throw new Exception("the reference table does not repeat each value for both members of a pair");
         }
         var mc = WanCompare(gotCos, wantCos); var ms = WanCompare(gotSin, wantSin);
-        Console.WriteLine($"[Ltx] rope vs reference: cos relRMS {mc.RelRms:E2} maxAbs {mc.MaxAbs:E2}; sin relRMS {ms.RelRms:E2} maxAbs {ms.MaxAbs:E2} ({N} tokens x {pairs} pairs)");
-        if (!(mc.MaxAbs < 1e-3 && ms.MaxAbs < 1e-3)) throw new Exception($"the RoPE table deviates from the reference: cos maxAbs {mc.MaxAbs:E2}, sin maxAbs {ms.MaxAbs:E2}");
+        // The angles reach 15708 rad (10000 * pi / 2): ONE float32 ulp of a frequency is 1e-3 rad, so two float32 implementations (torch's pow and cos, ours) cannot agree closer than that.
+        // The exact (double) table says which one is closer: ours must be no further from it than the reference is (plus the same float32 slack).
+        int nf = dim / 6, pad = dim % 6;
+        var truthCos = new float[gotCos.Length]; var truthSin = new float[gotCos.Length];
+        double sT = 8.0 / LtxFrameRate;
+        for (int n = 0, f = 0; f < Fz; f++)
+            for (int i = 0; i < h; i++)
+                for (int j = 0; j < w; j++, n++)
+                    for (int p = 0; p < pairs; p++)
+                    {
+                        double a = 0;
+                        if (p >= pad / 2)
+                        {
+                            int k = p - pad / 2, jf = k / 3, axis = k % 3;
+                            double freq = Math.Pow(10000.0, jf / (double)(nf - 1)) * Math.PI / 2;
+                            double g = axis == 0 ? f * sT / 20.0 : axis == 1 ? i * 32.0 / 2048.0 : j * 32.0 / 2048.0;
+                            a = freq * (g * 2 - 1);
+                        }
+                        truthCos[(long)n * pairs + p] = p < pad / 2 ? 1f : (float)Math.Cos(a); truthSin[(long)n * pairs + p] = p < pad / 2 ? 0f : (float)Math.Sin(a);
+                    }
+        var tOurs = WanCompare(gotCos, truthCos); var tRef = WanCompare(wantCos, truthCos); var tOursS = WanCompare(gotSin, truthSin); var tRefS = WanCompare(wantSin, truthSin);
+        var lines = new[]
+        {
+            $"vs the reference: cos relRMS {mc.RelRms:E2} maxAbs {mc.MaxAbs:E2}; sin relRMS {ms.RelRms:E2} maxAbs {ms.MaxAbs:E2} ({N} tokens x {pairs} pairs)",
+            $"vs exact (double) math: ours cos maxAbs {tOurs.MaxAbs:E2} sin {tOursS.MaxAbs:E2}; the reference's cos maxAbs {tRef.MaxAbs:E2} sin {tRefS.MaxAbs:E2}",
+        };
+        LtxLog("Rope", lines);
+        if (!(mc.MaxAbs < 4e-3 && ms.MaxAbs < 4e-3 && tOurs.MaxAbs <= tRef.MaxAbs * 1.5 + 1e-4 && tOursS.MaxAbs <= tRefS.MaxAbs * 1.5 + 1e-4))
+            throw new Exception("the RoPE table deviates from the reference: " + string.Join("; ", lines));
         await Task.CompletedTask;
-        return $"cos maxAbs {mc.MaxAbs:E2}, sin maxAbs {ms.MaxAbs:E2}";
+        return string.Join("; ", lines);
     });
 
     /// <summary>
@@ -103,7 +130,7 @@ public abstract partial class MLTestBase
             report.Add($"prompt {name} ({n} tokens): relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalSeconds:F1} s");
             worst = Math.Max(worst, m.RelRms);
         }
-        foreach (var line in report) Console.WriteLine("[Ltx] T5 vs reference: " + line);
+        LtxLog("T5", report);
         if (!(worst < 0.05)) throw new Exception("the T5 encoder deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
@@ -146,7 +173,7 @@ public abstract partial class MLTestBase
         var mv = WanCompare(video, want);
         report.Add($"video [{vs[0]}, {vs[1]}, {vs[2]}, {vs[3]}]: relRMS {mv.RelRms:E2}, maxAbs {mv.MaxAbs:F3} of {mv.RefMaxAbs:F2}; {ms:F0} ms");
         worst = Math.Max(worst, mv.RelRms);
-        foreach (var line in report) Console.WriteLine("[Ltx] VAE decode vs reference: " + line);
+        LtxLog("VaeDecode", report);
         if (!(worst < 0.02)) throw new Exception("the VAE decode deviates from the reference: " + string.Join("; ", report));
         return $"worst relRMS {worst:E2} over {report.Count} comparisons";
     });
@@ -180,21 +207,70 @@ public abstract partial class MLTestBase
         double ms = sw.Elapsed.TotalMilliseconds;
         dit.Tap = null;
         var report = new List<string>();
-        foreach (var name in LtxDitTaps)
+        // two references on the same inputs: the exact math (float32 on the same bf16 weights) and the pipeline as it runs (bf16 activations, which is itself far from the exact math here)
+        double[] worst = new double[2];
+        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", "dit_t2v_fp32.npz"), (1, "bf16 reference", "dit_t2v.npz") })
         {
-            var (want, _) = WanNpz(fx, "step0_" + name);
-            int count = taps[name].Length;
-            var w2 = name == "text_embedding" ? want.AsSpan(0, count).ToArray() : want;          // the reference holds all 128 caption rows, ours the real ones
-            var m = WanCompare(taps[name], w2);
-            report.Add($"{name}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            var refPath = Path.Combine(LtxDir, "ref", file);
+            if (!File.Exists(refPath)) { report.Add($"{tag}: fixture {file} missing"); worst[idx] = double.MaxValue; continue; }
+            using var rx = ZipFile.OpenRead(refPath);
+            foreach (var name in LtxDitTaps)
+            {
+                var (want, _) = WanNpz(rx, "step0_" + name);
+                int count = taps[name].Length;
+                var w2 = name == "text_embedding" ? want.AsSpan(0, count).ToArray() : want;          // the reference holds all 128 caption rows, ours the real ones
+                var m = WanCompare(taps[name], w2);
+                report.Add($"vs {tag} {name}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            }
+            var (wantPred, _) = WanNpz(rx, "step0_pred");                                           // [128, Fz, h, w], channel-major like ours
+            var mp = WanCompare(got, wantPred);
+            report.Add($"vs {tag} prediction [128, {ls[1]}, {ls[2]}, {ls[3]}]: relRMS {mp.RelRms:E2}, maxAbs {mp.MaxAbs:F3} of {mp.RefMaxAbs:F2}; first forward {ms:F0} ms");
+            worst[idx] = mp.RelRms;
         }
-        var (wantPred, _) = WanNpz(fx, "step0_pred");                                               // [128, Fz, h, w], channel-major like ours
-        var mp = WanCompare(got, wantPred);
-        report.Add($"prediction [128, {ls[1]}, {ls[2]}, {ls[3]}]: relRMS {mp.RelRms:E2}, maxAbs {mp.MaxAbs:F3} of {mp.RefMaxAbs:F2}; first forward {ms:F0} ms");
-        foreach (var line in report) Console.WriteLine("[Ltx] DiT vs reference: " + line);
-        if (!(mp.RelRms < 0.05)) throw new Exception("the DiT deviates from the reference: " + string.Join("; ", report));
+        // the bf16 pipeline against its own exact math, for the record
+        if (File.Exists(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")))
+        {
+            using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")); using var a16 = ZipFile.OpenRead(fxPath);
+            var floor = WanCompare(WanNpz(a16, "step0_pred").Data, WanNpz(a32, "step0_pred").Data);
+            report.Add($"the bf16 reference vs the fp32 reference (its own rounding): relRMS {floor.RelRms:E2}");
+        }
+        // The port itself, free of precision noise: the same forward with the bf16 tensor cores OFF (fp32 GEMMs) must sit on the exact math. The tensor-core forward above rounds
+        // every activation to bf16 (as the reference does), which around the model's 2500-sized outlier activations in the middle blocks costs ~1.5e-2; a LOGIC error would not vanish here.
+        double exactRel = double.NaN;
+        if (accelerator.AcceleratorType == AcceleratorType.Cuda && File.Exists(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz")))
+        {
+            bool saved = DiTKernels.EnableTensorCores;
+            try
+            {
+                DiTKernels.EnableTensorCores = false;
+                using var dit2 = new LtxDiT(accelerator, new DiTKernels(accelerator), weights);
+                dit2.SetGrid(ls[1], ls[2], ls[3], 8f / LtxFrameRate, 32f, 32f);
+                dit2.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
+                dit2.Forward(lIn.View, tArr[0], 0, lOut.View);
+                var exact = await lOut.View.CopyToHostAsync();
+                using var a32 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "dit_t2v_fp32.npz"));
+                exactRel = WanCompare(exact, WanNpz(a32, "step0_pred").Data).RelRms;
+                report.Add($"with the tensor cores off (fp32 GEMMs) vs the fp32 reference: prediction relRMS {exactRel:E2}");
+            }
+            finally { DiTKernels.EnableTensorCores = saved; }
+        }
+        LtxLog("DiT", report);
+        if (!(worst[0] < 0.02 && worst[1] < 0.15) || !(double.IsNaN(exactRel) || exactRel < 2e-3)) throw new Exception("the DiT deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
+
+    /// <summary>Print the lines and append them to LTX_DIR\out\ltx_tests.log (the PMT summary hides the console output of a passing desktop test).</summary>
+    private static void LtxLog(string what, IEnumerable<string> lines)
+    {
+        var all = lines.ToList();
+        try
+        {
+            var dir = Path.Combine(LtxDir, "out"); Directory.CreateDirectory(dir);
+            File.AppendAllLines(Path.Combine(dir, "ltx_tests.log"), all.Select(l => $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{what}] {l}"));
+        }
+        catch (IOException) { }
+        foreach (var l in all) Console.WriteLine($"[Ltx] {what}: {l}");
+    }
 
     /// <summary>
     /// The distilled sampler loop teacher-forced: at every one of the 7 steps our DiT gets the reference's own latent and our Euler update must reproduce the reference's next latent
@@ -218,27 +294,34 @@ public abstract partial class MLTestBase
         dit.SetGrid(ns[1], ns[2], ns[3], 8f / LtxFrameRate, 32f, 32f);
         dit.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
         using var lIn = accelerator.Allocate1D<float>(noise.Length); using var lOut = accelerator.Allocate1D<float>(noise.Length);
-        var free = (float[])noise.Clone();
         var report = new List<string>();
-        double worstForced = 0;
-        for (int s = 0; s < sigmas.Length - 1; s++)
+        double[] worstForced = new double[2];
+        // against the exact math (float32 reference, the bound) and against the bf16 reference as it runs (recorded; the bf16 reference is itself far from the exact math at the low-noise steps)
+        foreach (var (idx, tag, file) in new[] { (0, "fp32 reference", "dit_t2v_fp32.npz"), (1, "bf16 reference", "dit_t2v.npz") })
         {
-            var (refIn, _) = WanNpz(fx, $"step{s}_latent_in"); var (want, _) = WanNpz(fx, $"step{s}_latent_out");
-            float t = LtxSampler.Timestep(ours[s]);
-            if (MathF.Abs(t - timesteps[s]) > 1e-3f) throw new Exception($"our timestep {s} ({t}) differs from the reference's ({timesteps[s]})");
-            lIn.View.CopyFromCPU(refIn);
-            dit.Forward(lIn.View, t, 0, lOut.View); var v = await lOut.View.CopyToHostAsync();
-            var forced = (float[])refIn.Clone(); LtxSampler.Step(forced, v, ours[s], ours[s + 1]);
-            var mf = WanCompare(forced, want);
-            lIn.View.CopyFromCPU(free);
-            dit.Forward(lIn.View, t, 0, lOut.View); var vf = await lOut.View.CopyToHostAsync();
-            LtxSampler.Step(free, vf, ours[s], ours[s + 1]);
-            var mr = WanCompare(free, want);
-            report.Add($"step {s} (sigma {ours[s]:F4} -> {ours[s + 1]:F4}): teacher-forced relRMS {mf.RelRms:E2}; free-running {mr.RelRms:E2}");
-            worstForced = Math.Max(worstForced, mf.RelRms);
+            var refPath = Path.Combine(LtxDir, "ref", file);
+            if (!File.Exists(refPath)) { report.Add($"{tag}: fixture {file} missing"); worstForced[idx] = double.MaxValue; continue; }
+            using var rx = ZipFile.OpenRead(refPath);
+            var free = (float[])noise.Clone();
+            for (int s = 0; s < sigmas.Length - 1; s++)
+            {
+                var (refIn, _) = WanNpz(rx, $"step{s}_latent_in"); var (want, _) = WanNpz(rx, $"step{s}_latent_out");
+                float t = LtxSampler.Timestep(ours[s]);
+                if (MathF.Abs(t - timesteps[s]) > 1e-3f) throw new Exception($"our timestep {s} ({t}) differs from the reference's ({timesteps[s]})");
+                lIn.View.CopyFromCPU(refIn);
+                dit.Forward(lIn.View, t, 0, lOut.View); var v = await lOut.View.CopyToHostAsync();
+                var forced = (float[])refIn.Clone(); LtxSampler.Step(forced, v, ours[s], ours[s + 1]);
+                var mf = WanCompare(forced, want);
+                lIn.View.CopyFromCPU(free);
+                dit.Forward(lIn.View, t, 0, lOut.View); var vf = await lOut.View.CopyToHostAsync();
+                LtxSampler.Step(free, vf, ours[s], ours[s + 1]);
+                var mr = WanCompare(free, want);
+                report.Add($"vs {tag} step {s} (sigma {ours[s]:F4} -> {ours[s + 1]:F4}): teacher-forced relRMS {mf.RelRms:E2}; free-running {mr.RelRms:E2}");
+                worstForced[idx] = Math.Max(worstForced[idx], mf.RelRms);
+            }
         }
-        foreach (var line in report) Console.WriteLine("[Ltx] sampler loop vs reference: " + line);
-        if (!(worstForced < 0.02)) throw new Exception("a teacher-forced sampler step deviates from the reference: " + string.Join("; ", report));
-        return $"worst teacher-forced error {worstForced:E2} over {report.Count} steps";
+        LtxLog("SamplerLoop", report);
+        if (!(worstForced[0] < 0.01 && worstForced[1] < 0.15)) throw new Exception("a teacher-forced sampler step deviates from the reference: " + string.Join("; ", report));
+        return $"worst teacher-forced error {worstForced[0]:E2} (fp32 reference), {worstForced[1]:E2} (bf16 reference) over {sigmas.Length - 1} steps";
     });
 }

@@ -12,6 +12,7 @@
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
+//           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate)
 //           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
 //
@@ -28,6 +29,7 @@ using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Ltx;
 using SpawnDev.ILGPU.ML.Wan;
 
 var o = new Options();
@@ -54,6 +56,7 @@ for (int i = 0; i < args.Length; i++)
         case "--no-frames": o.NoFrames = true; break;
         case "--sampler" when i + 1 < args.Length: o.FewStep = args[++i].Equals("fewstep", StringComparison.OrdinalIgnoreCase); break;
         case "--turbo": o.Turbo = true; break;
+        case "--ltx": o.Ltx = true; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -63,9 +66,14 @@ if (o.Turbo)                                                    // Wan2.2-TI2V-5
     o.Dit = "turbo_q8"; o.FewStep = true; o.Guidance = 1.0;
     if (!args.Contains("--steps")) o.Steps = 4;
 }
+if (o.Ltx)                                                      // LTX-Video 2B 0.9.8 distilled: 7 steps, no guidance, 8n + 1 frames; its own native size
+{
+    if (!args.Contains("--size")) { o.Width = 704; o.Height = 480; }
+    if (!args.Contains("--frames")) o.Frames = 65;
+}
 if (o.Ci)
 {
-    o.Width = 320; o.Height = 192; o.Frames = 9; o.Steps = 8; o.Seed = 1;
+    o.Width = 320; o.Height = 192; o.Frames = o.Ltx ? 9 : 9; o.Steps = 8; o.Seed = 1;
     if (string.IsNullOrWhiteSpace(prompt)) prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly.";
 }
 if (string.IsNullOrWhiteSpace(prompt)) { Console.Error.WriteLine("Usage: dotnet run -- \"a prompt\" [--size 640x352] [--frames 17] [--steps 30] [--seed N] [--image first.png] [--models DIR]   (see the header of Program.cs)"); return 2; }
@@ -83,8 +91,9 @@ async Task<int> Run(string prompt, Options o)
     using var accelerator = device.CreateAccelerator(context);
     Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
 
-    string ditFile = Wan22Paths.DitFile(o.Dit), textFile = Wan22Paths.TextEncoderFile(o.Text);
     using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+    if (o.Ltx) return await RunLtx(accelerator, http, prompt, o);
+    string ditFile = Wan22Paths.DitFile(o.Dit), textFile = Wan22Paths.TextEncoderFile(o.Text);
     Wan22Pipeline pipe;
     if (o.Models != null)
     {
@@ -116,16 +125,47 @@ async Task<int> Run(string prompt, Options o)
     }
 
     var sw = System.Diagnostics.Stopwatch.StartNew();
+    var video = await pipe.GenerateAsync(request, ConsoleProgress(sw));
+    Console.WriteLine();
+    Console.WriteLine($"{video.Frames} frames {video.Width}x{video.Height} in {sw.Elapsed.TotalSeconds:F0} s");
+    return Save(video, o);
+}
+
+IProgress<WanProgress> ConsoleProgress(System.Diagnostics.Stopwatch sw)
+{
     string lastStage = "";
-    var progress = new Progress<WanProgress>(p =>
+    return new Progress<WanProgress>(p =>
     {
         if (p.Stage != lastStage) { if (lastStage != "") Console.WriteLine(); lastStage = p.Stage; Console.Write($"[{sw.Elapsed.TotalSeconds,6:F0} s] {p.Stage}: "); }
         Console.Write($"\r[{sw.Elapsed.TotalSeconds,6:F0} s] {p.Stage}: {p.Message}   ");
     });
-    var video = await pipe.GenerateAsync(request, progress);
+}
+
+// LTX-Video 2B 0.9.8 distilled (text to video): T5-v1.1-XXL streamed, the 2B DiT with the 7-step distilled sampler, the timestep-conditioned VAE decode
+async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, Options o)
+{
+    LtxPipeline pipe;
+    if (o.Models != null)
+    {
+        Console.WriteLine($"Models: {o.Models}");
+        pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(o.Models));
+    }
+    else
+    {
+        var store = o.Cache != null ? new FileModelStore(o.Cache) : FileModelStore.Default();
+        Console.WriteLine($"Model cache: {store.RootDirectory} (first run downloads the DiT, the VAE and the text encoder from the models host)");
+        pipe = new LtxPipeline(accelerator, new HttpClientModelSource(http, store), LtxPipeline.DefaultRepo, LtxPaths.InRepo());
+    }
+    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps };
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var video = await pipe.GenerateAsync(request, ConsoleProgress(sw));
     Console.WriteLine();
     Console.WriteLine($"{video.Frames} frames {video.Width}x{video.Height} in {sw.Elapsed.TotalSeconds:F0} s");
+    return Save(video, o);
+}
 
+int Save(WanVideo video, Options o)
+{
     Directory.CreateDirectory(o.Out);
     Image<Rgba32>? anim = null;
     for (int f = 0; f < video.Frames; f++)
@@ -153,7 +193,7 @@ async Task<int> Run(string prompt, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames, FewStep, Turbo;
+    public bool Ci, NoFrames, FewStep, Turbo, Ltx;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;
