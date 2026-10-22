@@ -259,6 +259,8 @@ Self-contained projects under [`Examples/`](Examples/README.md), each runnable w
 | 08 | [Asset generation (WPF)](Examples/08.AssetGen.Wpf) | The same, as a Windows app with a 3D preview |
 | 09 | [Scene generation](Examples/09.SceneGen.Console) | A scene from one sentence: LLM layout, then one generated asset per object |
 | 10 | [Image generation (WPF)](Examples/10.ImageGen.Wpf) | The image page as a Windows app |
+| 11 | [Video generation](Examples/11.VideoGen.Console) | Wan 2.2 TI2V-5B text or image to video, PNG frames and an animated WebP ([Docs/video.md](Docs/video.md)) |
+| 12 | [Video generation (WPF)](Examples/12.VideoGen.Wpf) | The same as a Windows app with a looping player |
 
 ## Repository layout
 

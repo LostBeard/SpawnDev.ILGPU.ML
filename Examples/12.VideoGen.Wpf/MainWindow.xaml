@@ -1,0 +1,104 @@
+<Window x:Class="SpawnDev.ILGPU.ML.Examples.VideoGenWpf.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SpawnDev.ILGPU.ML - Video Generation" Width="1280" Height="820" Background="{StaticResource Bg}" Foreground="{StaticResource Fg}">
+    <Grid Margin="14">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="470" />
+            <ColumnDefinition Width="14" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- left: the same settings the browser demo's Video Generation page offers -->
+        <Grid Grid.Column="0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="150" />
+            </Grid.RowDefinitions>
+
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <TextBlock Text="Prompt" Margin="0,0,0,4" />
+                    <TextBox x:Name="PromptBox" Text="A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field." TextWrapping="Wrap" AcceptsReturn="True" Height="92" Padding="6"
+                             VerticalScrollBarVisibility="Auto" Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
+
+                    <WrapPanel Margin="0,10,0,0">
+                        <TextBlock Text="Size" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="SizeBox" Width="110" SelectedIndex="1" Margin="0,0,14,0">
+                            <ComboBoxItem Content="512x288" /><ComboBoxItem Content="640x352" /><ComboBoxItem Content="832x480" /><ComboBoxItem Content="1280x704" />
+                        </ComboBox>
+                        <TextBlock Text="Frames" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="FramesBox" Width="60" SelectedIndex="1" Margin="0,0,14,0" ToolTip="24 frames per second; 4n + 1 frames">
+                            <ComboBoxItem Content="9" /><ComboBoxItem Content="17" /><ComboBoxItem Content="25" /><ComboBoxItem Content="33" /><ComboBoxItem Content="49" /><ComboBoxItem Content="81" /><ComboBoxItem Content="121" />
+                        </ComboBox>
+                        <TextBlock Text="Steps" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="StepsBox" Width="60" SelectedIndex="2" ToolTip="The reference uses 50; 20 to 30 is usually fine">
+                            <ComboBoxItem Content="12" /><ComboBoxItem Content="20" /><ComboBoxItem Content="30" /><ComboBoxItem Content="50" />
+                        </ComboBox>
+                    </WrapPanel>
+
+                    <WrapPanel Margin="0,8,0,0">
+                        <TextBlock Text="Guidance" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="GuidanceBox" Text="5" Width="40" Padding="2" Margin="0,0,14,0" />
+                        <TextBlock Text="Seed" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox x:Name="SeedBox" Width="90" Padding="2" Margin="0,0,14,0" ToolTip="Blank = random" />
+                        <TextBlock Text="Transformer" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="DitBox" Width="130" SelectedIndex="0">
+                            <ComboBoxItem Content="8-bit (5.6 GB)" /><ComboBoxItem Content="4-bit (3.1 GB)" /><ComboBoxItem Content="16-bit (10 GB)" />
+                        </ComboBox>
+                    </WrapPanel>
+
+                    <WrapPanel Margin="0,8,0,0">
+                        <TextBlock Text="Text encoder" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="TextEncBox" Width="130" SelectedIndex="0" Margin="0,0,14,0">
+                            <ComboBoxItem Content="8-bit (6.4 GB)" /><ComboBoxItem Content="16-bit (11.4 GB)" />
+                        </ComboBox>
+                    </WrapPanel>
+
+                    <TextBlock Text="First frame (optional: image to video)" Margin="0,14,0,4" />
+                    <StackPanel Orientation="Horizontal">
+                        <Button x:Name="PickButton" Content="Choose picture..." Click="PickClick" />
+                        <Button x:Name="ClearPictureButton" Content="Clear" Click="ClearPictureClick" Background="#334155" />
+                        <Image x:Name="PicturePreview" Height="60" Margin="8,0,0,0" />
+                    </StackPanel>
+
+                    <TextBlock Text="Negative prompt (blank = the model's default list of video defects)" Margin="0,14,0,4" />
+                    <TextBox x:Name="NegativeBox" Padding="4" Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
+
+                    <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                        <Button x:Name="GenerateButton" Content="Generate" Click="GenerateClick" Width="120" />
+                        <Button x:Name="FolderButton" Content="Model folder..." Click="FolderClick" Background="#334155" />
+                    </StackPanel>
+                    <TextBlock x:Name="FolderText" TextWrapping="Wrap" Margin="0,8,0,0" FontSize="11" />
+
+                    <TextBlock Margin="0,12,0,0" TextWrapping="Wrap" FontSize="11"
+                               Text="Wan 2.2 TI2V-5B (Alibaba, Apache-2.0), exported to 8-bit and 16-bit blocks for SpawnDev.ILGPU.ML. Everything runs on your GPU (CUDA or OpenCL); nothing leaves your machine except the model downloads. A 12 GB card runs 640x352 with 17 to 49 frames comfortably; the model gives good and bad clips by seed at small sizes, so try another seed first." />
+                </StackPanel>
+            </ScrollViewer>
+
+            <TextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11"
+                     Background="{StaticResource Panel}" Foreground="{StaticResource Muted}" BorderThickness="0" Margin="0,10,0,0" />
+        </Grid>
+
+        <!-- right: the player -->
+        <Grid Grid.Column="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Border Background="{StaticResource Panel}" CornerRadius="6">
+                <Image x:Name="Player" Stretch="Uniform" Margin="8" />
+            </Border>
+            <StackPanel Grid.Row="1" Margin="0,10,0,0">
+                <ProgressBar x:Name="Bar" Height="8" Minimum="0" Maximum="100" Foreground="{StaticResource Accent}" Background="#1E293B" BorderThickness="0" />
+                <TextBlock x:Name="StatusText" Margin="0,4,0,0" />
+                <TextBlock x:Name="InfoText" FontFamily="Consolas" FontSize="11" />
+            </StackPanel>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
+                <Button x:Name="ReplayButton" Content="Replay" Click="ReplayClick" IsEnabled="False" />
+                <Button x:Name="SaveButton" Content="Save frames..." Click="SaveClick" IsEnabled="False" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>
