@@ -23,6 +23,14 @@
                              VerticalScrollBarVisibility="Auto" Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" BorderThickness="0" />
 
                     <WrapPanel Margin="0,10,0,0">
+                        <TextBlock Text="Model" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox x:Name="ModelBox" Width="250" SelectedIndex="0" SelectionChanged="ModelChanged"
+                                  ToolTip="Wan 2.2 TI2V-5B: text or image to video, 4 to 50 steps. LTX-Video 2B (distilled): text to video, 7 steps, a small transformer and a heavily compressed video: fast, light on memory.">
+                            <ComboBoxItem Content="Wan 2.2 TI2V-5B" /><ComboBoxItem Content="LTX-Video 2B (distilled, 7 steps)" />
+                        </ComboBox>
+                    </WrapPanel>
+
+                    <WrapPanel Margin="0,8,0,0">
                         <TextBlock Text="Size" VerticalAlignment="Center" Margin="0,0,6,0" />
                         <ComboBox x:Name="SizeBox" Width="110" SelectedIndex="1" Margin="0,0,14,0">
                             <ComboBoxItem Content="512x288" /><ComboBoxItem Content="640x352" /><ComboBoxItem Content="832x480" /><ComboBoxItem Content="1280x704" />

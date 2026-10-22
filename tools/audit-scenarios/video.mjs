@@ -16,10 +16,12 @@ export const scenarios = {
   '/video': {
     expectConsole: [/status of 404.*\/video/],                  // a deep link on GitHub Pages is answered by 404.html (the SPA redirect); the local static server has no such response
     run: async h => {
-      const server = process.env.WAN_MODEL_SERVER || 'http://127.0.0.1:8768';        // WAN_MODEL_SERVER=default: leave the field empty = the real models host (what the live site does)
-      await h.waitFor(`document.querySelectorAll('select.vid-select').length >= 3`, 180e3, 'the video page renders');   // GitHub Pages serves a deep link through its 404.html and the WASM app boots after
-      await h.ev(setSelect(0, '512x288'));
-      await h.ev(setSelect(1, '9'));                                                  // the defaults are the Turbo transformer: 4 steps, guidance 1
+      const ltx = process.env.VIDEO_MODEL === 'ltx';                                  // VIDEO_MODEL=ltx: LTX-Video 2B (served from LTX_MODEL_SERVER, default http://127.0.0.1:8769) instead of Wan
+      const server = (ltx ? process.env.LTX_MODEL_SERVER : process.env.WAN_MODEL_SERVER) || (ltx ? 'http://127.0.0.1:8769' : 'http://127.0.0.1:8768');   // =default: leave the field empty = the real models host (what the live site does)
+      await h.waitFor(`document.querySelectorAll('select.vid-select').length >= 4`, 180e3, 'the video page renders');   // GitHub Pages serves a deep link through its 404.html and the WASM app boots after
+      // selects: 0 = model, 1 = size, 2 = frames (then steps, transformer for Wan only)
+      if (ltx) { await h.ev(setSelect(0, 'ltx')); await h.waitFor(`document.querySelectorAll('select.vid-select').length === 3`, 30e3, 'the LTX settings render'); await h.ev(setSelect(1, '480x320')); await h.ev(setSelect(2, '17')); }
+      else { await h.ev(setSelect(1, '512x288')); await h.ev(setSelect(2, '9')); }      // the Wan defaults are the Turbo transformer: 4 steps, guidance 1
       if (server !== 'default') {
         await h.ev(`(()=>{document.querySelector('details.vid-advanced').open=true;})()`);
         await h.type('input[placeholder="http://127.0.0.1:8767"]', server);
