@@ -130,7 +130,7 @@ async Task<int> Run(string prompt, Options o)
     anim.Metadata.GetWebpMetadata().RepeatCount = 0;
     string webp = Path.Combine(o.Out, "video.webp");
     anim!.SaveAsWebp(webp, new WebpEncoder { FileFormat = WebpFileFormatType.Lossy, Quality = 90 });
-    anim.Dispose();
+    anim?.Dispose();
     Console.WriteLine($"Wrote {webp}" + (o.NoFrames ? "" : $" and {video.Frames} PNG frames in {o.Out}"));
 
     if (o.Ci)
