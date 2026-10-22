@@ -299,6 +299,66 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // ===================================================================================================
+    // umT5 encoder kernels: attention WITHOUT the 1/sqrt(d) scaling, plus a per-head relative-position bias read from a bucket table
+    // ===================================================================================================
+    private Action<Index1D, FV, BV, IV, FV, int, int, int>? _t5Scores;
+    private static void T5ScoresImpl(Index1D idx, FV qkv, BV bias, IV bucket, FV s, int L, int H, int D)
+    {
+        int j = idx % L, i = (idx / L) % L, h = idx / (L * L);
+        long qb = (long)i * 3 * H * D + h * D, kb = (long)j * 3 * H * D + H * D + h * D;
+        float acc = 0f;
+        for (int d = 0; d < D; d++) acc += qkv[qb + d] * qkv[kb + d];
+        s[idx] = acc + PrecisionConvert.ConvertToSingle(bias[bucket[j - i + L - 1] * H + h]);
+    }
+    private Action<Index1D, FV, FV, FV, int, int, int>? _t5Out;
+    private static void T5OutImpl(Index1D idx, FV p, FV qkv, FV o, int L, int H, int D)
+    {
+        int hd = H * D, i = idx / hd, c = idx % hd, h = c / D;
+        float acc = 0f;
+        long pb = ((long)h * L + i) * L, vb = 2L * hd + c;
+        for (int j = 0; j < L; j++) acc += p[pb + j] * qkv[(long)j * 3 * hd + vb];
+        o[idx] = acc;
+    }
+    /// <summary>qkv [L, 3*H*D] (q | k | v), bias bf16 [numBuckets, H], bucket [2L-1] (index j - i + L - 1), scores scratch [H*L*L], o [L, H*D].</summary>
+    public void T5Attention(FV qkv, BV bias, IV bucket, FV scores, FV o, int L, int H, int D)
+    {
+        _t5Scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, IV, FV, int, int, int>(T5ScoresImpl);
+        _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
+        _t5Out ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int>(T5OutImpl);
+        _t5Scores(H * L * L, qkv, bias, bucket, scores, L, H, D);
+        _softmaxRows(H * L, scores, L);
+        _t5Out(L * H * D, scores, qkv, o, L, H, D);
+    }
+
+    private Action<Index1D, FV, FV>? _mulInPlace;
+    private static void MulInPlaceImpl(Index1D i, FV a, FV b) => a[i] *= b[i];
+    /// <summary>a[i] *= b[i] (the gated feed-forward: fc1(x) * gelu(gate(x))).</summary>
+    public void MulInPlace(FV a, FV b, int count)
+    {
+        _mulInPlace ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(MulInPlaceImpl);
+        _mulInPlace(count, a, b);
+    }
+
+    /// <summary>
+    /// T5RelativeEmbedding._relative_position_bucket for a bidirectional sequence of <paramref name="L"/> tokens: bucket of (key - query) at index (key - query + L - 1).
+    /// The reference computes the logarithmic buckets in float32 (a 1-ulp difference moves a bucket at the exact ratios 2, 4, 8: relative distance 16, 32, 64), so the same float32 steps are used.
+    /// </summary>
+    public static int[] T5RelativeBuckets(int L, int numBuckets = 32, int maxDist = 128)
+    {
+        int half = numBuckets / 2, maxExact = half / 2;
+        float denom = (float)Math.Log((double)maxDist / maxExact);
+        var t = new int[2 * L - 1];
+        for (int rel = -(L - 1); rel <= L - 1; rel++)
+        {
+            int b = rel > 0 ? half : 0, r = Math.Abs(rel);
+            int large = r == 0 ? 0 : maxExact + (int)(MathF.Log((float)r / maxExact) / denom * (half - maxExact));
+            large = Math.Min(large, half - 1);
+            t[rel + L - 1] = b + (r < maxExact ? r : large);
+        }
+        return t;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // host helpers
     // ---------------------------------------------------------------------------------------------------

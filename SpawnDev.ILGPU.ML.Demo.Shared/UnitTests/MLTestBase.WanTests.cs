@@ -38,6 +38,46 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The umT5-XXL encoder (streamed layer by layer, rows of the embedding table read from the file) against the reference's bf16 encoder output for the three dumped prompts,
+    /// fed the reference's own token ids: relative RMS of the context [n, 4096] and the peak VRAM of the run (one layer's weights, not 11 GB). Desktop device.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_UmT5_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the layer-streaming encoder test reads the 11 GB export from disk on a desktop GPU");
+        var path = Path.Combine(WanDir, "umt5_xxl_enc_bf16.safetensors");
+        if (!File.Exists(path)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var enc = new UmT5Encoder(accelerator, path);
+        var report = new List<string>();
+        double worstBf16 = 0, worstExact = 0;
+        foreach (var name in new[] { "0", "1", "neg" })
+        {
+            using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"t5_{name}.npz"));
+            using var fxx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"t5x_{name}.npz"));      // the same tokens through the reference layers upcast to fp32 (exact math on the same bf16 weights)
+            var (ids, _) = WanNpz(fx, "ids"); var (mask, _) = WanNpz(fx, "mask"); var (want, ws) = WanNpz(fx, "context");
+            int n = (int)mask.Sum();
+            var taps = new Dictionary<string, float[]>();
+            enc.Tap = (stage, view, count) => { accelerator.Synchronize(); var a = new float[count]; view.SubView(0, count).CopyToCPU(a); taps[stage] = a; };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var got = await enc.EncodeAsync(ids.Take(n).Select(v => (int)v).ToArray());
+            enc.Tap = null;
+            var mb = WanCompare(got, want);                                                         // the reference as it runs: bf16 activations
+            var (exact, _) = WanNpz(fxx, "fp32_final"); var (bfx, _) = WanNpz(fxx, "bf16_final");
+            var me = WanCompare(got, exact);                                                        // the exact math
+            var floor = WanCompare(bfx, exact);                                                     // the reference's own rounding against the exact math
+            var l0 = WanCompare(taps["layer_0"], WanNpz(fxx, "fp32_layer_0").Data); var l12 = WanCompare(taps["layer_12"], WanNpz(fxx, "fp32_layer_12").Data);
+            report.Add($"prompt {name} ({n} tokens): vs the bf16 reference {mb.RelRms:E2}; vs exact math {me.RelRms:E2} (the bf16 reference itself is {floor.RelRms:E2} from exact); layer_0 {l0.RelRms:E1}, layer_12 {l12.RelRms:E1}; {sw.Elapsed.TotalSeconds:F1} s");
+            worstBf16 = Math.Max(worstBf16, mb.RelRms); worstExact = Math.Max(worstExact, me.RelRms);
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] umT5 vs reference: " + line);
+        // vs the bf16 reference: its own bf16 rounding (2.2e-2 to 2.8e-2 from exact math on these prompts). vs exact math on the same weights: float rounding with the fp32 GEMM
+        // (4e-6 MEASURED with TRELLIS2_MMA=0 and on OpenCL), 5e-3 to 7.5e-3 with the CUDA tensor cores (they round the activations to bf16, as the reference does)
+        if (!(worstBf16 < 0.05 && worstExact < 0.015)) throw new Exception("umT5 deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The Unigram tokenizer against the reference's token ids (Hugging Face tokenizers, google/umt5-xxl) for the three dumped prompts: two English sentences and the 126-token
     /// Chinese default negative prompt (full-width punctuation, no spaces: every position is a segmentation choice). Host only; reads tokenizer.json from WAN_DIR.
     /// Red check: a tokenizer that ignores the Metaspace prefix produces different ids.
