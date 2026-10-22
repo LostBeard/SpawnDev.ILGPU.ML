@@ -38,6 +38,71 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The denoising loop end to end, two ways. TEACHER-FORCED: at every step our DiT (conditional and negative prompt) and our UniPC sampler get the reference's own latent, so errors
+    /// do not compound: each step must reproduce the reference's next latent to the level of one bf16 DiT call. FREE-RUNNING: our own trajectory from the reference's noise (and
+    /// conditioning latent for image-to-video). The sampler is sensitive: ref_sensitivity.py measured the REFERENCE diverging from a copy of itself started 1.3e-3 away by 1.8e-3,
+    /// 1.4e-2, 4.4e-2, 8.2e-2 over the four steps (3.6e-3, 4.8e-2, 2.3e-1, 4.4e-1 with a clean first frame), so the free-running bound is that sensitivity, not parity.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_SamplerLoop_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the 10 GB DiT runs on a desktop GPU or WebGPU");
+        var weightsPath = Path.Combine(WanDir, "wan22_ti2v_5b_dit_bf16.safetensors");
+        if (!File.Exists(weightsPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz")); using var t5n = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_neg.npz"));
+        var (ctx0, cs0) = WanNpz(t50, "context"); var (ctxN, csN) = WanNpz(t5n, "context");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
+        var report = new List<string>();
+        double worstForced = 0;
+        // teacher-forced: the reference's bf16 noise per DiT call (3.5e-3 text-to-video, 1e-2 with a clean first frame) amplified by classifier-free guidance (x5) and by the UniPC history at the
+        // low-noise steps (the last step is x0 = sample - sigma * prediction): MEASURED 3.1e-2 and 7.6e-2 after four steps
+        var forcedBound = new Dictionary<string, double> { ["t2v"] = 0.06, ["i2v"] = 0.12 };
+        var freeBound = new Dictionary<string, double[]> { ["t2v"] = new[] { 0.01, 0.06, 0.15, 0.3 }, ["i2v"] = new[] { 0.02, 0.15, 0.5, 0.8 } };     // about 2x the reference's own sensitivity
+        foreach (var (tag, firstFrame) in new[] { ("t2v", false), ("i2v", true) })
+        {
+            using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"dit_{tag}_640x352_f33.npz"));
+            var (noise, ns) = WanNpz(fx, "noise"); var (ts, _) = WanNpz(fx, "timesteps");
+            int Fz = ns[1], h = ns[2], w = ns[3], per = h * w;
+            dit.SetGrid(Fz, h, w);
+            dit.SetContext(0, ctx0, cs0[0]); dit.SetContext(1, ctxN, csN[0]);
+            float[] z0 = firstFrame ? WanNpz(fx, "z0").Data : Array.Empty<float>();
+            var free = (float[])noise.Clone();
+            if (firstFrame) for (int c = 0; c < 48; c++) Array.Copy(z0, (long)c * Fz * per, free, (long)c * Fz * per, per);           // latent = (1 - mask) * z0 + mask * latent: frame 0 is the picture
+            var schedFree = new FlowUniPCScheduler(); schedFree.SetTimesteps(ts.Length, 5.0);
+            var schedForced = new FlowUniPCScheduler(); schedForced.SetTimesteps(ts.Length, 5.0);
+            using var lIn = accelerator.Allocate1D<float>(free.Length); using var lOut = accelerator.Allocate1D<float>(free.Length);
+            async Task<float[]> Predict(float[] latent, int step)
+            {
+                lIn.View.CopyFromCPU(latent);
+                dit.Forward(lIn.View, schedFree.Timesteps[step], firstFrame, 0, lOut.View); var nc = await lOut.View.CopyToHostAsync();
+                dit.Forward(lIn.View, schedFree.Timesteps[step], firstFrame, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
+                var pred = new float[nc.Length];
+                for (int i = 0; i < pred.Length; i++) pred[i] = nu[i] + 5.0f * (nc[i] - nu[i]);                                          // classifier-free guidance, scale 5
+                return pred;
+            }
+            void Restore(float[] latent) { if (firstFrame) for (int c = 0; c < 48; c++) Array.Copy(z0, (long)c * Fz * per, latent, (long)c * Fz * per, per); }
+            for (int s = 0; s < ts.Length; s++)
+            {
+                var (refIn, _) = WanNpz(fx, $"step{s}_latent_in"); var (want, _) = WanNpz(fx, $"step{s}_latent_out");
+                // teacher-forced: the reference's own input, our DiT and sampler
+                var forced = schedForced.Step(await Predict(refIn, s), refIn); Restore(forced);
+                var mf = WanCompare(forced, want);
+                // free-running: our own trajectory
+                free = schedFree.Step(await Predict(free, s), free); Restore(free);
+                var mr = WanCompare(free, want);
+                report.Add($"{tag} step {s}: teacher-forced relRMS {mf.RelRms:E2}; free-running {mr.RelRms:E2} (bound {freeBound[tag][s]:E1})");
+                worstForced = Math.Max(worstForced, mf.RelRms / forcedBound[tag]);
+                if (mr.RelRms > freeBound[tag][s]) throw new Exception($"the free-running trajectory left the sampler's sensitivity band: {report[^1]}");
+            }
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] sampler loop vs reference: " + line);
+        if (!(worstForced < 1.0)) throw new Exception("a teacher-forced sampler step deviates from the reference: " + string.Join("; ", report));
+        return $"worst teacher-forced error {worstForced:P0} of its bound over {report.Count} steps";
+    });
+
+    /// <summary>
     /// The umT5-XXL encoder (streamed layer by layer, rows of the embedding table read from the file) against the reference's bf16 encoder output for the three dumped prompts,
     /// fed the reference's own token ids: relative RMS of the context [n, 4096] and the peak VRAM of the run (one layer's weights, not 11 GB). Desktop device.
     /// </summary>
