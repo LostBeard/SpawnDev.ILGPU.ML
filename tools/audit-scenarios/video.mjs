@@ -14,13 +14,16 @@ const setSelect = (n, value) => `(()=>{const s=document.querySelectorAll('select
 
 export const scenarios = {
   '/video': {
+    expectConsole: [/status of 404.*\/video/],                  // a deep link on GitHub Pages is answered by 404.html (the SPA redirect); the local static server has no such response
     run: async h => {
-      const server = process.env.WAN_MODEL_SERVER || 'http://127.0.0.1:8768';
+      const server = process.env.WAN_MODEL_SERVER || 'http://127.0.0.1:8768';        // WAN_MODEL_SERVER=default: leave the field empty = the real models host (what the live site does)
+      await h.waitFor(`document.querySelectorAll('select.vid-select').length >= 3`, 180e3, 'the video page renders');   // GitHub Pages serves a deep link through its 404.html and the WASM app boots after
       await h.ev(setSelect(0, '512x288'));
-      await h.ev(setSelect(1, '9'));
-      await h.ev(setSelect(2, '12'));
-      await h.ev(`(()=>{document.querySelector('details.vid-advanced').open=true;})()`);
-      await h.type('input[placeholder="http://127.0.0.1:8767"]', server);
+      await h.ev(setSelect(1, '9'));                                                  // the defaults are the Turbo transformer: 4 steps, guidance 1
+      if (server !== 'default') {
+        await h.ev(`(()=>{document.querySelector('details.vid-advanced').open=true;})()`);
+        await h.type('input[placeholder="http://127.0.0.1:8767"]', server);
+      }
       await h.click('.vid-btn');
       await h.waitFor(`(()=>{const r=document.querySelector('.vid-result');return !!r&&r.style.display!=='none'&&document.querySelector('#vid-player')?.naturalWidth>0;})()`, 90 * 60e3, 'the video player shows a frame');
       const st = await h.ev(imageStats('#vid-player'));
