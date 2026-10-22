@@ -127,43 +127,84 @@ public sealed class SparseKernels
     // Submanifold convolution (3x3x3): out[m,n] = bias[n] + sum_kk sum_c x[nbr[m,kk], c] * W[n,kk,c]
     // =====================================================================================================
     private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaConv;
-    private Action<Index1D, FV, HV, HV, FV, IV, int, int, int, int>? _naiveConv;
-    private static void NaiveConvImpl(Index1D idx, FV x, HV w, HV bias, FV o, IV nbr, int M, int cin, int cout, int hasBias)
+    private Action<Index1D, FV, HV, HV, FV, IV, int, int, int, int, int>? _naiveConv;
+    private static void NaiveConvImpl(Index1D idx, FV x, HV w, HV bias, FV o, IV nbr, int M, int cin, int cout, int hasBias, int taps)
     {
         int m = idx / cout, n = idx % cout;
         float acc = hasBias != 0 ? PrecisionConvert.ConvertToSingle(bias[n]) : 0f;
-        for (int kk = 0; kk < 27; kk++)
+        for (int kk = 0; kk < taps; kk++)
         {
             int src = nbr[m * 27 + kk];
             if (src < 0) continue;
-            long xb = (long)src * cin, wb = ((long)n * 27 + kk) * cin;
+            long xb = (long)src * cin, wb = ((long)n * taps + kk) * cin;
             for (int c = 0; c < cin; c++) acc += x[xb + c] * PrecisionConvert.ConvertToSingle(w[wb + c]);
         }
         o[idx] = acc;
     }
 
     /// <summary>x [M, cin] fp32 -> o [M, cout] fp32; weight [cout][27][cin] fp16, bias [cout] fp16.</summary>
-    public void Conv3(FV x, IV nbr, HV weight, HV bias, FV o, int M, int cin, int cout)
+    public void Conv3(FV x, IV nbr, HV weight, HV bias, FV o, int M, int cin, int cout) => ConvTaps(x, nbr, weight, bias, o, M, cin, cout, 27);
+
+    /// <summary>
+    /// <see cref="Conv3"/> with <paramref name="taps"/> taps instead of 27 (a 3x3 convolution is 9, a causal temporal one 3, a pointwise one 1): the neighbour table keeps its row
+    /// stride of 27 and fills the first <paramref name="taps"/> entries of every row, the weight is [cout][taps][cin]. The Wan 2.2 VAE's dense causal convolutions use it.
+    /// </summary>
+    public void ConvTaps(FV x, IV nbr, HV weight, HV bias, FV o, int M, int cin, int cout, int taps)
     {
         if (Cuda && cin % MmaGemm.BK == 0 && cout % 2 == 0)
         {
             _mmaConv ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Gather);
             _noRes ??= _acc.Allocate1D<float>(1);
             int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((cout + MmaGemm.BN - 1) / MmaGemm.BN);
-            _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, 27 * cin, cout, cin, 1, 0, 0);
+            _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, taps * cin, cout, cin, 1, 0, 0);
             return;
         }
-        if (UseTiled(27 * cin) && TiledGemm.Fits(M, 27 * cin, cout, x.Length / cin))
+        if (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, x.Length / cin))
         {
             _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
             _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
-                M, 27 * cin, cout, cin, 1, 0, 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
+                M, taps * cin, cout, cin, 1, 0, 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
             return;
         }
-        _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvImpl);
-        _naiveConv(M * cout, x, weight, bias, o, nbr, M, cin, cout, 1);
+        _naiveConv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int, int>(NaiveConvImpl);
+        _naiveConv(M * cout, x, weight, bias, o, nbr, M, cin, cout, 1, taps);
+    }
+
+    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinearF16;
+    private Action<Index1D, FV, HV, HV, FV, int, int, int>? _naiveLinearF16;
+    private static void NaiveLinearF16Impl(Index1D idx, FV x, HV w, HV bias, FV o, int M, int K, int N)
+    {
+        int m = idx / N, n = idx % N;
+        float acc = PrecisionConvert.ConvertToSingle(bias[n]);
+        for (int k = 0; k < K; k++) acc += x[(long)m * K + k] * PrecisionConvert.ConvertToSingle(w[(long)n * K + k]);
+        o[idx] = acc;
+    }
+
+    /// <summary>nn.Linear with fp16 weight [N, K] and fp16 bias [N]; x [M, K] fp32 -> o [M, N] fp32 (the pointwise convolutions of the Wan 2.2 VAE).</summary>
+    public void LinearF16(FV x, HV weight, HV bias, FV o, int M, int K, int N)
+    {
+        if (Cuda && K % MmaGemm.BK == 0 && N % 2 == 0 && M >= 16)
+        {
+            _mmaLinearF16 ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
+            _noRes ??= _acc.Allocate1D<float>(1); _noNbr ??= _acc.Allocate1D<int>(1);
+            int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
+            _mmaLinearF16(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, _noNbr.View, M, K, N, 0, 1, 0, 0);
+            return;
+        }
+        if (UseTiled(K) && TiledGemm.Fits(M, K, N))
+        {
+            _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
+            EnsureTiledDummies();
+            _noNbr ??= _acc.Allocate1D<int>(1);
+            int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, _noNbr.View,
+                M, K, N, 0, 1, 0, 0, TiledGemm.ModeF16);
+            return;
+        }
+        _naiveLinearF16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, int, int, int>(NaiveLinearF16Impl);
+        _naiveLinearF16(M * N, x, weight, bias, o, M, K, N);
     }
 
     // fp32-weight convolution (naive): the few convolutions whose checkpoint tensors are fp32 and tiny (SS decoder input / output)

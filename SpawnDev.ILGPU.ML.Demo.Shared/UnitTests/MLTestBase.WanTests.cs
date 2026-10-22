@@ -38,6 +38,54 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The Wan 2.2 VAE decoder (chunked, causal, cached convolutions, fp16 weights) against the reference's float32 decode of the same small latent [48, 3, 8, 12] -> video
+    /// [3, 9, 128, 192]: every stage tap (conv2, conv1, middle, the four up-blocks, the head) and the final clamped frames. Desktop device (the taps read back).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_VaeDecode_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the taps read back to the host: a desktop GPU");
+        var weightsPath = Path.Combine(WanDir, "wan22_vae_f16.safetensors"); var fxPath = Path.Combine(WanDir, "dump", "vae.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (z, zs) = WanNpz(fx, "z");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var dec = new WanVaeDecoder(accelerator, weights);
+        var taps = new Dictionary<string, List<float[]>>();
+        var dims = new Dictionary<string, (int C, int H, int W)>();
+        dec.Tap = (name, view, T, H, W, C) =>
+        {
+            accelerator.Synchronize();
+            var a = new float[(long)T * H * W * C]; view.SubView(0, a.Length).CopyToCPU(a);
+            if (!taps.TryGetValue(name, out var l)) taps[name] = l = new List<float[]>();
+            l.Add(a); dims[name] = (C, H, W);
+        };
+        var video = await dec.DecodeAsync(z, zs[1], zs[2], zs[3]);
+        dec.Tap = null;
+        var report = new List<string>();
+        double worst = 0;
+        foreach (var name in new[] { "dec_conv2", "dec_conv1", "dec_middle", "dec_up0", "dec_up1", "dec_up2", "dec_up3", "dec_head" })
+        {
+            var (rf, rs) = WanNpz(fx, name);                      // [1, C, T, H, W] channel-first
+            int C = rs[1], T = rs[2], HW = rs[3] * rs[4];
+            var ours = taps[name].SelectMany(x => x).ToArray();   // [T*HW, C] channel-last
+            var t = new float[rf.Length];
+            for (int c = 0; c < C; c++) for (int p = 0; p < T * HW; p++) t[(long)p * C + c] = rf[(long)c * T * HW + p];
+            var m = WanCompare(ours, t);
+            report.Add($"{name} [{C}, {T}, {rs[3]}, {rs[4]}]: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            worst = Math.Max(worst, m.RelRms);
+        }
+        var (rv, _) = WanNpz(fx, "video");
+        var mv = WanCompare(video, rv);
+        report.Add($"video [3, 9, 128, 192]: relRMS {mv.RelRms:E2}, maxAbs {mv.MaxAbs:F3} of {mv.RefMaxAbs:F2}");
+        foreach (var line in report) Console.WriteLine("[Wan] VAE decode vs reference: " + line);
+        worst = Math.Max(worst, mv.RelRms);
+        if (!(worst < 0.05)) throw new Exception("the VAE decode deviates from the reference: " + string.Join("; ", report));
+        return $"worst relRMS {worst:E2} over {report.Count} comparisons";
+    });
+
+    /// <summary>
     /// The UniPC flow sampler against the reference scheduler: set_timesteps(4, shift 5) gives the reference's integer timesteps and float32 sigmas exactly, and
     /// each step, fed the reference's own guidance-combined prediction and sample, returns the reference's next sample (predictor, corrector, the final order-1 step).
     /// Host math: no device involved. Red check: a wrong shift moves the sigmas, which the exact timestep comparison catches.

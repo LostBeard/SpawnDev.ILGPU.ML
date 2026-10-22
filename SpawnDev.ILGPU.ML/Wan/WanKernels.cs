@@ -5,6 +5,7 @@ namespace SpawnDev.ILGPU.ML.Wan;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
+using IV = ArrayView1D<int, Stride1D.Dense>;
 
 /// <summary>
 /// The kernels of the Wan 2.2 DiT that the TRELLIS.2 flow transformer's <see cref="Trellis2.DiTKernels"/> do not have: the RMS norm over a whole row (Wan
@@ -120,6 +121,182 @@ public sealed class WanKernels
     {
         _addBroadcast ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, FV, FV, int>(AddBroadcastImpl);
         _addBroadcast(count, a, b, o, period);
+    }
+
+    // ===================================================================================================
+    // VAE kernels. Activations are channel-last [voxels, C] fp32 with voxel = (t * H + h) * W + w.
+    // ===================================================================================================
+
+    // F.normalize(x, dim=channels) * sqrt(C) * gamma (the VAE's RMS_norm), per voxel, IN PLACE; gamma fp32.
+    private Action<KernelConfig, FV, FV, int>? _chanRmsGroup;
+    private static void ChannelRmsGroupImpl(FV buf, FV gamma, int C)
+    {
+        int row = Grid.IdxX, t = Group.IdxX;
+        long b = (long)row * C;
+        var sh = SharedMemory.Allocate<float>(NormGroup);
+        float s = 0f;
+        for (int c = t; c < C; c += NormGroup) { float v = buf[b + c]; s += v * v; }
+        sh[t] = s;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float inv = MathF.Sqrt((float)C) / MathF.Max(MathF.Sqrt(sh[0]), 1e-12f);
+        for (int c = t; c < C; c += NormGroup) buf[b + c] = buf[b + c] * inv * gamma[c];
+    }
+    private Action<Index1D, FV, FV, int>? _chanRms;
+    private static void ChannelRmsImpl(Index1D row, FV buf, FV gamma, int C)
+    {
+        long b = (long)(int)row * C;
+        float s = 0f;
+        for (int c = 0; c < C; c++) { float v = buf[b + c]; s += v * v; }
+        float inv = MathF.Sqrt((float)C) / MathF.Max(MathF.Sqrt(s), 1e-12f);
+        for (int c = 0; c < C; c++) buf[b + c] = buf[b + c] * inv * gamma[c];
+    }
+    public void ChannelRmsNorm(FV buf, FV gamma, int rows, int C)
+    {
+        if (_acc.MaxGroupSize.X >= NormGroup)
+        {
+            _chanRmsGroup ??= _acc.LoadStreamKernel<FV, FV, int>(ChannelRmsGroupImpl);
+            _chanRmsGroup(new KernelConfig(rows, NormGroup), buf, gamma, C);
+            return;
+        }
+        _chanRms ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(ChannelRmsImpl);
+        _chanRms(rows, buf, gamma, C);
+    }
+
+    // Neighbour tables (row stride 27, the gather GEMM's). Input frames are laid out [cache frames][chunk frames]; an output frame t of a causal temporal kernel of 3 taps
+    // reads input frames cnt + t - 2 + dt (dt = 0..2), a negative frame is the zero padding. `cnt` = the cached frames in front (0, 1 or 2).
+    private Action<Index1D, IV, int, int, int>? _causalTable;
+    private static void CausalTableImpl(Index1D m, IV nbr, int H, int W, int cnt)
+    {
+        int hw = H * W, t = m / hw, p = m % hw, h = p / W, w = p % W;
+        for (int kk = 0; kk < 27; kk++)
+        {
+            int dt = kk / 9, hh = h + (kk / 3) % 3 - 1, ww = w + kk % 3 - 1, c = cnt + t - 2 + dt;
+            nbr[m * 27 + kk] = c >= 0 && hh >= 0 && hh < H && ww >= 0 && ww < W ? (c * H + hh) * W + ww : -1;
+        }
+    }
+    /// <summary>3x3x3 causal convolution table over T output frames of H x W voxels.</summary>
+    public void CausalTable(IV nbr, int T, int H, int W, int cnt)
+    {
+        _causalTable ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int>(CausalTableImpl);
+        _causalTable(T * H * W, nbr, H, W, cnt);
+    }
+
+    private Action<Index1D, IV, int, int>? _timeTable;
+    private static void TimeTableImpl(Index1D m, IV nbr, int hw, int cnt)
+    {
+        int t = m / hw, p = m % hw;
+        for (int dt = 0; dt < 3; dt++) { int c = cnt + t - 2 + dt; nbr[m * 27 + dt] = c >= 0 ? c * hw + p : -1; }
+    }
+    /// <summary>(3,1,1) causal temporal convolution table (3 taps).</summary>
+    public void TimeTable(IV nbr, int T, int H, int W, int cnt)
+    {
+        _timeTable ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int>(TimeTableImpl);
+        _timeTable(T * H * W, nbr, H * W, cnt);
+    }
+
+    private Action<Index1D, IV, int, int>? _upTable;
+    private static void UpTableImpl(Index1D m, IV nbr, int Hin, int Win)
+    {
+        int Ho = 2 * Hin, Wo = 2 * Win, hw = Ho * Wo, t = m / hw, p = m % hw, h = p / Wo, w = p % Wo;
+        for (int kk = 0; kk < 9; kk++)
+        {
+            int hh = h + kk / 3 - 1, ww = w + kk % 3 - 1;
+            nbr[m * 27 + kk] = hh >= 0 && hh < Ho && ww >= 0 && ww < Wo ? (t * Hin + hh / 2) * Win + ww / 2 : -1;     // nearest-exact x2, then the 3x3 taps on the upsampled grid
+        }
+    }
+    /// <summary>Nearest-neighbour x2 followed by a 3x3 convolution, as one gather table (9 taps): input [T, Hin, Win], output [T, 2Hin, 2Win].</summary>
+    public void UpTable(IV nbr, int T, int Hin, int Win)
+    {
+        _upTable ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int>(UpTableImpl);
+        _upTable(T * 4 * Hin * Win, nbr, Hin, Win);
+    }
+
+    // DupUp3D (the up-block shortcut): channel repeat_interleave then a channel-to-space regroup; output [T*ft - dropFrames, H*fs, W*fs, outC]
+    private Action<Index1D, FV, FV, int, int, int, int, int, int, int, int>? _dupUp;
+    private static void DupUpImpl(Index1D i, FV x, FV o, int H, int W, int inC, int outC, int ft, int fs, int repeats, int dropFrames)
+    {
+        int oc = i % outC, rest = i / outC, Wo = W * fs, Ho = H * fs;
+        int col = rest % Wo; rest /= Wo;
+        int row = rest % Ho; int f = rest / Ho + dropFrames;
+        int a = f % ft, t = f / ft, b = row % fs, h = row / fs, d = col % fs, w = col / fs;
+        int cprime = ((oc * ft + a) * fs + b) * fs + d;
+        o[i] = x[((long)(t * H + h) * W + w) * inC + cprime / repeats];
+    }
+    public void DupUp(FV x, FV o, int T, int H, int W, int inC, int outC, int ft, int fs, int dropFrames)
+    {
+        _dupUp ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int, int, int>(DupUpImpl);
+        int repeats = outC * ft * fs * fs / inC;
+        _dupUp((T * ft - dropFrames) * H * fs * W * fs * outC, x, o, H, W, inC, outC, ft, fs, repeats, dropFrames);
+    }
+
+    // upsample3d's time doubling: conv output [T*HW, 2c] -> [2T*HW, c], output frame 2t + j takes channels j*c .. (j+1)*c of input frame t
+    private Action<Index1D, FV, FV, int, int>? _timeDouble;
+    private static void TimeDoubleImpl(Index1D i, FV x, FV o, int hw, int c)
+    {
+        int ch = i % c, rest = i / c, p = rest % hw, f = rest / hw, t = f / 2, j = f % 2;
+        o[i] = x[((long)(t * hw + p)) * (2 * c) + j * c + ch];
+    }
+    public void TimeDouble(FV x, FV o, int T, int hw, int c)
+    {
+        _timeDouble ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(TimeDoubleImpl);
+        _timeDouble(2 * T * hw * c, x, o, hw, c);
+    }
+
+    // The VAE's single-head spatial attention over N voxels of one frame, head width D: qkv [N, 3D] (q | k | v), scale 1/sqrt(D)
+    private Action<Index1D, FV, FV, int, int, float>? _attnScores;
+    private static void AttnScoresImpl(Index1D idx, FV qkv, FV s, int N, int D, float scale)
+    {
+        int i = idx / N, j = idx % N;
+        long qb = (long)i * 3 * D, kb = (long)j * 3 * D + D;
+        float acc = 0f;
+        for (int d = 0; d < D; d++) acc += qkv[qb + d] * qkv[kb + d];
+        s[idx] = acc * scale;
+    }
+    private Action<Index1D, FV, int>? _softmaxRows;
+    private static void SoftmaxRowsImpl(Index1D i, FV s, int N)
+    {
+        long b = (long)(int)i * N;
+        float mx = s[b];
+        for (int j = 1; j < N; j++) mx = MathF.Max(mx, s[b + j]);
+        float sum = 0f;
+        for (int j = 0; j < N; j++) { float e = MathF.Exp(s[b + j] - mx); s[b + j] = e; sum += e; }
+        float inv = 1f / sum;
+        for (int j = 0; j < N; j++) s[b + j] *= inv;
+    }
+    private Action<Index1D, FV, FV, FV, int, int>? _attnOut;
+    private static void AttnOutImpl(Index1D idx, FV p, FV qkv, FV o, int N, int D)
+    {
+        int i = idx / D, d = idx % D;
+        long pb = (long)i * N, vb = 2L * D + d;
+        float acc = 0f;
+        for (int j = 0; j < N; j++) acc += p[pb + j] * qkv[(long)j * 3 * D + vb];
+        o[idx] = acc;
+    }
+    /// <summary>scores [N, N] scratch, o [N, D].</summary>
+    public void SpatialAttention(FV qkv, FV scores, FV o, int N, int D)
+    {
+        _attnScores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float>(AttnScoresImpl);
+        _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
+        _attnOut ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnOutImpl);
+        _attnScores(N * N, qkv, scores, N, D, 1f / MathF.Sqrt(D));
+        _softmaxRows(N, scores, N);
+        _attnOut(N * D, scores, qkv, o, N, D);
+    }
+
+    // the decoder's last step: head output [F*H*W, 12] (channel c * 4 + r * 2 + q) -> video [3, F, 2H, 2W] channel-first, clamped to [-1, 1]
+    private Action<Index1D, FV, FV, int, int, int>? _unpatchVideo;
+    private static void UnpatchVideoImpl(Index1D i, FV head, FV video, int F, int H, int W)
+    {
+        int x = i % (2 * W), y = (i / (2 * W)) % (2 * H), f = (i / (4 * H * W)) % F, c = i / (4 * H * W * F);
+        int q = y % 2, r = x % 2;
+        float v = head[((long)(f * H + y / 2) * W + x / 2) * 12 + c * 4 + r * 2 + q];
+        video[i] = MathF.Max(-1f, MathF.Min(1f, v));
+    }
+    public void UnpatchifyVideo(FV head, FV video, int F, int H, int W)
+    {
+        _unpatchVideo ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(UnpatchVideoImpl);
+        _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
     // ---------------------------------------------------------------------------------------------------
