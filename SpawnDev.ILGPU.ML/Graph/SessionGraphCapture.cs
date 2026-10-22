@@ -253,6 +253,9 @@ public sealed class SessionGraphCapture : IDisposable
             // Set only by the catch below, so the outcome line further down can tell "a throw already
             // described this attempt" from "the previous call's status is still sitting there".
             bool statusWrittenByThrow = false;
+            // The implicit-GEMM Conv owns scratch buffers it allocates on first use and grows: not something to run inside a recording window (a device allocation there is fatal on CUDA), and a
+            // recorded WebGPU plan of it replayed 6x SLOWER than the direct run (SDTurbo_WebGPU_Capture_Replay: 85 s vs 14 s). Recording uses the direct convolution kernels, as it always did.
+            Kernels.Conv2DGemm.SuspendCount++;
             try
             {
                 if (_accelerator.AcceleratorType == AcceleratorType.Cuda)
@@ -272,6 +275,7 @@ public sealed class SessionGraphCapture : IDisposable
                 statusWrittenByThrow = true;
                 Console.WriteLine($"[SessionGraphCapture] capture failed - running direct: {ex.Message}");
             }
+            finally { Kernels.Conv2DGemm.SuspendCount--; }
 
             // ⚠️ TryCapture returning NULL is the one outcome that prints nothing and throws nothing, so
             // without this the loudest signal for the commonest silent failure is no signal at all.

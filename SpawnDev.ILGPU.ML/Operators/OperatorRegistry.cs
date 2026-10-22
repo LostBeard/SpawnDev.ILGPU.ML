@@ -81,6 +81,8 @@ public class OperatorRegistry : IDisposable
     public NormalizationKernels Normalization { get; }
     public TransposeKernel Transpose { get; }
     public GatherKernel Gather { get; }
+    /// <summary>The 2D Conv as an implicit GEMM (fp16 weights): see <see cref="Kernels.Conv2DGemm"/>.</summary>
+    public Kernels.Conv2DGemm ConvGemm { get; }
 
     /// <summary>GPU scatter for ScatterElements / ScatterND (both were no-ops before it existed).</summary>
     public ScatterKernel Scatter { get; }
@@ -136,6 +138,7 @@ public class OperatorRegistry : IDisposable
         Normalization = new NormalizationKernels(accelerator);
         Transpose = new TransposeKernel(accelerator);
         Gather = new GatherKernel(accelerator);
+        ConvGemm = new Kernels.Conv2DGemm(accelerator);
         Scatter = new ScatterKernel(accelerator);
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
@@ -482,6 +485,7 @@ public class OperatorRegistry : IDisposable
         // it catches the Accelerator property (IDisposable) which we don't own.
         // Disposing the shared Accelerator destroys the GPU device and causes
         // "obj null or undefined" on WebGPU for all subsequent operations.
+        try { ConvGemm.Dispose(); } catch { }
         try { (MatMul as IDisposable)?.Dispose(); } catch { }
         try { (LayerNorm as IDisposable)?.Dispose(); } catch { }
         try { (Softmax as IDisposable)?.Dispose(); } catch { }

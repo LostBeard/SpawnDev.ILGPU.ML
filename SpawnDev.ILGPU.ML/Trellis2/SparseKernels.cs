@@ -236,6 +236,23 @@ public sealed class SparseKernels
         int ci = idx % cin, kk = idx / cin % 27, co = idx / (cin * 27);
         dst[idx] = src[((long)co * cin + ci) * 27 + kk];
     }
+    private Action<Index1D, HV, HV, int, int, int>? _permuteTapsF16;
+    private static void PermuteTapsF16Impl(Index1D idx, HV src, HV dst, int cin, int taps, int dummy)
+    {
+        int ci = idx % cin, t = idx / cin % taps, co = idx / (cin * taps);
+        dst[idx] = src[((long)co * cin + ci) * taps + t];
+    }
+    /// <summary>Torch / ONNX Conv weight [Co][Ci][taps] (taps = kH * kW, row-major) -> the gather layout [Co][taps][Ci] of <see cref="ConvTaps"/>, for any tap count.</summary>
+    public void PermuteConvWeight(HV src, HV dst, int cin, int cout, int taps)
+    {
+        _permuteTapsF16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, int, int, int>(PermuteTapsF16Impl);
+        _permuteTapsF16(cout * taps * cin, src, dst, cin, taps, 0);
+    }
+
+    /// <summary>True when <see cref="ConvTaps"/> would run a GEMM (tensor cores or the tiled kernel) for these sizes instead of its naive loop.</summary>
+    public bool ConvTapsIsGemm(int M, int taps, int cin, int cout, long xRows)
+        => (Cuda && cin % MmaGemm.BK == 0 && cout % 2 == 0) || (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin));
+
     private Action<Index1D, FV, FV, int, int>? _permuteF32;
     private static void PermuteF32Impl(Index1D idx, FV src, FV dst, int cin, int cout)
     {

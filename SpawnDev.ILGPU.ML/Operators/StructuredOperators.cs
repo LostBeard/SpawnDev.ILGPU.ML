@@ -490,7 +490,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         if (xShape.Length != 4 || wShape.Length != 4) return false;
 
         int group = ctx.GetInt("group", 1);
-        var (_, inC, inH, inW) = LayoutHelper.GetDims(xShape, ctx.Format);
+        var (halfBatch, inC, inH, inW) = LayoutHelper.GetDims(xShape, ctx.Format);
         if (group == -1) group = inC;
         int outC = wShape[0];
         if (group != 1) return false;               // only standard (non-grouped, non-depthwise) here
@@ -512,6 +512,17 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
 
         // The VAE loads most conv weights as fp16: a Tensor with IsHalf=true has an EMPTY .Data (fp32) and a
         // populated .HalfData. Route to the half-weight kernel; only genuinely fp32 weights use Conv2D<T>.
+        if (wIn.Float.IsHalf && halfBatch == 1)
+        {
+            int gOutH = (inH + padTop + padBottom - (dilationH * (kH - 1) + 1)) / stride + 1, gOutW = (inW + padLeft + padRight - (dilationW * (kW - 1) + 1)) / strideW + 1;
+            if (gOutH > 0 && gOutW > 0 && reg.ConvGemm.Supports(1, inC, inH, inW, outC, kH, kW, gOutH, gOutW))
+            {
+                // implicit GEMM (tensor cores on CUDA, the tiled kernel elsewhere): about 10x the direct kernel below on a 512x512 VAE decode
+                reg.ConvGemm.Run<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.HalfData, bias, output.Data, 1, inC, inH, inW, outC, kH, kW, stride, strideW,
+                    padTop, padLeft, dilationH, dilationW, gOutH, gOutW);
+                return true;
+            }
+        }
         if (wIn.Float.IsHalf)
             pak.Conv2DHalfWeight<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.HalfData, bias, output.Data,
                 inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
@@ -669,6 +680,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
+                else if (w.IsHalf && ctx.Outputs[0].Shape.Length == 4 && reg.ConvGemm.Supports(batchN, inC, inH, inW, outC, kH, kW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]))
+                    reg.ConvGemm.Run<float>(x.Data, w.HalfData, bias, ctx.Outputs[0].Data, batchN, inC, inH, inW, outC, kH, kW, stride, strideW,
+                        padTop, padLeft, dilationH, dilationW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]);
                 else if (LowPWeightDispatch.IsLowP(w)) // native low-p weight (NCHW group-1) -> generic low-p kernel, fp32 accumulate
                     LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
