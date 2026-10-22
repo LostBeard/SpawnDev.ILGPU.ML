@@ -4,6 +4,11 @@ Text to video and image to video on ILGPU, desktop (CUDA, OpenCL) and in the bro
 Wan2.2-TI2V-5B (Apache-2.0): the umT5-XXL text encoder, a 5B-parameter diffusion transformer (DiT) with classifier-free guidance and the UniPC flow sampler, and the Wan2.2 video VAE
 (4x16x16 compression). One model does both modes: with a first-frame picture the first latent frame is held fixed at every step and the DiT gets per-token timesteps.
 
+**Turbo.** `wan22_ti2v_5b_dit_turbo_q8.safetensors` is the community step-distilled Wan2.2-TI2V-5B-Turbo (quanhaol; trained with Self-Forcing / DMD for 4 steps and guidance 1): one DiT pass per step,
+no negative prompt, `WanRequest { Steps = 4, GuidanceScale = 1, Sampler = WanSampler.FewStep }` (predict x0 from the velocity, re-noise it with fresh noise to the next sigma, the last step returns x0).
+It is the default of the demo page and the examples (`--turbo`): 1280x704 with 33 frames takes 79 s on an RTX 4070 (the standard model: 203 s for 20 steps, and less sharp), and it runs at 832x480 and 1280x704
+in the browser (see Measured). It is sharpest at its native 1280x704; at 640x352 it is rough. The model card names no licence (the base model is Apache-2.0; a mirror of the Turbo weights lists Apache-2.0).
+
 The stages run one after another so only one large model is on the device at a time (the umT5 streams one layer at a time), which is what lets a 12 GB card, and a browser tab, run it.
 
 ```csharp
@@ -22,6 +27,7 @@ Exported once from the reference checkpoints with `tools/wan-harness/reference` 
 | File | Size | Notes |
 |------|------|-------|
 | `wan22_ti2v_5b_dit_q8.safetensors` | 5.6 GB | 8-bit blocks (the FLUX.2 block format, dequantised one matrix at a time). Matches the 16-bit model within its own rounding |
+| `wan22_ti2v_5b_dit_turbo_q8.safetensors` | 5.6 GB | the Turbo (step-distilled) transformer, 8-bit; exported from the community fp16 checkpoint (`export_dit_bf16.py OUT SRC`, then `quantize_streaming.py`) |
 | `wan22_ti2v_5b_dit_q4.safetensors` | 3.1 GB | 4-bit; visibly softer |
 | `wan22_ti2v_5b_dit_bf16.safetensors` | 10 GB | as released |
 | `wan22_vae_f16.safetensors` | 1.4 GB | |
@@ -50,6 +56,7 @@ Every stage is checked against tensors dumped from the reference implementation 
 
 RTX 4070 12 GB, Chrome 156 WebGPU, 640x352, 17 frames, 30 steps, 8-bit DiT and 8-bit umT5: **176 s** (text 33 s, DiT 122 s, VAE decode 21 s). The browser run reads the weights by HTTP range
 requests / OPFS and the final latent matches the reference to 0.225 relative RMS (the desktop run: 0.114).
+Turbo in the browser (4 steps): 832x480 x33 frames 131 s (text 33 s, DiT 47 s, decode 51 s); 1280x704 x17 frames 166 s (text 27 s, DiT 50 s, decode 89 s).
 Desktop CUDA, `Examples/11.VideoGen.Console --ci` (320x192, 9 frames, 8 steps): 38 s, 14 s of it the text encoder.
 
 ## Limits

@@ -11,7 +11,8 @@
 //
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
-//           --dit q8|q4|bf16 (5.6 GB / 3.1 GB / 10 GB)  --text q8|bf16 (6.4 GB / 11.4 GB)  --models DIR (a local folder of the exports; else they
+//           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
+//           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
 //
 //  Output: <out>/video.webp (animated), <out>/frame_0000.png ...  A bigger size or more frames costs memory: on a 12 GB card 640x352 with 17-49 frames is comfortable.
@@ -51,10 +52,17 @@ for (int i = 0; i < args.Length; i++)
         case "--out" when i + 1 < args.Length: o.Out = args[++i]; break;
         case "--fps" when i + 1 < args.Length: o.Fps = int.Parse(args[++i]); break;
         case "--no-frames": o.NoFrames = true; break;
+        case "--sampler" when i + 1 < args.Length: o.FewStep = args[++i].Equals("fewstep", StringComparison.OrdinalIgnoreCase); break;
+        case "--turbo": o.Turbo = true; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
 string prompt = string.Join(' ', words);
+if (o.Turbo)                                                    // Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, the few-step sampler (each can still be overridden by a later option)
+{
+    o.Dit = "turbo_q8"; o.FewStep = true; o.Guidance = 1.0;
+    if (!args.Contains("--steps")) o.Steps = 4;
+}
 if (o.Ci)
 {
     o.Width = 320; o.Height = 192; o.Frames = 9; o.Steps = 8; o.Seed = 1;
@@ -93,7 +101,7 @@ async Task<int> Run(string prompt, Options o)
 
     var request = new WanRequest
     {
-        Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed,
+        Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
     };
     if (o.Image != null)
     {
@@ -102,7 +110,7 @@ async Task<int> Run(string prompt, Options o)
         img.CopyPixelDataTo(rgb);
         request = new WanRequest
         {
-            Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed,
+            Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
             ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height,
         };
     }
@@ -145,7 +153,7 @@ async Task<int> Run(string prompt, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames;
+    public bool Ci, NoFrames, FewStep, Turbo;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;

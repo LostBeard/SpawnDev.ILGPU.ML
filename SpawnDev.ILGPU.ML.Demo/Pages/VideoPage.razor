@@ -54,7 +54,9 @@
             </div>
             <div class="vid-setting">
                 <label>Steps:</label>
-                <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The reference uses 50; 20 to 30 is usually fine">
+                <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The Turbo transformer is distilled for 4 steps. The standard one uses 50 in the reference; 20 to 30 is usually fine">
+                    <option value="4">4 (Turbo)</option>
+                    <option value="8">8</option>
                     <option value="12">12 (draft)</option>
                     <option value="20">20</option>
                     <option value="30">30</option>
@@ -63,7 +65,7 @@
             </div>
             <div class="vid-setting">
                 <label>Guidance:</label>
-                <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@_isRunning" />
+                <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@(_isRunning || _dit == "turbo")" title="@(_dit == "turbo" ? "Turbo has the guidance built in (1): one transformer pass per step" : "classifier-free guidance scale, the reference uses 5")" />
             </div>
             <div class="vid-setting">
                 <label>Seed:</label>
@@ -71,9 +73,10 @@
             </div>
             <div class="vid-setting">
                 <label>Transformer:</label>
-                <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer.">
-                    <option value="q8">8-bit (5.6 GB)</option>
-                    <option value="q4">4-bit (3.1 GB)</option>
+                <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Turbo: Wan2.2-TI2V-5B-Turbo, a step-distilled version that draws a clip in 4 steps with one pass each (about 8x faster than the standard 30 steps with guidance, and sharper at 720p). Standard 8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer.">
+                    <option value="turbo">Turbo 8-bit (5.6 GB, 4 steps)</option>
+                    <option value="q8">Standard 8-bit (5.6 GB)</option>
+                    <option value="q4">Standard 4-bit (3.1 GB)</option>
                 </select>
             </div>
         </div>
@@ -83,7 +86,7 @@
 
         <details class="vid-advanced">
             <summary>Advanced</summary>
-            <label class="vid-label">Negative prompt (empty = the model's default list of video defects):</label>
+            <label class="vid-label">Negative prompt (standard transformer only: Turbo has no guidance; empty = the model's default list of video defects):</label>
             <input type="text" class="vid-prompt-input" @bind="_negative" disabled="@_isRunning" />
             <label class="vid-label">Model server (empty = models.spawndev.com):</label>
             <input type="text" class="vid-prompt-input" @bind="_modelServer" disabled="@(_isRunning || _isModelLoading)" placeholder="http://127.0.0.1:8767" />
@@ -150,10 +153,10 @@
     private string _prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.";
     private string _negative = "";
     private string _size = "640x352";
-    private int _frames = 17, _steps = 30;
-    private double _guidance = 5.0;
+    private int _frames = 17, _steps = 4;
+    private double _guidance = 1.0;
     private long? _seed;
-    private string _dit = "q8";                         // "q8" | "q4"
+    private string _dit = "turbo";                      // "turbo" | "q8" | "q4"
     private string _modelServer = "";
     private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
     private double _modelProgress, _inferenceMs, _fraction;
@@ -175,7 +178,11 @@
 
     private Task HandleBackendChange(string backend) => Task.CompletedTask;
 
-    private void PrecisionChanged() { _pipeline = null; _isModelLoaded = false; }
+    private void PrecisionChanged()
+    {
+        _pipeline = null; _isModelLoaded = false;
+        if (_dit == "turbo") { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
+    }
 
     private async Task EnsureAcceleratorAsync()
     {
@@ -198,13 +205,14 @@
         {
             await EnsureAcceleratorAsync();
             if (!string.IsNullOrWhiteSpace(_modelServer)) SpawnDev.ILGPU.ML.Hub.ModelsHost.BaseUrl = _modelServer.Trim().TrimEnd('/');
-            _pipeline ??= new Wan22Pipeline(_accelerator!, ModelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo(Wan22Paths.DitFile(_dit), Wan22Paths.TextEncoderFile("q8")));
+            _pipeline ??= new Wan22Pipeline(_accelerator!, ModelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo(Wan22Paths.DitFile(_dit == "turbo" ? "turbo_q8" : _dit), Wan22Paths.TextEncoderFile("q8")));
             var parts = _size.Split('x');
             int width = int.Parse(parts[0]), height = int.Parse(parts[1]);
             var request = new WanRequest
             {
                 Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
-                GuidanceScale = _guidance, Seed = _seed ?? Random.Shared.NextInt64(1, int.MaxValue),
+                GuidanceScale = _dit == "turbo" ? 1.0 : _guidance, Seed = _seed ?? Random.Shared.NextInt64(1, int.MaxValue),
+                Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC,
             };
             if (_references.Count > 0)
             {
@@ -213,7 +221,7 @@
                 for (int p = 0; p < pic.Width * pic.Height; p++) { rgb[p * 3] = pic.Rgba[p * 4]; rgb[p * 3 + 1] = pic.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = pic.Rgba[p * 4 + 2]; }
                 request = new WanRequest
                 {
-                    Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = _guidance, Seed = request.Seed,
+                    Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
                     ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height,
                 };
             }

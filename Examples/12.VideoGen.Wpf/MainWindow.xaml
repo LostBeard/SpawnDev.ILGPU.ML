@@ -32,19 +32,19 @@
                             <ComboBoxItem Content="9" /><ComboBoxItem Content="17" /><ComboBoxItem Content="25" /><ComboBoxItem Content="33" /><ComboBoxItem Content="49" /><ComboBoxItem Content="81" /><ComboBoxItem Content="121" />
                         </ComboBox>
                         <TextBlock Text="Steps" VerticalAlignment="Center" Margin="0,0,6,0" />
-                        <ComboBox x:Name="StepsBox" Width="60" SelectedIndex="2" ToolTip="The reference uses 50; 20 to 30 is usually fine">
-                            <ComboBoxItem Content="12" /><ComboBoxItem Content="20" /><ComboBoxItem Content="30" /><ComboBoxItem Content="50" />
+                        <ComboBox x:Name="StepsBox" Width="60" SelectedIndex="0" ToolTip="Turbo: 4. The standard transformer: the reference uses 50, 20 to 30 is usually fine">
+                            <ComboBoxItem Content="4" /><ComboBoxItem Content="8" /><ComboBoxItem Content="12" /><ComboBoxItem Content="20" /><ComboBoxItem Content="30" /><ComboBoxItem Content="50" />
                         </ComboBox>
                     </WrapPanel>
 
                     <WrapPanel Margin="0,8,0,0">
                         <TextBlock Text="Guidance" VerticalAlignment="Center" Margin="0,0,6,0" />
-                        <TextBox x:Name="GuidanceBox" Text="5" Width="40" Padding="2" Margin="0,0,14,0" />
+                        <TextBox x:Name="GuidanceBox" Text="1" Width="40" Padding="2" Margin="0,0,14,0" />
                         <TextBlock Text="Seed" VerticalAlignment="Center" Margin="0,0,6,0" />
                         <TextBox x:Name="SeedBox" Width="90" Padding="2" Margin="0,0,14,0" ToolTip="Blank = random" />
                         <TextBlock Text="Transformer" VerticalAlignment="Center" Margin="0,0,6,0" />
-                        <ComboBox x:Name="DitBox" Width="130" SelectedIndex="0">
-                            <ComboBoxItem Content="8-bit (5.6 GB)" /><ComboBoxItem Content="4-bit (3.1 GB)" /><ComboBoxItem Content="16-bit (10 GB)" />
+                        <ComboBox x:Name="DitBox" Width="170" SelectedIndex="0" SelectionChanged="DitChanged" ToolTip="Turbo is step-distilled: 4 steps, one pass each, sharper at 720p">
+                            <ComboBoxItem Content="Turbo 8-bit (5.6 GB)" /><ComboBoxItem Content="Standard 8-bit (5.6 GB)" /><ComboBoxItem Content="Standard 4-bit (3.1 GB)" /><ComboBoxItem Content="Standard 16-bit (10 GB)" />
                         </ComboBox>
                     </WrapPanel>
 

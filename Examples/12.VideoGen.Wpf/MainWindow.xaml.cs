@@ -114,7 +114,9 @@ public partial class MainWindow : Window
         int frames = int.Parse(Content(FramesBox)), steps = int.Parse(Content(StepsBox));
         double guidance = double.TryParse(GuidanceBox.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 5.0;
         long seed = long.TryParse(SeedBox.Text, out var sd) ? sd : Random.Shared.NextInt64(1, int.MaxValue);
-        string dit = DitBox.SelectedIndex switch { 0 => "q8", 1 => "q4", _ => "bf16" }, text = TextEncBox.SelectedIndex == 0 ? "q8" : "bf16";
+        bool turbo = DitBox.SelectedIndex == 0;
+        string dit = DitBox.SelectedIndex switch { 0 => "turbo_q8", 1 => "q8", 2 => "q4", _ => "bf16" }, text = TextEncBox.SelectedIndex == 0 ? "q8" : "bf16";
+        if (turbo) guidance = 1.0;
 
         Busy(true); _timer.Stop(); ReplayButton.IsEnabled = SaveButton.IsEnabled = false; Bar.Value = 0; InfoText.Text = "";
         var total = System.Diagnostics.Stopwatch.StartNew();
@@ -127,7 +129,7 @@ public partial class MainWindow : Window
             var request = new WanRequest
             {
                 Prompt = prompt, NegativePrompt = string.IsNullOrWhiteSpace(NegativeBox.Text) ? null : NegativeBox.Text.Trim(), Width = width, Height = height, Frames = frames, Steps = steps,
-                GuidanceScale = guidance, Seed = seed, ImageRgb = _pictureRgb, ImageWidth = _pictureW, ImageHeight = _pictureH,
+                GuidanceScale = guidance, Seed = seed, Sampler = turbo ? WanSampler.FewStep : WanSampler.UniPC, ImageRgb = _pictureRgb, ImageWidth = _pictureW, ImageHeight = _pictureH,
             };
             Log($"{(_pictureRgb != null ? "Image to video" : "Text to video")}: {width}x{height}, {frames} frames, {steps} steps, seed {seed}.");
             var progress = new Progress<WanProgress>(p =>
@@ -144,6 +146,13 @@ public partial class MainWindow : Window
         }
         catch (Exception ex) { Log("Failed: " + ex.Message); MessageBox.Show(ex.ToString(), "Generation failed"); StatusText.Text = "Failed."; }
         finally { Busy(false); }
+    }
+
+    private void DitChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        if (DitBox.SelectedIndex == 0) { StepsBox.SelectedIndex = 0; GuidanceBox.Text = "1"; }            // Turbo: 4 steps, guidance built in
+        else { if (StepsBox.SelectedIndex < 3) StepsBox.SelectedIndex = 4; GuidanceBox.Text = "5"; }       // the standard recipe: 30 steps, guidance 5
     }
 
     private void ReplayClick(object sender, RoutedEventArgs e) { _frameIndex = 0; if (_frames.Count > 0) Player.Source = _frames[0]; _timer.Start(); }

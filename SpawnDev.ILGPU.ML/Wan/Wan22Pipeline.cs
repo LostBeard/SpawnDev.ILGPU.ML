@@ -37,6 +37,10 @@ public sealed class Wan22Paths
     };
 }
 
+/// <summary>The sampler: <see cref="UniPC"/> is the reference's (50 steps with guidance); <see cref="FewStep"/> is what a step-distilled model (Wan2.2-TI2V-5B-Turbo, trained with Self-Forcing / DMD)
+/// is sampled with: predict x0 from the velocity, then re-noise it with FRESH noise to the next sigma (the last step returns x0).</summary>
+public enum WanSampler { UniPC, FewStep }
+
 /// <summary>What to generate.</summary>
 public sealed class WanRequest
 {
@@ -53,6 +57,8 @@ public sealed class WanRequest
     public double GuidanceScale { get; init; } = 5.0;
     public double Shift { get; init; } = 5.0;
     public long Seed { get; init; } = 42;
+    /// <summary>The sampler; <see cref="WanSampler.FewStep"/> with 4 steps and guidance 1 for the Turbo model.</summary>
+    public WanSampler Sampler { get; init; } = WanSampler.UniPC;
     /// <summary>Starting noise [48, F/4 + 1, H/16, W/16] to use instead of one drawn from <see cref="Seed"/> (to reproduce another implementation's run exactly).</summary>
     public float[]? InitialNoise { get; init; }
     /// <summary>Log the time of every VAE decoder stage to the console (<c>[Wan] vae</c> lines).</summary>
@@ -242,7 +248,20 @@ public sealed class Wan22Pipeline
                     float g = (float)req.GuidanceScale;
                     for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + g * (nc[i] - nu[i]);       // classifier-free guidance, in place
                 }
-                latent = sched.Step(nc, latent);
+                if (req.Sampler == WanSampler.FewStep)
+                {
+                    float sigma = sched.Sigmas[s], sNext = sched.Sigmas[s + 1];
+                    bool last = s == req.Steps - 1;
+                    var fresh = last ? null : Gaussian(latent.Length, req.Seed + 7919L * (s + 1));
+                    var next = new float[latent.Length];
+                    for (int i = 0; i < next.Length; i++)
+                    {
+                        float x0 = latent[i] - sigma * nc[i];                                     // flow matching: x_t = (1 - sigma) x0 + sigma noise, v = noise - x0
+                        next[i] = last ? x0 : (1f - sNext) * x0 + sNext * fresh![i];
+                    }
+                    latent = next;
+                }
+                else latent = sched.Step(nc, latent);
                 PutPicture(latent);
                 Report("denoise", (s + 1.0) / req.Steps, $"step {s + 1} of {req.Steps}");
             }

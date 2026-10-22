@@ -139,4 +139,43 @@ public abstract partial class MLTestBase
         if (!(std > 0.02)) throw new Exception($"the video is flat (std {std:F4})");
         return $"{sw.Elapsed.TotalSeconds:F0} s";
     });
+
+    /// <summary>
+    /// The Turbo transformer (step-distilled, 4 steps, guidance 1, the few-step sampler) in the browser at the sizes the /video page offers: 832x480 x33 frames, then 1280x704 x17 (the model's own size;
+    /// a failure there is reported, not thrown). The video must be finite and not flat; stage times go to the console.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_OverHttp_Turbo() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser pipeline test");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var source = new WanRangeSource(http);
+        try { await using var probe = await source.OpenAsync("", Wan22Paths.DitFile("turbo_q8")); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running or has no Turbo file ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        var pipe = new Wan22Pipeline(accelerator, source, "", Wan22Paths.InRepo(Wan22Paths.DitFile("turbo_q8"), Wan22Paths.TextEncoderFile("q8")));
+        string summary = "";
+        foreach (var (w, h, frames) in new[] { (832, 480, 33), (1280, 704, 17) })
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            string last = "";
+            var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; Console.WriteLine($"[Wan] browser turbo {w}x{h} stage {p.Stage} at {sw.Elapsed.TotalSeconds:F0} s"); } });
+            try
+            {
+                var video = await pipe.GenerateAsync(new WanRequest { Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = w, Height = h, Frames = frames, Steps = 4, GuidanceScale = 1.0, Sampler = WanSampler.FewStep, Seed = 8 }, progress);
+                double sum = 0, sum2 = 0;
+                foreach (var v in video.Data) { if (!float.IsFinite(v)) throw new Exception("a pixel is not finite"); sum += v; sum2 += (double)v * v; }
+                double mean = sum / video.Data.Length, std = Math.Sqrt(sum2 / video.Data.Length - mean * mean);
+                Console.WriteLine($"[Wan] browser turbo {w}x{h}x{frames}: {sw.Elapsed.TotalSeconds:F0} s, pixel std {std:F3}");
+                if (!(std > 0.02)) throw new Exception($"the video is flat (std {std:F4})");
+                summary += $"{w}x{h}x{frames} {sw.Elapsed.TotalSeconds:F0} s; ";
+            }
+            catch (Exception e) when (w == 1280)
+            {
+                Console.WriteLine($"[Wan] browser turbo {w}x{h}x{frames}: FAILED after {sw.Elapsed.TotalSeconds:F0} s: {e.GetType().Name}: {e.Message}");
+                summary += $"{w}x{h}x{frames} failed; ";
+            }
+        }
+        return summary;
+    });
 }
