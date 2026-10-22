@@ -293,6 +293,35 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// How big a video the VAE decoder can decode on this device: a random latent at each size in WAN_VAE_SIZES ("WxHxFRAMES,..." default 640x352x17,832x480x17,832x480x33,1024x576x17), decoded
+    /// with the per-stage trace; a size that runs out of memory is reported and ends the list. Never fails: it reports the largest size that fit (pixel values are not checked, the latent is noise).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Vae_DecodeSizes() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("desktop GPU");
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors");
+        if (!File.Exists(vaePath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        string last = "none";
+        foreach (var spec in (Environment.GetEnvironmentVariable("WAN_VAE_SIZES") ?? "640x352x17,832x480x17,832x480x33,1024x576x17").Split(','))
+        {
+            var p = spec.Split('x'); int w = int.Parse(p[0]) / 16, h = int.Parse(p[1]) / 16, frames = int.Parse(p[2]), Fz = (frames - 1) / 4 + 1;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var z = Wan.Wan22Pipeline.Gaussian(48L * Fz * h * w, 5);
+                var video = await vae.DecodeAsync(z, Fz, h, w);
+                Console.WriteLine($"[Wan] vae size {spec}: decoded {video.Length / (3L * h * 16 * w * 16)} frames in {sw.Elapsed.TotalSeconds:F1} s");
+                last = spec;
+            }
+            catch (Exception e) { Console.WriteLine($"[Wan] vae size {spec}: FAILED after {sw.Elapsed.TotalSeconds:F1} s: {e.GetType().Name}: {e.Message.Split((char)10)[0]}"); break; }
+        }
+        return $"largest size that decoded: {last}";
+    });
+
+    /// <summary>
     /// The whole pipeline against the reference's 30-step trajectory: the same prompt (t5_0), the same starting noise, 8-bit DiT, everything ours (umT5, DiT, UniPC, VAE); the video is compared
     /// with our decode of the reference's final latent. The free-running sampler alone ends 0.11 away (the reference's own sensitivity), so a bound of 0.5 on the decoded video separates
     /// "the same picture" from "a different one".

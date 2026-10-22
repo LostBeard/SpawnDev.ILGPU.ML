@@ -86,4 +86,34 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[Wan] vae decode on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s for {video.Length / (3 * 352 * 640)} frames, pixel mean {sum / video.Length:F5}, rms {Math.Sqrt(sum2 / video.Length):F5}");
         return $"{sw.Elapsed.TotalSeconds:F1} s";
     });
+
+    /// <summary>The browser counterpart of Wan_Vae_DecodeSizes: a random latent decoded at 832x480 with 17 and 33 frames (the sizes the /video page offers), timed; a failure is reported, not thrown.</summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Vae_OverHttp_DecodeSizes() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser VAE size test");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var source = new WanRangeSource(http);
+        try { await using var probe = await source.OpenAsync("", "wan22_vae_f16.safetensors"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        await using var stream = await source.OpenAsync("", "wan22_vae_f16.safetensors");
+        using var empty = System.Text.Json.JsonDocument.Parse("{}");
+        using var weights = await SpawnDev.ILGPU.ML.Trellis2.GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, "vae");
+        using var vae = new WanVae(accelerator, weights);
+        string last = "none";
+        foreach (var (w, h, frames) in new[] { (640, 352, 17), (832, 480, 17), (832, 480, 33) })
+        {
+            int Fz = (frames - 1) / 4 + 1, lw = w / 16, lh = h / 16;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var video = await vae.DecodeAsync(Wan22Pipeline.Gaussian(48L * Fz * lh * lw, 5), Fz, lh, lw);
+                Console.WriteLine($"[Wan] browser vae size {w}x{h}x{frames}: decoded in {sw.Elapsed.TotalSeconds:F1} s");
+                last = $"{w}x{h}x{frames}";
+            }
+            catch (Exception e) { Console.WriteLine($"[Wan] browser vae size {w}x{h}x{frames}: FAILED after {sw.Elapsed.TotalSeconds:F1} s: {e.GetType().Name}"); break; }
+        }
+        return $"largest size that decoded: {last}";
+    });
 }
