@@ -38,6 +38,46 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The whole pipeline end to end on a small clip (320x192, 9 frames, 8 steps, the 8-bit DiT): text through umT5, the DiT with guidance and UniPC, the VAE decode. No reference to compare
+    /// against at this size and step count (the stages have their own parity tests); this proves they compose, that the video is finite, in range and not constant, and writes three frames
+    /// as PNG to WAN_OUT (default WAN_DIR\out) to look at. Image to video is the second half: the first frame must come back close to the picture.
+    /// </summary>
+    private static int EnvInt(string name, int fallback) => int.TryParse(Environment.GetEnvironmentVariable(name), out var v) ? v : fallback;
+
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_GeneratesAVideo() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the desktop pipeline test needs a desktop GPU (the browser pipeline is separate)");
+        var paths = Wan22Paths.InFolder(WanDir);
+        if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder) || !File.Exists(paths.Tokenizer)) throw new UnsupportedTestException($"Wan exports not found in {WanDir}");
+        string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
+        var pipe = new Wan22Pipeline(accelerator, paths);
+        var stages = new List<string>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string last = "";
+        var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; stages.Add($"{p.Stage} at {sw.Elapsed.TotalSeconds:F0} s"); } });
+        var video = await pipe.GenerateAsync(new WanRequest
+        {
+            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly.", Width = EnvInt("WAN_W", 320), Height = EnvInt("WAN_H", 192), Frames = EnvInt("WAN_FRAMES", 9), Steps = EnvInt("WAN_STEPS", 8), Seed = 1,
+        }, progress);
+        void Check(WanVideo v, string tag)
+        {
+            if (v.Data.Length != 3L * v.Frames * v.Width * v.Height) throw new Exception($"{tag}: wrong shape {v.Frames}x{v.Width}x{v.Height}");
+            double min = double.MaxValue, max = double.MinValue, sum = 0, sum2 = 0;
+            foreach (var x in v.Data) { if (!float.IsFinite(x)) throw new Exception($"{tag}: a pixel is not finite"); min = Math.Min(min, x); max = Math.Max(max, x); sum += x; sum2 += (double)x * x; }
+            double mean = sum / v.Data.Length, std = Math.Sqrt(sum2 / v.Data.Length - mean * mean);
+            if (max > 1.0001 || min < -1.0001) throw new Exception($"{tag}: pixels outside [-1, 1] ({min}..{max})");
+            if (!(std > 0.02)) throw new Exception($"{tag}: the video is constant (std {std:F4})");
+            Console.WriteLine($"[Wan] pipeline {tag}: {v.Frames} frames {v.Width}x{v.Height}, pixel mean {mean:F3}, std {std:F3}");
+            foreach (int f in new[] { 0, v.Frames / 2, v.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"pipeline_{tag}_{f}.png"), Assets.AssetGenerator.EncodePng(v.GetFrameRgba(f), v.Width, v.Height));
+        }
+        Check(video, "t2v");
+        Console.WriteLine($"[Wan] pipeline t2v stages: {string.Join(", ", stages)}; total {sw.Elapsed.TotalSeconds:F0} s");
+        return $"t2v ok in {sw.Elapsed.TotalSeconds:F0} s";
+    });
+
+    /// <summary>
     /// The DiT from its 8-bit and 4-bit block exports (5.6 GB and 3.1 GB instead of 10 GB; <c>quantize_streaming.py</c>, the FLUX.2 block format, dequantised a matrix at a time into a shared
     /// scratch before the normal GEMM) against the reference's bf16 noise predictions on the same inputs, text-to-video and with a clean first frame. Prints the error per format so
     /// the cost of the quantisation is on record; the bound is loose for 4-bit (visible differences are expected).
@@ -180,6 +220,101 @@ public abstract partial class MLTestBase
         foreach (var line in report) Console.WriteLine("[Wan] sampler loop vs reference: " + line);
         if (!(worstForced < 1.0)) throw new Exception("a teacher-forced sampler step deviates from the reference: " + string.Join("; ", report));
         return $"worst teacher-forced error {worstForced:P0} of its bound over {report.Count} steps";
+    });
+
+    /// <summary>
+    /// The sampler at the production step count: the reference's 30-step text-to-video trajectory (dump2/dit_t2v30.npz, 640x352, 17 frames, ref_dit_dump.py --steps 30) replayed teacher-forced
+    /// through our 8-bit DiT and UniPC, every step compared with the reference's latent. The four-step test above cannot see what the later steps of a long schedule do (the multistep history,
+    /// the last-step order reduction, the noise level where the latents collapse onto the data).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_SamplerLong_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the DiT runs on a desktop GPU or WebGPU");
+        var weightsPath = Path.Combine(WanDir, "wan22_ti2v_5b_dit_q8.safetensors"); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
+        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz")); using var t5n = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_neg.npz"));
+        var (ctx0, cs0) = WanNpz(t50, "context"); var (ctxN, csN) = WanNpz(t5n, "context");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
+        using var fx = ZipFile.OpenRead(fixture);
+        var (noise, ns) = WanNpz(fx, "noise"); var (ts, _) = WanNpz(fx, "timesteps");
+        dit.SetGrid(ns[1], ns[2], ns[3]); dit.SetContext(0, ctx0, cs0[0]); dit.SetContext(1, ctxN, csN[0]);
+        var sched = new FlowUniPCScheduler(); sched.SetTimesteps(ts.Length, 5.0);
+        using var lIn = accelerator.Allocate1D<float>(noise.Length); using var lOut = accelerator.Allocate1D<float>(noise.Length);
+        var lines = new List<string>(); double worst = 0;
+        var schedFree = new FlowUniPCScheduler(); schedFree.SetTimesteps(ts.Length, 5.0);
+        var free = (float[])noise.Clone();
+        for (int s = 0; s < ts.Length; s++)
+        {
+            var (refIn, _) = WanNpz(fx, $"step{s}_latent_in"); var (want, _) = WanNpz(fx, $"step{s}_latent_out");
+            lIn.View.CopyFromCPU(free);
+            dit.Forward(lIn.View, schedFree.Timesteps[s], false, 0, lOut.View); var fc = await lOut.View.CopyToHostAsync();
+            dit.Forward(lIn.View, schedFree.Timesteps[s], false, 1, lOut.View); var fu = await lOut.View.CopyToHostAsync();
+            for (int i = 0; i < fc.Length; i++) fc[i] = fu[i] + 5.0f * (fc[i] - fu[i]);
+            free = schedFree.Step(fc, free);
+            var mfree = WanCompare(free, want);
+            lIn.View.CopyFromCPU(refIn);
+            dit.Forward(lIn.View, sched.Timesteps[s], false, 0, lOut.View); var nc = await lOut.View.CopyToHostAsync();
+            dit.Forward(lIn.View, sched.Timesteps[s], false, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
+            for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + 5.0f * (nc[i] - nu[i]);
+            var got = sched.Step(nc, refIn);
+            var m = WanCompare(got, want); worst = Math.Max(worst, m.RelRms);
+            lines.Add($"step {s} t={sched.Timesteps[s]:F0}: teacher-forced relRMS {m.RelRms:E2}; free-running {mfree.RelRms:E2}");
+        }
+        foreach (var l in lines) Console.WriteLine("[Wan] long sampler vs reference: " + l);
+        if (!(worst < 0.1)) throw new Exception("a teacher-forced step of the 30-step trajectory deviates from the reference: " + string.Join("; ", lines));
+        return $"worst relRMS {worst:E2} over {ts.Length} steps";
+    });
+
+    /// <summary>
+    /// Decodes the reference's own final latent of the 30-step trajectory with our VAE and writes frames as PNG (WAN_OUT): what the model's output looks like when nothing of ours produced it,
+    /// to judge whether the look of our pipeline's video (a fox in snow, oversaturated at 640x352) is the model's or ours.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_DecodeReferenceTrajectory() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("desktop GPU");
+        string tag = Environment.GetEnvironmentVariable("WAN_REF_TAG") ?? "t2v30";
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors"); var fixture = Path.Combine(WanDir, "dump2", $"dit_{tag}.npz");
+        if (!File.Exists(vaePath) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
+        string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
+        using var fx = ZipFile.OpenRead(fixture);
+        var (final, s) = WanNpz(fx, "step29_latent_out");
+        int Fz = s[1], h = s[2], w = s[3];
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        var video = new WanVideo { Data = await vae.DecodeAsync(final, Fz, h, w), Width = w * 16, Height = h * 16, Frames = 4 * Fz - 3 };
+        foreach (int f in new[] { 0, video.Frames / 2, video.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"reference_{tag}_{f}.png"), Assets.AssetGenerator.EncodePng(video.GetFrameRgba(f), video.Width, video.Height));
+        return $"{video.Frames} frames";
+    });
+
+    /// <summary>
+    /// The whole pipeline against the reference's 30-step trajectory: the same prompt (t5_0), the same starting noise, 8-bit DiT, everything ours (umT5, DiT, UniPC, VAE); the video is compared
+    /// with our decode of the reference's final latent. The free-running sampler alone ends 0.11 away (the reference's own sensitivity), so a bound of 0.5 on the decoded video separates
+    /// "the same picture" from "a different one".
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("desktop GPU");
+        var paths = Wan22Paths.InFolder(WanDir); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
+        string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
+        const string prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.";       // t5_0's text
+        using var fx = ZipFile.OpenRead(fixture);
+        var (noise, ns) = WanNpz(fx, "noise"); var (final, _) = WanNpz(fx, "step29_latent_out");
+        var pipe = new Wan22Pipeline(accelerator, paths);
+        var got = await pipe.GenerateAsync(new WanRequest { Prompt = prompt, Width = ns[3] * 16, Height = ns[2] * 16, Frames = 4 * ns[1] - 3, Steps = 30, InitialNoise = noise });
+        using var vw = GpuWeights.LoadFile(accelerator, paths.Vae); using var vae = new WanVae(accelerator, vw);
+        var want = await vae.DecodeAsync(final, ns[1], ns[2], ns[3]);
+        var m = WanCompare(got.Data, want);
+        foreach (int f in new[] { 0, got.Frames / 2, got.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"pipeline_ref_{f}.png"), Assets.AssetGenerator.EncodePng(got.GetFrameRgba(f), got.Width, got.Height));
+        Console.WriteLine($"[Wan] pipeline vs reference trajectory: prompt '{prompt}', decoded video relRMS {m.RelRms:E2}");
+        if (!(m.RelRms < 0.5)) throw new Exception($"the pipeline's video is not the reference's: relRMS {m.RelRms:E2}");
+        return $"relRMS {m.RelRms:E2}";
     });
 
     /// <summary>
