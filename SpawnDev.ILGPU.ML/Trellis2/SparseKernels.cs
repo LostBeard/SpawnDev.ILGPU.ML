@@ -159,7 +159,7 @@ public sealed class SparseKernels
             _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, taps * cin, cout, cin, 1, 0, 0);
             return;
         }
-        if (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, x.Length / cin))
+        if (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, x.Length / cin, cin))
         {
             _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();

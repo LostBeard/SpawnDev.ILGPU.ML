@@ -50,7 +50,7 @@ public abstract partial class MLTestBase
         var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; Console.WriteLine($"[Wan] browser stage {p.Stage} at {sw.Elapsed.TotalSeconds:F0} s ({p.Message})"); } });
         var video = await pipe.GenerateAsync(new WanRequest
         {
-            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = 640, Height = 352, Frames = 17, Steps = 30, InitialNoise = noise,
+            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = 640, Height = 352, Frames = 17, Steps = 30, InitialNoise = noise, Trace = true,
         }, progress);
         double se = 0, sr = 0, min = double.MaxValue, max = double.MinValue;
         for (int i = 0; i < want.Length; i++) { double d = video.Latent![i] - want[i]; se += d * d; sr += (double)want[i] * want[i]; }
@@ -60,5 +60,30 @@ public abstract partial class MLTestBase
         if (!(rel < 0.4)) throw new Exception($"the browser pipeline's final latent is not the reference's: relRMS {rel:F3}");
         if (max > 1.0001 || min < -1.0001 || !(max - min > 0.5)) throw new Exception($"the video is out of range or flat: {min}..{max}");
         return $"relRMS {rel:F3} in {sw.Elapsed.TotalSeconds:F0} s";
+    });
+
+    /// <summary>
+    /// The VAE decoder alone in the browser (the reference's final 30-step latent from the file server, 640x352, 17 frames) with the per-stage device times on the console: the part of the pipeline that
+    /// is slow in the browser. Same file server as above.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Vae_OverHttp_DecodeTimes() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser VAE timing test");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        float[] latent;
+        try { latent = WanFloats(await http.GetByteArrayAsync(WanServer + "dump2/browser/final_t2v30.f32")); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        var source = new WanRangeSource(http);
+        await using var stream = await source.OpenAsync("", "wan22_vae_f16.safetensors");
+        using var empty = System.Text.Json.JsonDocument.Parse("{}");
+        using var weights = await SpawnDev.ILGPU.ML.Trellis2.GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, "vae");
+        using var vae = new WanVae(accelerator, weights) { Trace = true };
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var video = await vae.DecodeAsync(latent, 5, 22, 40);
+        double sum = 0, sum2 = 0; foreach (var v in video) { sum += v; sum2 += (double)v * v; }
+        Console.WriteLine($"[Wan] vae decode on {accelerator.AcceleratorType}: {sw.Elapsed.TotalSeconds:F1} s for {video.Length / (3 * 352 * 640)} frames, pixel mean {sum / video.Length:F5}, rms {Math.Sqrt(sum2 / video.Length):F5}");
+        return $"{sw.Elapsed.TotalSeconds:F1} s";
     });
 }

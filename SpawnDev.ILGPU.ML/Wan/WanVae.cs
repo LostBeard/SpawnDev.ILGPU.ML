@@ -325,6 +325,7 @@ public sealed class WanVae : IDisposable
         for (int i = 0; i < Fz; i++)
         {
             int T = 1, H = h, W = w;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var xi = Tmp((long)hw * Z);
             xi.View.CopyFrom(zBuf.View.SubView((long)i * hw * Z, (long)hw * Z));
             var y = ConvCausal("decoder.conv1", xi, T, H, W, Z, 1024); Drop(xi);
@@ -333,6 +334,7 @@ public sealed class WanVae : IDisposable
             var m1 = Attention("decoder.middle.1.", m0, T, H, W, 1024); Drop(m0);
             var m2 = ResBlock("decoder.middle.2.", m1, T, H, W, 1024, 1024); Drop(m1);
             Tap?.Invoke("dec_middle", m2.View, T, H, W, 1024);
+            if (Trace) { await _acc.SynchronizeAsync(); Console.WriteLine($"[Wan] vae frame {i} middle {sw.ElapsedMilliseconds} ms"); sw.Restart(); }
             var stages = new[] { (1024, 1024, true, true), (1024, 1024, true, true), (1024, 512, false, true), (512, 256, false, false) };
             var cur = m2;
             for (int s = 0; s < 4; s++)
@@ -341,6 +343,7 @@ public sealed class WanVae : IDisposable
                 Drop(cur); cur = next;
                 Tap?.Invoke($"dec_up{s}", cur.View, T, H, W, stages[s].Item2);
                 Flush(); await _acc.SynchronizeAsync();
+                if (Trace) { Console.WriteLine($"[Wan] vae frame {i} up{s} {sw.ElapsedMilliseconds} ms ({T}x{H}x{W}, {stages[s].Item2} ch)"); sw.Restart(); }
             }
             var hn = NormSilu(cur, "decoder.head.0.gamma", T * H * W, 256); Drop(cur);
             var hc = ConvCausal("decoder.head.2", hn, T, H, W, 256, 12); Drop(hn);
@@ -359,6 +362,9 @@ public sealed class WanVae : IDisposable
         _caches.Clear();
         return result;
     }
+
+    /// <summary>Log the time of every decoder stage (each is awaited to completion, so the times are the device time): <c>[Wan] vae ...</c> lines on the console.</summary>
+    public bool Trace { get; set; }
 
     public void Dispose()
     {

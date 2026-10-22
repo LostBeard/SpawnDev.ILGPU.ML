@@ -286,6 +286,8 @@ public abstract partial class MLTestBase
         int Fz = s[1], h = s[2], w = s[3];
         using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
         var video = new WanVideo { Data = await vae.DecodeAsync(final, Fz, h, w), Width = w * 16, Height = h * 16, Frames = 4 * Fz - 3 };
+        double sum = 0, sum2 = 0; foreach (var v in video.Data) { sum += v; sum2 += (double)v * v; }
+        Console.WriteLine($"[Wan] vae decode of the reference latent on {accelerator.AcceleratorType}: pixel mean {sum / video.Data.Length:F5}, rms {Math.Sqrt(sum2 / video.Data.Length):F5}");
         foreach (int f in new[] { 0, video.Frames / 2, video.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"reference_{tag}_{f}.png"), Assets.AssetGenerator.EncodePng(video.GetFrameRgba(f), video.Width, video.Height));
         return $"{video.Frames} frames";
     });

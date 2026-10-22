@@ -49,6 +49,8 @@ public sealed class WanRequest
     public long Seed { get; init; } = 42;
     /// <summary>Starting noise [48, F/4 + 1, H/16, W/16] to use instead of one drawn from <see cref="Seed"/> (to reproduce another implementation's run exactly).</summary>
     public float[]? InitialNoise { get; init; }
+    /// <summary>Log the time of every VAE decoder stage to the console (<c>[Wan] vae</c> lines).</summary>
+    public bool Trace { get; init; }
     /// <summary>Optional first frame (image-to-video): RGB bytes, 3 per pixel, row-major; resized and centre-cropped to the output size.</summary>
     public byte[]? ImageRgb { get; init; }
     public int ImageWidth { get; init; }
@@ -237,7 +239,7 @@ public sealed class Wan22Pipeline
         float[] video;
         using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
-            video = await vae.DecodeAsync(latent, Fz, h, w);
+            { vae.Trace = req.Trace; video = await vae.DecodeAsync(latent, Fz, h, w); }
         Report("decode", 1, "done");
         return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
     }
