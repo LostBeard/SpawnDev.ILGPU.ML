@@ -52,6 +52,7 @@ The [live demo](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) is a Blazor WebA
 |------|--------------|-------|
 | [Text to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) / [Image to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d) | A prompt or a photo becomes a textured PBR `.glb`; rig it, animate it with 22 preset moves | FLUX 3 / FLUX.2 / SD-Turbo, RMBG-1.4, TRELLIS.2, SkinTokens, Kimodo |
 | [Image generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/generate) | Text to image, and edits of up to 10 reference pictures | FLUX 3 Image Klein, FLUX.2 klein, SD-Turbo |
+| [Video generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/video) | Text to video, or animate a picture (the first frame); about 13 GB of weights on first use | Wan 2.2 TI2V-5B |
 | [On-device chat](https://lostbeard.github.io/SpawnDev.ILGPU.ML/ai-chat) | Pick a `.gguf` and chat with it | Qwen, Gemma, Llama and others |
 | [Speech to text](https://lostbeard.github.io/SpawnDev.ILGPU.ML/whisper) | Microphone to text | Whisper |
 | [Text to speech](https://lostbeard.github.io/SpawnDev.ILGPU.ML/tts) | Built-in voices, or clone a voice from a short clip | Kokoro, ZipVoice |

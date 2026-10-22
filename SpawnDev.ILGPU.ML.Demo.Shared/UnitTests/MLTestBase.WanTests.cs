@@ -293,6 +293,61 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The fp16 pairs the VAE keeps its causal caches in (WanKernels.PackHalf2 / UnpackHalf2, plain uint arithmetic so it is the same on every backend): every value comes back as System.Half rounds it
+    /// (round to nearest even, subnormals, overflow to infinity), over magnitudes from 2^-26 to 2^17 plus exact ties and the edges of the half range.
+    /// Red check: truncating instead of rounding the mantissa fails the tie values.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Wan_PackHalf2_RoundsLikeHalf() => await RunTest(async accelerator =>
+    {
+        var rng = new Random(11);
+        var values = new List<float> { 0f, -0f, 1f, -1f, 65504f, 65520f, 70000f, -70000f, 6.1035156e-5f, 5.9604645e-8f, 2.9802322e-8f, 4.4703484e-8f, 1.00048828125f, 1.00146484375f, 2049f, 2051f, 0.333333f };
+        for (int i = 0; i < 4000; i++) values.Add((rng.Next(2) == 0 ? 1f : -1f) * (float)(Math.Pow(2, rng.NextDouble() * 43 - 26) * (1 + rng.NextDouble())));
+        if (values.Count % 2 != 0) values.Add(0.5f);
+        var src = values.ToArray();
+        using var inBuf = accelerator.Allocate1D(src);
+        using var packed = accelerator.Allocate1D<uint>(src.Length / 2);
+        using var outBuf = accelerator.Allocate1D<float>(src.Length);
+        var k = new WanKernels(accelerator);
+        k.PackHalf2(inBuf.View, packed.View, src.Length / 2);
+        k.UnpackHalf2(packed.View, outBuf.View, src.Length / 2);
+        var got = await outBuf.View.CopyToHostAsync();
+        int bad = 0; string first = "";
+        for (int i = 0; i < src.Length; i++)
+        {
+            float want = (float)(System.Half)src[i];
+            if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(want) && !(float.IsNaN(got[i]) && float.IsNaN(want)))
+            { if (bad++ == 0) first = $"{src[i]:R} -> {got[i]:R}, System.Half {want:R}"; }
+        }
+        if (bad > 0) throw new Exception($"{bad} of {src.Length} values differ from System.Half; first: {first}");
+        return $"{src.Length} values identical to System.Half";
+    });
+
+    /// <summary>
+    /// The decoder's frame slicing (the memory fix for big videos: the last two stages are decoded a frame at a time) must not change the picture: the reference trajectory's final latent decoded whole and
+    /// with MaxSliceBytes = 1 (every chunk in one-frame slices) agree to float rounding. Red check: slicing that loses the causal caches (a conv seeing zeros instead of the previous frames) differs by far more.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Vae_SlicedDecode_MatchesWhole() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("desktop GPU");
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors"); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        if (!File.Exists(vaePath) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
+        using var fx = ZipFile.OpenRead(fixture);
+        var (final, s) = WanNpz(fx, "step29_latent_out");
+        int Fz = s[1], h = s[2], w = s[3];
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        var whole = await vae.DecodeAsync(final, Fz, h, w);
+        vae.MaxSliceBytes = 1;
+        var sliced = await vae.DecodeAsync(final, Fz, h, w);
+        var m = WanCompare(sliced, whole);
+        Console.WriteLine($"[Wan] sliced vs whole decode on {accelerator.AcceleratorType}: relRMS {m.RelRms:E2}, max abs {m.MaxAbs:E2}");
+        if (!(m.RelRms < 1e-4)) throw new Exception($"sliced decode differs from the whole decode: relRMS {m.RelRms:E2}");
+        return $"relRMS {m.RelRms:E2}";
+    });
+
+    /// <summary>
     /// How big a video the VAE decoder can decode on this device: a random latent at each size in WAN_VAE_SIZES ("WxHxFRAMES,..." default 640x352x17,832x480x17,832x480x33,1024x576x17), decoded
     /// with the per-stage trace; a size that runs out of memory is reported and ends the list. Never fails: it reports the largest size that fit (pixel values are not checked, the latent is noise).
     /// </summary>

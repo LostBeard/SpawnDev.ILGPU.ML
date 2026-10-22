@@ -29,7 +29,8 @@ Exported once from the reference checkpoints with `tools/wan-harness/reference` 
 | `umt5_xxl_enc_bf16.safetensors` | 11.4 GB | |
 | `google/umt5-xxl/tokenizer.json` | 16 MB | Unigram tokenizer, ported (`UnigramTokenizer`) |
 
-The models host (`models.spawndev.com`) does not serve these yet; point the pipeline at a local folder (`Wan22Paths.InFolder`) or a local file server.
+`models.spawndev.com/LostBeard/Wan2.2-TI2V-5B-ILGPU` serves the 8-bit and 4-bit DiT, the VAE, the 8-bit umT5 and the tokenizer (`Wan22Pipeline.DefaultRepo`; the 16-bit files are not hosted, use
+`Wan22Paths.InFolder` for a local copy of those).
 
 ## Parity with the reference
 

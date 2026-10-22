@@ -6,6 +6,7 @@ namespace SpawnDev.ILGPU.ML.Wan;
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 using IV = ArrayView1D<int, Stride1D.Dense>;
+using UV = ArrayView1D<uint, Stride1D.Dense>;
 
 /// <summary>
 /// The kernels of the Wan 2.2 DiT that the TRELLIS.2 flow transformer's <see cref="Trellis2.DiTKernels"/> do not have: the RMS norm over a whole row (Wan
@@ -390,6 +391,51 @@ public sealed class WanKernels
         _t5Scores(H * L * L, qkv, bias, bucket, scores, L, H, D);
         _softmaxRows(H * L, scores, L);
         _t5Out(L * H * D, scores, qkv, o, L, H, D);
+    }
+
+    // fp16 storage for the VAE's feature caches, as pairs packed in a uint (no sub-word writes: every thread owns whole words, so it is exact on every backend including WebGPU)
+    private static uint FloatToHalfBits(float f)
+    {
+        uint x = Interop.FloatAsInt(f);
+        uint sign = (x >> 16) & 0x8000u, exp = (x >> 23) & 0xFFu, mant = x & 0x7FFFFFu;
+        if (exp == 255u) return sign | 0x7C00u | (mant != 0u ? 0x200u : 0u);               // inf / nan
+        int e = (int)exp - 112;                                                              // exponent rebiased 127 -> 15
+        if (e >= 31) return sign | 0x7C00u;                                                  // beyond 65504: inf (activations never get there)
+        if (e <= 0)
+        {
+            if (e < -10) return sign;                                                        // underflow to zero
+            mant |= 0x800000u;
+            int shift = 14 - e;                                                              // 14 .. 24
+            uint h = mant >> shift, rem = mant & ((1u << shift) - 1u), mid = 1u << (shift - 1);
+            if (rem > mid || (rem == mid && (h & 1u) != 0u)) h++;
+            return sign | h;
+        }
+        uint r = ((uint)e << 10) | (mant >> 13), low = mant & 0x1FFFu;
+        if (low > 0x1000u || (low == 0x1000u && (r & 1u) != 0u)) r++;                        // round to nearest even (a carry into the exponent is right)
+        return sign | r;
+    }
+    private static float HalfBitsToFloat(uint h)
+    {
+        uint sign = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u;
+        if (e == 0u) { float v = m * 5.9604644775390625e-8f; return sign != 0u ? -v : v; }
+        if (e == 31u) return Interop.IntAsFloat(sign | 0x7F800000u | (m << 13));
+        return Interop.IntAsFloat(sign | ((e + 112u) << 23) | (m << 13));
+    }
+    private Action<Index1D, FV, UV>? _packHalf2;
+    private static void PackHalf2Impl(Index1D i, FV src, UV dst) => dst[i] = FloatToHalfBits(src[2 * i]) | (FloatToHalfBits(src[2 * i + 1]) << 16);
+    /// <summary>dst[i] = the halves of src[2i] and src[2i+1] packed in one uint (round to nearest even); <paramref name="words"/> = count / 2.</summary>
+    public void PackHalf2(FV src, UV dst, int words)
+    {
+        _packHalf2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV>(PackHalf2Impl);
+        _packHalf2(words, src, dst);
+    }
+    private Action<Index1D, UV, FV>? _unpackHalf2;
+    private static void UnpackHalf2Impl(Index1D i, UV src, FV dst) { uint u = src[i]; dst[2 * i] = HalfBitsToFloat(u & 0xFFFFu); dst[2 * i + 1] = HalfBitsToFloat(u >> 16); }
+    /// <summary>The inverse of <see cref="PackHalf2"/>: src[i] to dst[2i], dst[2i+1].</summary>
+    public void UnpackHalf2(UV src, FV dst, int words)
+    {
+        _unpackHalf2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, UV, FV>(UnpackHalf2Impl);
+        _unpackHalf2(words, src, dst);
     }
 
     private Action<Index1D, FV, FV>? _mulInPlace;

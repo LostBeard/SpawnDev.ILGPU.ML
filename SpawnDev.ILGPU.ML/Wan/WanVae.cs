@@ -30,7 +30,8 @@ public sealed class WanVae : IDisposable
     private bool _cacheEnabled = true;     // the encoder sees one frame: nothing to cache for a later chunk
 
     /// <summary>The last (up to) two input frames of a causal convolution, channel-last [frames * H * W, C]; <see cref="Rep"/> = the "Rep" marker of upsample3d's first call.</summary>
-    private sealed class Cache { public Buf? Buf; public int Frames; public bool Rep; }
+    /// <summary>The last two input frames of a causal convolution, stored as fp16 pairs (half the memory of fp32: at 720p the caches are the largest resident tensors).</summary>
+    private sealed class Cache { public MemoryBuffer1D<uint, Stride1D.Dense>? Packed; public int Frames; public bool Rep; }
 
     /// <summary>Test hook: (stage name, activation view, frames, height, width, channels), called per chunk; valid only during the call.</summary>
     public Action<string, FV, int, int, int, int>? Tap { get; set; }
@@ -73,9 +74,9 @@ public sealed class WanVae : IDisposable
 
     private Buf Concat(Cache? c, int cnt, Buf x, int T, int hw, int cin)
     {
-        if (cnt == 0 || c?.Buf == null) return x;
+        if (cnt == 0 || c?.Packed == null) return x;
         var cat = Tmp((long)(cnt + T) * hw * cin);
-        cat.View.SubView(0, (long)cnt * hw * cin).CopyFrom(c.Buf.View.SubView(0, (long)cnt * hw * cin));
+        _wk.UnpackHalf2(c.Packed.View.SubView(0, (long)cnt * hw * cin / 2), cat.View.SubView(0, (long)cnt * hw * cin), cnt * hw * cin / 2);
         cat.View.SubView((long)cnt * hw * cin, (long)T * hw * cin).CopyFrom(x.View.SubView(0, (long)T * hw * cin));
         return cat;
     }
@@ -85,8 +86,8 @@ public sealed class WanVae : IDisposable
         // the last min(2, frames) frames of the concatenated input
         int keep = Math.Min(2, frames);
         if (!_caches.TryGetValue(name, out var c)) _caches[name] = c = new Cache();
-        c.Buf ??= _acc.Allocate1D<float>(2L * hw * cin);
-        c.Buf.View.SubView(0, (long)keep * hw * cin).CopyFrom(xcat.View.SubView((long)(frames - keep) * hw * cin, (long)keep * hw * cin));
+        c.Packed ??= _acc.Allocate1D<uint>(2L * hw * cin / 2);
+        _wk.PackHalf2(xcat.View.SubView((long)(frames - keep) * hw * cin, (long)keep * hw * cin), c.Packed.View.SubView(0, (long)keep * hw * cin / 2), keep * hw * cin / 2);
         c.Frames = keep; c.Rep = false;
     }
 
@@ -178,7 +179,7 @@ public sealed class WanVae : IDisposable
                 {
                     var pair = Tmp(2L * hw * C);
                     if (c.Rep || c.Frames == 0) pair.View.SubView(0, (long)hw * C).MemSetToZero();
-                    else pair.View.SubView(0, (long)hw * C).CopyFrom(c.Buf!.View.SubView((long)(c.Frames - 1) * hw * C, (long)hw * C));
+                    else _wk.UnpackHalf2(c.Packed!.View.SubView((long)(c.Frames - 1) * hw * C / 2, (long)hw * C / 2), pair.View.SubView(0, (long)hw * C), hw * C / 2);
                     pair.View.SubView((long)hw * C, (long)hw * C).CopyFrom(x.View.SubView(0, (long)hw * C));
                     StoreCache(name, pair, 2, hw, C);
                     Drop(pair);
@@ -320,8 +321,19 @@ public sealed class WanVae : IDisposable
         var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);
         Tap?.Invoke("dec_conv2", zBuf.View, Fz, h, w, Z);
         int H8 = h * 16, W8 = w * 16, totalFrames = 4 * Fz - 3;
-        var head = _acc.Allocate1D<float>((long)totalFrames * (h * 8) * (w * 8) * 12);
+        // the picture is assembled on the host chunk by chunk (a 720p, 121-frame video is 1.3 GB: it never exists on the device, which also keeps every device buffer small)
+        var result = new float[3L * totalFrames * H8 * W8];
+        long plane = (long)totalFrames * H8 * W8;
         int writtenFrames = 0;
+        async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
+        {
+            using var chunk = _acc.Allocate1D<float>(3L * frames * Hs * 2 * Ws * 2);
+            _wk.UnpatchifyVideo(headChunk.View, chunk.View, frames, Hs, Ws);          // [3, frames, 2 Hs, 2 Ws]
+            var host = await chunk.View.CopyToHostAsync();
+            long framePixels = (long)Hs * 2 * Ws * 2;
+            for (int c = 0; c < 3; c++) Array.Copy(host, c * frames * framePixels, result, c * plane + (long)writtenFrames * framePixels, frames * framePixels);
+            writtenFrames += frames;
+        }
         for (int i = 0; i < Fz; i++)
         {
             int T = 1, H = h, W = w;
@@ -337,28 +349,62 @@ public sealed class WanVae : IDisposable
             if (Trace) { await _acc.SynchronizeAsync(); Console.WriteLine($"[Wan] vae frame {i} middle {sw.ElapsedMilliseconds} ms"); sw.Restart(); }
             var stages = new[] { (1024, 1024, true, true), (1024, 1024, true, true), (1024, 512, false, true), (512, 256, false, false) };
             var cur = m2;
+            // The last two stages work at 8x and 16x the latent resolution and dominate the memory. They are per-frame operations on top of the causal caches (a convolution sees the same two
+            // previous frames whether a chunk is 4 frames or 1), so a chunk whose stage-2 input is big is decoded a few frames at a time: the same numbers, a fraction of the activations.
+            int sliceFrames = T;
             for (int s = 0; s < 4; s++)
             {
+                if (s == 2)
+                {
+                    long perFrameBytes = (long)H * W * 4 * 4 * 512 * 4;             // the stage-2 upsample output of ONE frame: 4x the pixels, 512 channels, fp32
+                    sliceFrames = Math.Max(1, (int)Math.Min(T, MaxSliceBytes / Math.Max(1, perFrameBytes)));
+                    if (sliceFrames < T) break;
+                }
                 var next = UpBlock(s, cur, ref T, ref H, ref W, stages[s].Item1, stages[s].Item2, stages[s].Item3, stages[s].Item4, i == 0);
                 Drop(cur); cur = next;
                 Tap?.Invoke($"dec_up{s}", cur.View, T, H, W, stages[s].Item2);
                 Flush(); await _acc.SynchronizeAsync();
                 if (Trace) { Console.WriteLine($"[Wan] vae frame {i} up{s} {sw.ElapsedMilliseconds} ms ({T}x{H}x{W}, {stages[s].Item2} ch)"); sw.Restart(); }
             }
+            if (sliceFrames < T)
+            {
+                int Tin = T, Hin = H, Win = W, frameRows = H * W;
+                for (int t0 = 0; t0 < Tin; t0 += sliceFrames)
+                {
+                    int n = Math.Min(sliceFrames, Tin - t0);
+                    var piece = Tmp((long)n * frameRows * stages[1].Item2);
+                    piece.View.CopyFrom(cur.View.SubView((long)t0 * frameRows * stages[1].Item2, (long)n * frameRows * stages[1].Item2));
+                    int Ts = n, Hs = Hin, Ws = Win;
+                    var sc = piece;
+                    for (int s = 2; s < 4; s++)
+                    {
+                        var next = UpBlock(s, sc, ref Ts, ref Hs, ref Ws, stages[s].Item1, stages[s].Item2, stages[s].Item3, stages[s].Item4, i == 0);
+                        Drop(sc); sc = next;
+                        Flush(); await _acc.SynchronizeAsync();
+                    }
+                    var hns = NormSilu(sc, "decoder.head.0.gamma", Ts * Hs * Ws, 256); Drop(sc);
+                    var hcs = ConvCausal("decoder.head.2", hns, Ts, Hs, Ws, 256, 12); Drop(hns);
+                    await _acc.SynchronizeAsync();
+                    await EmitAsync(hcs, Ts, Hs, Ws);
+                    Drop(hcs);
+                    Flush(); await _acc.SynchronizeAsync();
+                    if (Trace) { Console.WriteLine($"[Wan] vae frame {i} slice {t0}+{n} of {Tin} {sw.ElapsedMilliseconds} ms ({Ts}x{Hs}x{Ws})"); sw.Restart(); }
+                }
+                Drop(cur);
+                Flush(); await _acc.SynchronizeAsync();
+                continue;
+            }
             var hn = NormSilu(cur, "decoder.head.0.gamma", T * H * W, 256); Drop(cur);
             var hc = ConvCausal("decoder.head.2", hn, T, H, W, 256, 12); Drop(hn);
             Tap?.Invoke("dec_head", hc.View, T, H, W, 12);
-            head.View.SubView((long)writtenFrames * H * W * 12, (long)T * H * W * 12).CopyFrom(hc.View.SubView(0, (long)T * H * W * 12));
-            writtenFrames += T;
+            await _acc.SynchronizeAsync();
+            await EmitAsync(hc, T, H, W);
             Drop(hc);
             Flush(); await _acc.SynchronizeAsync();
         }
         if (writtenFrames != totalFrames) throw new InvalidOperationException($"decoded {writtenFrames} frames, expected {totalFrames}");
-        var video = _acc.Allocate1D<float>(3L * totalFrames * H8 * W8);
-        _wk.UnpatchifyVideo(head.View, video.View, totalFrames, h * 8, w * 8);
-        var result = await video.View.CopyToHostAsync();
-        video.Dispose(); head.Dispose(); zIn.Dispose(); Drop(zBuf); Flush();
-        foreach (var c in _caches.Values) c.Buf?.Dispose();
+        zIn.Dispose(); Drop(zBuf); Flush();
+        foreach (var c in _caches.Values) c.Packed?.Dispose();
         _caches.Clear();
         return result;
     }
@@ -366,13 +412,19 @@ public sealed class WanVae : IDisposable
     /// <summary>Log the time of every decoder stage (each is awaited to completion, so the times are the device time): <c>[Wan] vae ...</c> lines on the console.</summary>
     public bool Trace { get; set; }
 
+    /// <summary>
+    /// The most memory the decoder's last two stages may use for one chunk's upsample output; a bigger chunk is decoded a few frames at a time (identical result). Default 700 MB:
+    /// 640x352 is decoded whole, 832x480 and up in slices. Set it small in a test to force slicing.
+    /// </summary>
+    public long MaxSliceBytes { get; set; } = 700L << 20;
+
     public void Dispose()
     {
         foreach (var b in _live) b.Dispose();
         _live.Clear(); _drop.Clear();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
-        foreach (var c in _caches.Values) c.Buf?.Dispose();
+        foreach (var c in _caches.Values) c.Packed?.Dispose();
         _caches.Clear();
         _scores?.Dispose();
     }

@@ -24,8 +24,8 @@ dotnet run --project Examples/<name>/<name>.csproj -- <args>
 | 07 | **`AssetGen.Console`** | **a prompt to a rigged, animated 3D character** on your own GPU (CUDA / OpenCL): FLUX.2 klein draws it, RMBG-1.4 cuts it out, TRELLIS.2 builds the textured mesh, SkinTokens rigs it, Kimodo moves animate it; `.png` + `.glb` files out | ✅ shipped |
 | 08 | **`AssetGen.Wpf`** | the browser's Text and Image to 3D page as a Windows app: FLUX 3 / FLUX.2 / SD-Turbo (with the Qwen3 caption writer) or your own picture, auto-pick or draw 4 / 8 and pick (and draw more), triangles and texture size, rig, animate (arm clearance), preview in a WebGL viewer (WebView2), save the .glb | ✅ shipped |
 | 10 | **`ImageGen.Wpf`** | the browser `/generate` page as a Windows app: the same models and settings, reference images, a gallery with Save, the live caption | ✅ shipped |
-| 11 | **`VideoGen.Console`** | **text or image to video**: Wan 2.2 TI2V-5B on CUDA / OpenCL, 8-bit weights, PNG frames and an animated WebP (`--size`, `--frames`, `--steps`, `--image`, `--models`); see [Docs/video.md](../Docs/video.md) | ✅ shipped (the model files are not on the models host yet: `--models DIR`) |
-| 12 | **`VideoGen.Wpf`** | the browser `/video` page as a Windows app: settings, first-frame picture, a looping player, Save frames | ✅ shipped (same) |
+| 11 | **`VideoGen.Console`** | **text or image to video**: Wan 2.2 TI2V-5B on CUDA / OpenCL, 8-bit weights, PNG frames and an animated WebP (`--size`, `--frames`, `--steps`, `--image`, `--models`); see [Docs/video.md](../Docs/video.md) | ✅ shipped |
+| 12 | **`VideoGen.Wpf`** | the browser `/video` page as a Windows app: settings, first-frame picture, a looping player, Save frames | ✅ shipped |
 | 09+ | `*.BlazorWasm` | browser mirrors (zero-copy canvas for image-gen) | planned (the main demo already is one) |
 
 ## 02 · ModelInspector.Console
