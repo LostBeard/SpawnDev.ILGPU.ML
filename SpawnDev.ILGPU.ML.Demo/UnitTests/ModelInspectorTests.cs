@@ -172,13 +172,22 @@ public class ModelInspectorTests
         // supported. Earlier it showed 90% (27/30) only because And/IsNaN/LessOrEqual were registered and
         // runnable but missing from the inspector's stale hand-maintained op list — fixed by sourcing the
         // inspector from OperatorRegistry.BuiltinOpTypes (locked to the live registry by a drift test).
-        // Streamed — its compatibility is checked without ever loading its weights. This is the regression
-        // guard for the user-facing deliverable: GPT-2 == 100% compatible.
-        using (var gpt2Stream = await _http.GetStreamAsync("models/gpt2/model.onnx"))
+        // This is the regression guard for the user-facing deliverable: GPT-2 == 100% compatible.
+        // Opened by URL (byte ranges, structure only). It used _http.GetStreamAsync, which cannot seek, so the
+        // reader had to READ all 623 MB of weights through the .NET heap to skip them: 46 s on a good run, over
+        // the 120 s timeout in the 5.4.0, 5.5.0 and 5.6.0 release gates (2026-10-23: SqueezeNet + headers 0.6 s,
+        // then the whole remaining two minutes in that read). SqueezeNet above still covers the stream path.
+        await using (var gpt2Stream = await ModelInspectorHelper.OpenUrlForInspectionAsync(_http, "models/gpt2/model.onnx"))
         {
-            Console.WriteLine($"[ModelInspector] compat GPT-2 response headers at {sw.Elapsed.TotalSeconds:F1} s");
+            Console.WriteLine($"[ModelInspector] compat GPT-2 opened at {sw.Elapsed.TotalSeconds:F1} s");
             var gpt2 = await ModelInspectorHelper.CheckCompatibilityAsync(gpt2Stream);
-            Console.WriteLine($"[ModelInspector] compat GPT-2 done at {sw.Elapsed.TotalSeconds:F1} s");
+            long fetched = gpt2Stream is HttpRangeStream h ? h.BytesFetched : -1;
+            Console.WriteLine($"[ModelInspector] compat GPT-2 done at {sw.Elapsed.TotalSeconds:F1} s, fetched {fetched:N0} of {(gpt2Stream.CanSeek ? gpt2Stream.Length : -1):N0} bytes");
+            if (fetched < 0)
+                throw new Exception($"GPT-2 was not opened as a ranged stream ({gpt2Stream.GetType().Name}): the test server stopped honouring Range, so the inspector read the weights");
+            // Structure only: half is a loose bar, a regression that reads the weights sits at ~100%.
+            if (fetched >= gpt2Stream.Length / 2)
+                throw new Exception($"structure-only compatibility fetched {fetched:N0} of {gpt2Stream.Length:N0} bytes - it is reading weights");
             if (gpt2.SupportedOps.Length + gpt2.UnsupportedOps.Length != gpt2.TotalOpsUsed)
                 throw new Exception("GPT-2 op partition mismatch");
             if (gpt2.CompatibilityPercent < 0 || gpt2.CompatibilityPercent > 100)
