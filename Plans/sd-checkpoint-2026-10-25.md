@@ -27,10 +27,10 @@ The sampler, noise, CFG and host latents stay in SpawnGen. Tokenizer: `BPETokeni
 - Prediction type as ComfyUI: `v_pred` tensor, or for SD 2.x the std of `output_blocks.11.1.transformer_blocks.0.norm1.bias` > 0.09.
 
 ## Gates (tests `MLTestBase.SdTests.cs`, fixtures `D:\Projects\sd\ref`, reference `tools/sd-harness/reference/ref_sd_dump.py --f16-weights`)
-- [ ] SD 1.5: tokenizer ids, text encoder (last + penultimate), UNet taps + eps (32x40 and 64x64), VAE decode taps + image, encode mean (CUDA)
-- [ ] SD 1.5 on OpenCL and WebGPU (browser: checkpoint over HTTP from a local file server)
+- [x] SD 1.5: tokenizer ids, text encoder (last + penultimate), UNet taps + eps (32x40 and 64x64), VAE decode taps + image, encode mean: CUDA + OpenCL green, red-checked (9b9625f8)
+- [ ] SD 1.5 + SDXL on WebGPU (browser: checkpoint over HTTP from a local file server)
 - [ ] a 20-step picture identical to diffusers with the same noise (sampler on the host in the test, as SpawnGen runs it)
-- [ ] SDXL base (two towers, pooled, size ids, VAE fp32 activations) - file downloading to D:\Projects\sd
+- [x] SDXL base (two towers, pooled, size ids, VAE fp32 activations): CUDA green at 40x48 and 1024x1024 (UNet 436 ms/step)
 - [ ] SD 2.x (OpenCLIP-H, v-prediction detection)
 - [ ] LoRA merge at load (kohya + diffusers/PEFT names), strength
 - [ ] ControlNet (SD 1.5: hint encoder, 13 residuals into the UNet skips + mid)

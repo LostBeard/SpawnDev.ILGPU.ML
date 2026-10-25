@@ -8,14 +8,16 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 /// <summary>
 /// Stable Diffusion single-file checkpoints (SdCheckpoint, for SpawnGen's Load Checkpoint; Plans/sd-checkpoint-2026-10-25.md). Every stage is held to tensors dumped from the
-/// REFERENCE (diffusers' from_single_file on the same .safetensors, float32 on the CPU, weights rounded to fp16 first so the comparison measures our arithmetic and not the
-/// weight rounding: tools/sd-harness/reference/ref_sd_dump.py --f16-weights). Files in SD_DIR (default D:\Projects\sd): <c>v1-5-pruned-emaonly.safetensors</c>,
-/// <c>ref\sd_*.npz</c>, <c>tokenizer\clip-vit-large-patch14\tokenizer.json</c>; a missing file skips the test. Desktop GPU lanes (the checkpoint is read from disk).
+/// REFERENCE (diffusers' from_single_file on the same .safetensors, float32 math on the CPU with the weights rounded to fp16, so the comparison measures our arithmetic and not
+/// the weight rounding: tools/sd-harness/reference/ref_sd_dump.py --f16-weights / --f16-storage). Files in SD_DIR (default D:\Projects\sd):
+/// <c>v1-5-pruned-emaonly.safetensors</c>, <c>sd_xl_base_1.0.safetensors</c>, <c>ref\sd_*.npz</c>, <c>tokenizer\clip-vit-large-patch14\tokenizer.json</c>; a missing file skips
+/// the test. Desktop GPU lanes (the checkpoint is read from disk).
 /// </summary>
 public abstract partial class MLTestBase
 {
     private static string SdDir => Environment.GetEnvironmentVariable("SD_DIR") ?? @"D:\Projects\sd";
     private const string Sd15File = "v1-5-pruned-emaonly.safetensors";
+    private const string SdxlFile = "sd_xl_base_1.0.safetensors";
 
     private static string RequireSdFile(Accelerator accelerator, string file)
     {
@@ -69,61 +71,101 @@ public abstract partial class MLTestBase
         return $"77 ids identical ({w.Count(v => v != 49407) + 1} before padding)";
     });
 
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // text encoders
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
     /// <summary>The CLIP ViT-L text encoder of the SD 1.5 single file against the reference: the last layer (ComfyUI default) and the penultimate layer with the final norm (clip skip 2).</summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Sd15_TextEncoder_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Sd15_TextEncoder_MatchesReference() => await RunTest(accelerator => SdTextCheck(accelerator, Sd15File, SdFamily.SD1, "sd15_small_f16w", 5e-3));
+
+    /// <summary>SDXL base's two text towers (CLIP ViT-L and OpenCLIP bigG, penultimate layers without the final norm, concatenated) and the pooled embedding against the reference.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sdxl_TextEncoder_MatchesReference() => await RunTest(accelerator => SdTextCheck(accelerator, SdxlFile, SdFamily.SDXL, "sdxl_small_f16s", 5e-3));
+
+    private async Task<string> SdTextCheck(Accelerator accelerator, string file, SdFamily family, string tag, double bound)
     {
-        var path = RequireSdFile(accelerator, Sd15File);
-        var fxPath = Path.Combine(SdDir, "ref", "sd_sd15_small_f16w.npz");
-        if (!File.Exists(fxPath)) throw new UnsupportedTestException($"SD fixtures not found in {SdDir}");
+        var path = RequireSdFile(accelerator, file);
+        var fxPath = Path.Combine(SdDir, "ref", $"sd_{tag}.npz");
+        if (!File.Exists(fxPath)) throw new UnsupportedTestException($"SD fixture {fxPath} not found");
         using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions { LoadUNet = false, LoadVae = false });
-        if (ck.Family != SdFamily.SD1 || ck.TextEncoder == null) throw new Exception($"family {ck.Family}, text encoder {(ck.TextEncoder == null ? "missing" : "present")}");
+        if (ck.Family != family || ck.TextEncoder == null) throw new Exception($"family {ck.Family} (want {family}), text encoder {(ck.TextEncoder == null ? "missing" : "present")}");
         using var fx = ZipFile.OpenRead(fxPath);
         var ids = WanNpz(fx, "ids").Data.Select(v => (int)v).ToArray();
+        int[]? ids2 = fx.GetEntry("ids2.npy") != null ? WanNpz(fx, "ids2").Data.Select(v => (int)v).ToArray() : null;
         var report = new List<string>();
         double worst = 0;
-        foreach (var (key, layer) in new[] { ("ctx", -1), ("ctx_skip2", -2) })
+        var cases = family == SdFamily.SD1 ? new[] { ("ctx", (int?)-1), ("ctx_skip2", (int?)-2) } : new[] { ("ctx", (int?)null) };
+        foreach (var (key, layer) in cases)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var e = await ck.TextEncoder.EncodeAsync(ids, layer: layer);
+            var e = await ck.TextEncoder.EncodeAsync(ids, ids2, layer);
             var m = WanCompare(e.Context, WanNpz(fx, key).Data);
-            report.Add($"layer {layer}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:E2} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalMilliseconds:F0} ms");
+            report.Add($"{key} (layer {layer?.ToString() ?? "default"}): relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:E2} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalMilliseconds:F0} ms");
             worst = Math.Max(worst, m.RelRms);
+            if (family == SdFamily.SDXL)
+            {
+                if (e.Pooled == null) throw new Exception("SDXL returned no pooled embedding");
+                var mp = WanCompare(e.Pooled, WanNpz(fx, "pooled").Data);
+                report.Add($"pooled: relRMS {mp.RelRms:E2}, maxAbs {mp.MaxAbs:E2} of {mp.RefMaxAbs:F2}");
+                worst = Math.Max(worst, mp.RelRms);
+            }
         }
-        SdLog("SD1.5 text encoder", report);
-        if (!(worst < 5e-3)) throw new Exception("the text encoder deviates from the reference: " + string.Join("; ", report));
+        SdLog($"{family} text encoder", report);
+        if (!(worst < bound)) throw new Exception("the text encoder deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // UNets
+    // -----------------------------------------------------------------------------------------------------------------------------------
 
     /// <summary>
     /// The SD 1.5 UNet against the reference on identical latent / timestep / context, stage by stage (conv_in, the four down levels, mid, the four up levels, the output), at a small
     /// latent (32x40) and at production size (64x64, a 512x512 picture).
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Sd15_UNet_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Sd15_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, Sd15File, SdPrediction.Epsilon, new[] { "sd15_small_f16w", "sd15_512_f16w" }, 2e-2));
+
+    /// <summary>The SDXL base UNet (pooled text + size conditioning, three levels, 2 / 10 transformer layers) against the reference, small latent and 1024x1024.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sdxl_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, SdxlFile, SdPrediction.Epsilon, new[] { "sdxl_small_f16s", "sdxl_1024_f16s" }, 2e-2));
+
+    private static readonly string[] SdTapNames = { "conv_in", "down_0", "down_1", "down_2", "down_3", "mid", "up_0", "up_1", "up_2", "up_3" };
+
+    private async Task<string> SdUNetCheck(Accelerator accelerator, string file, SdPrediction prediction, string[] tags, double bound)
     {
-        var path = RequireSdFile(accelerator, Sd15File);
+        var path = RequireSdFile(accelerator, file);
         using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions { LoadTextEncoder = false, LoadVae = false });
         var unet = ck.UNet!;
-        if (ck.Prediction != SdPrediction.Epsilon) throw new Exception($"SD 1.5 is an epsilon model, inferred {ck.Prediction}");
+        if (ck.Prediction != prediction) throw new Exception($"expected a {prediction} model, inferred {ck.Prediction}");
         var report = new List<string>();
         double worstEps = 0, worstTap = 0;
-        foreach (var tag in new[] { "sd15_small_f16w", "sd15_512_f16w" })
+        int ran = 0;
+        foreach (var tag in tags)
         {
             var fxPath = Path.Combine(SdDir, "ref", $"sd_{tag}.npz");
-            if (!File.Exists(fxPath)) throw new UnsupportedTestException($"fixture {fxPath} not found");
+            if (!File.Exists(fxPath)) { report.Add($"{tag}: fixture missing, skipped"); continue; }
+            ran++;
             using var fx = ZipFile.OpenRead(fxPath);
             var (lat, ls) = WanNpz(fx, "latent"); var (ctx, cs) = WanNpz(fx, "ctx"); var t = WanNpz(fx, "timestep").Data[0];
             int h = ls[1], w = ls[2];
+            SdxlConditioning? xl = null;
+            if (unet.IsXL)
+            {
+                var ti = WanNpz(fx, "time_ids").Data;
+                xl = new SdxlConditioning(WanNpz(fx, "pooled").Data, (int)ti[0], (int)ti[1], (int)ti[2], (int)ti[3], (int)ti[4], (int)ti[5]);
+            }
             var taps = new Dictionary<string, (float[] Data, int C, int HW)>();
             unet.Tap = (name, view, H, W, C) => { accelerator.Synchronize(); var a = new float[(long)H * W * C]; view.SubView(0, a.Length).CopyToCPU(a); taps[name] = (a, C, H * W); };
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var eps = await unet.ForwardAsync(lat, h, w, t, ctx, cs[0]);
+            var eps = await unet.ForwardAsync(lat, h, w, t, ctx, cs[0], xl);
             double ms = sw.Elapsed.TotalMilliseconds;
             unet.Tap = null;
             var line = new List<string>();
-            foreach (var name in new[] { "conv_in", "down_0", "down_1", "down_2", "down_3", "mid", "up_0", "up_1", "up_2", "up_3" })
+            foreach (var name in SdTapNames)
             {
+                if (fx.GetEntry(name + ".npy") == null) continue;
                 if (!taps.TryGetValue(name, out var tp)) throw new Exception($"tap {name} was not produced");
                 var m = SdCompareTap(tp.Data, WanNpz(fx, name).Data, tp.C, tp.HW);
                 line.Add($"{name} {m.RelRms:E1}");
@@ -132,30 +174,42 @@ public abstract partial class MLTestBase
             var me = WanCompare(eps, WanNpz(fx, "eps").Data);
             worstEps = Math.Max(worstEps, me.RelRms);
             report.Add($"{tag} ({w * 8}x{h * 8}, t={t}): eps relRMS {me.RelRms:E2} maxAbs {me.MaxAbs:E2} of {me.RefMaxAbs:F2}, {ms:F0} ms (first call incl. kernel compile); taps: {string.Join(", ", line)}");
-            // a second call: the warm time
             sw.Restart();
-            await unet.ForwardAsync(lat, h, w, t, ctx, cs[0]);
+            await unet.ForwardAsync(lat, h, w, t, ctx, cs[0], xl);
             report.Add($"{tag}: warm forward {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
-        SdLog("SD1.5 UNet", report);
-        if (!(worstEps < 2e-2 && worstTap < 2e-2)) throw new Exception("the UNet deviates from the reference: " + string.Join("; ", report));
+        SdLog($"{ck.Family} UNet", report);
+        if (ran == 0) throw new UnsupportedTestException("no UNet fixture found");
+        if (!(worstEps < bound && worstTap < bound)) throw new Exception("the UNet deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // VAEs
+    // -----------------------------------------------------------------------------------------------------------------------------------
 
     /// <summary>The SD 1.5 VAE against the reference: decode (stage by stage) at 256x320 and 512x512, encode (posterior mean) at both sizes.</summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Sd15_Vae_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Sd15_Vae_MatchesReference() => await RunTest(accelerator => SdVaeCheck(accelerator, Sd15File, 0.18215f, new[] { "sd15_small_f16w", "sd15_512_f16w" }, 5e-3));
+
+    /// <summary>The SDXL VAE (fp32 activations: it overflows fp16) against the reference: decode and encode, small and 1024x1024.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sdxl_Vae_MatchesReference() => await RunTest(accelerator => SdVaeCheck(accelerator, SdxlFile, 0.13025f, new[] { "sdxl_small_f16s", "sdxl_1024_f16s" }, 5e-3));
+
+    private async Task<string> SdVaeCheck(Accelerator accelerator, string file, float scale, string[] tags, double bound)
     {
-        var path = RequireSdFile(accelerator, Sd15File);
+        var path = RequireSdFile(accelerator, file);
         using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions { LoadTextEncoder = false, LoadUNet = false });
         var vae = ck.Vae!;
-        if (Math.Abs(ck.LatentScale - 0.18215f) > 1e-7) throw new Exception($"latent scale {ck.LatentScale}");
+        if (Math.Abs(ck.LatentScale - scale) > 1e-7) throw new Exception($"latent scale {ck.LatentScale}, want {scale}");
         var report = new List<string>();
         double worst = 0;
-        foreach (var tag in new[] { "sd15_small_f16w", "sd15_512_f16w" })
+        int ran = 0;
+        foreach (var tag in tags)
         {
             var fxPath = Path.Combine(SdDir, "ref", $"sd_{tag}.npz");
-            if (!File.Exists(fxPath)) throw new UnsupportedTestException($"fixture {fxPath} not found");
+            if (!File.Exists(fxPath)) { report.Add($"{tag}: fixture missing, skipped"); continue; }
+            ran++;
             using var fx = ZipFile.OpenRead(fxPath);
             var (z, zs) = WanNpz(fx, "dec_in");
             int h = zs[1], w = zs[2];
@@ -183,8 +237,9 @@ public abstract partial class MLTestBase
             worst = Math.Max(worst, me.RelRms);
             report.Add($"encode {tag} ({ims[2]}x{ims[1]}): mean relRMS {me.RelRms:E2} maxAbs {me.MaxAbs:E2}, {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
-        SdLog("SD1.5 VAE", report);
-        if (!(worst < 5e-3)) throw new Exception("the VAE deviates from the reference: " + string.Join("; ", report));
+        SdLog($"{ck.Family} VAE", report);
+        if (ran == 0) throw new UnsupportedTestException("no VAE fixture found");
+        if (!(worst < bound)) throw new Exception("the VAE deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
 }
