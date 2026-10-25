@@ -65,7 +65,8 @@ public class RangeStreamModelSource : IModelSource
         if (!OperatingSystem.IsBrowser()) return new Counting(probe, this);
         // browser: fetch ranges that stay in JS (the loader uploads them to the GPU without touching the .NET heap)
         long length = probe.Length; probe.Dispose();
-        return new FetchRangeStream(HuggingFaceClient.GetDownloadUrl(repoId, filePath, _hub.Revision), length) { Progress = (d, t) => OnProgress?.Invoke(d, t) };
+        var url = await ModelsHost.PreferredUrlAsync(HuggingFaceClient.GetDownloadUrl(repoId, filePath, _hub.Revision)).ConfigureAwait(false);   // not mirrored: Hugging Face directly
+        return new FetchRangeStream(url, length) { Progress = (d, t) => OnProgress?.Invoke(d, t) };
     }
 
     /// <summary>

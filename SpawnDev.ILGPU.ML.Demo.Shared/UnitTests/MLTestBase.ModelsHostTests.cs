@@ -103,6 +103,7 @@ public abstract partial class MLTestBase
         var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
         var nowhere = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, "definitely-not-a-real-file.bin");
         using var log = new FallbackLog(u => u == url || u == nowhere);
+        using var noIndex = new MirrorIndexOff();             // the fallback itself: the mirror index would send the fixture straight to Hugging Face
 
         HttpResponseMessage direct;
         try { direct = await http.GetAsync(url); }
@@ -138,14 +139,24 @@ public abstract partial class MLTestBase
         if (OperatingSystem.IsBrowser()) throw new UnsupportedTestException("a request spy needs HttpClientHandler, which the browser does not have");
         var spy = new RequestSpy(new HttpClientHandler());
         using var http = new HttpClient(spy) { Timeout = TimeSpan.FromMinutes(1) };
-        try { await new HuggingFaceClient(http, "hf_test_token_not_a_real_one").DownloadFileAsync(UnmirroredRepo, UnmirroredFile); }
-        catch (HttpRequestException) { /* Hugging Face rejects a fake token with 401: only what was SENT matters here */ }
+        using (new MirrorIndexOff())                          // the fallback path: models host first, then Hugging Face
+        {
+            try { await new HuggingFaceClient(http, "hf_test_token_not_a_real_one").DownloadFileAsync(UnmirroredRepo, UnmirroredFile); }
+            catch (HttpRequestException) { /* Hugging Face rejects a fake token with 401: only what was SENT matters here */ }
+        }
 
         var toModels = spy.Requests.Where(r => r.Host.Contains("models.spawndev.com")).ToList();
         var toHf = spy.Requests.Where(r => r.Host.EndsWith("huggingface.co")).ToList();
         Ur_Expect(toModels.Count >= 1, "the models host was tried first");
         Ur_Expect(toModels.All(r => !r.HasAuthorization), "no request to the models host carries the token");
         Ur_Expect(toHf.Count >= 1 && toHf.All(r => r.HasAuthorization), $"the fallback request to Hugging Face carries it ({toHf.Count} request(s))");
+
+        // with the mirror index (the default): an unmirrored file never touches the models host, and the token still goes to Hugging Face
+        spy.Requests.Clear();
+        try { await new HuggingFaceClient(http, "hf_test_token_not_a_real_one").DownloadFileAsync(UnmirroredRepo, UnmirroredFile); }
+        catch (HttpRequestException) { }
+        Ur_Expect(spy.Requests.All(r => !r.Host.Contains("models.spawndev.com")), $"index on: no request to the models host ({string.Join(", ", spy.Requests.Select(r => r.Host))})");
+        Ur_Expect(spy.Requests.Count(r => r.Host.EndsWith("huggingface.co")) >= 1 && spy.Requests.Where(r => r.Host.EndsWith("huggingface.co")).All(r => r.HasAuthorization), "index on: the direct Hugging Face request carries the token");
         await Task.CompletedTask;
     });
 
@@ -180,6 +191,7 @@ public abstract partial class MLTestBase
         void OnFallback(string failed, string tried, string why) { lock (fallbacks) fallbacks.Add((failed, tried)); }
         var modelsBase = new Uri(ModelsHost.BaseUrl.TrimEnd('/') + "/");
         ModelsHost.Fallback += OnFallback;
+        using var noIndex = new MirrorIndexOff();             // the stub plays both hosts; the real index would route this file straight to Hugging Face
         try
         {
             using var http = new HttpClient(stub) { BaseAddress = modelsBase };
@@ -191,6 +203,42 @@ public abstract partial class MLTestBase
         }
         finally { ModelsHost.Fallback -= OnFallback; }
         await Task.CompletedTask;
+    });
+
+    /// <summary>Turns <see cref="ModelsHost.UseMirrorIndex"/> off for a block (the fallback tests exercise the path the index avoids).</summary>
+    private sealed class MirrorIndexOff : IDisposable
+    {
+        private readonly bool _was = ModelsHost.UseMirrorIndex;
+        public MirrorIndexOff() => ModelsHost.UseMirrorIndex = false;
+        public void Dispose() => ModelsHost.UseMirrorIndex = _was;
+    }
+
+    /// <summary>
+    /// The mirror index (<c>mirrors.json</c> on the models host): a file the host does not mirror goes STRAIGHT to Hugging Face (no 404 on the host, no
+    /// fallback event: in a browser each such 404 was a red console line), a mirrored file stays on the host. Real network.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task ModelsHost_MirrorIndexSendsUnmirroredFilesStraightToHuggingFace() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        if (!ModelsHost.UseMirrorIndex) throw new Exception("the mirror index is off by default");
+        var unmirrored = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
+        var mirrored = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, "tokenizer_config.json");
+        ModelsHost.ResetMirrorIndex();
+        string pu, pm;
+        try { pu = await ModelsHost.PreferredUrlAsync(unmirrored); pm = await ModelsHost.PreferredUrlAsync(mirrored); }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException) { throw new UnsupportedTestException("models host unreachable - needs internet"); }
+        Ur_Expect(pu == $"https://huggingface.co/{UnmirroredRepo}/resolve/main/{UnmirroredFile}", $"an unmirrored file goes to Hugging Face first: {pu}");
+        Ur_Expect(pm == mirrored, $"a mirrored file stays on the models host: {pm}");
+        Ur_Expect(await ModelsHost.PreferredUrlAsync("https://example.com/a/b/resolve/main/c") == "https://example.com/a/b/resolve/main/c", "a foreign url is untouched");
+        using var log = new FallbackLog(u => u == unmirrored);
+        using (var req = new HttpRequestMessage(HttpMethod.Get, unmirrored))
+        using (var res = await ModelsHost.SendAsync(http, req))
+        {
+            Ur_Expect(res.StatusCode == HttpStatusCode.OK, $"the direct request answered {(int)res.StatusCode}");
+            Ur_Expect((await res.Content.ReadAsByteArrayAsync()).Length == UnmirroredBytes, "the bytes are the file's");
+        }
+        Ur_Expect(log.Events.Count == 0, $"no fallback: the models host was never asked ({log.Events.Count} fallback(s))");
     });
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> answer) : HttpMessageHandler
@@ -217,7 +265,8 @@ public abstract partial class MLTestBase
         var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
         using var log = new FallbackLog(u => u == url);
 
-        // 1. the OPFS downloader (HttpModelDownloader): the first request 404s on the models host, the twin is fetched and cached.
+        // 1. the OPFS downloader (HttpModelDownloader): the first request 404s on the models host, the twin is fetched and cached (index off: it is the fallback under test).
+        using var noIndex = new MirrorIndexOff();
         using var cache = new OpfsModelCache(js) { CacheDirectoryName = "ilgpu-ml-test-modelshost" };
         if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
         using var source = new HubModelSource(cache, http);

@@ -111,6 +111,74 @@ public static class ModelsHost
         return headRes.Content.Headers.ContentLength ?? -1;
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // mirror index: which repos and files the models host has (mirrors.json, written by the mirror tool)
+    // ---------------------------------------------------------------------------------------------------
+
+    /// <summary>The index file at the root of the models host: <c>{"repos": {"org/repo": ["file", ...]}}</c>, every mirrored repo and its files.</summary>
+    public const string MirrorIndexFile = "mirrors.json";
+
+    /// <summary>
+    /// Consult <see cref="MirrorIndexFile"/> before asking the models host for a file (default on): a repo or file that is not mirrored goes straight to
+    /// Hugging Face, instead of a request that the host answers 404 (one red console line per file in a browser, and a wasted round trip). When the index
+    /// cannot be read (a custom <see cref="BaseUrl"/> without one, no network) every file is tried on the host first, as before.
+    /// </summary>
+    public static bool UseMirrorIndex { get; set; } = true;
+
+    private static readonly HttpClient IndexHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+    private static readonly object IndexLock = new();
+    private static Task<Dictionary<string, HashSet<string>>?>? _index;
+    private static string? _indexBase;
+
+    private static Task<Dictionary<string, HashSet<string>>?> MirrorIndexAsync()
+    {
+        lock (IndexLock)
+        {
+            var b = BaseUrl.TrimEnd('/');
+            if (_index == null || _indexBase != b) { _indexBase = b; _index = LoadIndexAsync(b); }
+            return _index;
+        }
+    }
+
+    private static async Task<Dictionary<string, HashSet<string>>?> LoadIndexAsync(string baseUrl)
+    {
+        try
+        {
+            using var res = await IndexHttp.GetAsync($"{baseUrl}/{MirrorIndexFile}").ConfigureAwait(false);
+            if (!res.IsSuccessStatusCode) return null;
+            using var doc = System.Text.Json.JsonDocument.Parse(await res.Content.ReadAsStringAsync().ConfigureAwait(false));
+            var repos = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            foreach (var r in doc.RootElement.GetProperty("repos").EnumerateObject())
+                repos[r.Name] = new HashSet<string>(r.Value.EnumerateArray().Select(f => f.GetString() ?? ""), StringComparer.Ordinal);
+            return repos;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The URL to ask first for <paramref name="url"/>: itself, or its Hugging Face twin when the mirror index says the models host does not have that file
+    /// (see <see cref="UseMirrorIndex"/>). A URL that is not a repo file on the models host comes back unchanged.
+    /// </summary>
+    public static async Task<string> PreferredUrlAsync(string url)
+    {
+        if (!UseMirrorIndex) return url;
+        var alt = GetFallbackUrl(url);
+        if (alt == null) return url;
+        var idx = await MirrorIndexAsync().ConfigureAwait(false);
+        if (idx == null) return url;
+        var path = url[(BaseUrl.TrimEnd('/').Length + 1)..].Split('?')[0];
+        var seg = path.Split('/');                                  // [datasets/]org/repo/resolve/revision/file...
+        int d = seg[0] == "datasets" ? 1 : 0;
+        string repo = string.Join('/', seg.Take(2 + d)), file = Uri.UnescapeDataString(string.Join('/', seg.Skip(4 + d)));
+        return idx.TryGetValue(repo, out var files) && files.Contains(file) ? url : alt;
+    }
+
+    /// <summary>Forget the loaded mirror index (it is read again on the next request): for tests, or after a new repo was mirrored.</summary>
+    public static void ResetMirrorIndex() { lock (IndexLock) { _index = null; _indexBase = null; } }
+
     /// <summary>Tell listeners a download fell back. Called by the transports.</summary>
     public static void ReportFallback(string failedUrl, string fallbackUrl, string reason) => Fallback?.Invoke(failedUrl, fallbackUrl, reason);
 
@@ -128,6 +196,15 @@ public static class ModelsHost
         var requestUri = request.RequestUri is { IsAbsoluteUri: false } rel && http.BaseAddress != null ? new Uri(http.BaseAddress, rel) : request.RequestUri;
         var alt = requestUri is { IsAbsoluteUri: true } uri ? GetFallbackUrl(uri.AbsoluteUri) : null;
         if (alt == null) return await http.SendAsync(request, completion, cancellationToken).ConfigureAwait(false);
+
+        // not mirrored (the index says so): straight to Hugging Face, no 404 from the models host first
+        if (await PreferredUrlAsync(requestUri!.AbsoluteUri).ConfigureAwait(false) == alt)
+        {
+            var direct = new HttpRequestMessage(request.Method, alt);   // not disposed here: the returned response may still reference it
+            foreach (var h in request.Headers) direct.Headers.TryAddWithoutValidation(h.Key, h.Value);
+            if (fallbackAuthorization != null) direct.Headers.Authorization = fallbackAuthorization;
+            return await http.SendAsync(direct, completion, cancellationToken).ConfigureAwait(false);
+        }
 
         string reason;
         try

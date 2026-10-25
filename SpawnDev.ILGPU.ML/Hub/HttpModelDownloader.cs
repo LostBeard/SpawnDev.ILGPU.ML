@@ -383,6 +383,8 @@ public class HttpModelDownloader
     private async Task DownloadAsync(string url, string key, long resumeFrom, string? knownETag,
         IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
     {
+        // a file the models host does not mirror (its mirrors.json says so) goes straight to Hugging Face: no 404 in the console first
+        url = await ModelsHost.PreferredUrlAsync(url).ConfigureAwait(false);
         var headers = new Dictionary<string, string>();
         // Segmented: ask for a BOUNDED range from the start, so the first response is a 206 carrying
         // Content-Range (which gives the true total) and a body small enough to take in one
