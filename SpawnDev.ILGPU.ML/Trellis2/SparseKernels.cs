@@ -164,7 +164,7 @@ public sealed class SparseKernels
             _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
-            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, nbr,
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), BiasWords(bias), o, _tiledDummyF!.View, nbr,
                 M, taps * cin, cout, cin, 1, 0, 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
             return;
         }
@@ -199,7 +199,7 @@ public sealed class SparseKernels
             EnsureTiledDummies();
             _noNbr ??= _acc.Allocate1D<int>(1);
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
-            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.Cast<global::ILGPU.Half, uint>(), o, _tiledDummyF!.View, _noNbr.View,
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), BiasWords(bias), o, _tiledDummyF!.View, _noNbr.View,
                 M, K, N, 0, 1, 0, 0, TiledGemm.ModeF16);
             return;
         }
@@ -262,7 +262,7 @@ public sealed class SparseKernels
         _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
         EnsureTiledDummies();
         int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
-        _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
+        _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? BiasWords(bias.Value) : _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
             M, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, addToOutput ? 2 : 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
     }
 
@@ -429,12 +429,31 @@ public sealed class SparseKernels
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
             // a residual that IS the output is added in place (hasRes 2): WebGPU forbids binding one buffer to two slots
             bool inPlace = res.HasValue && SameView(res.Value, o);
-            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View,
+            _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? BiasWords(bias.Value) : _tiledDummyU!.View,
                 o, res.HasValue && !inPlace ? res.Value : _tiledDummyF!.View, _tiledDummyI!.View, M, K, N, 0, bias.HasValue ? 1 : 0, act, !res.HasValue ? 0 : inPlace ? 2 : 1, TiledGemm.ModeF16);
             return;
         }
         _naiveLinear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, FV, int, int, int, int, int, int>(NaiveLinearImpl);
         _naiveLinear(M * N, x, weight, b, o, res ?? _tiledDummyF!.View, M, K, N, bias.HasValue ? 1 : 0, act, res.HasValue ? 1 : 0);
+    }
+
+    // The tiled GEMM reads an fp16 bias as 32-bit words (two halves each). Cast<Half, uint> of an ODD-length view drops the last half: with cout = 3 (the SD VAE's
+    // conv_out) the third bias was read past its binding - bounds-checked on WebGPU (a wrong blue channel, image relRMS 3.4e-2), silently past the view on CUDA /
+    // OpenCL (where it happened to be right). An odd length or odd start gets a zero-padded copy, made once per bias and kept (biases are never patched).
+    private readonly Dictionary<(object, long, long), MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _paddedBias = new();
+    private UV BiasWords(HV bias)
+    {
+        IContiguousArrayView cv = bias.BaseView;
+        if ((bias.Length & 1) == 0 && (cv.Index & 1) == 0) return bias.Cast<global::ILGPU.Half, uint>();
+        var key = ((object)cv.Buffer, cv.Index, bias.Length);
+        if (!_paddedBias.TryGetValue(key, out var padded))
+        {
+            padded = _acc.Allocate1D<global::ILGPU.Half>(bias.Length + 1);
+            padded.MemSetToZero();
+            padded.View.SubView(0, bias.Length).CopyFrom(bias);
+            _paddedBias[key] = padded;
+        }
+        return padded.View.Cast<global::ILGPU.Half, uint>();
     }
 
     private static bool SameView(FV a, FV b)

@@ -68,7 +68,7 @@ public sealed class DiTKernels
             _tiledBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureDummies();
             int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((N + TiledGemm.BN - 1) / TiledGemm.BN);
-            _tiledBf16(new KernelConfig(tiles, TiledGemm.Threads), x, w.Cast<BFloat16, uint>(), bias.HasValue ? bias.Value.Cast<BFloat16, uint>() : _dummyU!.View,
+            _tiledBf16(new KernelConfig(tiles, TiledGemm.Threads), x, w.Cast<BFloat16, uint>(), bias.HasValue ? BiasWords(bias.Value) : _dummyU!.View,
                 o, _dummyF!.View, _noNbr!.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0, TiledGemm.ModeBf16);
             return;
         }
@@ -85,6 +85,24 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledBf16;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _dummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyF;
+
+    // The tiled GEMM reads a bf16 bias as 32-bit words: Cast<BFloat16, uint> of an odd-length (or odd-start) view drops the last element (read past the binding:
+    // wrong on WebGPU, see SparseKernels.BiasWords). Those get a zero-padded copy, made once per bias and kept.
+    private readonly Dictionary<(object, long, long), MemoryBuffer1D<BFloat16, Stride1D.Dense>> _paddedBias = new();
+    private UV BiasWords(BV bias)
+    {
+        IContiguousArrayView cv = bias.BaseView;
+        if ((bias.Length & 1) == 0 && (cv.Index & 1) == 0) return bias.Cast<BFloat16, uint>();
+        var key = ((object)cv.Buffer, cv.Index, bias.Length);
+        if (!_paddedBias.TryGetValue(key, out var padded))
+        {
+            padded = _acc.Allocate1D<BFloat16>(bias.Length + 1);
+            padded.MemSetToZero();
+            padded.View.SubView(0, bias.Length).CopyFrom(bias);
+            _paddedBias[key] = padded;
+        }
+        return padded.View.Cast<BFloat16, uint>();
+    }
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _dummyB, _dummyB2;
     private void EnsureDummies()
     {   // bound in place of absent operands: WebGPU forbids binding one buffer to two slots, so no operand may stand in for another

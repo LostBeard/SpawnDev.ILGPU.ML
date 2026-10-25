@@ -28,11 +28,12 @@ The sampler, noise, CFG and host latents stay in SpawnGen. Tokenizer: `BPETokeni
 
 ## Gates (tests `MLTestBase.SdTests.cs`, fixtures `D:\Projects\sd\ref`, reference `tools/sd-harness/reference/ref_sd_dump.py --f16-weights`)
 - [x] SD 1.5: tokenizer ids, text encoder (last + penultimate), UNet taps + eps (32x40 and 64x64), VAE decode taps + image, encode mean: CUDA + OpenCL green, red-checked (9b9625f8)
-- [ ] SD 1.5 + SDXL on WebGPU (browser: checkpoint over HTTP from a local file server)
-- [ ] a 20-step picture identical to diffusers with the same noise (sampler on the host in the test, as SpawnGen runs it)
+- [ ] SD 1.5 + SDXL on WebGPU (browser, checkpoint over HTTP from `serve-files.mjs D:/Projects/sd 8769`): SD 1.5 UNet/sampler green (latent 6.1e-5); VAE image was 3.4e-2 = odd-length bias cast in the tiled GEMM wrappers (cout 3), FIXED (BiasWords) - re-run pending; SDXL browser not run
+- [x] a 20-step DDIM picture vs diffusers with the same noise (host sampler): CUDA 7.2e-3, OpenCL 4.8e-5 (e878b7e6)
 - [x] SDXL base (two towers, pooled, size ids, VAE fp32 activations): CUDA green at 40x48 and 1024x1024 (UNet 436 ms/step)
-- [ ] SD 2.x (OpenCLIP-H, v-prediction detection)
-- [ ] LoRA merge at load (kohya + diffusers/PEFT names), strength
+- [x] SD 2.x: 2.1 768-v (V inferred), 2.1 base (eps), sgm-layout sd_turbo (Lore's report); UpcastAttention for SD 2.x on CUDA (e878b7e6). Stability deleted its SD 2 repos: files from sd2-community
+- [x] LoRA merge (ApplyLorasAsync, kohya/PEFT/LDM keys, restore): LCM-LoRA SD 1.5 gated; [ ] a LoRA with text-encoder keys, an SDXL LoRA
+- [ ] Split component loaders for ComfyUI's VAELoader / UNETLoader / CLIPLoader / DualCLIPLoader (+ TAESD): per-component LoadAsync, unprefixed + diffusers/HF names (Lore, _DevComms/2026-10-25-1755-lore-TO-tuvok-split-loaders-needs.md)
 - [ ] ControlNet (SD 1.5: hint encoder, 13 residuals into the UNet skips + mid)
 - [ ] diffusers-format single files (second name map), SDXL refiner
 - [ ] memory: SDXL VAE decode at 1024 needs ~4 GB of activations: tiled decode for small cards / browser

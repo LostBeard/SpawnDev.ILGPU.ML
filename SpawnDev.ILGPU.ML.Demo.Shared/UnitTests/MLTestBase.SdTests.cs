@@ -55,6 +55,80 @@ public abstract partial class MLTestBase
         foreach (var l in all) Console.WriteLine($"[Sd] {what}: {l}");
     }
 
+    /// <summary>
+    /// The GEMM wrappers with an ODD output width and a bias (the SD VAE's conv_out has 3 channels): the tiled GEMM reads fp16 / bf16 biases as 32-bit words, and an
+    /// odd-length bias used to lose its last element (read past the binding: wrong on WebGPU, silently right elsewhere). fp16 Linear (N = 3 and 5), the exact
+    /// gathered convolution (cout = 3) and the bf16 Linear (N = 3) against a host reference on the same fp16 / bf16-rounded operands. Light, every backend.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Sd_OddWidthBias_MatchesHost() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("the tiled GEMM needs shared memory");
+        var rng = new Random(5);
+        float R() => (float)(rng.NextDouble() * 2 - 1);
+        var report = new List<string>();
+        double worst = 0;
+        var sk = new Trellis2.SparseKernels(accelerator);
+        foreach (int N in new[] { 3, 5 })
+        {
+            const int M = 70, K = 64;
+            var x = Enumerable.Range(0, M * K).Select(_ => R()).ToArray();
+            var w = Enumerable.Range(0, N * K).Select(_ => (global::ILGPU.Half)R()).ToArray();
+            var b = Enumerable.Range(0, N).Select(_ => (global::ILGPU.Half)(R() * 4)).ToArray();
+            using var xb = accelerator.Allocate1D(x); using var wb = accelerator.Allocate1D(w); using var bb = accelerator.Allocate1D(b); using var ob = accelerator.Allocate1D<float>(M * N);
+            sk.Linear(xb.View, wb.View, bb.View, ob.View, M, K, N);
+            var got = await ob.View.CopyToHostAsync();
+            double err = 0;
+            for (int m = 0; m < M; m++) for (int n = 0; n < N; n++)
+            {
+                double acc = (float)b[n]; for (int k = 0; k < K; k++) acc += x[m * K + k] * (float)w[n * K + k];
+                err = Math.Max(err, Math.Abs(got[m * N + n] - acc));
+            }
+            report.Add($"fp16 Linear N={N}: maxErr {err:E1}"); worst = Math.Max(worst, err);
+        }
+        {
+            // exact gathered 3x3 convolution, cin 16 -> cout 3 on an 8x8 picture (weights already in the gather layout [cout][taps][cin])
+            int H = 8, W = 8, cin = 16, cout = 3, M = H * W;
+            var sd = new StableDiffusion.SdKernels(accelerator);
+            var x = Enumerable.Range(0, M * cin).Select(_ => R()).ToArray();
+            var w = Enumerable.Range(0, cout * 9 * cin).Select(_ => (global::ILGPU.Half)R()).ToArray();
+            var b = Enumerable.Range(0, cout).Select(_ => (global::ILGPU.Half)(R() * 4)).ToArray();
+            using var xb = accelerator.Allocate1D(x); using var wb = accelerator.Allocate1D(w); using var bb = accelerator.Allocate1D(b); using var ob = accelerator.Allocate1D<float>(M * cout);
+            using var tb = accelerator.Allocate1D<int>(M * 27);
+            sd.BuildTable(tb.View, H, W, H, W, 3, 1, 1, 1);
+            sd.Conv(xb.View, tb.View, wb.View, bb.View, ob.View, M, cin, cout, 9, exact: true);
+            var got = await ob.View.CopyToHostAsync();
+            double err = 0;
+            for (int oy = 0; oy < H; oy++) for (int ox = 0; ox < W; ox++) for (int co = 0; co < cout; co++)
+            {
+                double acc = (float)b[co];
+                for (int t = 0; t < 9; t++) { int iy = oy - 1 + t / 3, ix = ox - 1 + t % 3; if (iy < 0 || iy >= H || ix < 0 || ix >= W) continue; for (int c = 0; c < cin; c++) acc += x[(iy * W + ix) * cin + c] * (float)w[(co * 9 + t) * cin + c]; }
+                err = Math.Max(err, Math.Abs(got[(oy * W + ox) * cout + co] - acc));
+            }
+            report.Add($"exact conv cout=3: maxErr {err:E1}"); worst = Math.Max(worst, err);
+        }
+        {
+            const int M = 70, K = 64, N = 3;
+            var dk = new Trellis2.DiTKernels(accelerator);
+            var x = Enumerable.Range(0, M * K).Select(_ => R()).ToArray();
+            var w = Enumerable.Range(0, N * K).Select(_ => (BFloat16)R()).ToArray();
+            var b = Enumerable.Range(0, N).Select(_ => (BFloat16)(R() * 4)).ToArray();
+            using var xb = accelerator.Allocate1D(x); using var wb = accelerator.Allocate1D(w); using var bb = accelerator.Allocate1D(b); using var ob = accelerator.Allocate1D<float>(M * N);
+            dk.Linear(xb.View, wb.View, bb.View, ob.View, M, K, N);
+            var got = await ob.View.CopyToHostAsync();
+            double err = 0;
+            for (int m = 0; m < M; m++) for (int n = 0; n < N; n++)
+            {
+                double acc = (float)b[n]; for (int k = 0; k < K; k++) acc += x[m * K + k] * (float)w[n * K + k];
+                err = Math.Max(err, Math.Abs(got[m * N + n] - acc));
+            }
+            report.Add($"bf16 Linear N=3: maxErr {err:E1}"); worst = Math.Max(worst, err);      // N < 64: never the tensor-core kernel, the tiled one on every backend
+        }
+        var line = string.Join("; ", report);
+        if (!(worst < 1e-3)) throw new Exception("odd-width bias GEMM deviates: " + line);
+        return line;
+    });
+
     /// <summary>The library's CLIP BPE tokenizer (<c>BPETokenizer.EncodeCLIP</c>) against the reference tokenizer's ids for the dumped prompt. Host only.</summary>
     [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Sd_ClipTokenizer_MatchesReference() => await RunTest(async accelerator =>
