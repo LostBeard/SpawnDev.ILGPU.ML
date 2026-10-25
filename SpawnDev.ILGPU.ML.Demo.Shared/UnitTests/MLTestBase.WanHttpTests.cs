@@ -9,7 +9,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <summary>
 /// Wan 2.2 TI2V-5B in the BROWSER: the whole pipeline fed by HTTP range requests from a local file server, the way the demo is fed from the model host (the 5.6 GB DiT, the 1.4 GB VAE and
 /// the 11.4 GB umT5 never sit in the page memory: each tensor goes from the fetch to the GPU). Serve the folder first:
-/// <c>node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767</c>, then <c>PMT_EXCLUDE_CATEGORIES= PMT_FILTER=Wan_Pipeline_OverHttp PMT_LANES=webgpu PMT_CONSOLE_LOG=Wan</c>.
+/// <c>node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767</c>, then <c>PMT_EXCLUDE_CATEGORIES= PMT_FILTER=Wan_Pipeline_OverHttp PMT_LANES=webgpu PMT_CONSOLE_LOG=Wan</c>.
 /// </summary>
 public abstract partial class MLTestBase
 {
@@ -42,7 +42,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         byte[] noiseRaw, wantRaw;
         try { noiseRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/noise_t2v30.f32"); wantRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/final_t2v30.f32"); }
-        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
         var noise = WanFloats(noiseRaw); var want = WanFloats(wantRaw);
         var pipe = new Wan22Pipeline(accelerator, new WanRangeSource(http), "", Wan22Paths.InRepo(textEncoder: Wan22Paths.TextEncoderFile("q8")));
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -74,7 +74,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         float[] latent;
         try { latent = WanFloats(await http.GetByteArrayAsync(WanServer + "dump2/browser/final_t2v30.f32")); }
-        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
         var source = new WanRangeSource(http);
         await using var stream = await source.OpenAsync("", "wan22_vae_f16.safetensors");
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
@@ -96,7 +96,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         var source = new WanRangeSource(http);
         try { await using var probe = await source.OpenAsync("", "wan22_vae_f16.safetensors"); }
-        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
         await using var stream = await source.OpenAsync("", "wan22_vae_f16.safetensors");
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
         using var weights = await SpawnDev.ILGPU.ML.Trellis2.GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, "vae");
@@ -126,7 +126,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         var source = new WanRangeSource(http);
         try { await using var probe = await source.OpenAsync("", "wan22_vae_f16.safetensors"); }
-        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
         var pipe = new Wan22Pipeline(accelerator, source, "", Wan22Paths.InRepo(textEncoder: Wan22Paths.TextEncoderFile("q8")));
         var sw = System.Diagnostics.Stopwatch.StartNew();
         string last = "";
@@ -152,7 +152,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         var source = new WanRangeSource(http);
         try { await using var probe = await source.OpenAsync("", Wan22Paths.DitFile("turbo_q8")); }
-        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running or has no Turbo file ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running or has no Turbo file ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
         var pipe = new Wan22Pipeline(accelerator, source, "", Wan22Paths.InRepo(Wan22Paths.DitFile("turbo_q8"), Wan22Paths.TextEncoderFile("q8")));
         string summary = "";
         foreach (var (w, h, frames) in new[] { (832, 480, 33), (1280, 704, 17) })

@@ -254,15 +254,16 @@ public sealed class SparseKernels
 
     /// <summary>
     /// <see cref="ConvTaps"/> on the portable tiled GEMM with fp32 activations all the way (no tensor cores). <paramref name="addToOutput"/> adds the product to what <paramref name="o"/> already
-    /// holds; no bias either way (the caller adds an fp32 one): two calls with the high and the low fp16 halves of an fp32 weight give a convolution with the weight's full 22-bit mantissa.
+    /// holds; no bias unless <paramref name="bias"/> is given (an fp16 one, added once: pass it to one call only): two calls with the high and the low fp16 halves of an fp32 weight
+    /// give a convolution with the weight's full 22-bit mantissa; the Stable Diffusion VAE passes its fp16 bias (fp32 activations: SDXL's VAE overflows fp16).
     /// </summary>
-    public void ConvTapsExact(FV x, IV nbr, HV weight, FV o, int M, int cin, int cout, int taps, bool addToOutput)
+    public void ConvTapsExact(FV x, IV nbr, HV weight, FV o, int M, int cin, int cout, int taps, bool addToOutput, HV? bias = null)
     {
         _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
         EnsureTiledDummies();
         int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
-        _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
-            M, taps * cin, cout, cin, 0, 0, addToOutput ? 2 : 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
+        _tiledGemm(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), bias.HasValue ? bias.Value.Cast<global::ILGPU.Half, uint>() : _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
+            M, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, addToOutput ? 2 : 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
     }
 
     /// <summary>True when <see cref="ConvTaps"/> would run a GEMM (tensor cores or the tiled kernel) for these sizes instead of its naive loop.</summary>

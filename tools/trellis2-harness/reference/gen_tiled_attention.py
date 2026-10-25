@@ -5,7 +5,7 @@ EDIT THIS FILE, NOT THE OUTPUT.
 Portable flash attention (no tensor cores, no inline assembly; fp32 throughout) for every ILGPU backend. Non-causal, no mask.
   O[i, h*D + d] = sum_j softmax_j(q_i . k_j / sqrt(D)) v_j[d]
 Group = 256 threads owns QPG queries of one head; P = 4 consecutive lanes share a query, lane p owning the dims d = p + 4 t (interleaved,
-so the four lanes of a quad read four consecutive banks). Keys go through shared memory in tiles of BKT; for each tile the quad computes
+so the four lanes of a quad read four consecutive banks). D = 128, 64, 160, 80, 40. Keys go through shared memory in tiles of BKT; for each tile the quad computes
 BKT scores (partial dots + two Warp.ShuffleXor steps), rescales its running output once per tile (online softmax), then accumulates
 P V. Shared memory: Ks + Vs = 2 * BKT * D floats (16 KB at D = 128, BKT = 16: WebGPU's guaranteed workgroup storage).
 Rows >= Nq load zeros and are not stored; keys >= Nk score -inf and stage zeros.
@@ -30,7 +30,7 @@ SP, SQT, SBKT128, SBKT64 = _cfg
 
 def kernel_shuffle(D, self_attn):
     P_, QT = SP, SQT
-    BKT = SBKT128 if D == 128 else SBKT64
+    BKT = SBKT128 if D == 128 else SBKT64 if D == 64 else (8 if D > 80 else 16)
     DT = D // P_
     LANES = TH // P_
     QG = LANES * QT                  # queries per group
@@ -58,11 +58,14 @@ def kernel_shuffle(D, self_attn):
             w(f"        float q{r}_{t} = ok{r} ? {Q}[qb{r} + {P_ * t}] * scale : 0f;")
         w("        " + " ".join(f"float o{r}_{t} = 0f;" for t in range(DT)))
         w(f"        float m{r} = -1e30f, l{r} = 0f;")
-    loads = BKT * D // TH
+    loads = -(-BKT * D // TH)
     w(f"        for (int kb = 0; kb < Nk; kb += {BKT})")
     w("        {")
     for r in range(loads):
-        w(f"            {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
+        if (r + 1) * TH <= BKT * D:
+            w(f"            {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
+        else:   # the last pass of a tile whose size is not a multiple of the group: the threads past its end stay idle
+            w(f"            if ({r * TH} + tid < {BKT * D}) {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
         w(f"              int kvb = gk * kvStride + h * {D} + d;")
         w(f"              ks[idx] = gk < Nk ? {KV}[kvb + kOff] : 0f; vs[idx] = gk < Nk ? {KV}[kvb + vOff] : 0f; }}")
     w("            Group.Barrier();")
@@ -107,7 +110,7 @@ def kernel_shuffle(D, self_attn):
 def kernel(D, self_attn, shuffle):
     if shuffle:
         return kernel_shuffle(D, self_attn)
-    BKT = 8
+    BKT = 4 if D > 128 else 8   # D = 160: Ks + Vs + red = 2304 floats, inside 16 KB
     DT = D // P                 # dims per lane
     name = f"{'Self' if self_attn else 'Cross'}D{D}{'' if shuffle else 'Smem'}"
     if self_attn:
@@ -134,11 +137,14 @@ def kernel(D, self_attn, shuffle):
     for t in range(DT):
         w(f"        float o{t} = 0f;")
     w("        float m = -1e30f, l = 0f;")
-    loads = BKT * D // TH
+    loads = -(-BKT * D // TH)
     w(f"        for (int kb = 0; kb < Nk; kb += {BKT})")
     w("        {")
     for r in range(loads):
-        w(f"            {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
+        if (r + 1) * TH <= BKT * D:
+            w(f"            {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
+        else:
+            w(f"            if ({r * TH} + tid < {BKT * D}) {{ int idx = {r * TH} + tid; int key = idx / {D}, d = idx - key * {D}; int gk = kb + key;")
         w(f"              long kvb = (long)gk * kvStride + h * {D} + d;")
         w(f"              ks[idx] = gk < Nk ? {KV}[kvb + kOff] : 0f; vs[idx] = gk < Nk ? {KV}[kvb + vOff] : 0f; }}")
     w("            Group.Barrier();")
@@ -194,7 +200,7 @@ w("{")
 w(f"    /// <summary>Queries per group: shuffle kernels ({SP} lanes x {SQT} queries per thread), *Smem kernels.</summary>")
 w(f"    public const int QueriesPerGroup = {(TH // SP) * SQT}, QueriesPerGroupSmem = {QPG}, Threads = {TH}, LanesPerQuery = {SP};")
 w("")
-for D in (128, 64):
+for D in (128, 64, 160, 80, 40):   # 160 / 80 / 40: the SD 1.x UNet's head widths (8 heads over 1280 / 640 / 320 channels)
     for sh in (True, False):
         kernel(D, False, sh)
         kernel(D, True, sh)

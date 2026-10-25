@@ -1,7 +1,7 @@
 // Scenario for the video demo: /video (Wan 2.2 TI2V-5B text to video). See _routes.mjs for the scenario contract.
 //
 // The Wan files are not on models.spawndev.com yet, so the page's "Model server" field points at a local file server laid out like the models host:
-//   node tools/unirig-harness/serve-files.mjs F:/Projects/wan-serve 8768        (F:/Projects/wan-serve/LostBeard/Wan2.2-TI2V-5B-ILGPU/resolve/main = junction to F:/Projects/wan)
+//   node tools/unirig-harness/serve-files.mjs D:/Projects/wan-serve 8768        (D:/Projects/wan-serve/LostBeard/Wan2.2-TI2V-5B-ILGPU/resolve/main = junction to D:/Projects/wan)
 // Env: WAN_MODEL_SERVER (default http://127.0.0.1:8768). This is the heaviest demo (13 GB of weights into OPFS, minutes of GPU work): run it alone on the GPU.
 
 // Pixel statistics of an <img> (drawn into a 64x64 canvas): a blank or constant picture has std ~ 0, a drawn one much more.

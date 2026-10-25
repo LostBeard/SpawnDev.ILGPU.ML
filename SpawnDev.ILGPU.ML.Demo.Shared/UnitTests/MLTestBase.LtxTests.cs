@@ -11,11 +11,11 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <summary>
 /// LTX-Video 2B 0.9.8 distilled (Plans/ltx-video-2b-2026-10-22.md). Each stage is held to tensors dumped from the REFERENCE implementation (diffusers) on identical inputs
 /// (tools/ltx-harness/reference: ref_t5_dump.py, ref_dit_dump.py, export_t5_bf16.py, export_dit_bf16.py). The fixtures and the bf16 exports live in LTX_DIR (default
-/// F:\Projects\ltx: <c>t5_xxl_enc_bf16.safetensors</c>, <c>ltx_dit_bf16.safetensors</c>, <c>ref\*.npz</c>, <c>google\t5-v1_1-xxl\tokenizer.json</c>); a missing directory skips the test.
+/// D:\Projects\ltx: <c>t5_xxl_enc_bf16.safetensors</c>, <c>ltx_dit_bf16.safetensors</c>, <c>ref\*.npz</c>, <c>google\t5-v1_1-xxl\tokenizer.json</c>); a missing directory skips the test.
 /// </summary>
 public abstract partial class MLTestBase
 {
-    private static string LtxDir => Environment.GetEnvironmentVariable("LTX_DIR") ?? @"F:\Projects\ltx";
+    private static string LtxDir => Environment.GetEnvironmentVariable("LTX_DIR") ?? @"D:\Projects\ltx";
     private const float LtxFrameRate = 25f;
 
     /// <summary>The Unigram tokenizer of google/t5-v1_1-xxl against the reference's token ids for the three dumped prompts. Host only.</summary>

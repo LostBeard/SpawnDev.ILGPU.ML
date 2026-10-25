@@ -11,11 +11,11 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <summary>
 /// Wan 2.2 TI2V-5B (Plans/wan22-ti2v-5b-2026-10-22.md). Each stage is held to tensors dumped from the REFERENCE implementation on identical inputs
 /// (tools/wan-harness/reference: ref_t5_dump.py, ref_dit_dump.py, export_dit_bf16.py). The fixtures and the bf16 DiT export live in WAN_DIR (default
-/// F:\Projects\wan: <c>wan22_ti2v_5b_dit_bf16.safetensors</c>, <c>dump\*.npz</c>); a missing directory skips the test.
+/// D:\Projects\wan: <c>wan22_ti2v_5b_dit_bf16.safetensors</c>, <c>dump\*.npz</c>); a missing directory skips the test.
 /// </summary>
 public abstract partial class MLTestBase
 {
-    private static string WanDir => Environment.GetEnvironmentVariable("WAN_DIR") ?? @"F:\Projects\wan";
+    private static string WanDir => Environment.GetEnvironmentVariable("WAN_DIR") ?? @"D:\Projects\wan";
 
     /// <summary>One array of an .npz written by numpy.savez, as floats with its shape.</summary>
     private static (float[] Data, int[] Shape) WanNpz(ZipArchive zip, string name)

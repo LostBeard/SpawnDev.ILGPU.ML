@@ -12,7 +12,7 @@ in the browser (see Measured). It is sharpest at its native 1280x704; at 640x352
 The stages run one after another so only one large model is on the device at a time (the umT5 streams one layer at a time), which is what lets a 12 GB card, and a browser tab, run it.
 
 ```csharp
-var pipe = new Wan22Pipeline(accelerator, Wan22Paths.InFolder(@"F:\Projects\wan"));                 // files on disk
+var pipe = new Wan22Pipeline(accelerator, Wan22Paths.InFolder(@"D:\Projects\wan"));                 // files on disk
 // or: new Wan22Pipeline(accelerator, modelSource, Wan22Pipeline.DefaultRepo, Wan22Paths.InRepo())      // IModelSource: models host + cache, browser OPFS, local folder
 var video = await pipe.GenerateAsync(new WanRequest { Prompt = "A red fox walking through fresh snow", Width = 640, Height = 352, Frames = 17, Steps = 30, Seed = 7 });
 byte[] rgba = video.GetFrameRgba(0);       // frames are floats in [-1, 1], channel-first; WanVideo.Latent is the denoised latent
@@ -73,7 +73,7 @@ Desktop CUDA, `Examples/11.VideoGen.Console --ci` (320x192, 9 frames, 8 steps): 
 
 `/video` in the demo (text or image to video, a frame player and WebM download), `Examples/11.VideoGen.Console` (PNG frames and an animated WebP) and `Examples/12.VideoGen.Wpf`.
 Tests: `Wan_*` in `MLTestBase.WanTests.cs` (desktop) and `Wan_Pipeline_OverHttp_MatchesReference`, `Wan_Vae_OverHttp_DecodeTimes` in `MLTestBase.WanHttpTests.cs` (WebGPU lane; serve the folder with
-`node tools/unirig-harness/serve-files.mjs F:/Projects/wan 8767` first); the demo page by `tools/audit-scenarios/video.mjs`.
+`node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767` first); the demo page by `tools/audit-scenarios/video.mjs`.
 
 # Video generation: LTX-Video 2B (0.9.8 distilled)
 
@@ -100,7 +100,7 @@ Red checks: q RoPE off (DiT 0.84), unpatchify offsets swapped (VAE 0.18), a wron
 
 ## Measured
 
-RTX 4070 12 GB, CUDA, `Examples/11.VideoGen.Console --ltx --models F:\Projects\ltx`: 704x480 x 97 frames **51 s** (T5 streamed from disk 24 s, DiT load 13 s, 7 steps 9 s, VAE decode 5 s); 480x320 x 49 frames 43 s
+RTX 4070 12 GB, CUDA, `Examples/11.VideoGen.Console --ltx --models D:\Projects\ltx`: 704x480 x 97 frames **51 s** (T5 streamed from disk 24 s, DiT load 13 s, 7 steps 9 s, VAE decode 5 s); 480x320 x 49 frames 43 s
 (30 s with the 8-bit DiT and T5: `--dit q8 --text q8`; the clips look the same).
 
 ## Licence

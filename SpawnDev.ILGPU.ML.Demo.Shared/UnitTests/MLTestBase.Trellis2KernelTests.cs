@@ -403,7 +403,7 @@ public abstract partial class MLTestBase
         RequireTrellisBackend(accelerator);
         var dk = new DiTKernels(accelerator);
         var report = new List<string>();
-        foreach (int D in new[] { 128, 64 })
+        foreach (int D in new[] { 128, 64, 160, 80, 40 })     // 160 / 80 / 40: the SD 1.x UNet's head widths (key tiles of 4 to 16 against Nk = 50: a partial last tile each)
         {
             if (!dk.UsesFlashAttention(D)) throw new UnsupportedTestException($"no flash attention for D={D} on this backend");
             foreach (bool packed in new[] { false, true })

@@ -426,9 +426,16 @@ public sealed class DiTKernels
         => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && headDim == MmaAttention.HeadDim;
     /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
     private bool UsesTiledAttention(int headDim)
-        => EnableTiled && (headDim == 128 || headDim == 64) && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4 && _acc.AcceleratorType != AcceleratorType.WebGL;
-    private readonly Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledCross = new Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[4];
-    private readonly Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledSelf = new Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[4];
+        => EnableTiled && TiledWidth(headDim) >= 0 && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4 && _acc.AcceleratorType != AcceleratorType.WebGL;
+    /// <summary>The head widths with a portable flash kernel, in kernel-key order (key = 2 * index + self): 160 / 80 / 40 are the SD 1.x UNet's.</summary>
+    private static readonly int[] TiledWidths = { 128, 64, 160, 80, 40 };
+    private static int TiledWidth(int headDim) => Array.IndexOf(TiledWidths, headDim);
+    private static readonly Delegate[] CrossShuffle = { TiledAttention.CrossD128, TiledAttention.CrossD64, TiledAttention.CrossD160, TiledAttention.CrossD80, TiledAttention.CrossD40 };
+    private static readonly Delegate[] CrossSmem = { TiledAttention.CrossD128Smem, TiledAttention.CrossD64Smem, TiledAttention.CrossD160Smem, TiledAttention.CrossD80Smem, TiledAttention.CrossD40Smem };
+    private static readonly Delegate[] SelfShuffle = { TiledAttention.SelfD128, TiledAttention.SelfD64, TiledAttention.SelfD160, TiledAttention.SelfD80, TiledAttention.SelfD40 };
+    private static readonly Delegate[] SelfSmem = { TiledAttention.SelfD128Smem, TiledAttention.SelfD64Smem, TiledAttention.SelfD160Smem, TiledAttention.SelfD80Smem, TiledAttention.SelfD40Smem };
+    private readonly Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledCross = new Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>?[10];
+    private readonly Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[] _tiledSelf = new Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>?[10];
     /// <summary>Null until the first attention: whether this backend compiles warp shuffles (NVIDIA's OpenCL does not; browsers need the subgroups feature).</summary>
     private bool? _shuffleOk;
 
@@ -493,10 +500,10 @@ public sealed class DiTKernels
         if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
         if (_shuffleOk != false)
         {
-            try { _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.CrossD128 : TiledAttention.CrossD64); _shuffleOk = true; return _tiledCross[key]!; }
+            try { _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, FV, int, int, int, int, int, int, int, int>)CrossShuffle[key / 2]); _shuffleOk = true; return _tiledCross[key]!; }
             catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
         }
-        return _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.CrossD128Smem : TiledAttention.CrossD64Smem);
+        return _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, FV, int, int, int, int, int, int, int, int>)CrossSmem[key / 2]);
     }
     private Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int> SelfKernel(int key)
     {
@@ -504,10 +511,10 @@ public sealed class DiTKernels
         if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
         if (_shuffleOk != false)
         {
-            try { _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.SelfD128 : TiledAttention.SelfD64); _shuffleOk = true; return _tiledSelf[key]!; }
+            try { _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, int, int, int, int, int, int, int, int>)SelfShuffle[key / 2]); _shuffleOk = true; return _tiledSelf[key]!; }
             catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
         }
-        return _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>(key < 2 ? TiledAttention.SelfD128Smem : TiledAttention.SelfD64Smem);
+        return _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, int, int, int, int, int, int, int, int>)SelfSmem[key / 2]);
     }
 
     /// <summary>
@@ -522,7 +529,7 @@ public sealed class DiTKernels
             IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;
             bool self = qv.Buffer == kvv.Buffer;
             if (self && qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
-            int key = (D == 128 ? 0 : 2) + (self ? 1 : 0);
+            int key = 2 * TiledWidth(D) + (self ? 1 : 0);
             Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int>? selfK = null;
             Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int>? crossK = null;
             if (self) selfK = SelfKernel(key); else crossK = CrossKernel(key);     // resolves _shuffleOk, which sets the queries per group
