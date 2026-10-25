@@ -110,13 +110,28 @@ public sealed class SdTextEncoder : IDisposable
     /// </summary>
     public async Task<SdTextEmbedding> EncodeAsync(int[] ids, int[]? ids2 = null, int? layer = null, CancellationToken cancellationToken = default)
     {
+        int T = ids.Length, W = Width;
+        var ctx = Slot(6, (long)T * W);
+        FV? pooled = _xl ? Slot(7, _towers[1].ProjectionWidth) : null;
+        await EncodeAsync(ids, ids2, layer, ctx, pooled, cancellationToken);
+        await _acc.SynchronizeAsync();
+        var context = await ctx.CopyToHostAsync();
+        float[]? p = pooled.HasValue ? await pooled.Value.CopyToHostAsync() : null;
+        return new SdTextEmbedding(context, T, W, p);
+    }
+
+    /// <summary>
+    /// Encode one prompt chunk on the device: <paramref name="context"/> receives [ids.Length, Width] row-major (the towers side by side for SDXL), <paramref name="pooled"/>
+    /// (SDXL only; [1280]) the pooled embedding. Same arguments as the host overload.
+    /// </summary>
+    public async Task EncodeAsync(int[] ids, int[]? ids2, int? layer, FV context, FV? pooled, CancellationToken cancellationToken = default)
+    {
         int T = ids.Length;
         if (T < 1 || T > MaxTokens) throw new ArgumentException($"a prompt chunk is 1 to {MaxTokens} tokens (pad to {MaxTokens} as CLIP does)");
         int lay = layer ?? _defaultLayer;
         if (lay > -1) throw new ArgumentException("layer counts from the end: -1 = the last layer, -2 = the penultimate");
         int W = Width;
-        var context = new float[(long)T * W];
-        float[]? pooled = null;
+        if (context.Length < (long)T * W) throw new ArgumentException($"the context needs [{T}, {W}]");
         int col = 0;
         for (int ti = 0; ti < _towers.Length; ti++)
         {
@@ -125,33 +140,30 @@ public sealed class SdTextEncoder : IDisposable
             if (tid.Length != T) throw new ArgumentException("both towers take the same number of tokens");
             int C = tw.Width, stop = tw.Layers + 1 + lay;            // layers to run for the context (-1: all)
             if (stop < 1) throw new ArgumentException($"layer {lay} is below the first of {tw.Layers} layers");
-            using var idBuf = _acc.Allocate1D(tid);
-            var x = Slot(0, (long)T * C); var n = Slot(1, (long)T * C); var qkv = Slot(2, (long)T * 3 * C); var a = Slot(3, (long)T * C);
-            int inner = tw.Width * 4;
-            var hid = Slot(4, (long)T * inner);
-            _k.Embed(idBuf.View, _w[tw.P + "tok"], _w[tw.P + "pos"], x, T, C);
-            tw.Run(x, T, 0, stop, n, qkv, a, hid);
-            var outv = x;
-            if (_finalNorm) { _k.Sparse.LayerNorm(x, n, _w[tw.P + "final_ln.weight"], _w[tw.P + "final_ln.bias"], T, C, 1e-5f); outv = n; }
-            await _acc.SynchronizeAsync();
-            var host = await outv.CopyToHostAsync();
-            for (int t = 0; t < T; t++) Array.Copy(host, (long)t * C, context, (long)t * W + col, C);
-            col += C;
-            if (_xl && ti == 1 && tw.HasProjection)
+            var idv = _acc.Allocate1D(tid);
+            try
             {
-                // the pooled embedding: the rest of the layers, the final norm, the end token's row (the highest id: OpenCLIP's text.argmax), the projection
-                tw.Run(x, T, stop, tw.Layers, n, qkv, a, hid);
-                _k.Sparse.LayerNorm(x, n, _w[tw.P + "final_ln.weight"], _w[tw.P + "final_ln.bias"], T, C, 1e-5f);
-                int eot = 0; for (int t = 1; t < T; t++) if (tid[t] > tid[eot]) eot = t;
-                int P = tw.ProjectionWidth;
-                var pv = Slot(5, P);
-                _k.Sparse.Linear(n.SubView((long)eot * C, C), _w[tw.P + "proj.weight"], null, pv, 1, C, P);
-                await _acc.SynchronizeAsync();
-                pooled = await pv.CopyToHostAsync();
+                var x = Slot(0, (long)T * C); var n = Slot(1, (long)T * C); var qkv = Slot(2, (long)T * 3 * C); var a = Slot(3, (long)T * C);
+                var hid = Slot(4, (long)T * tw.Width * 4);
+                _k.Embed(idv.View, _w[tw.P + "tok"], _w[tw.P + "pos"], x, T, C);
+                tw.Run(x, T, 0, stop, n, qkv, a, hid);
+                var outv = x;
+                if (_finalNorm) { _k.Sparse.LayerNorm(x, n, _w[tw.P + "final_ln.weight"], _w[tw.P + "final_ln.bias"], T, C, 1e-5f); outv = n; }
+                _k.CopyColumns(outv, context, T, C, W, col);
+                col += C;
+                if (_xl && ti == 1 && tw.HasProjection && pooled.HasValue)
+                {
+                    // the pooled embedding: the rest of the layers, the final norm, the end token's row (the highest id: OpenCLIP's text.argmax), the projection
+                    tw.Run(x, T, stop, tw.Layers, n, qkv, a, hid);
+                    _k.Sparse.LayerNorm(x, n, _w[tw.P + "final_ln.weight"], _w[tw.P + "final_ln.bias"], T, C, 1e-5f);
+                    int eot = 0; for (int t = 1; t < T; t++) if (tid[t] > tid[eot]) eot = t;
+                    _k.Sparse.Linear(n.SubView((long)eot * C, C), _w[tw.P + "proj.weight"], null, pooled.Value, 1, C, tw.ProjectionWidth);
+                }
+                await _acc.SynchronizeAsync();      // the ids buffer goes now, and the next tower reuses the scratch
             }
+            finally { idv.Dispose(); }
             cancellationToken.ThrowIfCancellationRequested();
         }
-        return new SdTextEmbedding(context, T, W, pooled);
     }
 
     public void Dispose()

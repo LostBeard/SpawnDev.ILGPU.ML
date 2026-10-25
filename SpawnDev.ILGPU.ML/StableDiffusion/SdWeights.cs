@@ -72,10 +72,26 @@ public sealed class SdWeights : IDisposable
         }
         var shape = (int[])first.Clone(); shape[0] = rows;
         await acc.SynchronizeAsync();               // the parts may only go once the copies ran (a browser batches them; Wasm runs them on workers)
-        foreach (var p in parts) Remove(p);
+        int row = 0;
+        foreach (var p in parts) { int r = Shape(p)[0]; _fusedParts[p] = (fused, row, r); row += r; Remove(p); }
         Add(fused, buf, shape);
         return true;
     }
+
+    private readonly Dictionary<string, (string Fused, int RowOffset, int Rows)> _fusedParts = new();
+
+    /// <summary>
+    /// Where a tensor of the file now lives: itself, or rows [RowOffset, RowOffset + Rows) of the fused tensor it went into (a LoRA for <c>attn1.to_k.weight</c> patches
+    /// rows C..2C of <c>attn1.qkv.weight</c>). Null when the tensor is not held.
+    /// </summary>
+    internal (string Name, int RowOffset, int Rows)? Locate(string name)
+    {
+        if (_fusedParts.TryGetValue(name, out var f)) return (f.Fused, f.RowOffset, f.Rows);
+        return Has(name) ? (name, 0, Shape(name)[0]) : null;
+    }
+
+    /// <summary>The file-level names this store answers for: the held tensors and the parts fused into them.</summary>
+    internal IEnumerable<string> SourceNames => _shapes.Keys.Concat(_fusedParts.Keys);
 
     public void Dispose()
     {
@@ -121,14 +137,15 @@ internal sealed class SdTensorStreamer : IDisposable
     private static void FromBf16Impl(Index1D i, ArrayView1D<BFloat16, Stride1D.Dense> src, HV dst, int layout, int a, int b)
         => dst[i] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(PrecisionConvert.ConvertToSingle(src[SourceIndex(i, layout, a, b)]));
 
-    /// <summary>A tensor's destination: the store, the internal name and the layout.</summary>
-    public readonly record struct Target(SdWeights Store, string Name, SdLayout Layout);
+    /// <summary>A tensor's destination: the store, the internal name and the layout. A null store = a tiny tensor (a LoRA alpha) read to the host: <c>onScalar</c> gets its first value.</summary>
+    public readonly record struct Target(SdWeights? Store, string Name, SdLayout Layout);
 
     /// <summary>
     /// Stream every tensor of <paramref name="tensors"/> (the parsed header, in file order) from <paramref name="stream"/> positioned just after the header (<paramref name="pos"/> = its
     /// absolute offset). <paramref name="route"/> returns the destination or null (skipped: read through, never uploaded). <paramref name="onBytes"/> reports the absolute stream position.
     /// </summary>
-    public async Task StreamAsync(Stream stream, IReadOnlyList<SafeTensorInfo> tensors, long pos, Func<string, Target?> route, Action<long>? onBytes, CancellationToken ct)
+    public async Task StreamAsync(Stream stream, IReadOnlyList<SafeTensorInfo> tensors, long pos, Func<string, Target?> route, Action<long>? onBytes, CancellationToken ct,
+        Action<string, float>? onScalar = null)
     {
         var ordered = tensors.OrderBy(t => t.DataOffset).ToList();
         long staging = 0;
@@ -137,7 +154,8 @@ internal sealed class SdTensorStreamer : IDisposable
         {
             var t = ordered[i];
             targets[i] = route(t.Name);
-            if (targets[i] is { } tg && (t.DType != "F16" || tg.Layout != SdLayout.AsIs)) staging = Math.Max(staging, t.DataLength);
+            if (targets[i] is { Store: not null } tg && (t.DType != "F16" || tg.Layout != SdLayout.AsIs)) staging = Math.Max(staging, t.DataLength);
+            if (targets[i] is { Store: null } && t.DataLength > 64) throw new InvalidDataException($"tensor '{t.Name}' ({t.DataLength} bytes) is too big to read to the host");
             if (targets[i] != null && t.DType is not ("F16" or "F32" or "BF16"))
                 throw new NotSupportedException($"tensor '{t.Name}' is {t.DType}: a Stable Diffusion checkpoint holds F32, F16 or BF16 weights");
         }
@@ -159,6 +177,20 @@ internal sealed class SdTensorStreamer : IDisposable
                 pos = t.DataOffset;
             }
             long n = SafeTensorsFileReader.ElementCount(t);
+            if (tg.Store == null)
+            {
+                var raw = new byte[t.DataLength];
+                await stream.ReadExactlyAsync(raw, ct);
+                float v = t.DType switch
+                {
+                    "F32" => BitConverter.ToSingle(raw, 0),
+                    "F16" => (float)BitConverter.ToHalf(raw, 0),
+                    _ => BitConverter.Int32BitsToSingle(BitConverter.ToUInt16(raw, 0) << 16),
+                };
+                onScalar?.Invoke(tg.Name, v);
+                pos += t.DataLength;
+                continue;
+            }
             var shape = t.Shape;
             int layout = 0, a = 1, b = 1;
             int[] outShape = shape;

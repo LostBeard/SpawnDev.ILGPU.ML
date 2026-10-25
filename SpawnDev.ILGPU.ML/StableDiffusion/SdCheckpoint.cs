@@ -45,7 +45,7 @@ public sealed class SdCheckpoint : IDisposable
 
     private SdCheckpoint(SdFamily family, SdPrediction prediction, SdWeights? unet, SdWeights? text, SdWeights? vae, Accelerator acc)
     {
-        Family = family; Prediction = prediction; _unet = unet; _text = text; _vae = vae;
+        Family = family; Prediction = prediction; _unet = unet; _text = text; _vae = vae; _acc = acc;
         if (unet != null) UNet = new SdUNet(acc, unet);
         if (text != null) TextEncoder = new SdTextEncoder(acc, text, family);
         if (vae != null) Vae = new SdVae(acc, vae);
@@ -94,6 +94,8 @@ public sealed class SdCheckpoint : IDisposable
                     local = MapHfClip(n["cond_stage_model.transformer.text_model.".Length..], "l.");
                 else if (family == SdFamily.SD2 && n.StartsWith("cond_stage_model.model.", StringComparison.Ordinal))
                     local = MapOpenClip(n["cond_stage_model.model.".Length..], "h.", out layout);
+                else if (family == SdFamily.SD2 && n.StartsWith("conditioner.embedders.0.model.", StringComparison.Ordinal))     // the sgm layout (sd_turbo)
+                    local = MapOpenClip(n["conditioner.embedders.0.model.".Length..], "h.", out layout);
                 else if (family == SdFamily.SDXL && n.StartsWith("conditioner.embedders.0.transformer.text_model.", StringComparison.Ordinal))
                     local = MapHfClip(n["conditioner.embedders.0.transformer.text_model.".Length..], "l.");
                 else if (family == SdFamily.SDXL && n.StartsWith("conditioner.embedders.1.model.", StringComparison.Ordinal))
@@ -160,7 +162,12 @@ public sealed class SdCheckpoint : IDisposable
     {
         if (names.Any(n => n.StartsWith("conditioner.embedders.1.model.", StringComparison.Ordinal))) return SdFamily.SDXL;
         if (names.Any(n => n.StartsWith("conditioner.embedders.0.model.", StringComparison.Ordinal)))
+        {
+            // Stability's sgm layout puts one OpenCLIP tower at embedders.0: ViT-H (1024 wide) = SD 2.x (sd_turbo.safetensors), bigG (1280) = the SDXL refiner (ComfyUI: SD20 / SDXLRefiner)
+            var lnf = tensors.FirstOrDefault(t => t.Name == "conditioner.embedders.0.model.ln_final.weight");
+            if (lnf != null && lnf.Shape[0] == 1024) return SdFamily.SD2;
             throw new NotSupportedException($"'{name}': an SDXL refiner checkpoint (one OpenCLIP bigG tower); only SDXL base is supported");
+        }
         if (names.Contains("cond_stage_model.model.ln_final.weight") || names.Any(n => n.StartsWith("cond_stage_model.model.transformer.", StringComparison.Ordinal))) return SdFamily.SD2;
         if (names.Any(n => n.StartsWith("cond_stage_model.transformer.", StringComparison.Ordinal))) return SdFamily.SD1;
         // a UNet-only file: the cross-attention width says the family
@@ -174,7 +181,7 @@ public sealed class SdCheckpoint : IDisposable
     private static bool HasTextEncoder(HashSet<string> names, SdFamily family) => family switch
     {
         SdFamily.SD1 => names.Contains("cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"),
-        SdFamily.SD2 => names.Contains("cond_stage_model.model.token_embedding.weight"),
+        SdFamily.SD2 => names.Contains("cond_stage_model.model.token_embedding.weight") || names.Contains("conditioner.embedders.0.model.token_embedding.weight"),
         _ => names.Contains("conditioner.embedders.0.transformer.text_model.embeddings.token_embedding.weight") && names.Contains("conditioner.embedders.1.model.token_embedding.weight"),
     };
 
@@ -237,8 +244,23 @@ public sealed class SdCheckpoint : IDisposable
         return r == null ? null : l + r;
     }
 
+    private SdLoraMerger? _lora;
+    private readonly Accelerator _acc;
+
+    /// <summary>
+    /// Merge LoRAs into the loaded UNet and text encoder(s), replacing any set merged before (the originals of patched tensors are kept on the device, so this restores them
+    /// first: call it again with other strengths, or with an empty list to remove every LoRA). Each LoRA's <see cref="SdLoraSpec.Strength"/> scales its UNet modules,
+    /// <see cref="SdLoraSpec.ClipStrength"/> its text-encoder modules. The report lists the keys that matched nothing in this checkpoint (a LoRA for another family).
+    /// </summary>
+    public async Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
+    {
+        _lora ??= new SdLoraMerger(_acc, _unet, _text, Family);
+        return await _lora.ApplyAsync(loras, cancellationToken);
+    }
+
     public void Dispose()
     {
+        _lora?.Dispose();
         UNet?.Dispose(); TextEncoder?.Dispose(); Vae?.Dispose();
         _unet?.Dispose(); _text?.Dispose(); _vae?.Dispose();
     }

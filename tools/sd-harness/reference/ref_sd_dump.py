@@ -52,6 +52,9 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="t")
     ap.add_argument("--f16-weights", action="store_true")
+    ap.add_argument("--lora", default=None, help="merge this LoRA (diffusers load_lora_weights + fuse_lora) before dumping")
+    ap.add_argument("--lora-scale", type=float, default=1.0)
+    ap.add_argument("--config", default=None, help="diffusers config repo (SD 2.x: Stability deleted its repos; sd2-community/stable-diffusion-2-1 mirrors them)")
     ap.add_argument("--f16-storage", action="store_true", help="keep the weights fp16 in memory and do every layer's math in fp32 (the same numbers as --f16-weights at half the memory: SDXL on a 16 GB machine)")
     ap.add_argument("--prompt", default="a photograph of an astronaut riding a horse on the moon, highly detailed")
     ap.add_argument("--image-size", default="256x320")
@@ -71,7 +74,8 @@ def main():
     else:
         from diffusers import StableDiffusionPipeline as P
     dt = torch.float16 if a.f16_storage else torch.float32
-    pipe = P.from_single_file(a.ckpt, torch_dtype=dt, safety_checker=None) if not sdxl else P.from_single_file(a.ckpt, torch_dtype=dt)
+    extra = {"config": a.config} if a.config else {}
+    pipe = P.from_single_file(a.ckpt, torch_dtype=dt, safety_checker=None, **extra) if not sdxl else P.from_single_file(a.ckpt, torch_dtype=dt, **extra)
     mods = [pipe.unet, pipe.vae, pipe.text_encoder] + ([pipe.text_encoder_2] if sdxl else [])
     if a.f16_storage:
         upcast_math(mods)
@@ -81,6 +85,11 @@ def main():
             with torch.no_grad():
                 for p in m.parameters():
                     p.copy_(p.half().float())
+    if a.lora:
+        pipe.load_lora_weights(a.lora)
+        pipe.fuse_lora(lora_scale=a.lora_scale)
+        pipe.unload_lora_weights()
+        print("lora fused:", a.lora, "scale", a.lora_scale)
     print("sdxl", sdxl)
     print("unet config:", json.dumps({k: v for k, v in pipe.unet.config.items() if not k.startswith("_")}, default=str))
     print("vae config:", json.dumps({k: v for k, v in pipe.vae.config.items() if not k.startswith("_")}, default=str))

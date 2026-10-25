@@ -168,9 +168,10 @@ public class BPETokenizer : ITokenizer
     }
 
     /// <summary>
-    /// Encode text with special tokens for CLIP (start/end of text).
+    /// Encode text with special tokens for CLIP (start/end of text), padded to <paramref name="maxLength"/> with <paramref name="padToken"/>: 49407 (the end token) for OpenAI
+    /// CLIP ViT-L (SD 1.x, SDXL's first tower), 0 for the OpenCLIP towers (SD 2.x's ViT-H, SDXL's bigG), as their tokenizers and ComfyUI pad.
     /// </summary>
-    public int[] EncodeCLIP(string text, int maxLength = 77)
+    public int[] EncodeCLIP(string text, int maxLength = 77, int padToken = 49407)
     {
         // CLIP BPE (NOT the GPT-2 Encode): whitespace-collapse + regex pretokenize (no standalone space
         // tokens) + byte-encode + BPE with </w> word-ending. The GPT-2 Encode produced 'Ġ'(space) tokens
@@ -180,13 +181,12 @@ public class BPETokenizer : ITokenizer
         result.AddRange(tokens.Take(maxLength - 2));
         result.Add(49407); // <|endoftext|>
 
-        // Pad to maxLength with the EOS token (49407) — CLIP's pad_token IS <|endoftext|>
-        // (HF CLIPTokenizer.pad_token_id == 49407). SD's text encoder runs over ALL 77 positions with no
-        // attention mask and the UNet cross-attends to all of them, so padding with token 0 ("!") instead
-        // of EOS swamps the real prompt with ~70 junk tokens → conditioning collapses → the UNet predicts
-        // ε≈input-noise → x0 goes near-flat → VAE decodes green mush. Must be 49407, not 0.
+        // The text encoder runs over ALL 77 positions with no attention mask and the UNet cross-attends to all of them, so the pad token is part of
+        // the conditioning and must be the one the model was trained with. OpenAI CLIP ViT-L (SD 1.x, SDXL tower 1): the end token 49407 (HF
+        // CLIPTokenizer.pad_token_id); padding it with 0 ("!") swamps the prompt with ~70 junk tokens (green mush). OpenCLIP (SD 2.x, SDXL tower 2):
+        // 0, as open_clip and ComfyUI pad; end-token padding there put SD-Turbo 0.39-0.80 rms off ComfyUI's latents (SpawnGen, 10-23).
         while (result.Count < maxLength)
-            result.Add(49407);
+            result.Add(padToken);
 
         return result.Take(maxLength).ToArray();
     }

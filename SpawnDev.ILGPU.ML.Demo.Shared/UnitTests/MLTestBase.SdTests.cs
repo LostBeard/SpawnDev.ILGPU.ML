@@ -18,6 +18,7 @@ public abstract partial class MLTestBase
     private static string SdDir => Environment.GetEnvironmentVariable("SD_DIR") ?? @"D:\Projects\sd";
     private const string Sd15File = "v1-5-pruned-emaonly.safetensors";
     private const string SdxlFile = "sd_xl_base_1.0.safetensors";
+    private const string Sd21vFile = "v2-1_768-ema-pruned.safetensors", Sd21BaseFile = "v2-1_512-ema-pruned.safetensors";
 
     private static string RequireSdFile(Accelerator accelerator, string file)
     {
@@ -83,6 +84,24 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Sdxl_TextEncoder_MatchesReference() => await RunTest(accelerator => SdTextCheck(accelerator, SdxlFile, SdFamily.SDXL, "sdxl_small_f16s", 5e-3));
 
+    /// <summary>SD 2.1's OpenCLIP ViT-H (in_proj fused in the file, the penultimate of 24 layers through the final norm: ComfyUI's and diffusers' default) against the reference.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd21_TextEncoder_MatchesReference() => await RunTest(accelerator => SdTextCheck(accelerator, Sd21vFile, SdFamily.SD2, "sd21v_small_f16s", 5e-3));
+
+    /// <summary>
+    /// SD-Turbo (<c>sd_turbo.safetensors</c>, Stability's sgm layout: the OpenCLIP-H tower under <c>conditioner.embedders.0.model.*</c>, which a refiner uses for bigG) must load as
+    /// SD 2.x (Lore's 10-25 report: it was rejected as a refiner) and its text encoder match the reference.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task SdTurbo_TextEncoder_MatchesReference() => await RunTest(accelerator => SdTextCheck(accelerator, SdTurboFile, SdFamily.SD2, "sdturbo_512_f16s", 5e-3));
+
+    /// <summary>The SD-Turbo UNet (sgm-layout SD 2.x) at 512x512, t = 999 (its one-step timestep), against the reference.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task SdTurbo_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, SdTurboFile, SdTurboPrediction, new[] { "sdturbo_512_f16s" }, 2e-2));
+
+    private const string SdTurboFile = "sd_turbo.safetensors";
+    private const SdPrediction SdTurboPrediction = SdPrediction.Epsilon;     // stabilityai/sd-turbo's scheduler config: epsilon (the V heuristic must not fire)
+
     private async Task<string> SdTextCheck(Accelerator accelerator, string file, SdFamily family, string tag, double bound)
     {
         var path = RequireSdFile(accelerator, file);
@@ -95,7 +114,7 @@ public abstract partial class MLTestBase
         int[]? ids2 = fx.GetEntry("ids2.npy") != null ? WanNpz(fx, "ids2").Data.Select(v => (int)v).ToArray() : null;
         var report = new List<string>();
         double worst = 0;
-        var cases = family == SdFamily.SD1 ? new[] { ("ctx", (int?)-1), ("ctx_skip2", (int?)-2) } : new[] { ("ctx", (int?)null) };
+        var cases = family == SdFamily.SD1 ? new[] { ("ctx", (int?)-1), ("ctx_skip2", (int?)-2) } : new[] { ("ctx", (int?)null) };      // SD 2.x / SDXL: the default layer
         foreach (var (key, layer) in cases)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -130,6 +149,57 @@ public abstract partial class MLTestBase
     /// <summary>The SDXL base UNet (pooled text + size conditioning, three levels, 2 / 10 transformer layers) against the reference, small latent and 1024x1024.</summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Sdxl_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, SdxlFile, SdPrediction.Epsilon, new[] { "sdxl_small_f16s", "sdxl_1024_f16s" }, 2e-2));
+
+    /// <summary>The SD 2.1 768-v UNet (64-wide heads, linear projections, 1024-wide context): the loader must infer V prediction (ComfyUI's norm-bias test); 32x40 and 96x96.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd21v_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, Sd21vFile, SdPrediction.V, new[] { "sd21v_small_f16s", "sd21v_768_f16s" }, 2e-2));
+
+    /// <summary>The SD 2.1 base (512) UNet: same layout, an epsilon model; the loader must NOT infer V.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd21Base_UNet_MatchesReference() => await RunTest(accelerator => SdUNetCheck(accelerator, Sd21BaseFile, SdPrediction.Epsilon, new[] { "sd21b_small_f16s" }, 2e-2));
+
+    /// <summary>The SD 2.1 VAE (the SD 1.x layout) decode and encode against the reference.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd21_Vae_MatchesReference() => await RunTest(accelerator => SdVaeCheck(accelerator, Sd21vFile, 0.18215f, new[] { "sd21v_small_f16s" }, 5e-3));
+
+    /// <summary>
+    /// LoRA merge on the SD 1.5 UNet: LCM-LoRA (kohya keys; every attention, feed-forward, projection and resnet convolution incl. the 3x3 ones, which sit in the gather layout,
+    /// and the fused q|k|v / k|v rows) at strength 0.8 against diffusers' load_lora_weights + fuse_lora; then an empty set must restore the plain model bit for bit (the
+    /// originals are kept), and the plain fixture must pass again.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_Lora_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var path = RequireSdFile(accelerator, Sd15File);
+        var loraPath = Path.Combine(SdDir, "lora", "lcm-lora-sdv1-5.safetensors");
+        var fxLora = Path.Combine(SdDir, "ref", "sd_sd15lcm_small_f16s.npz"); var fxPlain = Path.Combine(SdDir, "ref", "sd_sd15_small_f16w.npz");
+        if (!File.Exists(loraPath) || !File.Exists(fxLora) || !File.Exists(fxPlain)) throw new UnsupportedTestException($"LoRA fixtures not found in {SdDir}");
+        using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions { LoadVae = false });
+        async Task<(double Rel, float[] Eps)> Eps(string fxPath)
+        {
+            using var fx = ZipFile.OpenRead(fxPath);
+            var (lat, ls) = WanNpz(fx, "latent"); var (ctx, cs) = WanNpz(fx, "ctx"); var t = WanNpz(fx, "timestep").Data[0];
+            var eps = await ck.UNet!.ForwardAsync(lat, ls[1], ls[2], t, ctx, cs[0]);
+            return (WanCompare(eps, WanNpz(fx, "eps").Data).RelRms, eps);
+        }
+        var report = new List<string>();
+        var (plain0, eps0) = await Eps(fxPlain);
+        var spec = new SdLoraSpec(ct => Task.FromResult<Stream>(new FileStream(loraPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true)), "lcm-lora-sdv1-5", 0.8f, 1f);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var rep = await ck.ApplyLorasAsync(new[] { spec });
+        double applyMs = sw.Elapsed.TotalMilliseconds;
+        var (patched, unmatched) = (rep.Loras[0].Patched, rep.Loras[0].Unmatched);
+        var (withLora, _) = await Eps(fxLora);
+        var (plainVsLora, _) = await Eps(fxPlain);
+        await ck.ApplyLorasAsync(Array.Empty<SdLoraSpec>());
+        var (plain1, eps1) = await Eps(fxPlain);
+        bool identical = eps0.AsSpan().SequenceEqual(eps1);
+        report.Add($"LCM-LoRA x0.8: {patched} modules patched in {applyMs:F0} ms, {unmatched.Count} unmatched{(unmatched.Count > 0 ? " (" + string.Join(", ", unmatched.Take(5)) + ")" : "")}");
+        report.Add($"eps vs the LoRA reference relRMS {withLora:E2} (the plain reference is {plainVsLora:E2} away: the LoRA moves the model); removed: plain relRMS {plain1:E2} (before {plain0:E2}), restored output {(identical ? "bit-identical" : "DIFFERENT")}");
+        SdLog("SD1.5 LoRA", report);
+        if (!(withLora < 2e-2 && unmatched.Count == 0 && patched > 0 && identical && plainVsLora > 10 * withLora)) throw new Exception("LoRA merge failed: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
 
     private static readonly string[] SdTapNames = { "conv_in", "down_0", "down_1", "down_2", "down_3", "mid", "up_0", "up_1", "up_2", "up_3" };
 
@@ -183,6 +253,250 @@ public abstract partial class MLTestBase
         if (!(worstEps < bound && worstTap < bound)) throw new Exception("the UNet deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // a whole picture
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A whole SD 1.5 picture against the reference's (tools/sd-harness/reference/ref_sd_sample.py): text encoder (prompt and the empty negative), 20 DDIM steps (eta 0) with
+    /// guidance 7.5 run on the host around our UNet exactly as SpawnGen drives it, from the reference's own starting noise, then the VAE decode. Every step's latent and the
+    /// picture are compared; our picture goes to SD_DIR\out\sd15_ddim20_ours.png to look at.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_Ddim20_MatchesReference() => await RunTest(accelerator => SdSampleCheck(accelerator, Sd15File, "sd15_ddim20_f16w", 7.5f));
+
+    private async Task<string> SdSampleCheck(Accelerator accelerator, string file, string tag, float cfg)
+    {
+        var path = RequireSdFile(accelerator, file);
+        var fxPath = Path.Combine(SdDir, "ref", $"sample_{tag}.npz");
+        if (!File.Exists(fxPath)) throw new UnsupportedTestException($"fixture {fxPath} not found");
+        using var fx = ZipFile.OpenRead(fxPath);
+        using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions());
+        int[] Ids(string k) => WanNpz(fx, k).Data.Select(v => (int)v).ToArray();
+        int[]? Opt(string k) => fx.GetEntry(k + ".npy") != null ? Ids(k) : null;
+        var timesteps = WanNpz(fx, "timesteps").Data; var ac = WanNpz(fx, "alphas_cumprod").Data;
+        var (lats, lsh) = WanNpz(fx, "latents");                    // [steps + 1, 4, h, w]
+        int steps = timesteps.Length, h = lsh[2], w = lsh[3], n = 4 * h * w;
+        if (lsh[0] != steps + 1) throw new InvalidDataException("latents must hold steps + 1 entries");
+        var report = new List<string>();
+        double worstStep = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (x, img) = await SdDdimAsync(ck, Ids("ids"), Opt("ids2"), Ids("uncond_ids"), Opt("uncond_ids2"), timesteps.Select(v => (int)v).ToArray(), ac, lats.AsSpan(0, n).ToArray(), h, w, cfg,
+            (i, t, lat) =>
+            {
+                var m = WanCompare(lat, lats.AsSpan((i + 1) * n, n).ToArray());
+                worstStep = Math.Max(worstStep, m.RelRms);
+                if (i % 5 == 4 || i == steps - 1) report.Add($"step {i + 1} (t={t}): latent relRMS {m.RelRms:E2}");
+            });
+        double loopS = sw.Elapsed.TotalSeconds;
+        var mi = WanCompare(img, WanNpz(fx, "image").Data);
+        report.Add($"picture {w * 8}x{h * 8}: relRMS {mi.RelRms:E2} maxAbs {mi.MaxAbs:E2}; text + {steps} steps x 2 UNet calls + decode in {loopS:F1} s");
+        try
+        {
+            var outDir = Path.Combine(SdDir, "out"); Directory.CreateDirectory(outDir);
+            await File.WriteAllBytesAsync(Path.Combine(outDir, $"{tag}_ours_{accelerator.AcceleratorType}.png"), SdPng(img, h * 8, w * 8));
+        }
+        catch (IOException) { }
+        SdLog($"{ck.Family} sample {tag}", report);
+        // 20 steps of guidance 7.5 amplify a per-call difference; the bound is on the picture a user sees
+        if (!(mi.RelRms < 2e-2 && worstStep < 2e-2)) throw new Exception("the picture deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    }
+
+    private static byte[] SdPng(float[] img, int H, int W)
+    {
+        var rgba = new byte[H * W * 4];
+        for (int p = 0; p < H * W; p++) { for (int c = 0; c < 3; c++) rgba[p * 4 + c] = (byte)Math.Clamp(Math.Round((img[(long)c * H * W + p] + 1) * 127.5), 0, 255); rgba[p * 4 + 3] = 255; }
+        return Assets.AssetGenerator.EncodePng(rgba, W, H);
+    }
+
+    /// <summary>
+    /// Text (prompt and negative), <paramref name="timesteps"/>.Length DDIM steps (eta 0, diffusers DDIMScheduler with set_alpha_to_one false) with classifier-free guidance
+    /// <paramref name="cfg"/> on the host around the UNet, as SpawnGen drives it, then the VAE decode. <paramref name="onStep"/> sees every step's latent. Returns the final
+    /// (scaled) latent and the picture [3, 8h, 8w].
+    /// </summary>
+    private static async Task<(float[] Latent, float[] Image)> SdDdimAsync(SdCheckpoint ck, int[] ids, int[]? ids2, int[] uncondIds, int[]? uncondIds2, int[] timesteps, float[] ac,
+        float[] noise, int h, int w, float cfg, Action<int, int, float[]>? onStep)
+    {
+        var cond = await ck.TextEncoder!.EncodeAsync(ids, ids2);
+        var uncond = await ck.TextEncoder.EncodeAsync(uncondIds, uncondIds2);
+        SdxlConditioning? xlC = null, xlU = null;
+        if (ck.UNet!.IsXL)
+        {
+            xlC = new SdxlConditioning(cond.Pooled!, h * 8, w * 8, 0, 0, h * 8, w * 8);
+            xlU = new SdxlConditioning(uncond.Pooled!, h * 8, w * 8, 0, 0, h * 8, w * 8);
+        }
+        var x = (float[])noise.Clone();
+        int n = x.Length, stride = 1000 / timesteps.Length;
+        for (int i = 0; i < timesteps.Length; i++)
+        {
+            int t = timesteps[i];
+            var ec = await ck.UNet.ForwardAsync(x, h, w, t, cond.Context, cond.Rows, xlC);
+            var eu = await ck.UNet.ForwardAsync(x, h, w, t, uncond.Context, uncond.Rows, xlU);
+            int tp = t - stride;
+            double at = ac[t], ap = tp >= 0 ? ac[tp] : ac[0];
+            for (int k = 0; k < n; k++)
+            {
+                double e = eu[k] + cfg * (ec[k] - eu[k]);
+                double x0 = (x[k] - Math.Sqrt(1 - at) * e) / Math.Sqrt(at);
+                x[k] = (float)(Math.Sqrt(ap) * x0 + Math.Sqrt(1 - ap) * e);
+            }
+            onStep?.Invoke(i, t, x);
+        }
+        var img = await ck.Vae!.DecodeAsync(x.Select(v => v / ck.LatentScale).ToArray(), h, w);
+        return (x, img);
+    }
+
+    private const string SdServer = "http://127.0.0.1:8769/";
+
+    /// <summary>The local SD file server as a model source: files stream by Range requests that stay in JS (<see cref="Hub.FetchRangeStream"/>).</summary>
+    private sealed class SdRangeSource(HttpClient http) : Hub.IModelSource
+    {
+        public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+        {
+            using var head = await http.SendAsync(new HttpRequestMessage(HttpMethod.Head, SdServer + filePath), cancellationToken);
+            head.EnsureSuccessStatusCode();
+            return new Hub.FetchRangeStream(SdServer + filePath, head.Content.Headers.ContentLength ?? throw new InvalidDataException($"{filePath}: the server gave no length"));
+        }
+        public Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => http.GetByteArrayAsync(SdServer + filePath, cancellationToken);
+    }
+
+    // relRMS of a channel-last device tensor [HW, C] against a channel-first reference [C, HW] ON THE DEVICE: chunked partial sums of (got - want)^2 and want^2,
+    // only the partials (a few thousand floats) come back
+    private static void SdCmpPartialImpl(Index1D chunk, ArrayView1D<float, Stride1D.Dense> got, ArrayView1D<float, Stride1D.Dense> want, ArrayView1D<float, Stride1D.Dense> partial,
+        int C, int HW, int per, int channelLast)
+    {
+        int n = C * HW, i0 = (int)chunk * per, i1 = Math.Min(n, i0 + per);     // 32-bit indices: the largest tap is 33.5M elements (no emulated i64 on WebGPU)
+        float se = 0f, sr = 0f;
+        for (int i = i0; i < i1; i++)
+        {
+            int c = i / HW, p = i % HW;                    // reference index i = c * HW + p
+            float g = channelLast != 0 ? got[p * C + c] : got[i];
+            float d = g - want[i];
+            se += d * d; sr += want[i] * want[i];
+        }
+        partial[2 * chunk] = se; partial[2 * chunk + 1] = sr;
+    }
+
+    private static async Task<double> SdDeviceRelRms(Accelerator acc, ArrayView1D<float, Stride1D.Dense> got, ArrayView1D<float, Stride1D.Dense> want, int C, int HW, bool channelLast)
+    {
+        const int per = 4096;
+        long n = (long)C * HW;
+        int chunks = (int)((n + per - 1) / per);
+        using var partial = acc.Allocate1D<float>(2L * chunks);
+        var k = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SdCmpPartialImpl);
+        k(chunks, got, want, partial.View, C, HW, per, channelLast ? 1 : 0);
+        await acc.SynchronizeAsync();
+        var p = await partial.View.CopyToHostAsync();
+        double se = 0, sr = 0;
+        for (int i = 0; i < chunks; i++) { se += p[2 * i]; sr += p[2 * i + 1]; }
+        return Math.Sqrt(se / Math.Max(1e-30, sr));
+    }
+
+    /// <summary>
+    /// The SD 1.5 VAE decode and encode in the BROWSER at 512x512, stage by stage: the reference taps stream from the file server straight onto the GPU and every comparison
+    /// runs on the device (only the partial sums come back). Localises a backend-only deviation. Same file server as the picture test (D:/Projects/sd on 8769); fixture
+    /// files from tools/sd-harness/reference/export_browser_taps.py.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_Vae_OverHttp_StagesMatchReference() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser VAE stage test (the desktop runs Sd15_Vae_MatchesReference)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        const string fx = "browser/vae_sd15_512/";
+        var source = new SdRangeSource(http);
+        string shapesJson;
+        try { shapesJson = await http.GetStringAsync(SdServer + fx + "shapes.json"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/sd 8769"); }
+        using var shapes = System.Text.Json.JsonDocument.Parse(shapesJson);
+        int[] Shape(string n) => shapes.RootElement.GetProperty(n).EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        var bufs = new List<IDisposable>();
+        async Task<ArrayView1D<float, Stride1D.Dense>> Fetch(string n)
+        {
+            var s = Shape(n); long count = s.Aggregate(1L, (a, b) => a * b);
+            var b = accelerator.Allocate1D<float>(count); bufs.Add(b);
+            await using var st = await source.OpenAsync("", fx + n + ".f32");
+            await b.View.CopyFromStreamAsync(st);
+            return b.View;
+        }
+        try
+        {
+            using var ck = await SdCheckpoint.LoadAsync(accelerator, source, "", Sd15File, new SdCheckpointOptions { LoadUNet = false, LoadTextEncoder = false });
+            var vae = ck.Vae!;
+            var zin = await Fetch("dec_in"); var zs = Shape("dec_in");
+            int h = zs[1], w = zs[2];
+            var taps = new Dictionary<string, (MemoryBuffer1D<float, Stride1D.Dense> Buf, int C, int HW)>();
+            vae.Tap = (name, view, H, W, C) => { var b = accelerator.Allocate1D<float>((long)H * W * C); bufs.Add(b); b.View.CopyFrom(view.SubView(0, b.Length)); taps[name] = (b, C, H * W); };
+            var img = accelerator.Allocate1D<float>(3L * 64 * h * w); bufs.Add(img);
+            await vae.DecodeAsync(zin, h, w, img.View);
+            vae.Tap = null;
+            var report = new List<string>();
+            double worst = 0;
+            foreach (var name in new[] { "post_quant_conv", "dec_mid", "dec_up_0", "dec_up_1", "dec_up_2", "dec_up_3" })
+            {
+                var (b, C, HW) = taps[name];
+                double r = await SdDeviceRelRms(accelerator, b.View, await Fetch(name), C, HW, channelLast: true);
+                report.Add($"{name} {r:E2}"); worst = Math.Max(worst, r);
+            }
+            double ri = await SdDeviceRelRms(accelerator, img.View, await Fetch("image"), 3, 64 * h * w, channelLast: false);
+            report.Add($"image {ri:E2}"); worst = Math.Max(worst, ri);
+            var eimg = await Fetch("enc_image"); var es = Shape("enc_image");
+            var mean = accelerator.Allocate1D<float>(4L * (es[1] / 8) * (es[2] / 8)); bufs.Add(mean);
+            await vae.EncodeAsync(eimg, es[1], es[2], mean.View);
+            double re = await SdDeviceRelRms(accelerator, mean.View, await Fetch("enc_mean"), 4, (es[1] / 8) * (es[2] / 8), channelLast: false);
+            report.Add($"encode mean {re:E2}"); worst = Math.Max(worst, re);
+            var line = $"{accelerator.AcceleratorType} VAE 512: " + string.Join(", ", report);
+            Console.WriteLine("[Sd] " + line);
+            if (!(worst < 5e-3)) throw new Exception("the browser VAE deviates from the reference: " + line);
+            return line;
+        }
+        finally
+        {
+            await accelerator.SynchronizeAsync();
+            foreach (var b in bufs) b.Dispose();
+        }
+    });
+
+    /// <summary>
+    /// The same 20-step SD 1.5 picture in the BROWSER: the 4.3 GB fp32 checkpoint streamed by HTTP range requests into fp16 on the GPU (never through the page heap), the same
+    /// host DDIM loop, the reference's final latent and picture to compare. Serve SD_DIR first: <c>node tools/unirig-harness/serve-files.mjs D:/Projects/sd 8769</c>, fixture
+    /// files from tools/sd-harness/reference/export_browser_fixture.py; <c>PMT_EXCLUDE_CATEGORIES= PMT_FILTER=Sd15_Ddim20_OverHttp PMT_LANES=webgpu PMT_CONSOLE_LOG=Sd</c>.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Sd15_Ddim20_OverHttp_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser picture test (the desktop runs Sd15_Ddim20_MatchesReference)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        const string fx = "browser/sd15_ddim20_f16w/";
+        string metaJson; float[] noise, final, want;
+        try
+        {
+            metaJson = await http.GetStringAsync(SdServer + fx + "meta.json");
+            noise = WanFloats(await http.GetByteArrayAsync(SdServer + fx + "noise.f32"));
+            final = WanFloats(await http.GetByteArrayAsync(SdServer + fx + "final.f32"));
+            want = WanFloats(await http.GetByteArrayAsync(SdServer + fx + "image.f32"));
+        }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/sd 8769"); }
+        using var meta = System.Text.Json.JsonDocument.Parse(metaJson);
+        int[] Ints(string k) => meta.RootElement.GetProperty(k).EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        var ac = meta.RootElement.GetProperty("alphas_cumprod").EnumerateArray().Select(e => (float)e.GetDouble()).ToArray();
+        var shape = Ints("latent_shape");
+        int h = shape[1], w = shape[2];
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var ck = await SdCheckpoint.LoadAsync(accelerator, new SdRangeSource(http), "", Sd15File);
+        double loadS = sw.Elapsed.TotalSeconds;
+        sw.Restart();
+        var (x, img) = await SdDdimAsync(ck, Ints("ids"), null, Ints("uncond_ids"), null, Ints("timesteps"), ac, noise, h, w, 7.5f, null);
+        double genS = sw.Elapsed.TotalSeconds;
+        var ml = WanCompare(x, final); var mi = WanCompare(img, want);
+        var line = $"{accelerator.AcceleratorType}: load {loadS:F1} s, text + 20 steps x 2 + decode {genS:F1} s; final latent relRMS {ml.RelRms:E2}, picture relRMS {mi.RelRms:E2}";
+        Console.WriteLine("[Sd] browser picture " + line);
+        if (!(ml.RelRms < 2e-2 && mi.RelRms < 2e-2)) throw new Exception("the browser picture deviates from the reference: " + line);
+        return line;
+    });
 
     // -----------------------------------------------------------------------------------------------------------------------------------
     // VAEs

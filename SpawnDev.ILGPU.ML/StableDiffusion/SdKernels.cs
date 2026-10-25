@@ -154,17 +154,20 @@ public sealed class SdKernels
         }
     }
 
-    /// <summary>o [M, N] = act(x W^T + b) (+ res), the linear layer split into row chunks of bounded work. <paramref name="res"/> may be <paramref name="o"/> (an in-place residual).</summary>
-    public void Linear(FV x, HV weight, HV? bias, FV o, int M, int K, int N, int act = 0, FV? res = null)
+    /// <summary>
+    /// o [M, N] = act(x W^T + b) (+ res), the linear layer split into row chunks of bounded work. <paramref name="res"/> may be <paramref name="o"/> (an in-place residual).
+    /// <paramref name="exact"/> keeps the activations fp32 (no tensor cores).
+    /// </summary>
+    public void Linear(FV x, HV weight, HV? bias, FV o, int M, int K, int N, int act = 0, FV? res = null, bool exact = false)
     {
         long perRow = 2L * K * N;
         int chunk = (int)Math.Max(64, Math.Min(M, MaxFlopsPerDispatch / Math.Max(1, perRow)));
-        if (chunk >= M) { _sk.Linear(x, weight, bias, o, M, K, N, act, res); return; }
+        if (chunk >= M) { _sk.Linear(x, weight, bias, o, M, K, N, act, res, exact); return; }
         for (int m0 = 0; m0 < M; m0 += chunk)
         {
             int rows = Math.Min(chunk, M - m0);
             _sk.Linear(x.SubView((long)m0 * K, (long)rows * K), weight, bias, o.SubView((long)m0 * N, (long)rows * N), rows, K, N, act,
-                res.HasValue ? res.Value.SubView((long)m0 * N, (long)rows * N) : null);
+                res.HasValue ? res.Value.SubView((long)m0 * N, (long)rows * N) : null, exact);
         }
     }
 
@@ -184,6 +187,19 @@ public sealed class SdKernels
         _concat((int)((long)rows * (ca + cb)), a, b, o, ca, cb);
     }
 
+    // dst [rows, W] columns [col, col + C) = src [rows, C] (SDXL's two text towers side by side)
+    private Action<Index1D, FV, FV, int, int, int>? _copyCols;
+    private static void CopyColumnsImpl(Index1D i, FV src, FV dst, int C, int W, int col)
+    {
+        long r = i / C; int c = (int)(i % C);
+        dst[r * W + col + c] = src[i];
+    }
+    public void CopyColumns(FV src, FV dst, int rows, int C, int W, int col)
+    {
+        _copyCols ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(CopyColumnsImpl);
+        _copyCols((int)((long)rows * C), src, dst, C, W, col);
+    }
+
     // x [rows, C] += v [C] (the ResBlock's time embedding projection)
     private Action<Index1D, FV, FV, int>? _addRow;
     private static void AddRowImpl(Index1D i, FV x, FV v, int C) => x[i] = x[i] + v[(int)(i % C)];
@@ -191,6 +207,26 @@ public sealed class SdKernels
     {
         _addRow ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(AddRowImpl);
         _addRow((int)((long)rows * C), x, v, C);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // LoRA merge: W[rowOff + n, k] += scale * sum_r up[n, r] * down[r, k'] on an fp16 weight. A convolution weight is held in the gather layout [cout][taps][cin]
+    // while the LoRA's down is [rank][cin][taps]: k = t * cin + ci of the stored row reads k' = ci * taps + t.
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, HV, HV, HV, int, int, int, int, int, int, float>? _mergeLora;
+    private static void MergeLoraImpl(Index1D i, HV w, HV up, HV down, int K, int rank, int rowOff, int cols, int taps, int cin, float scale)
+    {
+        int n = i / K, k = i % K;
+        int kk = taps > 1 ? (k % cin) * taps + k / cin : k;
+        float acc = 0f;
+        for (int r = 0; r < rank; r++) acc += PrecisionConvert.ConvertToSingle(up[(long)n * rank + r]) * PrecisionConvert.ConvertToSingle(down[(long)r * K + kk]);
+        long wi = (long)(rowOff + n) * cols + k;
+        w[wi] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(PrecisionConvert.ConvertToSingle(w[wi]) + scale * acc);
+    }
+    public void MergeLora(HV w, HV up, HV down, int N, int K, int rank, int rowOff, int cols, int taps, int cin, float scale)
+    {
+        _mergeLora ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, HV, int, int, int, int, int, int, float>(MergeLoraImpl);
+        _mergeLora((int)((long)N * K), w, up, down, K, rank, rowOff, cols, taps, cin, scale);
     }
 
     // fp16 -> fp32 (reading a small weight back to the host)

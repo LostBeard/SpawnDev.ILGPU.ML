@@ -41,6 +41,15 @@ public sealed class SdUNet : IDisposable
     public int ContextDim { get; }
     /// <summary>True for SDXL (the pooled text + size conditioning, <see cref="SdxlConditioning"/>).</summary>
     public bool IsXL { get; }
+    /// <summary>
+    /// Compute the attention q / k / v projections with fp32 activations (no tensor cores), as diffusers' <c>upcast_attention</c> does for SD 2.x: its attention logits are large
+    /// enough that fp16-rounded q and k move the softmax (MEASURED on SD 2.1 768-v, CUDA: eps 5.3e-2 off the reference with tensor cores, fp32 paths 6e-5). Default on for the
+    /// 1024-wide-context (SD 2.x) models, off for SD 1.x / SDXL, which do not need it.
+    /// </summary>
+    public bool UpcastAttention { get; set; }
+
+    /// <summary>The width of SDXL's label vector (the input of <c>label_emb.0.0</c>: 2816 for SDXL base), 0 otherwise: what <see cref="SdxlLabel"/> takes.</summary>
+    public int LabelWidth => _admDim;
     private readonly int _timeDim, _admDim;
     private readonly bool _fixedHeads;      // SD 1.x: 8 heads at every width; SD 2.x / SDXL: 64-wide heads
 
@@ -73,6 +82,7 @@ public sealed class SdUNet : IDisposable
             if (m.Kind == Kind.Attn) { ctx = weights.Shape(m.Prefix + "transformer_blocks.0.attn2.kv.weight")[1]; break; }
         ContextDim = ctx;
         _fixedHeads = ctx == 768;
+        UpcastAttention = ctx == 1024;
     }
 
     private Module[] ParseBlock(string p, ref int c)
@@ -169,16 +179,16 @@ public sealed class SdUNet : IDisposable
             // self attention
             _k.Sparse.LayerNorm(h, n, _w[b + "norm1.weight"], _w[b + "norm1.bias"], rows, C, 1e-5f);
             var qkv = Slot(SlotWide, (long)rows * 8 * C).SubView(0, (long)rows * 3 * C);
-            _k.Linear(n, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C);
+            _k.Linear(n, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C, exact: UpcastAttention);
             var a = Slot(SlotMid, (long)rows * 4 * C).SubView(0, (long)rows * C);
             Attention(qkv, 3 * C, 0, qkv, 3 * C, C, 2 * C, a, rows, rows, C);
             _k.Linear(a, _w[b + "attn1.to_out.0.weight"], _w[b + "attn1.to_out.0.bias"], h, rows, C, C, 0, h);
             // cross attention to the text
             _k.Sparse.LayerNorm(h, n, _w[b + "norm2.weight"], _w[b + "norm2.bias"], rows, C, 1e-5f);
             var q = Slot(SlotQ, (long)rows * C);
-            _k.Linear(n, _w[b + "attn2.to_q.weight"], null, q, rows, C, C);
+            _k.Linear(n, _w[b + "attn2.to_q.weight"], null, q, rows, C, C, exact: UpcastAttention);
             var kv = Slot(SlotKv, (long)ctxRows * 2 * C);
-            _k.Linear(ctx, _w[b + "attn2.kv.weight"], null, kv, ctxRows, ContextDim, 2 * C);
+            _k.Linear(ctx, _w[b + "attn2.kv.weight"], null, kv, ctxRows, ContextDim, 2 * C, exact: UpcastAttention);
             Attention(q, C, 0, kv, 2 * C, 0, C, a, rows, ctxRows, C);
             _k.Linear(a, _w[b + "attn2.to_out.0.weight"], _w[b + "attn2.to_out.0.bias"], h, rows, C, C, 0, h);
             // feed forward (GEGLU)

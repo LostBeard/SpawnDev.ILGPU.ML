@@ -406,12 +406,15 @@ public sealed class SparseKernels
         o[idx] = acc;
     }
 
-    /// <summary>x [M,K] fp32; weight [N,K] fp16; act: 0 none, 1 SiLU; res (optional) [M,N] is added after the activation.</summary>
-    public void Linear(FV x, HV weight, HV? bias, FV o, int M, int K, int N, int act = 0, FV? res = null)
+    /// <summary>
+    /// x [M,K] fp32; weight [N,K] fp16; act: 0 none, 1 SiLU; res (optional) [M,N] is added after the activation. <paramref name="exact"/> keeps the activations fp32 (the portable
+    /// tiled GEMM instead of the tensor cores, which round them to fp16): the Stable Diffusion 2.x attention projections need it, as diffusers' upcast_attention.
+    /// </summary>
+    public void Linear(FV x, HV weight, HV? bias, FV o, int M, int K, int N, int act = 0, FV? res = null, bool exact = false)
     {
         _normDummyG ??= _acc.Allocate1D<global::ILGPU.Half>(2); _normDummyB ??= _acc.Allocate1D<global::ILGPU.Half>(2); EnsureTiledDummies();
         var b = bias ?? _normDummyG.View;   // separate placeholder: WebGPU forbids binding the weight twice
-        if (Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16)
+        if (!exact && Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16)
         {
             _mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
             _noNbr ??= _acc.Allocate1D<int>(1);
