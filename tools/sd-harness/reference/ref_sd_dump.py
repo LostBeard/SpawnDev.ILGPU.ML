@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="t")
     ap.add_argument("--f16-weights", action="store_true")
+    ap.add_argument("--vae", default=None, help="replace the checkpoint's VAE with this standalone VAE file (ComfyUI VAELoader) before dumping")
     ap.add_argument("--lora", default=None, help="merge this LoRA (diffusers load_lora_weights + fuse_lora) before dumping")
     ap.add_argument("--lora-scale", type=float, default=1.0)
     ap.add_argument("--config", default=None, help="diffusers config repo (SD 2.x: Stability deleted its repos; sd2-community/stable-diffusion-2-1 mirrors them)")
@@ -76,6 +77,14 @@ def main():
     dt = torch.float16 if a.f16_storage else torch.float32
     extra = {"config": a.config} if a.config else {}
     pipe = P.from_single_file(a.ckpt, torch_dtype=dt, safety_checker=None, **extra) if not sdxl else P.from_single_file(a.ckpt, torch_dtype=dt, **extra)
+    if a.vae:
+        from diffusers import AutoencoderKL
+        if os.path.isdir(a.vae):          # a diffusers folder (config.json + diffusion_pytorch_model[.fp16].safetensors)
+            fp16 = os.path.exists(os.path.join(a.vae, "diffusion_pytorch_model.fp16.safetensors"))
+            pipe.vae = AutoencoderKL.from_pretrained(a.vae, torch_dtype=dt, variant="fp16" if fp16 else None)
+        else:
+            pipe.vae = AutoencoderKL.from_single_file(a.vae, torch_dtype=dt, config="stabilityai/sd-vae-ft-mse" if not sdxl else "madebyollin/sdxl-vae-fp16-fix")
+        print("vae replaced by", a.vae)
     mods = [pipe.unet, pipe.vae, pipe.text_encoder] + ([pipe.text_encoder_2] if sdxl else [])
     if a.f16_storage:
         upcast_math(mods)

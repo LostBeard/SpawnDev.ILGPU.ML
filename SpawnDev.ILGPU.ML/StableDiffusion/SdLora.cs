@@ -53,7 +53,7 @@ internal sealed class SdLoraMerger : IDisposable
                 ix.TryAdd("lora_unet_" + ldm.Replace('.', '_'), e);
                 ix.TryAdd("diffusion_model." + ldm, e);
                 ix.TryAdd("model.diffusion_model." + ldm, e);
-                var diff = LdmToDiffusersUNet(ldm);
+                var diff = SdNames.LdmToDiffusersUNet(ldm);
                 if (diff != null)
                 {
                     ix.TryAdd("lora_unet_" + diff.Replace('.', '_'), e);
@@ -93,63 +93,6 @@ internal sealed class SdLoraMerger : IDisposable
         if (!s.Has(qkv)) return null;
         int C = s.Shape(qkv)[0] / 3, part = "qkv".IndexOf(m.Groups[2].Value[0]);
         return (qkv, part * C, C);
-    }
-
-    private static readonly Regex InBlock = new(@"^input_blocks\.(\d+)\.(\d+)\.(.+)$", RegexOptions.Compiled);
-    private static readonly Regex OutBlock = new(@"^output_blocks\.(\d+)\.(\d+)\.(.+)$", RegexOptions.Compiled);
-    private static readonly Regex MidBlock = new(@"^middle_block\.(\d)\.(.+)$", RegexOptions.Compiled);
-
-    private static string Resnet(string rest)
-    {
-        foreach (var (a, b) in new[] { ("in_layers.0", "norm1"), ("in_layers.2", "conv1"), ("emb_layers.1", "time_emb_proj"), ("out_layers.0", "norm2"), ("out_layers.3", "conv2"), ("skip_connection", "conv_shortcut") })
-            if (rest == a || rest.StartsWith(a + ".", StringComparison.Ordinal)) return b + rest[a.Length..];
-        return rest;
-    }
-
-    /// <summary>
-    /// The diffusers UNet2DConditionModel module path of an LDM UNet module path (SD 1.x / 2.x / SDXL: two resnets per level, so input block k is level (k-1)/3, slot (k-1)%3),
-    /// or null for a name with no counterpart. The upsampler of output block 3i+2 is its last module (index 1 without attention, 2 with).
-    /// </summary>
-    internal static string? LdmToDiffusersUNet(string m)
-    {
-        switch (m)
-        {
-            case "time_embed.0": return "time_embedding.linear_1";
-            case "time_embed.2": return "time_embedding.linear_2";
-            case "label_emb.0.0": return "add_embedding.linear_1";
-            case "label_emb.0.2": return "add_embedding.linear_2";
-            case "out.0": return "conv_norm_out";
-            case "out.2": return "conv_out";
-            case "input_blocks.0.0": return "conv_in";
-        }
-        var g = InBlock.Match(m);
-        if (g.Success)
-        {
-            int k = int.Parse(g.Groups[1].Value), sub = int.Parse(g.Groups[2].Value);
-            string rest = g.Groups[3].Value;
-            if (k == 0) return null;
-            int i = (k - 1) / 3, j = (k - 1) % 3;
-            if (j == 2) return rest.StartsWith("op", StringComparison.Ordinal) ? $"down_blocks.{i}.downsamplers.0.conv{rest[2..]}" : null;
-            return sub == 0 ? $"down_blocks.{i}.resnets.{j}.{Resnet(rest)}" : $"down_blocks.{i}.attentions.{j}.{rest}";
-        }
-        g = MidBlock.Match(m);
-        if (g.Success)
-        {
-            int sub = int.Parse(g.Groups[1].Value);
-            string rest = g.Groups[2].Value;
-            return sub switch { 0 => $"mid_block.resnets.0.{Resnet(rest)}", 1 => $"mid_block.attentions.0.{rest}", 2 => $"mid_block.resnets.1.{Resnet(rest)}", _ => null };
-        }
-        g = OutBlock.Match(m);
-        if (g.Success)
-        {
-            int k = int.Parse(g.Groups[1].Value), sub = int.Parse(g.Groups[2].Value);
-            string rest = g.Groups[3].Value;
-            int i = k / 3, j = k % 3;
-            if (sub == 0) return $"up_blocks.{i}.resnets.{j}.{Resnet(rest)}";
-            if (rest == "conv" || rest.StartsWith("conv.", StringComparison.Ordinal)) return $"up_blocks.{i}.upsamplers.0.{rest}";
-            return $"up_blocks.{i}.attentions.{j}.{rest}";
-        }
-        return null;
     }
 
     // ---------------------------------------------------------------------------------------------------

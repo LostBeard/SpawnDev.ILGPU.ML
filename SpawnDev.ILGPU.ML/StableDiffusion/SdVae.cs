@@ -14,8 +14,9 @@ using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 /// 0.13025 SDXL) after encoding and divides by it before decoding, as ComfyUI does. Activations are channel-last fp32 and every convolution keeps them fp32 (the portable tiled
 /// GEMM, fp16 weights): SDXL's VAE overflows fp16 activations. The mid-block attention (one head over every latent pixel) is two chunked GEMMs.
 /// </summary>
-public sealed class SdVae : IDisposable
+public sealed partial class SdVae : IDisposable
 {
+    private bool _ownsWeights;            // loaded alone (LoadAsync): Dispose frees the weights too
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -303,5 +304,6 @@ public sealed class SdVae : IDisposable
         _retired.Clear();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
+        if (_ownsWeights) _w.Dispose();
     }
 }

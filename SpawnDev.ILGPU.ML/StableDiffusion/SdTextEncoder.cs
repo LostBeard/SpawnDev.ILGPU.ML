@@ -64,8 +64,9 @@ internal sealed class SdClipTower
 /// layer of each tower WITHOUT the final norm, concatenated (768 + 1280 = 2048 wide), and the pooled embedding = the second tower's final-norm output at the end token through
 /// its projection. <c>layer</c> overrides the layer (-1 the last, -2 the penultimate: ComfyUI's "CLIP Set Last Layer").
 /// </summary>
-public sealed class SdTextEncoder : IDisposable
+public sealed partial class SdTextEncoder : IDisposable
 {
+    private bool _ownsWeights;            // loaded alone (LoadAsync / LoadSdxlAsync): Dispose frees the weights too
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -87,7 +88,10 @@ public sealed class SdTextEncoder : IDisposable
         switch (family)
         {
             case SdFamily.SD1: _towers = new[] { new SdClipTower(acc, weights, _k, "l.", quickGelu: true) }; _finalNorm = true; _defaultLayer = -1; break;
-            case SdFamily.SD2: _towers = new[] { new SdClipTower(acc, weights, _k, "h.", quickGelu: false) }; _finalNorm = true; _defaultLayer = -2; break;
+            case SdFamily.SD2:
+                _towers = new[] { new SdClipTower(acc, weights, _k, "h.", quickGelu: false) }; _finalNorm = true;
+                _defaultLayer = _towers[0].Layers == 23 ? -1 : -2;        // the penultimate of ViT-H's 24; a diffusers SD 2.x text_encoder already dropped the last layer (23 left)
+                break;
             default: _towers = new[] { new SdClipTower(acc, weights, _k, "l.", quickGelu: true), new SdClipTower(acc, weights, _k, "g.", quickGelu: false) }; _xl = true; _finalNorm = false; _defaultLayer = -2; break;
         }
     }
@@ -172,5 +176,6 @@ public sealed class SdTextEncoder : IDisposable
         _slots.Clear();
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();
+        if (_ownsWeights) _w.Dispose();
     }
 }

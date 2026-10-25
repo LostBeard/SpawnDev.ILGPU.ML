@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
@@ -91,15 +90,15 @@ public sealed class SdCheckpoint : IDisposable
                 if (text == null) return null;
                 string? local = null; SdLayout layout = SdLayout.AsIs;
                 if (family == SdFamily.SD1 && n.StartsWith("cond_stage_model.transformer.text_model.", StringComparison.Ordinal))
-                    local = MapHfClip(n["cond_stage_model.transformer.text_model.".Length..], "l.");
+                    local = SdNames.MapHfClip(n["cond_stage_model.transformer.text_model.".Length..], "l.");
                 else if (family == SdFamily.SD2 && n.StartsWith("cond_stage_model.model.", StringComparison.Ordinal))
-                    local = MapOpenClip(n["cond_stage_model.model.".Length..], "h.", out layout);
+                    local = SdNames.MapOpenClip(n["cond_stage_model.model.".Length..], "h.", out layout);
                 else if (family == SdFamily.SD2 && n.StartsWith("conditioner.embedders.0.model.", StringComparison.Ordinal))     // the sgm layout (sd_turbo)
-                    local = MapOpenClip(n["conditioner.embedders.0.model.".Length..], "h.", out layout);
+                    local = SdNames.MapOpenClip(n["conditioner.embedders.0.model.".Length..], "h.", out layout);
                 else if (family == SdFamily.SDXL && n.StartsWith("conditioner.embedders.0.transformer.text_model.", StringComparison.Ordinal))
-                    local = MapHfClip(n["conditioner.embedders.0.transformer.text_model.".Length..], "l.");
+                    local = SdNames.MapHfClip(n["conditioner.embedders.0.transformer.text_model.".Length..], "l.");
                 else if (family == SdFamily.SDXL && n.StartsWith("conditioner.embedders.1.model.", StringComparison.Ordinal))
-                    local = MapOpenClip(n["conditioner.embedders.1.model.".Length..], "g.", out layout);
+                    local = SdNames.MapOpenClip(n["conditioner.embedders.1.model.".Length..], "g.", out layout);
                 return local == null ? null : new SdTensorStreamer.Target(text, local, layout);
             }
             using (var streamer = new SdTensorStreamer(accelerator))
@@ -109,28 +108,11 @@ public sealed class SdCheckpoint : IDisposable
             // fuse the projections that run as one GEMM: q | k | v of every self-attention, k | v of every cross-attention
             if (unet != null)
             {
-                foreach (var n in unet.Names.Where(n => n.EndsWith(".attn1.to_q.weight", StringComparison.Ordinal)).ToList())
-                {
-                    string b = n[..^"to_q.weight".Length];
-                    await unet.FuseAsync(accelerator, b + "qkv.weight", b + "to_q.weight", b + "to_k.weight", b + "to_v.weight");
-                    string b2 = b[..^"attn1.".Length] + "attn2.";
-                    await unet.FuseAsync(accelerator, b2 + "kv.weight", b2 + "to_k.weight", b2 + "to_v.weight");
-                }
+                await SdNames.FuseUNetAsync(accelerator, unet);
                 if (!unet.Has("input_blocks.0.0.weight")) throw new InvalidDataException($"'{name}': no UNet (model.diffusion_model.*) in this file");
             }
-            if (vae != null)
-                foreach (var part in new[] { "encoder.mid.attn_1.", "decoder.mid.attn_1." })
-                {
-                    await vae.FuseAsync(accelerator, part + "qkv.weight", part + "q.weight", part + "k.weight", part + "v.weight");
-                    await vae.FuseAsync(accelerator, part + "qkv.bias", part + "q.bias", part + "k.bias", part + "v.bias");
-                }
-            if (text != null)
-                foreach (var n in text.Names.Where(n => n.EndsWith(".q.weight", StringComparison.Ordinal)).ToList())
-                {
-                    string b = n[..^"q.weight".Length];
-                    await text.FuseAsync(accelerator, b + "qkv.weight", b + "q.weight", b + "k.weight", b + "v.weight");
-                    await text.FuseAsync(accelerator, b + "qkv.bias", b + "q.bias", b + "k.bias", b + "v.bias");
-                }
+            if (vae != null) await SdNames.FuseVaeAsync(accelerator, vae);
+            if (text != null) await SdNames.FuseTextAsync(accelerator, text);
 
             var prediction = options.Prediction ?? (names.Contains("v_pred") ? SdPrediction.V : SdPrediction.Epsilon);
             if (options.Prediction == null && family == SdFamily.SD2 && unet != null)
@@ -184,65 +166,6 @@ public sealed class SdCheckpoint : IDisposable
         SdFamily.SD2 => names.Contains("cond_stage_model.model.token_embedding.weight") || names.Contains("conditioner.embedders.0.model.token_embedding.weight"),
         _ => names.Contains("conditioner.embedders.0.transformer.text_model.embeddings.token_embedding.weight") && names.Contains("conditioner.embedders.1.model.token_embedding.weight"),
     };
-
-    private static readonly Regex HfLayer = new(@"^encoder\.layers\.(\d+)\.(.+)$", RegexOptions.Compiled);
-    private static readonly Regex OcLayer = new(@"^transformer\.resblocks\.(\d+)\.(.+)$", RegexOptions.Compiled);
-
-    /// <summary>Hugging Face CLIPTextModel names (after <c>text_model.</c>) -> the normalised names, or null for tensors the encoder does not read.</summary>
-    internal static string? MapHfClip(string n, string p)
-    {
-        switch (n)
-        {
-            case "embeddings.token_embedding.weight": return p + "tok";
-            case "embeddings.position_embedding.weight": return p + "pos";
-            case "final_layer_norm.weight": return p + "final_ln.weight";
-            case "final_layer_norm.bias": return p + "final_ln.bias";
-        }
-        var m = HfLayer.Match(n);
-        if (!m.Success) return null;
-        string l = $"{p}layers.{m.Groups[1].Value}.", rest = m.Groups[2].Value;
-        string? r = rest switch
-        {
-            "self_attn.q_proj.weight" => "q.weight", "self_attn.q_proj.bias" => "q.bias",
-            "self_attn.k_proj.weight" => "k.weight", "self_attn.k_proj.bias" => "k.bias",
-            "self_attn.v_proj.weight" => "v.weight", "self_attn.v_proj.bias" => "v.bias",
-            "self_attn.out_proj.weight" => "out.weight", "self_attn.out_proj.bias" => "out.bias",
-            "layer_norm1.weight" => "ln1.weight", "layer_norm1.bias" => "ln1.bias",
-            "layer_norm2.weight" => "ln2.weight", "layer_norm2.bias" => "ln2.bias",
-            "mlp.fc1.weight" => "fc1.weight", "mlp.fc1.bias" => "fc1.bias",
-            "mlp.fc2.weight" => "fc2.weight", "mlp.fc2.bias" => "fc2.bias",
-            _ => null,
-        };
-        return r == null ? null : l + r;
-    }
-
-    /// <summary>OpenCLIP text names (after <c>model.</c>) -> the normalised names, or null. The text projection is applied as x @ P, so it is stored transposed ([out, in]).</summary>
-    internal static string? MapOpenClip(string n, string p, out SdLayout layout)
-    {
-        layout = SdLayout.AsIs;
-        switch (n)
-        {
-            case "token_embedding.weight": return p + "tok";
-            case "positional_embedding": return p + "pos";
-            case "ln_final.weight": return p + "final_ln.weight";
-            case "ln_final.bias": return p + "final_ln.bias";
-            case "text_projection": layout = SdLayout.Transpose; return p + "proj.weight";
-        }
-        var m = OcLayer.Match(n);
-        if (!m.Success) return null;
-        string l = $"{p}layers.{m.Groups[1].Value}.", rest = m.Groups[2].Value;
-        string? r = rest switch
-        {
-            "ln_1.weight" => "ln1.weight", "ln_1.bias" => "ln1.bias",
-            "ln_2.weight" => "ln2.weight", "ln_2.bias" => "ln2.bias",
-            "attn.in_proj_weight" => "qkv.weight", "attn.in_proj_bias" => "qkv.bias",
-            "attn.out_proj.weight" => "out.weight", "attn.out_proj.bias" => "out.bias",
-            "mlp.c_fc.weight" => "fc1.weight", "mlp.c_fc.bias" => "fc1.bias",
-            "mlp.c_proj.weight" => "fc2.weight", "mlp.c_proj.bias" => "fc2.bias",
-            _ => null,
-        };
-        return r == null ? null : l + r;
-    }
 
     private SdLoraMerger? _lora;
     private readonly Accelerator _acc;

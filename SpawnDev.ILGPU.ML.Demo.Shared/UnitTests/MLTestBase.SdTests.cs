@@ -183,16 +183,24 @@ public abstract partial class MLTestBase
         if (!File.Exists(fxPath)) throw new UnsupportedTestException($"SD fixture {fxPath} not found");
         using var ck = await SdLoad(accelerator, path, new SdCheckpointOptions { LoadUNet = false, LoadVae = false });
         if (ck.Family != family || ck.TextEncoder == null) throw new Exception($"family {ck.Family} (want {family}), text encoder {(ck.TextEncoder == null ? "missing" : "present")}");
+        var report = new List<string>();
+        double worst = await SdTextVsFixture(ck.TextEncoder, family, fxPath, report);
+        SdLog($"{family} text encoder", report);
+        if (!(worst < bound)) throw new Exception("the text encoder deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    }
+
+    private static async Task<double> SdTextVsFixture(SdTextEncoder te, SdFamily family, string fxPath, List<string> report)
+    {
         using var fx = ZipFile.OpenRead(fxPath);
         var ids = WanNpz(fx, "ids").Data.Select(v => (int)v).ToArray();
         int[]? ids2 = fx.GetEntry("ids2.npy") != null ? WanNpz(fx, "ids2").Data.Select(v => (int)v).ToArray() : null;
-        var report = new List<string>();
         double worst = 0;
         var cases = family == SdFamily.SD1 ? new[] { ("ctx", (int?)-1), ("ctx_skip2", (int?)-2) } : new[] { ("ctx", (int?)null) };      // SD 2.x / SDXL: the default layer
         foreach (var (key, layer) in cases)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var e = await ck.TextEncoder.EncodeAsync(ids, ids2, layer);
+            var e = await te.EncodeAsync(ids, ids2, layer);
             var m = WanCompare(e.Context, WanNpz(fx, key).Data);
             report.Add($"{key} (layer {layer?.ToString() ?? "default"}): relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:E2} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalMilliseconds:F0} ms");
             worst = Math.Max(worst, m.RelRms);
@@ -204,9 +212,7 @@ public abstract partial class MLTestBase
                 worst = Math.Max(worst, mp.RelRms);
             }
         }
-        SdLog($"{family} text encoder", report);
-        if (!(worst < bound)) throw new Exception("the text encoder deviates from the reference: " + string.Join("; ", report));
-        return string.Join("; ", report);
+        return worst;
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -284,6 +290,15 @@ public abstract partial class MLTestBase
         var unet = ck.UNet!;
         if (ck.Prediction != prediction) throw new Exception($"expected a {prediction} model, inferred {ck.Prediction}");
         var report = new List<string>();
+        var (worstEps, worstTap, ran) = await SdUNetVsFixtures(accelerator, unet, tags, report);
+        SdLog($"{ck.Family} UNet", report);
+        if (ran == 0) throw new UnsupportedTestException("no UNet fixture found");
+        if (!(worstEps < bound && worstTap < bound)) throw new Exception("the UNet deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    }
+
+    private static async Task<(double Eps, double Tap, int Ran)> SdUNetVsFixtures(Accelerator accelerator, SdUNet unet, string[] tags, List<string> report)
+    {
         double worstEps = 0, worstTap = 0;
         int ran = 0;
         foreach (var tag in tags)
@@ -322,10 +337,7 @@ public abstract partial class MLTestBase
             await unet.ForwardAsync(lat, h, w, t, ctx, cs[0], xl);
             report.Add($"{tag}: warm forward {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
-        SdLog($"{ck.Family} UNet", report);
-        if (ran == 0) throw new UnsupportedTestException("no UNet fixture found");
-        if (!(worstEps < bound && worstTap < bound)) throw new Exception("the UNet deviates from the reference: " + string.Join("; ", report));
-        return string.Join("; ", report);
+        return (worstEps, worstTap, ran);
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -591,6 +603,15 @@ public abstract partial class MLTestBase
         var vae = ck.Vae!;
         if (Math.Abs(ck.LatentScale - scale) > 1e-7) throw new Exception($"latent scale {ck.LatentScale}, want {scale}");
         var report = new List<string>();
+        var (worst, ran) = await SdVaeVsFixtures(accelerator, vae, tags, report);
+        SdLog($"{ck.Family} VAE", report);
+        if (ran == 0) throw new UnsupportedTestException("no VAE fixture found");
+        if (!(worst < bound)) throw new Exception("the VAE deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    }
+
+    private static async Task<(double Worst, int Ran)> SdVaeVsFixtures(Accelerator accelerator, SdVae vae, string[] tags, List<string> report)
+    {
         double worst = 0;
         int ran = 0;
         foreach (var tag in tags)
@@ -625,9 +646,93 @@ public abstract partial class MLTestBase
             worst = Math.Max(worst, me.RelRms);
             report.Add($"encode {tag} ({ims[2]}x{ims[1]}): mean relRMS {me.RelRms:E2} maxAbs {me.MaxAbs:E2}, {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
-        SdLog($"{ck.Family} VAE", report);
-        if (ran == 0) throw new UnsupportedTestException("no VAE fixture found");
-        if (!(worst < bound)) throw new Exception("the VAE deviates from the reference: " + string.Join("; ", report));
-        return string.Join("; ", report);
+        return (worst, ran);
     }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // split component loaders (ComfyUI UNETLoader / VAELoader / CLIPLoader / DualCLIPLoader)
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// SDXL base from its diffusers repo files instead of the single file: <c>unet/diffusion_pytorch_model.fp16.safetensors</c> (diffusers UNet names),
+    /// <c>vae/diffusion_pytorch_model.fp16.safetensors</c> (diffusers VAE names), <c>text_encoder</c> + <c>text_encoder_2</c> (Hugging Face CLIP-L and bigG with
+    /// text_projection.weight) through SdUNet / SdVae / SdTextEncoder.LoadAsync: the UNet and the text encoders hold the single file weights, so they are held to its
+    /// reference and must land on the same numbers; the repo VAE has a different decoder and its own reference (ref_sd_dump.py --vae on the folder). Files in SD_DIR\split\sdxl (stabilityai/stable-diffusion-xl-base-1.0).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sdxl_SplitLoaders_MatchReference() => await RunTest(async accelerator =>
+    {
+        RequireSdFile(accelerator, SdxlFile);
+        string dir = Path.Combine(SdDir, "split", "sdxl");
+        string F(string rel) { var f = Path.Combine(dir, rel); if (!File.Exists(f)) throw new UnsupportedTestException($"{f} not found"); return f; }
+        FileStream Open(string f) => new(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        var fx = Path.Combine(SdDir, "ref", "sd_sdxl_small_f16s.npz");
+        if (!File.Exists(fx)) throw new UnsupportedTestException("SDXL fixture not found");
+        var report = new List<string>();
+        double worst = 0;
+        {
+            await using var l = Open(F("text_encoder/model.fp16.safetensors")); await using var g = Open(F("text_encoder_2/model.fp16.safetensors"));
+            using var te = await SdTextEncoder.LoadSdxlAsync(accelerator, l, "text_encoder", g, "text_encoder_2");
+            var r = new List<string>();
+            worst = Math.Max(worst, await SdTextVsFixture(te, SdFamily.SDXL, fx, r));
+            report.Add("DualCLIP (HF L + HF bigG): " + string.Join(", ", r));
+        }
+        {
+            await using var s = Open(F("unet/diffusion_pytorch_model.fp16.safetensors"));
+            using var unet = await SdUNet.LoadAsync(accelerator, s, "unet (diffusers)");
+            if (!unet.IsXL || unet.LabelWidth != 2816) throw new Exception($"the diffusers UNet loaded as XL={unet.IsXL}, label width {unet.LabelWidth}");
+            var r = new List<string>();
+            var (e, t, _) = await SdUNetVsFixtures(accelerator, unet, new[] { "sdxl_small_f16s" }, r);
+            worst = Math.Max(worst, Math.Max(e, t));
+            report.Add("UNETLoader (diffusers names): " + string.Join(", ", r));
+        }
+        {
+            await using var s = Open(F("vae/diffusion_pytorch_model.fp16.safetensors"));
+            using var vae = await SdVae.LoadAsync(accelerator, s, "vae (diffusers)");
+            var r = new List<string>();
+            // the repo VAE is NOT the single file VAE (same encoder, a different decoder: post_quant_conv / decoder weights differ), so it has its own reference
+            var (wv, _) = await SdVaeVsFixtures(accelerator, vae, new[] { "sdxlrepovae_small_f16s" }, r);
+            worst = Math.Max(worst, wv);
+            report.Add("VAELoader (diffusers names): " + string.Join(", ", r));
+        }
+        SdLog("SDXL split loaders", report);
+        if (!(worst < 2e-2)) throw new Exception("a split loader deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// SD 1.x split loaders: CLIPLoader with one Hugging Face CLIP-L file (the SDXL repo's <c>text_encoder</c> is OpenAI CLIP ViT-L, the same encoder SD 1.5 uses: it must
+    /// load as SD 1.x and give the SD 1.5 context, last layer and clip skip 2) and VAELoader with an unprefixed LDM VAE (<c>vae-ft-mse-840000-ema-pruned</c>, fp32) against
+    /// its own reference (diffusers with that VAE swapped in).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_SplitLoaders_MatchReference() => await RunTest(async accelerator =>
+    {
+        RequireSdFile(accelerator, Sd15File);
+        string clip = Path.Combine(SdDir, "split", "sdxl", "text_encoder", "model.fp16.safetensors"), vaeFile = Path.Combine(SdDir, "split", "vae", "vae-ft-mse-840000-ema-pruned.safetensors");
+        string fxText = Path.Combine(SdDir, "ref", "sd_sd15_small_f16w.npz");
+        if (!File.Exists(clip) || !File.Exists(vaeFile) || !File.Exists(fxText) || !File.Exists(Path.Combine(SdDir, "ref", "sd_sd15ftmse_small_f16s.npz"))) throw new UnsupportedTestException("split SD 1.5 files not found");
+        FileStream Open(string f) => new(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        var report = new List<string>();
+        double worst = 0;
+        {
+            await using var s = Open(clip);
+            using var te = await SdTextEncoder.LoadAsync(accelerator, s, "clip_l (HF)");
+            if (te.IsXL || te.Width != 768) throw new Exception($"CLIP-L loaded as XL={te.IsXL}, width {te.Width}");
+            var r = new List<string>();
+            worst = Math.Max(worst, await SdTextVsFixture(te, SdFamily.SD1, fxText, r));
+            report.Add("CLIPLoader (HF CLIP-L): " + string.Join(", ", r));
+        }
+        {
+            await using var s = Open(vaeFile);
+            using var vae = await SdVae.LoadAsync(accelerator, s, "vae-ft-mse");
+            var r = new List<string>();
+            var (wv, _) = await SdVaeVsFixtures(accelerator, vae, new[] { "sd15ftmse_small_f16s" }, r);
+            worst = Math.Max(worst, wv);
+            report.Add("VAELoader (LDM, unprefixed): " + string.Join(", ", r));
+        }
+        SdLog("SD1.5 split loaders", report);
+        if (!(worst < 2e-2)) throw new Exception("a split loader deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
 }

@@ -22,8 +22,9 @@ public sealed record SdxlConditioning(float[] Pooled, int OriginalHeight, int Or
 /// implicit GEMM (tensor cores on CUDA), attention the portable flash kernels. The prediction is whatever the model was trained for (epsilon for SD 1.x / SDXL base, v for the
 /// SD 2.x 768-v models: <see cref="SdCheckpoint.Prediction"/>).
 /// </summary>
-public sealed class SdUNet : IDisposable
+public sealed partial class SdUNet : IDisposable
 {
+    private bool _ownsWeights;            // loaded alone (LoadAsync): Dispose frees the weights too
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -389,5 +390,6 @@ public sealed class SdUNet : IDisposable
         _retired.Clear();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
+        if (_ownsWeights) _w.Dispose();
     }
 }
