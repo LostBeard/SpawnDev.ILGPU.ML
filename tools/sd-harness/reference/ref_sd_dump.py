@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--vae", default=None, help="replace the checkpoint's VAE with this standalone VAE file (ComfyUI VAELoader) before dumping")
     ap.add_argument("--lora", default=None, help="merge this LoRA (diffusers load_lora_weights + fuse_lora) before dumping")
     ap.add_argument("--lora-scale", type=float, default=1.0)
+    ap.add_argument("--lora-attn-procs", action="store_true",
+                    help="the OLD diffusers attention-processor LoRA format (<attn>.processor.to_k_lora.down.weight), which load_lora_weights silently ignores: merged by hand, W += scale * up @ down")
     ap.add_argument("--config", default=None, help="diffusers config repo (SD 2.x: Stability deleted its repos; sd2-community/stable-diffusion-2-1 mirrors them)")
     ap.add_argument("--f16-storage", action="store_true", help="keep the weights fp16 in memory and do every layer's math in fp32 (the same numbers as --f16-weights at half the memory: SDXL on a 16 GB machine)")
     ap.add_argument("--prompt", default="a photograph of an astronaut riding a horse on the moon, highly detailed")
@@ -94,7 +96,23 @@ def main():
             with torch.no_grad():
                 for p in m.parameters():
                     p.copy_(p.half().float())
-    if a.lora:
+    if a.lora and a.lora_attn_procs:
+        from safetensors.torch import load_file
+        sd = load_file(a.lora)
+        mods = dict(pipe.unet.named_modules())
+        n = 0
+        with torch.no_grad():
+            for k in sd:
+                if not k.endswith("_lora.down.weight"):
+                    continue
+                base = k[: -len("_lora.down.weight")]                          # <attn>.processor.to_k
+                attn, proj = base.rsplit(".processor.", 1)
+                m = mods[attn + "." + ("to_out.0" if proj == "to_out" else proj)]
+                up, down = sd[base + "_lora.up.weight"].float(), sd[k].float()
+                m.weight.copy_((m.weight.float() + a.lora_scale * (up @ down)).to(m.weight.dtype))
+                n += 1
+        print("lora merged by hand:", a.lora, n, "modules, scale", a.lora_scale)
+    elif a.lora:
         pipe.load_lora_weights(a.lora)
         pipe.fuse_lora(lora_scale=a.lora_scale)
         pipe.unload_lora_weights()

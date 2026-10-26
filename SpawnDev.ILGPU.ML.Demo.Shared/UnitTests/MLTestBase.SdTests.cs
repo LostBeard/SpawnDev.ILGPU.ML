@@ -366,48 +366,123 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
-    /// SD 1.5 ControlNet (ComfyUI's single file <c>control_v11p_sd15_canny_fp16.safetensors</c>) against diffusers' ControlNetModel.from_single_file: the 13 residuals for a
-    /// line-drawing hint, then the UNet with them at strength 0.8. Fixture from tools/sd-harness/reference/ref_sd_control.py; files in SD_DIR\controlnet.
+    /// ControlNets against diffusers' ControlNetModel: the ComfyUI single file (<c>control_v11p_sd15_canny_fp16</c>, control_model.*), the diffusers-format file of the same
+    /// SD 1.5 model (lllyasviel/control_v11p_sd15_canny: the same weights, the same fixture) and an SDXL ControlNet in diffusers format (diffusers/controlnet-canny-sdxl-1.0,
+    /// 10 residuals, pooled + size conditioning): the residuals for a line-drawing hint, then the UNet with them at strength 0.8.
+    /// Fixtures from tools/sd-harness/reference/ref_sd_control.py; files in SD_DIR\controlnet.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Sd15_ControlNet_MatchesReference() => await RunTest(async accelerator =>
     {
-        var ckPath = RequireSdFile(accelerator, Sd15File);
-        var cnPath = Path.Combine(SdDir, "controlnet", "control_v11p_sd15_canny_fp16.safetensors");
-        var fxPath = Path.Combine(SdDir, "ref", "control_canny_small.npz");
-        if (!File.Exists(cnPath) || !File.Exists(fxPath)) throw new UnsupportedTestException("ControlNet files not found");
-        using var ck = await SdLoad(accelerator, ckPath, new SdCheckpointOptions { LoadTextEncoder = false, LoadVae = false });
+        RequireSdFile(accelerator, Sd15File);
+        var report = new List<string>();
+        double worst = 0;
+        string cnDir = Path.Combine(SdDir, "controlnet");
+        foreach (var (ckFile, cnFile, tag) in new[]
+        {
+            (Sd15File, "control_v11p_sd15_canny_fp16.safetensors", "canny_small"),
+            (Sd15File, "diffusers_control_v11p_sd15_canny.fp16.safetensors", "canny_small"),
+            (SdxlFile, Path.Combine("sdxl_canny", "diffusion_pytorch_model.fp16.safetensors"), "sdxlcanny_small"),
+        })
+            worst = Math.Max(worst, await SdControlCheck(accelerator, ckFile, Path.Combine(cnDir, cnFile), tag, report));
+        SdLog("ControlNet", report);
+        if (!(worst < 2e-2)) throw new Exception("a ControlNet deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    private async Task<double> SdControlCheck(Accelerator accelerator, string ckFile, string cnPath, string tag, List<string> report)
+    {
+        var fxPath = Path.Combine(SdDir, "ref", $"control_{tag}.npz");
+        if (!File.Exists(cnPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"{cnPath} or its fixture not found");
+        using var ck = await SdLoad(accelerator, Path.Combine(SdDir, ckFile), new SdCheckpointOptions { LoadTextEncoder = false, LoadVae = false });
         await using var cs = new FileStream(cnPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
-        using var cn = await SdControlNet.LoadAsync(accelerator, cs, "canny");
+        using var cn = await SdControlNet.LoadAsync(accelerator, cs, Path.GetFileName(cnPath));
         using var fx = ZipFile.OpenRead(fxPath);
         var (lat, ls) = WanNpz(fx, "latent"); var (ctx, ctxs) = WanNpz(fx, "ctx"); var t = WanNpz(fx, "timestep").Data[0];
         var hint = WanNpz(fx, "hint").Data; float scale = WanNpz(fx, "scale").Data[0];
         int h = ls[1], w = ls[2];
+        SdxlConditioning? xl = null;
+        if (ck.UNet!.IsXL)
+        {
+            var ti = WanNpz(fx, "time_ids").Data;
+            xl = new SdxlConditioning(WanNpz(fx, "pooled").Data, (int)ti[0], (int)ti[1], (int)ti[2], (int)ti[3], (int)ti[4], (int)ti[5]);
+        }
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var res = await cn.RunAsync(lat, h, w, t, ctx, ctxs[0], hint);
+        var res = await cn.RunAsync(lat, h, w, t, ctx, ctxs[0], hint, xl);
         await accelerator.SynchronizeAsync();
         double cnMs = sw.Elapsed.TotalMilliseconds;
-        var report = new List<string>();
+        int expect = fx.Entries.Count(e => e.Name.StartsWith("res_"));
+        if (res.Count != expect) throw new Exception($"{res.Count} residuals, the reference has {expect}");
         double worstRes = 0;
-        if (res.Count != 13) throw new Exception($"{res.Count} residuals, SD 1.5 takes 13");
-        var line = new List<string>();
         for (int i = 0; i < res.Count; i++)
         {
             var (want, wsh) = WanNpz(fx, $"res_{i}");
             int C = wsh[0], HW = wsh[1] * wsh[2];
             var got = await res[i].SubView(0, (long)C * HW).CopyToHostAsync();
-            var m = SdCompareTap(got, want, C, HW);
-            line.Add($"{i}:{m.RelRms:E1}");
-            worstRes = Math.Max(worstRes, m.RelRms);
+            worstRes = Math.Max(worstRes, SdCompareTap(got, want, C, HW).RelRms);
         }
-        report.Add($"residuals ({cnMs:F0} ms first call): {string.Join(" ", line)}");
+        // an independent set (the same ControlNet twice in one chain): a second run with another hint into it must leave the first set untouched
+        using (var other = cn.CreateResiduals())
+        {
+            await cn.RunAsync(lat, h, w, t, ctx, ctxs[0], new float[hint.Length], xl, other);
+            var (want0, w0) = WanNpz(fx, "res_0");
+            var again = await res[0].SubView(0, (long)w0[0] * w0[1] * w0[2]).CopyToHostAsync();
+            double r0 = SdCompareTap(again, want0, w0[0], w0[1] * w0[2]).RelRms;
+            if (r0 > 2e-2) throw new Exception($"a run into another residual set changed the first one (residual 0 now {r0:E2} off)");
+        }
         res.Strength = scale;
-        var eps = await ck.UNet!.ForwardAsync(lat, h, w, t, ctx, ctxs[0], null, new[] { res });
+        var eps = await ck.UNet.ForwardAsync(lat, h, w, t, ctx, ctxs[0], xl, new[] { res });
         var me = WanCompare(eps, WanNpz(fx, "eps_control").Data);
         var plainVsControl = WanCompare(WanNpz(fx, "eps_plain").Data, WanNpz(fx, "eps_control").Data).RelRms;
-        report.Add($"UNet + ControlNet x{scale}: eps relRMS {me.RelRms:E2} (the plain UNet is {plainVsControl:E2} away)");
-        SdLog("SD1.5 ControlNet", report);
-        if (!(worstRes < 2e-2 && me.RelRms < 2e-2 && plainVsControl > 10 * me.RelRms)) throw new Exception("the ControlNet deviates from the reference: " + string.Join("; ", report));
+        report.Add($"{Path.GetFileName(cnPath)} ({ck.Family}): {res.Count} residuals worst relRMS {worstRes:E2} ({cnMs:F0} ms first call); UNet + ControlNet x{scale}: eps {me.RelRms:E2} (plain UNet {plainVsControl:E2} away)");
+        return plainVsControl > 10 * me.RelRms ? Math.Max(worstRes, me.RelRms) : double.PositiveInfinity;
+    }
+
+    /// <summary>
+    /// LoRA key formats against diffusers' load_lora_weights + fuse_lora: a kohya SD 1.5 LoRA WITH text-encoder keys (retrocgi_sd15_v1, MIT; strength 0.7 on both models:
+    /// the context and the UNet), the OLD diffusers attention-processor format (sd-1-5-sketch-lora), a kohya SDXL LoRA in diffusers module names incl. convolutions
+    /// (lcm-lora-sdxl x0.8) and a kohya SDXL LoRA in LDM module names (pixel-art-xl). Every key must match; files in SD_DIR\lora.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd_LoraFormats_MatchReference() => await RunTest(async accelerator =>
+    {
+        RequireSdFile(accelerator, Sd15File);
+        FileStream Open(string f) => new(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        var report = new List<string>();
+        double worst = 0;
+        foreach (var (ckFile, withText, cases) in new (string, bool, (string Lora, float S, string Tag)[])[]
+        {
+            (Sd15File, true, new[] { ("retrocgi_sd15_v1.safetensors", 0.7f, "sd15retro_small_f16s"), ("sd15-sketch-diffusers-old.safetensors", 1.0f, "sd15sketch_small_f16s") }),
+            (SdxlFile, false, new[] { ("lcm-lora-sdxl.safetensors", 0.8f, "sdxllcm_small_f16s"), ("pixel-art-xl.safetensors", 1.0f, "sdxlpixel_small_f16s") }),
+        })
+        {
+            using var ck = await SdLoad(accelerator, Path.Combine(SdDir, ckFile), new SdCheckpointOptions { LoadVae = false, LoadTextEncoder = withText });
+            foreach (var (lora, strength, tag) in cases)
+            {
+                var lp = Path.Combine(SdDir, "lora", lora); var fx = Path.Combine(SdDir, "ref", $"sd_{tag}.npz");
+                if (!File.Exists(lp) || !File.Exists(fx)) throw new UnsupportedTestException($"{lora} or its fixture not found");
+                // the reference itself must carry the LoRA: diffusers silently ignored the old attention-processor format once, and a fixture equal to the plain model's proves nothing
+                using (var fxl = ZipFile.OpenRead(fx))
+                using (var fxp = ZipFile.OpenRead(Path.Combine(SdDir, "ref", ckFile == Sd15File ? "sd_sd15_small_f16w.npz" : "sd_sdxl_small_f16s.npz")))
+                {
+                    double moved = WanCompare(WanNpz(fxl, "eps").Data, WanNpz(fxp, "eps").Data).RelRms;
+                    if (moved < 1e-2) throw new Exception($"the {lora} fixture equals the plain model's (relRMS {moved:E1}): the reference did not apply the LoRA");
+                }
+                var rep = await ck.ApplyLorasAsync(new[] { new SdLoraSpec(ct => Task.FromResult<Stream>(Open(lp)), lora, strength, strength) });
+                var (patched, unmatched) = (rep.Loras[0].Patched, rep.Loras[0].Unmatched);
+                var r = new List<string>();
+                double w = 0;
+                if (withText) w = Math.Max(w, await SdTextVsFixture(ck.TextEncoder!, ck.Family, fx, r));
+                var (e, t, _) = await SdUNetVsFixtures(accelerator, ck.UNet!, new[] { tag }, r);
+                w = Math.Max(w, Math.Max(e, t));
+                report.Add($"{lora} x{strength}: {patched} modules, {unmatched.Count} unmatched{(unmatched.Count > 0 ? " (" + string.Join(", ", unmatched.Take(3)) + ")" : "")}; {string.Join(", ", r.Where(x => !x.Contains("warm")))}");
+                if (patched == 0 || unmatched.Count > 0) w = double.PositiveInfinity;
+                worst = Math.Max(worst, w);
+                await ck.ApplyLorasAsync(Array.Empty<SdLoraSpec>());
+            }
+        }
+        SdLog("LoRA formats", report);
+        if (!(worst < 2e-2)) throw new Exception("a LoRA format deviates: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
 

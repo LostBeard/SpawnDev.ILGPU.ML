@@ -98,15 +98,25 @@ internal sealed class SdLoraMerger : IDisposable
     // ---------------------------------------------------------------------------------------------------
     // apply
     // ---------------------------------------------------------------------------------------------------
-    private static readonly string[] DownSuffix = { ".lora_down.weight", ".lora_A.weight", ".lora.down.weight", ".lora_A.default.weight" };
-    private static readonly string[] UpSuffix = { ".lora_up.weight", ".lora_B.weight", ".lora.up.weight", ".lora_B.default.weight" };
+    private static readonly string[] DownSuffix = { ".lora_down.weight", ".lora_A.weight", ".lora.down.weight", ".lora_A.default.weight", ".lora_linear_layer.down.weight", "_lora.down.weight" };
+    private static readonly string[] UpSuffix = { ".lora_up.weight", ".lora_B.weight", ".lora.up.weight", ".lora_B.default.weight", ".lora_linear_layer.up.weight", "_lora.up.weight" };
 
     private static (string Module, int Kind)? Split(string key)
     {
-        foreach (var s in DownSuffix) if (key.EndsWith(s, StringComparison.Ordinal)) return (key[..^s.Length], 0);
-        foreach (var s in UpSuffix) if (key.EndsWith(s, StringComparison.Ordinal)) return (key[..^s.Length], 1);
+        foreach (var s in DownSuffix) if (key.EndsWith(s, StringComparison.Ordinal)) return (Module(key[..^s.Length]), 0);
+        foreach (var s in UpSuffix) if (key.EndsWith(s, StringComparison.Ordinal)) return (Module(key[..^s.Length]), 1);
         if (key.EndsWith(".alpha", StringComparison.Ordinal)) return (key[..^".alpha".Length], 2);
         return null;
+    }
+
+    // the old diffusers attention-processor format names a module "<attention>.processor.to_k" (key "...processor.to_k_lora.down.weight"):
+    // the module itself is "<attention>.to_k", and its output projection "to_out" is "to_out.0"
+    private static string Module(string m)
+    {
+        int p = m.LastIndexOf(".processor.", StringComparison.Ordinal);
+        if (p < 0) return m;
+        var proj = m[(p + ".processor.".Length)..];
+        return m[..p] + "." + (proj == "to_out" ? "to_out.0" : proj);
     }
 
     public async Task RestoreAsync()
