@@ -34,8 +34,8 @@ The sampler, noise, CFG and host latents stay in SpawnGen. Tokenizer: `BPETokeni
 - [x] SDXL base (two towers, pooled, size ids, VAE fp32 activations): CUDA green at 40x48 and 1024x1024 (UNet 436 ms/step)
 - [x] SD 2.x: 2.1 768-v (V inferred), 2.1 base (eps), sgm-layout sd_turbo (Lore's report); UpcastAttention for SD 2.x on CUDA (e878b7e6). Stability deleted its SD 2 repos: files from sd2-community
 - [x] LoRA merge (ApplyLorasAsync, kohya/PEFT/LDM keys, restore): LCM-LoRA SD 1.5 gated; [ ] a LoRA with text-encoder keys, an SDXL LoRA
-- [x] Split component loaders (SdUNet/SdVae/SdTextEncoder.LoadAsync, LoadSdxlAsync; LDM/diffusers/HF/OpenCLIP names), gated (8cd376f9); [ ] TAESD
-- [ ] ControlNet (SD 1.5: hint encoder, 13 residuals into the UNet skips + mid)
+- [x] Split component loaders (SdUNet/SdVae/SdTextEncoder.LoadAsync, LoadSdxlAsync; LDM/diffusers/HF/OpenCLIP names), gated (8cd376f9); [x] TAESD / TAESDXL (b057bb3b); [x] standalone LoRA + InferPredictionAsync (b057bb3b)
+- [x] ControlNet SD 1.x (SdControlNet, control_model.* single files; canny gated 8.3e-4 / 4.5e-4, b057bb3b); [ ] SDXL ControlNets, diffusers-format ControlNets, Control-LoRA
 - [ ] diffusers-format single files (second name map), SDXL refiner
 - [ ] memory: SDXL VAE decode at 1024 needs ~4 GB of activations: tiled decode for small cards / browser
-- [ ] the browser HubModelSource 404 probes for unmirrored files (Lore's console-noise note)
+- [x] the browser 404 probes (mirrors.json index, 1d5b4b34) + OPFS cache never hit for HF-served files (261047b8)
