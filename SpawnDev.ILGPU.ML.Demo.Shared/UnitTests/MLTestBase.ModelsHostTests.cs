@@ -205,6 +205,47 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    /// <summary>
+    /// The OPFS cache HITS for a file the models host does not mirror (Lore 10-25: the downloader recorded the Hugging Face URL it fetched from, the hit check compared
+    /// with the requested models-host URL, so every unmirrored model downloaded again on every load). The entry records the requested URL; a second open starts no
+    /// download; an entry written by the old code (recording the Hugging Face twin) is a hit too. Browser only.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task ModelsHost_OpfsCacheHitsForAnUnmirroredFile() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = "ilgpu-ml-test-modelshost" };
+        if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        using var source = new HubModelSource(cache, http);
+        const string key = "modelshost-cachehit-fixture";
+        await cache.RemoveAsync(key);
+        int downloads = 0;
+        void OnActive() => downloads++;
+        cache.Downloader.ActiveDownloadsChanged += OnActive;
+        try
+        {
+            await using (var s1 = await source.OpenUrlAsync(url, key, UnmirroredBytes)) Ur_Expect(s1.Length == UnmirroredBytes, $"first open: {s1.Length} bytes");
+            var state = await cache.GetStateAsync(key);
+            Ur_Expect(state.Complete && state.SourceRef == url, $"the entry records the requested url: '{state.SourceRef}'");
+            Ur_Expect(downloads > 0, "the first open downloaded");
+            downloads = 0;
+            await using (var s2 = await source.OpenUrlAsync(url, key, UnmirroredBytes)) Ur_Expect(s2.Length == UnmirroredBytes, $"second open: {s2.Length} bytes");
+            Ur_Expect(downloads == 0, $"the second open is a cache hit: {downloads} download event(s)");
+            // an entry the old code wrote: SourceRef = the Hugging Face twin
+            var twin = ModelsHost.GetFallbackUrl(url)!;
+            await cache.SetStateAsync(key, twin, state.TotalBytes, state.BytesWritten, true, state.ETag);
+            await using (var s3 = await source.OpenUrlAsync(url, key, UnmirroredBytes)) Ur_Expect(s3.Length == UnmirroredBytes, $"legacy entry: {s3.Length} bytes");
+            Ur_Expect(downloads == 0, $"an entry recording the Hugging Face twin is a hit too: {downloads} download event(s)");
+        }
+        finally
+        {
+            cache.Downloader.ActiveDownloadsChanged -= OnActive;
+            await cache.RemoveAsync(key);
+        }
+    });
+
     /// <summary>Turns <see cref="ModelsHost.UseMirrorIndex"/> off for a block (the fallback tests exercise the path the index avoids).</summary>
     private sealed class MirrorIndexOff : IDisposable
     {

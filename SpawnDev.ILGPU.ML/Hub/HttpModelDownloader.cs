@@ -165,14 +165,17 @@ public class HttpModelDownloader
             // Hit: complete, and either from this URL or from nowhere. An empty SourceRef means the entry
             // was handed to the store directly (a torrent stream, a picked file); re-downloading it over
             // HTTP because we cannot prove its origin would defeat the point of storing it.
-            if (state.Complete && (state.SourceRef == url || string.IsNullOrEmpty(state.SourceRef)))
+            // The Hugging Face twin of a models-host URL counts as this URL: both hosts serve the same bytes (every mirrored file was
+            // checked sha256 against Hugging Face), and entries written before 2026-10-25 recorded the URL the bytes came from, so
+            // every unmirrored model missed and downloaded again on every load (Lore: 2.1 GB per session, 6.9 GB for SDXL).
+            if (state.Complete && (SameSource(state.SourceRef, url) || string.IsNullOrEmpty(state.SourceRef)))
             {
                 progress?.Report(new ModelDownloadProgress(state.BytesWritten, state.BytesWritten, false));
                 return await OpenOrThrowAsync(key, cancellationToken).ConfigureAwait(false);
             }
 
             // Resume only a partial that was for THIS url.
-            long resumeFrom = !state.Complete && state.SourceRef == url ? state.BytesWritten : 0;
+            long resumeFrom = !state.Complete && SameSource(state.SourceRef, url) ? state.BytesWritten : 0;
 
             await DownloadAsync(url, key, resumeFrom, state.ETag, progress, cancellationToken).ConfigureAwait(false);
             return await OpenOrThrowAsync(key, cancellationToken).ConfigureAwait(false);
@@ -185,6 +188,8 @@ public class HttpModelDownloader
             gate.Release();
         }
     }
+
+    private static bool SameSource(string? stored, string url) => stored == url || (stored != null && stored == ModelsHost.GetFallbackUrl(url));
 
     private async Task<Stream> OpenOrThrowAsync(string key, CancellationToken ct)
         => await _store.OpenReadAsync(key, ct).ConfigureAwait(false)
@@ -383,7 +388,9 @@ public class HttpModelDownloader
     private async Task DownloadAsync(string url, string key, long resumeFrom, string? knownETag,
         IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
     {
-        // a file the models host does not mirror (its mirrors.json says so) goes straight to Hugging Face: no 404 in the console first
+        // The entry records the REQUESTED url (sourceRef): GetOrDownloadAsync recognises a hit by it. The bytes may come from elsewhere: a file the models
+        // host does not mirror (its mirrors.json says so) goes straight to Hugging Face, and a failed request falls back there.
+        string sourceRef = url;
         url = await ModelsHost.PreferredUrlAsync(url).ConfigureAwait(false);
         var headers = new Dictionary<string, string>();
         // Segmented: ask for a BOUNDED range from the start, so the first response is a 206 carrying
@@ -477,7 +484,7 @@ public class HttpModelDownloader
             etag = NullIfEmpty(respHeaders.Get("etag"));
         }
 
-        await _store.SetStateAsync(key, url, total, resumeFrom, false, etag, ct).ConfigureAwait(false);
+        await _store.SetStateAsync(key, sourceRef, total, resumeFrom, false, etag, ct).ConfigureAwait(false);
 
         var tracker = new Tracker
         {
@@ -584,7 +591,7 @@ public class HttpModelDownloader
                         // Durable checkpoint per segment - resume granularity is SegmentBytes.
                         var _cT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                         await dest.FlushAsync(ct).ConfigureAwait(false);
-                        await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
+                        await _store.SetStateAsync(key, sourceRef, total, written, false, etag, ct).ConfigureAwait(false);
                         LastCheckpointMs += (System.Diagnostics.Stopwatch.GetTimestamp() - _cT0)
                                             * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
                         LastCheckpoints++;
@@ -616,7 +623,7 @@ public class HttpModelDownloader
                 }
 
                 await dest.FlushAsync(ct).ConfigureAwait(false);
-                await _store.SetStateAsync(key, url, total, written, true, etag, ct).ConfigureAwait(false);
+                await _store.SetStateAsync(key, sourceRef, total, written, true, etag, ct).ConfigureAwait(false);
                 progress?.Report(new ModelDownloadProgress(received, total, resumed));
                 LastDownloadChunks = LastFetchChunks;
                 LastDownloadWrites = writeCount;
@@ -677,7 +684,7 @@ public class HttpModelDownloader
                     {
                         var _cpT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                         await dest.FlushAsync(ct).ConfigureAwait(false);
-                        await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
+                        await _store.SetStateAsync(key, sourceRef, total, written, false, etag, ct).ConfigureAwait(false);
                         LastCheckpointMs += (System.Diagnostics.Stopwatch.GetTimestamp() - _cpT0)
                                             * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
                         LastCheckpoints++;
@@ -708,7 +715,7 @@ public class HttpModelDownloader
                 try
                 {
                     await dest.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-                    await _store.SetStateAsync(key, url, total, written, false, etag, CancellationToken.None)
+                    await _store.SetStateAsync(key, sourceRef, total, written, false, etag, CancellationToken.None)
                         .ConfigureAwait(false);
                 }
                 catch { /* the original failure is the one worth reporting */ }
@@ -753,13 +760,13 @@ public class HttpModelDownloader
         // resumes it, rather than caching it and failing much later inside a proto reader.
         if (total > 0 && written != total)
         {
-            await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
+            await _store.SetStateAsync(key, sourceRef, total, written, false, etag, ct).ConfigureAwait(false);
             throw new IOException(
                 $"Model download truncated for {url}: got {written} of {total} bytes. " +
                 "The partial entry was kept and the next attempt will resume it.");
         }
 
-        await _store.SetStateAsync(key, url, total > 0 ? total : written, written, true, etag, ct).ConfigureAwait(false);
+        await _store.SetStateAsync(key, sourceRef, total > 0 ? total : written, written, true, etag, ct).ConfigureAwait(false);
         progress?.Report(new ModelDownloadProgress(received, total > 0 ? total : written, resumed));
     }
 
