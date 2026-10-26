@@ -10,19 +10,44 @@ using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 
 /// <summary>
 /// One ControlNet's output for one UNet call: a residual per skip connection plus one for the middle block (13 for SD 1.x), channel-last on the device, and the strength
-/// it is applied with. Valid until the ControlNet runs again.
+/// it is applied with. The buffers belong to this object (grown as needed, reused by every run written into it): the ControlNet's own set
+/// (<see cref="SdControlNet.RunAsync(FV, int, int, double, FV, int, FV, FV?, SdControlResiduals?, CancellationToken)"/> without <c>into</c>) is valid until it runs again;
+/// <see cref="SdControlNet.CreateResiduals"/> gives independent sets (the same ControlNet twice in one chain, as ComfyUI allows). Dispose what you create.
 /// </summary>
-public sealed class SdControlResiduals
+public sealed class SdControlResiduals : IDisposable
 {
-    private readonly FV[] _views;
-    internal SdControlResiduals(FV[] views, float strength) { _views = views; Strength = strength; }
-    public float Strength { get; set; }
+    private readonly Accelerator _acc;
+    private readonly List<Buf> _bufs = new();
+    private readonly List<IDisposable> _retired = new();     // a replaced buffer may still be read by a queued dispatch: freed on Dispose
+    private FV[] _views = Array.Empty<FV>();
+
+    internal SdControlResiduals(Accelerator acc) => _acc = acc;
+    public float Strength { get; set; } = 1f;
     public int Count => _views.Length;
     public FV this[int i] => _views[i];
+
+    internal void Reset(int count) { if (_views.Length != count) _views = new FV[count]; }
+
+    internal FV Prepare(int i, long n)
+    {
+        while (_bufs.Count <= i) _bufs.Add(_acc.Allocate1D<float>(64));
+        if (_bufs[i].Length < n) { _retired.Add(_bufs[i]); _bufs[i] = _acc.Allocate1D<float>(n); }
+        return _views[i] = _bufs[i].View.SubView(0, n);
+    }
+
+    public void Dispose()
+    {
+        foreach (var b in _bufs) b.Dispose();
+        _bufs.Clear();
+        foreach (var r in _retired) r.Dispose();
+        _retired.Clear();
+        _views = Array.Empty<FV>();
+    }
 }
 
 /// <summary>
-/// A ControlNet (lllyasviel's ControlNet v1.0 / v1.1 for SD 1.x in the single-file layout ComfyUI uses: <c>control_model.*</c>, e.g. <c>control_v11p_sd15_canny_fp16.safetensors</c>):
+/// A ControlNet (lllyasviel's ControlNet v1.0 / v1.1 for SD 1.x in the single-file layout ComfyUI uses: <c>control_model.*</c>, e.g. <c>control_v11p_sd15_canny_fp16.safetensors</c>;
+/// and the diffusers ControlNetModel files most SDXL ControlNets ship as, e.g. <c>diffusers/controlnet-canny-sdxl-1.0</c>):
 /// the UNet's encoder half (input blocks and middle block) fed the latent plus an encoded hint picture, whose block outputs go through zero-initialised 1x1 convolutions into
 /// residuals for the UNet's skip connections and middle block. <see cref="RunAsync(FV, int, int, double, FV, int, FV, FV?, CancellationToken)"/> computes them,
 /// <see cref="SdUNet.ForwardAsync(FV, int, int, double, FV, int, FV?, FV, IReadOnlyList{SdControlResiduals}?, CancellationToken)"/> adds them. The hint is the control picture
@@ -36,7 +61,7 @@ public sealed class SdControlNet : IDisposable
     private readonly SdKernels _k;
     private readonly DiTKernels _dk;
     private readonly Dictionary<(int, int, int, int, int), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
-    private readonly List<Buf> _outs = new();
+    private readonly SdControlResiduals _own;
     private readonly Dictionary<int, Buf> _slots = new();
     private readonly List<IDisposable> _retired = new();
     private readonly int _hintBlocks;
@@ -48,7 +73,7 @@ public sealed class SdControlNet : IDisposable
 
     private SdControlNet(Accelerator acc, SdWeights w)
     {
-        _acc = acc; _w = w; _enc = new SdUNet(acc, w); _k = new SdKernels(acc); _dk = new DiTKernels(acc);
+        _acc = acc; _w = w; _enc = new SdUNet(acc, w); _k = new SdKernels(acc); _dk = new DiTKernels(acc); _own = new SdControlResiduals(acc);
         int zeros = 0; while (w.Has($"zero_convs.{zeros}.0.weight")) zeros++;
         ResidualCount = zeros + 1;
         while (w.Has($"input_hint_block.{2 * _hintBlocks}.weight")) _hintBlocks++;
@@ -66,10 +91,10 @@ public sealed class SdControlNet : IDisposable
     {
         var w = await SdComponentFile.LoadAsync(accelerator, stream, name, tensors =>
         {
-            if (tensors.Any(t => t.Name.StartsWith("controlnet_cond_embedding.", StringComparison.Ordinal)))
-                throw new NotSupportedException($"'{name}': a diffusers-format ControlNet; this loader reads the single-file (control_model.*) layout ComfyUI uses");
             if (tensors.Any(t => t.Name.Contains("lora", StringComparison.OrdinalIgnoreCase)))
                 throw new NotSupportedException($"'{name}': a Control-LoRA; only full ControlNets are supported");
+            if (tensors.Any(t => t.Name.StartsWith("controlnet_cond_embedding.", StringComparison.Ordinal)))
+                return n => DiffusersToLdm(n) is { } l ? (l, SdLayout.ConvGather) : null;      // diffusers ControlNetModel (most SDXL ControlNets)
             return n =>
             {
                 var s = SdComponentFile.StripPrefix(n, "control_model.");
@@ -85,6 +110,34 @@ public sealed class SdControlNet : IDisposable
             return new SdControlNet(accelerator, w);
         }
         catch { w.Dispose(); throw; }
+    }
+
+    /// <summary>
+    /// diffusers ControlNetModel names -> the single-file (cldm) names: the conditioning embedding is input_hint_block (conv_in = 0, blocks.j = 2 (j + 1), conv_out = 14),
+    /// controlnet_down_blocks.i = zero_convs.i.0, controlnet_mid_block = middle_block_out.0, the UNet encoder through the diffusers -> LDM UNet map.
+    /// </summary>
+    internal static string? DiffusersToLdm(string n)
+    {
+        const string ce = "controlnet_cond_embedding.";
+        if (n.StartsWith(ce, StringComparison.Ordinal))
+        {
+            var r = n[ce.Length..];
+            if (r.StartsWith("conv_in.", StringComparison.Ordinal)) return "input_hint_block.0." + r["conv_in.".Length..];
+            if (r.StartsWith("conv_out.", StringComparison.Ordinal)) return "input_hint_block.14." + r["conv_out.".Length..];
+            if (r.StartsWith("blocks.", StringComparison.Ordinal))
+            {
+                var rest = r["blocks.".Length..]; int dot = rest.IndexOf('.');
+                return $"input_hint_block.{2 * (int.Parse(rest[..dot]) + 1)}{rest[dot..]}";
+            }
+            return null;
+        }
+        if (n.StartsWith("controlnet_down_blocks.", StringComparison.Ordinal))
+        {
+            var rest = n["controlnet_down_blocks.".Length..]; int dot = rest.IndexOf('.');
+            return $"zero_convs.{rest[..dot]}.0{rest[dot..]}";
+        }
+        if (n.StartsWith("controlnet_mid_block.", StringComparison.Ordinal)) return "middle_block_out.0." + n["controlnet_mid_block.".Length..];
+        return SdNames.DiffusersToLdmUNet(n, _ => false);
     }
 
     private FV Slot(int slot, long n)
@@ -108,12 +161,16 @@ public sealed class SdControlNet : IDisposable
         return t.View;
     }
 
+    /// <summary>An independent residual set to pass as <c>into</c> (the caller disposes it).</summary>
+    public SdControlResiduals CreateResiduals() => new(_acc);
+
     /// <summary>
     /// The residuals for one UNet call: the same latent, timestep and text context the UNet gets (<paramref name="latent"/> [4, h, w] channel-first, the scaled latent),
-    /// <paramref name="hint"/> the control picture [3, 8h, 8w] channel-first in [0, 1]. The returned set (strength 1, change it with <see cref="SdControlResiduals.Strength"/>)
-    /// lives in this ControlNet's buffers until it runs again.
+    /// <paramref name="hint"/> the control picture [3, 8h, 8w] channel-first in [0, 1]. Written into <paramref name="into"/> (from <see cref="CreateResiduals"/>) or, when
+    /// null, into this ControlNet's own set, valid until it runs again. Change the strength with <see cref="SdControlResiduals.Strength"/>.
     /// </summary>
-    public async Task<SdControlResiduals> RunAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV hint, FV? y = null, CancellationToken cancellationToken = default)
+    public async Task<SdControlResiduals> RunAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV hint, FV? y = null, SdControlResiduals? into = null,
+        CancellationToken cancellationToken = default)
     {
         int H = 8 * h, W = 8 * w, rows = H * W;
         // the hint encoder: 3x3 convolutions with SiLU between them, three of stride 2 (8x down), the last (zero-initialised) to the UNet's width
@@ -135,33 +192,41 @@ public sealed class SdControlNet : IDisposable
         if (ch != h || cw != w || c != _enc.ModelChannels) throw new InvalidOperationException($"the hint encoder gave {c} x {ch} x {cw}, the UNet needs {_enc.ModelChannels} x {h} x {w}");
         var guided = cur;
         // the encoder half with the hint added after conv_in; every block output through its zero convolution
-        while (_outs.Count < ResidualCount) _outs.Add(_acc.Allocate1D<float>(64));
-        var views = new FV[ResidualCount];
+        var res = into ?? _own;
+        res.Reset(ResidualCount);
         await _enc.RunAsync(latent, h, w, timestep, context, contextRows, y, default, null, guided, (i, view, bh, bw, bc) =>
         {
             long n = (long)bh * bw * bc;
-            if (_outs[i].Length < n) { _retired.Add(_outs[i]); _outs[i] = _acc.Allocate1D<float>(n); }
+
             string p = i < ResidualCount - 1 ? $"zero_convs.{i}.0." : "middle_block_out.0.";
-            _k.Linear(view, _w[p + "weight"], _w[p + "bias"], _outs[i].View.SubView(0, n), bh * bw, bc, bc);
-            views[i] = _outs[i].View.SubView(0, n);
+            _k.Linear(view, _w[p + "weight"], _w[p + "bias"], res.Prepare(i, n), bh * bw, bc, bc);
         }, cancellationToken);
-        return new SdControlResiduals(views, 1f);
+        return res;
     }
 
-    /// <summary>The residuals from host arrays: <paramref name="latent"/> [4, h, w], <paramref name="context"/> [rows, 768], <paramref name="hint"/> [3, 8h, 8w] in [0, 1].</summary>
-    public async Task<SdControlResiduals> RunAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, float[] hint, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The residuals from host arrays: <paramref name="latent"/> [4, h, w], <paramref name="context"/> [rows, ContextDim], <paramref name="hint"/> [3, 8h, 8w] in [0, 1];
+    /// an SDXL ControlNet needs <paramref name="xl"/> (the same conditioning the UNet gets).
+    /// </summary>
+    public async Task<SdControlResiduals> RunAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, float[] hint, SdxlConditioning? xl = null,
+        SdControlResiduals? into = null, CancellationToken cancellationToken = default)
     {
         var lat = Slot(10, latent.Length); lat.CopyFromCPU(latent);
         var ctx = Slot(11, context.Length); ctx.CopyFromCPU(context);
         var hv = Slot(12, hint.Length); hv.CopyFromCPU(hint);
-        return await RunAsync(lat, h, w, timestep, ctx, contextRows, hv, null, cancellationToken);
+        FV? y = null;
+        if (_enc.IsXL)
+        {
+            if (xl == null) throw new ArgumentException("an SDXL ControlNet needs the SDXL conditioning (pooled text embedding and size ids)");
+            var yv = Slot(13, _enc.LabelWidth); yv.CopyFromCPU(SdUNet.SdxlLabel(xl, _enc.LabelWidth)); y = yv;
+        }
+        return await RunAsync(lat, h, w, timestep, ctx, contextRows, hv, y, into, cancellationToken);
     }
 
     public void Dispose()
     {
         _enc.Dispose();
-        foreach (var b in _outs) b.Dispose();
-        _outs.Clear();
+        _own.Dispose();
         foreach (var b in _slots.Values) b.Dispose();
         _slots.Clear();
         foreach (var r in _retired) r.Dispose();
