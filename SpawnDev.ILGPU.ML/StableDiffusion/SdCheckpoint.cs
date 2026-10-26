@@ -31,7 +31,7 @@ public sealed class SdCheckpointOptions
 public sealed class SdCheckpoint : IDisposable
 {
     public SdFamily Family { get; }
-    public SdPrediction Prediction { get; }
+    public SdPrediction Prediction { get; private set; }
     /// <summary>The VAE latent scale: sampler latent = VAE latent x this (0.18215 SD 1.x / 2.x, 0.13025 SDXL).</summary>
     public float LatentScale => Family == SdFamily.SDXL ? 0.13025f : 0.18215f;
     public SdUNet? UNet { get; }
@@ -114,30 +114,16 @@ public sealed class SdCheckpoint : IDisposable
             if (vae != null) await SdNames.FuseVaeAsync(accelerator, vae);
             if (text != null) await SdNames.FuseTextAsync(accelerator, text);
 
-            var prediction = options.Prediction ?? (names.Contains("v_pred") ? SdPrediction.V : SdPrediction.Epsilon);
-            if (options.Prediction == null && family == SdFamily.SD2 && unet != null)
-                prediction = await Sd2PredictionAsync(accelerator, unet);
-            return new SdCheckpoint(family, prediction, unet, text, vae, accelerator);
+            var ck = new SdCheckpoint(family, SdPrediction.Epsilon, unet, text, vae, accelerator);
+            if (ck.UNet != null) ck.UNet.VPredTensor = names.Contains("v_pred");
+            ck.Prediction = options.Prediction ?? (ck.UNet != null ? await ck.UNet.InferPredictionAsync() : names.Contains("v_pred") ? SdPrediction.V : SdPrediction.Epsilon);
+            return ck;
         }
         catch
         {
             unet?.Dispose(); text?.Dispose(); vae?.Dispose();
             throw;
         }
-    }
-
-    /// <summary>ComfyUI's test for an SD 2.x v-prediction model (the 768-v checkpoints): the spread of one late layer-norm bias, above 0.09 for the v models.</summary>
-    private static async Task<SdPrediction> Sd2PredictionAsync(Accelerator acc, SdWeights unet)
-    {
-        const string key = "output_blocks.11.1.transformer_blocks.0.norm1.bias";
-        if (!unet.Has(key)) return SdPrediction.Epsilon;
-        var hv = unet[key];
-        using var f = acc.Allocate1D<float>(hv.Length);
-        new SdKernels(acc).HalfToFloat(hv, f.View);
-        await acc.SynchronizeAsync();
-        var v = await f.View.CopyToHostAsync();
-        double mean = v.Average(x => (double)x), var = v.Average(x => (x - mean) * (x - mean));
-        return Math.Sqrt(var) > 0.09 ? SdPrediction.V : SdPrediction.Epsilon;
     }
 
     private static SdFamily DetectFamily(string name, HashSet<string> names, List<SafeTensorInfo> tensors)
@@ -167,7 +153,6 @@ public sealed class SdCheckpoint : IDisposable
         _ => names.Contains("conditioner.embedders.0.transformer.text_model.embeddings.token_embedding.weight") && names.Contains("conditioner.embedders.1.model.token_embedding.weight"),
     };
 
-    private SdLoraMerger? _lora;
     private readonly Accelerator _acc;
 
     /// <summary>
@@ -177,13 +162,21 @@ public sealed class SdCheckpoint : IDisposable
     /// </summary>
     public async Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
     {
-        _lora ??= new SdLoraMerger(_acc, _unet, _text, Family);
-        return await _lora.ApplyAsync(loras, cancellationToken);
+        // each component merges its own modules (and keeps its own originals); a key is unmatched only when neither took it
+        var u = UNet != null ? await UNet.ApplyLorasAsync(loras, cancellationToken) : null;
+        var t = TextEncoder != null ? await TextEncoder.ApplyLorasAsync(loras, cancellationToken) : null;
+        var rows = new List<(string, int, IReadOnlyList<string>)>();
+        for (int i = 0; i < loras.Count; i++)
+        {
+            var ur = u?.Loras[i]; var tr = t?.Loras[i];
+            IReadOnlyList<string> unmatched = ur == null ? tr!.Value.Unmatched : tr == null ? ur.Value.Unmatched : ur.Value.Unmatched.Intersect(tr.Value.Unmatched).ToList();
+            rows.Add((loras[i].Name, (ur?.Patched ?? 0) + (tr?.Patched ?? 0), unmatched));
+        }
+        return new SdLoraReport(rows);
     }
 
     public void Dispose()
     {
-        _lora?.Dispose();
         UNet?.Dispose(); TextEncoder?.Dispose(); Vae?.Dispose();
         _unet?.Dispose(); _text?.Dispose(); _vae?.Dispose();
     }

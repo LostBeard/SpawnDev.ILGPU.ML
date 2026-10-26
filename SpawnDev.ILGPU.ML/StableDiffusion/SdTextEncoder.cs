@@ -67,6 +67,18 @@ internal sealed class SdClipTower
 public sealed partial class SdTextEncoder : IDisposable
 {
     private bool _ownsWeights;            // loaded alone (LoadAsync / LoadSdxlAsync): Dispose frees the weights too
+    private readonly SdFamily _family;
+    private SdLoraMerger? _lora;
+
+    /// <summary>
+    /// Merge LoRAs into these text encoder(s) (their text modules at <see cref="SdLoraSpec.ClipStrength"/>; UNet keys are ignored here and reported unmatched), replacing
+    /// any set merged before (originals kept on the device; an empty list removes every LoRA).
+    /// </summary>
+    public Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
+    {
+        _lora ??= new SdLoraMerger(_acc, null, _w, _family);
+        return _lora.ApplyAsync(loras, cancellationToken);
+    }
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -84,7 +96,7 @@ public sealed partial class SdTextEncoder : IDisposable
 
     internal SdTextEncoder(Accelerator acc, SdWeights weights, SdFamily family)
     {
-        _acc = acc; _w = weights; _k = new SdKernels(acc);
+        _acc = acc; _w = weights; _k = new SdKernels(acc); _family = family;
         switch (family)
         {
             case SdFamily.SD1: _towers = new[] { new SdClipTower(acc, weights, _k, "l.", quickGelu: true) }; _finalNorm = true; _defaultLayer = -1; break;
@@ -176,6 +188,7 @@ public sealed partial class SdTextEncoder : IDisposable
         _slots.Clear();
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();
+        _lora?.Dispose();
         if (_ownsWeights) _w.Dispose();
     }
 }

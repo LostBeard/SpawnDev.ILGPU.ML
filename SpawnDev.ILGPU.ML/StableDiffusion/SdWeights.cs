@@ -45,6 +45,14 @@ public sealed class SdWeights : IDisposable
         _t[name] = buffer; _shapes[name] = shape;
     }
 
+    /// <summary>Hand tensor <paramref name="name"/> to another store under <paramref name="newName"/> (the buffer moves, nothing is copied).</summary>
+    internal void MoveTo(string name, SdWeights other, string newName)
+    {
+        if (!_t.Remove(name, out var b)) throw new KeyNotFoundException(name);
+        var shape = _shapes[name]; _shapes.Remove(name);
+        other.Add(newName, b, shape);
+    }
+
     internal void Remove(string name)
     {
         if (_t.Remove(name, out var b)) b.Dispose();
@@ -115,17 +123,18 @@ internal sealed class SdTensorStreamer : IDisposable
 
     public SdTensorStreamer(Accelerator acc) => _acc = acc;
 
-    // dst index i in the target layout -> source index. layout 0 as is, 1 conv gather ([co][t][ci] <- [co][ci][t]), 2 transpose ([c][r] <- [r][c]); a = cin or cols, b = taps or rows
-    private static long SourceIndex(long i, int layout, int a, int b)
+    // dst index i in the target layout -> source index. layout 0 as is, 1 conv gather ([co][t][ci] <- [co][ci][t]), 2 transpose ([c][r] <- [r][c]); a = cin or cols, b = taps or rows.
+    // 32-bit: a launch is at most 2^31 elements (the largest SD tensor, SDXL's token table, is 63 M), and WGSL has no native 64-bit integers (emulated: slower to compile and to run).
+    private static int SourceIndex(int i, int layout, int a, int b)
     {
         if (layout == 1)
         {
-            long ci = i % a, t = i / a % b, co = i / ((long)a * b);
+            int ci = i % a, t = i / a % b, co = i / (a * b);
             return (co * a + ci) * b + t;
         }
         if (layout == 2)
         {
-            long r = i % b, c = i / b;      // dst [cols = a][rows = b]
+            int r = i % b, c = i / b;       // dst [cols = a][rows = b]
             return r * a + c;
         }
         return i;

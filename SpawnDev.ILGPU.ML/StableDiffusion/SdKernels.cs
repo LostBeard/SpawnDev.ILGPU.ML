@@ -238,6 +238,45 @@ public sealed class SdKernels
         _h2f((int)src.Length, src, dst);
     }
 
+    // ReLU in place; x = relu(x + y); TAESD's input clamp tanh(x * scale / 3) * 3; x = a * x + b
+    private Action<Index1D, FV>? _relu;
+    private static void ReluImpl(Index1D i, FV x) => x[i] = MathF.Max(0f, x[i]);
+    public void ReluInPlace(FV x, long count)
+    {
+        _relu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV>(ReluImpl);
+        _relu((int)count, x);
+    }
+    private Action<Index1D, FV, FV>? _addRelu;
+    private static void AddReluImpl(Index1D i, FV x, FV y) => x[i] = MathF.Max(0f, x[i] + y[i]);
+    public void AddReluInPlace(FV x, FV y, long count)
+    {
+        _addRelu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(AddReluImpl);
+        _addRelu((int)count, x, y);
+    }
+    private Action<Index1D, FV, float>? _taesdIn;
+    private static void TaesdInImpl(Index1D i, FV x, float scale) => x[i] = MathF.Tanh(x[i] * scale / 3f) * 3f;
+    public void TaesdIn(FV x, long count, float scale)
+    {
+        _taesdIn ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, float>(TaesdInImpl);
+        _taesdIn((int)count, x, scale);
+    }
+    private Action<Index1D, FV, float, float>? _affine;
+    private static void AffineImpl(Index1D i, FV x, float a, float b) => x[i] = a * x[i] + b;
+    public void Affine(FV x, long count, float a, float b)
+    {
+        _affine ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, float, float>(AffineImpl);
+        _affine((int)count, x, a, b);
+    }
+
+    // x += a * y (the ControlNet residuals, times their strength)
+    private Action<Index1D, FV, FV, float>? _axpy;
+    private static void AxpyImpl(Index1D i, FV x, FV y, float a) => x[i] = x[i] + a * y[i];
+    public void AxpyInPlace(FV x, FV y, float a, long count)
+    {
+        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
+        _axpy((int)count, x, y, a);
+    }
+
     // x += y (elementwise)
     private Action<Index1D, FV, FV>? _addInPlace;
     private static void AddInPlaceImpl(Index1D i, FV x, FV y) => x[i] = x[i] + y[i];

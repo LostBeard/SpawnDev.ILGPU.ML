@@ -281,6 +281,136 @@ public abstract partial class MLTestBase
         return string.Join("; ", report);
     });
 
+    /// <summary>
+    /// Standalone components (Lore's 10-25 asks): a UNet loaded ALONE (SdUNet.LoadAsync on a whole checkpoint takes only its UNet) infers its prediction type
+    /// (SD 2.1 768-v = V, SD 2.1 base = epsilon), and LoRA merges into a standalone UNet (LCM-LoRA x0.8 vs the reference, then removed bit-identically).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd_StandaloneComponents_PredictionAndLora() => await RunTest(async accelerator =>
+    {
+        RequireSdFile(accelerator, Sd15File);
+        FileStream Open(string f) => new(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        var report = new List<string>();
+        foreach (var (file, want) in new[] { (Sd21vFile, SdPrediction.V), (Sd21BaseFile, SdPrediction.Epsilon) })
+        {
+            var path = Path.Combine(SdDir, file);
+            if (!File.Exists(path)) throw new UnsupportedTestException($"{file} not found");
+            await using var s = Open(path);
+            using var u = await SdUNet.LoadAsync(accelerator, s, file);
+            var got = await u.InferPredictionAsync();
+            report.Add($"{file} alone: {u.Family}, {got}");
+            if (got != want || u.Family != SdFamily.SD2) throw new Exception($"{file}: inferred {u.Family} / {got}, want SD2 / {want}");
+        }
+        var loraPath = Path.Combine(SdDir, "lora", "lcm-lora-sdv1-5.safetensors");
+        var fxLora = Path.Combine(SdDir, "ref", "sd_sd15lcm_small_f16s.npz");
+        if (!File.Exists(loraPath) || !File.Exists(fxLora)) throw new UnsupportedTestException("LoRA fixtures not found");
+        await using var us = Open(Path.Combine(SdDir, Sd15File));
+        using var unet = await SdUNet.LoadAsync(accelerator, us, Sd15File);
+        using var fx = ZipFile.OpenRead(fxLora);
+        var (lat, ls) = WanNpz(fx, "latent"); var (ctx, cs) = WanNpz(fx, "ctx"); var t = WanNpz(fx, "timestep").Data[0];
+        var plain = await unet.ForwardAsync(lat, ls[1], ls[2], t, ctx, cs[0]);
+        var rep = await unet.ApplyLorasAsync(new[] { new SdLoraSpec(ct => Task.FromResult<Stream>(Open(loraPath)), "lcm", 0.8f) });
+        var withLora = await unet.ForwardAsync(lat, ls[1], ls[2], t, ctx, cs[0]);
+        var m = WanCompare(withLora, WanNpz(fx, "eps").Data);
+        await unet.ApplyLorasAsync(Array.Empty<SdLoraSpec>());
+        var back = await unet.ForwardAsync(lat, ls[1], ls[2], t, ctx, cs[0]);
+        bool identical = plain.AsSpan().SequenceEqual(back);
+        report.Add($"standalone SD 1.5 UNet + LCM-LoRA x0.8: {rep.Loras[0].Patched} modules, {rep.Loras[0].Unmatched.Count} unmatched, eps vs reference {m.RelRms:E2}, removed: {(identical ? "bit-identical" : "DIFFERENT")}");
+        SdLog("standalone components", report);
+        if (!(m.RelRms < 2e-2 && rep.Loras[0].Patched == 278 && rep.Loras[0].Unmatched.Count == 0 && identical)) throw new Exception("standalone LoRA failed: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// TAESD / TAESDXL (SdTaesd: the original <c>taesd_decoder / taesd_encoder.safetensors</c>, and the diffusers AutoencoderTiny file with both halves) against diffusers'
+    /// AutoencoderTiny: decode of an unscaled latent to [-1, 1] and encode back to the unscaled latent, as SdVae does. Files in SD_DIR\taesd, fixtures from
+    /// tools/sd-harness/reference/ref_taesd_dump.py.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Sd_Taesd_MatchesReference() => await RunTest(async accelerator =>
+    {
+        RequireSdFile(accelerator, Sd15File);
+        string dir = Path.Combine(SdDir, "taesd");
+        FileStream Open(string f) => new(Path.Combine(dir, f), FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        var report = new List<string>();
+        double worst = 0;
+        foreach (var (label, dec, enc, scale, tag) in new (string, string, string?, float, string)[]
+        {
+            ("TAESD (original files)", "taesd_decoder.safetensors", "taesd_encoder.safetensors", 0.18215f, "taesd"),
+            ("TAESD (diffusers file)", Path.Combine("diffusers", "diffusion_pytorch_model.safetensors"), null, 0.18215f, "taesd"),
+            // the published taesdxl_decoder.safetensors is NOT the diffusers TAESDXL decoder (same encoder): each has its own reference
+            ("TAESDXL (original files)", "taesdxl_decoder.safetensors", "taesdxl_encoder.safetensors", 0.13025f, "taesdxl_orig"),
+            ("TAESDXL (diffusers file)", Path.Combine("diffusers_xl", "diffusion_pytorch_model.safetensors"), null, 0.13025f, "taesdxl"),
+        })
+        {
+            var fxPath = Path.Combine(SdDir, "ref", $"taesd_{tag}.npz");
+            if (!File.Exists(Path.Combine(dir, dec)) || !File.Exists(fxPath)) throw new UnsupportedTestException($"TAESD files not found in {dir}");
+            await using var ds = Open(dec);
+            await using var es = enc != null ? Open(enc) : null;
+            using var t = await SdTaesd.LoadAsync(accelerator, ds, dec, es, enc, scale);
+            using var fx = ZipFile.OpenRead(fxPath);
+            var (z, zs) = WanNpz(fx, "dec_in");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var img = await t.DecodeAsync(z, zs[1], zs[2]);
+            double ms = sw.Elapsed.TotalMilliseconds;
+            var md = WanCompare(img, WanNpz(fx, "image").Data);
+            var (im, ims) = WanNpz(fx, "enc_image");
+            var lat = await t.EncodeAsync(im, ims[1], ims[2]);
+            var me = WanCompare(lat, WanNpz(fx, "enc_out").Data);
+            report.Add($"{label}: decode {zs[2] * 8}x{zs[1] * 8} relRMS {md.RelRms:E2} ({ms:F0} ms first call), encode relRMS {me.RelRms:E2}");
+            worst = Math.Max(worst, Math.Max(md.RelRms, me.RelRms));
+        }
+        SdLog("TAESD", report);
+        if (!(worst < 2e-2)) throw new Exception("TAESD deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// SD 1.5 ControlNet (ComfyUI's single file <c>control_v11p_sd15_canny_fp16.safetensors</c>) against diffusers' ControlNetModel.from_single_file: the 13 residuals for a
+    /// line-drawing hint, then the UNet with them at strength 0.8. Fixture from tools/sd-harness/reference/ref_sd_control.py; files in SD_DIR\controlnet.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_ControlNet_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var ckPath = RequireSdFile(accelerator, Sd15File);
+        var cnPath = Path.Combine(SdDir, "controlnet", "control_v11p_sd15_canny_fp16.safetensors");
+        var fxPath = Path.Combine(SdDir, "ref", "control_canny_small.npz");
+        if (!File.Exists(cnPath) || !File.Exists(fxPath)) throw new UnsupportedTestException("ControlNet files not found");
+        using var ck = await SdLoad(accelerator, ckPath, new SdCheckpointOptions { LoadTextEncoder = false, LoadVae = false });
+        await using var cs = new FileStream(cnPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        using var cn = await SdControlNet.LoadAsync(accelerator, cs, "canny");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (lat, ls) = WanNpz(fx, "latent"); var (ctx, ctxs) = WanNpz(fx, "ctx"); var t = WanNpz(fx, "timestep").Data[0];
+        var hint = WanNpz(fx, "hint").Data; float scale = WanNpz(fx, "scale").Data[0];
+        int h = ls[1], w = ls[2];
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var res = await cn.RunAsync(lat, h, w, t, ctx, ctxs[0], hint);
+        await accelerator.SynchronizeAsync();
+        double cnMs = sw.Elapsed.TotalMilliseconds;
+        var report = new List<string>();
+        double worstRes = 0;
+        if (res.Count != 13) throw new Exception($"{res.Count} residuals, SD 1.5 takes 13");
+        var line = new List<string>();
+        for (int i = 0; i < res.Count; i++)
+        {
+            var (want, wsh) = WanNpz(fx, $"res_{i}");
+            int C = wsh[0], HW = wsh[1] * wsh[2];
+            var got = await res[i].SubView(0, (long)C * HW).CopyToHostAsync();
+            var m = SdCompareTap(got, want, C, HW);
+            line.Add($"{i}:{m.RelRms:E1}");
+            worstRes = Math.Max(worstRes, m.RelRms);
+        }
+        report.Add($"residuals ({cnMs:F0} ms first call): {string.Join(" ", line)}");
+        res.Strength = scale;
+        var eps = await ck.UNet!.ForwardAsync(lat, h, w, t, ctx, ctxs[0], null, new[] { res });
+        var me = WanCompare(eps, WanNpz(fx, "eps_control").Data);
+        var plainVsControl = WanCompare(WanNpz(fx, "eps_plain").Data, WanNpz(fx, "eps_control").Data).RelRms;
+        report.Add($"UNet + ControlNet x{scale}: eps relRMS {me.RelRms:E2} (the plain UNet is {plainVsControl:E2} away)");
+        SdLog("SD1.5 ControlNet", report);
+        if (!(worstRes < 2e-2 && me.RelRms < 2e-2 && plainVsControl > 10 * me.RelRms)) throw new Exception("the ControlNet deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
     private static readonly string[] SdTapNames = { "conv_in", "down_0", "down_1", "down_2", "down_3", "mid", "up_0", "up_1", "up_2", "up_3" };
 
     private async Task<string> SdUNetCheck(Accelerator accelerator, string file, SdPrediction prediction, string[] tags, double bound)

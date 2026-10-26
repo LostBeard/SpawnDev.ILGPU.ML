@@ -25,6 +25,40 @@ public sealed record SdxlConditioning(float[] Pooled, int OriginalHeight, int Or
 public sealed partial class SdUNet : IDisposable
 {
     private bool _ownsWeights;            // loaded alone (LoadAsync): Dispose frees the weights too
+    internal bool VPredTensor;            // the file carried a "v_pred" tensor (ComfyUI's marker of a v-prediction fine-tune)
+    private SdLoraMerger? _lora;
+
+    /// <summary>The model family by its context width (768 SD 1.x, 1024 SD 2.x, 2048 SDXL).</summary>
+    public SdFamily Family => ContextDim switch { 768 => SdFamily.SD1, 1024 => SdFamily.SD2, _ => SdFamily.SDXL };
+
+    /// <summary>
+    /// What this UNet predicts, by ComfyUI's rules: a <c>v_pred</c> tensor in the file means V; an SD 2.x UNet is V when the spread of one late layer-norm bias
+    /// (<c>output_blocks.11.1.transformer_blocks.0.norm1.bias</c>) is above 0.09 (the 768-v models); anything else is epsilon. Reads 320 numbers back from the device.
+    /// </summary>
+    public async Task<SdPrediction> InferPredictionAsync()
+    {
+        if (VPredTensor) return SdPrediction.V;
+        if (Family != SdFamily.SD2) return SdPrediction.Epsilon;
+        const string key = "output_blocks.11.1.transformer_blocks.0.norm1.bias";
+        if (!_w.Has(key)) return SdPrediction.Epsilon;
+        var hv = _w[key];
+        using var f = _acc.Allocate1D<float>(hv.Length);
+        _k.HalfToFloat(hv, f.View);
+        await _acc.SynchronizeAsync();
+        var v = await f.View.CopyToHostAsync();
+        double mean = v.Average(x => (double)x), var = v.Average(x => (x - mean) * (x - mean));
+        return Math.Sqrt(var) > 0.09 ? SdPrediction.V : SdPrediction.Epsilon;
+    }
+
+    /// <summary>
+    /// Merge LoRAs into this UNet (their UNet modules at <see cref="SdLoraSpec.Strength"/>; text-encoder keys are ignored here and reported unmatched), replacing any set
+    /// merged before: the originals of patched tensors are kept on the device, so this restores them first (an empty list removes every LoRA).
+    /// </summary>
+    public Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
+    {
+        _lora ??= new SdLoraMerger(_acc, _w, null, Family);
+        return _lora.ApplyAsync(loras, cancellationToken);
+    }
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -65,7 +99,7 @@ public sealed partial class SdUNet : IDisposable
         _acc = accelerator; _w = weights; _k = new SdKernels(accelerator); _dk = new DiTKernels(accelerator);
         var convIn = weights.Shape("input_blocks.0.0.weight");
         ModelChannels = convIn[0]; InChannels = convIn[1];
-        OutChannels = weights.Shape("out.2.weight")[0];
+        OutChannels = weights.Has("out.2.weight") ? weights.Shape("out.2.weight")[0] : 0;      // 0: the encoder half only (a ControlNet's copy)
         _timeDim = weights.Shape("time_embed.0.weight")[0];
         IsXL = weights.Has("label_emb.0.0.weight");
         _admDim = IsXL ? weights.Shape("label_emb.0.0.weight")[1] : 0;
@@ -258,9 +292,27 @@ public sealed partial class SdUNet : IDisposable
     /// <paramref name="context"/> [contextRows, ContextDim] row-major (the text encoder output; any number of rows: ComfyUI concatenates 77-token chunks for long prompts),
     /// <paramref name="y"/> SDXL's label vector [adm] (<see cref="SdxlLabel"/>) or null, <paramref name="output"/> [outChannels, h, w].
     /// </summary>
-    public async Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, CancellationToken cancellationToken = default)
+    public Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, CancellationToken cancellationToken = default)
+        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, null, default, null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="ForwardAsync(FV, int, int, double, FV, int, FV?, FV, CancellationToken)"/> with ControlNet residuals (<see cref="SdControlNet.RunAsync(FV, int, int, double, FV, int, FV, FV?, CancellationToken)"/>):
+    /// each set, times its strength, is added to the skip connections and the middle block's output (several ControlNets add up, as ComfyUI chains them).
+    /// </summary>
+    public Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, IReadOnlyList<SdControlResiduals>? controls,
+        CancellationToken cancellationToken = default)
+        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, controls, default, null, cancellationToken);
+
+    /// <summary>
+    /// The core: the input blocks, the middle block, then (unless <paramref name="encoderOut"/> is given: the ControlNet's encoder pass) the output blocks and the head.
+    /// <paramref name="hint"/> (channel-last [h*w, ModelChannels]) is added to conv_in's output; <paramref name="encoderOut"/> sees (index, output, H, W, C) of conv_in, every input
+    /// block and the middle block, in that order.
+    /// </summary>
+    internal async Task RunAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, IReadOnlyList<SdControlResiduals>? controls,
+        FV? hint, Action<int, FV, int, int, int>? encoderOut, CancellationToken cancellationToken)
     {
         if (h % 8 != 0 || w % 8 != 0) throw new ArgumentException("the latent sides must be multiples of 8");
+        if (encoderOut == null && OutChannels == 0) throw new InvalidOperationException("this UNet holds the encoder half only (a ControlNet's): it cannot predict");
         if (IsXL != y.HasValue) throw new ArgumentException(IsXL ? "an SDXL UNet needs the label vector (pooled text + size ids)" : "only an SDXL UNet takes a label vector");
         int mc = ModelChannels, rows0 = h * w;
         // the largest activation: a level's pixels x the widest concatenated input of that level (output blocks read h | skip)
@@ -298,8 +350,10 @@ public sealed partial class SdUNet : IDisposable
         var skips = new List<(FV View, int H, int W, int C)>();
         var s0 = Slot(SlotSkip, (long)rows0 * mc);
         _k.Conv(xin, Table(h, w, h, w, 3, 1, 1, 1), _w["input_blocks.0.0.weight"], _w["input_blocks.0.0.bias"], s0, rows0, InChannels, mc, 9);
+        if (hint.HasValue) _k.AddInPlace(s0, hint.Value, (long)rows0 * mc);
         skips.Add((s0, h, w, mc));
         Tap?.Invoke("conv_in", s0, h, w, mc);
+        encoderOut?.Invoke(0, s0, h, w, mc);
 
         int Hc = h, Wc = w, Cc = mc;
         var cur = s0;
@@ -312,6 +366,7 @@ public sealed partial class SdUNet : IDisposable
             var dst = Slot(SlotSkip + 1 + i, (long)oh * ow * oc);
             (cur, Hc, Wc, Cc) = RunBlock(mods, cur, dst, embAct, context, contextRows, Hc, Wc, Cc, maxElems);
             skips.Add((cur, Hc, Wc, Cc));
+            encoderOut?.Invoke(i + 1, cur, Hc, Wc, Cc);
             bool levelEnd = mods.Any(m => m.Kind == Kind.Down) || i == _input.Count - 1;
             if (levelEnd) { Tap?.Invoke($"down_{level}", cur, Hc, Wc, Cc); level++; }
             if (_acc.IsBrowser()) await _acc.SynchronizeAsync();
@@ -320,6 +375,13 @@ public sealed partial class SdUNet : IDisposable
 
         (cur, Hc, Wc, Cc) = RunBlock(_middle, cur, null, embAct, context, contextRows, Hc, Wc, Cc, maxElems);
         Tap?.Invoke("mid", cur, Hc, Wc, Cc);
+        if (encoderOut != null) { encoderOut(_input.Count + 1, cur, Hc, Wc, Cc); return; }
+        if (controls != null)
+            foreach (var c in controls)
+            {
+                if (c.Count != skips.Count + 1) throw new ArgumentException($"a ControlNet gave {c.Count} residuals, this UNet takes {skips.Count + 1}");
+                _k.AxpyInPlace(cur, c[skips.Count], c.Strength, (long)Hc * Wc * Cc);
+            }
         if (_acc.IsBrowser()) await _acc.SynchronizeAsync();
 
         level = 0;
@@ -327,6 +389,8 @@ public sealed partial class SdUNet : IDisposable
         {
             var (sv, sh, sw, sc) = skips[^1];
             skips.RemoveAt(skips.Count - 1);
+            if (controls != null)
+                foreach (var c in controls) _k.AxpyInPlace(sv, c[skips.Count], c.Strength, (long)sh * sw * sc);     // the skip this block concatenates + strength x residual
             if (sh != Hc || sw != Wc) throw new InvalidOperationException($"skip {sh}x{sw} does not meet {Hc}x{Wc} (latent sides must be multiples of 8)");
             var cat = PickFree(cur, maxElems).SubView(0, (long)Hc * Wc * (Cc + sc));
             _k.ConcatChannels(cur, sv, cat, Hc * Wc, Cc, sc);
@@ -353,6 +417,11 @@ public sealed partial class SdUNet : IDisposable
     /// SDXL needs <paramref name="xl"/>.
     /// </summary>
     public async Task<float[]> ForwardAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl = null, CancellationToken cancellationToken = default)
+        => await ForwardAsync(latent, h, w, timestep, context, contextRows, xl, null, cancellationToken);
+
+    /// <summary>The host-array prediction with ControlNet residuals (see the device overload).</summary>
+    public async Task<float[]> ForwardAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl,
+        IReadOnlyList<SdControlResiduals>? controls, CancellationToken cancellationToken = default)
     {
         if (latent.Length != (long)InChannels * h * w) throw new ArgumentException($"the latent must be [{InChannels}, {h}, {w}]");
         if (context.Length != (long)contextRows * ContextDim) throw new ArgumentException($"the context must be [{contextRows}, {ContextDim}]");
@@ -365,7 +434,7 @@ public sealed partial class SdUNet : IDisposable
             var yv = Slot(SlotY, _admDim); yv.CopyFromCPU(SdxlLabel(xl, _admDim)); y = yv;
         }
         var o = Slot(SlotHostOut, (long)OutChannels * h * w);
-        await ForwardAsync(lat, h, w, timestep, ctx, contextRows, y, o, cancellationToken);
+        await RunAsync(lat, h, w, timestep, ctx, contextRows, y, o, controls, null, null, cancellationToken);
         await _acc.SynchronizeAsync();
         return await o.CopyToHostAsync();
     }
@@ -390,6 +459,7 @@ public sealed partial class SdUNet : IDisposable
         _retired.Clear();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
+        _lora?.Dispose();
         if (_ownsWeights) _w.Dispose();
     }
 }

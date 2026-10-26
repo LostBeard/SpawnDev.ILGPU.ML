@@ -70,7 +70,29 @@ using var vae = await SdVae.LoadAsync(accelerator, source, repo, "sdxl_vae.safet
 using var clip = await SdTextEncoder.LoadAsync(accelerator, source, repo, "clip_l.safetensors"); // one tower: CLIP-L (SD 1.x) or OpenCLIP-H (SD 2.x), HF or OpenCLIP names
 using var dual = await SdTextEncoder.LoadSdxlAsync(accelerator, source, repo, "clip_l.safetensors", "clip_g.safetensors");  // SDXL
 ```
-A component loaded alone owns its weights (`Dispose` frees them).
+A component loaded alone owns its weights (`Dispose` frees them). `unet.InferPredictionAsync()` gives its prediction type (ComfyUI's rules) and
+`unet.ApplyLorasAsync(...)` / `clip.ApplyLorasAsync(...)` merge LoRAs into standalone components (the checkpoint's `ApplyLorasAsync` delegates to both).
+
+## TAESD (tiny previews)
+
+```csharp
+using var taesd = await SdTaesd.LoadAsync(accelerator, source, repo, "taesd_decoder.safetensors", "taesd_encoder.safetensors", latentScale: 0.18215f);  // taesdxl: 0.13025
+float[] preview = await taesd.DecodeAsync(latent.Select(v => v / 0.18215f).ToArray(), h, w);   // same UNSCALED latents and [-1, 1] pictures as SdVae
+```
+madebyollin's tiny autoencoder (about 1 M parameters): ComfyUI's live-preview decoder and its VAELoader "taesd" / "taesdxl" entries. Reads the original
+`taesd_decoder / taesd_encoder` files, ComfyUI's prefixed form and the diffusers AutoencoderTiny file. The published `taesdxl_decoder.safetensors` is a different
+(newer) decoder than the diffusers TAESDXL file, so their pictures differ; both load.
+
+## ControlNet (SD 1.x)
+
+```csharp
+using var cn = await SdControlNet.LoadAsync(accelerator, source, repo, "control_v11p_sd15_canny_fp16.safetensors");
+var res = await cn.RunAsync(latent, h, w, timestep, te.Context, te.Rows, hint /* [3, 8h, 8w] in [0, 1] */);
+res.Strength = 0.8f;
+float[] eps = await ck.UNet!.ForwardAsync(latent, h, w, timestep, te.Context, te.Rows, null, new[] { res });   // several ControlNets add up
+```
+The single-file ControlNet v1.0 / v1.1 layout (`control_model.*`) ComfyUI uses: the UNet encoder copy, the hint encoder and the zero convolutions, 13 residuals
+for the skip connections and the middle block, kept on the device.
 
 ## How it is checked
 
@@ -85,7 +107,10 @@ math on fp16-rounded weights), every gate red-checked. RTX 4070:
 | SD 2.1 768-v UNet 768 | 4.0e-4 | 2.6e-6 | |
 | VAE decode 512 / 1024 | 1.1e-5 / 2.2e-4 | 4.8e-6 | 4.8e-6 |
 | LCM-LoRA SD 1.5 x0.8 | 1.6e-3 | 1.2e-4 | |
+| ControlNet canny SD 1.5 (13 residuals / eps x0.8) | 8.3e-4 / 4.5e-4 | | |
+| TAESD / TAESDXL decode (encode) | 1.2e-3 (9e-4) / 1.5e-3 (3.6e-3), ~30 ms at 512 | | |
 
 SpawnGen (Lore) compared it with ComfyUI's own renders on an RX 590: SD 1.5 0.19 % rms, SDXL 1024 0.0001, SD-Turbo 0.0000-0.0002, LCM-LoRA 0.27 %.
 
-Not yet: ControlNet, TAESD, the SDXL refiner, SDXL in the browser at 1024 (the VAE decode needs a tiled path on small cards).
+Not yet: SDXL ControlNets, diffusers-format ControlNets, Control-LoRA, the SDXL refiner, a tiled VAE decode for small cards (SDXL 1024 in the browser fits an
+8 GB RX 590, SpawnGen measured).

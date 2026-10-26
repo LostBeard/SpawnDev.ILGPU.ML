@@ -49,6 +49,9 @@ internal static class SdComponentFile
 
 public sealed partial class SdUNet
 {
+    private static readonly string[] LdmRoots = { "input_blocks.", "middle_block.", "output_blocks.", "time_embed.", "label_emb.", "out." };
+    private static bool IsLdmUNetName(string n) => LdmRoots.Any(r => n.StartsWith(r, StringComparison.Ordinal));
+
     /// <summary>
     /// Load a UNet-only file (ComfyUI's UNETLoader, models/diffusion_models): LDM names with or without <c>model.diffusion_model.</c>, or diffusers names (a diffusers
     /// <c>unet/diffusion_pytorch_model.safetensors</c>, with or without <c>unet.</c>). The returned UNet owns its weights.
@@ -62,25 +65,27 @@ public sealed partial class SdUNet
     /// <summary>Load a UNet-only file from a stream (read once, front to back).</summary>
     public static async Task<SdUNet> LoadAsync(Accelerator accelerator, Stream stream, string name, Action<string, double>? onProgress = null, CancellationToken cancellationToken = default)
     {
+        bool vPred = false;
         var w = await SdComponentFile.LoadAsync(accelerator, stream, name, tensors =>
         {
+            vPred = tensors.Any(t => t.Name == "v_pred");
             var names = tensors.Select(t => SdComponentFile.StripPrefix(t.Name, "model.diffusion_model.", "diffusion_model.", "unet.")).ToHashSet();
             bool diffusers = names.Any(n => n.StartsWith("down_blocks.", StringComparison.Ordinal));
+            // a whole checkpoint passed to the UNet loader holds other models (and bookkeeping such as model_ema.num_updates, an I32): only its UNet is claimed
+            bool prefixed = tensors.Any(t => t.Name.StartsWith("model.diffusion_model.", StringComparison.Ordinal));
             return n =>
             {
-                if (!n.StartsWith("model.diffusion_model.", StringComparison.Ordinal) && !n.StartsWith("diffusion_model.", StringComparison.Ordinal) && !n.StartsWith("unet.", StringComparison.Ordinal)
-                    && (n.StartsWith("first_stage_model.", StringComparison.Ordinal) || n.StartsWith("cond_stage_model.", StringComparison.Ordinal) || n.StartsWith("conditioner.", StringComparison.Ordinal)))
-                    return null;                                          // a whole checkpoint passed to the UNet loader: only its UNet
+                if (prefixed && !n.StartsWith("model.diffusion_model.", StringComparison.Ordinal)) return null;
                 var s = SdComponentFile.StripPrefix(n, "model.diffusion_model.", "diffusion_model.", "unet.");
-                var local = diffusers ? SdNames.DiffusersToLdmUNet(s, i => names.Any(x => x.StartsWith($"up_blocks.{i}.attentions.", StringComparison.Ordinal))) : s;
-                return local == null ? null : (local, SdLayout.ConvGather);
+                if (diffusers) return SdNames.DiffusersToLdmUNet(s, i => names.Any(x => x.StartsWith($"up_blocks.{i}.attentions.", StringComparison.Ordinal))) is { } d ? (d, SdLayout.ConvGather) : null;
+                return IsLdmUNetName(s) ? (s, SdLayout.ConvGather) : null;
             };
         }, null, onProgress, cancellationToken);
         try
         {
             if (!w.Has("input_blocks.0.0.weight")) throw new InvalidDataException($"'{name}': no UNet tensors (conv_in / input_blocks.0.0) in this file");
             await SdNames.FuseUNetAsync(accelerator, w);
-            return new SdUNet(accelerator, w) { _ownsWeights = true };
+            return new SdUNet(accelerator, w) { _ownsWeights = true, VPredTensor = vPred };
         }
         catch { w.Dispose(); throw; }
     }
