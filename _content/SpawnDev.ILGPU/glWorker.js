@@ -2,6 +2,9 @@
 let gl = null;
 let canvas = null;
 const programCache = {};
+// programId -> the compile or link error of a program that failed. The accelerator sends a program's source and
+// varying names with its FIRST dispatch only, so a later dispatch of a failed program must repeat that error.
+const failedPrograms = {};
 
 // ---- GPU-resident buffer registry ----
 // Maps bufferId → { texture, width, height, glslType, byteSize, data: Uint8Array }
@@ -47,6 +50,17 @@ self.onmessage = function (e) {
             });
             canvas.addEventListener('webglcontextrestored', function () {
                 gl = canvas.getContext('webgl2');
+                // programs and the cached GL objects belonged to the lost context; the accelerator re-sends sources
+                for (const id in programCache) delete programCache[id];
+                for (const id in failedPrograms) delete failedPrograms[id];
+                for (const t in scatterPrograms) delete scatterPrograms[t];
+                scatterFBO = null;
+                cachedTFBuffer = null;
+                cachedTFBufferSize = 0;
+                cachedTFObject = null;
+                cachedDummyVBO = null;
+                cachedDummyVBOSize = 0;
+                cachedDummyVAO = null;
                 self.postMessage({ type: 'contextrestored' });
             });
             break;
@@ -374,11 +388,26 @@ function handleCopyBuffer(msg) {
 
 // ---- Shader Compilation ----
 
+// source / varyingNames are null after a program's first dispatch: the cached entry (or the cached error) answers.
 function getOrCompileProgram(programId, source, varyingNames) {
     const cached = programCache[programId];
-    if (cached && !cached.disposed && cached.source === source) {
+    if (cached && !cached.disposed && (source == null || cached.source === source)) {
         return cached;
     }
+    if (source == null) {
+        if (programId in failedPrograms) throw new Error(failedPrograms[programId]);
+        throw new Error('GL worker: program ' + programId + ' is not compiled and its source was not sent');
+    }
+    try {
+        return compileProgram(programId, source, varyingNames || []);
+    } catch (e) {
+        failedPrograms[programId] = e.message;
+        throw e;
+    }
+}
+
+function compileProgram(programId, source, varyingNames) {
+    const cached = programCache[programId];
     if (cached && !cached.disposed) {
         gl.deleteProgram(cached.program);
         gl.deleteShader(cached.vs);
@@ -423,7 +452,7 @@ function getOrCompileProgram(programId, source, varyingNames) {
         throw new Error('Program link error: ' + log);
     }
 
-    const entry = { program, vs, fs, uniformCache: {}, disposed: false, source };
+    const entry = { program, vs, fs, uniformCache: {}, disposed: false, source, varyingNames };
     programCache[programId] = entry;
     return entry;
 }
@@ -445,7 +474,7 @@ function dispatchKernel(msg) {
     while (gl.getError() !== 0) { }
 
     // ---- Step 1: Get or compile program ----
-    const cached = getOrCompileProgram(programId, source, varyingNames || []);
+    const cached = getOrCompileProgram(programId, source, varyingNames);
     gl.useProgram(cached.program);
 
     // ---- ANGLE f64 workaround: set u_one = 1.0 ----
@@ -581,7 +610,8 @@ function dispatchKernel(msg) {
     // ---- Step 4: Transform Feedback setup ----
     let tfBuffer = null;
     let transformFeedback = null;
-    const vNames = varyingNames || [];
+    // from the program cache: the message carries varying names with the program's first dispatch only
+    const vNames = cached.varyingNames || [];
 
     if (vNames.length > 0) {
         const tfFloatCount = totalVertices * vNames.length;
@@ -637,6 +667,10 @@ function dispatchKernel(msg) {
     }
 
     // ---- Step 6: TF Readback → update GPU-resident buffers ----
+    // A readback that refuses the dispatch (a store site with two elements, an address out of bounds) must still
+    // finish the GL state below: the error used to skip it, the TF buffer stayed bound, and the NEXT dispatch read this
+    // dispatch's records (StoreAddress_OffSlotStore after StoreAddress_OneSiteManyElements).
+    let readbackError = null;
     if (tfBuffer && vNames.length > 0 && outputs && outputs.length > 0) {
         // gl.finish() blocks until all submitted GL commands (including TF) complete.
         // Note: ANGLE emits a cosmetic "READ-usage buffer" warning here because it
@@ -663,6 +697,34 @@ function dispatchKernel(msg) {
         // Set of bufferIds that were modified (need texture re-upload)
         const modifiedBufferIds = new Set();
 
+        // The element vertex v's store of output `out` targets, or -1 when that store site did not store in v. A store
+        // site's value lands at its group base + siteConst (GLSLKernelFunctionGenerator.EmitStoreAddressVaryings); a
+        // varying without a base (baseIndex < 0) is the vertex's own element (slot within a positional record).
+        // Plans/webgl-store-addresses-2026-10-26.md: before this every value landed at the vertex's own element.
+        const int32All = new Int32Array(readbackBytes.buffer);
+        const strideWords = varyingCount;
+        // Elements a dispatch does not store keep the values in the CPU mirror, which is then re-uploaded whole: a
+        // mirror a scatter left stale must be read back first, or that upload would revert the scatter's results.
+        for (let oi = 0; oi < outputs.length; oi++) {
+            if (!outputs[oi].isAtomicVote) ensureCpuFresh(bufferRegistry[outputs[oi].bufferId]);
+        }
+        function storeElement(out, v, elemCount) {
+            if (out.baseIndex < 0) {
+                const own = v * (out.storeCount || 1) + (out.storeSlot >= 0 ? out.storeSlot : 0);
+                return own < elemCount ? own : -1;
+            }
+            if ((int32All[v * strideWords + out.maskIndex] & out.maskBit) === 0) return -1;
+            const base = int32All[v * strideWords + out.baseIndex];
+            if (base === -2)
+                throw new Error('WebGL: a store site of output ' + out.varyingName + ' wrote two different elements in one thread (vertex ' + v +
+                    '). Transform feedback captures one element per store site per thread; a kernel that scatters several elements from one store needs WebGPU/Wasm/desktop (AcceleratorRequirements.RequiresScatterStores).');
+            const e = base + out.siteConst;
+            if (e < 0 || e >= elemCount)
+                throw new Error('WebGL: output ' + out.varyingName + ' stored element ' + e + ' outside its view of ' + elemCount + ' elements (vertex ' + v + ')');
+            return e;
+        }
+
+        try {
         for (let oi = 0; oi < outputs.length; oi++) {
             const out = outputs[oi];
 
@@ -726,11 +788,13 @@ function dispatchKernel(msg) {
                 const structElemSize = fieldsInOrder[0].structByteSize;
                 const fieldByteOffsets = fieldsInOrder.map(o => o.fieldByteOffset);
 
-                const elemCount = Math.min(totalVertices, Math.floor(out.writeLengthBytes / structElemSize));
-                for (let v = 0; v < elemCount; v++) {
+                const viewElems = Math.floor(out.writeLengthBytes / structElemSize);
+                for (let v = 0; v < totalVertices; v++) {
+                    const e = storeElement(fieldsInOrder[0], v, viewElems);
+                    if (e < 0) continue;
                     for (let fi = 0; fi < fieldsInOrder.length; fi++) {
                         const fieldOut = fieldsInOrder[fi];
-                        const dstOff = writeOffset + v * structElemSize + fieldByteOffsets[fi];
+                        const dstOff = writeOffset + e * structElemSize + fieldByteOffsets[fi];
                         const srcOff = v * strideBytes + fieldOut.outputIndex * 4;
                         if (srcOff + 4 > readbackBytes.length) continue;
                         const loBytes = Math.min(fieldByteWidths[fi], 4);
@@ -755,15 +819,14 @@ function dispatchKernel(msg) {
                 // 8 bytes, so only the LAST store's value ever reached the host, discovered and
                 // fixed 2026-09-22 with a minimal repro that reproduced it standalone, no ref
                 // params or fn-def calls needed at all).
-                const emuStoreCount = out.storeCount || 1;
-                const emuSlot = out.storeSlot >= 0 ? out.storeSlot : 0;
-                const emuBytesPerVertex = emuStoreCount * 8;
                 const hiOutIdx = out.outputIndex + 1;
-                const elemCount = Math.min(totalVertices, Math.floor(out.writeLengthBytes / emuBytesPerVertex));
-                for (let v = 0; v < elemCount; v++) {
+                const viewElems = Math.floor(out.writeLengthBytes / 8);
+                for (let v = 0; v < totalVertices; v++) {
+                    const e = storeElement(out, v, viewElems);
+                    if (e < 0) continue;
                     const loSrc = v * strideBytes + out.outputIndex * 4;
                     const hiSrc = v * strideBytes + hiOutIdx * 4;
-                    const dst = writeOffset + v * emuBytesPerVertex + emuSlot * 8;
+                    const dst = writeOffset + e * 8;
                     destView[dst] = readbackBytes[loSrc];
                     destView[dst + 1] = readbackBytes[loSrc + 1];
                     destView[dst + 2] = readbackBytes[loSrc + 2];
@@ -774,21 +837,19 @@ function dispatchKernel(msg) {
                     destView[dst + 7] = readbackBytes[hiSrc + 3];
                 }
             } else if (out.fieldIndex < 0) {
-                const storeCount = out.storeCount || 1;
-                const storeSlot = out.storeSlot >= 0 ? out.storeSlot : 0;
-                const bytesPerVertex = storeCount * 4;
 
                 // Sub-word packing: TF outputs one i32 per element, but the destination
                 // buffer stores packed sub-word values (e.g. 2 shorts per i32).
                 // Pack by reading each TF i32 and writing only the sub-word portion.
                 if (out.subWordElementSize && out.subWordElementSize < 4) {
                     const swSize = out.subWordElementSize;
-                    const elemCount = Math.min(totalVertices, Math.floor(out.writeLengthBytes / swSize));
-                    const int32TF = new Int32Array(readbackFloat.buffer);
-                    for (let v = 0; v < elemCount; v++) {
+                    const viewElems = Math.floor(out.writeLengthBytes / swSize);
+                    for (let v = 0; v < totalVertices; v++) {
+                        const e = storeElement(out, v, viewElems);
+                        if (e < 0) continue;
                         const srcIdx = (v * strideBytes + out.outputIndex * 4) >> 2;
-                        const val = int32TF[srcIdx];
-                        const dstOff = writeOffset + v * swSize;
+                        const val = int32All[srcIdx];
+                        const dstOff = writeOffset + e * swSize;
                         if (swSize === 2) {
                             // Pack as 16-bit (little-endian)
                             destView[dstOff] = val & 0xFF;
@@ -797,11 +858,24 @@ function dispatchKernel(msg) {
                             destView[dstOff] = val & 0xFF;
                         }
                     }
+                } else if (out.baseIndex < 0 && (out.storeCount || 1) === 1 && ((destView.byteOffset + writeOffset) & 3) === 0) {
+                    // Vertex v's value is element v (an own-element output, GLSLKernelFunctionGenerator
+                    // _ownElementOutputs): one typed copy instead of a per-element call and four byte copies,
+                    // which cost as much as the readback itself (WebGL 1.4M radix sort: 5.7 s of 800 dispatches).
+                    const n = Math.min(totalVertices, Math.floor(out.writeLengthBytes / 4));
+                    const dst32 = new Int32Array(destView.buffer, destView.byteOffset + writeOffset, n);
+                    if (strideWords === 1) dst32.set(int32All.subarray(0, n));
+                    else {
+                        const o = out.outputIndex;
+                        for (let v = 0; v < n; v++) dst32[v] = int32All[v * strideWords + o];
+                    }
                 } else {
-                    const elemCount = Math.min(totalVertices, Math.floor(out.writeLengthBytes / bytesPerVertex));
-                    for (let v = 0; v < elemCount; v++) {
+                    const viewElems = Math.floor(out.writeLengthBytes / 4);
+                    for (let v = 0; v < totalVertices; v++) {
+                        const e = storeElement(out, v, viewElems);
+                        if (e < 0) continue;
                         const srcOff = v * strideBytes + out.outputIndex * 4;
-                        const dstOff = writeOffset + v * bytesPerVertex + storeSlot * 4;
+                        const dstOff = writeOffset + e * 4;
                         if (srcOff + 4 <= readbackBytes.length) {
                             destView[dstOff] = readbackBytes[srcOff];
                             destView[dstOff + 1] = readbackBytes[srcOff + 1];
@@ -815,7 +889,13 @@ function dispatchKernel(msg) {
             modifiedBufferIds.add(out.bufferId);
         }
 
-        // Re-upload modified buffers to their GPU textures (GPU-resident update)
+        } catch (err) {
+            readbackError = err;
+        }
+        gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+
+        // Re-upload modified buffers to their GPU textures (GPU-resident update; also after a refused readback, so
+        // the CPU mirror and the texture agree)
         for (const bid of modifiedBufferIds) {
             const entry = bufferRegistry[bid];
             if (entry) {
@@ -826,6 +906,13 @@ function dispatchKernel(msg) {
     }
 
     gl.useProgram(null);
+    // A context lost DURING the dispatch (driver reset, GPU hang) reads back an all-zero transform feedback buffer: no
+    // store-site bit set, so every element kept its old value and the dispatch looked successful (SpawnDev.Codecs
+    // VorbisResidueAccumulateGpu_Type2: target came back untouched, nothing refused). The webglcontextlost event comes
+    // later, asynchronously; isContextLost() is the synchronous answer.
+    if (!readbackError && gl.isContextLost())
+        readbackError = new Error('WebGL: the context was lost during this dispatch (GPU reset or driver crash); its results were not written.');
+    if (readbackError) throw readbackError;
 
     // No ArrayBuffer transfers — data stays GPU-resident in the worker
     return {
