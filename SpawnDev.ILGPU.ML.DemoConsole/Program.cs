@@ -901,6 +901,54 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
 
 // Investigation diagnostic (NOT a PMT-substitute test runner): CPU-vs-CUDA per-node
 // bisection for the CPU-backend style-transfer correctness bug.
+// Investigation diagnostic (NOT a PMT test): splits a model's cost on the Velocity CPU accelerator into session
+// creation, the first run (kernel compile + run) and warm runs, to price an ILGPU optimization level.
+//   dotnet <DemoConsole.dll> OPTCOST <model.onnx> <C,H,W input dims> [runs]
+//   env ML_ILGPU_OPT=O0|O1|O2 picks the level (unset = the library default), OPTCOST_PEROP=1 times every node of the last run
+// 2026-10-30, ILGPU 5.4.12, style-mosaic 3,224,224: warm 2.5 s at O1, 4.4 s at O2 - all of it in the naive Conv2DImpl.
+if (args.Length > 2 && args[0] == "OPTCOST")
+{
+    var cdims = args[2].Split(',').Select(int.Parse).ToArray();
+    var cruns = args.Length > 3 ? int.Parse(args[3]) : 4;
+    var csw = System.Diagnostics.Stopwatch.StartNew();
+    var copt = Environment.GetEnvironmentVariable("ML_ILGPU_OPT");
+    var cbuilder = MLContext.Create();
+    if (!string.IsNullOrEmpty(copt)) cbuilder = cbuilder.Optimize(Enum.Parse<OptimizationLevel>(copt));
+    using var cctx = cbuilder.ToContext();
+    using var cacc = MLContext.CreateCpuAccelerator(cctx);
+    var tCtx = csw.Elapsed.TotalMilliseconds; csw.Restart();
+    using var csession = InferenceSession.CreateFromOnnx(cacc, await File.ReadAllBytesAsync(args[1]));
+    var tSession = csw.Elapsed.TotalMilliseconds;
+    var cin = new float[cdims.Aggregate(1, (a, b) => a * b)];
+    for (var i = 0; i < cin.Length; i++) cin[i] = (i % 255) / 255f;
+    using var cbuf = cacc.Allocate1D<float>(cin.Length);
+    cbuf.View.CopyFromCPU(cin);
+    var cinputs = new Dictionary<string, Tensor> { [csession.InputNames[0]] = new Tensor(cbuf.View, new[] { 1 }.Concat(cdims).ToArray()) };
+    Console.WriteLine($"OPTCOST {Path.GetFileName(Path.GetDirectoryName(args[1]))} on {cacc.AcceleratorType} opt={Environment.GetEnvironmentVariable("ML_ILGPU_OPT") ?? "(default)"} "
+                    + $"context {tCtx:F0} ms, session {tSession:F0} ms");
+    var cperOp = Environment.GetEnvironmentVariable("OPTCOST_PEROP") == "1";
+    for (var r = 0; r < cruns; r++)
+    {
+        // the last run (warm) attributes GPU time per node: PerOpSync makes each node's time its own drain
+        var attribute = cperOp && r == cruns - 1;
+        if (attribute) { SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true; SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new(); }
+        csw.Restart();
+        var cout = await csession.RunAsync(cinputs);
+        await cacc.SynchronizeAsync();
+        Console.WriteLine($"OPTCOST run {r}{(attribute ? " (per-op sync)" : "")}: {csw.Elapsed.TotalMilliseconds:F0} ms (output {cout[csession.OutputNames[0]].ElementCount} elements)");
+        if (attribute)
+        {
+            var t = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs!;
+            foreach (var g in t.GroupBy(kv => kv.Key.Split('_')[1]).OrderByDescending(g => g.Sum(kv => kv.Value)))
+                Console.WriteLine($"OPTCOST op {g.Key,-22} {g.Sum(kv => kv.Value),8:F0} ms x{g.Count()}");
+            foreach (var kv in t.OrderByDescending(kv => kv.Value).Take(8))
+                Console.WriteLine($"OPTCOST node {kv.Key,-50} {kv.Value,8:F1} ms");
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = false; SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+        }
+    }
+    return 0;
+}
+
 if (args.Length > 0 && args[0] == "STYLEBISECT")
 {
     await StyleBisect.Run(args);
