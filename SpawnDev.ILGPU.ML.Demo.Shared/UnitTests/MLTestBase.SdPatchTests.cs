@@ -10,7 +10,7 @@ public abstract partial class MLTestBase
     /// <summary>
     /// ComfyUI's UNet patches on SD 1.5 against diffusers with ComfyUI's code put in (tools/sd-harness/reference/ref_sd_patches.py -> ref\sd_sd15patches_small_f16w.npz,
     /// 32x40 latent: the deepest level is 4x5, so the Fourier window meets an odd side): FreeU (1.1, 1.2, 0.9, 0.2), FreeU_V2 (1.3, 1.4, 0.9, 0.2) and Perturbed-Attention
-    /// Guidance's perturbed pass (the middle block's self-attention returns v). Each patch must match its reference, move the prediction well away from the plain one
+    /// Guidance's perturbed pass (the middle block's self-attention returns v) and HyperTile (tiled self-attention). Each patch must match its reference, move the prediction well away from the plain one
     /// (it ran), and switching it off must give the plain prediction bit-identically.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
@@ -35,6 +35,8 @@ public abstract partial class MLTestBase
             ("freeu", on => unet.FreeU = on ? new SdFreeU(1.1f, 1.2f, 0.9f, 0.2f) : null),
             ("freeu2", on => unet.FreeU = on ? new SdFreeU(1.3f, 1.4f, 0.9f, 0.2f, V2: true) : null),
             ("pag", on => unet.PerturbMiddleSelfAttention = on),
+            // 32x40 latent, tile 128 px = 16 latent: the full-resolution self-attention runs in 2 x 2 tiles (ComfyUI's transposed h x w grid); depth 1 stays whole
+            ("hypertile", on => unet.HyperTile = on ? new SdHyperTile(TileSize: 128, SwapSize: 1, MaxDepth: 1) : null),
         })
         {
             setup(true);

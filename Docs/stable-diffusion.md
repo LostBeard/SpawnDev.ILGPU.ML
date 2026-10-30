@@ -66,6 +66,7 @@ Deep shrink (ComfyUI's PatchModelAddDownscale):
 unet.DeepShrink = new SdDeepShrink(Block: 3, Factor: 2.0, AfterSkip: true);   // bicubic down / up by default (SdResize)
 // ComfyUI applies it only while sigma is in [sigma(end_percent), sigma(start_percent)] (defaults 0 .. 0.35): set it for those steps, null for the rest
 ```
+HyperTile: `unet.HyperTile = new SdHyperTile(TileSize: 256, SwapSize: 2, MaxDepth: 0)` (ComfyUI's defaults; tiles the self-attention of the first MaxDepth + 1 resolutions exactly as ComfyUI's node does, including its token grid for non-square latents).
 The latent may have any size (not only multiples of 8): upsampling blocks resize to the next skip connection's size, as ComfyUI does.
 FreeU follows ComfyUI (nodes_freelunch.py), not diffusers: the scales are chosen by the channel count of the features entering an output block (4x the model
 channels -> b1 / s1, 2x -> b2 / s2), after ControlNet residuals; the Fourier filter (threshold 1) is computed exactly from four DFT coefficients per channel.

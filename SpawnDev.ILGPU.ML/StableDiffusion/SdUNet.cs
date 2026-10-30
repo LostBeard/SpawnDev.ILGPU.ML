@@ -29,6 +29,15 @@ public enum SdResize { Bicubic, Bilinear, NearestExact }
 /// block whose features do not meet their skip connection's size resizes them to it with <see cref="Up"/>. ComfyUI applies it only while the step's sigma is inside
 /// [sigma(end_percent), sigma(start_percent)] (defaults 0 and 0.35): set and clear the property per step accordingly.
 /// </summary>
+/// <summary>
+/// ComfyUI's HyperTile (<see cref="SdUNet.HyperTile"/>): the self-attention of the blocks at the first <see cref="MaxDepth"/> + 1 resolutions runs inside tiles of
+/// about <see cref="TileSize"/> pixels (latent max(32, TileSize) / 8, doubled per depth when <see cref="ScaleDepth"/>). ComfyUI picks each side's tile count at
+/// random among the first <see cref="SwapSize"/> - 1 candidates (its torch.randint excludes the last; <see cref="Rng"/>, null = a shared System.Random): SwapSize 1
+/// or 2 is deterministic. ComfyUI's defaults:
+/// 256, 2, 0, false.
+/// </summary>
+public sealed record SdHyperTile(int TileSize = 256, int SwapSize = 2, int MaxDepth = 0, bool ScaleDepth = false, Random? Rng = null);
+
 public sealed record SdDeepShrink(int Block = 3, double Factor = 2.0, bool AfterSkip = true, SdResize Down = SdResize.Bicubic, SdResize Up = SdResize.Bicubic);
 
 public sealed record SdxlConditioning(float[] Pooled, int OriginalHeight, int OriginalWidth, int CropTop, int CropLeft, int TargetHeight, int TargetWidth);
@@ -138,6 +147,10 @@ public sealed partial class SdUNet : IDisposable
     /// </summary>
     public bool UpcastAttention { get; set; }
 
+    /// <summary>HyperTile (<see cref="SdHyperTile"/>), null = off.</summary>
+    public SdHyperTile? HyperTile { get; set; }
+    private int _latH, _latW;           // the latent size of the running prediction (HyperTile's original_shape)
+
     /// <summary>Deep shrink (<see cref="SdDeepShrink"/>), null = off.</summary>
     public SdDeepShrink? DeepShrink { get; set; }
 
@@ -226,7 +239,7 @@ public sealed partial class SdUNet : IDisposable
         return b.View.SubView(0, n);
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
-        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24,
+        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -281,10 +294,30 @@ public sealed partial class SdUNet : IDisposable
             // self attention
             _k.Sparse.LayerNorm(h, n, _w[b + "norm1.weight"], _w[b + "norm1.bias"], rows, C, 1e-5f);
             var qkv = Slot(SlotWide, (long)rows * 8 * C).SubView(0, (long)rows * 3 * C);
-            _k.Linear(n, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C, exact: UpcastAttention);
+            bool pag = PerturbMiddleSelfAttention && p.StartsWith("middle_block.", StringComparison.Ordinal);
+            var grid = pag ? null : HyperTileGrid(rows);
+            FV qkvIn = n;
+            if (grid is { } g0)
+            {
+                // HyperTile: the tokens in tile order (q, k and v are per token), attention per tile, back to the original order below (to_out is per token)
+                qkvIn = Slot(SlotTileIn, (long)rows * C);
+                _k.TileRows(n, qkvIn, rows, g0.Th, g0.Tw, g0.Nw, C, inverse: false);
+            }
+            _k.Linear(qkvIn, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C, exact: UpcastAttention);
             var a = Slot(SlotMid, (long)rows * 4 * C).SubView(0, (long)rows * C);
-            if (PerturbMiddleSelfAttention && p.StartsWith("middle_block.", StringComparison.Ordinal))
+            if (pag)
                 _k.CopyColumnsFrom(qkv, a, rows, C, 3 * C, 2 * C);                     // PAG: softmax(q k^T) replaced by the identity -> the values
+            else if (grid is { } tg)
+            {
+                int T = tg.Th * tg.Tw, tiles = tg.Nh * tg.Nw;
+                var aT = Slot(SlotTileOut, (long)rows * C);
+                for (int t = 0; t < tiles; t++)
+                {
+                    var qt = qkv.SubView((long)t * T * 3 * C, (long)T * 3 * C);
+                    Attention(qt, 3 * C, 0, qt, 3 * C, C, 2 * C, aT.SubView((long)t * T * C, (long)T * C), T, T, C);
+                }
+                _k.TileRows(aT, a, rows, tg.Th, tg.Tw, tg.Nw, C, inverse: true);
+            }
             else Attention(qkv, 3 * C, 0, qkv, 3 * C, C, 2 * C, a, rows, rows, C);
             _k.Linear(a, _w[b + "attn1.to_out.0.weight"], _w[b + "attn1.to_out.0.bias"], h, rows, C, C, 0, h);
             // cross attention to the text
@@ -305,6 +338,38 @@ public sealed partial class SdUNet : IDisposable
             _k.Linear(g, _w[b + "ff.net.2.weight"], _w[b + "ff.net.2.bias"], h, rows, inner, C, 0, h);
         }
         _k.Linear(h, _w[p + "proj_out.weight"], _w[p + "proj_out.bias"], dst, rows, C, C, 0, x);
+    }
+
+    /// <summary>
+    /// ComfyUI's hypertile_in, literally: tiles when the token count is (latH / 2^i) * (latW / 2^i) for i &lt;= MaxDepth; the token grid is taken as
+    /// round(sqrt(hw * aspect)) x round(sqrt(hw / aspect)) with aspect = latW / latH - that is W x H, transposed for a non-square latent, as ComfyUI does - and each side's
+    /// tile count is random_divisor(side, latent tile size, SwapSize). Null = no tiling.
+    /// </summary>
+    private (int Nh, int Nw, int Th, int Tw)? HyperTileGrid(int hw)
+    {
+        if (HyperTile is not { } ht) return null;
+        int depth = -1;
+        for (int i = 0; i <= ht.MaxDepth; i++)
+            if ((_latH / Math.Pow(2, i)) * (_latW / Math.Pow(2, i)) == hw) { depth = i; break; }
+        if (depth < 0) return null;
+        double aspect = (double)_latW / _latH;
+        int h = (int)Math.Round(Math.Sqrt(hw * aspect), MidpointRounding.ToEven), w = (int)Math.Round(Math.Sqrt(hw / aspect), MidpointRounding.ToEven);
+        int factor = ht.ScaleDepth ? 1 << depth : 1;
+        int tile = Math.Max(32, ht.TileSize) / 8 * factor;
+        int nh = RandomDivisor(h, tile, ht), nw = RandomDivisor(w, tile, ht);
+        if (nh * nw <= 1 || h * w != hw) return null;
+        return (nh, nw, h / nh, w / nw);
+    }
+
+    private static readonly Random SharedRng = new();
+    private static int RandomDivisor(int value, int minValue, SdHyperTile ht)
+    {
+        minValue = Math.Min(minValue, value);
+        var ns = new List<int>();
+        for (int i = minValue; i <= value && ns.Count < Math.Max(1, ht.SwapSize); i++) if (value % i == 0) ns.Add(value / i);
+        // ComfyUI: randint(low=0, high=len(ns) - 1) - torch's high is exclusive, so the last candidate is never chosen (SwapSize 2 always takes the first)
+        int idx = ns.Count > 1 ? (ht.Rng ?? SharedRng).Next(ns.Count - 1) : 0;
+        return ns[idx];
     }
 
     private void Down(Module m, FV x, FV dst, int H, int W)
@@ -400,6 +465,7 @@ public sealed partial class SdUNet : IDisposable
         if (encoderOut == null && OutChannels == 0) throw new InvalidOperationException("this UNet holds the encoder half only (a ControlNet's): it cannot predict");
         if (IsXL != y.HasValue) throw new ArgumentException(IsXL ? "an SDXL UNet needs the label vector (pooled text + size ids)" : "only an SDXL UNet takes a label vector");
         int mc = ModelChannels, rows0 = h * w;
+        _latH = h; _latW = w;
         // the largest activation: a level's pixels x the widest concatenated input of that level (output blocks read h | skip)
         long maxElems = (long)rows0 * mc * 2;
         {

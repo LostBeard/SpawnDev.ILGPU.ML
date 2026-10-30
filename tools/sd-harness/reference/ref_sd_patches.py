@@ -8,6 +8,7 @@ FreeU is ComfyUI's, not diffusers': diffusers' apply_freeu picks the scale by th
 (model_channels * 4 -> b1 / s1, * 2 -> b2 / s2), so diffusers' function is replaced by ComfyUI's code. PAG: ComfyUI's perturbed_attention returns v.
 """
 import argparse
+import math
 import numpy as np
 import torch
 import diffusers.models.unets.unet_2d_blocks as blocks
@@ -47,6 +48,35 @@ def comfy_freeu(resolution_idx, h, hsp, **_):
     else:
         h[:, :half] = h[:, :half] * scale[0]
     return h, fourier_filter(hsp, threshold=1, scale=scale[1])
+
+
+class HyperTileAttn:                                 # ComfyUI nodes_hypertile.py (hypertile_in / hypertile_out) around diffusers' processor
+    def __init__(self, base, lat_hw, tile_size=128, swap_size=1, max_depth=1, scale_depth=False):
+        self.base, (self.H, self.W) = base, lat_hw
+        self.tile, self.swap, self.max_depth, self.scale_depth = max(32, tile_size) // 8, swap_size, max_depth, scale_depth
+
+    @staticmethod
+    def random_divisor(value, min_value, max_options=1):
+        min_value = min(min_value, value)
+        divisors = [i for i in range(min_value, value + 1) if value % i == 0]
+        ns = [value // i for i in divisors[:max_options]]
+        return ns[0] if len(ns) - 1 <= 0 else ns[int(torch.randint(low=0, high=len(ns) - 1, size=(1,)).item())]
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, **kw):
+        hw = hidden_states.shape[1]
+        apply_to = [(self.H / (2 ** i)) * (self.W / (2 ** i)) for i in range(self.max_depth + 1)]
+        if hw in apply_to:
+            aspect = self.W / self.H
+            h, w = round(math.sqrt(hw * aspect)), round(math.sqrt(hw / aspect))
+            factor = (2 ** apply_to.index(hw)) if self.scale_depth else 1
+            nh, nw = self.random_divisor(h, self.tile * factor, self.swap), self.random_divisor(w, self.tile * factor, self.swap)
+            if nh * nw > 1:
+                b, _, c = hidden_states.shape
+                th, tw = h // nh, w // nw
+                x = hidden_states.view(b, nh, th, nw, tw, c).permute(0, 1, 3, 2, 4, 5).reshape(b * nh * nw, th * tw, c)   # b (nh h nw w) c -> (b nh nw) (h w) c
+                out = self.base(attn, x, None, attention_mask, temb)
+                return out.view(b, nh, nw, th, tw, c).permute(0, 1, 3, 2, 4, 5).reshape(b, nh * th * nw * tw, c)
+        return self.base(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
 
 
 class IdentityAttn:                                  # PAG: softmax(q k^T) -> identity, the attention returns v (then to_out)
@@ -89,8 +119,18 @@ def main():
     for n, m in unet.mid_block.named_modules():
         if n in saved:
             m.set_processor(saved[n])
+    # HyperTile (tile 128 -> latent 16, swap 1 = deterministic, depth 0 and 1) on every self-attention
+    procs = {}
+    for n, m in unet.named_modules():
+        if n.endswith("attn1"):
+            procs[n] = m.processor
+            m.set_processor(HyperTileAttn(m.processor, tuple(latent.shape[-2:])))
+    out["eps_hypertile"] = run()
+    for n, m in unet.named_modules():
+        if n in procs:
+            m.set_processor(procs[n])
     np.savez(a.out, **out)
-    for k in ("plain", "freeu", "freeu2", "pag"):
+    for k in ("plain", "freeu", "freeu2", "pag", "hypertile"):
         e = out["eps_" + k]
         print(k, e.shape, "absmax", float(np.abs(e).max()), "vs plain", float(np.sqrt(((e - out["eps_plain"]) ** 2).mean() / (out["eps_plain"] ** 2).mean())))
 

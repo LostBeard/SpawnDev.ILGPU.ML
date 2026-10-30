@@ -218,6 +218,23 @@ public sealed class SdKernels
         _copyColsFrom((int)((long)rows * C), src, dst, C, W, col);
     }
 
+    // HyperTile's token rearrangement (einops "b (nh h nw w) c -> (b nh nw) (h w) c" with tile sides th, tw): row r of the tiled order holds token
+    // ((ih * th + y) * nw + iw) * tw + x of the original, where r = ((ih * nw + iw) * th + y) * tw + x. inverse = 1 writes back.
+    private Action<Index1D, FV, FV, int, int, int, int, int>? _tileRows;
+    private static void TileRowsImpl(Index1D i, FV src, FV dst, int th, int tw, int nw, int C, int inverse)
+    {
+        int ii = i, c = ii % C, r = ii / C;
+        int x = r % tw, y = r / tw % th, t = r / (tw * th), iw = t % nw, ih = t / nw;
+        long o = ((long)(ih * th + y) * nw + iw) * tw + x;
+        if (inverse == 0) dst[(long)r * C + c] = src[o * C + c];
+        else dst[o * C + c] = src[(long)r * C + c];
+    }
+    public void TileRows(FV src, FV dst, int rows, int th, int tw, int nw, int C, bool inverse)
+    {
+        _tileRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int>(TileRowsImpl);
+        _tileRows((int)((long)rows * C), src, dst, th, tw, nw, C, inverse ? 1 : 0);
+    }
+
     // x [rows, C] += v [C] (the ResBlock's time embedding projection)
     private Action<Index1D, FV, FV, int>? _addRow;
     private static void AddRowImpl(Index1D i, FV x, FV v, int C) => x[i] = x[i] + v[(int)(i % C)];
