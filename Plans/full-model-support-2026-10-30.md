@@ -1,0 +1,36 @@
+# Full model support - audit and plan (2026-10-30)
+
+TJ, 2026-10-30: "We will need to fully support models (image, video, etc...), not just features and specs that work well on this PC."
+
+A model counts as supported only when ALL of these hold:
+1. **Every mode** of the model's reference pipeline is ported and gated against the reference (not just the one that runs well here).
+2. **Hosted**: weights on models.spawndev.com (with the licence files the licence requires), so the demo and consumers load them without setup.
+3. **Browser**: runs on WebGPU in the demo / a WebGPU-lane test, re-verified on the current SpawnDev.ILGPU.
+4. **Smaller devices**: fits and is verified beyond the RTX 4070 12 GB: an 8 GB GPU (Lore's RX 590), browser buffer limits; peak memory measured; streaming / tiling / offload where it does not fit.
+
+Status key: ✅ verified (with evidence) · 🟡 partial · ❌ missing · ❓ to check (not verified either way).
+
+## Generative models (first)
+
+| Model | 1. Modes | 2. Hosted | 3. Browser | 4. Smaller devices |
+|---|---|---|---|---|
+| **LTX-Video 2B 0.9.8 distilled** (`LtxPipeline`) | 🟡 text-to-video ✅ (every stage gated, CUDA); image-to-video (VAE encoder + first-frame conditioning) ❌; x2 latent upscaler second pass ❌ | ❌ (`LostBeard/LTX-Video-2B-0.9.8-distilled-ILGPU` named in code, never uploaded; licence text + change notices must ship) | ❌ never run (the 10-22 run was stopped; no WebGPU-lane test) | ❓ 8-bit DiT 2.2 GB + T5 streamed: should fit 8 GB, unmeasured |
+| **Wan 2.2 TI2V-5B** (`Wan22Pipeline`) | ✅ text-to-video, image-to-video (first frame), Turbo 4-step | ✅ `LostBeard/Wan2.2-TI2V-5B-ILGPU` (q8 / q4 / Turbo DiT, VAE, q8 umT5, tokenizer) | ✅ re-verified 2026-10-30 on ILGPU 5.4.13: 640x352 x17, 30 steps = 176 s (`Wan_Pipeline_OverHttp_MatchesReference`) | ❓ only the 12 GB RTX 4070 measured; 8 GB not verified |
+| Wan 2.2 A14B (T2V / I2V MoE) | ❌ not ported | ❌ | ❌ | ❌ (27B total: needs expert streaming) |
+| **Stable Diffusion 1.x / 2.x / SDXL** (`SdCheckpoint`) | 🟡 UNet / CLIP / VAE, LoRA, ControlNet (SD1 + SDXL), TAESD, merge + save, inpainting, FreeU / PAG / HyperTile / deep shrink / SAG ✅ (CUDA + OpenCL); SDXL refiner ❌, unCLIP / IP-Adapter ❌, ToMe ❌, Control-LoRA ❌ | n/a (user checkpoints from HF / CivitAI) | 🟡 SD 1.5 20-step picture over HTTP ✅ (WebGPU, 10-25); SDXL browser by Lore on RX 590 (his check, not our gate); merge / save / inpaint / patches not browser-gated | 🟡 Lore: SD 1.5 + SDXL 1024 on RX 590 8 GB in the browser (10-25, his report) |
+| SD-Turbo (ONNX pipeline) | ❓ | ❓ | ✅ `/generate` (`SDTurbo_Generate_E2E` incl. WebGPU) | ❓ `SDTurbo_WebGPU_ImageGen_MultiGen` fails (memory grows gen1 -> gen2): open bug |
+| FLUX.2 klein 4B | ❓ text-to-image + reference editing ✅ (Docs/flux2.md) - check the reference pipeline for other modes | ✅ `LostBeard/FLUX.2-klein-4B-q4-ILGPU` | ✅ `/generate` (❓ re-verify on 5.4.13) | ❓ |
+| FLUX 3 Image Klein | ❓ (Docs/flux3.md) | ✅ `LostBeard/flux-3-image-klein-q4-ILGPU` | 🟡 Chrome 151 lost the GPU process on picture 3 with resident weights (fine on 153) - ❓ re-verify | ❓ |
+| TRELLIS.2 (text / image to 3D) | ❓ (Docs/trellis2.md) | ❓ | ✅ live 10-17 (crown photo -> GLB 148 s) - ❓ re-verify on 5.4.13 | ❓ |
+| Kimodo animation, UniRig / SkinTokens rigging | ❓ | 🟡 `LostBeard/SkinTokens-bf16` | ❓ | ❓ |
+
+Then the same audit for the vision / audio / LLM models (Docs/DEMO_AND_MODEL_STATUS.md lists them; column 1 is mostly ✅ there, columns 3 and 4 need the same re-verification).
+
+## Order (editor's choice)
+
+1. ✅ Wan in the browser re-verified on 5.4.13 (2026-10-30).
+2. **LTX to full support**: a WebGPU-lane pipeline test over HTTP (like Wan's); host the q8 DiT, q8 T5, VAE, tokenizer + licence files; image-to-video (VAE encoder, the reference's first-frame conditioning); the x2 latent upscaler second pass; peak memory per stage, an 8 GB plan.
+3. Smaller-device verification for Wan and LTX (peak memory per stage in the browser; what an 8 GB card needs).
+4. Re-verify FLUX.2 / FLUX 3 / TRELLIS.2 in the browser on 5.4.13; fill the ❓ cells from their reference pipelines.
+5. SD: ToMe, SDXL refiner, unCLIP / IP-Adapter (Lore's #3 to #5), and browser gates for the new SD features.
+6. Wan 2.2 A14B.
