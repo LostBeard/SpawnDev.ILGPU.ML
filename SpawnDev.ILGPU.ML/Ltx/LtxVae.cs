@@ -128,7 +128,7 @@ public sealed class LtxVae : IDisposable
         using var zIn = _acc.Allocate1D(z);
         using var nIn = noiseScale != 0f ? _acc.Allocate1D(noise!) : null;
         var x0 = Tmp((long)vox * LatentChannels);
-        _lk.LatentToVoxels(zIn.View, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), nIn?.View ?? zIn.View, vox, LatentChannels, 1f, noiseScale);
+        _lk.LatentToVoxels(zIn.View, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), nIn?.View, vox, LatentChannels, 1f, noiseScale);
         var x = Conv("conv_in", x0, T, H, W, LatentChannels, 1024); Drop(x0); Flush();
         Tapped("conv_in", x, T, H, W, 1024);
 

@@ -83,7 +83,7 @@ Euler sampler (guidance 1: ONE forward per step, the latent never leaves the dev
 as the recipe does). A 704x480 clip of 97 frames is only 4,290 tokens, which is why this model suits a tab. Image to video, the VAE encoder and the x2 latent upscaler (the recipe's second pass) are not ported yet.
 
 Files (`tools/ltx-harness/reference`): `export_dit_bf16.py` (the single-file checkpoint to the Wan layout, q/k/v fused; 3.6 GB; `quantize_streaming.py` makes the 8-bit one, 2.0 GB), `export_t5_bf16.py` (8.9 GB / 8-bit
-5.0 GB), `export_vae_f16.py` (the decoder, 1.0 GB), the T5 `tokenizer.json`. `LtxPaths.InFolder` / `InRepo` name them.
+5.0 GB), `export_vae_f16.py` (the decoder, 1.0 GB), the T5 `tokenizer.json`. `LtxPaths.InFolder` / `InRepo` name them. models.spawndev.com serves them as `LostBeard/LTX-Video-2B-0.9.8-distilled-ILGPU` (`LtxPipeline.DefaultRepo`: bf16 and 8-bit DiT, 8-bit T5, VAE decoder, tokenizer, the licence and the change notices).
 
 ## Parity with the reference (diffusers, same inputs; `MLTestBase.LtxTests.cs`)
 
@@ -103,7 +103,8 @@ Red checks: q RoPE off (DiT 0.84), unpatchify offsets swapped (VAE 0.18), a wron
 RTX 4070 12 GB, CUDA, `Examples/11.VideoGen.Console --ltx --models D:\Projects\ltx`: 704x480 x 97 frames **51 s** (T5 streamed from disk 24 s, DiT load 13 s, 7 steps 9 s, VAE decode 5 s); 480x320 x 49 frames 43 s
 (30 s with the 8-bit DiT and T5: `--dit q8 --text q8`; the clips look the same).
 
+Browser (Chrome WebGPU, RTX 4070, the hosted 8-bit DiT and T5 read over HTTP): 704x480 x 97 frames **72 s** (T5 26 s, DiT 28 s, decode 18 s). Every stage gated in the browser against the reference (`Ltx_Stages_OverHttp_MatchReference`: T5 1.5e-2 to 5.1e-2, DiT step 0 vs fp32 2.8e-2, VAE 1.4e-6); `Ltx_Pipeline_OverHttp_Generates` runs the clip (serve the model folder: `node tools/unirig-harness/serve-files.mjs D:/Projects/ltx 8771`).
+
 ## Licence
 
-The weights are under the LTXV Open Weights License 0.X (free for entities under $10M annual revenue, use restrictions in its Attachment A, redistribution only with the licence text, change notices and the use
-restrictions passed on). The T5-v1.1-XXL encoder is Apache 2.0.
+The weights are under the LTXV Open Weights License 0.X (Lightricks, 2025-04-15; it covers every LTXV release since 0.9.6, so 0.9.8): free use under its use-based restrictions (Attachment A); redistribution of the model or of modified files only with a copy of the licence, the Attachment A restrictions passed on as enforceable terms, prominent notices on changed files and the original notices kept (its section 3). The text has no revenue threshold. The T5-v1.1-XXL encoder is Apache 2.0.

@@ -24,8 +24,11 @@ public sealed class LtxPaths
     /// <summary>The T5 file for a precision: "bf16" (8.9 GB) or "q8" (5.0 GB).</summary>
     public static string TextEncoderFile(string precision) => $"t5_xxl_enc_{precision}.safetensors";
 
-    /// <summary>The file names the exporters write and a model repo holds (relative, forward slashes).</summary>
-    public static LtxPaths InRepo(string dit = "ltx_dit_bf16.safetensors", string textEncoder = "t5_xxl_enc_bf16.safetensors") => new()
+    /// <summary>
+    /// The file names a model repo holds (relative, forward slashes). <see cref="LtxPipeline.DefaultRepo"/> on models.spawndev.com serves the bf16 and 8-bit DiT, the 8-bit
+    /// T5 (the 9 GB bf16 one is not hosted), the VAE decoder and the tokenizer.
+    /// </summary>
+    public static LtxPaths InRepo(string dit = "ltx_dit_bf16.safetensors", string textEncoder = "t5_xxl_enc_q8.safetensors") => new()
     {
         Dit = dit, Vae = "ltx_vae_f16.safetensors", TextEncoder = textEncoder, Tokenizer = "google/t5-v1_1-xxl/tokenizer.json",
     };

@@ -13,7 +13,7 @@
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
 //           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate)
-//           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB)  --models DIR (a local folder of the exports; else they
+//           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB; default q8, the hosted one: bf16 only with --models)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
 //
 //  Output: <out>/video.webp (animated), <out>/frame_0000.png ...  A bigger size or more frames costs memory: on a 12 GB card 640x352 with 17-49 frames is comfortable.
@@ -199,5 +199,5 @@ sealed class Options
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;
     public string? Negative, Image, Models, Cache;
-    public string Dit = "q8", Text = "bf16", Out = "video_out";
+    public string Dit = "q8", Text = "q8", Out = "video_out";      // text q8: the models host serves the 8-bit text encoders only (bf16 needs --models with the 16-bit export)
 }

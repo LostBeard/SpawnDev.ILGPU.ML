@@ -89,11 +89,27 @@ public sealed class LtxKernels
         long src = (long)c * vox + v;
         o[i] = (1f - noiseScale) * (z[src] * std[c] / scale + mean[c]) + noiseScale * noise[src];
     }
-    /// <param name="noise">standard normal noise shaped like <paramref name="z"/>; read only when <paramref name="noiseScale"/> is not 0 (pass <paramref name="z"/> itself otherwise).</param>
-    public void LatentToVoxels(FV z, FV o, FV mean, FV std, FV noise, int vox, int C, float scalingFactor, float noiseScale)
+    private Action<Index1D, FV, FV, FV, FV, int, int, float>? _latentToVoxelsPlain;
+    private static void LatentToVoxelsPlainImpl(Index1D i, FV z, FV o, FV mean, FV std, int vox, int C, float scale)
     {
+        int c = i % C, v = i / C;
+        o[i] = z[(long)c * vox + v] * std[c] / scale + mean[c];
+    }
+    /// <param name="noise">
+    /// standard normal noise shaped like <paramref name="z"/> when <paramref name="noiseScale"/> is not 0; null otherwise (a separate kernel without it: WebGPU binds every view
+    /// read-write, so the latent cannot stand in for the noise - it failed with "storage buffer aliasing" in the browser).
+    /// </param>
+    public void LatentToVoxels(FV z, FV o, FV mean, FV std, FV? noise, int vox, int C, float scalingFactor, float noiseScale)
+    {
+        if (noiseScale == 0f || noise == null)
+        {
+            if (noiseScale != 0f) throw new ArgumentException("a decode noise scale needs the noise", nameof(noise));
+            _latentToVoxelsPlain ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, float>(LatentToVoxelsPlainImpl);
+            _latentToVoxelsPlain(vox * C, z, o, mean, std, vox, C, scalingFactor);
+            return;
+        }
         _latentToVoxels ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, int, int, float, float>(LatentToVoxelsImpl);
-        _latentToVoxels(vox * C, z, o, mean, std, noise, vox, C, scalingFactor, noiseScale);
+        _latentToVoxels(vox * C, z, o, mean, std, noise.Value, vox, C, scalingFactor, noiseScale);
     }
 
     // x[i] += dt * v[i]   (the flow-matching Euler step, on the device)
