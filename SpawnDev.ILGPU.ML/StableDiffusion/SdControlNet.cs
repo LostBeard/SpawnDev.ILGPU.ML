@@ -200,7 +200,7 @@ public sealed class SdControlNet : IDisposable
 
             string p = i < ResidualCount - 1 ? $"zero_convs.{i}.0." : "middle_block_out.0.";
             _k.Linear(view, _w[p + "weight"], _w[p + "bias"], res.Prepare(i, n), bh * bw, bc, bc);
-        }, cancellationToken);
+        }, null, cancellationToken);
         return res;
     }
 

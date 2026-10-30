@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.7" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.12" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.13" />
 	</ItemGroup>
 
 	<ItemGroup>

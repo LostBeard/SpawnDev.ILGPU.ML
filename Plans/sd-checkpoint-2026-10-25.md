@@ -40,6 +40,8 @@ The sampler, noise, CFG and host latents stay in SpawnGen. Tokenizer: `BPETokeni
 - [x] Model merge (Lore #1, 10-30): `SdUNet / SdTextEncoder.MergeAsync(other, factors)`, `SdMerge.Simple / Add / Subtract / Blocks` (ComfyUI's ModelMergeSimple / Add / Subtract / Blocks / SD1 / SDXL, CLIPMerge*); edits in call order with LoRAs (`SdPatchState`), `ResetAsync`; gated: SD 2.1 base + 768-v Blocks 0.2/0.5/0.8 + CLIP 0.3, 1.22e9 values 0 beyond 1 fp16 ulp, reset bit-identical; merge / LoRA order 7 checks (CUDA)
 - [x] Save (Lore #1, 10-30): `SdCheckpoint.SaveAsync` (CheckpointSave), `SdUNet / SdTextEncoder / SdVae.SaveAsync` (ModelSave / CLIPSave / VAESave), F16 / F32 / BF16, `v_pred` marker, streams through CopyToStreamAsync; gated: SD 1.5 + SD 2.1 round trip bit-exact vs the source files, reload bit-identical (CUDA)
 - [ ] merge / save on OpenCL; a browser save into an OPFS / download stream (CopyToStreamAsync JS path)
-- [ ] Lore #2 inpainting UNet (9 input channels, c_concat), #3 UNet patches (FreeU, PAG, SAG, deep shrink, HyperTile, ToMe), #4 SDXL refiner + CLIPTextEncodeSDXLRefiner, #5 unCLIP / CLIP vision / IP-Adapter / GLIGEN
+- [x] Lore #2 inpainting UNet (10-30): `SdUNet.ConcatChannels`, `ForwardAsync(latent, concat, ...)`; gated vs diffusers 7.5e-5 CUDA / 9.3e-7 OpenCL (Sd15Inpaint_UNet_MatchesReference, fixture ref_sd_inpaint.py)
+- [ ] Lore #3 UNet patches: [x] FreeU / FreeU_V2 + PAG (SdUNet.FreeU, PerturbMiddleSelfAttention; Sd15_UNetPatches_FreeUAndPag_MatchComfyUI CUDA 1.3e-3 / OpenCL 3e-6, red-checked); [ ] SAG, deep shrink (PatchModelAddDownscale), HyperTile, ToMe
+- [ ] Lore #4 SDXL refiner + CLIPTextEncodeSDXLRefiner, #5 unCLIP / CLIP vision / IP-Adapter / GLIGEN
 - [ ] memory: SDXL VAE decode at 1024 needs ~4 GB of activations: tiled decode for small cards / browser
 - [x] the browser 404 probes (mirrors.json index, 1d5b4b34) + OPFS cache never hit for HF-served files (261047b8)

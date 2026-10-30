@@ -12,6 +12,14 @@ using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 /// SDXL's extra conditioning: the pooled text embedding of the second text encoder and the six size numbers (original size, crop top-left, target size; ComfyUI's width / height
 /// fields, in pixels).
 /// </summary>
+/// <summary>
+/// ComfyUI's FreeU / FreeU_V2 (<see cref="SdUNet.FreeU"/>): in every output block whose incoming features have 4x the model channels (1280 on SD 1.x / SDXL) the first half
+/// of those channels is scaled by <see cref="B1"/> (V2: by (B1 - 1) x the min-max normalised per-pixel channel mean + 1) and the skip connection's lowest frequencies by
+/// <see cref="S1"/> (ComfyUI's Fourier_filter, threshold 1); at 2x the model channels <see cref="B2"/> / <see cref="S2"/>. ComfyUI's defaults: FreeU 1.1, 1.2, 0.9, 0.2;
+/// FreeU_V2 1.3, 1.4, 0.9, 0.2.
+/// </summary>
+public sealed record SdFreeU(float B1, float B2, float S1, float S2, bool V2 = false);
+
 public sealed record SdxlConditioning(float[] Pooled, int OriginalHeight, int OriginalWidth, int CropTop, int CropLeft, int TargetHeight, int TargetWidth);
 
 /// <summary>
@@ -102,6 +110,11 @@ public sealed partial class SdUNet : IDisposable
 
     public int ModelChannels { get; }
     public int InChannels { get; }
+    /// <summary>
+    /// The channels an inpainting UNet takes besides the latent (<see cref="InChannels"/> - <see cref="OutChannels"/>: 5 for SD 1.x / 2.x / SDXL inpainting = the mask, then
+    /// the masked image's latent, as diffusers and ComfyUI's InpaintModelConditioning concatenate them); 0 for an ordinary UNet. See the <c>concat</c> overloads of ForwardAsync.
+    /// </summary>
+    public int ConcatChannels => OutChannels == 0 ? 0 : Math.Max(0, InChannels - OutChannels);
     public int OutChannels { get; }
     /// <summary>The text context width (768 SD 1.x, 1024 SD 2.x, 2048 SDXL).</summary>
     public int ContextDim { get; }
@@ -113,6 +126,15 @@ public sealed partial class SdUNet : IDisposable
     /// 1024-wide-context (SD 2.x) models, off for SD 1.x / SDXL, which do not need it.
     /// </summary>
     public bool UpcastAttention { get; set; }
+
+    /// <summary>FreeU / FreeU_V2 on the output blocks (<see cref="SdFreeU"/>), null = off. Applied after ControlNet residuals are added to the skips, as ComfyUI does.</summary>
+    public SdFreeU? FreeU { get; set; }
+
+    /// <summary>
+    /// Perturbed-Attention Guidance's perturbed pass (ComfyUI's PerturbedAttentionGuidance): every self-attention of the middle block returns its values (the attention map
+    /// replaced by the identity). Run the conditional prediction once with this on and combine as ComfyUI does: <c>cfg + (cond - perturbed) * scale</c>.
+    /// </summary>
+    public bool PerturbMiddleSelfAttention { get; set; }
 
     /// <summary>The width of SDXL's label vector (the input of <c>label_emb.0.0</c>: 2816 for SDXL base), 0 otherwise: what <see cref="SdxlLabel"/> takes.</summary>
     public int LabelWidth => _admDim;
@@ -190,7 +212,7 @@ public sealed partial class SdUNet : IDisposable
         return b.View.SubView(0, n);
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
-        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20,
+        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -247,7 +269,9 @@ public sealed partial class SdUNet : IDisposable
             var qkv = Slot(SlotWide, (long)rows * 8 * C).SubView(0, (long)rows * 3 * C);
             _k.Linear(n, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C, exact: UpcastAttention);
             var a = Slot(SlotMid, (long)rows * 4 * C).SubView(0, (long)rows * C);
-            Attention(qkv, 3 * C, 0, qkv, 3 * C, C, 2 * C, a, rows, rows, C);
+            if (PerturbMiddleSelfAttention && p.StartsWith("middle_block.", StringComparison.Ordinal))
+                _k.CopyColumnsFrom(qkv, a, rows, C, 3 * C, 2 * C);                     // PAG: softmax(q k^T) replaced by the identity -> the values
+            else Attention(qkv, 3 * C, 0, qkv, 3 * C, C, 2 * C, a, rows, rows, C);
             _k.Linear(a, _w[b + "attn1.to_out.0.weight"], _w[b + "attn1.to_out.0.bias"], h, rows, C, C, 0, h);
             // cross attention to the text
             _k.Sparse.LayerNorm(h, n, _w[b + "norm2.weight"], _w[b + "norm2.bias"], rows, C, 1e-5f);
@@ -324,7 +348,19 @@ public sealed partial class SdUNet : IDisposable
     /// <paramref name="y"/> SDXL's label vector [adm] (<see cref="SdxlLabel"/>) or null, <paramref name="output"/> [outChannels, h, w].
     /// </summary>
     public Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, CancellationToken cancellationToken = default)
-        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, null, default, null, cancellationToken);
+        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, null, default, null, null, cancellationToken);
+
+    /// <summary>
+    /// One prediction of an inpainting UNet (<see cref="ConcatChannels"/> &gt; 0) on the device: <paramref name="latent"/> [OutChannels, h, w] is the latent being denoised and
+    /// <paramref name="concat"/> [ConcatChannels, h, w] channel-first what it is concatenated with (the mask [1, h, w] at latent resolution, then the masked image's scaled
+    /// latent [4, h, w]: diffusers' StableDiffusionInpaintPipeline order and ComfyUI's c_concat). Joined on the device; the rest as the plain overload, ControlNets included.
+    /// </summary>
+    public Task ForwardAsync(FV latent, FV concat, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output,
+        IReadOnlyList<SdControlResiduals>? controls = null, CancellationToken cancellationToken = default)
+    {
+        if (ConcatChannels == 0) throw new InvalidOperationException($"this UNet takes {InChannels} input channels and no concatenated input (not an inpainting model)");
+        return RunAsync(latent, h, w, timestep, context, contextRows, y, output, controls, default, null, concat, cancellationToken);
+    }
 
     /// <summary>
     /// <see cref="ForwardAsync(FV, int, int, double, FV, int, FV?, FV, CancellationToken)"/> with ControlNet residuals (<see cref="SdControlNet.RunAsync(FV, int, int, double, FV, int, FV, FV?, SdControlResiduals?, CancellationToken)"/>):
@@ -332,7 +368,7 @@ public sealed partial class SdUNet : IDisposable
     /// </summary>
     public Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, IReadOnlyList<SdControlResiduals>? controls,
         CancellationToken cancellationToken = default)
-        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, controls, default, null, cancellationToken);
+        => RunAsync(latent, h, w, timestep, context, contextRows, y, output, controls, default, null, null, cancellationToken);
 
     /// <summary>
     /// The core: the input blocks, the middle block, then (unless <paramref name="encoderOut"/> is given: the ControlNet's encoder pass) the output blocks and the head.
@@ -340,8 +376,11 @@ public sealed partial class SdUNet : IDisposable
     /// block and the middle block, in that order.
     /// </summary>
     internal async Task RunAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, IReadOnlyList<SdControlResiduals>? controls,
-        FV? hint, Action<int, FV, int, int, int>? encoderOut, CancellationToken cancellationToken)
+        FV? hint, Action<int, FV, int, int, int>? encoderOut, FV? concat, CancellationToken cancellationToken)
     {
+        int latC = concat.HasValue ? InChannels - ConcatChannels : InChannels;
+        if (latent.Length != (long)latC * h * w) throw new ArgumentException($"the latent must be [{latC}, {h}, {w}]");
+        if (concat.HasValue && concat.Value.Length != (long)ConcatChannels * h * w) throw new ArgumentException($"the concatenated input must be [{ConcatChannels}, {h}, {w}]");
         if (h % 8 != 0 || w % 8 != 0) throw new ArgumentException("the latent sides must be multiples of 8");
         if (encoderOut == null && OutChannels == 0) throw new InvalidOperationException("this UNet holds the encoder half only (a ControlNet's): it cannot predict");
         if (IsXL != y.HasValue) throw new ArgumentException(IsXL ? "an SDXL UNet needs the label vector (pooled text + size ids)" : "only an SDXL UNet takes a label vector");
@@ -377,7 +416,12 @@ public sealed partial class SdUNet : IDisposable
 
         // conv_in on the channel-last latent
         var xin = Slot(SlotIn, (long)rows0 * InChannels);
-        _dk.Transpose(latent, xin, InChannels, rows0);
+        if (concat.HasValue)
+        {
+            _k.ChannelFirstToLastColumns(latent, xin, rows0, latC, InChannels, 0);
+            _k.ChannelFirstToLastColumns(concat.Value, xin, rows0, ConcatChannels, InChannels, latC);
+        }
+        else _dk.Transpose(latent, xin, InChannels, rows0);
         var skips = new List<(FV View, int H, int W, int C)>();
         var s0 = Slot(SlotSkip, (long)rows0 * mc);
         _k.Conv(xin, Table(h, w, h, w, 3, 1, 1, 1), _w["input_blocks.0.0.weight"], _w["input_blocks.0.0.bias"], s0, rows0, InChannels, mc, 9);
@@ -423,6 +467,16 @@ public sealed partial class SdUNet : IDisposable
             if (controls != null)
                 foreach (var c in controls) _k.AxpyInPlace(sv, c[skips.Count], c.Strength, (long)sh * sw * sc);     // the skip this block concatenates + strength x residual
             if (sh != Hc || sw != Wc) throw new InvalidOperationException($"skip {sh}x{sw} does not meet {Hc}x{Wc} (latent sides must be multiples of 8)");
+            if (FreeU is { } fu && (Cc == mc * 4 || Cc == mc * 2))
+            {
+                // ComfyUI's output_block_patch: chosen by the channel count of h (not by the block index, as diffusers does)
+                bool deep = Cc == mc * 4;
+                float b = deep ? fu.B1 : fu.B2, s = deep ? fu.S1 : fu.S2;
+                var scratch = Slot(SlotFreeU, Math.Max((long)Hc * Wc + 2, (long)sc * 8));
+                if (fu.V2) _k.FreeUBackboneV2(cur, Hc * Wc, Cc, Cc / 2, b, scratch);
+                else _k.FreeUBackbone(cur, Hc * Wc, Cc, Cc / 2, b);
+                _k.FreeUFourier(sv, sh, sw, sc, s, scratch);
+            }
             var cat = PickFree(cur, maxElems).SubView(0, (long)Hc * Wc * (Cc + sc));
             _k.ConcatChannels(cur, sv, cat, Hc * Wc, Cc, sc);
             var mods = _output[i];
@@ -451,12 +505,34 @@ public sealed partial class SdUNet : IDisposable
         => await ForwardAsync(latent, h, w, timestep, context, contextRows, xl, null, cancellationToken);
 
     /// <summary>The host-array prediction with ControlNet residuals (see the device overload).</summary>
-    public async Task<float[]> ForwardAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl,
+    public Task<float[]> ForwardAsync(float[] latent, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl,
         IReadOnlyList<SdControlResiduals>? controls, CancellationToken cancellationToken = default)
+        => HostForwardAsync(latent, null, h, w, timestep, context, contextRows, xl, controls, cancellationToken);
+
+    /// <summary>
+    /// One prediction of an inpainting UNet from host arrays: <paramref name="latent"/> [OutChannels, h, w], <paramref name="concat"/> [ConcatChannels, h, w] (mask, then the masked
+    /// image's latent; see the device overload); returns [OutChannels, h, w].
+    /// </summary>
+    public Task<float[]> ForwardAsync(float[] latent, float[] concat, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl = null,
+        IReadOnlyList<SdControlResiduals>? controls = null, CancellationToken cancellationToken = default)
     {
-        if (latent.Length != (long)InChannels * h * w) throw new ArgumentException($"the latent must be [{InChannels}, {h}, {w}]");
+        if (ConcatChannels == 0) throw new InvalidOperationException($"this UNet takes {InChannels} input channels and no concatenated input (not an inpainting model)");
+        return HostForwardAsync(latent, concat, h, w, timestep, context, contextRows, xl, controls, cancellationToken);
+    }
+
+    private async Task<float[]> HostForwardAsync(float[] latent, float[]? concat, int h, int w, double timestep, float[] context, int contextRows, SdxlConditioning? xl,
+        IReadOnlyList<SdControlResiduals>? controls, CancellationToken cancellationToken)
+    {
+        int latC = concat != null ? InChannels - ConcatChannels : InChannels;
+        if (latent.Length != (long)latC * h * w) throw new ArgumentException($"the latent must be [{latC}, {h}, {w}]");
         if (context.Length != (long)contextRows * ContextDim) throw new ArgumentException($"the context must be [{contextRows}, {ContextDim}]");
         var lat = Slot(SlotHostIn, latent.Length); lat.CopyFromCPU(latent);
+        FV? cc = null;
+        if (concat != null)
+        {
+            if (concat.Length != (long)ConcatChannels * h * w) throw new ArgumentException($"the concatenated input must be [{ConcatChannels}, {h}, {w}]");
+            var cv = Slot(SlotHostConcat, concat.Length); cv.CopyFromCPU(concat); cc = cv;
+        }
         var ctx = Slot(SlotCtx, context.Length); ctx.CopyFromCPU(context);
         FV? y = null;
         if (IsXL)
@@ -465,7 +541,7 @@ public sealed partial class SdUNet : IDisposable
             var yv = Slot(SlotY, _admDim); yv.CopyFromCPU(SdxlLabel(xl, _admDim)); y = yv;
         }
         var o = Slot(SlotHostOut, (long)OutChannels * h * w);
-        await RunAsync(lat, h, w, timestep, ctx, contextRows, y, o, controls, null, null, cancellationToken);
+        await RunAsync(lat, h, w, timestep, ctx, contextRows, y, o, controls, null, null, cc, cancellationToken);
         await _acc.SynchronizeAsync();
         return await o.CopyToHostAsync();
     }

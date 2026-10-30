@@ -1,4 +1,5 @@
 using ILGPU;
+using ILGPU.Algorithms;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Trellis2;
 
@@ -199,6 +200,19 @@ public sealed class SdKernels
         _copyCols((int)((long)rows * C), src, dst, C, W, col);
     }
 
+    // dst [rows, C] = src [rows, W] columns [col, col + C) (PAG: the value block of a fused q|k|v)
+    private Action<Index1D, FV, FV, int, int, int>? _copyColsFrom;
+    private static void CopyColumnsFromImpl(Index1D i, FV src, FV dst, int C, int W, int col)
+    {
+        long r = i / C; int c = (int)(i % C);
+        dst[i] = src[r * W + col + c];
+    }
+    public void CopyColumnsFrom(FV src, FV dst, int rows, int C, int W, int col)
+    {
+        _copyColsFrom ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(CopyColumnsFromImpl);
+        _copyColsFrom((int)((long)rows * C), src, dst, C, W, col);
+    }
+
     // x [rows, C] += v [C] (the ResBlock's time embedding projection)
     private Action<Index1D, FV, FV, int>? _addRow;
     private static void AddRowImpl(Index1D i, FV x, FV v, int C) => x[i] = x[i] + v[(int)(i % C)];
@@ -247,6 +261,112 @@ public sealed class SdKernels
             int n = (int)Math.Min(BlendChunk, w.Length - at);
             _blend(n, w.SubView(at, n), o.SubView(at, n), a, b);
         }
+    }
+
+    // channel-first src [C, rows] into columns [colOff, colOff + C) of channel-last dst [rows, dstC]: the inpainting UNet's input is the latent and the
+    // concatenated mask + masked-image latent side by side, assembled here with no host copy
+    private Action<Index1D, FV, FV, int, int, int, int>? _toLastCols;
+    private static void ToLastColsImpl(Index1D i, FV src, FV dst, int rows, int C, int dstC, int colOff)
+    {
+        int p = i % rows, c = i / rows;
+        dst[(long)p * dstC + colOff + c] = src[i];
+    }
+    public void ChannelFirstToLastColumns(FV src, FV dst, int rows, int C, int dstC, int colOff)
+    {
+        _toLastCols ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(ToLastColsImpl);
+        _toLastCols((int)((long)rows * C), src, dst, rows, C, dstC, colOff);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // FreeU (ComfyUI's FreeU / FreeU_V2) on channel-last [rows = H * W, C] activations.
+    // Backbone: the first `cols` channels of h times s (V1), or times (s - 1) * normMean[p] + 1 (V2: normMean = the per-pixel channel mean of h, min-max normalised
+    // over the pixels). Skip: ComfyUI's Fourier_filter(x, threshold = 1, scale): fftn over (H, W), fftshift, the 2 x 2 window [c - 1, c + 1) around the centre times
+    // scale, inverse. That window holds the frequencies {-1, 0} x {-1, 0}, so the filter is x + (scale - 1) / (H W) * sum over those (k, l) of
+    // Re(X[k, l] e^{2 pi i (k m / H + l n / W)}): four DFT coefficients per channel and an elementwise correction, exact without an FFT. A side of 1 has one frequency.
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, int, int, float>? _scaleCols;
+    private static void ScaleColsImpl(Index1D i, FV x, int C, int cols, float s)
+    {
+        int ii = i; long p = ii / cols; int c = ii % cols;
+        x[p * C + c] = x[p * C + c] * s;
+    }
+    public void FreeUBackbone(FV x, int rows, int C, int cols, float s)
+    {
+        _scaleCols ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int, int, float>(ScaleColsImpl);
+        _scaleCols((int)((long)rows * cols), x, C, cols, s);
+    }
+
+    private Action<Index1D, FV, FV, int>? _pixelMean;
+    private static void PixelMeanImpl(Index1D p, FV x, FV mean, int C)
+    {
+        float acc = 0f;
+        for (int c = 0; c < C; c++) acc += x[(long)(int)p * C + c];
+        mean[p] = acc / C;
+    }
+    private Action<Index1D, FV, FV, int>? _minMax;
+    private static void MinMaxImpl(Index1D i, FV mean, FV mm, int rows)
+    {
+        float lo = mean[0], hi = mean[0];
+        for (int p = 1; p < rows; p++) { float v = mean[p]; lo = v < lo ? v : lo; hi = v > hi ? v : hi; }
+        mm[0] = lo; mm[1] = hi;
+    }
+    private Action<Index1D, FV, FV, FV, int, int, float>? _scaleColsV2;
+    private static void ScaleColsV2Impl(Index1D i, FV x, FV mean, FV mm, int C, int cols, float s)
+    {
+        int ii = i; long p = ii / cols; int c = ii % cols;
+        float m = (mean[p] - mm[0]) / (mm[1] - mm[0]);
+        x[p * C + c] = x[p * C + c] * ((s - 1f) * m + 1f);
+    }
+    /// <summary>FreeU_V2's backbone scaling. <paramref name="scratch"/> holds rows + 2 floats.</summary>
+    public void FreeUBackboneV2(FV x, int rows, int C, int cols, float s, FV scratch)
+    {
+        _pixelMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(PixelMeanImpl);
+        _minMax ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(MinMaxImpl);
+        _scaleColsV2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, float>(ScaleColsV2Impl);
+        var mean = scratch.SubView(0, rows); var mm = scratch.SubView(rows, 2);
+        _pixelMean(rows, x, mean, C);
+        _minMax(1, mean, mm, rows);
+        _scaleColsV2((int)((long)rows * cols), x, mean, mm, C, cols, s);
+    }
+
+    // coefficient f = (kIdx, lIdx) with k = -kIdx, l = -lIdx: X[c, f] = sum_p x[p, c] e^{-2 pi i (k m / H + l n / W)} -> coef[(c * 4 + f) * 2 + {re, im}]
+    private Action<Index1D, FV, FV, int, int, int>? _fourierCoef;
+    private static void FourierCoefImpl(Index1D i, FV x, FV coef, int H, int W, int C)
+    {
+        int ii = i, c = ii / 4, f = ii % 4, k = -(f >> 1), l = -(f & 1);
+        float re = 0f, im = 0f;
+        for (int m = 0; m < H; m++)
+            for (int n = 0; n < W; n++)
+            {
+                float th = -6.28318530718f * ((float)(k * m) / H + (float)(l * n) / W);
+                float v = x[((long)m * W + n) * C + c];
+                re += v * XMath.Cos(th); im += v * XMath.Sin(th);
+            }
+        coef[ii * 2] = re; coef[ii * 2 + 1] = im;
+    }
+    private Action<Index1D, FV, FV, int, int, int, float>? _fourierApply;
+    private static void FourierApplyImpl(Index1D i, FV x, FV coef, int H, int W, int C, float s)
+    {
+        int ii = i, c = ii % C; long p = ii / C; int m = (int)(p / W), n = (int)(p % W);
+        float add = 0f;
+        for (int f = 0; f < 4; f++)
+        {
+            int k = -(f >> 1), l = -(f & 1);
+            if ((k != 0 && H == 1) || (l != 0 && W == 1)) continue;      // a side of 1 has only frequency 0 (the window holds it once)
+            float th = 6.28318530718f * ((float)(k * m) / H + (float)(l * n) / W);
+            float re = coef[(c * 4 + f) * 2], im = coef[(c * 4 + f) * 2 + 1];
+            add += re * XMath.Cos(th) - im * XMath.Sin(th);
+        }
+        x[i] = x[i] + (s - 1f) / (H * W) * add;
+    }
+    /// <summary>ComfyUI's Fourier_filter(x, threshold 1, scale) in place on channel-last [H * W, C]. <paramref name="scratch"/> holds C * 8 floats.</summary>
+    public void FreeUFourier(FV x, int H, int W, int C, float scale, FV scratch)
+    {
+        _fourierCoef ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(FourierCoefImpl);
+        _fourierApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, float>(FourierApplyImpl);
+        var coef = scratch.SubView(0, (long)C * 8);
+        _fourierCoef(C * 4, x, coef, H, W, C);
+        _fourierApply((int)((long)H * W * C), x, coef, H, W, C, scale);
     }
 
     // fp16 -> fp32 (reading a small weight back to the host)

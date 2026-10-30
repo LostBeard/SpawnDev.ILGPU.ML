@@ -44,6 +44,26 @@ Batch 1; call it twice for classifier-free guidance (prompt and negative). `h` a
 overload takes and returns GPU views. `UNet.LabelWidth` is SDXL's label width (2816). SD 2.x runs its attention projections with fp32 activations
 (`UpcastAttention`, diffusers' `upcast_attention`): with fp16 tensor cores SD 2.1 768-v drifts 5e-2 from the reference on CUDA.
 
+Inpainting models (`UNet.ConcatChannels` = 5: SD 1.5 / 2.x / SDXL inpainting, 9 input channels) take what ComfyUI's InpaintModelConditioning concatenates:
+```csharp
+// concat [5, h, w] channel-first: the mask (1 = repaint) at latent resolution, then the masked image's SCALED latent (VAE encode * LatentScale) - diffusers' order
+float[] eps = await unet.ForwardAsync(latent /* [4, h, w] */, concat, h, w, timestep, te.Context, te.Rows);
+```
+The latent and the concatenated input are joined on the device (no host concatenation; the device overload takes both as GPU views). The split loader reads the
+diffusers inpainting UNet (`unet/diffusion_pytorch_model.fp16.safetensors`); single-file inpainting checkpoints load like any other (the 9-channel conv_in decides).
+
+## UNet patches (ComfyUI's FreeU / FreeU_V2 / PerturbedAttentionGuidance)
+
+```csharp
+unet.FreeU = new SdFreeU(1.1f, 1.2f, 0.9f, 0.2f);              // FreeU (b1, b2, s1, s2); V2: new SdFreeU(1.3f, 1.4f, 0.9f, 0.2f, V2: true); null = off
+unet.PerturbMiddleSelfAttention = true;                         // PAG's perturbed pass: the middle block's self-attention returns its values
+var perturbed = await unet.ForwardAsync(latent, h, w, t, cond.Context, cond.Rows);
+unet.PerturbMiddleSelfAttention = false;
+// ComfyUI's PAG: result = cfg_result + (cond_pred - perturbed) * scale
+```
+FreeU follows ComfyUI (nodes_freelunch.py), not diffusers: the scales are chosen by the channel count of the features entering an output block (4x the model
+channels -> b1 / s1, 2x -> b2 / s2), after ControlNet residuals; the Fourier filter (threshold 1) is computed exactly from four DFT coefficients per channel.
+
 ## VAE
 
 ```csharp

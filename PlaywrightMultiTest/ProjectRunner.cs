@@ -320,7 +320,7 @@ namespace PlaywrightMultiTest
                         testableProject.Browser = testableProject.BrowserContext.Browser;
                         // Grant all available permissions to avoid prompts
                         await testableProject.BrowserContext.GrantPermissionsAsync(
-                            new[] { "clipboard-read", "clipboard-write" }).ConfigureAwait(false);
+                            new[] { "clipboard-read", "clipboard-write", "camera", "microphone" }).ConfigureAwait(false);
                         // Temporary: capture browser console output containing WGSL dumps to a log file
                         var wgslDumpDir = Path.Combine(project.Directory, "..", "PlaywrightMultiTest", "WGSLDumps");
                         Directory.CreateDirectory(wgslDumpDir);
@@ -1432,7 +1432,10 @@ namespace PlaywrightMultiTest
                 "--no-sandbox",
                 // Auto-grant file system write permission (no prompt)
                 "--disable-features=FileSystemAccessPermissionPrompt",
-                "--allow-file-access-from-files"
+                "--allow-file-access-from-files",
+                // getUserMedia: Chromium's synthetic camera and microphone, no device picker (camera / microphone tests: Webcam_StartWebcam_DeliversFrames)
+                "--use-fake-device-for-media-stream",
+                "--use-fake-ui-for-media-stream"
             };
 
             // PMT_CHROMIUM_ARGS="--flag-a --flag-b": extra launch arguments for an A/B (nothing is added by default).
