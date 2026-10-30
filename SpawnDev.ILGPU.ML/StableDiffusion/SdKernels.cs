@@ -117,22 +117,27 @@ public sealed class SdKernels
     // (the VAE encoder's downsampler pads (0, 1, 0, 1) and convolves with no padding).
     // ---------------------------------------------------------------------------------------------------
     private Action<Index1D, IV, int, int, int, int, int, int, int, int>? _table;
-    private static void TableImpl(Index1D idx, IV nbr, int inH, int inW, int outW, int k, int stride, int pad, int up, int dummy)
+    // up > 1: the convolution reads a nearest-upsampled image of the OUTPUT's size (outH, outW), source row floor(y * inH / outH) computed in fp32 as torch's
+    // F.interpolate(mode="nearest", size=...) does: 2x for the usual blocks (y / 2 exactly), any size for ComfyUI's Upsample(output_shape = the next skip's shape).
+    private static void TableImpl(Index1D idx, IV nbr, int inH, int inW, int outW, int k, int stride, int pad, int up, int outH)
     {
         int taps = k * k;
         int t = idx % taps, m = idx / taps;
         int ox = m % outW, oy = m / outW;
         int ky = t / k, kx = t - ky * k;
         int iy = oy * stride - pad + ky, ix = ox * stride - pad + kx;
-        int H = inH * up, W = inW * up;
-        nbr[m * 27 + t] = (iy >= 0 && iy < H && ix >= 0 && ix < W) ? (iy / up) * inW + ix / up : -1;
+        int H = up > 1 ? outH : inH, W = up > 1 ? outW : inW;
+        bool inside = iy >= 0 && iy < H && ix >= 0 && ix < W;
+        int sy = up > 1 ? XMath.Min((int)XMath.Floor(iy * ((float)inH / H)), inH - 1) : iy;
+        int sx = up > 1 ? XMath.Min((int)XMath.Floor(ix * ((float)inW / W)), inW - 1) : ix;
+        nbr[m * 27 + t] = inside ? sy * inW + sx : -1;
     }
 
     /// <summary>Fill a neighbour table for a k x k convolution (k = 1 or 3): output size (outH, outW) for an input of (inH, inW).</summary>
     public void BuildTable(IV nbr, int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
     {
         _table ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int, int, int, int, int, int>(TableImpl);
-        _table(outH * outW * k * k, nbr, inH, inW, outW, k, stride, pad, up, 0);
+        _table(outH * outW * k * k, nbr, inH, inW, outW, k, stride, pad, up, outH);
     }
 
     /// <summary>
@@ -367,6 +372,57 @@ public sealed class SdKernels
         var coef = scratch.SubView(0, (long)C * 8);
         _fourierCoef(C * 4, x, coef, H, W, C);
         _fourierApply((int)((long)H * W * C), x, coef, H, W, C, scale);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Resize channel-last [inH * inW, C] -> [outH * outW, C] as torch's F.interpolate(size=...) with align_corners=False, no antialias (ComfyUI's common_upscale):
+    // mode 0 bicubic (A = -0.75, border-clamped taps), 1 bilinear, 2 nearest-exact. Source coordinate (dst + 0.5) * in / out - 0.5 (bilinear clamps it at 0).
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, int, int, int, int, int, int>? _resize;
+    private static float Cubic1(float x) => ((1.25f * x - 2.25f) * x) * x + 1f;                     // |x| <= 1, A = -0.75
+    private static float Cubic2(float x) => ((-0.75f * x + 3.75f) * x - 6f) * x + 3f;               // 1 < |x| < 2
+    private static void ResizeImpl(Index1D i, FV src, FV dst, int inH, int inW, int outH, int outW, int C, int mode)
+    {
+        int ii = i, c = ii % C, p = ii / C, ox = p % outW, oy = p / outW;
+        float sh = (float)inH / outH, sw = (float)inW / outW;
+        float v;
+        if (mode == 2)
+        {
+            int sy = XMath.Min((int)XMath.Floor((oy + 0.5f) * sh), inH - 1), sx = XMath.Min((int)XMath.Floor((ox + 0.5f) * sw), inW - 1);
+            v = src[((long)sy * inW + sx) * C + c];
+        }
+        else if (mode == 1)
+        {
+            float ry = XMath.Max((oy + 0.5f) * sh - 0.5f, 0f), rx = XMath.Max((ox + 0.5f) * sw - 0.5f, 0f);
+            int y0 = (int)ry, x0 = (int)rx;
+            int y1 = XMath.Min(y0 + 1, inH - 1), x1 = XMath.Min(x0 + 1, inW - 1);
+            float ty = ry - y0, tx = rx - x0;
+            v = (1 - ty) * ((1 - tx) * src[((long)y0 * inW + x0) * C + c] + tx * src[((long)y0 * inW + x1) * C + c])
+              + ty * ((1 - tx) * src[((long)y1 * inW + x0) * C + c] + tx * src[((long)y1 * inW + x1) * C + c]);
+        }
+        else
+        {
+            float ry = (oy + 0.5f) * sh - 0.5f, rx = (ox + 0.5f) * sw - 0.5f;
+            int fy = (int)XMath.Floor(ry), fx = (int)XMath.Floor(rx);
+            float ty = ry - fy, tx = rx - fx;
+            float wy0 = Cubic2(ty + 1f), wy1 = Cubic1(ty), wy2 = Cubic1(1f - ty), wy3 = Cubic2(2f - ty);
+            float wx0 = Cubic2(tx + 1f), wx1 = Cubic1(tx), wx2 = Cubic1(1f - tx), wx3 = Cubic2(2f - tx);
+            v = 0f;
+            for (int a = 0; a < 4; a++)
+            {
+                int yy = XMath.Clamp(fy - 1 + a, 0, inH - 1);
+                float wy = a == 0 ? wy0 : a == 1 ? wy1 : a == 2 ? wy2 : wy3;
+                long row = (long)yy * inW;
+                int xa = XMath.Clamp(fx - 1, 0, inW - 1), xb = XMath.Clamp(fx, 0, inW - 1), xc = XMath.Clamp(fx + 1, 0, inW - 1), xd = XMath.Clamp(fx + 2, 0, inW - 1);
+                v += wy * (wx0 * src[(row + xa) * C + c] + wx1 * src[(row + xb) * C + c] + wx2 * src[(row + xc) * C + c] + wx3 * src[(row + xd) * C + c]);
+            }
+        }
+        dst[i] = v;
+    }
+    public void Resize(FV src, FV dst, int inH, int inW, int outH, int outW, int C, int mode)
+    {
+        _resize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int>(ResizeImpl);
+        _resize((int)((long)outH * outW * C), src, dst, inH, inW, outH, outW, C, mode);
     }
 
     // fp16 -> fp32 (reading a small weight back to the host)

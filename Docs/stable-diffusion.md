@@ -61,6 +61,12 @@ var perturbed = await unet.ForwardAsync(latent, h, w, t, cond.Context, cond.Rows
 unet.PerturbMiddleSelfAttention = false;
 // ComfyUI's PAG: result = cfg_result + (cond_pred - perturbed) * scale
 ```
+Deep shrink (ComfyUI's PatchModelAddDownscale):
+```csharp
+unet.DeepShrink = new SdDeepShrink(Block: 3, Factor: 2.0, AfterSkip: true);   // bicubic down / up by default (SdResize)
+// ComfyUI applies it only while sigma is in [sigma(end_percent), sigma(start_percent)] (defaults 0 .. 0.35): set it for those steps, null for the rest
+```
+The latent may have any size (not only multiples of 8): upsampling blocks resize to the next skip connection's size, as ComfyUI does.
 FreeU follows ComfyUI (nodes_freelunch.py), not diffusers: the scales are chosen by the channel count of the features entering an output block (4x the model
 channels -> b1 / s1, 2x -> b2 / s2), after ControlNet residuals; the Fourier filter (threshold 1) is computed exactly from four DFT coefficients per channel.
 

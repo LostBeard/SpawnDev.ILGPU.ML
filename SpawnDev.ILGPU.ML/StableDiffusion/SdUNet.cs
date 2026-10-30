@@ -20,13 +20,24 @@ using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 /// </summary>
 public sealed record SdFreeU(float B1, float B2, float S1, float S2, bool V2 = false);
 
+/// <summary>How a feature map is resized (torch's F.interpolate, align_corners False, as ComfyUI's common_upscale).</summary>
+public enum SdResize { Bicubic, Bilinear, NearestExact }
+
+/// <summary>
+/// ComfyUI's PatchModelAddDownscale ("Kohya deep shrink", <see cref="SdUNet.DeepShrink"/>): after input block <see cref="Block"/> the features are resized by
+/// 1 / <see cref="Factor"/> (Python's round of each side) with <see cref="Down"/> - after the skip connection is stored when <see cref="AfterSkip"/> - and an output
+/// block whose features do not meet their skip connection's size resizes them to it with <see cref="Up"/>. ComfyUI applies it only while the step's sigma is inside
+/// [sigma(end_percent), sigma(start_percent)] (defaults 0 and 0.35): set and clear the property per step accordingly.
+/// </summary>
+public sealed record SdDeepShrink(int Block = 3, double Factor = 2.0, bool AfterSkip = true, SdResize Down = SdResize.Bicubic, SdResize Up = SdResize.Bicubic);
+
 public sealed record SdxlConditioning(float[] Pooled, int OriginalHeight, int OriginalWidth, int CropTop, int CropLeft, int TargetHeight, int TargetWidth);
 
 /// <summary>
 /// The Stable Diffusion UNet (the LDM <c>UNetModel</c>, read from a single-file checkpoint in its original key names): SD 1.x, SD 2.x and SDXL are one code path, the layout
 /// (levels, resnets per level, transformer depth, heads, linear or 1x1-conv projections, SDXL's label embedding) is read from the tensors themselves.
 /// One call is one noise prediction at one timestep for batch 1 (the sampler, CFG and noise stay with the caller): <see cref="ForwardAsync(float[], int, int, double, float[], int, SdxlConditioning?, CancellationToken)"/>.
-/// The latent may have any size whose sides are multiples of 8 (three halvings). Activations are channel-last fp32 [pixels, C], weights fp16, convolutions the gathered-row
+/// The latent may have any size (odd sides halve upward and upsample back to their skip connection's size, as in ComfyUI). Activations are channel-last fp32 [pixels, C], weights fp16, convolutions the gathered-row
 /// implicit GEMM (tensor cores on CUDA), attention the portable flash kernels. The prediction is whatever the model was trained for (epsilon for SD 1.x / SDXL base, v for the
 /// SD 2.x 768-v models: <see cref="SdCheckpoint.Prediction"/>).
 /// </summary>
@@ -127,6 +138,9 @@ public sealed partial class SdUNet : IDisposable
     /// </summary>
     public bool UpcastAttention { get; set; }
 
+    /// <summary>Deep shrink (<see cref="SdDeepShrink"/>), null = off.</summary>
+    public SdDeepShrink? DeepShrink { get; set; }
+
     /// <summary>FreeU / FreeU_V2 on the output blocks (<see cref="SdFreeU"/>), null = off. Applied after ControlNet residuals are added to the skips, as ComfyUI does.</summary>
     public SdFreeU? FreeU { get; set; }
 
@@ -212,7 +226,7 @@ public sealed partial class SdUNet : IDisposable
         return b.View.SubView(0, n);
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
-        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22,
+        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -299,24 +313,26 @@ public sealed partial class SdUNet : IDisposable
         _k.Conv(x, Table(H, W, oh, ow, 3, 2, 1, 1), _w[m.Prefix + "weight"], _w[m.Prefix + "bias"], dst, oh * ow, m.Cin, m.Cout, 9);
     }
 
-    private void Up(Module m, FV x, FV dst, int H, int W)
+    // nearest upsampling to (oh, ow) fused into the convolution: twice the size, or (ComfyUI's Upsample(output_shape)) the size of the skip connection it meets next
+    private void Up(Module m, FV x, FV dst, int H, int W, int oh, int ow)
     {
-        _k.Conv(x, Table(H, W, 2 * H, 2 * W, 3, 1, 1, 2), _w[m.Prefix + "weight"], _w[m.Prefix + "bias"], dst, 4 * H * W, m.Cin, m.Cout, 9);
+        _k.Conv(x, Table(H, W, oh, ow, 3, 1, 1, 2), _w[m.Prefix + "weight"], _w[m.Prefix + "bias"], dst, oh * ow, m.Cin, m.Cout, 9);
     }
 
     /// <summary>
     /// Run one block's modules from <paramref name="x"/>; the last writes into <paramref name="last"/>, or (null) into whichever ping-pong slot its input is not in.
     /// Returns the output view and size.
     /// </summary>
-    private (FV View, int H, int W, int C) RunBlock(Module[] mods, FV x, FV? last, FV embAct, FV ctx, int ctxRows, int H, int W, int c, long maxElems)
+    private (FV View, int H, int W, int C) RunBlock(Module[] mods, FV x, FV? last, FV embAct, FV ctx, int ctxRows, int H, int W, int c, long maxElems,
+        (int H, int W)? upTo = null)
     {
         var cur = x;
         for (int i = 0; i < mods.Length; i++)
         {
             var m = mods[i];
             bool isLast = i == mods.Length - 1;
-            int oh = m.Kind == Kind.Down ? (H + 1) / 2 : m.Kind == Kind.Up ? 2 * H : H;
-            int ow = m.Kind == Kind.Down ? (W + 1) / 2 : m.Kind == Kind.Up ? 2 * W : W;
+            int oh = m.Kind == Kind.Down ? (H + 1) / 2 : m.Kind == Kind.Up ? upTo?.H ?? 2 * H : H;
+            int ow = m.Kind == Kind.Down ? (W + 1) / 2 : m.Kind == Kind.Up ? upTo?.W ?? 2 * W : W;
             long n = (long)oh * ow * m.Cout;
             FV dst = isLast && last.HasValue ? last.Value.SubView(0, n) : PickFree(cur, maxElems).SubView(0, n);
             switch (m.Kind)
@@ -324,7 +340,7 @@ public sealed partial class SdUNet : IDisposable
                 case Kind.Res: ResBlock(m, cur, dst, embAct, H, W); break;
                 case Kind.Attn: Transformer(m, cur, dst, ctx, ctxRows, H, W); break;
                 case Kind.Down: Down(m, cur, dst, H, W); break;
-                case Kind.Up: Up(m, cur, dst, H, W); break;
+                case Kind.Up: Up(m, cur, dst, H, W, oh, ow); break;
             }
             cur = dst; H = oh; W = ow; c = m.Cout;
         }
@@ -381,7 +397,6 @@ public sealed partial class SdUNet : IDisposable
         int latC = concat.HasValue ? InChannels - ConcatChannels : InChannels;
         if (latent.Length != (long)latC * h * w) throw new ArgumentException($"the latent must be [{latC}, {h}, {w}]");
         if (concat.HasValue && concat.Value.Length != (long)ConcatChannels * h * w) throw new ArgumentException($"the concatenated input must be [{ConcatChannels}, {h}, {w}]");
-        if (h % 8 != 0 || w % 8 != 0) throw new ArgumentException("the latent sides must be multiples of 8");
         if (encoderOut == null && OutChannels == 0) throw new InvalidOperationException("this UNet holds the encoder half only (a ControlNet's): it cannot predict");
         if (IsXL != y.HasValue) throw new ArgumentException(IsXL ? "an SDXL UNet needs the label vector (pooled text + size ids)" : "only an SDXL UNet takes a label vector");
         int mc = ModelChannels, rows0 = h * w;
@@ -440,7 +455,17 @@ public sealed partial class SdUNet : IDisposable
             foreach (var m in mods) { if (m.Kind == Kind.Down) { oh = (oh + 1) / 2; ow = (ow + 1) / 2; } }
             var dst = Slot(SlotSkip + 1 + i, (long)oh * ow * oc);
             (cur, Hc, Wc, Cc) = RunBlock(mods, cur, dst, embAct, context, contextRows, Hc, Wc, Cc, maxElems);
-            skips.Add((cur, Hc, Wc, Cc));
+            if (DeepShrink is { } ds && ds.Block == i + 1 && encoderOut == null)
+            {
+                // ComfyUI's input_block_patch(_after_skip): round(side / factor) with Python's round (half to even)
+                int nh = (int)Math.Round(Hc * (1.0 / ds.Factor), MidpointRounding.ToEven), nw = (int)Math.Round(Wc * (1.0 / ds.Factor), MidpointRounding.ToEven);
+                var small = Slot(SlotShrink, (long)nh * nw * Cc);
+                if (ds.AfterSkip) skips.Add((cur, Hc, Wc, Cc));
+                _k.Resize(cur, small, Hc, Wc, nh, nw, Cc, (int)ds.Down);
+                (cur, Hc, Wc) = (small, nh, nw);
+                if (!ds.AfterSkip) skips.Add((cur, Hc, Wc, Cc));
+            }
+            else skips.Add((cur, Hc, Wc, Cc));
             encoderOut?.Invoke(i + 1, cur, Hc, Wc, Cc);
             bool levelEnd = mods.Any(m => m.Kind == Kind.Down) || i == _input.Count - 1;
             if (levelEnd) { Tap?.Invoke($"down_{level}", cur, Hc, Wc, Cc); level++; }
@@ -466,7 +491,14 @@ public sealed partial class SdUNet : IDisposable
             skips.RemoveAt(skips.Count - 1);
             if (controls != null)
                 foreach (var c in controls) _k.AxpyInPlace(sv, c[skips.Count], c.Strength, (long)sh * sw * sc);     // the skip this block concatenates + strength x residual
-            if (sh != Hc || sw != Wc) throw new InvalidOperationException($"skip {sh}x{sw} does not meet {Hc}x{Wc} (latent sides must be multiples of 8)");
+            if (sh != Hc || sw != Wc)
+            {
+                // only deep shrink makes the features miss their skip connection (ComfyUI's output_block_patch resizes them to it)
+                if (DeepShrink is not { } dsu) throw new InvalidOperationException($"skip {sh}x{sw} does not meet {Hc}x{Wc}");
+                var big = Slot(SlotShrinkUp, (long)sh * sw * Cc);
+                _k.Resize(cur, big, Hc, Wc, sh, sw, Cc, (int)dsu.Up);
+                (cur, Hc, Wc) = (big, sh, sw);
+            }
             if (FreeU is { } fu && (Cc == mc * 4 || Cc == mc * 2))
             {
                 // ComfyUI's output_block_patch: chosen by the channel count of h (not by the block index, as diffusers does)
@@ -482,7 +514,9 @@ public sealed partial class SdUNet : IDisposable
             var mods = _output[i];
             var first = mods[0];
             if (first.Cin != Cc + sc) throw new InvalidOperationException($"output block {i}: expects {first.Cin} channels, got {Cc + sc}");
-            (cur, Hc, Wc, Cc) = RunBlock(mods, cat, null, embAct, context, contextRows, Hc, Wc, Cc + sc, maxElems);
+            // an upsampling block resizes to the next skip connection's size (ComfyUI: Upsample(output_shape = hs[-1].shape)): 2x unless the sides are odd
+            (int, int)? upTo = skips.Count > 0 ? (skips[^1].H, skips[^1].W) : null;
+            (cur, Hc, Wc, Cc) = RunBlock(mods, cat, null, embAct, context, contextRows, Hc, Wc, Cc + sc, maxElems, upTo);
             bool levelEnd = mods.Any(m => m.Kind == Kind.Up) || i == _output.Count - 1;
             if (levelEnd) { Tap?.Invoke($"up_{level}", cur, Hc, Wc, Cc); level++; }
             if (_acc.IsBrowser()) await _acc.SynchronizeAsync();
