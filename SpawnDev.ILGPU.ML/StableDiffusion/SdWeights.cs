@@ -101,6 +101,17 @@ public sealed class SdWeights : IDisposable
     /// <summary>The file-level names this store answers for: the held tensors and the parts fused into them.</summary>
     internal IEnumerable<string> SourceNames => _shapes.Keys.Concat(_fusedParts.Keys);
 
+    /// <summary>
+    /// Every file-level tensor as it lives now: a held tensor whole (row 0, all rows), a part fused away as its rows of the fused tensor. The fused tensors themselves are
+    /// not listed (their parts are). What a saved file is written from.
+    /// </summary>
+    internal IEnumerable<(string Source, string Tensor, int RowOffset, int Rows)> Sources()
+    {
+        var fused = new HashSet<string>(_fusedParts.Values.Select(f => f.Fused), StringComparer.Ordinal);
+        foreach (var n in _shapes.Keys) if (!fused.Contains(n)) yield return (n, n, 0, _shapes[n].Length == 0 ? 1 : _shapes[n][0]);
+        foreach (var (p, f) in _fusedParts) yield return (p, f.Fused, f.RowOffset, f.Rows);
+    }
+
     public void Dispose()
     {
         foreach (var b in _t.Values) b.Dispose();

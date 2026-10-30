@@ -33,9 +33,13 @@ The sampler, noise, CFG and host latents stay in SpawnGen. Tokenizer: `BPETokeni
 - [x] a 20-step DDIM picture vs diffusers with the same noise (host sampler): CUDA 7.2e-3, OpenCL 4.8e-5 (e878b7e6)
 - [x] SDXL base (two towers, pooled, size ids, VAE fp32 activations): CUDA green at 40x48 and 1024x1024 (UNet 436 ms/step)
 - [x] SD 2.x: 2.1 768-v (V inferred), 2.1 base (eps), sgm-layout sd_turbo (Lore's report); UpcastAttention for SD 2.x on CUDA (e878b7e6). Stability deleted its SD 2 repos: files from sd2-community
-- [x] LoRA merge (ApplyLorasAsync, kohya/PEFT/LDM keys, restore): LCM-LoRA SD 1.5 gated; [ ] a LoRA with text-encoder keys, an SDXL LoRA
+- [x] LoRA merge (ApplyLorasAsync, kohya/PEFT/LDM keys, restore): LCM-LoRA SD 1.5 gated; [x] a LoRA with text-encoder keys (retrocgi), SDXL LoRAs (LCM-LoRA SDXL, pixel-art-xl), the old diffusers attn-procs format (c3ef2f04)
 - [x] Split component loaders (SdUNet/SdVae/SdTextEncoder.LoadAsync, LoadSdxlAsync; LDM/diffusers/HF/OpenCLIP names), gated (8cd376f9); [x] TAESD / TAESDXL (b057bb3b); [x] standalone LoRA + InferPredictionAsync (b057bb3b)
-- [x] ControlNet SD 1.x (SdControlNet, control_model.* single files; canny gated 8.3e-4 / 4.5e-4, b057bb3b); [ ] SDXL ControlNets, diffusers-format ControlNets, Control-LoRA
+- [x] ControlNet SD 1.x (SdControlNet, control_model.* single files; canny gated 8.3e-4 / 4.5e-4, b057bb3b); [x] SDXL ControlNets, diffusers-format ControlNets (a58ece28); [ ] Control-LoRA, controlnet-union-sdxl
 - [ ] diffusers-format single files (second name map), SDXL refiner
+- [x] Model merge (Lore #1, 10-30): `SdUNet / SdTextEncoder.MergeAsync(other, factors)`, `SdMerge.Simple / Add / Subtract / Blocks` (ComfyUI's ModelMergeSimple / Add / Subtract / Blocks / SD1 / SDXL, CLIPMerge*); edits in call order with LoRAs (`SdPatchState`), `ResetAsync`; gated: SD 2.1 base + 768-v Blocks 0.2/0.5/0.8 + CLIP 0.3, 1.22e9 values 0 beyond 1 fp16 ulp, reset bit-identical; merge / LoRA order 7 checks (CUDA)
+- [x] Save (Lore #1, 10-30): `SdCheckpoint.SaveAsync` (CheckpointSave), `SdUNet / SdTextEncoder / SdVae.SaveAsync` (ModelSave / CLIPSave / VAESave), F16 / F32 / BF16, `v_pred` marker, streams through CopyToStreamAsync; gated: SD 1.5 + SD 2.1 round trip bit-exact vs the source files, reload bit-identical (CUDA)
+- [ ] merge / save on OpenCL; a browser save into an OPFS / download stream (CopyToStreamAsync JS path)
+- [ ] Lore #2 inpainting UNet (9 input channels, c_concat), #3 UNet patches (FreeU, PAG, SAG, deep shrink, HyperTile, ToMe), #4 SDXL refiner + CLIPTextEncodeSDXLRefiner, #5 unCLIP / CLIP vision / IP-Adapter / GLIGEN
 - [ ] memory: SDXL VAE decode at 1024 needs ~4 GB of activations: tiled decode for small cards / browser
 - [x] the browser 404 probes (mirrors.json index, 1d5b4b34) + OPFS cache never hit for HF-served files (261047b8)

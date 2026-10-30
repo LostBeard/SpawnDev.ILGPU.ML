@@ -20,7 +20,6 @@ public sealed class SdKernels
     private readonly Accelerator _acc;
     private readonly SparseKernels _sk;
     private MemoryBuffer1D<float, Stride1D.Dense>? _partial, _stats;
-    private MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>? _noBias;
 
     /// <summary>The most multiply-adds x 2 one convolution or linear dispatch may cover (default 2^34: ~10 ms on a mid-range desktop GPU's portable GEMM); larger ones run as row chunks.</summary>
     public static long MaxFlopsPerDispatch { get; set; } = 1L << 34;
@@ -227,6 +226,27 @@ public sealed class SdKernels
     {
         _mergeLora ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, HV, int, int, int, int, int, int, float>(MergeLoraImpl);
         _mergeLora((int)((long)N * K), w, up, down, K, rank, rowOff, cols, taps, cin, scale);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Model merge: w = w * a + o * b on fp16 weights, computed in fp32 (ComfyUI's add_patches: strength_model, strength_patch). Launched in chunks of at most
+    // BlendChunk elements so no launch grows with the tensor (SDXL's token table is 63 M).
+    // ---------------------------------------------------------------------------------------------------
+    private const int BlendChunk = 1 << 24;
+    private Action<Index1D, HV, HV, float, float>? _blend;
+    private static void BlendImpl(Index1D i, HV w, HV o, float a, float b)
+        => w[i] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(PrecisionConvert.ConvertToSingle(w[i]) * a + PrecisionConvert.ConvertToSingle(o[i]) * b);
+    public void Blend(HV w, HV o, float a, float b)
+    {
+        if (w.Length != o.Length) throw new ArgumentException($"blend of {w.Length} and {o.Length} elements");
+        _blend ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, float, float>(BlendImpl);
+        // OpenCL (SpawnDev.ILGPU 5.4.13-local.1): a launch on a SubView at offset >= 2^24 elements wrote outside its range (garbage in other buffers); one launch
+        // was exact. Reported to SpawnDev.ILGPU; gated by Sd21_MergeBlocksAndClip_MatchComfyFormulas (SD 2.1's 50.6 M-element token table takes 3 chunks).
+        for (long at = 0; at < w.Length; at += BlendChunk)
+        {
+            int n = (int)Math.Min(BlendChunk, w.Length - at);
+            _blend(n, w.SubView(at, n), o.SubView(at, n), a, b);
+        }
     }
 
     // fp16 -> fp32 (reading a small weight back to the host)

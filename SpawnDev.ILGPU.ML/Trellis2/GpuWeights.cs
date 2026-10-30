@@ -50,7 +50,7 @@ public sealed class GpuWeights : IDisposable
         {
             using var reader = SafeTensorsFileReader.Open(safetensorsPath);
             w.Metadata = reader.Metadata;
-            var prof = Environment.GetEnvironmentVariable("TRELLIS2_PROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew(); double tAlloc = 0, tUp = 0;
+            var prof = Environment.GetEnvironmentVariable("TRELLIS2_PROFILE") == "1"; var psw = System.Diagnostics.Stopwatch.StartNew(); double tUp = 0;
             foreach (var t in reader.Tensors)
             {
                 if (prof) psw.Restart();

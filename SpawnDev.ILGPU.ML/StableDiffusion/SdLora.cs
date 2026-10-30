@@ -22,20 +22,21 @@ public sealed record SdLoraReport(IReadOnlyList<(string Lora, int Patched, IRead
 /// LoRA merging into the resident fp16 weights: W += strength * alpha / rank * (up @ down), on the device, into the fused q|k|v / k|v rows where the projection was fused.
 /// Key formats: kohya (<c>lora_unet_*</c>, <c>lora_te_*</c>, <c>lora_te1_*</c> / <c>lora_te2_*</c>, diffusers or LDM module paths with underscores; <c>.lora_down / .lora_up / .alpha</c>),
 /// PEFT / diffusers (<c>unet.* / text_encoder.* / text_encoder_2.*</c> with <c>.lora_A / .lora_B</c> or <c>.lora.down / .lora.up</c>) and LDM dotted names (<c>diffusion_model.*</c>).
-/// Linear and convolution (LoCon) modules. The original of every patched tensor is kept on the device, so a new set of LoRAs (or new strengths) restores before merging.
+/// Linear and convolution (LoCon) modules. What a LoRA set is taken off to is kept by the store's <see cref="SdPatchState"/>, so a new set of LoRAs (or new strengths)
+/// restores before merging.
 /// </summary>
-internal sealed class SdLoraMerger : IDisposable
+internal sealed class SdLoraMerger
 {
     private readonly Accelerator _acc;
     private readonly SdKernels _k;
     private readonly SdWeights? _unet, _text;
+    private readonly SdPatchState? _unetState, _textState;
     private readonly SdFamily _family;
-    private readonly Dictionary<(SdWeights, string), MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _originals = new();
     private Dictionary<string, (SdWeights Store, string Source, bool Clip)>? _index;
 
-    public SdLoraMerger(Accelerator acc, SdWeights? unet, SdWeights? text, SdFamily family)
+    public SdLoraMerger(Accelerator acc, SdPatchState? unet, SdPatchState? text, SdFamily family)
     {
-        _acc = acc; _k = new SdKernels(acc); _unet = unet; _text = text; _family = family;
+        _acc = acc; _k = new SdKernels(acc); _unetState = unet; _textState = text; _unet = unet?.Weights; _text = text?.Weights; _family = family;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -121,8 +122,8 @@ internal sealed class SdLoraMerger : IDisposable
 
     public async Task RestoreAsync()
     {
-        foreach (var ((store, name), orig) in _originals) store[name].CopyFrom(orig.View);
-        await _acc.SynchronizeAsync();
+        if (_unetState != null) await _unetState.RestoreLorasAsync();
+        if (_textState != null) await _textState.RestoreLorasAsync();
     }
 
     public async Task<SdLoraReport> ApplyAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken ct)
@@ -183,12 +184,7 @@ internal sealed class SdLoraMerger : IDisposable
                 float alpha = e.Alpha != null && alphas.TryGetValue(e.Alpha, out var a) ? a : rank;
                 float scale = (clip ? spec.ClipStrength : spec.Strength) * alpha / rank;
                 if (scale == 0f) continue;
-                if (!_originals.ContainsKey((store, tname)))
-                {
-                    var copy = _acc.Allocate1D<global::ILGPU.Half>(store[tname].Length);
-                    copy.View.CopyFrom(store[tname]);
-                    _originals[(store, tname)] = copy;
-                }
+                (store == _text ? _textState : _unetState)!.BeforeLora(tname);
                 _k.MergeLora(store[tname], lw[e.Up], lw[e.Down], N, K, rank, rowOff, cols, taps, cin, scale);
                 patched++;
             }
@@ -196,11 +192,5 @@ internal sealed class SdLoraMerger : IDisposable
             results.Add((spec.Name, patched, unmatched));
         }
         return new SdLoraReport(results);
-    }
-
-    public void Dispose()
-    {
-        foreach (var b in _originals.Values) b.Dispose();
-        _originals.Clear();
     }
 }

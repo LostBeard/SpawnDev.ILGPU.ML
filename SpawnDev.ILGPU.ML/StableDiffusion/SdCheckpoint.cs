@@ -175,6 +175,21 @@ public sealed class SdCheckpoint : IDisposable
         return new SdLoraReport(rows);
     }
 
+    /// <summary>
+    /// Write the loaded components' current weights (merges and LoRAs included) as one single-file checkpoint in the LDM layout (ComfyUI's CheckpointSave):
+    /// <c>model.diffusion_model.*</c>, the text encoders under their family's names, <c>first_stage_model.*</c>, and ComfyUI's <c>v_pred</c> marker for a v-prediction
+    /// model (<see cref="SdSaveOptions.VPrediction"/>, default <see cref="Prediction"/>). Components not loaded are not written. Streams front to back.
+    /// </summary>
+    public Task SaveAsync(Stream target, SdSaveOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        options ??= new SdSaveOptions();
+        var list = new List<SdSafeTensorsWriter.Out>();
+        if (UNet != null) list.AddRange(SdSafeTensorsWriter.Ldm(UNet.Weights, "model.diffusion_model."));
+        if (TextEncoder != null) list.AddRange(SdSafeTensorsWriter.Text(TextEncoder.Weights, Family));
+        if (Vae != null) list.AddRange(SdSafeTensorsWriter.Ldm(Vae.Weights, "first_stage_model."));
+        return SdSafeTensorsWriter.WriteAsync(_acc, target, list, options, options.VPrediction ?? Prediction == SdPrediction.V, cancellationToken);
+    }
+
     public void Dispose()
     {
         UNet?.Dispose(); TextEncoder?.Dispose(); Vae?.Dispose();

@@ -136,6 +136,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// utterance says <c>then=21, else=0</c>, so all five of this decoder's Ifs take exactly that path -
     /// and <c>SessionGraphCapture</c> no longer refuses on sight, it runs one forward with the body counter
     /// zeroed and records only if NOTHING ran. The device survives and the plan records 8,197 dispatches.
+    /// </para>
     /// <para>
     /// 🔴 It still defaults OFF because REPLAY IS NOT FAITHFUL - see the decoder-capture remarks above.
     /// Speed was never the blocker; correctness is. Turning this on today would ship confident, wrong

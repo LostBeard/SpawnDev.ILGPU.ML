@@ -28,6 +28,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// </para>
 /// <para>
 /// Models are cached locally so they only download once — subsequent loads are instant.
+/// </para>
 /// <para>
 /// For API access (search, metadata, file listing) without caching, use
 /// <see cref="HuggingFaceClient"/> directly.
@@ -56,7 +57,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// var cached = await hub.ListCachedAsync();
 /// foreach (var (key, size) in cached) Console.WriteLine($"  {key}: {size / 1024 / 1024} MB");
 /// </code>
-/// </summary>
+/// </remarks>
 public class ModelHub : IDisposable
 {
     /// <summary>

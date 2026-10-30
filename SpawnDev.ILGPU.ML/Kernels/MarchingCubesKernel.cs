@@ -15,8 +15,6 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// </summary>
 public class MarchingCubesKernel
 {
-    private readonly Accelerator _accelerator;
-
     /// <summary>
     /// Extract an isosurface mesh from a 3D density field.
     /// </summary>

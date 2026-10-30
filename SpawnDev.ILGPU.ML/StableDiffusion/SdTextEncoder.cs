@@ -69,6 +69,8 @@ public sealed partial class SdTextEncoder : IDisposable
     private bool _ownsWeights;            // loaded alone (LoadAsync / LoadSdxlAsync): Dispose frees the weights too
     private readonly SdFamily _family;
     private SdLoraMerger? _lora;
+    private SdPatchState? _patches;
+    private SdPatchState Patches => _patches ??= new SdPatchState(_acc, _w);
 
     /// <summary>
     /// Merge LoRAs into these text encoder(s) (their text modules at <see cref="SdLoraSpec.ClipStrength"/>; UNet keys are ignored here and reported unmatched), replacing
@@ -76,9 +78,36 @@ public sealed partial class SdTextEncoder : IDisposable
     /// </summary>
     public Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
     {
-        _lora ??= new SdLoraMerger(_acc, null, _w, _family);
+        _lora ??= new SdLoraMerger(_acc, null, Patches, _family);
         return _lora.ApplyAsync(loras, cancellationToken);
     }
+
+    /// <summary>The model family these encoders belong to (SD 1.x CLIP-L, SD 2.x OpenCLIP-H, SDXL both).</summary>
+    public SdFamily Family => _family;
+
+    /// <summary>
+    /// Merge other text encoders of the same family into these (ComfyUI's CLIPMergeSimple / CLIPAdd / CLIPSubtract: <see cref="SdMerge"/>). Same rules as
+    /// <see cref="SdUNet.MergeAsync"/>; tensor names are <c>l. / h. / g.</c> + <c>tok, pos, layers.N.{ln1, qkv, out, ln2, fc1, fc2}, final_ln, proj</c>.
+    /// </summary>
+    public Task<SdMergeReport> MergeAsync(SdTextEncoder other, Func<string, SdMergeFactors?> factors, bool restorable = true, CancellationToken cancellationToken = default)
+    {
+        if (!ReferenceEquals(other._acc, _acc)) throw new ArgumentException("the other text encoder is on another accelerator", nameof(other));
+        if (other._family != _family) throw new ArgumentException($"a {other._family} text encoder cannot be merged into a {_family} one", nameof(other));
+        return SdMerge.RunAsync(_acc, _k, Patches, other._w, factors, restorable, cancellationToken);
+    }
+
+    /// <summary>Undo every merge and LoRA: back to the weights the file had.</summary>
+    public Task ResetAsync() => _patches?.ResetAsync() ?? Task.CompletedTask;
+
+    /// <summary>
+    /// Write these encoders' current weights as a .safetensors file under the names a checkpoint of their family uses (<c>cond_stage_model.*</c> /
+    /// <c>conditioner.embedders.*</c>): ComfyUI's CLIPSave, read back by <see cref="LoadAsync(Accelerator, Stream, string, Action{string, double}?, CancellationToken)"/> /
+    /// <c>LoadSdxlAsync</c> and ComfyUI's CLIPLoader.
+    /// </summary>
+    public Task SaveAsync(Stream target, SdSaveOptions? options = null, CancellationToken cancellationToken = default)
+        => SdSafeTensorsWriter.WriteAsync(_acc, target, SdSafeTensorsWriter.Text(_w, _family), options ?? new SdSaveOptions(), false, cancellationToken);
+
+    internal SdWeights Weights => _w;
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -188,7 +217,7 @@ public sealed partial class SdTextEncoder : IDisposable
         _slots.Clear();
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();
-        _lora?.Dispose();
+        _patches?.Dispose();
         if (_ownsWeights) _w.Dispose();
     }
 }

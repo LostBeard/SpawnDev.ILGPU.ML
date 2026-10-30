@@ -213,7 +213,8 @@ public static class GraphOptimizer
             if (beta == null || !PerChannel(beta, out int c2) || c1 != c2 || c1 % groups != 0) continue;
 
             float eps = 1e-5f;
-            if (inorm.Attributes.TryGetValue("epsilon", out var epsEl) && epsEl.ValueKind == JsonValueKind.Number)
+            // a node built without an attribute dictionary (the TFLite loader) has Attributes == null: ONNX's default epsilon
+            if (inorm.Attributes != null && inorm.Attributes.TryGetValue("epsilon", out var epsEl) && epsEl.ValueKind == JsonValueKind.Number)
                 eps = epsEl.GetSingle();
 
             graph.Nodes[r1] = new GraphNode

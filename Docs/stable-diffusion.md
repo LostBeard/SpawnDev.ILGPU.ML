@@ -62,6 +62,38 @@ kohya (`lora_unet_*`, `lora_te_*`, `lora_te1_* / lora_te2_*`), PEFT / diffusers 
 and convolution (LoCon) modules; merged on the device into the fp16 weights (into the fused q|k|v rows where the projection was fused). The report lists the keys
 that matched nothing in the checkpoint.
 
+## Merging models (ComfyUI's ModelMerge* / CLIPMerge*)
+
+```csharp
+using var other = await SdCheckpoint.LoadAsync(accelerator, source, repo2, file2, new SdCheckpointOptions { LoadVae = false });
+await ck.UNet!.MergeAsync(other.UNet!, SdMerge.Simple(0.6f));          // ModelMergeSimple: W = W1 * 0.6 + W2 * 0.4
+await ck.TextEncoder!.MergeAsync(other.TextEncoder!, SdMerge.Simple(0.6f));   // CLIPMergeSimple
+await ck.UNet.MergeAsync(other.UNet!, SdMerge.Blocks(new KeyValuePair<string, float>[] { new("input", 0.2f), new("middle", 0.5f), new("out", 0.8f) }));  // ModelMergeBlocks
+// ModelMergeSD1 / SDXL: Blocks with ComfyUI's argument names ("time_embed.", "label_emb.", "input_blocks.0." ... "middle_block.1." ... "out.") - the longest prefix wins,
+// the first entry's ratio when none matches. SdMerge.Add() = ModelAdd (W1 + W2), SdMerge.Subtract(m) = ModelSubtract ((W1 - W2) * m).
+other.Dispose();                                                       // the second model is only read
+await ck.UNet.ResetAsync();                                            // back to the file's weights (merges and LoRAs)
+```
+A factor function gets each tensor's internal name (UNet: the LDM name without `model.diffusion_model.`, the q|k|v / k|v projections fused under the
+same block prefix; text: `l. / h. / g.` + `tok, pos, layers.N.{ln1, qkv, out, ln2, fc1, fc2}, final_ln, proj`) and returns the factors or null (leave it).
+Edits apply in call order, like the graph: LoRAs applied after a merge stay replaceable (`ApplyLorasAsync` takes them off back to the merged weights); a
+merge on top of LoRAs bakes them in (LoraLoader -> ModelMergeSimple computes exactly that). The file's weights of every edited tensor are kept on the device
+for `ResetAsync` (as much memory again as the merged tensors); `MergeAsync(..., restorable: false)` skips that copy (an SDXL UNet is 5 GB), and `ResetAsync` then throws.
+
+## Saving (ComfyUI's CheckpointSave / ModelSave / CLIPSave / VAESave)
+
+```csharp
+await using var file = File.Create("merged.safetensors");          // any writable Stream; in the browser an OPFS / download write stream
+await ck.SaveAsync(file, new SdSaveOptions { DType = SdSaveDType.F16, Metadata = new Dictionary<string, string> { ["title"] = "my merge" } });
+await ck.UNet!.SaveAsync(unetFile);      // model.diffusion_model.*        (UNETLoader reads it back)
+await ck.TextEncoder!.SaveAsync(clipFile); // cond_stage_model.* / conditioner.embedders.*
+await ck.Vae!.SaveAsync(vaeFile);         // encoder.* / decoder.* (no prefix, VAELoader)
+```
+The current weights (merges and LoRAs included) in the LDM single-file layout, fp16 (default, no rounding: the weights are held as fp16), fp32 or bf16, and
+ComfyUI's empty `v_pred` tensor for a v-prediction checkpoint (`SdSaveOptions.VPrediction`, default the checkpoint's `Prediction`). Written front to back
+(no seeking); each tensor goes back to the file layout on the device and out through `CopyToStreamAsync`, so in the browser the bytes go GPU -> JS -> stream
+without the .NET heap. Not written, as in ComfyUI's saves: tensors the loaders do not read (EMA copies, `alphas_cumprod`, `position_ids`, `logit_scale`).
+
 ## Split loaders (ComfyUI's UNETLoader / VAELoader / CLIPLoader / DualCLIPLoader)
 
 ```csharp

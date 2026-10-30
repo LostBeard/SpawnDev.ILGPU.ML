@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 
@@ -74,6 +75,44 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 180000)]
     public async Task Fusion_ErfGelu_MatchesOnnxRuntime() => await FusionFixture("erf_gelu",
         ops => ops.Contains("Erf") ? "an Erf survived: FuseErfGelu did not claim every GELU chain" : null);
+
+    /// <summary>
+    /// The GroupNorm chain whose InstanceNormalization carries NO attribute dictionary (a node built by the TFLite loader: <c>GraphNode.Attributes</c> null, not
+    /// empty) fuses with ONNX's default epsilon 1e-5. The fusion read <c>inorm.Attributes.TryGetValue("epsilon")</c> unguarded: a NullReferenceException out of
+    /// GraphOptimizer.Optimize, so the model failed to load. Host-only (the optimizer): runs on the CPU lane.
+    /// </summary>
+    [TestMethod]
+    public async Task Fusion_GroupNorm_InstanceNormWithoutAttributes_UsesDefaultEpsilon() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.CPU) throw new UnsupportedTestException("host-only check: runs on the CPU lane");
+        var graph = new ModelGraph
+        {
+            Name = "groupnorm_null_attrs",
+            Inputs = new() { new() { Name = "x", Shape = new[] { 1, 4, 2, 2 } } },
+            Outputs = new() { new() { Name = "y", Shape = new[] { 1, 4, 2, 2 } } },
+            Initializers = new() { ["shape_g"] = new[] { 3 }, ["ones"] = new[] { 2 }, ["zeros"] = new[] { 2 }, ["gamma"] = new[] { 4, 1, 1 }, ["beta"] = new[] { 4, 1, 1 } },
+            Nodes = new()
+            {
+                N("Reshape", new[] { "x", "shape_g" }, new[] { "r1" }),
+                N("InstanceNormalization", new[] { "r1", "ones", "zeros" }, new[] { "in" }),     // attrs: null
+                N("Shape", new[] { "x" }, new[] { "xs" }),
+                N("Reshape", new[] { "in", "xs" }, new[] { "r2" }),
+                N("Mul", new[] { "r2", "gamma" }, new[] { "m" }),
+                N("Add", new[] { "m", "beta" }, new[] { "y" }),
+            },
+        };
+        graph.ConstantData = new() { ["shape_g"] = new[] { 0, 2, -1 } };
+        graph.FloatConstantData = new() { ["ones"] = new[] { 1f, 1f }, ["zeros"] = new[] { 0f, 0f } };
+        var optimized = GraphOptimizer.Optimize(graph);
+        var gn = optimized.Nodes.SingleOrDefault(nd => nd.OpType == "GroupNormalization")
+            ?? throw new Exception("not fused: " + string.Join(",", optimized.Nodes.Select(nd => nd.OpType)));
+        float eps = gn.Attributes!["epsilon"].GetSingle();
+        int groups = gn.Attributes["num_groups"].GetInt32();
+        if (eps != 1e-5f || groups != 2 || optimized.Nodes.Any(nd => nd.OpType == "InstanceNormalization"))
+            throw new Exception($"fused with epsilon {eps}, {groups} groups: {string.Join(",", optimized.Nodes.Select(nd => nd.OpType))}");
+        await Task.CompletedTask;
+        return $"fused into GroupNormalization (epsilon {eps}, {groups} groups)";
+    });
 
     /// <summary>torch's GroupNorm export fuses into one GroupNormalization and matches onnxruntime.</summary>
     [TestMethod(Timeout = 180000)]

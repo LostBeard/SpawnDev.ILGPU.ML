@@ -99,6 +99,9 @@ public class MediaStreamCapture : IDisposable
     /// <summary>The error that ended audio capture, if any. Cleared by a new StartMicrophoneAsync.</summary>
     public Exception? LastAudioError { get; private set; }
 
+    /// <summary>Why the last <see cref="StartWebcamAsync"/> returned false (null after a successful start).</summary>
+    public Exception? LastVideoError { get; private set; }
+
     /// <summary>Whether microphone capture is currently running.</summary>
     public bool IsCapturingAudio => _audioReader != null;
 
@@ -122,13 +125,14 @@ public class MediaStreamCapture : IDisposable
     public async Task<bool> StartWebcamAsync(int width = 640, int height = 480, bool facingUser = true)
     {
         if (_isCapturing) return false;
+        LastVideoError = null;
 
         try
         {
             using var navigator = _js.Get<Navigator>("navigator");
             using var mediaDevices = navigator.MediaDevices;
             _stream = await mediaDevices.GetUserMedia(video: true, audio: false);
-            if (_stream == null) return false;
+            if (_stream == null) { LastVideoError = new InvalidOperationException("getUserMedia returned no stream"); return false; }
 
             Width = width;
             Height = height;
@@ -136,10 +140,9 @@ public class MediaStreamCapture : IDisposable
             // Create hidden video element to receive the stream
             _video = new HTMLVideoElement();
             _video.SrcObject = _stream;
-            _video.Play();
-
-            // Wait for video to start
-            await Task.Delay(100);
+            // play() resolves once playback has started (frames can be drawn); a rejection (autoplay policy, device lost) lands in the catch below.
+            // It was not awaited (a fixed 100 ms delay stood in for it), so a rejected play was an unobserved exception and capture started on a dead video.
+            await _video.Play();
 
             _isCapturing = true;
             _captureCts = new CancellationTokenSource();
@@ -147,8 +150,9 @@ public class MediaStreamCapture : IDisposable
 
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            LastVideoError = ex;
             Stop();
             return false;
         }
@@ -167,7 +171,8 @@ public class MediaStreamCapture : IDisposable
 
         _video = new HTMLVideoElement();
         _video.SrcObject = _stream;
-        _video.Play();
+        // a rejected play() (autoplay policy, an ended stream) stops the capture instead of becoming an unobserved exception
+        _ = _video.Play().ContinueWith(t => { if (t.IsFaulted) Stop(); }, TaskScheduler.Default);
 
         _isCapturing = true;
         _captureCts = new CancellationTokenSource();

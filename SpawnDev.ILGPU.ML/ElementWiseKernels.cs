@@ -1664,7 +1664,6 @@ public class ElementWiseKernels : IDisposable
         int rank = (int)paramsArr[0];
         // Decode output flat index to coordinates
         int tmp = idx;
-        float val = 0f;
         bool inBounds = true;
         int srcIdx = 0;
         for (int d = rank - 1; d >= 0; d--)

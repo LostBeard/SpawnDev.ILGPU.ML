@@ -49,7 +49,7 @@ public sealed class SdControlResiduals : IDisposable
 /// A ControlNet (lllyasviel's ControlNet v1.0 / v1.1 for SD 1.x in the single-file layout ComfyUI uses: <c>control_model.*</c>, e.g. <c>control_v11p_sd15_canny_fp16.safetensors</c>;
 /// and the diffusers ControlNetModel files most SDXL ControlNets ship as, e.g. <c>diffusers/controlnet-canny-sdxl-1.0</c>):
 /// the UNet's encoder half (input blocks and middle block) fed the latent plus an encoded hint picture, whose block outputs go through zero-initialised 1x1 convolutions into
-/// residuals for the UNet's skip connections and middle block. <see cref="RunAsync(FV, int, int, double, FV, int, FV, FV?, CancellationToken)"/> computes them,
+/// residuals for the UNet's skip connections and middle block. <see cref="RunAsync(FV, int, int, double, FV, int, FV, FV?, SdControlResiduals?, CancellationToken)"/> computes them,
 /// <see cref="SdUNet.ForwardAsync(FV, int, int, double, FV, int, FV?, FV, IReadOnlyList{SdControlResiduals}?, CancellationToken)"/> adds them. The hint is the control picture
 /// [3, 8h, 8w] in [0, 1] (a canny edge map, a depth map, ...), as ComfyUI passes it.
 /// </summary>

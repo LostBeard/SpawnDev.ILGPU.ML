@@ -27,6 +27,8 @@ public sealed partial class SdUNet : IDisposable
     private bool _ownsWeights;            // loaded alone (LoadAsync): Dispose frees the weights too
     internal bool VPredTensor;            // the file carried a "v_pred" tensor (ComfyUI's marker of a v-prediction fine-tune)
     private SdLoraMerger? _lora;
+    private SdPatchState? _patches;
+    private SdPatchState Patches => _patches ??= new SdPatchState(_acc, _w);
 
     /// <summary>The model family by its context width (768 SD 1.x, 1024 SD 2.x, 2048 SDXL).</summary>
     public SdFamily Family => ContextDim switch { 768 => SdFamily.SD1, 1024 => SdFamily.SD2, _ => SdFamily.SDXL };
@@ -56,9 +58,38 @@ public sealed partial class SdUNet : IDisposable
     /// </summary>
     public Task<SdLoraReport> ApplyLorasAsync(IReadOnlyList<SdLoraSpec> loras, CancellationToken cancellationToken = default)
     {
-        _lora ??= new SdLoraMerger(_acc, _w, null, Family);
+        _lora ??= new SdLoraMerger(_acc, Patches, null, Family);
         return _lora.ApplyAsync(loras, cancellationToken);
     }
+
+    /// <summary>
+    /// Merge another UNet into this one, tensor by tensor: <c>W = W * Self + W_other * Other</c> with the factors <paramref name="factors"/> returns for each tensor name
+    /// (null = leave it; <see cref="SdMerge"/> has ComfyUI's ModelMergeSimple / Add / Subtract / Blocks / SD1 / SDXL). <paramref name="other"/> must be loaded on the same
+    /// accelerator; it is read, not changed, and may be disposed afterwards. Edits apply in call order as in ComfyUI's graph: the merge reads this UNet's current weights
+    /// (LoRAs included, which become part of the weights) and the other's current weights (its own merges and LoRAs included); LoRAs applied after it stay replaceable.
+    /// <paramref name="restorable"/> keeps the file's weights of every changed tensor on the device (<see cref="ResetAsync"/>), as much memory again as the merged tensors:
+    /// false saves that (an SDXL UNet is 5 GB) and makes <see cref="ResetAsync"/> throw.
+    /// </summary>
+    public Task<SdMergeReport> MergeAsync(SdUNet other, Func<string, SdMergeFactors?> factors, bool restorable = true, CancellationToken cancellationToken = default)
+    {
+        if (!ReferenceEquals(other._acc, _acc)) throw new ArgumentException("the other UNet is on another accelerator", nameof(other));
+        return SdMerge.RunAsync(_acc, _k, Patches, other._w, factors, restorable, cancellationToken);
+    }
+
+    /// <summary>Undo every merge and LoRA: back to the weights the file had.</summary>
+    public Task ResetAsync() => _patches?.ResetAsync() ?? Task.CompletedTask;
+
+    /// <summary>
+    /// Write this UNet's current weights (merges and LoRAs included) as a .safetensors file with LDM names (<c>model.diffusion_model.*</c>: ComfyUI's ModelSave, which
+    /// <see cref="LoadAsync(Accelerator, Stream, string, Action{string, double}?, CancellationToken)"/> and ComfyUI's UNETLoader read back). Streams front to back.
+    /// </summary>
+    public Task SaveAsync(Stream target, SdSaveOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        options ??= new SdSaveOptions();
+        return SdSafeTensorsWriter.WriteAsync(_acc, target, SdSafeTensorsWriter.Ldm(_w, "model.diffusion_model."), options, options.VPrediction ?? false, cancellationToken);
+    }
+
+    internal SdWeights Weights => _w;
     private readonly Accelerator _acc;
     private readonly SdWeights _w;
     private readonly SdKernels _k;
@@ -296,7 +327,7 @@ public sealed partial class SdUNet : IDisposable
         => RunAsync(latent, h, w, timestep, context, contextRows, y, output, null, default, null, cancellationToken);
 
     /// <summary>
-    /// <see cref="ForwardAsync(FV, int, int, double, FV, int, FV?, FV, CancellationToken)"/> with ControlNet residuals (<see cref="SdControlNet.RunAsync(FV, int, int, double, FV, int, FV, FV?, CancellationToken)"/>):
+    /// <see cref="ForwardAsync(FV, int, int, double, FV, int, FV?, FV, CancellationToken)"/> with ControlNet residuals (<see cref="SdControlNet.RunAsync(FV, int, int, double, FV, int, FV, FV?, SdControlResiduals?, CancellationToken)"/>):
     /// each set, times its strength, is added to the skip connections and the middle block's output (several ControlNets add up, as ComfyUI chains them).
     /// </summary>
     public Task ForwardAsync(FV latent, int h, int w, double timestep, FV context, int contextRows, FV? y, FV output, IReadOnlyList<SdControlResiduals>? controls,
@@ -459,7 +490,7 @@ public sealed partial class SdUNet : IDisposable
         _retired.Clear();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
-        _lora?.Dispose();
+        _patches?.Dispose();
         if (_ownsWeights) _w.Dispose();
     }
 }

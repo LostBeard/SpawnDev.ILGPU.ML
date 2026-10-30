@@ -36,6 +36,15 @@ public sealed partial class SdVae : IDisposable
     /// <summary>Test hook: (stage name, activation view [pixels, C] channel-last, height, width, channels); valid only during the call.</summary>
     public Action<string, FV, int, int, int>? Tap { get; set; }
 
+    /// <summary>
+    /// Write this VAE as a .safetensors file with LDM names and no prefix (<c>encoder.* / decoder.* / quant_conv.* / post_quant_conv.*</c>: ComfyUI's VAESave, read back by
+    /// <see cref="LoadAsync(Accelerator, Stream, string, Action{string, double}?, CancellationToken)"/> and ComfyUI's VAELoader).
+    /// </summary>
+    public Task SaveAsync(Stream target, SdSaveOptions? options = null, CancellationToken cancellationToken = default)
+        => SdSafeTensorsWriter.WriteAsync(_acc, target, SdSafeTensorsWriter.Ldm(_w, ""), options ?? new SdSaveOptions(), false, cancellationToken);
+
+    internal SdWeights Weights => _w;
+
     public SdVae(Accelerator accelerator, SdWeights weights)
     {
         _acc = accelerator; _w = weights; _k = new SdKernels(accelerator); _dk = new DiTKernels(accelerator);
