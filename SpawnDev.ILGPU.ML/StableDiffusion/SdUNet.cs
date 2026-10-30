@@ -147,6 +147,25 @@ public sealed partial class SdUNet : IDisposable
     /// </summary>
     public bool UpcastAttention { get; set; }
 
+    /// <summary>
+    /// Self-Attention Guidance's capture (ComfyUI's SelfAttentionGuidance records the middle block's first self-attention, attn1 of ("middle", 0, 0), in the
+    /// unconditional pass): while true, every prediction keeps that attention's per-key mass - softmax(q k^T / sqrt(d)) averaged over the heads and summed over
+    /// the queries, ComfyUI's attn.mean(1).sum(1) - for <see cref="ReadMiddleAttentionAsync"/>. The prediction itself is unchanged.
+    /// </summary>
+    public bool RecordMiddleSelfAttention { get; set; }
+    private int _sagN;
+
+    /// <summary>
+    /// The middle-attention mass of the last prediction made with <see cref="RecordMiddleSelfAttention"/> on ([tokens] at the middle block's resolution), or null.
+    /// Feed it to <see cref="SdGuidance.SagBlur"/> with the unconditional x0 prediction.
+    /// </summary>
+    public async Task<float[]?> ReadMiddleAttentionAsync()
+    {
+        if (_sagN == 0) return null;
+        await _acc.SynchronizeAsync();
+        return await Slot(SlotSagMass, _sagN).CopyToHostAsync();
+    }
+
     /// <summary>HyperTile (<see cref="SdHyperTile"/>), null = off.</summary>
     public SdHyperTile? HyperTile { get; set; }
     private int _latH, _latW;           // the latent size of the running prediction (HyperTile's original_shape)
@@ -239,7 +258,7 @@ public sealed partial class SdUNet : IDisposable
         return b.View.SubView(0, n);
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
-        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26,
+        SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26, SlotSagMass = 27, SlotSagStats = 28, SlotSagPart = 29,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -304,6 +323,12 @@ public sealed partial class SdUNet : IDisposable
                 _k.TileRows(n, qkvIn, rows, g0.Th, g0.Tw, g0.Nw, C, inverse: false);
             }
             _k.Linear(qkvIn, _w[b + "attn1.qkv.weight"], null, qkv, rows, C, 3 * C, exact: UpcastAttention);
+            if (RecordMiddleSelfAttention && j == 0 && grid == null && !pag && p.StartsWith("middle_block.", StringComparison.Ordinal))
+            {
+                int Hh = Heads(C);
+                _k.AttentionKeyMass(qkv, Slot(SlotSagMass, rows), Slot(SlotSagStats, 2L * Hh * rows), Slot(SlotSagPart, (long)Hh * rows), rows, C, Hh);
+                _sagN = rows;
+            }
             var a = Slot(SlotMid, (long)rows * 4 * C).SubView(0, (long)rows * C);
             if (pag)
                 _k.CopyColumnsFrom(qkv, a, rows, C, 3 * C, 2 * C);                     // PAG: softmax(q k^T) replaced by the identity -> the values
@@ -466,6 +491,7 @@ public sealed partial class SdUNet : IDisposable
         if (IsXL != y.HasValue) throw new ArgumentException(IsXL ? "an SDXL UNet needs the label vector (pooled text + size ids)" : "only an SDXL UNet takes a label vector");
         int mc = ModelChannels, rows0 = h * w;
         _latH = h; _latW = w;
+        _sagN = 0;
         // the largest activation: a level's pixels x the widest concatenated input of that level (output blocks read h | skip)
         long maxElems = (long)rows0 * mc * 2;
         {

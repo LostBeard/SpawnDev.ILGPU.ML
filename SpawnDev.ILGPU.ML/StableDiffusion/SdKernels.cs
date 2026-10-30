@@ -235,6 +235,74 @@ public sealed class SdKernels
         _tileRows((int)((long)rows * C), src, dst, th, tw, nw, C, inverse ? 1 : 0);
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // Self-Attention Guidance's attention capture: mass[j] = mean over heads of sum over queries i of softmax_j(q_i . k_j * scale) - ComfyUI's
+    // attn.mean(1).sum(1) of attention_basic_with_sim's sim, the input of create_blur_map. q, k from a fused [N, 3C] q|k|v (k at column C). Three launches:
+    // per (head, query) the softmax max and sum; per (head, key) the sum over queries; per key the mean over heads.
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, int, int, int, float>? _attnRowStats;
+    private static void AttnRowStatsImpl(Index1D idx, FV qkv, FV stats, int N, int C, int D, float scale)
+    {
+        int ii = idx, h = ii / N, i = ii % N;
+        long qb = (long)i * 3 * C + h * D;
+        float mx = float.NegativeInfinity;
+        for (int j = 0; j < N; j++)
+        {
+            long kb = (long)j * 3 * C + C + h * D;
+            float s = 0f;
+            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            s *= scale;
+            mx = s > mx ? s : mx;
+        }
+        float sum = 0f;
+        for (int j = 0; j < N; j++)
+        {
+            long kb = (long)j * 3 * C + C + h * D;
+            float s = 0f;
+            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            sum += XMath.Exp(s * scale - mx);
+        }
+        stats[ii * 2] = mx; stats[ii * 2 + 1] = sum;
+    }
+    private Action<Index1D, FV, FV, FV, int, int, int, float>? _attnKeyPart;
+    private static void AttnKeyPartImpl(Index1D idx, FV qkv, FV stats, FV part, int N, int C, int D, float scale)
+    {
+        int ii = idx, h = ii / N, j = ii % N;
+        long kb = (long)j * 3 * C + C + h * D;
+        float acc = 0f;
+        for (int i = 0; i < N; i++)
+        {
+            long qb = (long)i * 3 * C + h * D;
+            float s = 0f;
+            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            int r = h * N + i;
+            acc += XMath.Exp(s * scale - stats[r * 2]) / stats[r * 2 + 1];
+        }
+        part[ii] = acc;
+    }
+    private Action<Index1D, FV, FV, int, int>? _attnKeyMean;
+    private static void AttnKeyMeanImpl(Index1D j, FV part, FV mass, int N, int H)
+    {
+        float acc = 0f;
+        for (int h = 0; h < H; h++) acc += part[h * N + j];
+        mass[j] = acc / H;
+    }
+    /// <summary>
+    /// mass [N] from a fused q|k|v [N, 3C] with H heads of width C / H. <paramref name="stats"/> holds 2 * H * N floats, <paramref name="part"/> H * N (separate
+    /// buffers: sub-views of one buffer in one WebGPU launch must start 256 bytes apart).
+    /// </summary>
+    public void AttentionKeyMass(FV qkv, FV mass, FV stats, FV part, int N, int C, int H)
+    {
+        int D = C / H;
+        float scale = 1f / MathF.Sqrt(D);
+        _attnRowStats ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, float>(AttnRowStatsImpl);
+        _attnKeyPart ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, float>(AttnKeyPartImpl);
+        _attnKeyMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(AttnKeyMeanImpl);
+        _attnRowStats(H * N, qkv, stats, N, C, D, scale);
+        _attnKeyPart(H * N, qkv, stats, part, N, C, D, scale);
+        _attnKeyMean(N, part, mass, N, H);
+    }
+
     // x [rows, C] += v [C] (the ResBlock's time embedding projection)
     private Action<Index1D, FV, FV, int>? _addRow;
     private static void AddRowImpl(Index1D i, FV x, FV v, int C) => x[i] = x[i] + v[(int)(i % C)];

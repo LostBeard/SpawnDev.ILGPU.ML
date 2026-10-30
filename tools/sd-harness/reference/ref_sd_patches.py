@@ -79,6 +79,52 @@ class HyperTileAttn:                                 # ComfyUI nodes_hypertile.p
         return self.base(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
 
 
+class SimAttn:                                       # ComfyUI SAG's attention_basic_with_sim: the same output, the softmax kept
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, **kw):
+        b, n, c = hidden_states.shape
+        heads = attn.heads
+        d = c // heads
+        q, k, v = (t.view(b, n, heads, d).permute(0, 2, 1, 3) for t in (attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states)))
+        sim = ((q @ k.transpose(-1, -2)) * d ** -0.5).softmax(-1)
+        STATE["sim"] = sim.reshape(b * heads, n, n)
+        return attn.to_out[1](attn.to_out[0]((sim @ v).permute(0, 2, 1, 3).reshape(b, n, c)))
+
+
+def gaussian_blur_2d(img, kernel_size, sigma):        # ComfyUI comfy_extras/nodes_sag.py
+    ksize_half = (kernel_size - 1) * 0.5
+    x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size)
+    pdf = torch.exp(-0.5 * (x / sigma).pow(2))
+    x_kernel = pdf / pdf.sum()
+    kernel2d = torch.mm(x_kernel[:, None], x_kernel[None, :])
+    kernel2d = kernel2d.expand(img.shape[-3], 1, kernel2d.shape[0], kernel2d.shape[1])
+    padding = [kernel_size // 2, kernel_size // 2, kernel_size // 2, kernel_size // 2]
+    img = torch.nn.functional.pad(img, padding, mode="reflect")
+    return torch.nn.functional.conv2d(img, kernel2d, groups=img.shape[-3])
+
+
+def create_blur_map(x0, attn, sigma=3.0, threshold=1.0):   # ComfyUI comfy_extras/nodes_sag.py
+    _, hw1, hw2 = attn.shape
+    b, _, lh, lw = x0.shape
+    attn = attn.reshape(b, -1, hw1, hw2)
+    mask = attn.mean(1, keepdim=False).sum(1, keepdim=False) > threshold
+    total = mask.shape[-1]
+    x = round(math.sqrt((lh / lw) * total))
+    xx = None
+    for i in range(0, math.floor(math.sqrt(total) / 2)):
+        for j in [(x + i), max(1, x - i)]:
+            if total % j == 0:
+                xx = j
+                break
+        if xx is not None:
+            break
+    x = xx
+    y = total // x
+    mask = (mask.reshape(b, x, y).unsqueeze(1).type(attn.dtype))
+    mask = torch.nn.functional.interpolate(mask, (lh, lw))
+    blurred = gaussian_blur_2d(x0, kernel_size=9, sigma=sigma)
+    return blurred * mask + x0 * (1 - mask)
+
+
 class IdentityAttn:                                  # PAG: softmax(q k^T) -> identity, the attention returns v (then to_out)
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, **kw):
         return attn.to_out[1](attn.to_out[0](attn.to_v(hidden_states)))
@@ -129,6 +175,19 @@ def main():
     for n, m in unet.named_modules():
         if n in procs:
             m.set_processor(procs[n])
+    # SAG: the middle block's first self-attention map (transformer_blocks[0].attn1), its per-key mass, and ComfyUI's blur map of a test latent
+    blk = unet.mid_block.attentions[0].transformer_blocks[0].attn1
+    saved_p = blk.processor
+    blk.set_processor(SimAttn())
+    out["eps_sag_record"] = run()                     # must equal eps_plain: recording does not change the prediction
+    blk.set_processor(saved_p)
+    sim = STATE["sim"]
+    heads = sim.shape[0]
+    out["sag_mass"] = sim.reshape(1, heads, sim.shape[1], sim.shape[2]).mean(1).sum(1)[0].numpy()
+    x0 = latent                                         # any latent: the blur map is a function of x0 and the mass
+    out["sag_degraded"] = create_blur_map(x0, sim, sigma=2.0, threshold=1.0)[0].numpy()
+    print("sag mass", out["sag_mass"].shape, "min", float(out["sag_mass"].min()), "max", float(out["sag_mass"].max()), "above 1:", int((out["sag_mass"] > 1).sum()),
+          "record vs plain", float(np.abs(out["eps_sag_record"] - out["eps_plain"]).max()))
     np.savez(a.out, **out)
     for k in ("plain", "freeu", "freeu2", "pag", "hypertile"):
         e = out["eps_" + k]
