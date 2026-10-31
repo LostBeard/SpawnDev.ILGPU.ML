@@ -122,8 +122,12 @@
             @if (Ltx)
             {
             <div class="vid-setting">
+                <label>Keep loaded:</label>
+                <input type="checkbox" class="vid-keep" @bind="_ltxKeep" disabled="@Busy" title="Keep the transformer and the VAE on the GPU between clips: about 5 s faster per clip (a 704x480 clip with a repeated prompt: 35 s to 30 s on an RTX 4070), about 5 GB more GPU memory. Leave it off on GPUs with 8 GB or less." />
+            </div>
+            <div class="vid-setting">
                 <label>Two-pass:</label>
-                <input type="checkbox" @bind="_ltxUpscale" disabled="@_isRunning" title="The distilled model's recipe: a first pass at 2/3 of the size, the x2 latent upscaler, and 3 more steps at twice the first-pass size (896x576 for 704x480). Sharper, slower, more GPU memory." />
+                <input type="checkbox" @bind="_ltxUpscale" disabled="@Busy" title="The distilled model's recipe: a first pass at 2/3 of the size, the x2 latent upscaler, and 3 more steps at twice the first-pass size (896x576 for 704x480). Sharper, slower, more GPU memory." />
             </div>
             }
             @if (!Ltx)
@@ -284,7 +288,7 @@
     private string _dit = "turbo";                      // "turbo" | "turbo_q4" | "q8" | "q4"
     private string _model = "wan";                      // "wan" | "ltx"
     private bool Ltx => _model == "ltx";
-    private bool _ltxUpscale;
+    private bool _ltxUpscale, _ltxKeep;
     private string _mode = "t2v";                       // "t2v" | "i2v" | "morph" (LTX) | "extend" (LTX)
     private bool _hasPreview, _cameraOn;
     private string _previewLabel = "", _camUrl = "";
@@ -321,6 +325,7 @@
 
     private void ModelChanged()
     {
+        _ltxPipeline?.Dispose();                                                   // frees the weights it kept on the GPU (KeepLoaded)
         _pipeline = null; _ltxPipeline = null; _isModelLoaded = false;
         _modelStatusText = Ltx ? "LTX-Video 2B" : "Wan 2.2 TI2V-5B";
         if (Ltx) { _size = "480x320"; _frames = 49; }              // the first pass of LTX's recipe: fast; 8n + 1 frames
@@ -537,6 +542,7 @@
                 var c = _lastClip!.Value;
                 conditions = new[] { new LtxCondition { Rgb = c.Rgb, Width = c.Width, Height = c.Height, Frames = c.Frames } };
             }
+            if (Ltx) _ltxPipeline!.KeepLoaded = _ltxKeep;
             if (Ltx) _ltxPipeline!.Preview = p => ShowPreview(p.X0, p.Frames, p.Height, p.Width, LatentPreview.Ltx, $"step {p.Step} of {p.Steps}{(p.Pass.Length > 0 ? $" ({p.Pass})" : "")}: what the model sees so far");
             else _pipeline!.Preview = p => ShowPreview(p.X0, p.Frames, p.Height, p.Width, LatentPreview.Wan, $"step {p.Step} of {p.Steps}: what the model sees so far");
             var video = Ltx
@@ -604,6 +610,7 @@
     public void Dispose()
     {
         try { _camera?.Dispose(); } catch { }
+        try { _ltxPipeline?.Dispose(); } catch { }
         try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
         try { using var player = JS.Get<SpawnJSObject>("videoPlayer"); player.JSRef!.CallVoid("stop", "vid-player"); } catch { }
         _accelerator?.Dispose(); _accelerator = null;

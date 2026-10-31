@@ -145,7 +145,7 @@ public sealed class LtxRequest
 /// large model is on the device at a time. Returns the same container as the Wan pipeline (frames in [-1, 1], channel-first). Every stage is gated against the diffusers reference
 /// (LTXPipeline for text to video, LTXConditionPipeline with conditions; see <c>Plans/ltx-video-2b-2026-10-22.md</c>).
 /// </summary>
-public sealed class LtxPipeline
+public sealed class LtxPipeline : IDisposable
 {
     private readonly Accelerator _acc;
     private readonly LtxPaths _paths;
@@ -178,6 +178,39 @@ public sealed class LtxPipeline
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
         return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, file, cancellationToken: ct);
     }
+
+    /// <summary>
+    /// Keep the DiT, the VAE decoder and encoder and the latent upscaler on the device between generations instead of loading them for every clip (the T5 is streamed as
+    /// always). In the browser (RTX 4070) a 704x480 x97 clip with a cached prompt went from 35 s to 30 s; it costs their size in device memory (about 5 GB with the 8-bit DiT)
+    /// on top of every stage's own peak, so leave it off on an 8 GB GPU. <see cref="Dispose"/> (or setting it back to false) frees them.
+    /// </summary>
+    public bool KeepLoaded { get => _keep; set { _keep = value; if (!value) ReleaseKept(); } }
+    private bool _keep;
+    private readonly Dictionary<string, GpuWeights> _kept = new();
+
+    /// <summary>The weights of <paramref name="file"/> for one stage: kept ones are shared (the lease does not free them), others are freed with the lease.</summary>
+    private async Task<WeightsLease> AcquireAsync(string file, CancellationToken ct)
+    {
+        if (_keep && _kept.TryGetValue(file, out var w)) return new WeightsLease(w, owned: false);
+        var loaded = await LoadWeightsAsync(file, ct);
+        if (_keep) { _kept[file] = loaded; return new WeightsLease(loaded, owned: false); }
+        return new WeightsLease(loaded, owned: true);
+    }
+
+    private sealed class WeightsLease(GpuWeights w, bool owned) : IDisposable
+    {
+        public GpuWeights W { get; } = w;
+        public void Dispose() { if (owned) W.Dispose(); }
+    }
+
+    private void ReleaseKept()
+    {
+        foreach (var w in _kept.Values) w.Dispose();
+        _kept.Clear();
+    }
+
+    /// <summary>Frees the weights <see cref="KeepLoaded"/> kept on the device (the accelerator is the application's and is not touched).</summary>
+    public void Dispose() => ReleaseKept();
 
     // the last few prompts' T5 outputs: the encoder streams 5 GB of weights per prompt (in the browser about half of a short clip's time), so a new seed, another mode or an
     // extension with the same prompt skips it (an embedding is at most 128 x 4096 floats)
@@ -232,8 +265,8 @@ public sealed class LtxPipeline
     public async Task<float[]> UpsampleLatentAsync(float[] latent, int Fz, int h, int w, float adainFactor = 1f, CancellationToken ct = default)
     {
         if (_paths.Upsampler == null) throw new InvalidOperationException("the latent upscaler needs LtxPaths.Upsampler");
-        using var uw = await LoadWeightsAsync(_paths.Upsampler, ct);
-        using var up = new LtxLatentUpsampler(_acc, uw);
+        using var uw = await AcquireAsync(_paths.Upsampler, ct);
+        using var up = new LtxLatentUpsampler(_acc, uw.W);
         return await up.UpsampleAsync(latent, Fz, h, w, adainFactor);
     }
 
@@ -252,8 +285,8 @@ public sealed class LtxPipeline
         float[] video = Array.Empty<float>();
         byte[][]? rgba = null;
         var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
-        using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
-        using (var vae = new LtxVae(_acc, vw))
+        using (var vw = await AcquireAsync(_paths.Vae, ct))
+        using (var vae = new LtxVae(_acc, vw.W))
         {
             if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
             else video = await vae.DecodeAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
@@ -331,8 +364,8 @@ public sealed class LtxPipeline
         int steps = sigmas.Length - 1;
         Report("denoise", 0, "loading the transformer");
         var lk = new LtxKernels(_acc);
-        using var dw = await LoadWeightsAsync(_paths.Dit, ct);
-        using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw);
+        using var dw = await AcquireAsync(_paths.Dit, ct);
+        using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw.W);
         dit.SetGrid(Fz, h, w, (float)TemporalRatio / req.FrameRate, SpatialRatio, SpatialRatio);
         dit.SetContext(0, ctx, rows);
         using var lat = _acc.Allocate1D(noise); using var v = _acc.Allocate1D<float>(noise.Length);
@@ -423,8 +456,8 @@ public sealed class LtxPipeline
         // 2. the conditions through the VAE encoder (normalised latents), blended into the starting latent or kept as extra tokens
         Report("conditions", 0, "encoding the conditions");
         if (_paths.VaeEncoder == null) throw new InvalidOperationException("conditioning needs the VAE encoder (LtxPaths.VaeEncoder)");
-        using (var ew = await LoadWeightsAsync(_paths.VaeEncoder, ct))
-        using (var enc = new LtxVaeEncoder(_acc, ew))
+        using (var ew = await AcquireAsync(_paths.VaeEncoder, ct))
+        using (var enc = new LtxVaeEncoder(_acc, ew.W))
         {
             int extraIndex = 0;
             for (int i = 0; i < req.Conditions!.Count; i++)
@@ -497,8 +530,8 @@ public sealed class LtxPipeline
         // 3. the denoising loop on the device
         Report("denoise", 0, "loading the transformer");
         var lk = new LtxKernels(_acc);
-        using var dw = await LoadWeightsAsync(_paths.Dit, ct);
-        using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw);
+        using var dw = await AcquireAsync(_paths.Dit, ct);
+        using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw.W);
         dit.SetPositions(coords);
         dit.SetContext(0, ctx, rows);
         using var lat = _acc.Allocate1D(tokens); using var init = _acc.Allocate1D(tokens); using var v = _acc.Allocate1D<float>(tokens.Length);

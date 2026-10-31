@@ -43,8 +43,17 @@ async Task<bool> WaitResultAsync(string step, int minutes)
         await page.WaitForTimeoutAsync(200);
     }
     bool sawPreview = false;
+    var runClock = System.Diagnostics.Stopwatch.StartNew();
+    string lastStage = "";
     while (DateTime.UtcNow < deadline)
     {
+        // the stage line, timed: where a clip's time goes (text, conditions, loading the transformer, steps, decode)
+        if (await page.Locator(".vid-progress-text").CountAsync() > 0)
+        {
+            var st = (await page.Locator(".vid-progress-text").InnerTextAsync()).Trim();
+            var key = Regex.Replace(st, @"step \d+ of \d+", "steps");
+            if (key != lastStage) { lastStage = key; Console.WriteLine($"      {runClock.Elapsed.TotalSeconds,5:F1} s  {st}"); }
+        }
         if (!sawPreview && await page.Locator(".vid-live").IsVisibleAsync())
         {
             var label = await page.Locator(".vid-live-label").InnerTextAsync();
@@ -78,9 +87,25 @@ if (modelServer.Length > 0)
     await page.Locator("details.vid-advanced input.vid-prompt-input").Last.BlurAsync();
 }
 
+if (Environment.GetEnvironmentVariable("VIDEO_DRIVE_KEEP") == "1")
+{
+    // "Keep loaded" (LTX): the checkbox only exists once LTX is the model; the first example switches to it, so pick LTX here first
+    await page.Locator("select.vid-select").First.SelectOptionAsync("ltx");
+    await page.Locator("input.vid-keep").CheckAsync();
+    Console.WriteLine("    Keep loaded: on");
+}
 Console.WriteLine("--- step 1: example 'Animate the kitten' (LTX image to video, live preview)");
 await page.GetByRole(AriaRole.Button, new() { Name = "Animate the kitten" }).ClickAsync();
 if (!await WaitResultAsync("1-kitten", 30)) failed++;
+if (Environment.GetEnvironmentVariable("VIDEO_DRIVE_TIMING") == "1")
+{
+    // the same example again: the prompt's encoding is cached now, so this run shows what the rest of a clip costs
+    Console.WriteLine("--- timing: the kitten again (cached prompt)");
+    await page.GetByRole(AriaRole.Button, new() { Name = "Animate the kitten" }).ClickAsync();
+    if (!await WaitResultAsync("1b-kitten", 30)) failed++;
+    Console.WriteLine($"=== timing run done: {failed} failed");
+    return failed;
+}
 var info1 = await InfoAsync();
 int frames1 = int.TryParse(Regex.Match(info1, @"^(\d+) frames").Groups[1].Value, out var f1) ? f1 : 0;
 
