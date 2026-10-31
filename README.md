@@ -38,7 +38,7 @@ You hand it a model file. It detects the format, builds a graph, optimizes it an
 - **One codebase, six backends.** WebGPU, WebGL, WebAssembly, CUDA, OpenCL and CPU (the Velocity SIMD backend by default on 64-bit desktop). Kernels are tested on all of them.
 - **Seven model formats, auto-detected.** ONNX, TFLite, GGUF, SafeTensors, TensorFlow GraphDef, PyTorch checkpoints and Core ML, all lowered to one graph IR.
 - **200+ ONNX operators**, a graph optimizer (constant folding, fusion, strength reduction, dead-node elimination) and fused kernels for linear layers, attention, quantized matmul and more.
-- **Generative models, ported and checked.** FLUX 3 Image Klein, FLUX.2 klein, SD-Turbo, TRELLIS.2 (text and image to textured 3D), SkinTokens and UniRig (auto-rigging), Kimodo (character animation). Stages are gated against the reference implementations.
+- **Generative models, ported and checked.** FLUX 3 Image Klein, FLUX.2 klein, Stable Diffusion 1.x / 2.x / SDXL (LoRA, ControlNet, ComfyUI's UNet patches, ToMe and ToDo), SD-Turbo, LTX-Video and Wan 2.2 (text, picture, keyframes and story to video), TRELLIS.2 (text and image to textured 3D), SkinTokens and UniRig (auto-rigging), Kimodo (character animation). Stages are gated against the reference implementations.
 - **Language and speech.** Quantized GGUF LLMs with KV-cache decode and TurboQuant cache compression, Whisper speech-to-text, Kokoro and ZipVoice text-to-speech with voice cloning.
 - **Training, not only inference.** Backpropagation, SGD and Adam as GPU kernels, so a small network can be trained in a browser tab.
 - **Zero-copy by design.** Pixels, activations and weights stay on the GPU. In the browser, bulk data streams from `fetch` and OPFS straight into GPU buffers without touching the .NET heap.
@@ -52,7 +52,7 @@ The [live demo](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) is a Blazor WebA
 |------|--------------|-------|
 | [Text to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/text-to-3d) / [Image to 3D](https://lostbeard.github.io/SpawnDev.ILGPU.ML/image-to-3d) | A prompt or a photo becomes a textured PBR `.glb`; rig it, animate it with 22 preset moves | FLUX 3 / FLUX.2 / SD-Turbo, RMBG-1.4, TRELLIS.2, SkinTokens, Kimodo |
 | [Image generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/generate) | Text to image, and edits of up to 10 reference pictures | FLUX 3 Image Klein, FLUX.2 klein, SD-Turbo |
-| [Video generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/video) | Text to video, or animate a picture (the first frame); about 13 GB of weights on first use | Wan 2.2 TI2V-5B |
+| [Video generation](https://lostbeard.github.io/SpawnDev.ILGPU.ML/video) | A studio: text to video, animate a picture (or a camera snapshot), morph between two keyframes, extend the clip, and Story mode, where a local LLM writes the shots and a voice narrates them; the clip forms on screen step by step. About 8 GB of weights on first use (LTX) | LTX-Video 2B, Wan 2.2 TI2V-5B, Qwen3 4B, Kokoro |
 | [On-device chat](https://lostbeard.github.io/SpawnDev.ILGPU.ML/ai-chat) | Pick a `.gguf` and chat with it | Qwen, Gemma, Llama and others |
 | [Speech to text](https://lostbeard.github.io/SpawnDev.ILGPU.ML/whisper) | Microphone to text | Whisper |
 | [Text to speech](https://lostbeard.github.io/SpawnDev.ILGPU.ML/tts) | Built-in voices, or clone a voice from a short clip | Kokoro, ZipVoice |
@@ -162,7 +162,8 @@ More: [Docs/assetgen.md](Docs/assetgen.md), [Docs/scenes.md](Docs/scenes.md) (a 
 | Area | What is in the box |
 |------|--------------------|
 | **Vision** | Classification, object detection (YOLOv8), face detection (BlazeFace), pose (MoveNet), depth (Depth Anything V2, multi-view and streaming variants), style transfer, super-resolution, background removal (RMBG-1.4, IS-Net), zero-shot classification (CLIP) |
-| **Image generation** | FLUX 3 Image Klein 5.6B (text to image, edits with up to 10 references, Qwen3 caption writer), FLUX.2 klein 4B, SD-Turbo, DDPM |
+| **Image generation** | FLUX 3 Image Klein 5.6B (text to image, edits with up to 10 references, Qwen3 caption writer), FLUX.2 klein 4B, Stable Diffusion 1.x / 2.x / SDXL checkpoints (LoRA, ControlNet, TAESD, merging and saving, ComfyUI's FreeU / PAG / SAG / HyperTile / deep shrink / ToMe, ToDo), SD-Turbo, DDPM |
+| **Video generation** | LTX-Video 2B 0.9.8 distilled (text or picture to video, keyframes, clip extension, the x2 upscaler two-pass recipe) and Wan 2.2 TI2V-5B (Turbo 4 steps, or 50 steps with MagCache); a story writer (Qwen3 writes the shots) and narration (Kokoro); live previews while denoising |
 | **3D** | TRELLIS.2 text and image to textured PBR mesh (`Trellis2ImageTo3D`, `Trellis2TextTo3D`), mesh repair, remeshing, simplification, UV atlas and texture baking on the device; glTF, OBJ, PLY and SPZ import and export |
 | **Rigging and animation** | `SkinTokensRigger` (learned skeleton and skin weights), `UniRigRigger`, `HumanoidRetargeter` and `AnimatedGlb` (Kimodo clips on any rigged humanoid) |
 | **Language** | GGUF LLM inference (Llama, Qwen, Gemma, Mistral, Phi, LFM2, gpt-oss and more) with KV-cache decode and TurboQuant cache compression, sentiment (DistilBERT), embeddings (MiniLM), text generation, multimodal Gemma 4 |
@@ -241,6 +242,10 @@ Measured on an RTX 4070 12 GB, models cached. Full methodology and the other num
 | The same 1024 cascade | Chrome, WebGPU | 1403 s | [trellis2.md](Docs/trellis2.md) |
 | Prompt to rigged, animated character, end to end | CUDA | 77 s | [assetgen.md](Docs/assetgen.md) |
 | FLUX 3 Image Klein, 512 px, 16 steps | CUDA | 26.1 s (4-bit), 32.8 s (8-bit) | [flux3.md](Docs/flux3.md) |
+| Animate a picture, 704x480, 97 frames (LTX-Video) | Chrome, WebGPU | 59 s (30 s with the model kept loaded) | [video.md](Docs/video.md) |
+| One idea to a narrated three-shot story, 10.7 s of video | Chrome, WebGPU | 4.3 min | [video.md](Docs/video.md) |
+| Wan 2.2, 640x352, 17 frames, 50 steps | CUDA | 75 s, 54 s with MagCache | [video.md](Docs/video.md) |
+| Stable Diffusion 1.5, one 1024 px UNet step | CUDA | 606 ms, 294 ms with ToDo | [stable-diffusion.md](Docs/stable-diffusion.md) |
 | Auto-rig a character (SkinTokens) | CUDA | about 6 s | [rigging.md](Docs/rigging.md) |
 
 Correctness comes first: kernels are checked against CPU references, vision and language models against ONNX Runtime outputs, and the generative models stage by stage against their reference PyTorch implementations (for example SkinTokens: 295 of 296 generated tokens identical, skin weights within 5.7e-5).
@@ -260,7 +265,7 @@ Self-contained projects under [`Examples/`](Examples/README.md), each runnable w
 | 08 | [Asset generation (WPF)](Examples/08.AssetGen.Wpf) | The same, as a Windows app with a 3D preview |
 | 09 | [Scene generation](Examples/09.SceneGen.Console) | A scene from one sentence: LLM layout, then one generated asset per object |
 | 10 | [Image generation (WPF)](Examples/10.ImageGen.Wpf) | The image page as a Windows app |
-| 11 | [Video generation](Examples/11.VideoGen.Console) | Wan 2.2 TI2V-5B text or image to video, PNG frames and an animated WebP ([Docs/video.md](Docs/video.md)) |
+| 11 | [Video generation](Examples/11.VideoGen.Console) | LTX-Video (`--ltx`: picture, keyframes, the two-pass upscale) and Wan 2.2 TI2V-5B (Turbo, MagCache) text or image to video, PNG frames and an animated WebP ([Docs/video.md](Docs/video.md)) |
 | 12 | [Video generation (WPF)](Examples/12.VideoGen.Wpf) | The same as a Windows app with a looping player |
 
 ## Repository layout
@@ -287,6 +292,8 @@ Self-contained projects under [`Examples/`](Examples/README.md), each runnable w
 | [Operators](Docs/operators.md) | ONNX operator support and implementation tiers |
 | [TRELLIS.2](Docs/trellis2.md) | Text and image to 3D: pipeline, API, browser design, numbers |
 | [FLUX 3 Image Klein](Docs/flux3.md) / [FLUX.2 klein](Docs/flux2.md) | Image generation and reference editing |
+| [Stable Diffusion](Docs/stable-diffusion.md) | SD 1.x / 2.x / SDXL checkpoints, LoRA, ControlNet, ComfyUI's patches, token merging |
+| [Video generation](Docs/video.md) | LTX-Video and Wan 2.2: the /video studio, story writer and narration, MagCache, parity and numbers |
 | [Rigging and animation](Docs/rigging.md) | SkinTokens, UniRig, Kimodo retargeting |
 | [Asset generation](Docs/assetgen.md) / [Scenes](Docs/scenes.md) | Prompt to character, sentence to scene |
 | [System One](Docs/system-one.md) | Typed decision heads |
@@ -310,7 +317,7 @@ The demo is published with `dotnet publish SpawnDev.ILGPU.ML.Demo -c Release -p:
 
 ## Model licenses
 
-The code in this repository is MIT. Model weights keep their own licenses, which travel with the files on the models host and are listed in each model's doc. Notably, **FLUX 3 Image Klein weights are under the FLUX Kommunity License (non-commercial)**, FLUX.2 klein is Apache-2.0, TRELLIS.2, SkinTokens and UniRig are MIT, and the bundled Kimodo motion clips carry the terms in [`SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md`](SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md). Check them before commercial use.
+The code in this repository is MIT. Model weights keep their own licenses, which travel with the files on the models host and are listed in each model's doc. Notably, **FLUX 3 Image Klein weights are under the FLUX Kommunity License (non-commercial)**, FLUX.2 klein is Apache-2.0, **LTX-Video weights are under the LTXV Open Weights License (use restrictions; entities with $10M+ annual revenue need a commercial licence from Lightricks)**, Wan 2.2 is Apache-2.0, Stable Diffusion checkpoints carry their own CreativeML / Open RAIL licences, TRELLIS.2, SkinTokens and UniRig are MIT, and the bundled Kimodo motion clips carry the terms in [`SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md`](SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md). Check them before commercial use.
 
 ## Contributing
 
@@ -325,7 +332,7 @@ SpawnDev is built by one developer and a small team of AI agents. If it is usefu
 - [**ILGPU**](https://github.com/m4rs-mt/ILGPU) by Marcel Koester and contributors, the compiler that makes C# GPU kernels possible.
 - [**SpawnDev.ILGPU**](https://github.com/LostBeard/SpawnDev.ILGPU), which adds the WebGPU, WebGL and Wasm backends and the Velocity CPU backend.
 - [**SpawnDev.SpawnJS**](https://github.com/LostBeard/SpawnDev.SpawnJS), typed C# access to the browser's APIs.
-- The authors and licensors of the models ported here: Black Forest Labs (FLUX), Microsoft (TRELLIS.2), VAST AI Research (SkinTokens, UniRig), NVIDIA (Kimodo), OpenAI (Whisper), Stability AI (SD-Turbo), Alibaba (Qwen), and the many others named in the docs.
+- The authors and licensors of the models ported here: Black Forest Labs (FLUX), Microsoft (TRELLIS.2), VAST AI Research (SkinTokens, UniRig), NVIDIA (Kimodo), OpenAI (Whisper), Stability AI (Stable Diffusion, SD-Turbo), Lightricks (LTX-Video), Alibaba (Qwen, Wan), hexgrad (Kokoro), and the many others named in the docs.
 
 Created by Todd Tanner ([@LostBeard](https://github.com/LostBeard)) together with a crew of Claude AI agents: Riker, Data, Tuvok, Geordi and Seven. Live long and prosper. 🖖
 

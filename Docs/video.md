@@ -1,3 +1,35 @@
+# Video generation
+
+Two video models run in this library, on the desktop and in a browser tab: **LTX-Video 2B 0.9.8 distilled** (`LtxPipeline`, 7 steps, small and fast; [below](#video-generation-ltx-video-2b-098-distilled))
+and **Wan 2.2 TI2V-5B** (`Wan22Pipeline`, the 4-step Turbo or the standard 50-step model with MagCache; [below](#video-generation-wan-22-ti2v-5b)). The `/video` page puts both behind one studio.
+
+## The /video studio
+
+| Mode | What it does | Library |
+|------|--------------|---------|
+| Text to video | A prompt becomes a clip | `LtxPipeline.GenerateAsync`, `Wan22Pipeline.GenerateAsync` |
+| Animate a picture | A picture (a file or the camera) is the first frame | `LtxCondition.Image`, `WanRequest.ImageRgb` |
+| Morph start to end | Two pictures are the first and last frames; the model fills the motion (keyframes: a fly-through from a house into its living room is one of the examples) | `LtxCondition.Image(..., frameIndex: frames - 1)` |
+| Extend this clip | The clip on screen continues from its last 17 frames with a new prompt; the new frames are appended | `LtxCondition` with a clip (video conditioning) |
+| Story | One shot per line, each extending the clip: three lines make a 257-frame (10.7 s) video | the extend mode, shot after shot |
+
+- **The AI story writer.** In Story mode, one idea becomes the shots, written in the tab by Qwen3 4B (`LtxStoryWriter.WriteAsync`; the file the FLUX 3 caption writer uses). Each line is a
+  self-contained LTX prompt; the request numbers the shots and asks for each line to repeat the character and the place, since every shot is generated on its own.
+- **Narration.** The writer also writes one short line per shot (`narrate: true` returns `LtxStory.Narration`); `StoryNarrator.NarrateAsync` speaks each line with Kokoro from the
+  moment its shot starts (spoken faster, up to 1.3x, when it would run into the next shot; lines never overlap) into one track as long as the video. The page plays it with the clip and
+  records it into the downloaded WebM (VP9 + Opus).
+- **Live preview.** Every denoising step's x0 estimate is shown as a small looping clip while the model works (`LtxPipeline.Preview`, `Wan22Pipeline.Preview`; `LatentPreview.Ltx` / `.Wan`
+  map latents to colours with linear fits over decoded clips: R² 0.97 / 0.95 on held-out clips, gated by `LatentPreview_Colours_PredictTheDecodedVideo`).
+- **Memory.** `RgbaFrames` returns frames as RGBA bytes converted on the device a frame at a time (the float array of a 704x480 x97 clip is 393 MB; the tab's .NET heap ran out after four),
+  bit-identical to `GetFrameRgba`. `LtxPipeline.KeepLoaded` keeps the transformer, the VAE and the upscaler on the device between clips (about 5 GB more; the page's "Keep loaded",
+  off by default). The last 8 prompt encodings are cached in both pipelines.
+- **Speed.** Wan's standard transformer runs with MagCache by default (50 steps for about the cost of 30; see the Wan section).
+
+MEASURED in Chrome (RTX 4070, WebGPU, models cached, `tools/drive-video-page.cs`): animate a picture at 704x480 x97 59 s (T5 17.7 s, VAE encode 3.1 s, transformer load 9 s, 7 steps 17 s,
+decode 11 s), the same prompt again 35 s, with Keep loaded 30 s; extend +80 frames 58 s; keyframes 58 s; a three-shot story 257 frames in about 2.4 min; "AI writes the story" (Qwen3 writes
+3 shots and their narration, 3 clips, Kokoro speaks) 4.3 min end to end, the WebM 5.7 MB with its sound track. The driver runs every example and asserts on the page
+(`VIDEO_DRIVE_AISTORY=1` for the AI story, `VIDEO_DRIVE_TIMING=1` / `VIDEO_DRIVE_KEEP=1` for the stage times).
+
 # Video generation: Wan 2.2 TI2V-5B
 
 Text to video and image to video on ILGPU, desktop (CUDA, OpenCL) and in the browser (WebGPU). `Wan22Pipeline` (namespace `SpawnDev.ILGPU.ML.Wan`) runs the model Alibaba released as
