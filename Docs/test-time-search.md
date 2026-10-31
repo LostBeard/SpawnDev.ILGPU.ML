@@ -6,7 +6,7 @@ cost several times one: decoded together, each step reads the weights once for a
 
 | Piece | What it is |
 |---|---|
-| `GgufBatchDecoder` | N continuations of one prompt decoded together (Qwen2-family GGUF) |
+| `GgufBatchDecoder` | N continuations of one prompt decoded together (GGUF: qwen2, qwen3, llama) |
 | `SelfConsistency` | the final answer of a reasoning chain (`\boxed{}`), a normaliser, the vote, an exact early exit |
 | `/self-consistency` | the demo page: N answers streaming side by side, the vote updating as they finish |
 | `tools/prm-harness/` | the pilot (PyTorch, with a process reward model) and the same evaluation on our engine |
@@ -91,6 +91,7 @@ Options: `FusedAttention` (default on where a group can be a head wide), `JoinPr
 | Test | What it proves |
 |---|---|
 | `GgufBatchDecoder_GreedyMatchesGenerator` | greedy = the single-sequence engine word for word; batched greedy rows identical; device draws = the full-row sampler (96 of 96); the shrinking batch = riding along; split-K attention = the three-kernel path (2-4e-6 at 489 tokens); joined projections = separate (bit-identical); WebGPU captured steps = encoded ones. CUDA, OpenCL, WebGPU, each check red-checked |
+| `GgufBatchDecoder_OtherArchs_GreedyMatchesGenerator` | qwen3 (Qwen3-0.6B: per-head q / k norms, a query wider than the model) and llama (SmolLM2-360M: rotary on adjacent pairs): greedy = the single-sequence engine, batched rows identical, CUDA / OpenCL / WebGPU |
 | `Gemv_Rows_AllTypes_MatchOracle` | the word-wise GEMVs against the CPU dequant oracle, Q8_0 / Q4_K / Q6_K / Q4_0 at M = 1, 3, 8 |
 | `SelfConsistency_ExtractNormalizeVote` | extraction, the spellings that must and must not vote together, the vote order, `IsDecided` |
 
