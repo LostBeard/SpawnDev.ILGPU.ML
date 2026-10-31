@@ -71,6 +71,11 @@ public sealed class WanRequest
     /// tile instead of the frame, so 720p decodes on an 8 GB card. The reference's own tiled mode, not the same numbers as the untiled decode (1.8e-2 apart in the reference).
     /// </summary>
     public bool TiledDecode { get; init; }
+    /// <summary>
+    /// Return the frames as RGBA bytes (<see cref="WanVideo.FramesRgba"/>, converted on the device a chunk at a time) instead of the float data: a quarter of the memory and no host
+    /// array the size of the whole clip (the browser's .NET heap). With <see cref="TiledDecode"/> the conversion runs on the host after the tiles are blended.
+    /// </summary>
+    public bool RgbaFrames { get; init; }
     /// <summary>Optional first frame (image-to-video): RGB bytes, 3 per pixel, row-major; resized and centre-cropped to the output size.</summary>
     public byte[]? ImageRgb { get; init; }
     public int ImageWidth { get; init; }
@@ -80,7 +85,13 @@ public sealed class WanRequest
 /// <summary>The result: frames as floats in [-1, 1], channel-first [3, Frames, Height, Width] (the VAE's own layout).</summary>
 public sealed class WanVideo
 {
+    /// <summary>The frames [3, Frames, Height, Width] channel-first in [-1, 1]; empty when the pipeline was asked for <see cref="FramesRgba"/> instead.</summary>
     public required float[] Data { get; init; }
+    /// <summary>
+    /// The frames as RGBA bytes, one array per frame, when the request asked for them (<c>RgbaFrames</c>): converted on the device and read back a frame at a time, a quarter of
+    /// the float data's size and no array of hundreds of megabytes (the browser's .NET heap runs out after a few 704x480 x97 clips of floats).
+    /// </summary>
+    public IReadOnlyList<byte[]>? FramesRgba { get; init; }
     public required int Width { get; init; }
     public required int Height { get; init; }
     public required int Frames { get; init; }
@@ -90,6 +101,7 @@ public sealed class WanVideo
     /// <summary>One frame as RGBA bytes (alpha 255).</summary>
     public byte[] GetFrameRgba(int frame)
     {
+        if (FramesRgba != null) return FramesRgba[frame];
         var o = new byte[Width * Height * 4];
         long plane = (long)Frames * Height * Width;
         for (int p = 0; p < Width * Height; p++)
@@ -280,11 +292,21 @@ public sealed class Wan22Pipeline
 
         // 4. decode
         Report("decode", 0, "decoding the video");
-        float[] video;
+        float[] video = Array.Empty<float>(); byte[][]? rgba = null;
         using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
-            { vae.Trace = req.Trace; video = req.TiledDecode ? await vae.DecodeTiledAsync(latent, Fz, h, w) : await vae.DecodeAsync(latent, Fz, h, w); }
+        {
+            vae.Trace = req.Trace;
+            if (req.RgbaFrames && !req.TiledDecode) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w);
+            else video = req.TiledDecode ? await vae.DecodeTiledAsync(latent, Fz, h, w) : await vae.DecodeAsync(latent, Fz, h, w);
+            if (req.RgbaFrames && req.TiledDecode)
+            {
+                var tmp = new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3 };
+                rgba = Enumerable.Range(0, tmp.Frames).Select(tmp.GetFrameRgba).ToArray();
+                video = Array.Empty<float>();
+            }
+        }
         Report("decode", 1, "done");
-        return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
+        return new WanVideo { Data = video, FramesRgba = rgba, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
     }
 }

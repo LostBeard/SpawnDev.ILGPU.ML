@@ -320,6 +320,35 @@ public sealed class WanVae : IDisposable
     }
 
     /// <summary>
+    /// <see cref="DecodeAsync"/> to RGBA bytes, one array per frame: every chunk is unpatchified and converted on the device and read back a frame at a time, so no float array of
+    /// the whole clip exists on the host. The conversion is <see cref="WanVideo.GetFrameRgba"/>'s.
+    /// </summary>
+    public async Task<byte[][]> DecodeRgbaFramesAsync(float[] z, int Fz, int h, int w)
+    {
+        int totalFrames = 4 * Fz - 3;
+        var o = new List<byte[]>(totalFrames);
+        var lk = new Ltx.LtxKernels(_acc);
+        async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
+        {
+            int pixels = Hs * 2 * Ws * 2;
+            using var chunk = _acc.Allocate1D<float>(3L * frames * pixels);
+            _wk.UnpatchifyVideo(headChunk.View, chunk.View, frames, Hs, Ws);          // [3, frames, 2 Hs, 2 Ws]
+            using var packed = _acc.Allocate1D<int>(pixels);
+            for (int f = 0; f < frames; f++)
+            {
+                lk.FrameRgba(chunk.View, packed.View, frames, pixels, f);
+                var ints = await packed.View.CopyToHostAsync();
+                var frame = new byte[pixels * 4];
+                Buffer.BlockCopy(ints, 0, frame, 0, frame.Length);
+                o.Add(frame);
+            }
+        }
+        await DecodeCoreAsync(z, Fz, h, w, EmitAsync);
+        if (o.Count != totalFrames) throw new InvalidOperationException($"decoded {o.Count} frames, expected {totalFrames}");
+        return o.ToArray();
+    }
+
+    /// <summary>
     /// <see cref="DecodeAsync"/> in spatial tiles, as diffusers' <c>AutoencoderKLWan.enable_tiling()</c> decodes (the low-memory path: device memory follows the tile, not the frame).
     /// Latent tiles of <paramref name="tileSample"/> / 16 with a stride of <paramref name="strideSample"/> / 16 (defaults 256 / 192 px: 16 / 12 latent positions), each decoded through the
     /// whole causal decoder with fresh caches; the 12-channel outputs before the pixel unshuffle are blended over the overlap (tileSample - strideSample) / 2 = 32 positions with

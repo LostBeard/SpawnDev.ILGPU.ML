@@ -8,7 +8,8 @@
 //         dotnet run tools/drive-video-page.cs -- http://localhost:5071 http://127.0.0.1:8769 <out dir>
 //
 // Steps: the "Animate the kitten" example (LTX image to video), the live preview must appear while it denoises (a screenshot of it is saved), then the clip;
-// "Extend this clip" with a new prompt must append frames to it; the "Morph: dog into cat" example (two keyframes) must produce a clip. Screenshots go to the out dir.
+// "Extend this clip" with a new prompt must append frames to it; the "Keyframes: fly into the house" example must produce a clip; "A story in three shots" must
+// produce 97 + 2 x 80 frames. Screenshots go to the out dir.
 // Uses TJ's installed Chrome with a persistent profile (real WebGPU adapter; the models cache in OPFS across runs), like drive-ml-pages.cs.
 // Exit code = number of failed steps.
 using System.Text.RegularExpressions;
@@ -93,9 +94,16 @@ int frames2 = int.TryParse(Regex.Match(info2, @"^(\d+) frames").Groups[1].Value,
 if (!(frames2 > frames1)) { Console.WriteLine($"    FAIL: extending did not add frames ({frames1} -> {frames2})"); failed++; }
 else Console.WriteLine($"    extended {frames1} -> {frames2} frames");
 
-Console.WriteLine("--- step 3: example 'Morph: dog into cat' (two keyframes)");
-await page.GetByRole(AriaRole.Button, new() { Name = "Morph: dog into cat" }).ClickAsync();
-if (!await WaitResultAsync("3-morph", 30)) failed++;
+Console.WriteLine("--- step 3: example 'Keyframes: fly into the house' (two keyframes)");
+await page.GetByRole(AriaRole.Button, new() { Name = "Keyframes: fly into the house" }).ClickAsync();
+if (!await WaitResultAsync("3-keyframes", 30)) failed++;
+
+Console.WriteLine("--- step 4: example 'A story in three shots' (each shot extends the clip)");
+await page.GetByRole(AriaRole.Button, new() { Name = "A story in three shots" }).ClickAsync();
+if (!await WaitResultAsync("4-story", 45)) failed++;
+var info4 = await InfoAsync();
+int frames4 = int.TryParse(Regex.Match(info4, @"^(\d+) frames").Groups[1].Value, out var f4) ? f4 : 0;
+if (frames4 != 97 + 2 * 80) { Console.WriteLine($"    FAIL: a three-shot story should be 257 frames, got {frames4}"); failed++; }
 
 File.WriteAllLines(Path.Combine(outDir, "console.log"), log);
 Console.WriteLine($"=== {failed} failed step(s) in {sw.Elapsed.TotalSeconds:F0} s; screenshots in {outDir}");

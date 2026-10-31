@@ -11,6 +11,7 @@
 //
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
+//           --end-image PATH (LTX: the last frame, a keyframe; with --image the clip morphs from one picture to the other)
 //           --save-latent (write the denoised latent beside the frames: latent.f32 + latent.json)
 //           --tiled-vae (Wan: decode in 256 px tiles as diffusers' enable_tiling: 720p on an 8 GB card)
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
@@ -63,6 +64,7 @@ for (int i = 0; i < args.Length; i++)
         case "--upscale": o.Upscale = true; break;
         case "--tiled-vae": o.TiledVae = true; break;
         case "--save-latent": o.SaveLatent = true; break;
+        case "--end-image" when i + 1 < args.Length: o.EndImage = args[++i]; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -166,15 +168,11 @@ async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, 
         Console.WriteLine($"Model cache: {store.RootDirectory} (first run downloads the DiT, the VAE and the text encoder from the models host)");
         pipe = new LtxPipeline(accelerator, new HttpClientModelSource(http, store), LtxPipeline.DefaultRepo, LtxPaths.InRepo(ditFile, textFile));
     }
-    LtxCondition[]? conditions = null;
-    if (o.Image != null)
-    {
-        using var img = Image.Load<Rgb24>(o.Image);
-        var rgb = new byte[img.Width * img.Height * 3];
-        img.CopyPixelDataTo(rgb);
-        conditions = new[] { LtxCondition.Image(rgb, img.Width, img.Height) };          // the picture is frame 0 (scaled to cover the size, centre-cropped)
-    }
-    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps, Conditions = conditions, Upscale = o.Upscale };
+    var conditions = new List<LtxCondition>();
+    static (byte[] Rgb, int W, int H) LoadRgb(string path) { using var img = Image.Load<Rgb24>(path); var rgb = new byte[img.Width * img.Height * 3]; img.CopyPixelDataTo(rgb); return (rgb, img.Width, img.Height); }
+    if (o.Image != null) { var (rgb, w, h) = LoadRgb(o.Image); conditions.Add(LtxCondition.Image(rgb, w, h)); }                          // frame 0 (scaled to cover the size, centre-cropped)
+    if (o.EndImage != null) { var (rgb, w, h) = LoadRgb(o.EndImage); conditions.Add(LtxCondition.Image(rgb, w, h, frameIndex: o.Frames - 1)); }   // the last frame: a keyframe (morph with --image)
+    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps, Conditions = conditions.Count > 0 ? conditions : null, Upscale = o.Upscale };
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var video = await pipe.GenerateAsync(request, ConsoleProgress(sw));
     Console.WriteLine();
@@ -224,6 +222,6 @@ sealed class Options
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;
-    public string? Negative, Image, Models, Cache;
+    public string? Negative, Image, EndImage, Models, Cache;
     public string Dit = "q8", Text = "q8", Out = "video_out";      // text q8: the models host serves the 8-bit text encoders only (bf16 needs --models with the 16-bit export)
 }

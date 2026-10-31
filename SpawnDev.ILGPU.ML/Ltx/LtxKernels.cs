@@ -278,6 +278,22 @@ public sealed class LtxKernels
         _posteriorSample(128 * vox, head, o, mean, std, noise.Value, vox);
     }
 
+    // video [3, F, H, W] channel-first in [-1, 1] -> one frame as packed RGBA (R in the low byte, alpha 255): round((v + 1) * 127.5) clamped to 0..255, as WanVideo.GetFrameRgba
+    private Action<Index1D, FV, IV, int, int, int>? _frameRgba;
+    private static void FrameRgbaImpl(Index1D p, FV video, IV o, int frames, int pixels, int frame)
+    {
+        long plane = (long)frames * pixels, at = (long)frame * pixels + p;
+        int r = Clamp255(video[at]), g = Clamp255(video[plane + at]), b = Clamp255(video[2 * plane + at]);
+        o[p] = r | (g << 8) | (b << 16) | unchecked((int)0xFF000000);
+    }
+    private static int Clamp255(float v) { int q = (int)MathF.Round((v + 1f) * 127.5f); return q < 0 ? 0 : (q > 255 ? 255 : q); }
+    /// <summary>Frame <paramref name="frame"/> of the channel-first video as packed RGBA (one int per pixel, little-endian R, G, B, A).</summary>
+    public void FrameRgba(FV video, IV o, int frames, int pixels, int frame)
+    {
+        _frameRgba ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, int, int, int>(FrameRgbaImpl);
+        _frameRgba(pixels, video, o, frames, pixels, frame);
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // latent upsampler kernels (same channel-last layout)
     // ---------------------------------------------------------------------------------------------------

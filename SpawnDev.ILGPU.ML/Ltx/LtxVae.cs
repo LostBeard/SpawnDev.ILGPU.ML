@@ -113,6 +113,36 @@ public sealed class LtxVae : IDisposable
     /// </summary>
     public async Task<float[]> DecodeAsync(float[] z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
     {
+        var video = await DecodeToDeviceAsync(z, Fz, h, w, timestep, noiseScale, noise);
+        await _acc.SynchronizeAsync();
+        var result = await video.View.CopyToHostAsync();
+        Drop(video); Flush();
+        return result;
+    }
+
+    /// <summary>
+    /// <see cref="DecodeAsync"/> to RGBA bytes, one array per frame (converted on the device and read back a frame at a time: no float array of the whole clip on the host).
+    /// The conversion is <see cref="Wan.WanVideo.GetFrameRgba"/>'s: round((v + 1) * 127.5) clamped.
+    /// </summary>
+    public async Task<byte[][]> DecodeRgbaFramesAsync(float[] z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
+    {
+        var video = await DecodeToDeviceAsync(z, Fz, h, w, timestep, noiseScale, noise);
+        int frames = 8 * (Fz - 1) + 1, pixels = 32 * h * 32 * w;                                    // 32x32 pixels per latent position (the 4x4 patch after three 2x upsamplers)
+        var o = new byte[frames][];
+        using var packed = _acc.Allocate1D<int>(pixels);
+        for (int f = 0; f < frames; f++)
+        {
+            _lk.FrameRgba(video.View, packed.View, frames, pixels, f);
+            var ints = await packed.View.CopyToHostAsync();
+            o[f] = new byte[pixels * 4];
+            Buffer.BlockCopy(ints, 0, o[f], 0, o[f].Length);
+        }
+        Drop(video); Flush();
+        return o;
+    }
+
+    private async Task<Buf> DecodeToDeviceAsync(float[] z, int Fz, int h, int w, float timestep, float noiseScale, float[]? noise)
+    {
         int T = Fz, H = h, W = w, vox = T * H * W;
         if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, Fz, h, w]");
         if (noiseScale != 0f && (noise == null || noise.Length != z.Length)) throw new ArgumentException("a decode noise scale needs standard normal noise shaped like the latent");
@@ -153,10 +183,7 @@ public sealed class LtxVae : IDisposable
         var video = Tmp(3L * T * Patch * H * Patch * W);
         _lk.UnpatchifyVideo(head.View, video.View, T, H, W);
         Drop(head);
-        await _acc.SynchronizeAsync();
-        var result = await video.View.CopyToHostAsync();
-        Drop(video); Flush();
-        return result;
+        return video;
     }
 
     public void Dispose()

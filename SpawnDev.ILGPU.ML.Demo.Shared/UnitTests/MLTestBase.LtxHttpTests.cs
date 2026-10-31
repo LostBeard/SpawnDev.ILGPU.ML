@@ -102,6 +102,13 @@ public abstract partial class MLTestBase
             var m = WanCompare(video, WanNpz(fx, "video").Data);
             report.Add($"VAE decode {m.RelRms:E2} in {sw.Elapsed.TotalSeconds:F1} s");
             ok &= m.RelRms < 0.02;
+            // the RGBA frames converted on the device (the demo's path) against the host conversion of the float frames
+            var frames = await vae.DecodeRgbaFramesAsync(latent, ls[1], ls[2], ls[3], tArr[0]);
+            var asFloat = new Wan.WanVideo { Data = video, Width = 32 * ls[3], Height = 32 * ls[2], Frames = frames.Length };
+            int worst = 0; long off = 0;
+            for (int f = 0; f < frames.Length; f++) { var hostRgba = asFloat.GetFrameRgba(f); for (int i = 0; i < hostRgba.Length; i++) { int d = Math.Abs(hostRgba[i] - frames[f][i]); if (d > 0) off++; worst = Math.Max(worst, d); } }
+            report.Add($"RGBA frames on the device vs the host conversion: {frames.Length} frames, {off} bytes differ, by at most {worst}");
+            ok &= worst <= 1 && frames.Length == 8 * (ls[1] - 1) + 1;
         }
         foreach (var l in report) Console.WriteLine($"[Ltx] browser {l}");
         if (!ok) throw new Exception("LTX in the browser: " + string.Join("; ", report));

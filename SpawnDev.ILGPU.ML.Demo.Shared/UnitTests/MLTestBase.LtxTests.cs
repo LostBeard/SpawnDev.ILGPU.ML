@@ -177,7 +177,14 @@ public abstract partial class MLTestBase
         }
         var (want, vs) = WanNpz(fx, "video");                                                        // [3, 17, 128, 192]
         var mv = WanCompare(video, want);
+        // the RGBA frames converted on the device (LtxRequest.RgbaFrames) against the host conversion of the same float frames
+        var rgbaFrames = await vae.DecodeRgbaFramesAsync(latent, ls[1], ls[2], ls[3], tArr[0]);
+        var asFloat = new Wan.WanVideo { Data = video, Width = vs[3], Height = vs[2], Frames = vs[1] };
+        int rgbaWorst = 0; long rgbaOff = 0;
+        for (int f = 0; f < rgbaFrames.Length; f++) { var hostRgba = asFloat.GetFrameRgba(f); for (int i = 0; i < hostRgba.Length; i++) { int d = Math.Abs(hostRgba[i] - rgbaFrames[f][i]); if (d > 0) rgbaOff++; rgbaWorst = Math.Max(rgbaWorst, d); } }
         report.Add($"video [{vs[0]}, {vs[1]}, {vs[2]}, {vs[3]}]: relRMS {mv.RelRms:E2}, maxAbs {mv.MaxAbs:F3} of {mv.RefMaxAbs:F2}; {ms:F0} ms");
+        report.Add($"RGBA frames on the device vs the host conversion: {rgbaFrames.Length} frames, {rgbaOff} bytes differ, by at most {rgbaWorst}");
+        if (rgbaWorst > 1 || rgbaFrames.Length != vs[1]) throw new Exception("the device RGBA frames differ from the host conversion: " + report[^1]);
         worst = Math.Max(worst, mv.RelRms);
         LtxLog("VaeDecode", report);
         if (!(worst < 0.02)) throw new Exception("the VAE decode deviates from the reference: " + string.Join("; ", report));

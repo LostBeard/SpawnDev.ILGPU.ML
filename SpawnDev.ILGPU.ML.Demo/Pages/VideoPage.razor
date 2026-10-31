@@ -31,14 +31,14 @@
     </div>
 
     <div class="vid-prompt-section">
-        <label class="vid-label">Prompt:</label>
+        <label class="vid-label">@(_mode == "story" ? "Shots, one per line (each continues the clip from the last; the first can start from a picture):" : "Prompt:")</label>
         <div class="vid-prompt-row">
-            <textarea class="vid-prompt-input" rows="3" @bind="_prompt" @bind:event="oninput"
+            <textarea class="vid-prompt-input" rows="@(_mode == "story" ? 5 : 3)" @bind="_prompt" @bind:event="oninput"
                       placeholder="Describe the scene and the motion: a red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field."
                       disabled="@(_isModelLoading || _isRunning)"></textarea>
             <button class="vid-btn" @onclick="GenerateVideo"
-                    disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isModelLoading || _isRunning)">
-                @(_isRunning ? "Generating..." : _isModelLoading ? "Loading..." : "Generate")
+                    disabled="@(string.IsNullOrWhiteSpace(_prompt) || _isModelLoading || Busy)">
+                @(Busy ? "Generating..." : _isModelLoading ? "Loading..." : "Generate")
             </button>
         </div>
 
@@ -144,9 +144,10 @@
             <button class="vid-mode @(_mode == "t2v" ? "on" : "")" @onclick="@(() => SetMode("t2v"))" disabled="@_isRunning">Text to video</button>
             <button class="vid-mode @(_mode == "i2v" ? "on" : "")" @onclick="@(() => SetMode("i2v"))" disabled="@_isRunning">Animate a picture</button>
             <button class="vid-mode @(_mode == "morph" ? "on" : "")" @onclick="@(() => SetMode("morph"))" disabled="@_isRunning" title="LTX-Video: a first and a last frame, the model fills the motion between them (keyframe conditioning)">Morph start to end</button>
+            <button class="vid-mode @(_mode == "story" ? "on" : "")" @onclick="@(() => SetMode("story"))" disabled="@_isRunning" title="LTX-Video: one shot per line; each shot extends the clip from its last 17 frames, so a few lines make one continuous video">Story</button>
             <button class="vid-mode @(_mode == "extend" ? "on" : "")" @onclick="@(() => SetMode("extend"))" disabled="@(_isRunning || _lastClip == null)" title="LTX-Video: continue the clip on screen from its last 17 frames with a new prompt (video conditioning); the new frames are appended">Extend this clip</button>
         </div>
-        @if (_mode == "i2v" || _mode == "morph")
+        @if (_mode == "i2v" || _mode == "morph" || _mode == "story")
         {
             <ReferenceImages @ref="_refs" MaxImages="@(_mode == "morph" ? 2 : 1)" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
             <div class="vid-camera">
@@ -173,6 +174,7 @@
             }
             <p class="vid-hint">@(_mode == "morph"
                 ? (PictureCount == 2 ? "Morph: the first picture is frame 1, the second is the last frame; describe the motion between them." : "Add two pictures: the first frame and the last frame.")
+                : _mode == "story" ? (PictureCount > 0 ? "The story starts from your picture." : "Optional: a picture for the first frame of the story.")
                 : (PictureCount > 0 ? "Your picture is the first frame; describe how it moves." : "Add a picture (or take one with the camera): it becomes the first frame."))</p>
         }
         @if (_mode == "extend")
@@ -200,7 +202,7 @@
     {
         <div class="vid-progress">
             <div class="vid-progress-bar"><div class="vid-progress-fill" style="width: @(_fraction * 100)%"></div></div>
-            <span class="vid-progress-text">@_stage @_stageMessage</span>
+            <span class="vid-progress-text">@(_storyStatus.Length > 0 ? _storyStatus + ": " : "")@_stage @_stageMessage</span>
         </div>
     }
 
@@ -214,7 +216,7 @@
         <div class="vid-live-label">@_previewLabel</div>
     </div>
 
-    <div class="vid-result" style="@(_hasVideo && !_isRunning ? "" : "display:none")">
+    <div class="vid-result" style="@(_hasVideo && !Busy ? "" : "display:none")">
         <img id="vid-player" class="vid-player" alt="the generated video" />
         <div class="vid-info">
             <span class="vid-info-item">@_resultInfo</span>
@@ -336,7 +338,8 @@
     {
         new("Animate the kitten", "i2v", "The kitten slowly lifts its head, blinks and looks around curiously, its ears twitching, soft window light, shallow depth of field.", new[] { "samples/cat.jpg" }),
         new("Bring a landscape to life", "i2v", "Clouds drift slowly across the sky, the grass and trees sway in a gentle wind, light shifts across the hills, slow cinematic push forward.", new[] { "samples/landscape.jpg" }),
-        new("Morph: dog into cat", "morph", "The dog slowly and smoothly transforms into a kitten, a magical seamless transition, soft warm light.", new[] { "samples/dog.jpg", "samples/cat.jpg" }),
+        new("Keyframes: fly into the house", "morph", "The camera glides smoothly toward the house, through the open front door and into the cozy living room, one continuous cinematic shot, warm light.", new[] { "samples/house.jpg", "samples/room.jpg" }),
+        new("A story in three shots", "story", "A small red fox wakes up in a snowy forest at dawn, stretches and yawns, soft golden light.\nThe fox trots through the snowy forest between the trees, the camera follows it from the side.\nThe fox stops at the edge of a frozen lake and watches the sunrise, its breath visible in the cold air.", Array.Empty<string>()),
         new("A street at dusk", "i2v", "Evening falls on the street: people walk past, cars drive by with their headlights on, shop lights flicker on, slow camera pan.", new[] { "samples/street.jpg" }),
         new("A fox in the snow (two-pass)", "t2v", "A red fox trots through fresh snow at golden hour, its breath visible in the cold air, the camera follows it slowly, soft light, shallow depth of field.", Array.Empty<string>(), Upscale: true),
     };
@@ -367,7 +370,7 @@
     private void SetMode(string mode)
     {
         _mode = mode;
-        if ((mode == "morph" || mode == "extend") && !Ltx) { _model = "ltx"; ModelChanged(); }        // keyframes and clip conditioning are LTX-Video's
+        if ((mode == "morph" || mode == "extend" || mode == "story") && !Ltx) { _model = "ltx"; ModelChanged(); }      // keyframes and clip conditioning are LTX-Video's
         StateHasChanged();
     }
 
@@ -443,6 +446,34 @@
 
     private async Task GenerateVideo()
     {
+        if (_mode != "story") { await GenerateCoreAsync(); return; }
+        // a story: the first shot from text (or the picture), every following one extends the clip on screen from its last frames
+        var shots = _prompt.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        var story = _prompt;
+        var storyClock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            for (int i = 0; i < shots.Count; i++)
+            {
+                _mode = i == 0 ? (PictureCount > 0 ? "i2v" : "t2v") : "extend";
+                _prompt = shots[i];
+                _storyStatus = $"shot {i + 1} of {shots.Count}";
+                await GenerateCoreAsync();
+                if (_error != null) break;
+            }
+        }
+        finally
+        {
+            if (_error == null && _hasVideo) _resultInfo = $"{_frameCount} frames at {_fps} fps ({_frameCount / (double)_fps:F1} s), a story of {shots.Count} shots, {storyClock.Elapsed.TotalSeconds:F0} s total";
+            _mode = "story"; _prompt = story; _storyStatus = ""; StateHasChanged();
+        }
+    }
+
+    private string _storyStatus = "";
+    private bool Busy => _isRunning || _storyStatus.Length > 0;           // a story is busy between its shots too
+
+    private async Task GenerateCoreAsync()
+    {
         bool extending = _mode == "extend" && _lastClip != null && Ltx;
         _error = null; _isRunning = true; _hasPreview = false; _fraction = 0; _stage = "starting"; _stageMessage = "";
         if (!extending) _hasVideo = false;
@@ -464,7 +495,7 @@
                 {
                     Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
                     GuidanceScale = Turbo ? 1.0 : _guidance, Seed = seed,
-                    Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled,
+                    Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled, RgbaFrames = true,
                 };
             }
             var pics = Pictures().ToList();
@@ -482,7 +513,7 @@
                 request = new WanRequest
                 {
                     Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
-                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height, TiledDecode = request.TiledDecode,
+                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height, TiledDecode = request.TiledDecode, RgbaFrames = true,
                 };
             }
             var progress = new Progress<WanProgress>(p =>
@@ -512,6 +543,7 @@
                 ? await _ltxPipeline!.GenerateAsync(new LtxRequest
                 {
                     Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps, Upscale = _ltxUpscale, Conditions = conditions,
+                    RgbaFrames = true,                                                     // frames as bytes read a frame at a time: floats of whole clips exhaust the tab's .NET heap
                 }, progress)
                 : await _pipeline!.GenerateAsync(request, progress);
             try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
