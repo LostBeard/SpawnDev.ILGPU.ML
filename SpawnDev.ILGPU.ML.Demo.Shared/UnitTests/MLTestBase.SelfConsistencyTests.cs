@@ -36,6 +36,13 @@ public abstract partial class MLTestBase
         if (vote[0].Votes != 2 || !vote[0].Members.SequenceEqual(new[] { 0, 3 })) throw new Exception($"group 4: {vote[0].Votes} votes, members {string.Join(",", vote[0].Members)}");
         Eq(@"\frac{1}{2}", vote[1].Answer, "second group");
         if (vote.Count != 3) throw new Exception($"{vote.Count} groups (the unboxed chain must abstain)");
+        // decided: 2 votes vs 1 with 0 pending yes; with 1 pending no (it could tie); 4 vs 0 with 3 pending yes; nothing boxed: no
+        if (SelfConsistency.IsDecided(vote, 0)) throw new Exception("IsDecided: a 2-2 tie is not decided");
+        var twoOne = SelfConsistency.Vote(new[] { @"\boxed{4}", @"\boxed{4}", @"\boxed{9}" });
+        if (!SelfConsistency.IsDecided(twoOne, 0) || SelfConsistency.IsDecided(twoOne, 1)) throw new Exception("IsDecided: 2 vs 1");
+        var four = SelfConsistency.Vote(new[] { @"\boxed{7}", @"\boxed{7}", @"\boxed{7}", @"\boxed{7}" });
+        if (!SelfConsistency.IsDecided(four, 3) || SelfConsistency.IsDecided(four, 4)) throw new Exception("IsDecided: 4 vs 0");
+        if (SelfConsistency.IsDecided(SelfConsistency.Vote(new[] { "none" }), 0)) throw new Exception("IsDecided: no votes");
         await Task.CompletedTask;
         return "extract, normalise and vote as specified";
     });

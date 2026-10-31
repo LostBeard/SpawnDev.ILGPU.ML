@@ -73,6 +73,13 @@ public static class SelfConsistency
         return s;
     }
 
+    /// <summary>
+    /// True when <paramref name="pending"/> more chains cannot change the vote's winner: the leader has more votes than the runner-up would have if every pending chain
+    /// joined it. Stopping the rest then gives the same answer as waiting for them (an exact early exit: easy questions stop after a few chains).
+    /// </summary>
+    public static bool IsDecided(IReadOnlyList<Group> vote, int pending) =>
+        vote.Count > 0 && vote[0].Votes > (vote.Count > 1 ? vote[1].Votes : 0) + pending;
+
     /// <summary>One answer group of a vote: the normalised answer, how many chains gave it, and which (indices into the voted texts).</summary>
     public sealed record Group(string Answer, int Votes, int[] Members);
 

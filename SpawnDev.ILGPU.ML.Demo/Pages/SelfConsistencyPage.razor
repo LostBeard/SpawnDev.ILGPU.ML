@@ -80,6 +80,7 @@
             <label>Temperature <input type="number" min="0" max="1.5" step="0.1" @bind="_temperature" disabled="@_busy" /></label>
             <label>Top-p <input type="number" min="0.1" max="1" step="0.05" @bind="_topP" disabled="@_busy" /></label>
             <label>Max tokens <input type="number" min="64" max="@MaxTokensLimit" step="64" @bind="_maxTokens" disabled="@_busy" /></label>
+            <label class="check" title="Stop the other answers once they could not change the winner, even if every one of them joined the runner-up"><input type="checkbox" @bind="_stopWhenDecided" disabled="@_busy" /> Stop when the vote is decided</label>
             @if (_busy)
             {
                 <button class="primary stop" @onclick="() => _genCts?.Cancel()">Stop</button>
@@ -96,7 +97,7 @@
             int boxed = vote.Sum(g => g.Votes);
             <div class="vote">
                 <div class="vote-head">
-                    <span class="vote-title">@(_busy ? "The vote so far" : "The vote")</span>
+                    <span class="vote-title">@(_busy ? "The vote so far" : _decidedAfter > 0 ? $"The vote (decided after {_decidedAfter} of {_texts.Count} answers: the rest could not change it, so they were stopped)" : "The vote")</span>
                     <span class="stats">@_tokens tokens · @_seconds.ToString("F1") s · @((_seconds > 0 ? _tokens / _seconds : 0).ToString("F1")) tok/s across all answers</span>
                 </div>
                 @if (vote.Count == 0)
@@ -129,7 +130,7 @@
                     <div class="card @(winner ? "win" : "") @(_finished[s] ? "" : "live")">
                         <div class="card-head">
                             <span>Answer @(s + 1)</span>
-                            <span class="box">@(box ?? (_finished[s] ? "no boxed answer" : "…"))</span>
+                            <span class="box">@(box ?? (_stopped[s] ? "stopped" : _finished[s] ? "no boxed answer" : "…"))</span>
                         </div>
                         @* column-reverse on the body keeps a growing answer scrolled to its newest line *@
                         <div class="card-body"><div>@text@if (!_finished[s]) {<span class="caret">▋</span>}</div></div>
@@ -177,7 +178,9 @@
     string _problem = Examples[0];
     int _n = 8, _maxTokens = 768;
     float _temperature = 0.7f, _topP = 0.8f;
-    bool _busy;
+    bool _busy, _stopWhenDecided = true;
+    bool[] _stopped = Array.Empty<bool>();
+    int _decidedAfter;
     readonly List<System.Text.StringBuilder> _texts = new();
     bool[] _finished = Array.Empty<bool>();
     int _tokens;
@@ -243,7 +246,7 @@
         _texts.Clear(); _tokens = 0; _seconds = 0;
         var decoders = new SentencePieceStreamingDecoder[n];
         for (int s = 0; s < n; s++) { _texts.Add(new System.Text.StringBuilder()); decoders[s] = _tokenizer.CreateStreamingDecoder(); }
-        _finished = new bool[n];
+        _finished = new bool[n]; _stopped = new bool[n]; _decidedAfter = 0;
         _busy = true;
         _genCts = new CancellationTokenSource();
         StateHasChanged();
@@ -258,7 +261,18 @@
                     _texts[s].Append(decoders[s].Push(t)); _tokens++;
                     if (sw.ElapsedMilliseconds - lastPaint > 120) { lastPaint = sw.ElapsedMilliseconds; _seconds = sw.Elapsed.TotalSeconds; StateHasChanged(); }
                 },
-                onFinished: s => { _texts[s].Append(decoders[s].Finish()); _finished[s] = true; },
+                onFinished: s =>
+                {
+                    _texts[s].Append(decoders[s].Finish()); _finished[s] = true;
+                    // the vote over the finished answers; when the unfinished ones cannot change its winner, stop them (the same answer, sooner)
+                    int done = _finished.Count(f => f);
+                    if (_stopWhenDecided && done < n && _decidedAfter == 0
+                        && SelfConsistency.IsDecided(SelfConsistency.Vote(Enumerable.Range(0, n).Where(i => _finished[i]).Select(i => _texts[i].ToString()).ToList()), n - done))
+                    {
+                        _decidedAfter = done;
+                        _genCts!.Cancel();
+                    }
+                },
                 ct: _genCts.Token);
         }
         catch (OperationCanceledException) { }
@@ -268,9 +282,9 @@
             _status = ex.Message;
         }
         _seconds = sw.Elapsed.TotalSeconds;
-        for (int s = 0; s < n; s++) _finished[s] = true;
+        for (int s = 0; s < n; s++) { if (!_finished[s]) _stopped[s] = true; _finished[s] = true; }
         _busy = false;
-        JS.Log($"[SelfConsistency] {n} answers, {_tokens} tokens in {_seconds:F1} s ({_tokens / Math.Max(1e-9, _seconds):F1} tok/s); vote: {string.Join(", ", SelfConsistency.Vote(_texts.Select(t => t.ToString()).ToList()).Select(g => $"{g.Answer} x{g.Votes}"))}");
+        JS.Log($"[SelfConsistency] {n} answers{(_decidedAfter > 0 ? $" (decided after {_decidedAfter})" : "")}, {_tokens} tokens in {_seconds:F1} s ({_tokens / Math.Max(1e-9, _seconds):F1} tok/s); vote: {string.Join(", ", SelfConsistency.Vote(_texts.Select(t => t.ToString()).ToList()).Select(g => $"{g.Answer} x{g.Votes}"))}");
         StateHasChanged();
     }
 

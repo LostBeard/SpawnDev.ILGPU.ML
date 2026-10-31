@@ -64,6 +64,7 @@ button.link:disabled { color: #9aa6b4; cursor: default; }
     color: #e2e8f0; font-size: .82rem;
 }
 .controls select option { background: #1e293b; }
+.controls label.check input { width: auto; }
 
 /* ── Vote ── */
 .vote { border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: .9rem 1.1rem; background: rgba(255,255,255,0.03); margin-bottom: 1rem; }
