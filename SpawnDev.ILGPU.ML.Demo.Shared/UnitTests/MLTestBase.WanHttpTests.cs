@@ -117,6 +117,45 @@ public abstract partial class MLTestBase
         return $"largest size that decoded: {last}";
     });
 
+    /// <summary>
+    /// MagCache in the browser (the /video page's default for the standard transformer): the reference run's prompt and noise, 640x352 x17, 30 steps, plain and with MagCache. MagCache must
+    /// skip what its rule says for 30 steps (26 of 60 calls), the video must be finite, and it must stay close to the plain one (PSNR over 22 dB; the desktop measured 28.6 dB at 50 steps).
+    /// Both times go to the console.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Wan_MagCache_OverHttp() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser pipeline test (the desktop runs Wan_MagCache_ClipQuality)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        byte[] noiseRaw;
+        try { noiseRaw = await http.GetByteArrayAsync(WanServer + "dump2/browser/noise_t2v30.f32"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
+        var noise = WanFloats(noiseRaw);
+        var pipe = new Wan22Pipeline(accelerator, new WanRangeSource(http), "", Wan22Paths.InRepo(textEncoder: Wan22Paths.TextEncoderFile("q8")));
+        WanRequest Req(WanMagCache? mc, int steps = 30) => new()
+        {
+            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = 640, Height = 352, Frames = 17, Steps = steps, InitialNoise = noise, MagCache = mc,
+        };
+        await pipe.GenerateAsync(Req(null, 1));                                         // warm-up: kernels compiled, the prompt's encoding cached
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var plain = await pipe.GenerateAsync(Req(null));
+        double plainS = sw.Elapsed.TotalSeconds;
+        sw.Restart();
+        var fast = await pipe.GenerateAsync(Req(new WanMagCache()));
+        double fastS = sw.Elapsed.TotalSeconds, mse = 0;
+        for (int i = 0; i < fast.Data.Length; i++)
+        {
+            if (!float.IsFinite(fast.Data[i])) throw new Exception("a pixel is not finite");
+            double d = (Math.Clamp(fast.Data[i], -1f, 1f) - Math.Clamp(plain.Data[i], -1f, 1f)) / 2; mse += d * d;
+        }
+        double psnr = 10 * Math.Log10(1 / (mse / fast.Data.Length));
+        var report = $"browser MagCache on {accelerator.AcceleratorType}: {fast.MagCacheSkips.Skipped} of {fast.MagCacheSkips.Calls} calls skipped; plain {plainS:F0} s, MagCache {fastS:F0} s ({plainS / fastS:F2}x; prompt cached in both); PSNR {psnr:F1} dB vs plain";
+        Console.WriteLine("[Wan] " + report);
+        if (fast.MagCacheSkips != (26, 60) || !(psnr > 22)) throw new Exception(report);
+        return report;
+    });
+
     /// <summary>The largest video the /video page offers, end to end in the browser: 832x480, 33 frames, 8 steps (a draft: only the memory and the stage times matter), seed 3; the video must be finite and not flat.</summary>
     [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
     public async Task Wan_Pipeline_OverHttp_Large() => await RunTest(async accelerator =>

@@ -65,7 +65,9 @@ blocks' residual the calibrated magnitude ratios predict reuses the last one ins
 (github.com/Zehong-Ma/MagCache, Apache-2.0); the skip pattern matches MagCache's code for 30 to 50 steps (`WanMagCache_Decisions_MatchMagCache`). Our own calibration
 (`WanRequest.MeasureMagRatios`) reproduces MagCache's table to a mean of 0.0017 (step 25: 0.98956 vs 0.98959), so the table holds for this engine and sampler.
 MEASURED, RTX 4070 CUDA, 640x352 x17, 50 UniPC steps, guidance 5: plain 75.2 s; threshold 0.04 skips 42 of 100 calls, 54.1 s (1.39x), 28.6 dB PSNR against the plain
-clip; 0.12 skips 52, 47.3 s (1.59x), 27.6 dB. One extra [tokens, 3072] buffer per guidance branch. Not for Turbo (4 steps: nothing to skip).
+clip; 0.12 skips 52, 47.3 s (1.59x), 27.6 dB. In the browser (Chrome WebGPU, `Wan_MagCache_OverHttp`), 30 steps: 26 of 60 calls skipped, 139 s -> 97 s
+(1.43x), 24.2 dB (fewer steps: each skip covers more), so `/video` runs the standard transformer at the reference's 50 steps with MagCache, about the cost of 30 plain
+steps. One extra [tokens, 3072] buffer per guidance branch. Not for Turbo (4 steps: nothing to skip).
 
 ## Limits
 

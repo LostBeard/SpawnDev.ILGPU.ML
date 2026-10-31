@@ -95,7 +95,7 @@
             {
             <div class="vid-setting">
                 <label>Steps:</label>
-                <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The Turbo transformer is distilled for 4 steps. The standard one uses 50 in the reference; 20 to 30 is usually fine">
+                <select @bind="_steps" class="vid-select" disabled="@_isRunning" title="The Turbo transformer is distilled for 4 steps. The standard one uses 50 in the reference; with MagCache on, 50 steps cost about what 30 do without it (58 of 100 transformer calls run)">
                     <option value="4">4 (Turbo)</option>
                     <option value="8">8</option>
                     <option value="12">12 (draft)</option>
@@ -123,7 +123,7 @@
             {
             <div class="vid-setting">
                 <label>MagCache:</label>
-                <input type="checkbox" @bind="_wanMagCache" disabled="@_isRunning" title="Skip the transformer on the steps whose result MagCache predicts from the last one (NeurIPS 2025, its calibrated ratios for this model): 42 of 100 calls at 50 steps, 1.4x faster, 28.6 dB from the full clip (measured, 640x352 x17 on an RTX 4070). The standard transformer only: Turbo's 4 steps have nothing to skip." />
+                <input type="checkbox" @bind="_wanMagCache" disabled="@_isRunning" title="Skip the transformer on the steps whose result MagCache predicts from the last one (NeurIPS 2025, its calibrated ratios for this model): 42 of 100 calls at 50 steps, 1.4x faster, 28.6 dB from the full clip (measured, 640x352 x17 on an RTX 4070; at 30 steps in the browser 1.43x, 24.2 dB: each skip covers a bigger step). The standard transformer only: Turbo's 4 steps have nothing to skip." />
             </div>
             }
             }
@@ -382,7 +382,8 @@
     private void PrecisionChanged()
     {
         _pipeline = null; _isModelLoaded = false;
-        if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
+        // each transformer's own recipe; the standard one at the reference's 50 steps: with MagCache that is about the cost of 30 plain steps (browser, 640x352 x17: 30 plain steps 139 s, MagCache at 30 steps 97 s)
+        if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 50; if (_guidance <= 1.0) _guidance = 5.0; }
     }
 
     /// <summary>An example: a prompt (or, with <c>Idea</c>, the idea the story writer turns into the shots first) and its pictures.</summary>
