@@ -10,6 +10,8 @@
 // Steps: the "Animate the kitten" example (LTX image to video), the live preview must appear while it denoises (a screenshot of it is saved), then the clip;
 // "Extend this clip" with a new prompt must append frames to it; the "Keyframes: fly into the house" example must produce a clip; "A story in three shots" must
 // produce 97 + 2 x 80 frames. Screenshots go to the out dir.
+// VIDEO_DRIVE_AISTORY=1 runs only "AI writes the story" (Qwen3 4B writes 3 shots, then the story: 257 frames); the model server needs unsloth/Qwen3-4B-GGUF/Qwen3-4B-Q4_0.gguf
+// (or the request falls back to Hugging Face). VIDEO_DRIVE_TIMING=1 and VIDEO_DRIVE_KEEP=1: see below.
 // Uses TJ's installed Chrome with a persistent profile (real WebGPU adapter; the models cache in OPFS across runs), like drive-ml-pages.cs.
 // Exit code = number of failed steps.
 using System.Text.RegularExpressions;
@@ -93,6 +95,35 @@ if (Environment.GetEnvironmentVariable("VIDEO_DRIVE_KEEP") == "1")
     await page.Locator("select.vid-select").First.SelectOptionAsync("ltx");
     await page.Locator("input.vid-keep").CheckAsync();
     Console.WriteLine("    Keep loaded: on");
+}
+if (Environment.GetEnvironmentVariable("VIDEO_DRIVE_AISTORY") == "1")
+{
+    // the story writer: Qwen3 4B turns the example's idea into shots in the prompt box, then the shots run as a story (each extends the clip)
+    Console.WriteLine("--- AI story: example 'AI writes the story'");
+    await page.GetByRole(AriaRole.Button, new() { Name = "AI writes the story" }).ClickAsync();
+    var writeBy = DateTime.UtcNow.AddMinutes(15);
+    string shotsText = "";
+    while (DateTime.UtcNow < writeBy)
+    {
+        if (await page.Locator(".vid-error").CountAsync() > 0) { Console.WriteLine($"    ERROR shown: {await page.Locator(".vid-error").InnerTextAsync()}"); return 1; }
+        if (await page.Locator(".vid-progress-text").CountAsync() > 0 && (await page.Locator(".vid-progress-text").InnerTextAsync()).Contains("shot 1 of")) break;   // writing done, the story runs
+        await page.WaitForTimeoutAsync(1000);
+    }
+    Console.WriteLine($"    shots written at {sw.Elapsed.TotalSeconds:F0} s");
+    if (!await WaitResultAsync("ai-story", 45)) failed++;
+    // while a story runs the box holds the shot being generated; the whole story is back in it when the story is done
+    shotsText = await page.Locator("textarea.vid-prompt-input").InputValueAsync();
+    var shotLines = shotsText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    Console.WriteLine($"    {shotLines.Length} shots:");
+    foreach (var l in shotLines) Console.WriteLine($"      | {l}");
+    File.WriteAllText(Path.Combine(outDir, "ai-story-shots.txt"), shotsText);
+    if (shotLines.Length != 3) { Console.WriteLine($"    FAIL: expected 3 shots, got {shotLines.Length}"); failed++; }
+    var infoS = await InfoAsync();
+    int framesS = int.TryParse(Regex.Match(infoS, @"^(\d+) frames").Groups[1].Value, out var fs) ? fs : 0;
+    if (framesS != 97 + 2 * 80) { Console.WriteLine($"    FAIL: a three-shot story should be 257 frames, got {framesS}"); failed++; }
+    File.WriteAllLines(Path.Combine(outDir, "console.log"), log);
+    Console.WriteLine($"=== AI story done: {failed} failed in {sw.Elapsed.TotalSeconds:F0} s");
+    return failed;
 }
 Console.WriteLine("--- step 1: example 'Animate the kitten' (LTX image to video, live preview)");
 await page.GetByRole(AriaRole.Button, new() { Name = "Animate the kitten" }).ClickAsync();

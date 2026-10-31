@@ -151,6 +151,21 @@
             <button class="vid-mode @(_mode == "story" ? "on" : "")" @onclick="@(() => SetMode("story"))" disabled="@_isRunning" title="LTX-Video: one shot per line; each shot extends the clip from its last 17 frames, so a few lines make one continuous video">Story</button>
             <button class="vid-mode @(_mode == "extend" ? "on" : "")" @onclick="@(() => SetMode("extend"))" disabled="@(_isRunning || _lastClip == null)" title="LTX-Video: continue the clip on screen from its last 17 frames with a new prompt (video conditioning); the new frames are appended">Extend this clip</button>
         </div>
+        @if (_mode == "story")
+        {
+            <div class="vid-writer">
+                <input type="text" class="vid-prompt-input vid-idea" @bind="_storyIdea" @bind:event="oninput" disabled="@Busy"
+                       placeholder="Or give an idea and let AI write the shots: a lighthouse keeper's cat during a storm" />
+                <select @bind="_storyShots" class="vid-select" disabled="@Busy" title="How many shots: each one is a clip of about 4 seconds that continues the one before">
+                    <option value="2">2 shots</option>
+                    <option value="3">3 shots</option>
+                    <option value="4">4 shots</option>
+                    <option value="5">5 shots</option>
+                </select>
+                <button class="vid-action vid-download" @onclick="WriteStoryAsync" disabled="@(Busy || _isModelLoading || string.IsNullOrWhiteSpace(_storyIdea))">Write the shots</button>
+            </div>
+            <p class="vid-hint">@LtxStoryWriter.Label (@LtxStoryWriter.SizeText, downloaded once) writes one shot per line, in this tab; edit them, then Generate. Each new idea or click writes a different story.</p>
+        }
         @if (_mode == "i2v" || _mode == "morph" || _mode == "story")
         {
             <ReferenceImages @ref="_refs" MaxImages="@(_mode == "morph" ? 2 : 1)" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
@@ -251,6 +266,8 @@
     .vid-presets-label { color: #64748b; font-size: 0.8rem; }
     .vid-preset { padding: 0.35rem 0.75rem; border-radius: 8px; border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.08); color: #6ee7b7; font-size: 0.8rem; cursor: pointer; }
     .vid-preset:disabled { opacity: 0.45; cursor: not-allowed; }
+    .vid-writer { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
+    .vid-idea { flex: 1 1 18rem; }
     .vid-snaps { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
     .vid-snap { height: 72px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); }
     .vid-modes { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.9rem 0 0.5rem; }
@@ -338,13 +355,15 @@
         if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
     }
 
-    private sealed record Preset(string Label, string Mode, string Prompt, string[] Pictures, bool Upscale = false);
+    /// <summary>An example: a prompt (or, with <c>Idea</c>, the idea the story writer turns into the shots first) and its pictures.</summary>
+    private sealed record Preset(string Label, string Mode, string Prompt, string[] Pictures, bool Upscale = false, string? Idea = null);
     private static readonly Preset[] Presets =
     {
         new("Animate the kitten", "i2v", "The kitten slowly lifts its head, blinks and looks around curiously, its ears twitching, soft window light, shallow depth of field.", new[] { "samples/cat.jpg" }),
         new("Bring a landscape to life", "i2v", "Clouds drift slowly across the sky, the grass and trees sway in a gentle wind, light shifts across the hills, slow cinematic push forward.", new[] { "samples/landscape.jpg" }),
         new("Keyframes: fly into the house", "morph", "The camera glides smoothly toward the house, through the open front door and into the cozy living room, one continuous cinematic shot, warm light.", new[] { "samples/house.jpg", "samples/room.jpg" }),
         new("A story in three shots", "story", "A small red fox wakes up in a snowy forest at dawn, stretches and yawns, soft golden light.\nThe fox trots through the snowy forest between the trees, the camera follows it from the side.\nThe fox stops at the edge of a frozen lake and watches the sunrise, its breath visible in the cold air.", Array.Empty<string>()),
+        new("AI writes the story", "story", "", Array.Empty<string>(), Idea: "A paper boat sails down a rainy city street and out to the sea"),
         new("A street at dusk", "i2v", "Evening falls on the street: people walk past, cars drive by with their headlights on, shop lights flicker on, slow camera pan.", new[] { "samples/street.jpg" }),
         new("A fox in the snow (two-pass)", "t2v", "A red fox trots through fresh snow at golden hour, its breath visible in the cold air, the camera follows it slowly, soft light, shallow depth of field.", Array.Empty<string>(), Upscale: true),
     };
@@ -369,7 +388,38 @@
         }
         catch (Exception ex) { _error = "Could not load the example's picture: " + ex.Message; }
         StateHasChanged();
+        if (pr.Idea != null) { _storyIdea = pr.Idea; _storyShots = 3; if (!await WriteStoryAsync()) return; }
         if (_error == null) await GenerateVideo();
+    }
+
+    private string _storyIdea = "";
+    private int _storyShots = 3;
+
+    /// <summary>The story writer (<see cref="LtxStoryWriter"/>): the idea becomes one shot per line in the prompt box, shown as it is written. False when it failed or wrote nothing.</summary>
+    private async Task<bool> WriteStoryAsync()
+    {
+        if (Busy || string.IsNullOrWhiteSpace(_storyIdea)) return false;
+        _error = null; _isRunning = true; _hasPreview = false; _fraction = 0; _stage = ""; _stageMessage = "starting";
+        _storyStatus = "writing the shots";                         // Busy, and the result panel stays hidden while the shots are written
+        StateHasChanged();
+        try
+        {
+            await EnsureAcceleratorAsync();
+            if (!string.IsNullOrWhiteSpace(_modelServer)) SpawnDev.ILGPU.ML.Hub.ModelsHost.BaseUrl = _modelServer.Trim().TrimEnd('/');
+            if (_ltxPipeline != null) _ltxPipeline.KeepLoaded = false;          // the language model and the video transformer never share the GPU; Generate loads it again
+            int shots = _storyShots;
+            var lines = await LtxStoryWriter.WriteAsync(_accelerator!, (repo, file, download) => ModelSource.OpenAsync(repo, file, download), _storyIdea, shots,
+                _seed is { } s ? (int)(s % int.MaxValue) : Random.Shared.Next(1, int.MaxValue),
+                status => { _stageMessage = status; _ = InvokeAsync(StateHasChanged); },
+                pct => { _fraction = 0.5 * pct / 100; _ = InvokeAsync(StateHasChanged); },
+                text => { _prompt = text; _fraction = 0.5 + 0.5 * Math.Min(1, text.Length / (330.0 * shots)); _ = InvokeAsync(StateHasChanged); });
+            if (lines.Length == 0) { _error = "The story writer wrote no shots; try again or change the idea."; return false; }
+            _prompt = string.Join("\n", lines);
+            Console.WriteLine($"[Video] story: {lines.Length} shots written for \"{_storyIdea}\"");
+            return true;
+        }
+        catch (Exception ex) { _error = "The story writer failed: " + ex.Message; Console.WriteLine($"[Video] story writer: {ex}"); return false; }
+        finally { _isRunning = false; _storyStatus = ""; _stage = ""; _stageMessage = ""; StateHasChanged(); }
     }
 
     private void SetMode(string mode)

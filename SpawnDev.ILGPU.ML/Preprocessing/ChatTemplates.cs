@@ -189,9 +189,14 @@ public static class ChatTemplates
         else ids.AddRange(tok.Encode(marker));               // fallback: encode the literal text
     }
 
+    /// <summary>True when a ChatML template can turn reasoning off (Qwen3's <c>enable_thinking</c> switch, which emits an empty <c>&lt;think&gt;</c> block).</summary>
+    public static bool HasThinkingSwitch(string? chatTemplate) => chatTemplate != null && chatTemplate.Contains("enable_thinking", StringComparison.Ordinal);
+
     /// <summary>Build ChatML prompt token ids for a multi-turn conversation.</summary>
+    /// <param name="emptyThinking">After the generation prompt, an empty reasoning block (<c>&lt;think&gt;\n\n&lt;/think&gt;\n\n</c>): what Qwen3's template emits for
+    /// <c>enable_thinking=false</c>, so the model answers directly instead of reasoning first.</param>
     public static int[] BuildChatMLPromptTokens(SentencePieceTokenizer tok,
-        IReadOnlyList<(string Role, string Content)> messages, bool addGenerationPrompt = true)
+        IReadOnlyList<(string Role, string Content)> messages, bool addGenerationPrompt = true, bool emptyThinking = false)
     {
         var ids = new List<int>();
         foreach (var (role, content) in messages)
@@ -202,6 +207,11 @@ public static class ChatTemplates
             ids.AddRange(tok.Encode("\n"));
         }
         if (addGenerationPrompt) { EmitMarker(ids, tok, "<|im_start|>"); ids.AddRange(tok.Encode("assistant\n")); }
+        if (addGenerationPrompt && emptyThinking)
+        {
+            EmitMarker(ids, tok, "<think>"); ids.AddRange(tok.Encode("\n\n"));
+            EmitMarker(ids, tok, "</think>"); ids.AddRange(tok.Encode("\n\n"));
+        }
         return ids.ToArray();
     }
 
@@ -429,7 +439,9 @@ public static class ChatTemplates
                         Ids(tok, "<|eot_id|>", "<|eom_id|>"));
             case ChatFormat.ChatML:
             default:
-                var chatmlIds = BuildChatMLPromptTokens(tok, messages);
+                // thinking=false on a template with the switch (Qwen3's enable_thinking) = its empty reasoning block; until 2026-10-31 the flag reached only gemma4, so
+                // Qwen3 reasoned whatever a caller asked
+                var chatmlIds = BuildChatMLPromptTokens(tok, messages, emptyThinking: !thinking && HasThinkingSwitch(model.GetMetadataString("tokenizer.chat_template")));
                 // Most ChatML models are BOS-less (qwen2.5/qwen3/smollm2 begin at <|im_start|>), but some
                 // declare their own BOS via add_bos_token (LFM2: add_bos_token=true, <|startoftext|>=1).
                 // A missing BOS puts the model OFF its training distribution -> coherent for a token or two

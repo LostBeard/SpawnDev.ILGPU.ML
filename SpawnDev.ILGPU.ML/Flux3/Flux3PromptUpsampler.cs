@@ -18,10 +18,13 @@ public sealed class Flux3PromptUpsampler
     /// <summary>A chat that can stream: the third argument, when not null, is called with (tokens so far, the answer so far) as the model writes.</summary>
     public Flux3PromptUpsampler(Func<string, string, Func<int, string, Task>?, Task<string>> chat) => _chat = chat;
 
-    /// <summary>An upsampler on a loaded GGUF model (greedy, reasoning off, capped at 1200 new tokens: captions run 100 to 350 words).</summary>
+    /// <summary>
+    /// An upsampler on a loaded GGUF model (greedy, capped at 1200 new tokens: captions run 100 to 350 words). Qwen3 reasons before the caption: every caption so far was written that way (the
+    /// thinking flag did not reach ChatML models until 2026-10-31) and the pages show the reasoning as it grows, so it stays on.
+    /// </summary>
     public static Flux3PromptUpsampler FromPipeline(GgufTextGenerationPipeline pipeline, int maxNewTokens = 1200)
         => new((system, user, onToken) => pipeline.GenerateAsync(new List<(string, string)> { ("system", system), ("user", user) },
-            new GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" }, thinking: false, onToken: onToken));
+            new GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" }, thinking: true, onToken: onToken));
 
     /// <summary>Black Forest Labs' text-to-image upsampler system prompt (Apache-2.0).</summary>
     public const string TextToImagePrompt = """
