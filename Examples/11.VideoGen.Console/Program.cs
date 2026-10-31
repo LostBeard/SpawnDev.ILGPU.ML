@@ -12,7 +12,7 @@
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
-//           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate)
+//           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate)
 //           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB; default q8, the hosted one: bf16 only with --models)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
 //
@@ -141,7 +141,8 @@ IProgress<WanProgress> ConsoleProgress(System.Diagnostics.Stopwatch sw)
     });
 }
 
-// LTX-Video 2B 0.9.8 distilled (text to video): T5-v1.1-XXL streamed, the 2B DiT with the 7-step distilled sampler, the timestep-conditioned VAE decode
+// LTX-Video 2B 0.9.8 distilled (text to video, or image to video with --image): T5-v1.1-XXL streamed, the VAE encoder for the picture, the 2B DiT with the 7-step distilled sampler,
+// the timestep-conditioned VAE decode
 async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, Options o)
 {
     string ditFile = LtxPaths.DitFile(args.Contains("--dit") ? o.Dit : "bf16"), textFile = LtxPaths.TextEncoderFile(o.Text);       // LTX: --dit bf16|q8 (3.6 / 2.0 GB), --text bf16|q8 (8.9 / 5.0 GB)
@@ -157,7 +158,15 @@ async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, 
         Console.WriteLine($"Model cache: {store.RootDirectory} (first run downloads the DiT, the VAE and the text encoder from the models host)");
         pipe = new LtxPipeline(accelerator, new HttpClientModelSource(http, store), LtxPipeline.DefaultRepo, LtxPaths.InRepo(ditFile, textFile));
     }
-    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps };
+    LtxCondition[]? conditions = null;
+    if (o.Image != null)
+    {
+        using var img = Image.Load<Rgb24>(o.Image);
+        var rgb = new byte[img.Width * img.Height * 3];
+        img.CopyPixelDataTo(rgb);
+        conditions = new[] { LtxCondition.Image(rgb, img.Width, img.Height) };          // the picture is frame 0 (scaled to cover the size, centre-cropped)
+    }
+    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps, Conditions = conditions };
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var video = await pipe.GenerateAsync(request, ConsoleProgress(sw));
     Console.WriteLine();

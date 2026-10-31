@@ -8,6 +8,13 @@ namespace SpawnDev.ILGPU.ML.Ltx;
 using FV = ArrayView1D<float, Stride1D.Dense>;
 
 /// <summary>
+/// Tokens [<see cref="Start"/>, <see cref="Start"/> + <see cref="Count"/>) of one DiT forward and the model timestep they see. LTXConditionPipeline gives each token its own timestep
+/// (<c>min(t, (1 - conditioning strength) * 1000)</c>: a hard-conditioned frame sees 0); the conditioning strength is per latent frame or per condition, so the timestep is constant on
+/// contiguous token runs and the forward runs its modulation once per run.
+/// </summary>
+public readonly record struct LtxTimestepSegment(int Start, int Count, double Timestep);
+
+/// <summary>
 /// The LTX-Video 2B diffusion transformer (<c>LTXVideoTransformer3DModel</c>): a linear patch projection of the 128 latent channels (patch 1x1x1: every latent position is a token),
 /// the caption projection MLP, a time embedding with a 6-way adaLN projection, 28 blocks of (RMS norm + adaLN modulation, self-attention with qk RMS norm over the whole q / k vector
 /// and RoPE over the whole 2048 width, cross-attention to the T5 text on the raw residual stream, GELU-tanh feed-forward with a gate) and a modulated LayerNorm head. Batch 1.
@@ -15,7 +22,8 @@ using FV = ArrayView1D<float, Stride1D.Dense>;
 /// The T5 padding mask is a pure suffix (the tokenizer pads on the right) and the reference adds -10000 to the padded keys, which is exactly zero attention weight, so the
 /// cross-attention here just runs over the real text rows. The text half of every cross-attention (k and v of the caption) does not change between steps: <see cref="SetContext"/>
 /// computes it once per prompt slot and block. The latent is [128, frames, h, w] (= [128, N] channel-major, the VAE layout); the DiT transposes to tokens and back.
-/// Work buffers are allocated once per latent grid (<see cref="SetGrid"/>); <see cref="Dispose"/> frees them.
+/// Work buffers are allocated once per latent grid (<see cref="SetGrid"/>, or <see cref="SetPositions"/> for tokens at explicit positions); <see cref="Dispose"/> frees them.
+/// A forward can give runs of tokens different timesteps (<see cref="LtxTimestepSegment"/>: image-to-video and video conditioning).
 /// </summary>
 public sealed class LtxDiT : IDisposable
 {
@@ -32,7 +40,10 @@ public sealed class LtxDiT : IDisposable
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _ctxBufs = new();
     private MemoryBuffer1D<float, Stride1D.Dense>? _phases;
     private FV _tokens, _hid, _hn, _qkv, _q, _attn, _proj, _mlp, _scores, _headOut, _outTokens;
-    private FV _tFreq, _tHidden, _e, _eAct, _e0, _mod, _hm, _ctxIn, _ctxHid;
+    private FV _ctxIn, _ctxHid;
+    /// <summary>The time embedding buffers of one timestep run: sinusoid, hidden, e, silu(e), the 6-way projection e0, the block modulation, the head modulation.</summary>
+    private sealed record SegmentBuffers(FV TFreq, FV THidden, FV E, FV EAct, FV E0, FV Mod, FV Hm);
+    private readonly List<SegmentBuffers> _seg = new();
     private readonly FV[] _textEmb = new FV[2];
     private readonly FV[][] _crossKv = new FV[2][];          // [slot][block]: k | v of the caption, [rows, 2C], k already RMS-normalised
     private readonly int[] _rows = new int[2];
@@ -77,6 +88,7 @@ public sealed class LtxDiT : IDisposable
     {
         foreach (var b in _ws) b.Dispose();
         _ws.Clear();
+        _seg.Clear();
         _phases?.Dispose(); _phases = null;
     }
 
@@ -86,13 +98,27 @@ public sealed class LtxDiT : IDisposable
     /// </summary>
     public void SetGrid(int frames, int h, int w, float ropeScaleT, float ropeScaleH, float ropeScaleW)
     {
+        SetTokens(frames * h * w, LtxKernels.RopePhases(frames, h, w, _dim, ropeScaleT, ropeScaleH, ropeScaleW));
+        _fz = frames; _h = h; _wd = w;
+    }
+
+    /// <summary>
+    /// Fix the tokens by explicit positions (the <c>video_coords</c> of LTXConditionPipeline: [N, 3] = time in seconds, pixel row, pixel column; see
+    /// <see cref="LtxKernels.RopePhasesForCoords"/>): the latent is then [128, N] in the order of <paramref name="coords"/>. Sizes the work buffers.
+    /// </summary>
+    public void SetPositions(float[] coords)
+    {
+        SetTokens(coords.Length / 3, LtxKernels.RopePhasesForCoords(coords, _dim));
+        _fz = 0; _h = 0; _wd = 0;
+    }
+
+    private void SetTokens(int n, float[] table)
+    {
         FreeWorkspace();
-        _fz = frames; _h = h; _wd = w; _n = frames * h * w;
+        _n = n;
         int N = _n, C = _dim;
-        var table = LtxKernels.RopePhases(frames, h, w, C, ropeScaleT, ropeScaleH, ropeScaleW);
         _phases = _acc.Allocate1D<float>(table.Length);
         _phases.View.CopyFromCPU(table);
-        _tFreq = Alloc(_freqDim); _tHidden = Alloc(C); _e = Alloc(C); _eAct = Alloc(C); _e0 = Alloc(6 * C); _mod = Alloc(6 * C); _hm = Alloc(2 * C);
         _tokens = Alloc((long)N * _inCh); _hid = Alloc((long)N * C); _hn = Alloc((long)N * C); _qkv = Alloc((long)N * 3 * C); _q = Alloc((long)N * C);
         _attn = Alloc((long)N * C); _proj = Alloc((long)N * C); _mlp = Alloc((long)N * _ffn);
         _scores = Alloc(_k.UsesFlashAttention(_headDim) ? 1 : (long)_heads * N * Math.Max(N, _textLen));
@@ -130,44 +156,63 @@ public sealed class LtxDiT : IDisposable
         _acc.Fence();
     }
 
-    /// <summary>The time embedding e = time_embedding(sinusoid(t)) and the 6-way adaLN projection e0 = time_projection(silu(e)).</summary>
-    private void TimeEmbed(double t)
+    /// <summary>
+    /// The time embedding e = time_embedding(sinusoid(t)) and the 6-way adaLN projection e0 = time_projection(silu(e)) of run <paramref name="i"/>. Every run has its own buffers: the
+    /// sinusoid is written from the host, and on WebGPU a host write lands before dispatches still queued, so a shared buffer would hand an earlier run the later run's timestep.
+    /// </summary>
+    private SegmentBuffers TimeEmbed(int i, double t)
     {
         int C = _dim;
-        _tFreq.CopyFromCPU(WanKernels.SinusoidalEmbedding(t, _freqDim));
-        _k.Linear(_tFreq, _mat.Matrix("time_embedding.0.weight"), _w.BF16("time_embedding.0.bias"), _tHidden, 1, _freqDim, C, DiTKernels.Act.Silu);
-        _k.Linear(_tHidden, _mat.Matrix("time_embedding.2.weight"), _w.BF16("time_embedding.2.bias"), _e, 1, C, C);
-        _k.Silu(_e, _eAct, C);
-        _k.Linear(_eAct, _mat.Matrix("time_projection.1.weight"), _w.BF16("time_projection.1.bias"), _e0, 1, C, 6 * C);
+        while (_seg.Count <= i) _seg.Add(new SegmentBuffers(Alloc(_freqDim), Alloc(C), Alloc(C), Alloc(C), Alloc(6 * C), Alloc(6 * C), Alloc(2 * C)));
+        var s = _seg[i];
+        s.TFreq.CopyFromCPU(WanKernels.SinusoidalEmbedding(t, _freqDim));
+        _k.Linear(s.TFreq, _mat.Matrix("time_embedding.0.weight"), _w.BF16("time_embedding.0.bias"), s.THidden, 1, _freqDim, C, DiTKernels.Act.Silu);
+        _k.Linear(s.THidden, _mat.Matrix("time_embedding.2.weight"), _w.BF16("time_embedding.2.bias"), s.E, 1, C, C);
+        _k.Silu(s.E, s.EAct, C);
+        _k.Linear(s.EAct, _mat.Matrix("time_projection.1.weight"), _w.BF16("time_projection.1.bias"), s.E0, 1, C, 6 * C);
+        return s;
     }
 
     /// <summary>
     /// One noise (velocity) prediction. <paramref name="latent"/> is [128, frames, h, w] (channel-major), <paramref name="o"/> receives the same shape. <paramref name="t"/> is the model
     /// timestep as the reference passes it. <paramref name="slot"/> selects the prompt set with <see cref="SetContext"/>.
     /// </summary>
-    public void Forward(FV latent, double t, int slot, FV o)
+    public void Forward(FV latent, double t, int slot, FV o) => Forward(latent, new[] { new LtxTimestepSegment(0, _n, t) }, slot, o);
+
+    /// <summary>
+    /// One prediction where runs of tokens see different timesteps: <paramref name="segments"/> cover the tokens [0, N) in order without gaps (each run costs one time embedding and its own
+    /// modulation dispatches, so merge adjacent runs with the same timestep). With <paramref name="tokenMajor"/> the latent and the prediction are [N, 128] (packed tokens, the layout
+    /// LTXConditionPipeline works in: a run of tokens is then a contiguous range) instead of [128, N].
+    /// </summary>
+    public void Forward(FV latent, IReadOnlyList<LtxTimestepSegment> segments, int slot, FV o, bool tokenMajor = false)
     {
-        if (_n == 0) throw new InvalidOperationException("SetGrid must be called before Forward");
+        if (_n == 0) throw new InvalidOperationException("SetGrid or SetPositions must be called before Forward");
         if (_textEmb[slot].Length == 0) throw new InvalidOperationException($"SetContext({slot}) must be called before Forward");
         int N = _n, C = _dim, H = _heads, D = _headDim, L = _rows[slot];
+        int next = 0;
+        foreach (var sg in segments) { if (sg.Start != next || sg.Count < 1) throw new ArgumentException("the timestep runs must cover the tokens in order without gaps", nameof(segments)); next += sg.Count; }
+        if (next != N) throw new ArgumentException($"the timestep runs cover {next} tokens, the grid has {N}", nameof(segments));
 
-        TimeEmbed(t);
-        Tap?.Invoke("time_embedding", _e, C);
-        Tap?.Invoke("time_projection", _e0, 6 * C);
+        var seg = new SegmentBuffers[segments.Count];
+        for (int i = 0; i < seg.Length; i++) seg[i] = TimeEmbed(i, segments[i].Timestep);
+        Tap?.Invoke("time_embedding", seg[0].E, C);
+        Tap?.Invoke("time_projection", seg[0].E0, 6 * C);
         Tap?.Invoke("text_embedding", _textEmb[slot], L * C);
+        FV Rows(FV v, int i) => v.SubView((long)segments[i].Start * C, (long)segments[i].Count * C);
 
         // tokens: [128, N] -> [N, 128], then the patch projection (a linear layer)
-        _k.Transpose(latent, _tokens, _inCh, N);
-        _k.Linear(_tokens, _mat.Matrix("patch_embedding.weight"), _w.BF16("patch_embedding.bias"), _hid, N, _inCh, C);
+        if (!tokenMajor) _k.Transpose(latent, _tokens, _inCh, N);
+        _k.Linear(tokenMajor ? latent : _tokens, _mat.Matrix("patch_embedding.weight"), _w.BF16("patch_embedding.bias"), _hid, N, _inCh, C);
         Tap?.Invoke("patch_embedding", _hid, N * C);
 
         for (int b = 0; b < _blocks; b++)
         {
             string p = $"blocks.{b}.";
-            _k.AddBf16(_w.BF16(p + "modulation"), _e0, _mod, 6 * C);          // scale_shift_table + temb: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+            for (int i = 0; i < seg.Length; i++)
+                _k.AddBf16(_w.BF16(p + "modulation"), seg[i].E0, seg[i].Mod, 6 * C);   // scale_shift_table + temb: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
             // self attention
-            _lk.RmsNormModulate(_hid, _hn, _mod, 0 * C, 1 * C, N, C, 1e-6f);
+            for (int i = 0; i < seg.Length; i++) _lk.RmsNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Mod, 0 * C, 1 * C, segments[i].Count, C, 1e-6f);
             _k.Linear(_hn, _mat.Matrix(p + "self_attn.qkv.weight"), _w.BF16(p + "self_attn.qkv.bias"), _qkv, N, C, 3 * C);
             _wk.RowRmsNorm(_qkv, _w.BF16(p + "self_attn.norm_q.weight"), N, 3 * C, 0 * C, C, 1e-5f);
             _wk.RowRmsNorm(_qkv, _w.BF16(p + "self_attn.norm_k.weight"), N, 3 * C, 1 * C, C, 1e-5f);
@@ -175,7 +220,7 @@ public sealed class LtxDiT : IDisposable
             _wk.RopeApply(_qkv, _phases.View, N, 3 * C, 1 * C, 1, C);
             _k.Attention(_qkv, 3 * C, 0, _qkv, 3 * C, 1 * C, 2 * C, _scores, _attn, N, N, H, D);
             _k.Linear(_attn, _mat.Matrix(p + "self_attn.o.weight"), _w.BF16(p + "self_attn.o.bias"), _proj, N, C, C);
-            _k.GateResidual(_hid, _proj, _mod, 2 * C, N * C, C);
+            for (int i = 0; i < seg.Length; i++) _k.GateResidual(Rows(_hid, i), Rows(_proj, i), seg[i].Mod, 2 * C, segments[i].Count * C, C);
 
             // cross attention: on the raw residual stream (no norm, no modulation, no RoPE), plain residual
             _k.Linear(_hid, _mat.Matrix(p + "cross_attn.q.weight"), _w.BF16(p + "cross_attn.q.bias"), _q, N, C, C);
@@ -185,20 +230,24 @@ public sealed class LtxDiT : IDisposable
             _k.GateResidual(_hid, _proj, default, -1, N * C, C);
 
             // feed forward
-            _lk.RmsNormModulate(_hid, _hn, _mod, 3 * C, 4 * C, N, C, 1e-6f);
+            for (int i = 0; i < seg.Length; i++) _lk.RmsNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Mod, 3 * C, 4 * C, segments[i].Count, C, 1e-6f);
             _k.Linear(_hn, _mat.Matrix(p + "ffn.0.weight"), _w.BF16(p + "ffn.0.bias"), _mlp, N, C, _ffn, DiTKernels.Act.GeluTanh);
             _k.Linear(_mlp, _mat.Matrix(p + "ffn.2.weight"), _w.BF16(p + "ffn.2.bias"), _proj, N, _ffn, C);
-            _k.GateResidual(_hid, _proj, _mod, 5 * C, N * C, C);
+            for (int i = 0; i < seg.Length; i++) _k.GateResidual(Rows(_hid, i), Rows(_proj, i), seg[i].Mod, 5 * C, segments[i].Count * C, C);
 
             if (Tap != null && Array.IndexOf(TapBlocks, b) >= 0) Tap($"block_{b}", _hid, N * C);
         }
 
         // head: LayerNorm (no affine) modulated by (scale_shift_table + e): shift = row 0, scale = row 1, then the output projection
-        _wk.AddBroadcastBf16(_w.BF16("head.modulation"), _e, _hm, 2 * C, C);
-        _k.LayerNormModulate(_hid, _hn, _hm, 0, C, N, C, 1e-6f);
-        _k.Linear(_hn, _mat.Matrix("head.head.weight"), _w.BF16("head.head.bias"), _headOut, N, C, _outCh);
-        Tap?.Invoke("head", _headOut, N * _outCh);
-        _k.Transpose(_headOut, o, N, _outCh);                                    // [N, 128] -> [128, N]
+        for (int i = 0; i < seg.Length; i++)
+        {
+            _wk.AddBroadcastBf16(_w.BF16("head.modulation"), seg[i].E, seg[i].Hm, 2 * C, C);
+            _k.LayerNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Hm, 0, C, segments[i].Count, C, 1e-6f);
+        }
+        var head = tokenMajor ? o : _headOut;
+        _k.Linear(_hn, _mat.Matrix("head.head.weight"), _w.BF16("head.head.bias"), head, N, C, _outCh);
+        Tap?.Invoke("head", head, N * _outCh);
+        if (!tokenMajor) _k.Transpose(_headOut, o, N, _outCh);                   // [N, 128] -> [128, N]
         _acc.Fence();
     }
 

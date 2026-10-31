@@ -52,7 +52,8 @@ public partial class MainWindow : Window
     private void Busy(bool busy)
     {
         foreach (var c in new Control[] { GenerateButton, FolderButton, ModelBox, SizeBox, FramesBox, SeedBox, DitBox, TextEncBox, PromptBox }) c.IsEnabled = !busy;
-        foreach (var c in new Control[] { PickButton, ClearPictureButton, StepsBox, GuidanceBox, NegativeBox }) c.IsEnabled = !busy && !Ltx;      // Wan only: LTX is text to video with a fixed 7-step recipe and no guidance
+        foreach (var c in new Control[] { PickButton, ClearPictureButton }) c.IsEnabled = !busy;                                       // the first frame: both models
+        foreach (var c in new Control[] { StepsBox, GuidanceBox, NegativeBox }) c.IsEnabled = !busy && !Ltx;                           // Wan only: LTX has a fixed 7-step recipe and no guidance
     }
 
     private static void Fill(ComboBox box, int selected, params string[] items)
@@ -166,13 +167,14 @@ public partial class MainWindow : Window
                 LtxPipeline lp = _modelFolder != null
                     ? new LtxPipeline(_accelerator!, LtxPaths.InFolder(_modelFolder, LtxPaths.DitFile(dit), LtxPaths.TextEncoderFile(text)))
                     : new LtxPipeline(_accelerator!, new HttpClientModelSource(_http, new FileModelStore(_cacheDir)), LtxPipeline.DefaultRepo, LtxPaths.InRepo(LtxPaths.DitFile(dit), LtxPaths.TextEncoderFile(text)));
-                Log($"Text to video (LTX-Video 2B): {width}x{height}, {frames} frames, 7 steps, seed {seed}.");
+                Log($"{(_pictureRgb != null ? "Image to video" : "Text to video")} (LTX-Video 2B): {width}x{height}, {frames} frames, 7 steps, seed {seed}.");
                 var lprogress = new Progress<WanProgress>(p =>
                 {
                     StatusText.Text = $"{p.Stage}: {p.Message}";
-                    Bar.Value = 100 * p.Stage switch { "text" => 0.3 * p.Fraction, "denoise" => 0.3 + 0.55 * p.Fraction, "decode" => 0.85 + 0.15 * p.Fraction, _ => 0 };
+                    Bar.Value = 100 * p.Stage switch { "text" => 0.3 * p.Fraction, "conditions" => 0.3, "denoise" => 0.3 + 0.55 * p.Fraction, "decode" => 0.85 + 0.15 * p.Fraction, _ => 0 };
                 });
-                _video = await Task.Run(() => lp.GenerateAsync(new LtxRequest { Prompt = prompt, Width = width, Height = height, Frames = frames, Seed = seed }, lprogress));
+                var conditions = _pictureRgb != null ? new[] { LtxCondition.Image(_pictureRgb, _pictureW, _pictureH) } : null;
+                _video = await Task.Run(() => lp.GenerateAsync(new LtxRequest { Prompt = prompt, Width = width, Height = height, Frames = frames, Seed = seed, Conditions = conditions }, lprogress));
                 ShowVideo(seed, total);
                 return;
             }

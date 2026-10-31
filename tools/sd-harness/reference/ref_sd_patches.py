@@ -51,8 +51,11 @@ def comfy_freeu(resolution_idx, h, hsp, **_):
 
 
 class HyperTileAttn:                                 # ComfyUI nodes_hypertile.py (hypertile_in / hypertile_out) around diffusers' processor
-    def __init__(self, base, lat_hw, tile_size=128, swap_size=1, max_depth=1, scale_depth=False):
-        self.base, (self.H, self.W) = base, lat_hw
+    """ComfyUI's attn1_patch rearranges ONLY q; k and v are projected from the untiled tokens and attention_pytorch reshapes them with q's batch
+    (t.view(b, -1, heads, dim_head) with b = q.shape[0]), so query tile t attends to the flat tokens [t * L, (t + 1) * L) of its own picture.
+    tile_kv=True is true tiled attention (q, k and v of the tile)."""
+    def __init__(self, base, lat_hw, tile_size=128, swap_size=1, max_depth=1, scale_depth=False, tile_kv=False):
+        self.base, (self.H, self.W), self.tile_kv = base, lat_hw, tile_kv
         self.tile, self.swap, self.max_depth, self.scale_depth = max(32, tile_size) // 8, swap_size, max_depth, scale_depth
 
     @staticmethod
@@ -74,7 +77,16 @@ class HyperTileAttn:                                 # ComfyUI nodes_hypertile.p
                 b, _, c = hidden_states.shape
                 th, tw = h // nh, w // nw
                 x = hidden_states.view(b, nh, th, nw, tw, c).permute(0, 1, 3, 2, 4, 5).reshape(b * nh * nw, th * tw, c)   # b (nh h nw w) c -> (b nh nw) (h w) c
-                out = self.base(attn, x, None, attention_mask, temb)
+                if self.tile_kv:
+                    out = self.base(attn, x, None, attention_mask, temb)
+                else:
+                    heads = attn.heads
+                    bq, d = x.shape[0], c // heads
+                    q = attn.to_q(x).view(bq, -1, heads, d).transpose(1, 2)
+                    k = attn.to_k(hidden_states).reshape(bq, -1, heads, d).transpose(1, 2)        # the untiled tokens, split by q's batch: the band of tile t
+                    v = attn.to_v(hidden_states).reshape(bq, -1, heads, d).transpose(1, 2)
+                    o = torch.nn.functional.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(bq, -1, c)
+                    out = attn.to_out[1](attn.to_out[0](o))
                 return out.view(b, nh, nw, th, tw, c).permute(0, 1, 3, 2, 4, 5).reshape(b, nh * th * nw * tw, c)
         return self.base(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
 
@@ -174,6 +186,10 @@ def main():
     out["eps_hypertile"] = run()
     for n, m in unet.named_modules():
         if n in procs:
+            m.set_processor(HyperTileAttn(procs[n], tuple(latent.shape[-2:]), tile_kv=True))
+    out["eps_hypertile_kv"] = run()
+    for n, m in unet.named_modules():
+        if n in procs:
             m.set_processor(procs[n])
     # SAG: the middle block's first self-attention map (transformer_blocks[0].attn1), its per-key mass, and ComfyUI's blur map of a test latent
     blk = unet.mid_block.attentions[0].transformer_blocks[0].attn1
@@ -189,7 +205,7 @@ def main():
     print("sag mass", out["sag_mass"].shape, "min", float(out["sag_mass"].min()), "max", float(out["sag_mass"].max()), "above 1:", int((out["sag_mass"] > 1).sum()),
           "record vs plain", float(np.abs(out["eps_sag_record"] - out["eps_plain"]).max()))
     np.savez(a.out, **out)
-    for k in ("plain", "freeu", "freeu2", "pag", "hypertile"):
+    for k in ("plain", "freeu", "freeu2", "pag", "hypertile", "hypertile_kv"):
         e = out["eps_" + k]
         print(k, e.shape, "absmax", float(np.abs(e).max()), "vs plain", float(np.sqrt(((e - out["eps_plain"]) ** 2).mean() / (out["eps_plain"] ** 2).mean())))
 

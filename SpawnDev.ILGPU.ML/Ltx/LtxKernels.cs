@@ -121,6 +121,15 @@ public sealed class LtxKernels
         _axpy(count, x, v, dt);
     }
 
+    // o[i] = a[i] + c * b[i]   (the image-conditioning noise: a hard-conditioned token is its clean latent plus noise scaled by (t / 1000)^2)
+    private Action<Index1D, FV, FV, FV, float>? _addScaled;
+    private static void AddScaledImpl(Index1D i, FV a, FV b, FV o, float c) => o[i] = a[i] + c * b[i];
+    public void AddScaled(FV a, FV b, float c, FV o, int count)
+    {
+        _addScaled ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(AddScaledImpl);
+        _addScaled(count, a, b, o, c);
+    }
+
     // The 3x3x3 table of the LTX decoder's (non-causal) convolutions: zero padding in space, REPLICATE padding in time (the first / last frame is repeated), row stride 27.
     private Action<Index1D, IV, int, int, int>? _replicateTable;
     private static void ReplicateTableImpl(Index1D m, IV nbr, int T, int H, int W)
@@ -174,6 +183,102 @@ public sealed class LtxKernels
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // VAE encoder kernels (same channel-last layout)
+    // ---------------------------------------------------------------------------------------------------
+
+    // video [3, F, 4H, 4W] channel-first -> [F * H * W, 48]: channel c * 16 + pA * 4 + pB holds pixel (y = 4h + pB, x = 4w + pA) (the inverse of UnpatchifyVideo: the encoder's patch order)
+    private Action<Index1D, FV, FV, int, int, int>? _patchifyVideo;
+    private static void PatchifyVideoImpl(Index1D i, FV video, FV o, int F, int H, int W)
+    {
+        int ch = i % 48, v = i / 48;
+        int w = v % W, h = (v / W) % H, f = v / (W * H);
+        int c = ch / 16, pA = (ch / 4) % 4, pB = ch % 4;
+        o[i] = video[(((long)c * F + f) * 4 * H + 4 * h + pB) * 4 * W + 4 * w + pA];
+    }
+    public void PatchifyVideo(FV video, FV o, int F, int H, int W)
+    {
+        _patchifyVideo ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(PatchifyVideoImpl);
+        _patchifyVideo(F * H * W * 48, video, o, F, H, W);
+    }
+
+    // The 3x3x3 table of the encoder's CAUSAL convolutions over a grid of T frames: zero padding in space, in time two copies of the first frame before it (taps t - 2, t - 1, t).
+    // With shift > 0 the convolution runs over the source with its first frame repeated shift more times in front (the temporal downsampler's prepend): output frame f, tap kt reads
+    // prepended frame max(f + kt - 2, 0), which is source frame max(f + kt - 2 - shift, 0). Source grid T x H x W; the table covers (T + shift) x H x W outputs.
+    private Action<Index1D, IV, int, int, int>? _causalTable;
+    private static void CausalTableImpl(Index1D m, IV nbr, int H, int W, int shift)
+    {
+        int hw = H * W, t = m / hw, p = m % hw, h = p / W, w = p % W;
+        for (int kk = 0; kk < 27; kk++)
+        {
+            int tt = t + kk / 9 - 2 - shift, hh = h + (kk / 3) % 3 - 1, ww = w + kk % 3 - 1;
+            tt = tt < 0 ? 0 : tt;
+            nbr[m * 27 + kk] = hh >= 0 && hh < H && ww >= 0 && ww < W ? (tt * H + hh) * W + ww : -1;
+        }
+    }
+    public void CausalTable(IV nbr, int T, int H, int W, int shift)
+    {
+        _causalTable ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int>(CausalTableImpl);
+        _causalTable((T + shift) * H * W, nbr, H, W, shift);
+    }
+
+    // LTXVideoDownsampler3d (stride s0 x s1 x s2, s0 - 1 copies of the first frame prepended): conv [(T + s0 - 1) * H * W, C / S] over the prepended grid and the source x [T * H * W, Cin]
+    // become [(T + s0 - 1) / s0 * (H / s1) * (W / s2), C]. Space to depth puts sub-position (a, b, d) of channel c at ((c * s0 + a) * s1 + b) * s2 + d; the residual is x moved to depth the same
+    // way (Cin * S channels) and averaged over groups of g = Cin * S / C consecutive channels.
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int>? _downShuffle;
+    private static void DownShuffleImpl(Index1D i, FV conv, FV x, FV o, int H, int W, int C, int Cin, int s0, int s1, int s2, int g)
+    {
+        int S = s0 * s1 * s2, Ho = H / s1, Wo = W / s2;
+        int j = i % C, v = i / C;
+        int wo = v % Wo, ho = (v / Wo) % Ho, to = v / (Wo * Ho);
+        int d = j % s2, b = (j / s2) % s1, a = (j / (s2 * s1)) % s0, c = j / S;
+        long src = ((long)(to * s0 + a) * H + ho * s1 + b) * W + wo * s2 + d;
+        float r = 0f;
+        for (int k = j * g; k < j * g + g; k++)
+        {
+            int dk = k % s2, bk = (k / s2) % s1, ak = (k / (s2 * s1)) % s0, ck = k / S;
+            int f = to * s0 + ak - (s0 - 1);
+            f = f < 0 ? 0 : f;
+            r += x[(((long)f * H + ho * s1 + bk) * W + wo * s2 + dk) * Cin + ck];
+        }
+        o[i] = conv[src * (C / S) + c] + r / g;
+    }
+    public void DownShuffle(FV conv, FV x, FV o, int T, int H, int W, int C, int Cin, int s0, int s1, int s2)
+    {
+        int S = s0 * s1 * s2, g = Cin * S / C;
+        _downShuffle ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int>(DownShuffleImpl);
+        _downShuffle((T + s0 - 1) / s0 * (H / s1) * (W / s2) * C, conv, x, o, H, W, C, Cin, s0, s1, s2, g);
+    }
+
+    // the encoder head [vox, 129] (128 means, one log-variance) -> the normalised latent [128, vox] channel-first: (mean - latents_mean) / latents_std
+    private Action<Index1D, FV, FV, FV, FV, int>? _posteriorMean;
+    private static void PosteriorMeanImpl(Index1D i, FV head, FV o, FV mean, FV std, int vox)
+    {
+        int c = i / vox, v = i % vox;
+        o[i] = (head[(long)v * 129 + c] - mean[c]) / std[c];
+    }
+    // the same with a sample of the posterior: (mean + exp(logvar / 2) * noise - latents_mean) / latents_std, the log-variance clamped to [-30, 20] (DiagonalGaussianDistribution)
+    private Action<Index1D, FV, FV, FV, FV, FV, int>? _posteriorSample;
+    private static void PosteriorSampleImpl(Index1D i, FV head, FV o, FV mean, FV std, FV noise, int vox)
+    {
+        int c = i / vox, v = i % vox;
+        float lv = head[(long)v * 129 + 128];
+        lv = lv < -30f ? -30f : (lv > 20f ? 20f : lv);
+        o[i] = (head[(long)v * 129 + c] + MathF.Exp(0.5f * lv) * noise[i] - mean[c]) / std[c];
+    }
+    /// <param name="noise">standard normal noise [128, vox] to sample the posterior; null for its mean (a separate kernel: WebGPU binds every view read-write, nothing may stand in for it).</param>
+    public void Posterior(FV head, FV o, FV mean, FV std, FV? noise, int vox)
+    {
+        if (noise == null)
+        {
+            _posteriorMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int>(PosteriorMeanImpl);
+            _posteriorMean(128 * vox, head, o, mean, std, vox);
+            return;
+        }
+        _posteriorSample ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, int>(PosteriorSampleImpl);
+        _posteriorSample(128 * vox, head, o, mean, std, noise.Value, vox);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // host helpers
     // ---------------------------------------------------------------------------------------------------
 
@@ -187,6 +292,34 @@ public sealed class LtxKernels
     /// </summary>
     public static float[] RopePhases(int frames, int h, int w, int dim, float scaleT, float scaleH, float scaleW, float baseFrames = 20f, float baseH = 2048f, float baseW = 2048f, float theta = 10000f)
     {
+        var gf = new float[frames]; var gh = new float[h]; var gw = new float[w];
+        for (int i = 0; i < frames; i++) gf[i] = i * scaleT * 1f / baseFrames;
+        for (int i = 0; i < h; i++) gh[i] = i * scaleH * 1f / baseH;
+        for (int i = 0; i < w; i++) gw[i] = i * scaleW * 1f / baseW;
+        int N = frames * h * w;
+        var g = new float[N * 3];
+        int n = 0;
+        for (int f = 0; f < frames; f++)
+            for (int i = 0; i < h; i++)
+                for (int j = 0; j < w; j++, n++) { g[3 * n] = gf[f]; g[3 * n + 1] = gh[i]; g[3 * n + 2] = gw[j]; }
+        return RopePhasesOfGrid(g, dim, theta);
+    }
+
+    /// <summary>
+    /// The same table for tokens at explicit positions (the <c>video_coords</c> path of LTXVideoRotaryPosEmbed, used by LTXConditionPipeline): <paramref name="coords"/> is [N, 3] (time in seconds,
+    /// i.e. the pixel frame index / frame rate; pixel row; pixel column), divided by the base sizes (20 frames, 2048, 2048) in float32 like the reference.
+    /// </summary>
+    public static float[] RopePhasesForCoords(float[] coords, int dim, float baseFrames = 20f, float baseH = 2048f, float baseW = 2048f, float theta = 10000f)
+    {
+        if (coords.Length % 3 != 0) throw new ArgumentException("coords must be [N, 3]", nameof(coords));
+        var g = new float[coords.Length];
+        for (int n = 0; n < coords.Length / 3; n++) { g[3 * n] = coords[3 * n] / baseFrames; g[3 * n + 1] = coords[3 * n + 1] / baseH; g[3 * n + 2] = coords[3 * n + 2] / baseW; }
+        return RopePhasesOfGrid(g, dim, theta);
+    }
+
+    /// <summary>The phase table from the per-token normalised positions <paramref name="g"/> [N, 3] (time, row, column, each already divided by its base size).</summary>
+    private static float[] RopePhasesOfGrid(float[] g, int dim, float theta)
+    {
         int nf = dim / 6, pad = dim % 6, pairs = dim / 2;
         if (pad % 2 != 0) throw new ArgumentException("the RoPE width must leave an even padding (dim % 6 even)", nameof(dim));
         var lin = new float[nf];
@@ -194,29 +327,21 @@ public sealed class LtxKernels
         for (int i = 0; i < nf; i++) lin[i] = i < nf / 2 ? i * step : 1f - (nf - 1 - i) * step;
         var freq = new float[nf];
         for (int i = 0; i < nf; i++) freq[i] = MathF.Pow(theta, lin[i]) * MathF.PI / 2f;
-        var gf = new float[frames]; var gh = new float[h]; var gw = new float[w];
-        for (int i = 0; i < frames; i++) gf[i] = i * scaleT * 1f / baseFrames;
-        for (int i = 0; i < h; i++) gh[i] = i * scaleH * 1f / baseH;
-        for (int i = 0; i < w; i++) gw[i] = i * scaleW * 1f / baseW;
-        int N = frames * h * w;
+        int N = g.Length / 3;
         var t = new float[(long)N * pairs * 2];
-        int n = 0;
-        for (int f = 0; f < frames; f++)
-            for (int i = 0; i < h; i++)
-                for (int j = 0; j < w; j++, n++)
-                {
-                    long o = (long)n * pairs * 2;
-                    for (int p = 0; p < pad / 2; p++) { t[o + 2 * p] = 1f; t[o + 2 * p + 1] = 0f; }
-                    for (int k = 0; k < 3 * nf; k++)
-                    {
-                        int jf = k / 3, axis = k % 3;
-                        float g = axis == 0 ? gf[f] : axis == 1 ? gh[i] : gw[j];
-                        float a = freq[jf] * (g * 2f - 1f);
-                        int pair = pad / 2 + k;
-                        t[o + 2 * pair] = MathF.Cos(a);
-                        t[o + 2 * pair + 1] = MathF.Sin(a);
-                    }
-                }
+        for (int n = 0; n < N; n++)
+        {
+            long o = (long)n * pairs * 2;
+            for (int p = 0; p < pad / 2; p++) { t[o + 2 * p] = 1f; t[o + 2 * p + 1] = 0f; }
+            for (int k = 0; k < 3 * nf; k++)
+            {
+                int jf = k / 3, axis = k % 3;
+                float a = freq[jf] * (g[3 * n + axis] * 2f - 1f);
+                int pair = pad / 2 + k;
+                t[o + 2 * pair] = MathF.Cos(a);
+                t[o + 2 * pair + 1] = MathF.Sin(a);
+            }
+        }
         return t;
     }
 }

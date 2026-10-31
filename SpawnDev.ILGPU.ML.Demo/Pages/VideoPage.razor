@@ -116,14 +116,11 @@
             }
         </div>
 
-        @if (!Ltx)
+        <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
+        <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
+        @if (Ltx)
         {
-            <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
-            <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
-        }
-        else
-        {
-            <p class="vid-hint">LTX-Video 2B here is text to video (image to video is not wired up yet). Weights under the LTXV Open Weights License (free below $10M annual revenue, use restrictions apply).</p>
+            <p class="vid-hint">LTX-Video weights are under the LTXV Open Weights License 0.X (use restrictions apply: see the model repo's LICENSE).</p>
         }
 
         <details class="vid-advanced">
@@ -276,11 +273,16 @@
                     Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC,
                 };
             }
-            if (!Ltx && _references.Count > 0)
+            byte[]? firstRgb = null; int firstW = 0, firstH = 0;
+            if (_references.Count > 0)
             {
                 var pic = _references[0];
-                var rgb = new byte[pic.Width * pic.Height * 3];
-                for (int p = 0; p < pic.Width * pic.Height; p++) { rgb[p * 3] = pic.Rgba[p * 4]; rgb[p * 3 + 1] = pic.Rgba[p * 4 + 1]; rgb[p * 3 + 2] = pic.Rgba[p * 4 + 2]; }
+                firstRgb = new byte[pic.Width * pic.Height * 3]; firstW = pic.Width; firstH = pic.Height;
+                for (int p = 0; p < pic.Width * pic.Height; p++) { firstRgb[p * 3] = pic.Rgba[p * 4]; firstRgb[p * 3 + 1] = pic.Rgba[p * 4 + 1]; firstRgb[p * 3 + 2] = pic.Rgba[p * 4 + 2]; }
+            }
+            if (!Ltx && firstRgb != null)
+            {
+                var rgb = firstRgb; var pic = _references[0];
                 request = new WanRequest
                 {
                     Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
@@ -291,12 +293,16 @@
             {
                 _stage = p.Stage; _stageMessage = p.Message;
                 // the transformer's steps are most of the time: text 0-10 %, loading + steps 10-90 %, decode 90-100 %
-                _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
+                _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" or "conditions" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
                 _modelStatusText = $"{(Ltx ? "LTX-Video" : "Wan 2.2")} - {p.Stage}";
                 _ = InvokeAsync(StateHasChanged);
             });
             var video = Ltx
-                ? await _ltxPipeline!.GenerateAsync(new LtxRequest { Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps }, progress)
+                ? await _ltxPipeline!.GenerateAsync(new LtxRequest
+                {
+                    Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps,
+                    Conditions = firstRgb != null ? new[] { LtxCondition.Image(firstRgb, firstW, firstH) } : null,
+                }, progress)
                 : await _pipeline!.GenerateAsync(request, progress);
             _stage = "showing"; _stageMessage = "the frames"; StateHasChanged();
             await Task.Yield();

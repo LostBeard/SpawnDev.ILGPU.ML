@@ -109,6 +109,42 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Image-to-video in the browser over HTTP (the VAE encoder, the DiT): <see cref="LtxPipeline.DenoiseAsync"/> on the reference's picture, prompt embedding and random draws
+    /// (fixture <c>ref/cond_i2v.npz</c>, LTXConditionPipeline) against its final latent. With the bf16 DiT the browser's math is float32 (no tensor cores), so it is held to the
+    /// exact-math bound of the desktop gate (1e-3); the hosted 8-bit DiT is then the quantisation's cost, which the desktop gate measures on CUDA with the same weights (bound 0.2).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx_ImageToVideo_OverHttp_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var (http, source) = await LtxHttp();
+        using var t5 = await LtxFixture(http, "t5_0.npz"); using var fx = await LtxFixture(http, "cond_i2v.npz");
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        int steps = LtxSampler.DistilledFirstPass.Length;
+        var req = new LtxRequest
+        {
+            Prompt = "", PromptEmbedding = ctx.AsSpan(0, rows * 4096).ToArray(), Width = 480, Height = 320, Frames = 25, FrameRate = LtxFrameRate,
+            Conditions = new[] { new LtxCondition { Pixels = WanNpz(fx, "image").Data } },
+            InitialNoise = WanNpz(fx, "noise").Data, PosteriorNoise = new[] { WanNpz(fx, "posterior").Data },
+            StepNoise = Enumerable.Range(0, steps).Select(i => WanNpz(fx, $"cond_noise{i}").Data).ToArray(),
+        };
+        var want = WanNpz(fx, "final").Data;
+        var lines = new List<string>();
+        double bf16 = 0, q8 = 0;
+        foreach (var precision in new[] { "bf16", "q8" })
+        {
+            var pipe = new LtxPipeline(accelerator, source, "", LtxPaths.InRepo(LtxPaths.DitFile(precision), LtxPaths.TextEncoderFile("q8")));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var m = WanCompare(await pipe.DenoiseAsync(req), want);
+            lines.Add($"image to video ({precision} DiT) final latent relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2} in {sw.Elapsed.TotalSeconds:F1} s");
+            if (precision == "bf16") bf16 = m.RelRms; else q8 = m.RelRms;
+        }
+        foreach (var l in lines) Console.WriteLine($"[Ltx] browser {l}");
+        var report = string.Join("; ", lines);
+        if (!(bf16 < 1e-3 && q8 < 0.2)) throw new Exception("LTX image to video in the browser: " + report);
+        return report;
+    });
+
+    /// <summary>
     /// The whole LTX pipeline in the browser over HTTP with the hosted files (the demo's configuration: 8-bit DiT and T5), at the model's native 704x480 and 97 frames: the
     /// clip must be finite, a picture (spread out, no blow-up beyond the decoder's small overshoot of [-1, 1]); stage times go to the console (each stage is gated against the reference by Ltx_Stages_OverHttp_MatchReference).
     /// </summary>

@@ -184,6 +184,53 @@ public abstract partial class MLTestBase
         return $"worst relRMS {worst:E2} over {report.Count} comparisons";
     });
 
+    /// <summary>
+    /// The VAE ENCODER (image-to-video and video conditioning: fp16 weights, fp32 activations, causal 3x3x3 convolutions as gather GEMMs, residual space-to-depth downsamplers) against the
+    /// reference's float32 encode of a 256x192 picture (one frame: every temporal step works on a single frame) and a 17-frame 128x96 clip (the temporal downsamplers' first-frame
+    /// prepend over real time): every stage tap (conv_in, the four down stages, the mid block, conv_out) and the normalised latent (the posterior mean). Desktop GPU (the taps read back).
+    /// Fixtures: ref_vae_encode_dump.py --size 1x192x256 --tag img, --size 17x96x128 --seed 12 --tag vid; weights export_vae_encoder_f16.py.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_VaeEncode_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the taps read back to the host: a desktop GPU");
+        var weightsPath = Path.Combine(LtxDir, "ltx_vae_encoder_f16.safetensors");
+        if (!File.Exists(weightsPath) || !File.Exists(Path.Combine(LtxDir, "ref", "vae_enc_img.npz"))) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var enc = new LtxVaeEncoder(accelerator, weights);
+        var report = new List<string>();
+        double worst = 0;
+        foreach (var tag in new[] { "img", "vid" })
+        {
+            using var fx = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"vae_enc_{tag}.npz"));
+            var (video, vs) = WanNpz(fx, "video");                                                   // [3, F, H, W]
+            var taps = new Dictionary<string, float[]>();
+            enc.Tap = (name, view, T, H, W, C) => { accelerator.Synchronize(); var a = new float[(long)T * H * W * C]; view.SubView(0, a.Length).CopyToCPU(a); taps[name] = a; };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var latent = await enc.EncodeAsync(video, vs[1], vs[2], vs[3]);
+            double ms = sw.Elapsed.TotalMilliseconds;
+            enc.Tap = null;
+            foreach (var name in new[] { "conv_in", "down_0", "down_1", "down_2", "down_3", "mid_block", "conv_out" })
+            {
+                var (rf, rs) = WanNpz(fx, name);                                                     // [C, T, H, W] channel-first
+                int C = rs[0], vox = rs[1] * rs[2] * rs[3];
+                var t = new float[rf.Length];
+                for (int c = 0; c < C; c++) for (int p = 0; p < vox; p++) t[(long)p * C + c] = rf[(long)c * vox + p];
+                var m = WanCompare(taps[name], t);
+                report.Add($"{tag} {name} [{C}, {rs[1]}, {rs[2]}, {rs[3]}]: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+                worst = Math.Max(worst, m.RelRms);
+            }
+            var (want, ls) = WanNpz(fx, "latent");
+            var ml = WanCompare(latent, want);
+            report.Add($"{tag} latent [{ls[0]}, {ls[1]}, {ls[2]}, {ls[3]}]: relRMS {ml.RelRms:E2}, maxAbs {ml.MaxAbs:F3} of {ml.RefMaxAbs:F2}; {ms:F0} ms");
+            worst = Math.Max(worst, ml.RelRms);
+        }
+        LtxLog("VaeEncode", report);
+        if (!(worst < 0.02)) throw new Exception("the VAE encode deviates from the reference: " + string.Join("; ", report));
+        return $"worst relRMS {worst:E2} over {report.Count} comparisons";
+    });
+
     private static readonly string[] LtxDitTaps = { "time_embedding", "time_projection", "text_embedding", "patch_embedding", "block_0", "block_1", "block_14", "block_27", "head" };
 
     /// <summary>

@@ -77,13 +77,20 @@ Tests: `Wan_*` in `MLTestBase.WanTests.cs` (desktop) and `Wan_Pipeline_OverHttp_
 
 # Video generation: LTX-Video 2B (0.9.8 distilled)
 
-`LtxPipeline` (`SpawnDev.ILGPU.ML.Ltx`): text to video with Lightricks' LTX-Video 2B distilled model: a 2B-parameter DiT (28 blocks, width 2048, every latent position is a token, RMS norm + adaLN,
+`LtxPipeline` (`SpawnDev.ILGPU.ML.Ltx`): text to video, image to video and video conditioning with Lightricks' LTX-Video 2B distilled model: a 2B-parameter DiT (28 blocks, width 2048, every latent position is a token, RMS norm + adaLN,
 RoPE over the whole 2048-wide q and k, qk RMS norm, cross-attention to the T5), the T5-v1.1-XXL text encoder (the umT5 encoder class with the shared position bias of block 0), the 7-step distilled flow-matching
 Euler sampler (guidance 1: ONE forward per step, the latent never leaves the device), and the timestep-conditioned 32x32x8 video VAE decoder (128 latent channels; the decode adds a little noise at timestep 0.05,
-as the recipe does). A 704x480 clip of 97 frames is only 4,290 tokens, which is why this model suits a tab. Image to video, the VAE encoder and the x2 latent upscaler (the recipe's second pass) are not ported yet.
+as the recipe does). A 704x480 clip of 97 frames is only 4,290 tokens, which is why this model suits a tab. The x2 latent upscaler (the recipe's second pass) is not ported yet.
+
+**Conditioning** (diffusers' `LTXConditionPipeline`): `LtxRequest.Conditions` takes pictures or clips (`LtxCondition`: RGB bytes, scaled to cover the size and centre-cropped, or ready pixels;
+`FrameIndex`, `Strength`). `LtxCondition.Image(rgb, w, h)` at frame 0 is image to video: the VAE encoder (`LtxVaeEncoder`, the causal 3D encoder, 694M parameters, fp16) turns the picture into the
+first latent frame, whose tokens then see timestep 0 (`min(t, (1 - strength) * 1000)` per token) and are reset before every step to their clean latent plus `ImageCondNoiseScale` (0.15) times
+(t / 1000)^2 noise; the time positions follow the reference's causal fix (pixel frame max(8 f - 7, 0)). A condition at a later frame becomes extra tokens placed at that time (keyframes); a clip
+longer than two latent frames also replaces the latent frames after its first two. Without conditions the pipeline is the text-to-video `LTXPipeline` as before. `PromptEmbedding` takes a T5 output
+instead of the prompt (no text encoder loaded), `DenoiseAsync` returns the latent before the decode, and `PosteriorNoise` / `ConditionNoise` / `StepNoise` take another implementation's draws.
 
 Files (`tools/ltx-harness/reference`): `export_dit_bf16.py` (the single-file checkpoint to the Wan layout, q/k/v fused; 3.6 GB; `quantize_streaming.py` makes the 8-bit one, 2.0 GB), `export_t5_bf16.py` (8.9 GB / 8-bit
-5.0 GB), `export_vae_f16.py` (the decoder, 1.0 GB), the T5 `tokenizer.json`. `LtxPaths.InFolder` / `InRepo` name them. models.spawndev.com serves them as `LostBeard/LTX-Video-2B-0.9.8-distilled-ILGPU` (`LtxPipeline.DefaultRepo`: bf16 and 8-bit DiT, 8-bit T5, VAE decoder, tokenizer, the licence and the change notices).
+5.0 GB), `export_vae_f16.py` (the decoder, 1.0 GB), `export_vae_encoder_f16.py` (the encoder, 1.4 GB, loaded only with conditions), the T5 `tokenizer.json`. `LtxPaths.InFolder` / `InRepo` name them. models.spawndev.com serves them as `LostBeard/LTX-Video-2B-0.9.8-distilled-ILGPU` (`LtxPipeline.DefaultRepo`: bf16 and 8-bit DiT, 8-bit T5, VAE decoder and encoder, tokenizer, the licence and the change notices).
 
 ## Parity with the reference (diffusers, same inputs; `MLTestBase.LtxTests.cs`)
 
@@ -95,15 +102,22 @@ Files (`tools/ltx-harness/reference`): `export_dit_bf16.py` (the single-file che
 | DiT noise prediction | **4.4e-5 / 7.3e-5 against the float32 reference with the bf16 tensor cores off (exact math), 600 / 2400 tokens**; 1.5e-2 / 8.5e-3 with them on. The bf16 reference is itself 5.2e-2 / 4.0e-2 from exact math (outlier activations of 2500 in the middle blocks), so the bound is the float32 reference. 8-bit DiT: 4.4e-2 |
 | sampler loop, teacher-forced | worst 7.5e-3 / 4.5e-3 per step against the float32 reference (7 steps) |
 | VAE decode | 1.4e-4 (video), every stage tap 7e-5 to 3.3e-4 |
+| VAE encode (float32 reference on the CPU) | latent 1.9e-4 (a 256x192 picture) / 1.7e-4 (a 17-frame 128x96 clip: the temporal downsamplers' first-frame repeat), every stage tap 3e-5 to 1.4e-4 |
+| conditioned DiT (`LTXConditionPipeline`'s own calls: 150 tokens at t 0, 450 at t) | **3.5e-5 / 1.0e-5 at steps 0 / 5 with the tensor cores off**; 1.1e-2 / 6.7e-3 with them on |
+| image to video, the whole sampler (480x320 x 25, the reference's draws) | condition latent 5.6e-6, **final latent 1.4e-4 with the tensor cores off** (OpenCL 1.2e-4, browser WebGPU 1.9e-4); 5.2e-2 with them on (each step 1.1e-2; the reference's own bf16 run is 5e-2 off on one step). The hosted 8-bit DiT: 1.2e-1 after the 7 steps, identical on CUDA and in the browser (the quantisation's cost, not a backend's) |
 
-Red checks: q RoPE off (DiT 0.84), unpatchify offsets swapped (VAE 0.18), a wrong T5 bucket distance (0.14 / 0.28).
+Red checks: q RoPE off (DiT 0.84), unpatchify offsets swapped (VAE 0.18), a wrong T5 bucket distance (0.14 / 0.28), centred instead of causal time padding in the encoder (0.7), one timestep for every
+token run (1.26), the global timestep for conditioned tokens (0.80).
+
+The image-to-video reference (`ref_condition_dump.py`) runs the real `LTXConditionPipeline` and must run with TF32 off: PyTorch's cuDNN convolutions default to TF32 on the GPU, which put 8e-4 of
+error into the reference's own encoding of the picture; the model grew that to 8e-3 over the steps, which looked like a port error until the reference was made float32 for real.
 
 ## Measured
 
 RTX 4070 12 GB, CUDA, `Examples/11.VideoGen.Console --ltx --models D:\Projects\ltx`: 704x480 x 97 frames **51 s** (T5 streamed from disk 24 s, DiT load 13 s, 7 steps 9 s, VAE decode 5 s); 480x320 x 49 frames 43 s
 (30 s with the 8-bit DiT and T5: `--dit q8 --text q8`; the clips look the same).
 
-Browser (Chrome WebGPU, RTX 4070, the hosted 8-bit DiT and T5 read over HTTP): 704x480 x 97 frames **72 s** (T5 26 s, DiT 28 s, decode 18 s). Every stage gated in the browser against the reference (`Ltx_Stages_OverHttp_MatchReference`: T5 1.5e-2 to 5.1e-2, DiT step 0 vs fp32 2.8e-2, VAE 1.4e-6); `Ltx_Pipeline_OverHttp_Generates` runs the clip (serve the model folder: `node tools/unirig-harness/serve-files.mjs D:/Projects/ltx 8771`).
+Browser (Chrome WebGPU, RTX 4070, the hosted 8-bit DiT and T5 read over HTTP): 704x480 x 97 frames **72 s** (T5 26 s, DiT 28 s, decode 18 s; 75 s re-measured after the conditioning changes). Image to video at 480x320 x 25 (the gate, prompt embedding given): denoise incl. the VAE encode 15 s with the 8-bit DiT, 29 s with the bf16 one (`Ltx_ImageToVideo_OverHttp_MatchesReference`). Every stage gated in the browser against the reference (`Ltx_Stages_OverHttp_MatchReference`: T5 1.5e-2 to 5.1e-2, DiT step 0 vs fp32 2.8e-2, VAE 1.4e-6); `Ltx_Pipeline_OverHttp_Generates` runs the clip (serve the model folder: `node tools/unirig-harness/serve-files.mjs D:/Projects/ltx 8771`).
 
 ## Licence
 

@@ -66,7 +66,7 @@ Deep shrink (ComfyUI's PatchModelAddDownscale):
 unet.DeepShrink = new SdDeepShrink(Block: 3, Factor: 2.0, AfterSkip: true);   // bicubic down / up by default (SdResize)
 // ComfyUI applies it only while sigma is in [sigma(end_percent), sigma(start_percent)] (defaults 0 .. 0.35): set it for those steps, null for the rest
 ```
-HyperTile: `unet.HyperTile = new SdHyperTile(TileSize: 256, SwapSize: 2, MaxDepth: 0)` (ComfyUI's defaults; tiles the self-attention of the first MaxDepth + 1 resolutions exactly as ComfyUI's node does, including its token grid for non-square latents).
+HyperTile: `unet.HyperTile = new SdHyperTile(TileSize: 256, SwapSize: 2, MaxDepth: 0)` (ComfyUI's defaults; tiles the self-attention of the first MaxDepth + 1 resolutions exactly as ComfyUI's node does, including its token grid for non-square latents). ComfyUI's node tiles only the queries: k and v come from the untiled tokens and its attention reshapes them by q's batch, so query tile t attends to the band of flat tokens [t * L, (t + 1) * L) of its picture, not to its own tile. That is the default (ComfyUI's pictures, 2.7e-6 vs its code); `TileKeysAndValues: true` gives true tiled self-attention (each tile attends to itself).
 Self-Attention Guidance (ComfyUI's SelfAttentionGuidance; you keep the guidance arithmetic, as for CFG):
 ```csharp
 unet.RecordMiddleSelfAttention = true;                                 // on the unconditional pass

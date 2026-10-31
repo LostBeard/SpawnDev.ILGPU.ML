@@ -35,8 +35,13 @@ public enum SdResize { Bicubic, Bilinear, NearestExact }
 /// random among the first <see cref="SwapSize"/> - 1 candidates (its torch.randint excludes the last; <see cref="Rng"/>, null = a shared System.Random): SwapSize 1
 /// or 2 is deterministic. ComfyUI's defaults:
 /// 256, 2, 0, false.
+/// <para>
+/// ComfyUI's node tiles only the QUERIES: its attn1 patch rearranges q, and k / v are projected from the untiled tokens, then reshaped with q's batch, so query tile t
+/// (t = tile row * tiles per row + tile column) attends to the flat tokens [t * L, (t + 1) * L) of its own picture (L = tokens per tile): a band of rows, not its own tile.
+/// That is the default here (ComfyUI's pictures; found by SpawnGen's parity test). <see cref="TileKeysAndValues"/> = true gives true tiled self-attention instead (each tile attends to itself).
+/// </para>
 /// </summary>
-public sealed record SdHyperTile(int TileSize = 256, int SwapSize = 2, int MaxDepth = 0, bool ScaleDepth = false, Random? Rng = null);
+public sealed record SdHyperTile(int TileSize = 256, int SwapSize = 2, int MaxDepth = 0, bool ScaleDepth = false, Random? Rng = null, bool TileKeysAndValues = false);
 
 public sealed record SdDeepShrink(int Block = 3, double Factor = 2.0, bool AfterSkip = true, SdResize Down = SdResize.Bicubic, SdResize Up = SdResize.Bicubic);
 
@@ -315,10 +320,11 @@ public sealed partial class SdUNet : IDisposable
             var qkv = Slot(SlotWide, (long)rows * 8 * C).SubView(0, (long)rows * 3 * C);
             bool pag = PerturbMiddleSelfAttention && p.StartsWith("middle_block.", StringComparison.Ordinal);
             var grid = pag ? null : HyperTileGrid(rows);
+            bool tileKv = HyperTile?.TileKeysAndValues == true;
             FV qkvIn = n;
-            if (grid is { } g0)
+            if (grid is { } g0 && tileKv)
             {
-                // HyperTile: the tokens in tile order (q, k and v are per token), attention per tile, back to the original order below (to_out is per token)
+                // true tiled attention: the tokens in tile order (q, k and v are per token), attention per tile, back to the original order below (to_out is per token)
                 qkvIn = Slot(SlotTileIn, (long)rows * C);
                 _k.TileRows(n, qkvIn, rows, g0.Th, g0.Tw, g0.Nw, C, inverse: false);
             }
@@ -336,10 +342,14 @@ public sealed partial class SdUNet : IDisposable
             {
                 int T = tg.Th * tg.Tw, tiles = tg.Nh * tg.Nw;
                 var aT = Slot(SlotTileOut, (long)rows * C);
+                // ComfyUI: q in tile order, k / v in the original order, so tile t's keys are the band of rows [t * T, (t + 1) * T)
+                var qT = tileKv ? qkv : Slot(SlotTileIn, (long)rows * 3 * C);
+                if (!tileKv) _k.TileRows(qkv, qT, rows, tg.Th, tg.Tw, tg.Nw, 3 * C, inverse: false);
                 for (int t = 0; t < tiles; t++)
                 {
-                    var qt = qkv.SubView((long)t * T * 3 * C, (long)T * 3 * C);
-                    Attention(qt, 3 * C, 0, qt, 3 * C, C, 2 * C, aT.SubView((long)t * T * C, (long)T * C), T, T, C);
+                    var qt = qT.SubView((long)t * T * 3 * C, (long)T * 3 * C);
+                    var kvt = qkv.SubView((long)t * T * 3 * C, (long)T * 3 * C);
+                    Attention(qt, 3 * C, 0, kvt, 3 * C, C, 2 * C, aT.SubView((long)t * T * C, (long)T * C), T, T, C);
                 }
                 _k.TileRows(aT, a, rows, tg.Th, tg.Tw, tg.Nw, C, inverse: true);
             }
