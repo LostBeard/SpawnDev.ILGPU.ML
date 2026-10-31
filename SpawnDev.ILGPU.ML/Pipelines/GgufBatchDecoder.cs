@@ -32,6 +32,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly GGUFModel _model;
     private readonly Stream _stream;
     private readonly FusedDequantMatMul _mm;
+    private readonly NormalizationKernels _norm;
     private readonly List<IDisposable> _owned = new();
     private readonly Dictionary<string, (MemoryBuffer1D<byte, Stride1D.Dense> Data, GGMLType Type)> _mats = new();
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _vecs = new();
@@ -56,6 +57,22 @@ public sealed class GgufBatchDecoder : IDisposable
     public int Position { get; private set; }
     /// <summary>Where the time of all decode steps since <see cref="PrefillAsync"/> went, in ms: the token ids up and the gather queued, the forward on the device (to its sync), the candidates read back.</summary>
     public (double Embed, double Device, double Readback, int Steps) DecodeTimings { get; private set; }
+    /// <summary>
+    /// Diagnostics (desktop accelerators: it synchronises after every kernel): when set, each forward adds every kernel's time, its own GPU drain included, to
+    /// <see cref="KernelTimes"/> (ms, by kernel). Off: no cost.
+    /// </summary>
+    public bool ProfileKernels { get; set; }
+    /// <summary>Accumulated kernel times while <see cref="ProfileKernels"/> is on (ms by kernel name; cleared by <see cref="PrefillAsync"/>).</summary>
+    public Dictionary<string, double> KernelTimes { get; } = new();
+    private long _profT;
+    private void Prof(string name)
+    {
+        if (!ProfileKernels) return;
+        _acc.Synchronize();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        KernelTimes[name] = KernelTimes.GetValueOrDefault(name) + (now - _profT) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _profT = now;
+    }
     /// <summary>Tokens per row the device keeps after each forward (the nucleus is drawn from these unless it is wider).</summary>
     public const int Candidates = 64;
     /// <summary>Draws since <see cref="PrefillAsync"/> that read their full logits row: the nucleus was wider than the candidates, or more than <see cref="SelectCap"/> tokens reached the floor.</summary>
@@ -69,7 +86,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _logits, _maxV, _selV, _cand;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _logits, _maxV, _selV, _cand;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
@@ -81,7 +98,7 @@ public sealed class GgufBatchDecoder : IDisposable
 
     private GgufBatchDecoder(Accelerator accelerator, GGUFModel model, Stream stream, int maxSeq, int maxBatch)
     {
-        _acc = accelerator; _model = model; _stream = stream; _mm = new FusedDequantMatMul(accelerator);
+        _acc = accelerator; _model = model; _stream = stream; _mm = new FusedDequantMatMul(accelerator); _norm = new NormalizationKernels(accelerator);
         string a = model.Architecture;
         if (a is not ("qwen2"))
             throw new NotSupportedException($"GgufBatchDecoder: architecture '{a}' (supported: qwen2: NeoX rotary, biased q/k/v)");
@@ -173,6 +190,14 @@ public sealed class GgufBatchDecoder : IDisposable
         return b.View.SubView(0, n);
     }
 
+    // sum = a + b (the residual stream), normed = rmsnorm(sum) * w; one fused pass, or (WebGL: no shared memory) an add then the two-pass norm
+    private void AddNorm(FV a, FV b, FV sum, FV normed, FV w, int rows, int C)
+    {
+        if (_norm.AddRMSNormFused(a, b, sum, normed, w, rows, C, _eps, 1)) return;
+        _add3!((int)((long)rows * C), a, b, sum);
+        _norm.RMSNorm(sum, normed, w, rows, C, _eps);
+    }
+
     // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM
     private void Gemm(FV x, string name, FV o, int rows, int K, int N)
     {
@@ -192,6 +217,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
         LoadKernels();
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (ProfileKernels) { _acc.Synchronize(); _profT = t0; }
         // the embedding rows, gathered and dequantised on the device from the token embedding's blocks
         var idBuf = IntBuf(R); idBuf.CopyFromCPU(ids);
         // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for
@@ -201,43 +227,43 @@ public sealed class GgufBatchDecoder : IDisposable
         var hid = Buf(ref _hid, (long)R * C);
         var (embW, embT) = _mats["token_embd.weight"];
         int code = FusedDequantMatMul.TypeCode(embT);
-        _embed!((int)((long)R * C), idBuf, embW.View.Cast<byte, int>(), hid, C, code, FusedDequantMatMul.RowBytesOf(code, C));
+        _embed!((int)((long)R * C), idBuf, embW.View.Cast<byte, int>(), hid, C, code, FusedDequantMatMul.RowBytesOf(code, C)); Prof("embed");
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var hid2 = Buf(ref _hid2, (long)R * C);
         var hn = Buf(ref _hn, (long)R * C); var q = Buf(ref _q, (long)R * C); var k = Buf(ref _k, (long)R * kvC); var v = Buf(ref _v, (long)R * kvC);
         var att = Buf(ref _att, (long)R * C); var proj = Buf(ref _proj, (long)R * C);
         var gate = Buf(ref _gate, (long)R * FfnDim); var up = Buf(ref _up, (long)R * FfnDim);
         int nk = p + (decode ? 1 : R);
         var scores = Buf(ref _scores, (long)Heads * R * nk);
         int mode = decode ? 1 : 0;
+        // the residual stream alternates between hid and hid2; every residual add is fused with the norm after it (a layer's FFN add with the next layer's
+        // attention norm, the last one with the output norm): one group per row, not a thread per row walking the row twice
+        _norm.RMSNorm(hid, hn, _vecs["blk.0.attn_norm.weight"].View, R, C, _eps); Prof("rms");
         for (int l = 0; l < Layers; l++)
         {
             string b = $"blk.{l}.";
-            _rms!(R, hid, hn, _vecs[b + "attn_norm.weight"].View, C, _eps);
-            Gemm(hn, b + "attn_q.weight", q, R, C, C); _bias!((int)((long)R * C), q, _vecs[b + "attn_q.bias"].View, C);
-            Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC);
-            Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC);
+            Gemm(hn, b + "attn_q.weight", q, R, C, C); _bias!((int)((long)R * C), q, _vecs[b + "attn_q.bias"].View, C); Prof("q");
+            Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
+            Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
             _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
-            _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode);
-            _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode);
-            _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim));
-            _softmax!(Heads * R, scores, nk);
-            _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode);
-            Gemm(att, b + "attn_output.weight", proj, R, C, C);
-            _add!((int)((long)R * C), hid, proj);
-            _rms(R, hid, hn, _vecs[b + "ffn_norm.weight"].View, C, _eps);
-            Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim);
-            Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim);
-            _swiglu!((int)((long)R * FfnDim), gate, up);
-            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C);
-            _add((int)((long)R * C), hid, proj);
+            _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode); Prof("rope");
+            _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
+            _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim)); Prof("scores");
+            _softmax!(Heads * R, scores, nk); Prof("softmax");
+            _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
+            Gemm(att, b + "attn_output.weight", proj, R, C, C); Prof("o");
+            AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
+            Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Prof("gate");
+            Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Prof("up");
+            _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
+            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Prof("down");
+            AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
         }
-        // final norm and the LM head: every row when decoding, the last row of a prefill
+        // the LM head on the output norm's rows: every row when decoding, the last row of a prefill
         int outRows = decode ? R : 1;
-        var last = decode ? hid : hid.SubView((long)(R - 1) * C, C);
-        var hnOut = hn.SubView(0, (long)outRows * C);
-        _rms(outRows, last, hnOut, _vecs["output_norm.weight"].View, C, _eps);
+        var hnOut = decode ? hn : hn.SubView((long)(R - 1) * C, C);
         var logits = Buf(ref _logits, (long)outRows * Vocab);
-        Gemm(hnOut, _head, logits, outRows, C, Vocab);
+        Gemm(hnOut, _head, logits, outRows, C, Vocab); Prof("head");
         // each row's best tokens and (sampling) its softmax mass, on the device
         int nch = Chunks, S = CandStride;
         var maxV = Buf(ref _maxV, (long)outRows * nch);
@@ -247,10 +273,10 @@ public sealed class GgufBatchDecoder : IDisposable
         _selN ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch)));
         var maxI = _maxI.View.SubView(0, (long)outRows * nch);
         var cand = Buf(ref _cand, (long)outRows * S);
-        _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch);
-        _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S);
-        _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature);
-        _final!(outRows, selV, _selI.View, _selN.View, cand, S);
+        _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch); Prof("chunkMax");
+        _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
+        _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature); Prof("select");
+        _final!(outRows, selV, _selI.View, _selN.View, cand, S); Prof("final");
         await _acc.SynchronizeAsync().ConfigureAwait(false);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         Position += decode ? 1 : R;
@@ -272,7 +298,7 @@ public sealed class GgufBatchDecoder : IDisposable
     public Task PrefillAsync(int[] promptIds, float temperature = 0f, CancellationToken ct = default)
     {
         if (promptIds.Length == 0) throw new ArgumentException("an empty prompt");
-        Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0;
+        Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear();
         return ForwardAsync(promptIds, null, decode: false, temperature, ct);
     }
 
@@ -408,14 +434,13 @@ public sealed class GgufBatchDecoder : IDisposable
     // kernels. Row r: prefill (mode 0) = sequence 0 at position p + r; decode (mode 1) = sequence seqs[r] at position p.
     // Caches: [sequence][MaxSeq][kvHeads * headDim].
     // ---------------------------------------------------------------------------------------------------
-    private Action<Index1D, FV, FV, FV, int, float>? _rms;
+    private Action<Index1D, FV, FV, FV>? _add3;
     private Action<Index1D, FV, FV, int>? _bias;
     private Action<Index1D, FV, FV, int, int, int, int>? _rope;
     private Action<Index1D, FV, FV, FV, FV, IV, int, int, int, int>? _store;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>? _scoresK;
     private Action<Index1D, FV, int>? _softmax;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
-    private Action<Index1D, FV, FV>? _add;
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, long, long>? _fork;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
@@ -426,15 +451,14 @@ public sealed class GgufBatchDecoder : IDisposable
 
     private void LoadKernels()
     {
-        if (_rms != null) return;
-        _rms = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, float>(RmsImpl);
+        if (_add3 != null) return;
+        _add3 = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV>(Add3Impl);
         _bias = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(BiasImpl);
         _rope = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(RopeImpl);
         _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, int, int, int, int>(StoreImpl);
         _scoresK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
         _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
-        _add = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(AddImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
@@ -445,16 +469,8 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     // o[r] = x[r] / rms(x[r]) * w (Qwen2RMSNorm: mean of squares + eps)
-    private static void RmsImpl(Index1D r, FV x, FV o, FV w, int C, float eps)
-    {
-        long b = (long)(int)r * C;
-        float s = 0f;
-        for (int c = 0; c < C; c++) { float v = x[b + c]; s += v * v; }
-        float inv = 1f / MathF.Sqrt(s / C + eps);
-        for (int c = 0; c < C; c++) o[b + c] = x[b + c] * inv * w[c];
-    }
+    private static void Add3Impl(Index1D i, FV a, FV b, FV o) => o[i] = a[i] + b[i];
     private static void BiasImpl(Index1D i, FV x, FV bias, int C) => x[i] += bias[(int)i % C];
-    private static void AddImpl(Index1D i, FV h, FV d) => h[i] += d[i];
     // gate[i] = silu(gate[i]) * up[i]
     private static void SwigluImpl(Index1D i, FV g, FV u) { float x = g[i]; g[i] = x / (1f + MathF.Exp(-x)) * u[i]; }
 
@@ -610,6 +626,7 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var o in _owned) o.Dispose();
         _owned.Clear();
         _mm.Dispose();
+        _norm.Dispose();
         _stream.Dispose();
     }
 }
