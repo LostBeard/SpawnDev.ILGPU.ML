@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.7.0</Version>
+		<Version>5.8.0</Version>
 		<PackageReleaseNotes>v5.6.0 - on SpawnDev.ILGPU 5.4.3 (nested-ternary and WGSL loop-header codegen fixes): LTX-Video 2B 0.9.8 distilled text to video (LtxPipeline; 704x480 x97 frames in 51 s on an RTX 4070, 8-bit DiT and T5 exports). Details: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

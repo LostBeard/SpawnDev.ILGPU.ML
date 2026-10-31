@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.0 - 2026-10-30 - on SpawnDev.ILGPU 5.4.13: LTX-Video in every mode (image to video, keyframes, clips, the x2 upscaler two-pass recipe), video on 8 GB GPUs, SD UNet patches
 
 - **Wan 2.2 Turbo in 4 bits** (`wan22_ti2v_5b_dit_turbo_q4.safetensors`, 3.1 GB, hosted; demo "Turbo 4-bit", console `--turbo --dit turbo_q4`): with the tiled decode, 1280x704 x33 peaks at 4.8 GB (94 s on an RTX 4070), so the fast 4-step model runs at its native size on 8 GB GPUs. New gate `Wan_TurboDiT_Quantized_MatchesBf16` puts the cost on record (one forward vs the bf16 Turbo: 8-bit 1.6e-2 / 5.7e-2, 4-bit 0.15 / 0.37; clips from the 4-bit file match the 8-bit one's subject and motion). The Wan repo on models.spawndev.com gets a README with per-file change notices and the Apache-2.0 licence text.
 - **Wan 2.2: tiled VAE decoding** (`WanRequest.TiledDecode`, `WanVae.DecodeTiledAsync`, console `--tiled-vae`; diffusers' `AutoencoderKLWan.enable_tiling()`: 256 px tiles, 192 px stride, blended before the pixel unshuffle): the 720p decode needs 2.5 GB instead of 8.4 GB, so 1280x704 runs on an 8 GB card with the 4-bit DiT (peak 4.8 GB measured). Gated against diffusers' own tiled decode (diffusers' Wan 2.2 VAE checked against the official one first: 8e-7): 2.9e-4 CUDA / 2.5e-4 OpenCL, the tiling's own effect identical to the reference's (1.769e-2); red-checked.
