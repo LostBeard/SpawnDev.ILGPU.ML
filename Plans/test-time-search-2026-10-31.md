@@ -22,6 +22,20 @@ open-source derivatives labelled "Skywork Inside"; PRC law) scores every sample 
 noise), and as a best-of-N selector alone it is below plain voting. Consistent with the literature: search helps small policies most, and majority voting is a strong baseline
 (Skywork's own table: Qwen2.5-7B on MATH greedy 75.2, majority@64 78.4, PRM best-of-64 79.8).
 
+## Our engine on the same 50 (`tools/prm-harness/sc_eval.cs`, `score_sc.py`)
+
+`GgufBatchDecoder` on CUDA, Qwen2.5-Math-1.5B-Instruct Q8_0 (bartowski's GGUF), the same prompt, sampling and limits, the 8 samples decoded together;
+scored with math_verify like the pilot.
+
+| Method | PyTorch pilot | Our engine |
+|---|---|---|
+| greedy | 66.0 | 64.0 |
+| majority of 8 | 80.0 | 78.0 (`SelfConsistency.Vote`; math_verify's parse as the key: also 78.0, differing on 2 problems) |
+| pass@8 | 90.0 | 90.0 |
+
+Within the sampling noise of the pilot (different random draws and a Q8_0 model). 44 minutes for the 50, 121 sampled tok/s on average: finished
+sequences ride along to the end of the longest, so the batch is often mostly idle rows (next: drop finished rows from the step).
+
 ## Decision
 
 1. Build **batched multi-sequence decode** first: N samples of one prompt decoded together (the prompt's KV shared, each sequence its own continuation), so N answers cost
