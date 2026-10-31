@@ -570,6 +570,37 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Tiled decoding (<see cref="WanVae.DecodeTiledAsync"/>, diffusers' AutoencoderKLWan.enable_tiling: 256 px tiles, 192 px stride, 64 px blends, the low-memory path for 720p)
+    /// against diffusers' own tiled decode of a [48, 3, 20, 28] latent (320x448: 2 x 3 tiles; tools/wan-harness/reference/ref_vae_tiled_dump.py, float32, TF32 off; diffusers' untiled
+    /// decode matches the official Wan2.2 VAE to 8e-7). Bound 0.05 like the untiled gate (the fp16 weights); and our tiled-vs-untiled difference must equal the reference's (1.8e-2:
+    /// tiling is not the same numbers, the blend has to be the reference's) to within 10 %. Desktop device or WebGPU.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_VaeDecodeTiled_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the Wan VAE runs on a desktop GPU or WebGPU");
+        var weightsPath = Path.Combine(WanDir, "wan22_vae_f16.safetensors"); var fxPath = Path.Combine(WanDir, "dump", "vae_tiled.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (z, zs) = WanNpz(fx, "z");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var dec = new WanVae(accelerator, weights);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var tiled = await dec.DecodeTiledAsync(z, zs[1], zs[2], zs[3]);
+        double ms = sw.Elapsed.TotalMilliseconds;
+        var whole = await dec.DecodeAsync(z, zs[1], zs[2], zs[3]);
+        var refTiled = WanNpz(fx, "video_tiled").Data; var refWhole = WanNpz(fx, "video_whole").Data;
+        var mt = WanCompare(tiled, refTiled); var mw = WanCompare(whole, refWhole);
+        double ours = WanCompare(tiled, whole).RelRms, theirs = WanCompare(refTiled, refWhole).RelRms;
+        var report = $"tiled vs the reference's tiled decode relRMS {mt.RelRms:E2} (maxAbs {mt.MaxAbs:F3}), untiled vs untiled {mw.RelRms:E2}; tiled - untiled: ours {ours:E3}, the reference's {theirs:E3}; tiled decode {ms:F0} ms";
+        Console.WriteLine("[Wan] " + report);
+        try { var od = Path.Combine(WanDir, "out"); Directory.CreateDirectory(od); File.AppendAllText(Path.Combine(od, "wan_tests.log"), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [VaeDecodeTiled {accelerator.AcceleratorType}] {report}{Environment.NewLine}"); } catch (IOException) { }
+        if (!(mt.RelRms < 0.05 && Math.Abs(ours - theirs) < 0.1 * theirs)) throw new Exception("the tiled VAE decode deviates from the reference: " + report);
+        return report;
+    });
+
+    /// <summary>
     /// The UniPC flow sampler against the reference scheduler: set_timesteps(4, shift 5) gives the reference's integer timesteps and float32 sigmas exactly, and
     /// each step, fed the reference's own guidance-combined prediction and sample, returns the reference's next sample (predictor, corrector, the final order-1 step).
     /// Host math: no device involved. Red check: a wrong shift moves the sigmas, which the exact timestep comparison catches.

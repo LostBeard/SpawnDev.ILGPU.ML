@@ -63,6 +63,11 @@ public sealed class WanRequest
     public float[]? InitialNoise { get; init; }
     /// <summary>Log the time of every VAE decoder stage to the console (<c>[Wan] vae</c> lines).</summary>
     public bool Trace { get; init; }
+    /// <summary>
+    /// Decode in spatial tiles (diffusers' <c>AutoencoderKLWan.enable_tiling()</c>: 256 px tiles, 192 px stride; <see cref="WanVae.DecodeTiledAsync"/>): device memory follows the
+    /// tile instead of the frame, so 720p decodes on an 8 GB card. The reference's own tiled mode, not the same numbers as the untiled decode (1.8e-2 apart in the reference).
+    /// </summary>
+    public bool TiledDecode { get; init; }
     /// <summary>Optional first frame (image-to-video): RGB bytes, 3 per pixel, row-major; resized and centre-cropped to the output size.</summary>
     public byte[]? ImageRgb { get; init; }
     public int ImageWidth { get; init; }
@@ -249,7 +254,7 @@ public sealed class Wan22Pipeline
         float[] video;
         using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
-            { vae.Trace = req.Trace; video = await vae.DecodeAsync(latent, Fz, h, w); }
+            { vae.Trace = req.Trace; video = req.TiledDecode ? await vae.DecodeTiledAsync(latent, Fz, h, w) : await vae.DecodeAsync(latent, Fz, h, w); }
         Report("decode", 1, "done");
         return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
     }

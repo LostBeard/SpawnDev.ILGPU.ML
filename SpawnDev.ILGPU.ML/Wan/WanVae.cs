@@ -300,19 +300,6 @@ public sealed class WanVae : IDisposable
     /// </summary>
     public async Task<float[]> DecodeAsync(float[] z, int Fz, int h, int w)
     {
-        const int Z = 48;
-        int hw = h * w;
-        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
-        // z * std + mean (the reference: z / (1 / std) + mean), channel-first -> channel-last
-        var zc = new float[(long)Fz * hw * Z];
-        for (int c = 0; c < Z; c++)
-            for (int f = 0; f < Fz; f++)
-                for (int p = 0; p < hw; p++)
-                    zc[((long)f * hw + p) * Z + c] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
-        _caches.Clear();
-        var zIn = _acc.Allocate1D(zc);
-        var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);
-        Tap?.Invoke("dec_conv2", zBuf.View, Fz, h, w, Z);
         int H8 = h * 16, W8 = w * 16, totalFrames = 4 * Fz - 3;
         // the picture is assembled on the host chunk by chunk (a 720p, 121-frame video is 1.3 GB: it never exists on the device, which also keeps every device buffer small)
         var result = new float[3L * totalFrames * H8 * W8];
@@ -327,6 +314,124 @@ public sealed class WanVae : IDisposable
             for (int c = 0; c < 3; c++) Array.Copy(host, c * frames * framePixels, result, c * plane + (long)writtenFrames * framePixels, frames * framePixels);
             writtenFrames += frames;
         }
+        await DecodeCoreAsync(z, Fz, h, w, EmitAsync);
+        if (writtenFrames != totalFrames) throw new InvalidOperationException($"decoded {writtenFrames} frames, expected {totalFrames}");
+        return result;
+    }
+
+    /// <summary>
+    /// <see cref="DecodeAsync"/> in spatial tiles, as diffusers' <c>AutoencoderKLWan.enable_tiling()</c> decodes (the low-memory path: device memory follows the tile, not the frame).
+    /// Latent tiles of <paramref name="tileSample"/> / 16 with a stride of <paramref name="strideSample"/> / 16 (defaults 256 / 192 px: 16 / 12 latent positions), each decoded through the
+    /// whole causal decoder with fresh caches; the 12-channel outputs before the pixel unshuffle are blended over the overlap (tileSample - strideSample) / 2 = 32 positions with
+    /// diffusers' in-place row-then-column blends, cropped, assembled, unpatchified and clamped. Not the same numbers as the untiled decode (the reference's tiled decode is 1.8e-2 from
+    /// its untiled one): the reference's own tiled mode.
+    /// </summary>
+    public async Task<float[]> DecodeTiledAsync(float[] z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
+    {
+        const int Z = 48, Ch = 12, P = 2, Ratio = 16;
+        if (tileSample % Ratio != 0 || strideSample % Ratio != 0 || strideSample > tileSample) throw new ArgumentException("tile and stride must be multiples of 16, stride <= tile");
+        int tl = tileSample / Ratio, ts = strideSample / Ratio;
+        int sh = h * Ratio / P, sw = w * Ratio / P, sStride = strideSample / P, blend = tileSample / P - sStride, totalFrames = 4 * Fz - 3;
+        var r = new float[(long)totalFrames * sh * sw * Ch];                          // the assembled 12-channel output, channel-last [F, sh, sw, 12]
+        List<(float[] Data, int Hp, int Wp)>? prev = null;
+        for (int i = 0; i < h; i += ts)
+        {
+            var row = new List<(float[] Data, int Hp, int Wp)>();
+            for (int j = 0; j < w; j += ts)
+            {
+                int th = Math.Min(tl, h - i), tw = Math.Min(tl, w - j);
+                var sub = new float[(long)Z * Fz * th * tw];
+                for (int c = 0; c < Z; c++)
+                    for (int f = 0; f < Fz; f++)
+                        for (int y = 0; y < th; y++)
+                            Array.Copy(z, (((long)c * Fz + f) * h + i + y) * w + j, sub, (((long)c * Fz + f) * th + y) * tw, tw);
+                int Hp = th * Ratio / P, Wp = tw * Ratio / P;
+                var tile = new float[(long)totalFrames * Hp * Wp * Ch];
+                int written = 0;
+                async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
+                {
+                    var host = await headChunk.View.SubView(0, (long)frames * Hs * Ws * Ch).CopyToHostAsync();
+                    Array.Copy(host, 0, tile, (long)written * Hs * Ws * Ch, host.Length);
+                    written += frames;
+                }
+                await DecodeCoreAsync(sub, Fz, th, tw, EmitAsync);
+                if (written != totalFrames) throw new InvalidOperationException($"a tile decoded {written} frames, expected {totalFrames}");
+                row.Add((tile, Hp, Wp));
+            }
+            for (int j = 0; j < row.Count; j++)
+            {
+                var (b, bh, bw) = row[j];
+                if (prev != null) BlendV(prev[j].Data, prev[j].Hp, b, bh, bw, blend, totalFrames, Ch);
+                if (j > 0) BlendH(row[j - 1].Data, row[j - 1].Wp, b, bh, bw, blend, totalFrames, Ch);
+                int y0 = (i / ts) * sStride, x0 = (j) * sStride;
+                for (int f = 0; f < totalFrames; f++)
+                    for (int y = 0; y < Math.Min(sStride, bh) && y0 + y < sh; y++)
+                    {
+                        int n = Math.Min(Math.Min(sStride, bw), sw - x0);
+                        if (n > 0) Array.Copy(b, (((long)f * bh + y) * bw) * Ch, r, (((long)f * sh + y0 + y) * sw + x0) * Ch, (long)n * Ch);
+                    }
+            }
+            prev = row;
+        }
+        // unpatchify + clamp on the device, a few frames at a time
+        int H8 = sh * P, W8 = sw * P;
+        var result = new float[3L * totalFrames * H8 * W8];
+        long plane = (long)totalFrames * H8 * W8, framePixels = (long)H8 * W8;
+        int step = Math.Max(1, (int)Math.Min(totalFrames, (64L << 20) / ((long)sh * sw * Ch)));
+        for (int f0 = 0; f0 < totalFrames; f0 += step)
+        {
+            int n = Math.Min(step, totalFrames - f0);
+            using var head = _acc.Allocate1D(r.AsSpan((int)((long)f0 * sh * sw * Ch), (int)((long)n * sh * sw * Ch)).ToArray());
+            using var chunk = _acc.Allocate1D<float>(3L * n * framePixels);
+            _wk.UnpatchifyVideo(head.View, chunk.View, n, sh, sw);
+            var host = await chunk.View.CopyToHostAsync();
+            for (int c = 0; c < 3; c++) Array.Copy(host, c * n * framePixels, result, c * plane + (long)f0 * framePixels, n * framePixels);
+        }
+        return result;
+    }
+
+    // diffusers' blend_v / blend_h on channel-last [F, H, W, C] tiles, in place on b (the weights in float32, as torch multiplies a float tensor by a Python float)
+    private static void BlendV(float[] a, int ah, float[] b, int bh, int bw, int extent, int frames, int C)
+    {
+        int ext = Math.Min(Math.Min(ah, bh), extent);
+        for (int f = 0; f < frames; f++)
+            for (int y = 0; y < ext; y++)
+            {
+                float wa = (float)(1.0 - (double)y / ext), wb = (float)((double)y / ext);
+                long ra = (((long)f * ah + ah - ext + y) * bw) * C, rb = (((long)f * bh + y) * bw) * C;
+                for (int k = 0; k < bw * C; k++) b[rb + k] = a[ra + k] * wa + b[rb + k] * wb;
+            }
+    }
+    private static void BlendH(float[] a, int aw, float[] b, int bh, int bw, int extent, int frames, int C)
+    {
+        int ext = Math.Min(Math.Min(aw, bw), extent);
+        for (int f = 0; f < frames; f++)
+            for (int y = 0; y < bh; y++)
+                for (int x = 0; x < ext; x++)
+                {
+                    float wa = (float)(1.0 - (double)x / ext), wb = (float)((double)x / ext);
+                    long pa = (((long)f * bh + y) * aw + aw - ext + x) * C, pb = (((long)f * bh + y) * bw + x) * C;
+                    for (int c = 0; c < C; c++) b[pb + c] = a[pa + c] * wa + b[pb + c] * wb;
+                }
+    }
+
+    /// <summary>The chunked causal decode of <paramref name="z"/>; every finished chunk's 12-channel head output [frames * Hs * Ws, 12] goes to <paramref name="emit"/> in order.</summary>
+    private async Task DecodeCoreAsync(float[] z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit)
+    {
+        const int Z = 48;
+        int hw = h * w;
+        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+        // z * std + mean (the reference: z / (1 / std) + mean), channel-first -> channel-last
+        var zc = new float[(long)Fz * hw * Z];
+        for (int c = 0; c < Z; c++)
+            for (int f = 0; f < Fz; f++)
+                for (int p = 0; p < hw; p++)
+                    zc[((long)f * hw + p) * Z + c] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+        _caches.Clear();
+        var zIn = _acc.Allocate1D(zc);
+        var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);
+        Tap?.Invoke("dec_conv2", zBuf.View, Fz, h, w, Z);
+        var EmitAsync = emit;
         for (int i = 0; i < Fz; i++)
         {
             int T = 1, H = h, W = w;
@@ -395,11 +500,9 @@ public sealed class WanVae : IDisposable
             Drop(hc);
             Flush(); await _acc.SynchronizeAsync();
         }
-        if (writtenFrames != totalFrames) throw new InvalidOperationException($"decoded {writtenFrames} frames, expected {totalFrames}");
         zIn.Dispose(); Drop(zBuf); Flush();
         foreach (var c in _caches.Values) c.Packed?.Dispose();
         _caches.Clear();
-        return result;
     }
 
     /// <summary>Log the time of every decoder stage (each is awaited to completion, so the times are the device time): <c>[Wan] vae ...</c> lines on the console.</summary>

@@ -11,6 +11,7 @@
 //
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
+//           --tiled-vae (Wan: decode in 256 px tiles as diffusers' enable_tiling: 720p on an 8 GB card)
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
 //           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate;
 //                  --upscale runs the model's two-pass recipe: 2/3 size, the x2 latent upscaler, 3 steps at twice that size, so 704x480 comes out at 896x576)
@@ -59,6 +60,7 @@ for (int i = 0; i < args.Length; i++)
         case "--turbo": o.Turbo = true; break;
         case "--ltx": o.Ltx = true; break;
         case "--upscale": o.Upscale = true; break;
+        case "--tiled-vae": o.TiledVae = true; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -113,6 +115,7 @@ async Task<int> Run(string prompt, Options o)
     var request = new WanRequest
     {
         Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
+        TiledDecode = o.TiledVae,
     };
     if (o.Image != null)
     {
@@ -122,7 +125,7 @@ async Task<int> Run(string prompt, Options o)
         request = new WanRequest
         {
             Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
-            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height,
+            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height, TiledDecode = o.TiledVae,
         };
     }
 
@@ -205,7 +208,7 @@ int Save(WanVideo video, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale;
+    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;
