@@ -33,7 +33,7 @@ public abstract partial class MLTestBase
 
     /// <summary>
     /// The DiT with per-token timesteps and explicit token positions (the conditioned forward: 150 tokens at timestep 0, 450 at t; the causal time positions max(8 f - 7, 0) / 25 s):
-    /// our prediction at steps 0 and 5 on the reference's own inputs against its float32 prediction, with the bf16 tensor cores (bound 0.02, as the text-to-video DiT gate) and, on CUDA,
+    /// our prediction at steps 0 and 5 on the reference's own inputs against its float32 prediction, with the bf16 tensor cores (bound 0.05: the reference's own bf16 run is 5.2e-2 off exact math; ours 1.1e-2 at 600 tokens, 2.6e-2 at 216) and, on CUDA,
     /// without them (fp32 GEMMs: the exact math, bound 2e-3). Desktop GPU or WebGPU.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
@@ -43,10 +43,11 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
         var weightsPath = Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "cond_i2v.npz");
         if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
-        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath);
+        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz"));
         var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
-        var coords = LtxTokens(WanNpz(fx, "coords").Data);
         using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        // 480x320 (600 tokens) and 288x192 (216 tokens, a 6 x 9 latent: the multi-scale recipe's first pass)
+        var fixtures = new[] { "i2v", "i2v288" }.Where(f => File.Exists(Path.Combine(LtxDir, "ref", $"cond_{f}.npz"))).ToArray();
         var report = new List<string>();
         double worstTc = 0, worstExact = 0;
         bool exactPass = accelerator.AcceleratorType == AcceleratorType.Cuda;
@@ -57,25 +58,27 @@ public abstract partial class MLTestBase
             {
                 DiTKernels.EnableTensorCores = tensorCores;
                 bool mma = tensorCores && accelerator.AcceleratorType == AcceleratorType.Cuda;      // only CUDA has the bf16 tensor cores: elsewhere the math is float32
-                using var dit = new LtxDiT(accelerator, new DiTKernels(accelerator), weights);
-                dit.SetPositions(coords);
-                dit.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
+                foreach (var tag in fixtures)
                 foreach (int step in new[] { 0, 5 })
                 {
+                    using var fx = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"cond_{tag}.npz"));
+                    using var dit = new LtxDiT(accelerator, new DiTKernels(accelerator), weights);
+                    dit.SetPositions(LtxTokens(WanNpz(fx, "coords").Data));
+                    dit.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
                     var (lat, _) = WanNpz(fx, $"latent_in{step}"); var (t, _) = WanNpz(fx, $"t{step}");
                     var segs = LtxRuns(t);
                     using var lIn = accelerator.Allocate1D(lat); using var lOut = accelerator.Allocate1D<float>(lat.Length);
                     dit.Forward(lIn.View, segs, 0, lOut.View, tokenMajor: true);
                     var got = await lOut.View.CopyToHostAsync();
                     var m = WanCompare(got, WanNpz(fx, $"pred{step}").Data);
-                    report.Add($"step {step} ({string.Join(" + ", segs.Select(s => $"{s.Count} tokens at t {s.Timestep:F1}"))}) {(mma ? "tensor cores" : "fp32 GEMMs")}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+                    report.Add($"{tag} step {step} ({string.Join(" + ", segs.Select(s => $"{s.Count} tokens at t {s.Timestep:F1}"))}) {(mma ? "tensor cores" : "fp32 GEMMs")}: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
                     if (mma) worstTc = Math.Max(worstTc, m.RelRms); else worstExact = Math.Max(worstExact, m.RelRms);
                 }
             }
             finally { DiTKernels.EnableTensorCores = saved; }
         }
         LtxLog("ConditionedDiT", report);
-        if (!(worstTc < 0.02 && worstExact < 2e-3)) throw new Exception("the conditioned DiT deviates from the reference: " + string.Join("; ", report));
+        if (!(worstTc < 0.05 && worstExact < 2e-3)) throw new Exception("the conditioned DiT deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
 
@@ -225,6 +228,133 @@ public abstract partial class MLTestBase
         finally { DiTKernels.EnableTensorCores = saved; }
         LtxLog("Conditions", report);
         if (!(worst < 1e-3)) throw new Exception("LTX conditioning deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+    /// <summary>
+    /// The distilled model's multi-scale recipe against diffusers' real pipelines chained (ref_multiscale_dump.py: LTXConditionPipeline at 288x192 -> LTXLatentUpsamplePipeline with
+    /// AdaIN -> LTXConditionPipeline at 576x384 from the upsampled latent re-noised to sigma 0.9094, the second-pass sigmas; a picture at frame 0 in both passes; the reference's draws),
+    /// stage by stage with <see cref="LtxPipeline.DenoiseAsync"/> and <see cref="LtxPipeline.UpsampleLatentAsync"/> as <see cref="LtxPipeline.GenerateAsync"/> chains them. Exact math
+    /// (tensor cores off; the fixture's upsampler has the export's fp16 weights). Each stage is checked on the REFERENCE's input as well as chained, because the model is
+    /// sensitive at these small sizes (Ltx_ImageToVideo_Steps_MatchReference: the reference perturbed by its own fp16 encoder moves 9.7e-4): the upscaler on the reference's first-pass latent (bound 1e-4), the second pass on the
+    /// reference's upsampled latent (5e-3), the first pass (5e-3) and the whole chain (1e-2). Also checks <see cref="LtxPipeline.FirstPassSize"/> against the reference's sizes.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_MultiScale_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
+        var fxPath = Path.Combine(LtxDir, "ref", "ms_ms.npz");
+        if (!File.Exists(Path.Combine(LtxDir, "ltx_dit_bf16.safetensors")) || !File.Exists(Path.Combine(LtxDir, "ltx_upsampler_f16.safetensors")) || !File.Exists(fxPath))
+            throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath);
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        var sizes = WanNpz(fx, "sizes").Data;
+        int w1 = (int)sizes[0], h1 = (int)sizes[1], w2 = (int)sizes[2], h2 = (int)sizes[3];
+        var report = new List<string>();
+        var fp = LtxPipeline.FirstPassSize(480, 320);
+        report.Add($"first-pass size for 480x320: {fp.Width}x{fp.Height} (reference {w1}x{h1})");
+        bool ok = fp.Width == w1 && fp.Height == h1;
+        var emb = ctx.AsSpan(0, rows * 4096).ToArray();
+        LtxRequest Req(string p, int w, int h, float[]? sigmas, float[]? latents, int steps) => new()
+        {
+            Prompt = "", PromptEmbedding = emb, Width = w, Height = h, Frames = 25, FrameRate = LtxFrameRate, Sigmas = sigmas, Latents = latents,
+            Conditions = new[] { new LtxCondition { Pixels = WanNpz(fx, p + "_pixels").Data } },
+            InitialNoise = WanNpz(fx, p + "_noise").Data, PosteriorNoise = new[] { WanNpz(fx, p + "_posterior").Data },
+            StepNoise = Enumerable.Range(0, steps).Select(s => WanNpz(fx, $"{p}_cond_noise{s}").Data).ToArray(),
+        };
+        double worst = 0;
+        bool saved = DiTKernels.EnableTensorCores;
+        try
+        {
+            DiTKernels.EnableTensorCores = false;
+            var pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(LtxDir));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var p1 = await pipe.DenoiseAsync(Req("p1", w1, h1, null, null, LtxSampler.DistilledFirstPass.Length));
+            var m1 = WanCompare(p1, WanNpz(fx, "p1_final").Data);
+            var refUp = WanNpz(fx, "up").Data;
+            var muRef = WanCompare(await pipe.UpsampleLatentAsync(WanNpz(fx, "p1_final").Data, 4, h1 / 32, w1 / 32, 1f), refUp);
+            var m2Ref = WanCompare(await pipe.DenoiseAsync(Req("p2", w2, h2, LtxSampler.DistilledSecondPass, refUp, LtxSampler.DistilledSecondPass.Length)), WanNpz(fx, "p2_final").Data);
+            var up = await pipe.UpsampleLatentAsync(p1, 4, h1 / 32, w1 / 32, 1f);
+            var mu = WanCompare(up, refUp);
+            var p2 = await pipe.DenoiseAsync(Req("p2", w2, h2, LtxSampler.DistilledSecondPass, up, LtxSampler.DistilledSecondPass.Length));
+            var m2 = WanCompare(p2, WanNpz(fx, "p2_final").Data);
+            report.Add($"on the reference's inputs: upscaler {muRef.RelRms:E2}, second pass {w2}x{h2} {m2Ref.RelRms:E2}");
+            report.Add($"chained: first pass {w1}x{h1} {m1.RelRms:E2}, upsampled {mu.RelRms:E2}, second pass {m2.RelRms:E2} (maxAbs {m2.MaxAbs:F4} of {m2.RefMaxAbs:F2}); {sw.Elapsed.TotalSeconds:F1} s");
+            ok &= muRef.RelRms < 1e-4 && m2Ref.RelRms < 5e-3 && m1.RelRms < 5e-3;
+            worst = m2.RelRms;
+        }
+        finally { DiTKernels.EnableTensorCores = saved; }
+        LtxLog("MultiScale", report);
+        if (!(ok && worst < 1e-2)) throw new Exception("the multi-scale recipe deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+    /// <summary>
+    /// The conditioned sampler step by step on the 288x192 image-to-video fixture (cond_i2v288.npz: 216 tokens, the multi-scale recipe's first-pass size), exact math: before every
+    /// step the DiT input (after the image-conditioning noise) and the prediction against the reference's, a standalone DiT forward on the pipeline's own input (must equal the
+    /// pipeline's prediction), and the final latent. At this size the trajectory amplifies tiny differences: the REFERENCE itself, with only its encoder rounded to fp16
+    /// (cond_i2v288_encf16.npz: the condition latent moved 2.5e-6), is 1.0e-3 off its own step-5 prediction and 9.7e-4 off its final latent - the same as ours (1.3e-3 / 7.2e-4),
+    /// while random 1e-5 input noise moves our step-5 prediction only 4e-5 (the amplified direction is along the trajectory). So the inputs must track the reference to 1e-3 and the
+    /// final latent is bounded by 3e-3. Desktop GPU or WebGPU.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_ImageToVideo_Steps_MatchReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
+        var fxPath = Path.Combine(LtxDir, "ref", "cond_i2v288.npz");
+        if (!File.Exists(Path.Combine(LtxDir, "ltx_dit_bf16.safetensors")) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz")); using var fx = ZipFile.OpenRead(fxPath);
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        int steps = LtxSampler.DistilledFirstPass.Length;
+        var req = new LtxRequest
+        {
+            Prompt = "", PromptEmbedding = ctx.AsSpan(0, rows * 4096).ToArray(), Width = 288, Height = 192, Frames = 25, FrameRate = LtxFrameRate,
+            Conditions = new[] { new LtxCondition { Pixels = WanNpz(fx, "image").Data } },
+            InitialNoise = WanNpz(fx, "noise").Data, PosteriorNoise = new[] { WanNpz(fx, "posterior").Data },
+            StepNoise = Enumerable.Range(0, steps).Select(i => WanNpz(fx, $"cond_noise{i}").Data).ToArray(),
+        };
+        var report = new List<string>();
+        double worst = 0, worstInput = 0;
+        bool saved = DiTKernels.EnableTensorCores;
+        try
+        {
+            DiTKernels.EnableTensorCores = false;
+            // the DiT's own sensitivity at step 5: the reference's input, and the same plus 1e-5 relative Gaussian noise
+            using var weights = GpuWeights.LoadFile(accelerator, Path.Combine(LtxDir, "ltx_dit_bf16.safetensors"));
+            using var dit = new LtxDiT(accelerator, new DiTKernels(accelerator), weights);
+            {
+                dit.SetPositions(LtxTokens(WanNpz(fx, "coords").Data));
+                dit.SetContext(0, ctx.AsSpan(0, rows * 4096).ToArray(), rows);
+                var (lat5, _) = WanNpz(fx, "latent_in5"); var segs = LtxRuns(WanNpz(fx, "t5").Data); var want5 = WanNpz(fx, "pred5").Data;
+                double rms = Math.Sqrt(lat5.Select(v => (double)v * v).Average());
+                var eps = LtxPipeline.Gaussian(lat5.Length, 5);
+                var pert = lat5.Select((v, i) => v + (float)(1e-5 * rms) * eps[i]).ToArray();
+                async Task<float[]> Pred(float[] x) { using var a = accelerator.Allocate1D(x); using var o = accelerator.Allocate1D<float>(x.Length); dit.Forward(a.View, segs, 0, o.View, tokenMajor: true); return await o.View.CopyToHostAsync(); }
+                var p0 = await Pred(lat5); var p1 = await Pred(pert);
+                report.Add($"step-5 sensitivity: prediction on the reference input {WanCompare(p0, want5).RelRms:E2}; with 1e-5 input noise {WanCompare(p1, want5).RelRms:E2} (vs our own clean prediction {WanCompare(p1, p0).RelRms:E2})");
+            }
+            var pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(LtxDir));
+            pipe.StepTap = (s, lat, v) =>
+            {
+                accelerator.Synchronize();
+                var a = new float[lat.Length]; lat.CopyToCPU(a); var b = new float[v.Length]; v.CopyToCPU(b);
+                var mi = WanCompare(a, WanNpz(fx, $"latent_in{s}").Data); var mp = WanCompare(b, WanNpz(fx, $"pred{s}").Data);
+                // a fresh forward of the standalone DiT on the pipeline's own input and the reference's timesteps: the pipeline's forward must equal it
+                using var xa = accelerator.Allocate1D(a); using var xo = accelerator.Allocate1D<float>(a.Length);
+                dit.Forward(xa.View, LtxRuns(WanNpz(fx, $"t{s}").Data), 0, xo.View, tokenMajor: true);
+                accelerator.Synchronize();
+                var c = new float[a.Length]; xo.View.CopyToCPU(c);
+                report.Add($"step {s}: input {mi.RelRms:E2}, prediction {mp.RelRms:E2}; standalone DiT on this input vs the pipeline's prediction {WanCompare(b, c).RelRms:E2}, vs the reference {WanCompare(c, WanNpz(fx, $"pred{s}").Data).RelRms:E2}");
+                worstInput = Math.Max(worstInput, mi.RelRms);
+            };
+            var m = WanCompare(await pipe.DenoiseAsync(req), WanNpz(fx, "final").Data);
+            pipe.StepTap = null;
+            report.Add($"final latent relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F4}");
+            worst = m.RelRms;
+        }
+        finally { DiTKernels.EnableTensorCores = saved; }
+        LtxLog("ImageToVideoSteps", report);
+        if (!(worst < 3e-3 && worstInput < 1e-3)) throw new Exception("the conditioned sampler deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
 }

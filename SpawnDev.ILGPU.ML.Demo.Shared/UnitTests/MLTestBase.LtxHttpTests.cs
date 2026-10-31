@@ -145,6 +145,57 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The distilled model's two-pass recipe in the browser over HTTP: each stage on the reference's own input (fixture <c>ref/ms_ms.npz</c>, diffusers' pipelines chained; the
+    /// browser's math is float32 with the bf16 DiT): the upscaler on the reference's first-pass latent (bound 1e-4) and the second pass on the reference's upsampled latent (5e-3),
+    /// as Ltx_MultiScale_MatchesReference on the desktop; then the demo's configuration end to end (<see cref="LtxRequest.Upscale"/>, the 8-bit DiT and T5, a picture as the first
+    /// frame, 704x480 x 97 -> 896x576): finite, a picture, the stage times to the console.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx_MultiScale_OverHttp_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var (http, source) = await LtxHttp();
+        using var t5 = await LtxFixture(http, "t5_0.npz"); using var fx = await LtxFixture(http, "ms_ms.npz");
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        var sizes = WanNpz(fx, "sizes").Data;
+        int w1 = (int)sizes[0], h1 = (int)sizes[1], w2 = (int)sizes[2], h2 = (int)sizes[3];
+        var lines = new List<string>();
+        var pipe = new LtxPipeline(accelerator, source, "", LtxPaths.InRepo(LtxPaths.DitFile("bf16"), LtxPaths.TextEncoderFile("q8")));
+        var refUp = WanNpz(fx, "up").Data;
+        var mu = WanCompare(await pipe.UpsampleLatentAsync(WanNpz(fx, "p1_final").Data, 4, h1 / 32, w1 / 32, 1f), refUp);
+        var req2 = new LtxRequest
+        {
+            Prompt = "", PromptEmbedding = ctx.AsSpan(0, rows * 4096).ToArray(), Width = w2, Height = h2, Frames = 25, FrameRate = LtxFrameRate, Sigmas = LtxSampler.DistilledSecondPass, Latents = refUp,
+            Conditions = new[] { new LtxCondition { Pixels = WanNpz(fx, "p2_pixels").Data } },
+            InitialNoise = WanNpz(fx, "p2_noise").Data, PosteriorNoise = new[] { WanNpz(fx, "p2_posterior").Data },
+            StepNoise = Enumerable.Range(0, LtxSampler.DistilledSecondPass.Length).Select(s => WanNpz(fx, $"p2_cond_noise{s}").Data).ToArray(),
+        };
+        var m2 = WanCompare(await pipe.DenoiseAsync(req2), WanNpz(fx, "p2_final").Data);
+        lines.Add($"on the reference's inputs: upscaler {mu.RelRms:E2}, second pass {w2}x{h2} (bf16 DiT) {m2.RelRms:E2}");
+        bool ok = mu.RelRms < 1e-4 && m2.RelRms < 5e-3;
+
+        // the demo's configuration end to end: a picture (smooth test content) as the first frame
+        int pw = 640, ph = 448;
+        var rgb = new byte[pw * ph * 3];
+        for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) { int i = (y * pw + x) * 3; rgb[i] = (byte)(128 + 100 * Math.Sin(x / 40.0)); rgb[i + 1] = (byte)(128 + 100 * Math.Cos(y / 30.0)); rgb[i + 2] = (byte)((x + y) % 256); }
+        var demo = new LtxPipeline(accelerator, source, "", LtxPaths.InRepo(LtxPaths.DitFile("q8"), LtxPaths.TextEncoderFile("q8")));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string last = ""; var stages = new List<string>();
+        var progress = new Progress<WanProgress>(p => { var key = p.Stage + (p.Message.StartsWith("second") ? "2" : ""); if (key != last) { last = key; stages.Add($"{p.Stage}{(key.EndsWith("2") ? " (second pass)" : "")} at {sw.Elapsed.TotalSeconds:F0} s"); } });
+        var video = await demo.GenerateAsync(new LtxRequest
+        {
+            Prompt = "A colourful abstract painting slowly comes alive, the shapes drift and swirl, soft light.", Width = 704, Height = 480, Frames = 97, Seed = 42,
+            Upscale = true, Conditions = new[] { LtxCondition.Image(rgb, pw, ph) },
+        }, progress);
+        double min = double.MaxValue, max = double.MinValue;
+        foreach (var v in video.Data) { if (!float.IsFinite(v)) throw new Exception("a pixel is not finite"); min = Math.Min(min, v); max = Math.Max(max, v); }
+        lines.Add($"two-pass 704x480 x 97 (8-bit DiT + T5, a first frame): {video.Frames} frames {video.Width}x{video.Height} in {sw.Elapsed.TotalSeconds:F0} s ({string.Join(", ", stages)}), pixels {min:F2}..{max:F2}");
+        ok &= video.Width == 896 && video.Height == 576 && video.Frames == 97 && max <= 3 && min >= -3 && max - min > 0.5;
+        foreach (var l in lines) Console.WriteLine($"[Ltx] browser {l}");
+        if (!ok) throw new Exception("LTX two-pass in the browser: " + string.Join("; ", lines));
+        return string.Join("; ", lines);
+    });
+
+    /// <summary>
     /// The whole LTX pipeline in the browser over HTTP with the hosted files (the demo's configuration: 8-bit DiT and T5), at the model's native 704x480 and 97 frames: the
     /// clip must be finite, a picture (spread out, no blow-up beyond the decoder's small overshoot of [-1, 1]); stage times go to the console (each stage is gated against the reference by Ltx_Stages_OverHttp_MatchReference).
     /// </summary>

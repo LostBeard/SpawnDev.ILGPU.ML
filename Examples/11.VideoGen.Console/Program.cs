@@ -12,7 +12,8 @@
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
-//           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate)
+//           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate;
+//                  --upscale runs the model's two-pass recipe: 2/3 size, the x2 latent upscaler, 3 steps at twice that size, so 704x480 comes out at 896x576)
 //           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB; default q8, the hosted one: bf16 only with --models)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
 //
@@ -57,6 +58,7 @@ for (int i = 0; i < args.Length; i++)
         case "--sampler" when i + 1 < args.Length: o.FewStep = args[++i].Equals("fewstep", StringComparison.OrdinalIgnoreCase); break;
         case "--turbo": o.Turbo = true; break;
         case "--ltx": o.Ltx = true; break;
+        case "--upscale": o.Upscale = true; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -166,7 +168,7 @@ async Task<int> RunLtx(Accelerator accelerator, HttpClient http, string prompt, 
         img.CopyPixelDataTo(rgb);
         conditions = new[] { LtxCondition.Image(rgb, img.Width, img.Height) };          // the picture is frame 0 (scaled to cover the size, centre-cropped)
     }
-    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps, Conditions = conditions };
+    var request = new LtxRequest { Prompt = prompt, Width = o.Width, Height = o.Height, Frames = o.Frames, Seed = o.Seed, FrameRate = o.Fps, Conditions = conditions, Upscale = o.Upscale };
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var video = await pipe.GenerateAsync(request, ConsoleProgress(sw));
     Console.WriteLine();
@@ -203,7 +205,7 @@ int Save(WanVideo video, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames, FewStep, Turbo, Ltx;
+    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;

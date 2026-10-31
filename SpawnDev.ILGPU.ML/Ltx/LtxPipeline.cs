@@ -16,6 +16,8 @@ public sealed class LtxPaths
     public required string Vae { get; init; }
     /// <summary><c>ltx_vae_encoder_f16.safetensors</c> (1.4 GB, the encoder: loaded only for image / video conditioning).</summary>
     public string? VaeEncoder { get; init; }
+    /// <summary><c>ltx_upsampler_f16.safetensors</c> (253 MB, the x2 spatial latent upscaler: loaded only for <see cref="LtxRequest.Upscale"/>).</summary>
+    public string? Upsampler { get; init; }
     /// <summary><c>t5_xxl_enc_bf16.safetensors</c> (9.5 GB, streamed layer by layer).</summary>
     public required string TextEncoder { get; init; }
     /// <summary>The <c>tokenizer.json</c> of google/t5-v1_1-xxl.</summary>
@@ -28,18 +30,19 @@ public sealed class LtxPaths
 
     /// <summary>
     /// The file names a model repo holds (relative, forward slashes). <see cref="LtxPipeline.DefaultRepo"/> on models.spawndev.com serves the bf16 and 8-bit DiT, the 8-bit
-    /// T5 (the 9 GB bf16 one is not hosted), the VAE decoder and encoder and the tokenizer.
+    /// T5 (the 9 GB bf16 one is not hosted), the VAE decoder and encoder, the latent upscaler and the tokenizer.
     /// </summary>
     public static LtxPaths InRepo(string dit = "ltx_dit_bf16.safetensors", string textEncoder = "t5_xxl_enc_q8.safetensors") => new()
     {
-        Dit = dit, Vae = "ltx_vae_f16.safetensors", VaeEncoder = "ltx_vae_encoder_f16.safetensors", TextEncoder = textEncoder, Tokenizer = "google/t5-v1_1-xxl/tokenizer.json",
+        Dit = dit, Vae = "ltx_vae_f16.safetensors", VaeEncoder = "ltx_vae_encoder_f16.safetensors", Upsampler = "ltx_upsampler_f16.safetensors", TextEncoder = textEncoder,
+        Tokenizer = "google/t5-v1_1-xxl/tokenizer.json",
     };
 
     /// <summary>The conventional layout of one folder on disk: the file names the exporters write.</summary>
     public static LtxPaths InFolder(string folder, string dit = "ltx_dit_bf16.safetensors", string textEncoder = "t5_xxl_enc_bf16.safetensors") => new()
     {
         Dit = Path.Combine(folder, dit), Vae = Path.Combine(folder, "ltx_vae_f16.safetensors"), VaeEncoder = Path.Combine(folder, "ltx_vae_encoder_f16.safetensors"),
-        TextEncoder = Path.Combine(folder, textEncoder), Tokenizer = Path.Combine(folder, "google", "t5-v1_1-xxl", "tokenizer.json"),
+        Upsampler = Path.Combine(folder, "ltx_upsampler_f16.safetensors"), TextEncoder = Path.Combine(folder, textEncoder), Tokenizer = Path.Combine(folder, "google", "t5-v1_1-xxl", "tokenizer.json"),
     };
 }
 
@@ -87,6 +90,23 @@ public sealed class LtxRequest
     public float DecodeNoiseScale { get; init; } = 0.025f;
     /// <summary>Starting noise [128, (F - 1) / 8 + 1, H / 32, W / 32] to use instead of one drawn from <see cref="Seed"/> (to reproduce another implementation's run exactly).</summary>
     public float[]? InitialNoise { get; init; }
+    /// <summary>
+    /// A model-space latent to start from (the reference pipelines' <c>latents</c> with a schedule that starts below 1): the start is <c>sigma0 * noise + (1 - sigma0) * Latents</c>, sigma0
+    /// the first of <see cref="Sigmas"/>, before the conditions are applied. The recipe's second pass starts from the upsampled first pass this way.
+    /// </summary>
+    public float[]? Latents { get; init; }
+
+    /// <summary>
+    /// The distilled model's multi-scale recipe (configs/ltxv-2b-0.9.8-distilled.yaml): a first pass at 2/3 of <see cref="Width"/> x <see cref="Height"/> (times 0.6666666, rounded
+    /// down to multiples of 32, as the official code), the x2 latent upscaler with AdaIN, and a second pass at twice the first-pass size with <see cref="SecondPassSigmas"/>, then the
+    /// decode. The video comes out at the second-pass size (896x576 for 704x480: 480 x 0.6666666 floors to 319, then 288; the official script then resizes the frames to the request). Conditions must be given as
+    /// <see cref="LtxCondition.Rgb"/> (each pass resizes them); the noise overrides are not used.
+    /// </summary>
+    public bool Upscale { get; init; }
+    /// <summary>The second pass's sigmas; null = the recipe's (0.9094, 0.7250, 0.4219).</summary>
+    public float[]? SecondPassSigmas { get; init; }
+    /// <summary>The upscaler's AdaIN blend (each channel's statistics moved to the first pass's): 1 in the recipe.</summary>
+    public float AdainFactor { get; init; } = 1f;
 
     /// <summary>
     /// Pictures / clips to condition on (empty or null: text to video). With conditions the pipeline follows LTXConditionPipeline: per-token timesteps, the causal time positions
@@ -122,6 +142,9 @@ public sealed class LtxPipeline
     private readonly string _repo;
     private UnigramTokenizer? _tok;
 
+    /// <summary>Test hook of the conditioned sampler: (step, the DiT's token-major input [tokens, 128], its prediction) after each step's forward; valid only during the call.</summary>
+    public Action<int, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? StepTap { get; set; }
+
     /// <summary>The model repo the SpawnDev models host serves the exports from (https://models.spawndev.com/&lt;repo&gt;/resolve/main/&lt;file&gt;).</summary>
     public const string DefaultRepo = "LostBeard/LTX-Video-2B-0.9.8-distilled-ILGPU";
     private const int TextLength = 128;
@@ -154,11 +177,33 @@ public sealed class LtxPipeline
     /// <summary>Standard normal samples, seeded (<see cref="SeededNoise"/>). Not torch's generator, so a seed here is not a seed there; <see cref="LtxRequest.InitialNoise"/> takes another implementation's noise.</summary>
     public static float[] Gaussian(long count, long seed) => SeededNoise.Gaussian(count, seed);
 
-    /// <summary>The whole pipeline: <see cref="DenoiseAsync"/>, then the VAE decode.</summary>
+    /// <summary>The recipe's first-pass size for a requested size: <c>int(side * 0.6666666)</c> rounded down to a multiple of 32 (the official inference script's arithmetic).</summary>
+    public static (int Width, int Height) FirstPassSize(int width, int height)
+    {
+        static int Side(int v) { int x = (int)(v * 0.6666666); return x - x % SpatialRatio; }
+        return (Side(width), Side(height));
+    }
+
+    /// <summary>The x2 spatial latent upscaler on a model-space latent [128, Fz, h, w] -> [128, Fz, 2h, 2w] (<see cref="LtxLatentUpsampler"/>; the weights are loaded for the call).</summary>
+    public async Task<float[]> UpsampleLatentAsync(float[] latent, int Fz, int h, int w, float adainFactor = 1f, CancellationToken ct = default)
+    {
+        if (_paths.Upsampler == null) throw new InvalidOperationException("the latent upscaler needs LtxPaths.Upsampler");
+        using var uw = await LoadWeightsAsync(_paths.Upsampler, ct);
+        using var up = new LtxLatentUpsampler(_acc, uw);
+        return await up.UpsampleAsync(latent, Fz, h, w, adainFactor);
+    }
+
+    /// <summary>The whole pipeline: <see cref="DenoiseAsync"/> (with <see cref="LtxRequest.Upscale"/>: both passes and the upscaler between them), then the VAE decode.</summary>
     public async Task<WanVideo> GenerateAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
+        if (req.Upscale) return await GenerateMultiScaleAsync(req, progress, ct);
         var latent = await DenoiseAsync(req, progress, ct);
         int Fz = (req.Frames - 1) / TemporalRatio + 1, h = req.Height / SpatialRatio, w = req.Width / SpatialRatio;
+        return await DecodeAsync(req, latent, Fz, h, w, progress, ct);
+    }
+
+    private async Task<WanVideo> DecodeAsync(LtxRequest req, float[] latent, int Fz, int h, int w, IProgress<WanProgress>? progress, CancellationToken ct)
+    {
         progress?.Report(new WanProgress("decode", 0, "decoding the video"));
         float[] video;
         var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
@@ -166,7 +211,43 @@ public sealed class LtxPipeline
         using (var vae = new LtxVae(_acc, vw))
             video = await vae.DecodeAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
         progress?.Report(new WanProgress("decode", 1, "done"));
-        return new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = TemporalRatio * (Fz - 1) + 1, Latent = latent };
+        return new WanVideo { Data = video, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1, Latent = latent };
+    }
+
+    private static LtxRequest Pass(LtxRequest r, int width, int height, float[]? sigmas, float[]? latents, long seed, float[] embedding) => new()
+    {
+        Prompt = r.Prompt, Width = width, Height = height, Frames = r.Frames, Sigmas = sigmas, FrameRate = r.FrameRate, Seed = seed, DecodeTimestep = r.DecodeTimestep,
+        DecodeNoiseScale = r.DecodeNoiseScale, Conditions = r.Conditions, ImageCondNoiseScale = r.ImageCondNoiseScale, PromptEmbedding = embedding, Latents = latents,
+    };
+
+    private async Task<WanVideo> GenerateMultiScaleAsync(LtxRequest req, IProgress<WanProgress>? progress, CancellationToken ct)
+    {
+        if (req.InitialNoise != null || req.Latents != null || req.PosteriorNoise != null || req.ConditionNoise != null || req.StepNoise != null)
+            throw new ArgumentException("Upscale runs two passes with their own noise: InitialNoise, Latents and the noise overrides are not used with it");
+        if (req.Conditions?.Any(c => c.Rgb == null) == true) throw new ArgumentException("with Upscale every condition must be given as Rgb (each pass resizes it to its own size)");
+        var (w1, h1) = FirstPassSize(req.Width, req.Height);
+        if (w1 < SpatialRatio || h1 < SpatialRatio) throw new ArgumentException($"{req.Width}x{req.Height} is too small for the two-pass recipe (its first pass would be {w1}x{h1})");
+        int Fz = (req.Frames - 1) / TemporalRatio + 1;
+        void Report(string stage, double f, string msg) => progress?.Report(new WanProgress(stage, f, msg));
+
+        // the prompt once for both passes
+        var embedding = req.PromptEmbedding;
+        if (embedding == null)
+        {
+            Report("text", 0, "encoding the prompt");
+            var ids = await TokenizeAsync(req.Prompt, ct);
+            using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
+                embedding = await t5.EncodeAsync(ids, ct);
+            Report("text", 1, $"{ids.Length} tokens");
+        }
+        var inner = progress == null ? null : new Progress<WanProgress>(p => progress.Report(p.Stage == "denoise" ? p with { Message = "first pass: " + p.Message } : p));
+        var first = await DenoiseAsync(Pass(req, w1, h1, req.Sigmas, null, req.Seed, embedding), inner, ct);
+        Report("upscale", 0, "x2 latent upscaler");
+        var up = await UpsampleLatentAsync(first, Fz, h1 / SpatialRatio, w1 / SpatialRatio, req.AdainFactor, ct);
+        Report("upscale", 1, "done");
+        var inner2 = progress == null ? null : new Progress<WanProgress>(p => progress.Report(p.Stage == "denoise" ? p with { Message = "second pass: " + p.Message } : p));
+        var second = await DenoiseAsync(Pass(req, 2 * w1, 2 * h1, req.SecondPassSigmas ?? LtxSampler.DistilledSecondPass, up, req.Seed + 7919L, embedding), inner2, ct);
+        return await DecodeAsync(req, second, Fz, 2 * h1 / SpatialRatio, 2 * w1 / SpatialRatio, progress, ct);
     }
 
     /// <summary>
@@ -199,6 +280,12 @@ public sealed class LtxPipeline
 
         var noise = req.InitialNoise != null ? (float[])req.InitialNoise.Clone() : Gaussian(128L * N, req.Seed);
         if (noise.Length != 128L * N) throw new ArgumentException("InitialNoise has the wrong length for this size");
+        if (req.Latents != null)
+        {
+            if (req.Latents.Length != noise.Length) throw new ArgumentException("Latents must be [128, (F - 1) / 8 + 1, H / 32, W / 32]");
+            float s0 = sigmas[0];
+            for (long i = 0; i < noise.Length; i++) noise[i] = s0 * noise[i] + (1f - s0) * req.Latents[i];        // prepare_latents: sigma * noise + (1 - sigma) * latents
+        }
         if (req.Conditions is { Count: > 0 }) return await DenoiseConditionedAsync(req, ctx, rows, noise, sigmas, Fz, h, w, Report, ct);
 
         // 2. the denoising loop: the latent [128, Fz, h, w] stays on the device, the Euler step runs there too
@@ -392,6 +479,7 @@ public sealed class LtxPipeline
                 else segs.Add(new LtxTimestepSegment(r.Start, r.Count, tt));
             }
             dit.Forward(lat.View, segs, 0, v.View, tokenMajor: true);
+            StepTap?.Invoke(s, lat.View, v.View);
             foreach (var r in runs)
             {
                 if (!(t / 1000f - 1e-6f < 1f - r.M)) continue;                                // tokens_to_denoise_mask: a conditioned token waits until the schedule reaches its strength

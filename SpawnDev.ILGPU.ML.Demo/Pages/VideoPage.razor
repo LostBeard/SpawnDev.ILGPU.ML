@@ -37,7 +37,7 @@
         <div class="vid-settings">
             <div class="vid-setting">
                 <label>Model:</label>
-                <select @bind="_model" @bind:after="ModelChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Wan 2.2 TI2V-5B: text to video and image to video, sharper, 4 to 50 steps. LTX-Video 2B: text to video only, 7 steps, a much smaller transformer and a heavily compressed video, so clips are fast and cheap on memory.">
+                <select @bind="_model" @bind:after="ModelChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Wan 2.2 TI2V-5B: text to video and image to video, sharper, 4 to 50 steps. LTX-Video 2B: text or image to video, 7 steps (plus 3 at twice the size with the two-pass recipe), a much smaller transformer and a heavily compressed video, so clips are fast and cheap on memory.">
                     <option value="wan">Wan 2.2 TI2V-5B</option>
                     <option value="ltx">LTX-Video 2B (distilled, 7 steps)</option>
                 </select>
@@ -103,6 +103,13 @@
                 <label>Seed:</label>
                 <input type="number" @bind="_seed" class="vid-input" placeholder="random" disabled="@_isRunning" />
             </div>
+            @if (Ltx)
+            {
+            <div class="vid-setting">
+                <label>Two-pass:</label>
+                <input type="checkbox" @bind="_ltxUpscale" disabled="@_isRunning" title="The distilled model's recipe: a first pass at 2/3 of the size, the x2 latent upscaler, and 3 more steps at twice the first-pass size (896x576 for 704x480). Sharper, slower, more GPU memory." />
+            </div>
+            }
             @if (!Ltx)
             {
             <div class="vid-setting">
@@ -120,7 +127,7 @@
         <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
         @if (Ltx)
         {
-            <p class="vid-hint">LTX-Video weights are under the LTXV Open Weights License 0.X (use restrictions apply: see the model repo's LICENSE).</p>
+            <p class="vid-hint">LTX-Video weights are under the LTXV Open Weights License 0.X: use restrictions apply, and entities with $10M+ annual revenue need a commercial licence from Lightricks (see the model repo's LICENSE).</p>
         }
 
         <details class="vid-advanced">
@@ -201,6 +208,7 @@
     private string _dit = "turbo";                      // "turbo" | "q8" | "q4"
     private string _model = "wan";                      // "wan" | "ltx"
     private bool Ltx => _model == "ltx";
+    private bool _ltxUpscale;
     private LtxPipeline? _ltxPipeline;
     private string _modelServer = "";
     private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
@@ -293,14 +301,14 @@
             {
                 _stage = p.Stage; _stageMessage = p.Message;
                 // the transformer's steps are most of the time: text 0-10 %, loading + steps 10-90 %, decode 90-100 %
-                _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" or "conditions" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
+                _fraction = p.Stage switch { "text" => 0.1 * p.Fraction, "image" or "conditions" or "upscale" => 0.1, "denoise" => 0.1 + 0.8 * p.Fraction, "decode" => 0.9 + 0.1 * p.Fraction, _ => _fraction };
                 _modelStatusText = $"{(Ltx ? "LTX-Video" : "Wan 2.2")} - {p.Stage}";
                 _ = InvokeAsync(StateHasChanged);
             });
             var video = Ltx
                 ? await _ltxPipeline!.GenerateAsync(new LtxRequest
                 {
-                    Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps,
+                    Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps, Upscale = _ltxUpscale,
                     Conditions = firstRgb != null ? new[] { LtxCondition.Image(firstRgb, firstW, firstH) } : null,
                 }, progress)
                 : await _pipeline!.GenerateAsync(request, progress);

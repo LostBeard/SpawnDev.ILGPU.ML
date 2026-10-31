@@ -279,6 +279,68 @@ public sealed class LtxKernels
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // latent upsampler kernels (same channel-last layout)
+    // ---------------------------------------------------------------------------------------------------
+
+    // The 3x3x3 table of an ordinary Conv3d (padding 1, zeros in time and space): row stride 27.
+    private Action<Index1D, IV, int, int, int>? _zeroTable3;
+    private static void ZeroTable3Impl(Index1D m, IV nbr, int T, int H, int W)
+    {
+        int hw = H * W, t = m / hw, p = m % hw, h = p / W, w = p % W;
+        for (int kk = 0; kk < 27; kk++)
+        {
+            int tt = t + kk / 9 - 1, hh = h + (kk / 3) % 3 - 1, ww = w + kk % 3 - 1;
+            nbr[m * 27 + kk] = tt >= 0 && tt < T && hh >= 0 && hh < H && ww >= 0 && ww < W ? (tt * H + hh) * W + ww : -1;
+        }
+    }
+    public void ZeroTable3(IV nbr, int T, int H, int W)
+    {
+        _zeroTable3 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int>(ZeroTable3Impl);
+        _zeroTable3(T * H * W, nbr, T, H, W);
+    }
+
+    // The 3x3 table of a per-frame Conv2d (padding 1, zeros): the first 9 entries of rows of stride 27 (SparseKernels.ConvTaps keeps the stride of 27 for any tap count).
+    private Action<Index1D, IV, int, int>? _zeroTable2;
+    private static void ZeroTable2Impl(Index1D m, IV nbr, int H, int W)
+    {
+        int hw = H * W, t = m / hw, p = m % hw, h = p / W, w = p % W;
+        for (int kk = 0; kk < 9; kk++)
+        {
+            int hh = h + kk / 3 - 1, ww = w + kk % 3 - 1;
+            nbr[m * 27 + kk] = hh >= 0 && hh < H && ww >= 0 && ww < W ? (t * H + hh) * W + ww : -1;
+        }
+    }
+    public void ZeroTable2(IV nbr, int T, int H, int W)
+    {
+        _zeroTable2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int>(ZeroTable2Impl);
+        _zeroTable2(T * H * W, nbr, H, W);
+    }
+
+    // PixelShuffleND(2): conv [T * H * W, 4 C] (channel c * 4 + a * 2 + b) -> [T * 2H * 2W, C] with sub-position (a, b) at (2h + a, 2w + b)
+    private Action<Index1D, FV, FV, int, int, int>? _pixelShuffle2;
+    private static void PixelShuffle2Impl(Index1D i, FV conv, FV o, int H, int W, int C)
+    {
+        int c = i % C, v = i / C, Wo = 2 * W, Ho = 2 * H;
+        int x = v % Wo, y = (v / Wo) % Ho, t = v / (Wo * Ho);
+        long src = ((long)t * H + y / 2) * W + x / 2;
+        o[i] = conv[src * 4 * C + c * 4 + (y % 2) * 2 + x % 2];
+    }
+    public void PixelShuffle2(FV conv, FV o, int T, int H, int W, int C)
+    {
+        _pixelShuffle2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(PixelShuffle2Impl);
+        _pixelShuffle2(T * 4 * H * W * C, conv, o, H, W, C);
+    }
+
+    // o[i] = silu(a[i] + b[i])   (the upsampler resblock's end: activation(norm2(conv2) + residual))
+    private Action<Index1D, FV, FV, FV>? _addSilu;
+    private static void AddSiluImpl(Index1D i, FV a, FV b, FV o) { float v = a[i] + b[i]; o[i] = v / (1f + MathF.Exp(-v)); }
+    public void AddSilu(FV a, FV b, FV o, int count)
+    {
+        _addSilu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV>(AddSiluImpl);
+        _addSilu(count, a, b, o);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // host helpers
     // ---------------------------------------------------------------------------------------------------
 

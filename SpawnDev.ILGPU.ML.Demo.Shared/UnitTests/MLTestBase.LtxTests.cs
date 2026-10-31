@@ -201,7 +201,7 @@ public abstract partial class MLTestBase
         using var enc = new LtxVaeEncoder(accelerator, weights);
         var report = new List<string>();
         double worst = 0;
-        foreach (var tag in new[] { "img", "vid" })
+        foreach (var tag in new[] { "img", "vid", "img288" }.Where(f => File.Exists(Path.Combine(LtxDir, "ref", $"vae_enc_{f}.npz"))))      // img288: 192x288, a 6 x 9 latent
         {
             using var fx = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"vae_enc_{tag}.npz"));
             var (video, vs) = WanNpz(fx, "video");                                                   // [3, F, H, W]
@@ -229,6 +229,72 @@ public abstract partial class MLTestBase
         LtxLog("VaeEncode", report);
         if (!(worst < 0.02)) throw new Exception("the VAE encode deviates from the reference: " + string.Join("; ", report));
         return $"worst relRMS {worst:E2} over {report.Count} comparisons";
+    });
+
+    /// <summary>
+    /// The x2 spatial latent upscaler (fp16 weights, fp32 activations, zero-padded 3x3x3 and per-frame 3x3 convolutions as gather GEMMs, GroupNorm resblocks, 2x2 pixel shuffle) against
+    /// diffusers' LTXLatentUpsamplePipeline in float32 on the CPU (ref_upsampler_dump.py; the input is the final latent of the image-to-video fixture, [128, 4, 10, 15]): every stage tap
+    /// (on the denormalised latent) and the model-space output with AdaIN (factor 1, the recipe; it moves the output 0.38) and without, bound 5e-3. The source weights are float32 and
+    /// the export fp16, which alone moves the reference 7.1e-4; so the port's own math is held to a reference with the weights rounded to fp16 (<c>--round-f16</c>, fixture
+    /// <c>upsampler_f16w.npz</c>): bound 1e-4 without tensor cores (CUDA with them off, or OpenCL). Desktop GPU (the taps read back).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_LatentUpsampler_MatchesReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the taps read back to the host: a desktop GPU");
+        var weightsPath = Path.Combine(LtxDir, "ltx_upsampler_f16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "upsampler.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (latent, ls) = WanNpz(fx, "latent");
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var up = new LtxLatentUpsampler(accelerator, weights);
+        var taps = new Dictionary<string, float[]>();
+        up.Tap = (name, view, T, H, W, C) => { accelerator.Synchronize(); var a = new float[(long)T * H * W * C]; view.SubView(0, a.Length).CopyToCPU(a); taps[name] = a; };
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var got = await up.UpsampleAsync(latent, ls[1], ls[2], ls[3], 1f);
+        double ms = sw.Elapsed.TotalMilliseconds;
+        up.Tap = null;
+        var got0 = await up.UpsampleAsync(latent, ls[1], ls[2], ls[3], 0f);
+        var report = new List<string>();
+        double exact = 0;
+        var f16Path = Path.Combine(LtxDir, "ref", "upsampler_f16w.npz");
+        if (!File.Exists(f16Path)) throw new UnsupportedTestException("fixture upsampler_f16w.npz missing (ref_upsampler_dump.py --round-f16)");
+        {
+            bool saved = DiTKernels.EnableTensorCores;
+            try
+            {
+                DiTKernels.EnableTensorCores = false;
+                using var upExact = new LtxLatentUpsampler(accelerator, weights);
+                using var f16 = ZipFile.OpenRead(f16Path);
+                var me = WanCompare(await upExact.UpsampleAsync(latent, ls[1], ls[2], ls[3], 1f), WanNpz(f16, "output").Data);
+                report.Add($"fp32 math vs the reference with the weights rounded to fp16: output relRMS {me.RelRms:E2}, maxAbs {me.MaxAbs:F4}");
+                exact = me.RelRms;
+            }
+            finally { DiTKernels.EnableTensorCores = saved; }
+        }
+        double worst = 0;
+        foreach (var name in new[] { "initial", "res", "upsampled", "post", "final" })
+        {
+            var (rf, rs) = WanNpz(fx, name);                                                         // [C, T, H, W] channel-first
+            int C = rs[0], vox = rs[1] * rs[2] * rs[3];
+            var t = new float[rf.Length];
+            for (int c = 0; c < C; c++) for (int p = 0; p < vox; p++) t[(long)p * C + c] = rf[(long)c * vox + p];
+            var m = WanCompare(taps[name], t);
+            report.Add($"{name} [{C}, {rs[1]}, {rs[2]}, {rs[3]}]: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            worst = Math.Max(worst, m.RelRms);
+        }
+        foreach (var (name, data) in new[] { ("output", got), ("output_noadain", got0) })
+        {
+            var (want, ws) = WanNpz(fx, name);
+            var m = WanCompare(data, want);
+            report.Add($"{name} [{ws[0]}, {ws[1]}, {ws[2]}, {ws[3]}]: relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}");
+            worst = Math.Max(worst, m.RelRms);
+        }
+        report.Add($"{ms:F0} ms");
+        LtxLog("LatentUpsampler", report);
+        if (!(worst < 5e-3 && exact < 1e-4)) throw new Exception("the latent upsampler deviates from the reference: " + string.Join("; ", report));
+        return $"worst relRMS {worst:E2} over {report.Count - 1} comparisons";
     });
 
     private static readonly string[] LtxDitTaps = { "time_embedding", "time_projection", "text_embedding", "patch_embedding", "block_0", "block_1", "block_14", "block_27", "head" };
