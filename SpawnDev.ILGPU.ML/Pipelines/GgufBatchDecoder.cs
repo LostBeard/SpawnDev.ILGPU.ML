@@ -100,7 +100,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
     private int _lastRows;
@@ -124,6 +124,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (Vocab >= 1 << 24) throw new NotSupportedException($"vocabulary {Vocab}: candidate ids travel as floats (exact below 2^24)");
         _head = model.Tensors.Any(t => t.Name == "output.weight") ? "output.weight" : "token_embd.weight";
         MaxSeq = maxSeq; MaxBatch = maxBatch;
+        CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
         // the fused attention runs a group per head (a power of two up to 256 threads; WebGL has no groups)
         FusedAttention = accelerator.AcceleratorType != AcceleratorType.WebGL && HeadDim <= AttChunk && (HeadDim & (HeadDim - 1)) == 0 && HeadDim <= accelerator.MaxNumThreadsPerGroup;
         var inv = new float[HeadDim / 2];
@@ -243,13 +244,13 @@ public sealed class GgufBatchDecoder : IDisposable
     private IV IntBuf(int n)
     {
         int slot = _idCall++ & 1;
-        while (_idBufs.Count <= slot) _idBufs.Add(Own(_acc.Allocate1D<int>(Math.Max(64, MaxSeq))));
+        while (_idBufs.Count <= slot) { _idBufs.Add(Own(_acc.Allocate1D<int>(Math.Max(64, MaxSeq)))); _bufGen++; }
         return _idBufs[slot].View.SubView(0, n);
     }
 
     private FV Buf(ref MemoryBuffer1D<float, Stride1D.Dense>? b, long n)
     {
-        if (b == null || b.Length < n) { b = _acc.Allocate1D<float>(Math.Max(n, 64)); _owned.Add(b); }     // a replaced buffer stays owned (a queued dispatch may read it) and is freed with the decoder
+        if (b == null || b.Length < n) { b = _acc.Allocate1D<float>(Math.Max(n, 64)); _owned.Add(b); _bufGen++; }     // a replaced buffer stays owned (a queued dispatch may read it) and is freed with the decoder
         return b.View.SubView(0, n);
     }
 
@@ -270,28 +271,90 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     /// <summary>
-    /// Run <paramref name="ids"/> through the model: <paramref name="decode"/> = false is a prefill of sequence 0 at positions Position.. (causal over its cache), true is one
-    /// token per live sequence at Position. Leaves the final hidden rows' logits (prefill: only the last row's) on the device and their candidates on the host
-    /// (with the softmax mass at <paramref name="temperature"/> when it is above 0).
+    /// WebGPU: capture a decode step's dispatches once per (live sequences, temperature) and replay them each step after with one interop crossing, the position
+    /// patched into the scalars that carry it (found by diffing captures at two positions; WebGPUDispatchPlan). On by default on WebGPU with the fused attention;
+    /// off: every step encodes its kernels one by one.
     /// </summary>
-    private async Task ForwardAsync(int[] ids, int[]? seqs, bool decode, float temperature, CancellationToken ct)
+    public bool CaptureWebGPU { get; set; }
+    private bool CaptureActive => CaptureWebGPU && FusedAttention && !ProfileKernels && _acc is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
+    private bool _fixedChunks;
+    private int _bufGen;
+    private sealed class StepPlan
     {
-        int R = ids.Length, C = Hidden, kvC = KvHeads * HeadDim, p = Position;
-        if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
-        LoadKernels();
-        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (ProfileKernels) { _acc.Synchronize(); _profT = t0; }
-        // the embedding rows, gathered and dequantised on the device from the token embedding's blocks
-        var idBuf = IntBuf(R); idBuf.CopyFromCPU(ids);
-        // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for
-        _seqBuf ??= Own(_acc.Allocate1D<int>((long)MaxSeq + MaxBatch));
-        if (decode) _seqBuf.View.SubView(0, R).CopyFromCPU(seqs!);
-        var seqView = _seqBuf.View;
+        public SpawnDev.ILGPU.WebGPU.WebGPUDispatchPlan? Plan;
+        public int P0, Gen;
+        public FV Logits, Cand;
+        public int OutRows;
+        public readonly List<(int Snap, int Ofs, int ValAtP0, int Slope)> Patches = new();
+        public bool Failed;
+    }
+    private readonly Dictionary<(int R, float T), StepPlan> _plans = new();
+    /// <summary>Diagnostics: decode steps replayed from a captured plan, and plans captured, since the decoder was created.</summary>
+    public (int Replays, int Captures) CaptureStats { get; private set; }
+
+    private async Task<(FV Logits, FV Cand, int OutRows)> CapturedStepAsync(IV idBuf, int R, float temperature, int p)
+    {
+        _fixedChunks = true;
+        if (_plans.TryGetValue((R, temperature), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
+        {
+            foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));
+            await sp.Plan.ReplayAsync().ConfigureAwait(false);
+            CaptureStats = (CaptureStats.Replays + 1, CaptureStats.Captures);
+            return (sp.Logits, sp.Cand, sp.OutRows);
+        }
+        if (sp is { Failed: true }) return EncodeForward(idBuf, R, true, temperature, p);
+        sp?.Plan?.Dispose();
+        // warm: a real step (allocates whatever the shape needs), then the captures: one at p + 1 (only for the diff: it writes cache row p + 1, which the real step
+        // at p + 1 overwrites; the cache is position-addressed), then the real one at p, whose results stand
+        var warm = EncodeForward(idBuf, R, true, temperature, p);
+        await _acc.SynchronizeAsync().ConfigureAwait(false);
+        int gen = _bufGen;
+        var wacc = (SpawnDev.ILGPU.WebGPU.WebGPUAccelerator)_acc;
+        bool caching = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching;
+        SpawnDev.ILGPU.WebGPU.WebGPUDispatchPlan? a = null, b = null;
+        (FV Logits, FV Cand, int OutRows) res;
+        SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = false;
+        try
+        {
+            b = wacc.BeginDispatchCapture(); b.CaptureScalarSnapshots = true;
+            EncodeForward(idBuf, R, true, temperature, p + 1);
+            wacc.EndDispatchCapture();
+            await _acc.SynchronizeAsync().ConfigureAwait(false);
+            a = wacc.BeginDispatchCapture(); a.CaptureScalarSnapshots = true;
+            res = EncodeForward(idBuf, R, true, temperature, p);
+            wacc.EndDispatchCapture();
+            await _acc.SynchronizeAsync().ConfigureAwait(false);
+        }
+        finally { SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = caching; }
+        sp = new StepPlan { P0 = p, Gen = gen, Logits = res.Logits, Cand = res.Cand, OutRows = res.OutRows };
+        bool ok = _bufGen == gen && a.DispatchCount == b.DispatchCount && a.ScalarSnapshots.Count == b.ScalarSnapshots.Count && a.CopyEntries.Count == 0;
+        for (int i = 0; ok && i < a.ScalarSnapshots.Count; i++)
+        {
+            var (ea, _, ba) = a.ScalarSnapshots[i];
+            var (eb, _, bb) = b.ScalarSnapshots[i];
+            if (ea != eb || ba.Length != bb.Length) { ok = false; break; }
+            for (int o = 0; o + 4 <= ba.Length; o += 4)
+            {
+                int va = BitConverter.ToInt32(ba, o), vb = BitConverter.ToInt32(bb, o);
+                if (va != vb) sp.Patches.Add((i, o, va, vb - va));               // a value of the position: affine, value(p) = value(p0) + slope (p - p0)
+            }
+        }
+        b.Dispose();
+        if (!ok) { a.Dispose(); sp.Failed = true; }
+        else { sp.Plan = a; CaptureStats = (CaptureStats.Replays, CaptureStats.Captures + 1); }
+        _plans[(R, temperature)] = sp;
+        return ok ? res : warm;
+    }
+
+    // every kernel of one forward (no sync): the embedding gather through the candidate kernels. Decode steps on WebGPU are captured from here and replayed.
+    private (FV Logits, FV Cand, int OutRows) EncodeForward(IV idBuf, int R, bool decode, float temperature, int p)
+    {
+        int C = Hidden, kvC = KvHeads * HeadDim;
+        var seqView = _seqBuf!.View;
         var hid = Buf(ref _hid, (long)R * C);
         var (embW, embT) = _mats["token_embd.weight"];
         int code = FusedDequantMatMul.TypeCode(embT);
         _embed!((int)((long)R * C), idBuf, embW.View.Cast<byte, int>(), hid, C, code, FusedDequantMatMul.RowBytesOf(code, C)); Prof("embed");
-        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         var hid2 = Buf(ref _hid2, (long)R * C);
         var hn = Buf(ref _hn, (long)R * C); var q = Buf(ref _q, (long)R * C); var k = Buf(ref _k, (long)R * kvC); var v = Buf(ref _v, (long)R * kvC);
         var att = Buf(ref _att, (long)R * C); var proj = Buf(ref _proj, (long)R * C);
@@ -328,7 +391,8 @@ public sealed class GgufBatchDecoder : IDisposable
             if (FusedAttention)
             {
                 // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
-                int ach = (nk + AttChunk - 1) / AttChunk;
+                // a captured step keeps one shape for the whole generation: every chunk the cache can hold (the ones past the position mask to nothing)
+                int ach = _fixedChunks ? (MaxSeq + AttChunk - 1) / AttChunk : (nk + AttChunk - 1) / AttChunk;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
                 _attPartial!(new KernelConfig(R * Heads * ach, HeadDim), q, _kc[l].View, _vc[l].View, seqView, part, ml, Heads, KvHeads, MaxSeq, p, mode, ach, 1f / MathF.Sqrt(HeadDim)); Prof("attn");
                 _attCombine!((int)((long)R * C), part, ml, att, HeadDim, ach); Prof("attn-merge");
@@ -375,6 +439,33 @@ public sealed class GgufBatchDecoder : IDisposable
         _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
         _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature); Prof("select");
         _final!(outRows, selV, _selI.View, _selN.View, cand, S); Prof("final");
+        return (logits, cand, outRows);
+    }
+
+    /// <summary>
+    /// Run <paramref name="ids"/> through the model: <paramref name="decode"/> = false is a prefill of sequence 0 at positions Position.. (causal over its cache), true is one
+    /// token per live sequence at Position. Leaves the final hidden rows' logits (prefill: only the last row's) on the device and their candidates on the host
+    /// (with the softmax mass at <paramref name="temperature"/> when it is above 0).
+    /// </summary>
+    private async Task ForwardAsync(int[] ids, int[]? seqs, bool decode, float temperature, CancellationToken ct)
+    {
+        int R = ids.Length, C = Hidden, kvC = KvHeads * HeadDim, p = Position;
+        if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
+        LoadKernels();
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (ProfileKernels) { _acc.Synchronize(); _profT = t0; }
+        // the token ids (decode: one stable buffer, the one a captured step binds) and the sequence map; the embedding rows are gathered on the device
+        IV idBuf;
+        if (decode) { _stepIds ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch))); idBuf = _stepIds.View.SubView(0, R); }
+        else idBuf = IntBuf(R);
+        idBuf.CopyFromCPU(ids);
+        // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for
+        _seqBuf ??= Own(_acc.Allocate1D<int>((long)MaxSeq + MaxBatch));
+        if (decode) _seqBuf.View.SubView(0, R).CopyFromCPU(seqs!);
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        FV logits, cand; int outRows;
+        if (decode && CaptureActive) (logits, cand, outRows) = await CapturedStepAsync(idBuf, R, temperature, p).ConfigureAwait(false);
+        else (logits, cand, outRows) = EncodeForward(idBuf, R, decode, temperature, p);
         await _acc.SynchronizeAsync().ConfigureAwait(false);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         Position += decode ? 1 : R;
@@ -844,6 +935,8 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         foreach (var o in _owned) o.Dispose();
         _owned.Clear();
+        foreach (var sp in _plans.Values) sp.Plan?.Dispose();
+        _plans.Clear();
         _mm.Dispose();
         _norm.Dispose();
         _stream.Dispose();
