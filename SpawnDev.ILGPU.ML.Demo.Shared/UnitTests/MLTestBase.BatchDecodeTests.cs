@@ -161,4 +161,50 @@ public abstract partial class MLTestBase
         if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2 || !attOk || !joinOk || !captureOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
+
+    /// <summary>
+    /// <see cref="GgufBatchDecoder"/> on the other architectures it reads: qwen3 (per-head q / k norms, no biases, head width from its own metadata; Qwen3-0.6B) and
+    /// llama (rotary on adjacent pairs, no biases; SmolLM2-360M). Per model the greedy answer must be the existing generator's word for word and three greedy
+    /// rows decoded together must be identical.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task GgufBatchDecoder_OtherArchs_GreedyMatchesGenerator() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("a GPU decode test");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var messages = new List<(string, string)> { ("user", "Name three primary colors and say why they are called primary.") };
+        const int maxNew = 32;
+        var reports = new List<string>();
+        bool allOk = true;
+        foreach (var (repo, file) in new[] { ("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"), ("HuggingFaceTB/SmolLM2-360M-Instruct-GGUF", "smollm2-360m-instruct-q8_0.gguf") })
+        {
+            string want;
+            {
+                var m = await hub.OpenAsync(repo, file, deselect: false);
+                await using (m.Stream)
+                using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512))
+                    want = await pipe.GenerateAsync(messages, new GenerationConfig { MaxNewTokens = maxNew, Strategy = "greedy" }, thinking: false);
+            }
+            var src = await hub.OpenAsync(repo, file, deselect: false);
+            using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 512, maxBatch: 3);
+            var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
+            var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, messages, thinking: false);
+            var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
+            string Text(int[] t) { var d = tok.CreateStreamingDecoder(); var sb = new System.Text.StringBuilder(); foreach (var x in t) sb.Append(d.Push(x)); sb.Append(d.Finish()); return sb.ToString(); }
+            var one = await dec.GenerateAsync(ids, 1, maxNew, 0f, 1f, 1, stopSet);
+            var three = await dec.GenerateAsync(ids, 3, maxNew, 0f, 1f, 1, stopSet);
+            string got = Text(one[0]);
+            bool same = got == want, rows = three.All(r => r.SequenceEqual(one[0]));
+            allOk &= same && rows;
+            reports.Add($"{dec.Model.Architecture} ({file}, head width {dec.HeadDim}, query {dec.QDim} of {dec.Hidden}): greedy {(same ? "= the generator" : "DIFFERS")} ({one[0].Length} tokens), three rows {(rows ? "identical" : "DIFFER")}"
+                + (same ? "" : $" | want: {want} | got: {got}"));
+        }
+        var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", reports);
+        Console.WriteLine("[BatchDecodeArchs] " + report);
+        if (!allOk) throw new Exception(report);
+        return report;
+    });
 }

@@ -48,6 +48,9 @@ public sealed class GgufBatchDecoder : IDisposable
     public int Heads { get; }
     public int KvHeads { get; }
     public int HeadDim { get; }
+    /// <summary>Query width: heads x head width (qwen3: not the model width).</summary>
+    public int QDim { get; }
+    private readonly bool _normRope, _qkNorm;
     public int FfnDim { get; }
     public int Vocab { get; }
     /// <summary>Longest sequence (prompt + generation) and most sequences the caches hold.</summary>
@@ -113,10 +116,19 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         _acc = accelerator; _model = model; _stream = stream; _mm = new FusedDequantMatMul(accelerator); _norm = new NormalizationKernels(accelerator);
         string a = model.Architecture;
-        if (a is not ("qwen2"))
-            throw new NotSupportedException($"GgufBatchDecoder: architecture '{a}' (supported: qwen2: NeoX rotary, biased q/k/v)");
+        if (a is not ("qwen2" or "qwen3" or "llama"))
+            throw new NotSupportedException($"GgufBatchDecoder: architecture '{a}' (supported: qwen2, qwen3, llama)");
         Hidden = (int)model.EmbeddingLength; Layers = (int)model.BlockCount; Heads = (int)model.AttentionHeadCount; KvHeads = (int)model.AttentionHeadCountKV;
-        HeadDim = Hidden / Heads; FfnDim = (int)model.GetMetadataInt($"{a}.feed_forward_length", 0);
+        // the head width is its own metadata (qwen3: heads x head width need not be the model width)
+        HeadDim = (int)model.GetMetadataInt($"{a}.attention.key_length", Hidden / Heads); FfnDim = (int)model.GetMetadataInt($"{a}.feed_forward_length", 0);
+        QDim = Heads * HeadDim;
+        // llama's GGUF q/k are permuted for rotary on adjacent pairs; qwen's rotate split halves (GGUFGraphBuilder.UsesNormRope)
+        _normRope = SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.UsesNormRope(a);
+        _qkNorm = model.Tensors.Any(t => t.Name == "blk.0.attn_q_norm.weight");
+        if ((int)model.GetMetadataInt($"{a}.rope.dimension_count", HeadDim) != HeadDim)
+            throw new NotSupportedException($"GgufBatchDecoder: rotary over part of the head ({a}.rope.dimension_count)");
+        if (model.Tensors.Any(t => t.Name == "rope_freqs.weight"))
+            throw new NotSupportedException("GgufBatchDecoder: per-frequency rotary factors (rope_freqs, llama 3 scaling)");
         _eps = model.GetMetadataFloat($"{a}.attention.layer_norm_rms_epsilon", 1e-6f);
         _theta = model.GetMetadataFloat($"{a}.rope.freq_base", 10000f);
         _embd = Tensor("token_embd.weight");
@@ -178,18 +190,23 @@ public sealed class GgufBatchDecoder : IDisposable
                 _qkvAll[l] = tv == tq;
                 await JoinAsync(p + "attn_qkv", _qkvAll[l] ? new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" } : new[] { p + "attn_q.weight", p + "attn_k.weight" }, ct).ConfigureAwait(false);
                 if (!_qkvAll[l]) mats.Add(p + "attn_v.weight");
-                _vecs[p + "attn_qkv.bias"] = Own(_acc.Allocate1D((await VecAsync(p + "attn_q.bias", ct)).Concat(await VecAsync(p + "attn_k.bias", ct)).Concat(await VecAsync(p + "attn_v.bias", ct)).ToArray()));
+                int kvC = KvHeads * HeadDim;
+                _vecs[p + "attn_qkv.bias"] = Own(_acc.Allocate1D((await BiasAsync(p + "attn_q.bias", QDim, ct)).Concat(await BiasAsync(p + "attn_k.bias", kvC, ct)).Concat(await BiasAsync(p + "attn_v.bias", kvC, ct)).ToArray()));
             }
             else
             {
                 mats.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
-                vecs.AddRange(new[] { p + "attn_q.bias", p + "attn_k.bias", p + "attn_v.bias" });
+                int kvC = KvHeads * HeadDim;
+                _vecs[p + "attn_q.bias"] = Own(_acc.Allocate1D(await BiasAsync(p + "attn_q.bias", QDim, ct)));
+                _vecs[p + "attn_k.bias"] = Own(_acc.Allocate1D(await BiasAsync(p + "attn_k.bias", kvC, ct)));
+                _vecs[p + "attn_v.bias"] = Own(_acc.Allocate1D(await BiasAsync(p + "attn_v.bias", kvC, ct)));
             }
             if (JoinProjections && Tensor(p + "ffn_gate.weight").Type == Tensor(p + "ffn_up.weight").Type)
                 await JoinAsync(p + "ffn_gate_up", new[] { p + "ffn_gate.weight", p + "ffn_up.weight" }, ct).ConfigureAwait(false);
             else mats.AddRange(new[] { p + "ffn_gate.weight", p + "ffn_up.weight" });
             mats.AddRange(new[] { p + "attn_output.weight", p + "ffn_down.weight" });
             vecs.AddRange(new[] { p + "attn_norm.weight", p + "ffn_norm.weight" });
+            if (_qkNorm) vecs.AddRange(new[] { p + "attn_q_norm.weight", p + "attn_k_norm.weight" });
         }
         foreach (var name in mats.Distinct())
         {
@@ -227,6 +244,9 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var c in chunks) { Buffer.BlockCopy(c, 0, all, (int)at, c.Length); at += c.Length; }
         _mats[name] = (Own(_acc.Allocate1D(all)), type);
     }
+    // a projection's bias, or zeros when the GGUF has none (qwen3, llama)
+    private async Task<float[]> BiasAsync(string name, int length, CancellationToken ct) =>
+        _model.Tensors.Any(t => t.Name == name) ? await VecAsync(name, ct).ConfigureAwait(false) : new float[length];
     private async Task<float[]> VecAsync(string name, CancellationToken ct)
     {
         var t = Tensor(name);
@@ -356,8 +376,9 @@ public sealed class GgufBatchDecoder : IDisposable
         int code = FusedDequantMatMul.TypeCode(embT);
         _embed!((int)((long)R * C), idBuf, embW.View.Cast<byte, int>(), hid, C, code, FusedDequantMatMul.RowBytesOf(code, C)); Prof("embed");
         var hid2 = Buf(ref _hid2, (long)R * C);
-        var hn = Buf(ref _hn, (long)R * C); var q = Buf(ref _q, (long)R * C); var k = Buf(ref _k, (long)R * kvC); var v = Buf(ref _v, (long)R * kvC);
-        var att = Buf(ref _att, (long)R * C); var proj = Buf(ref _proj, (long)R * C);
+        int Q = QDim, rope = _normRope ? 2 : 0;                               // rotary style, passed in bit 1 of the rotary kernels' mode
+        var hn = Buf(ref _hn, (long)R * C); var q = Buf(ref _q, (long)R * Q); var k = Buf(ref _k, (long)R * kvC); var v = Buf(ref _v, (long)R * kvC);
+        var att = Buf(ref _att, (long)R * Q); var proj = Buf(ref _proj, (long)R * C);
         var gate = Buf(ref _gate, (long)R * FfnDim); var up = Buf(ref _up, (long)R * FfnDim);
         int nk = p + (decode ? 1 : R);
         int mode = decode ? 1 : 0;
@@ -371,21 +392,32 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 // one GEMV for q|k(|v), then bias + rotary + the cache store in one kernel (q to its buffer, k and v to the caches)
                 bool all = _qkvAll[l];
-                int n = all ? C + 2 * kvC : C + kvC;
-                var qkv = Buf(ref _qkv, (long)R * (C + 2 * kvC));
+                int n = all ? Q + 2 * kvC : Q + kvC;
+                var qkv = Buf(ref _qkv, (long)R * (Q + 2 * kvC));
                 Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
                 var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
                 if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); vb = v; Prof("v"); }
+                if (_qkNorm)
+                {
+                    // qwen3: an RMS norm per head of q and of k (weight [head width]) before the rotary; no biases, so the post kernel's zero bias changes nothing
+                    _headNorm!(new KernelConfig(R * Heads, HeadDim), qkv, _vecs[b + "attn_q_norm.weight"].View, n, 0, Heads, _eps);
+                    _headNorm(new KernelConfig(R * KvHeads, HeadDim), qkv, _vecs[b + "attn_k_norm.weight"].View, n, Q, KvHeads, _eps); Prof("qk-norm");
+                }
                 int U = Heads * (HeadDim / 2) + KvHeads * (HeadDim / 2) + kvC;
-                _qkvPost!(R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, _kc[l].View, _vc[l].View, seqView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1), MaxSeq, p); Prof("qkv-post");
+                _qkvPost!(R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, _kc[l].View, _vc[l].View, seqView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1) | (rope << 1), MaxSeq, p); Prof("qkv-post");
             }
             else
             {
-                Gemm(hn, b + "attn_q.weight", q, R, C, C); _bias!((int)((long)R * C), q, _vecs[b + "attn_q.bias"].View, C); Prof("q");
+                Gemm(hn, b + "attn_q.weight", q, R, C, Q); _bias!((int)((long)R * Q), q, _vecs[b + "attn_q.bias"].View, Q); Prof("q");
                 Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
                 Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
-                _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
-                _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode); Prof("rope");
+                if (_qkNorm)
+                {
+                    _headNorm!(new KernelConfig(R * Heads, HeadDim), q, _vecs[b + "attn_q_norm.weight"].View, Q, 0, Heads, _eps);
+                    _headNorm(new KernelConfig(R * KvHeads, HeadDim), k, _vecs[b + "attn_k_norm.weight"].View, kvC, 0, KvHeads, _eps); Prof("qk-norm");
+                }
+                _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode | rope);
+                _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode | rope); Prof("rope");
                 _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
             }
             if (FusedAttention)
@@ -395,16 +427,16 @@ public sealed class GgufBatchDecoder : IDisposable
                 int ach = _fixedChunks ? (MaxSeq + AttChunk - 1) / AttChunk : (nk + AttChunk - 1) / AttChunk;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
                 _attPartial!(new KernelConfig(R * Heads * ach, HeadDim), q, _kc[l].View, _vc[l].View, seqView, part, ml, Heads, KvHeads, MaxSeq, p, mode, ach, 1f / MathF.Sqrt(HeadDim)); Prof("attn");
-                _attCombine!((int)((long)R * C), part, ml, att, HeadDim, ach); Prof("attn-merge");
+                _attCombine!((int)((long)R * Q), part, ml, att, HeadDim, ach); Prof("attn-merge");
             }
             else
             {
                 var scores = Buf(ref _scores, (long)Heads * R * nk);
                 _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim)); Prof("scores");
                 _softmax!(Heads * R, scores, nk); Prof("softmax");
-                _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
+                _pv!((int)((long)R * Q), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
             }
-            Gemm(att, b + "attn_output.weight", proj, R, C, C); Prof("o");
+            Gemm(att, b + "attn_output.weight", proj, R, Q, C); Prof("o");
             AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
             if (_mats.ContainsKey(b + "ffn_gate_up"))
             {
@@ -633,6 +665,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>? _qkvPost;
     private Action<Index1D, FV, FV, int>? _swigluJoined;
+    private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
     private Action<KernelConfig, FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>? _attPartial;
     private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
@@ -655,6 +688,7 @@ public sealed class GgufBatchDecoder : IDisposable
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
         _qkvPost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>(QkvPostImpl);
         _swigluJoined = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SwigluJoinedImpl);
+        if (_qkNorm) _headNorm = _acc.LoadStreamKernel<FV, FV, int, int, int, float>(HeadNormImpl);
         if (FusedAttention)
         {
             _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialImpl);
@@ -683,10 +717,10 @@ public sealed class GgufBatchDecoder : IDisposable
     }
     // after the joined q|k(|v) GEMV (row stride sa): bias, rotary (NeoX pairs d, d + D/2) and the store, the arithmetic of BiasImpl + RopeImpl + StoreImpl. Per row the
     // threads are the q pairs, the k pairs, then v's values; q goes to qOut [r, C], k and v to their sequence's cache row; v comes from qkv (flags bit 0) or from vb
-    // (row kvC); flags bit 1 = decode (row r is sequence seqs[r] at p; prefill: sequence 0 at p + r); heads = H | kvH << 16
+    // (row kvC); flags bit 1 = decode (row r is sequence seqs[r] at p; prefill: sequence 0 at p + r), bit 2 = rotary on adjacent pairs (llama); heads = H | kvH << 16
     private static void QkvPostImpl(Index1D i, FV qkv, FV vb, FV bias, FV invFreq, FV qOut, FV kc, FV vc, IV seqs, int heads, int D, int sa, int flags, int maxSeq, int p)
     {
-        int H = heads & 0xFFFF, kvH = heads >> 16, vInA = flags & 1, mode = flags >> 1;
+        int H = heads & 0xFFFF, kvH = heads >> 16, vInA = flags & 1, mode = (flags >> 1) & 1, adj = (flags >> 2) & 1;
         int half = D / 2, C = H * D, kvC = kvH * D, qPairs = H * half, kPairs = kvH * half;
         int U = qPairs + kPairs + kvC, ii = i, r = ii / U, u = ii % U;
         int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
@@ -695,12 +729,13 @@ public sealed class GgufBatchDecoder : IDisposable
         {
             bool isQ = u < qPairs;
             int uu = isQ ? u : u - qPairs, hh = uu / half, kk = uu % half;
-            int col = (isQ ? 0 : C) + hh * D + kk;
-            float x0 = qkv[row + col] + bias[col], x1 = qkv[row + col + half] + bias[col + half];
+            int i0 = adj != 0 ? 2 * kk : kk, i1 = adj != 0 ? 2 * kk + 1 : kk + half;      // the pair: adjacent (llama) or split halves (qwen)
+            int col = (isQ ? 0 : C) + hh * D;
+            float x0 = qkv[row + col + i0] + bias[col + i0], x1 = qkv[row + col + i1] + bias[col + i1];
             float ang = pos * invFreq[kk], c = MathF.Cos(ang), s = MathF.Sin(ang);
             float y0 = x0 * c - x1 * s, y1 = x1 * c + x0 * s;
-            if (isQ) { long qo = (long)r * C + hh * D + kk; qOut[qo] = y0; qOut[qo + half] = y1; }
-            else { long ko = cacheRow + hh * D + kk; kc[ko] = y0; kc[ko + half] = y1; }
+            if (isQ) { long qo = (long)r * C + hh * D; qOut[qo + i0] = y0; qOut[qo + i1] = y1; }
+            else { long ko = cacheRow + hh * D; kc[ko + i0] = y0; kc[ko + i1] = y1; }
         }
         else
         {
@@ -873,16 +908,34 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     // NeoX / rotate_half rotary in place: element k pairs with k + D/2, at the row's position
+    // mode bit 0: decode (row r at p) or prefill (row r at p + r); bit 1: rotary on adjacent pairs (2k, 2k + 1, llama) instead of split halves (k, k + D/2)
     private static void RopeImpl(Index1D i, FV buf, FV invFreq, int H, int D, int p, int mode)
     {
         int half = D / 2, ii = i;
         int k = ii % half, rest = ii / half, h = rest % H, r = rest / H;
-        int pos = mode == 0 ? p + r : p;
+        int pos = (mode & 1) == 0 ? p + r : p;
         float ang = pos * invFreq[k], c = MathF.Cos(ang), s = MathF.Sin(ang);
         long b = (long)r * H * D + h * D;
-        float x0 = buf[b + k], x1 = buf[b + half + k];
-        buf[b + k] = x0 * c - x1 * s;
-        buf[b + half + k] = x1 * c + x0 * s;
+        int i0 = (mode & 2) != 0 ? 2 * k : k, i1 = (mode & 2) != 0 ? 2 * k + 1 : half + k;
+        float x0 = buf[b + i0], x1 = buf[b + i1];
+        buf[b + i0] = x0 * c - x1 * s;
+        buf[b + i1] = x1 * c + x0 * s;
+    }
+    // an RMS norm of each head's D values in place (qwen3's q / k norms): group g = (row, head), a thread per value; rows are stride apart, the heads start at off
+    private static void HeadNormImpl(FV buf, FV w, int stride, int off, int heads, float eps)
+    {
+        int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
+        long b = (long)(g / heads) * stride + off + (long)(g % heads) * D;
+        var red = SharedMemory.Allocate<float>(AttChunk);
+        float x = buf[b + t];
+        red[t] = x * x;
+        Group.Barrier();
+        for (int s2 = D / 2; s2 > 0; s2 >>= 1)
+        {
+            if (t < s2) red[t] += red[t + s2];
+            Group.Barrier();
+        }
+        buf[b + t] = x * (1f / MathF.Sqrt(red[0] / D + eps)) * w[t];
     }
 
     // the row's k / v into its sequence's cache at its position
