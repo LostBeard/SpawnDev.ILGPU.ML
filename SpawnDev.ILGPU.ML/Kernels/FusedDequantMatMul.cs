@@ -1791,6 +1791,75 @@ public class FusedDequantMatMul : IDisposable
         return d * sc * q;
     }
 
+    // ── multi-row GEMV (M = 2..8): the GEMV's group-per-column shape with each decoded weight multiplied into M rows ──
+    /// <summary>The most rows <see cref="ForwardRows"/> takes.</summary>
+    public const int RowsMax = 8;
+    private readonly Dictionary<(int M, int K, int N, int T), MemoryBuffer1D<int, Stride1D.Dense>> _rowsParams = new();
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvRows;
+
+    /// <summary>
+    /// input [M, K] x weight (raw GGUF blocks) -> output [M, N] for a few rows (M &lt;= <see cref="RowsMax"/>): one group of 64 threads per output column walks its weight row
+    /// once, coalesced, and multiplies each decoded weight into all M rows (batched decoding: M sequences, one token each, read every weight once a step). The general kernel
+    /// <see cref="Forward"/> uses for M &gt; 1 streams the whole weight row once per output element. Any block type <see cref="Supports"/>; barriers only in the reduction, so
+    /// it also suits WebGPU's uniformity rule (not WebGL: no shared memory).
+    /// </summary>
+    public void ForwardRows(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> weightQuant, ArrayView1D<float, Stride1D.Dense> output, int M, int K, int N, GGMLType type)
+    {
+        if (M < 1 || M > RowsMax) throw new ArgumentOutOfRangeException(nameof(M), $"1..{RowsMax}");
+        if (!Supports(type)) throw new NotSupportedException($"ForwardRows: {type}");
+        if (_accelerator.AcceleratorType == AcceleratorType.WebGL) { Forward(input, weightQuant, output, M, K, N, type); return; }
+        int code = type switch { GGMLType.Q8_0 => 0, GGMLType.Q4_0 => 1, GGMLType.Q4_1 => 2, GGMLType.Q5_0 => 3, GGMLType.Q4_K => 4, GGMLType.Q6_K => 5, _ => 6 };
+        if (!_rowsParams.TryGetValue((M, K, N, code), out var pb)) { pb = _accelerator.Allocate1D(new[] { M, K, N, code }); _rowsParams[(M, K, N, code)] = pb; }
+        _gemvRows ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvRowsImpl);
+        _gemvRows(new KernelConfig(N, GemvGroupSize), input, weightQuant.Cast<byte, int>(), output, pb.View);
+    }
+
+    private static int RowBytesOf(int code, int K) => code switch { 0 => K / 32 * 34, 1 => K / 32 * 18, 2 => K / 32 * 20, 3 => K / 32 * 22, 4 => K / 256 * 144, 5 => K / 256 * 210, _ => K / 32 * 17 };
+    private static float DecodeOf(int code, ArrayView1D<int, Stride1D.Dense> w, int rowBase, int k) => code switch
+    {
+        0 => DecodeQ8_0Element(w, rowBase, k),
+        1 => DecodeQ4_0Element(w, rowBase, k),
+        2 => DecodeQ4_1Element(w, rowBase, k),
+        3 => DecodeQ5_0Element(w, rowBase, k),
+        4 => DecodeQ4KElement(w, rowBase, k),
+        5 => DecodeQ6KElement(w, rowBase, k),
+        _ => DecodeMXFP4Element(w, rowBase, k),
+    };
+
+    private static void GemvRowsImpl(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2], code = p[3];
+        int n = Grid.IdxX, tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize * RowsMax);
+        float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, a6 = 0f, a7 = 0f;
+        if (n < N)
+        {
+            int rowBase = n * RowBytesOf(code, K);
+            for (int k = tid; k < K; k += GemvGroupSize)
+            {
+                float wv = DecodeOf(code, w, rowBase, k);
+                a0 += input[k] * wv;
+                if (M > 1) a1 += input[K + k] * wv;
+                if (M > 2) a2 += input[2 * K + k] * wv;
+                if (M > 3) a3 += input[3 * K + k] * wv;
+                if (M > 4) a4 += input[4 * K + k] * wv;
+                if (M > 5) a5 += input[5 * K + k] * wv;
+                if (M > 6) a6 += input[6 * K + k] * wv;
+                if (M > 7) a7 += input[7 * K + k] * wv;
+            }
+        }
+        sh[tid] = a0; sh[GemvGroupSize + tid] = a1; sh[2 * GemvGroupSize + tid] = a2; sh[3 * GemvGroupSize + tid] = a3;
+        sh[4 * GemvGroupSize + tid] = a4; sh[5 * GemvGroupSize + tid] = a5; sh[6 * GemvGroupSize + tid] = a6; sh[7 * GemvGroupSize + tid] = a7;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride)
+                for (int r = 0; r < RowsMax; r++) sh[r * GemvGroupSize + tid] += sh[r * GemvGroupSize + tid + stride];
+            Group.Barrier();
+        }
+        if (tid < M && n < N) output[(long)tid * N + n] = sh[tid * GemvGroupSize];
+    }
+
     // ── Q8_0 GEMV (M==1): 34B/32 = [d:fp16][32×int8], value = q·d ──
     private static void GemvDequantQ8_0Impl(
         ArrayView1D<float, Stride1D.Dense> input,
@@ -2180,6 +2249,8 @@ public class FusedDequantMatMul : IDisposable
     {
         foreach (var buf in _paramsBufs.Values) buf.Dispose();
         _paramsBufs.Clear();
+        foreach (var buf in _rowsParams.Values) buf.Dispose();
+        _rowsParams.Clear();
         foreach (var buf in _actQs.Values) buf.Dispose();
         _actQs.Clear();
         foreach (var buf in _actDs.Values) buf.Dispose();
