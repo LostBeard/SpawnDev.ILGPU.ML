@@ -14,6 +14,7 @@
 //           --end-image PATH (LTX: the last frame, a keyframe; with --image the clip morphs from one picture to the other)
 //           --save-latent (write the denoised latent beside the frames: latent.f32 + latent.json)
 //           --tiled-vae (Wan: decode in 256 px tiles as diffusers' enable_tiling: 720p on an 8 GB card)
+//           --magcache [T] (Wan, standard transformer: MagCache skips the calls its calibrated ratios predict; threshold T, default 0.04: 1.4x at 50 steps)
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
 //           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate;
 //                  --upscale runs the model's two-pass recipe: 2/3 size, the x2 latent upscaler, 3 steps at twice that size, so 704x480 comes out at 896x576)
@@ -63,6 +64,10 @@ for (int i = 0; i < args.Length; i++)
         case "--ltx": o.Ltx = true; break;
         case "--upscale": o.Upscale = true; break;
         case "--tiled-vae": o.TiledVae = true; break;
+        case "--magcache":
+            o.MagCache = 0.04;                                                          // MagCache's default threshold; an optional number after the flag replaces it
+            if (i + 1 < args.Length && double.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var mt)) { o.MagCache = mt; i++; }
+            break;
         case "--save-latent": o.SaveLatent = true; break;
         case "--end-image" when i + 1 < args.Length: o.EndImage = args[++i]; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
@@ -120,7 +125,7 @@ async Task<int> Run(string prompt, Options o)
     var request = new WanRequest
     {
         Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
-        TiledDecode = o.TiledVae,
+        TiledDecode = o.TiledVae, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
     };
     if (o.Image != null)
     {
@@ -130,7 +135,7 @@ async Task<int> Run(string prompt, Options o)
         request = new WanRequest
         {
             Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
-            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height, TiledDecode = o.TiledVae,
+            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height, TiledDecode = o.TiledVae, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
         };
     }
 
@@ -219,6 +224,7 @@ int Save(WanVideo video, Options o)
 sealed class Options
 {
     public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae, SaveLatent;
+    public double MagCache;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;

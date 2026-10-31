@@ -46,6 +46,39 @@ public sealed class WanDiT : IDisposable
     /// <summary>Blocks whose output is tapped (as "block_N").</summary>
     public int[] TapBlocks { get; set; } = { 0, 1, 14, 29 };
 
+    /// <summary>
+    /// MagCache's residual cache (Ma et al., "MagCache: Fast Video Generation with Magnitude-Aware Cache", NeurIPS 2025): while true, every full call keeps its prompt slot's
+    /// residual (the blocks' output minus their input, [N, C]), and a call with <c>reuseResidual</c> adds it to the patch embedding instead of running the blocks. One buffer
+    /// per slot (it also holds the input during the call); the residuals are forgotten by <see cref="SetGrid"/> and <see cref="ForgetResiduals"/>.
+    /// </summary>
+    public bool CacheResiduals { get; set; }
+
+    /// <summary>
+    /// With <see cref="CacheResiduals"/>: every full call after the first of its slot also measures MagCache's calibration ratio, the mean over tokens of
+    /// |new residual| / |previous residual| (read it with <see cref="ReadResidualRatioAsync"/>).
+    /// </summary>
+    public bool MeasureResidualRatio { get; set; }
+    private readonly FV[] _res = new FV[2];
+    private readonly bool[] _resValid = new bool[2];
+    private FV _resTmp, _ratio;
+    private bool _ratioReady;
+
+    /// <summary>Whether slot <paramref name="slot"/> has a cached residual to reuse.</summary>
+    public bool HasResidual(int slot) => _resValid[slot];
+
+    /// <summary>Forget the cached residuals (a new video).</summary>
+    public void ForgetResiduals() { _resValid[0] = _resValid[1] = false; _ratioReady = false; }
+
+    /// <summary>The calibration ratio of the last full call (null when it had no previous residual to compare with).</summary>
+    public async Task<double?> ReadResidualRatioAsync()
+    {
+        if (!_ratioReady) return null;
+        await _acc.SynchronizeAsync();
+        var r = await _ratio.CopyToHostAsync();
+        double s = 0; foreach (var v in r) s += v;
+        return s / r.Length;
+    }
+
     public WanDiT(Accelerator accelerator, DiTKernels kernels, GpuWeights weights)
     {
         _acc = accelerator; _k = kernels; _wk = new WanKernels(accelerator); _w = weights; _mat = new Flux2.Flux2Weights(accelerator, weights, ownsWeights: false);
@@ -84,6 +117,7 @@ public sealed class WanDiT : IDisposable
     {
         if (h % 2 != 0 || w % 2 != 0) throw new ArgumentException("the latent height and width must be even (1x2x2 patches)");
         FreeWorkspace();
+        _res[0] = _res[1] = default; _resTmp = default; _ratio = default; ForgetResiduals();
         _fz = frames; _h = h; _wd = w; _n = frames * (h / 2) * (w / 2); _n0 = (h / 2) * (w / 2);
         int N = _n, C = _dim;
         var table = WanKernels.RopePhases3D(frames, h / 2, w / 2, _headDim);
@@ -134,7 +168,8 @@ public sealed class WanDiT : IDisposable
     /// (the scheduler's, 0..1000). <paramref name="firstFrameClean"/>: the first latent frame is the conditioning picture (timestep 0 for its tokens).
     /// <paramref name="slot"/> selects the prompt set with <see cref="SetContext"/>.
     /// </summary>
-    public void Forward(FV latent, double t, bool firstFrameClean, int slot, FV o)
+    /// <param name="reuseResidual">MagCache: add the slot's cached residual (<see cref="CacheResiduals"/>) to the patch embedding instead of running the blocks</param>
+    public void Forward(FV latent, double t, bool firstFrameClean, int slot, FV o, bool reuseResidual = false)
     {
         if (_n == 0) throw new InvalidOperationException("SetGrid must be called before Forward");
         if (_textEmb[slot].Length == 0) throw new InvalidOperationException($"SetContext({slot}) must be called before Forward");
@@ -157,7 +192,25 @@ public sealed class WanDiT : IDisposable
         void Segments(Action<int, int, FV> body) { if (n0 > 0) body(0, n0, _modA); body(n0, N, _modB); }
         FV Rows(FV v, int row0, int rows) => v.SubView((long)row0 * C, (long)rows * C);
 
-        for (int b = 0; b < _blocks; b++)
+        // MagCache: a skipped call is the patch embedding plus the residual of the slot's last full call; a full call keeps its own residual
+        _ratioReady = false;
+        FV keep = default;
+        bool measure = false;
+        if (reuseResidual)
+        {
+            if (!_resValid[slot]) throw new InvalidOperationException($"no cached residual for slot {slot}: run a full call with CacheResiduals first");
+            _wk.AddResidual(_hid, _res[slot], (long)N * C);
+        }
+        else if (CacheResiduals)
+        {
+            if (_res[slot].Length == 0) _res[slot] = Alloc((long)N * C);
+            measure = MeasureResidualRatio && _resValid[slot];
+            if (measure && _resTmp.Length == 0) { _resTmp = Alloc((long)N * C); _ratio = Alloc(N); }
+            keep = measure ? _resTmp : _res[slot];
+            keep.CopyFrom(_hid);
+        }
+
+        for (int b = 0; b < (reuseResidual ? 0 : _blocks); b++)
         {
             string p = $"blocks.{b}.";
             if (n0 > 0) _k.AddBf16(_w.BF16(p + "modulation"), _e0A, _modA, 6 * C);          // (self.modulation + e): shift/scale/gate msa, shift/scale/gate mlp
@@ -191,6 +244,17 @@ public sealed class WanDiT : IDisposable
             Segments((r0, r1, mod) => _k.GateResidual(Rows(_hid, r0, r1 - r0), Rows(_proj, r0, r1 - r0), mod, 5 * C, (r1 - r0) * C, C));
 
             if (Tap != null && Array.IndexOf(TapBlocks, b) >= 0) Tap($"block_{b}", _hid, N * C);
+        }
+        if (!reuseResidual && CacheResiduals)
+        {
+            _wk.ResidualFrom(_hid, keep, (long)N * C);
+            if (measure)
+            {
+                _wk.NormRatio(keep, _res[slot], _ratio, N, C);
+                (_res[slot], _resTmp) = (_resTmp, _res[slot]);
+                _ratioReady = true;
+            }
+            _resValid[slot] = true;
         }
 
         // head: LayerNorm (no affine) modulated by (head.modulation + e), Linear to 4 * out channels, unpatchify

@@ -119,6 +119,13 @@
                 <label>Tiled decode:</label>
                 <input type="checkbox" @bind="_wanTiled" disabled="@_isRunning" title="Decode the video in 256 px tiles (diffusers' enable_tiling): the decoder needs a fraction of the GPU memory (720p: 2.5 GB instead of 8.4 GB) and takes about 1.5x as long. For GPUs with 8 GB or less." />
             </div>
+            @if (!Turbo)
+            {
+            <div class="vid-setting">
+                <label>MagCache:</label>
+                <input type="checkbox" @bind="_wanMagCache" disabled="@_isRunning" title="Skip the transformer on the steps whose result MagCache predicts from the last one (NeurIPS 2025, its calibrated ratios for this model): 42 of 100 calls at 50 steps, 1.4x faster, 28.6 dB from the full clip (measured, 640x352 x17 on an RTX 4070). The standard transformer only: Turbo's 4 steps have nothing to skip." />
+            </div>
+            }
             }
             @if (Ltx)
             {
@@ -339,7 +346,7 @@
     private const int ExtendFrames = 17;
     private int PictureCount => _references.Count + _snaps.Count;
     private string PreviewAspect { get { var p = _size.Split('x'); return $"{p[0]} / {p[1]}"; } }
-    private bool _wanTiled;
+    private bool _wanTiled, _wanMagCache = true;
     private bool Turbo => _dit.StartsWith("turbo", StringComparison.Ordinal);       // "turbo" (8-bit) or "turbo_q4"
     private LtxPipeline? _ltxPipeline;
     private string _modelServer = "";
@@ -624,7 +631,7 @@
                 {
                     Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
                     GuidanceScale = Turbo ? 1.0 : _guidance, Seed = seed,
-                    Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled, RgbaFrames = true,
+                    Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled, RgbaFrames = true, MagCache = !Turbo && _wanMagCache ? new WanMagCache() : null,
                 };
             }
             var pics = Pictures().ToList();
@@ -642,7 +649,7 @@
                 request = new WanRequest
                 {
                     Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
-                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height, TiledDecode = request.TiledDecode, RgbaFrames = true,
+                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height, TiledDecode = request.TiledDecode, RgbaFrames = true, MagCache = request.MagCache,
                 };
             }
             var progress = new Progress<WanProgress>(p =>

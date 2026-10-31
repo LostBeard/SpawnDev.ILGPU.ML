@@ -20,6 +20,39 @@ public sealed class WanKernels
     public WanKernels(Accelerator accelerator) => _acc = accelerator;
 
     // ---------------------------------------------------------------------------------------------------
+    // MagCache's residual: res = hid - res (res held the blocks' input), hid += res (a skipped call), and per token |new| / |old| (its calibration ratio)
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV>? _residualFrom, _addRows;
+    private static void ResidualFromImpl(Index1D i, FV hid, FV res) => res[i] = hid[i] - res[i];
+    private static void AddRowsImpl(Index1D i, FV hid, FV res) => hid[i] += res[i];
+    /// <summary><paramref name="res"/> (the blocks' input) becomes the residual <paramref name="hid"/> - input.</summary>
+    public void ResidualFrom(FV hid, FV res, long n)
+    {
+        _residualFrom ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(ResidualFromImpl);
+        _residualFrom((int)n, hid, res);
+    }
+    /// <summary><paramref name="hid"/> += <paramref name="res"/> (a call that reuses the cached residual instead of running the blocks).</summary>
+    public void AddResidual(FV hid, FV res, long n)
+    {
+        _addRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(AddRowsImpl);
+        _addRows((int)n, hid, res);
+    }
+    private Action<Index1D, FV, FV, FV, int>? _normRatio;
+    private static void NormRatioImpl(Index1D t, FV a, FV b, FV o, int C)
+    {
+        long r = (long)(int)t * C;
+        float sa = 0f, sb = 0f;
+        for (int c = 0; c < C; c++) { float x = a[r + c], y = b[r + c]; sa += x * x; sb += y * y; }
+        o[t] = MathF.Sqrt(sa) / MathF.Sqrt(sb);
+    }
+    /// <summary>o[t] = |a[t]| / |b[t]| over the C columns of each of <paramref name="rows"/> rows (torch: a.norm(dim=-1) / b.norm(dim=-1)).</summary>
+    public void NormRatio(FV a, FV b, FV o, int rows, int C)
+    {
+        _normRatio ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int>(NormRatioImpl);
+        _normRatio(rows, a, b, o, C);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // x[n, off + c] = x[n, off + c] * rsqrt(mean_c(x^2) + eps) * gamma[c]      over C columns of every row, IN PLACE (WanRMSNorm).
     // ---------------------------------------------------------------------------------------------------
     private const int NormGroup = 256;

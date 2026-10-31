@@ -60,6 +60,13 @@ requests / OPFS and the final latent matches the reference to 0.225 relative RMS
 Turbo in the browser (4 steps): 832x480 x33 frames 131 s (text 33 s, DiT 47 s, decode 51 s); 1280x704 x17 frames 166 s (text 27 s, DiT 50 s, decode 89 s).
 Desktop CUDA, `Examples/11.VideoGen.Console --ci` (320x192, 9 frames, 8 steps): 38 s, 14 s of it the text encoder.
 
+**MagCache** (`WanRequest.MagCache = new WanMagCache()`, console `--magcache [threshold]`, `/video` on by default for the standard transformer; Ma et al., NeurIPS 2025): a call whose
+blocks' residual the calibrated magnitude ratios predict reuses the last one instead of running the 30 blocks. MagCache's own rule, thresholds and TI2V-5B tables
+(github.com/Zehong-Ma/MagCache, Apache-2.0); the skip pattern matches MagCache's code for 30 to 50 steps (`WanMagCache_Decisions_MatchMagCache`). Our own calibration
+(`WanRequest.MeasureMagRatios`) reproduces MagCache's table to a mean of 0.0017 (step 25: 0.98956 vs 0.98959), so the table holds for this engine and sampler.
+MEASURED, RTX 4070 CUDA, 640x352 x17, 50 UniPC steps, guidance 5: plain 75.2 s; threshold 0.04 skips 42 of 100 calls, 54.1 s (1.39x), 28.6 dB PSNR against the plain
+clip; 0.12 skips 52, 47.3 s (1.59x), 27.6 dB. One extra [tokens, 3072] buffer per guidance branch. Not for Turbo (4 steps: nothing to skip).
+
 ## Limits
 
 - **Memory.** The model's own size, 1280x704 with 121 frames (5 s), runs on a 12 GB card: 2 steps took 224 s (text 23 s, DiT 85 s, about 21 s per forward at 27,280 tokens, VAE decode 116 s), so a

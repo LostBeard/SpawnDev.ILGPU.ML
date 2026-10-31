@@ -80,6 +80,13 @@ public sealed class WanRequest
     public byte[]? ImageRgb { get; init; }
     public int ImageWidth { get; init; }
     public int ImageHeight { get; init; }
+    /// <summary>
+    /// MagCache (<see cref="WanMagCache"/>): skip the transformer's blocks on calls whose residual is predicted by the calibrated magnitude ratios, null = every call runs.
+    /// For the standard many-step sampler (its ratios are the 50-step UniPC run's); not for the 4-step Turbo model. Costs one [tokens, 3072] buffer per guidance branch.
+    /// </summary>
+    public WanMagCache? MagCache { get; init; }
+    /// <summary>Measure MagCache's calibration ratios on this run (every call runs; <see cref="WanVideo.MagRatios"/>): to calibrate a model, a sampler or a size.</summary>
+    public bool MeasureMagRatios { get; init; }
 }
 
 /// <summary>The result: frames as floats in [-1, 1], channel-first [3, Frames, Height, Width] (the VAE's own layout).</summary>
@@ -97,6 +104,10 @@ public sealed class WanVideo
     public required int Frames { get; init; }
     /// <summary>The denoised latent the video was decoded from, [48, F/4 + 1, H/16, W/16] (small; for tests and for re-decoding).</summary>
     public float[]? Latent { get; init; }
+    /// <summary>With <see cref="WanRequest.MeasureMagRatios"/>: MagCache's ratio of every call (conditional and unconditional interleaved; 1 for each branch's first call).</summary>
+    public IReadOnlyList<double>? MagRatios { get; init; }
+    /// <summary>With <see cref="WanRequest.MagCache"/>: how many transformer calls reused the cached residual, of how many.</summary>
+    public (int Skipped, int Calls) MagCacheSkips { get; init; }
 
     /// <summary>One frame as RGBA bytes (alpha 255).</summary>
     public byte[] GetFrameRgba(int frame)
@@ -245,6 +256,7 @@ public sealed class Wan22Pipeline
         void PutPicture(float[] l) { if (z0 != null) for (int c = 0; c < 48; c++) Array.Copy(z0, (long)c * per, l, (long)c * Fz * per, per); }
         PutPicture(latent);
         Report("denoise", 0, "loading the transformer");
+        IReadOnlyList<double>? magRatios = null; (int, int) magSkips = default;
         using (var dw = await LoadWeightsAsync(_paths.Dit, ct))
         using (var dit = new WanDiT(_acc, new DiTKernels(_acc), dw))
         {
@@ -252,14 +264,28 @@ public sealed class Wan22Pipeline
             dit.SetContext(0, ctx, ctxRows); if (guided) dit.SetContext(1, ctxNeg, ctxNegRows);
             var sched = new FlowUniPCScheduler(); sched.SetTimesteps(req.Steps, req.Shift);
             using var lIn = _acc.Allocate1D<float>(latent.Length); using var lOut = _acc.Allocate1D<float>(latent.Length);
+            // MagCache: the calibrated skip rule per guidance branch (the unguided run uses the conditional branch's ratios)
+            var mag = req.MagCache == null ? null : new WanMagCache.State(req.MagCache, i2v ? WanMagCache.Ti2v5bImageToVideo : WanMagCache.Ti2v5bTextToVideo, req.Steps);
+            dit.CacheResiduals = mag != null || req.MeasureMagRatios;
+            dit.MeasureResidualRatio = req.MeasureMagRatios;
+            var ratios = req.MeasureMagRatios ? new List<double>() : null;
+            int calls = 0;
+            async Task<float[]> CallAsync(int s, int branch)
+            {
+                bool skip = mag != null && dit.HasResidual(branch) && mag.Skip(s, branch);
+                dit.Forward(lIn.View, sched.Timesteps[s], i2v, branch, lOut.View, reuseResidual: skip);
+                calls++;
+                if (ratios != null) ratios.Add(await dit.ReadResidualRatioAsync() ?? 1.0);
+                return await lOut.View.CopyToHostAsync();
+            }
             for (int s = 0; s < req.Steps; s++)
             {
                 ct.ThrowIfCancellationRequested();
                 lIn.View.CopyFromCPU(latent);
-                dit.Forward(lIn.View, sched.Timesteps[s], i2v, 0, lOut.View); var nc = await lOut.View.CopyToHostAsync();
+                var nc = await CallAsync(s, 0);
                 if (guided)
                 {
-                    dit.Forward(lIn.View, sched.Timesteps[s], i2v, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
+                    var nu = await CallAsync(s, 1);
                     float g = (float)req.GuidanceScale;
                     for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + g * (nc[i] - nu[i]);       // classifier-free guidance, in place
                 }
@@ -288,6 +314,7 @@ public sealed class Wan22Pipeline
                 PutPicture(latent);
                 Report("denoise", (s + 1.0) / req.Steps, $"step {s + 1} of {req.Steps}");
             }
+            magRatios = ratios; magSkips = (mag?.Skipped ?? 0, calls);
         }
 
         // 4. decode
@@ -307,6 +334,6 @@ public sealed class Wan22Pipeline
             }
         }
         Report("decode", 1, "done");
-        return new WanVideo { Data = video, FramesRgba = rgba, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent };
+        return new WanVideo { Data = video, FramesRgba = rgba, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent, MagRatios = magRatios, MagCacheSkips = magSkips };
     }
 }
