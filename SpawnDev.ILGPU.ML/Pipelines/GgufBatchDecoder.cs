@@ -177,7 +177,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private void Gemm(FV x, string name, FV o, int rows, int K, int N)
     {
         var (w, t) = _mats[name];
-        if (rows > 1 && rows <= FusedDequantMatMul.RowsMax) _mm.ForwardRows(x, w.View, o, rows, K, N, t);
+        if (rows <= FusedDequantMatMul.RowsMax) _mm.ForwardRows(x, w.View, o, rows, K, N, t);
         else _mm.Forward(x, w.View, o, rows, K, N, t);
     }
 
@@ -332,10 +332,10 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <paramref name="n"/> continuations of <paramref name="promptIds"/> decoded together: prefill once, fork, then one batched step per token. Each sequence samples from
     /// its own logits with its own generator (seed + index): greedy when <paramref name="temperature"/> &lt;= 0, else temperature then nucleus (top-p). A sequence ends at a
     /// stop token or after <paramref name="maxNew"/> tokens; finished sequences ride along until all are done. Returns the generated token ids per sequence (stop token
-    /// excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled.
+    /// excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled, <paramref name="onFinished"/> the sequence when it ends.
     /// </summary>
     public async Task<int[][]> GenerateAsync(int[] promptIds, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
-        Action<int, int>? onToken = null, CancellationToken ct = default)
+        Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default)
     {
         await PrefillAsync(promptIds, temperature, ct).ConfigureAwait(false);
         Fork(n);
@@ -349,10 +349,15 @@ public sealed class GgufBatchDecoder : IDisposable
             for (int s = 0; s < n; s++)
             {
                 if (done[s]) continue;
-                if (stopIds.Contains(next[s]) || outs[s].Count >= maxNew) { done[s] = true; continue; }
+                if (stopIds.Contains(next[s]) || outs[s].Count >= maxNew) { done[s] = true; onFinished?.Invoke(s); continue; }
                 outs[s].Add(next[s]); onToken?.Invoke(s, next[s]);
             }
-            if (done.All(d => d) || Position + 1 > MaxSeq) break;
+            if (done.All(d => d)) break;
+            if (Position + 1 > MaxSeq)
+            {
+                for (int s = 0; s < n; s++) if (!done[s]) { done[s] = true; onFinished?.Invoke(s); }
+                break;
+            }
             ct.ThrowIfCancellationRequested();
             await StepAsync(next, temperature, ct).ConfigureAwait(false);
             for (int s = 0; s < n; s++) if (!done[s]) next[s] = await SampleAsync(s, topP, rngs[s]).ConfigureAwait(false);

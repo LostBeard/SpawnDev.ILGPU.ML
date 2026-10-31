@@ -205,6 +205,16 @@ public class FusedDequantMatMul : IDisposable
         // (Plans/webgpu-q4k-gemv-uniform-barrier-2026-10-19.md). The Q4_K GEMV (barriers inside its per-super-block loop) is such a kernel, so on
         // WebGPU Q4_K stays on the per-element kernel below: correct, slower. The Q8_0 / Q4_0 / Q4_1 / Q5_0 / Q6_K GEMVs barrier only in the final reduction.
         bool webGpuUniformBarrierUnsafe = _accelerator.AcceleratorType == AcceleratorType.WebGPU && type == GGMLType.Q4_K;
+        // M == 1 of Q8_0 / Q4_K / Q6_K on ForwardRows' word-wise kernels: on a 4070 (tools/llm-bench/gemv_rows_bench.cs) 2.2x the Q8_0 GEMV below, 2.5x the Q4_K one,
+        // 3x the Q6_K one. They barrier only in the final reduction (WebGPU-uniform), so WebGPU takes them too instead of the per-element kernel. The opt-in CUDA dp4a /
+        // warp kernels keep precedence when enabled; GGUF_GEMV_ROWS_GENERIC=1 restores the per-type GEMVs.
+        bool cudaOptIn = (EnableDp4aGemv || EnableWarpGemv) && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        if (M == 1 && !ForceGenericRows && !ForcePerElementGemv && !cudaOptIn && _accelerator.AcceleratorType != AcceleratorType.WebGL
+            && (type is GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K))
+        {
+            ForwardRows(input, weightQuant, output, 1, K, N, type);
+            return;
+        }
         if (M == 1 && !gpuBrowser && !ForcePerElementGemv && !webGpuUniformBarrierUnsafe)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
@@ -1810,8 +1820,167 @@ public class FusedDequantMatMul : IDisposable
         if (_accelerator.AcceleratorType == AcceleratorType.WebGL) { Forward(input, weightQuant, output, M, K, N, type); return; }
         int code = TypeCode(type);
         if (!_rowsParams.TryGetValue((M, K, N, code), out var pb)) { pb = _accelerator.Allocate1D(new[] { M, K, N, code }); _rowsParams[(M, K, N, code)] = pb; }
-        _gemvRows ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvRowsImpl);
-        _gemvRows(new KernelConfig(N, GemvGroupSize), input, weightQuant.Cast<byte, int>(), output, pb.View);
+        var kernel = ForceGenericRows ? null : type switch
+        {
+            GGMLType.Q8_0 => _gemvRowsQ8_0 ??= LoadRows(GemvRowsQ8_0Impl),
+            GGMLType.Q4_K => _gemvRowsQ4_K ??= LoadRows(GemvRowsQ4_KImpl),
+            GGMLType.Q6_K => _gemvRowsQ6_K ??= LoadRows(GemvRowsQ6_KImpl),
+            _ => null,
+        };
+        kernel ??= _gemvRows ??= LoadRows(GemvRowsImpl);
+        kernel(new KernelConfig(N, GemvGroupSize), input, weightQuant.Cast<byte, int>(), output, pb.View);
+    }
+
+    /// <summary>A/B switch (env GGUF_GEMV_ROWS_GENERIC=1): <see cref="ForwardRows"/> on its per-element kernel for every type instead of the word-wise Q8_0 / Q4_K / Q6_K ones.</summary>
+    public static bool ForceGenericRows = Environment.GetEnvironmentVariable("GGUF_GEMV_ROWS_GENERIC") == "1";
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvRowsQ8_0, _gemvRowsQ4_K, _gemvRowsQ6_K;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> LoadRows(
+        Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> impl) =>
+        _accelerator.LoadStreamKernel(impl);
+
+    // ── word-wise multi-row GEMVs: a thread decodes a word's weights once (block scales read once per block, the fp16 exponent by bit construction, not a pow) and
+    //    multiplies them into all M rows; the shared-memory reduction over the group is the per-element kernel's ──
+
+    // fp16 bits -> float, exact: subnormals scaled, the exponent built in the float's bits (inf / nan do not occur in a block scale)
+    private static float HalfBits(int h)
+    {
+        int exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+        float r = exp == 0 ? man * (1f / 16777216f) : Interop.IntAsFloat((uint)(((exp + 112) << 23) | (man << 13)));
+        return (h & 0x8000) != 0 ? -r : r;
+    }
+    // 16 bits at an even byte offset
+    private static int ReadU16(ArrayView1D<int, Stride1D.Dense> w, int byteOff) => (w[byteOff >> 2] >> ((byteOff & 2) << 3)) & 0xFFFF;
+    // 32 bits at an even byte offset (two words when it is not 4-aligned; the second index is clamped so an aligned read at the end stays in the buffer)
+    private static int ReadWordAt(ArrayView1D<int, Stride1D.Dense> w, int byteOff)
+    {
+        int i = byteOff >> 2, s = (byteOff & 3) << 3;
+        int lo = w[i], hi = w[Math.Min(i + 1, (int)w.Length - 1)];
+        return s == 0 ? lo : (int)(((uint)lo >> s) | ((uint)hi << ((32 - s) & 31)));
+    }
+    private static float Dot4(ArrayView1D<float, Stride1D.Dense> x, int o, float w0, float w1, float w2, float w3) => x[o] * w0 + x[o + 1] * w1 + x[o + 2] * w2 + x[o + 3] * w3;
+
+    // the group's per-thread row sums -> output[r, n] (rows 0..M-1)
+    private static void ReduceRows(ArrayView1D<float, Stride1D.Dense> output, int M, int N, int n, int tid,
+        float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7)
+    {
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize * RowsMax);
+        sh[tid] = a0; sh[GemvGroupSize + tid] = a1; sh[2 * GemvGroupSize + tid] = a2; sh[3 * GemvGroupSize + tid] = a3;
+        sh[4 * GemvGroupSize + tid] = a4; sh[5 * GemvGroupSize + tid] = a5; sh[6 * GemvGroupSize + tid] = a6; sh[7 * GemvGroupSize + tid] = a7;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride)
+                for (int r = 0; r < M; r++) sh[r * GemvGroupSize + tid] += sh[r * GemvGroupSize + tid + stride];
+            Group.Barrier();
+        }
+        if (tid < M && n < N) output[(long)tid * N + n] = sh[tid * GemvGroupSize];
+    }
+
+    // Q8_0 (34 B per 32: fp16 d, 32 int8): a thread per word (4 weights), neighbouring threads on neighbouring words, so the weight and the input reads coalesce
+    private static void GemvRowsQ8_0Impl(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int n = Grid.IdxX, tid = Group.IdxX;
+        float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, a6 = 0f, a7 = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K >> 5) * 34;
+            for (int c = tid; c < (K >> 2); c += GemvGroupSize)
+            {
+                int bo = rowBase + (c >> 3) * 34;
+                float d = HalfBits(ReadU16(w, bo));
+                {
+                    int q = ReadWordAt(w, bo + 2 + ((c & 7) << 2));
+                    float w0 = d * ((q << 24) >> 24), w1 = d * ((q << 16) >> 24), w2 = d * ((q << 8) >> 24), w3 = d * (q >> 24);
+                    int k = c << 2;
+                    a0 += Dot4(input, k, w0, w1, w2, w3);
+                    if (M > 1) a1 += Dot4(input, K + k, w0, w1, w2, w3);
+                    if (M > 2) a2 += Dot4(input, 2 * K + k, w0, w1, w2, w3);
+                    if (M > 3) a3 += Dot4(input, 3 * K + k, w0, w1, w2, w3);
+                    if (M > 4) a4 += Dot4(input, 4 * K + k, w0, w1, w2, w3);
+                    if (M > 5) a5 += Dot4(input, 5 * K + k, w0, w1, w2, w3);
+                    if (M > 6) a6 += Dot4(input, 6 * K + k, w0, w1, w2, w3);
+                    if (M > 7) a7 += Dot4(input, 7 * K + k, w0, w1, w2, w3);
+                }
+            }
+        }
+        ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    // Q4_K (144 B per 256: fp16 d, fp16 dmin, 12 B of 6-bit scales / mins, 128 B of nibbles): a thread per nibble word (8 values: 4 low nibbles of sub-block 2t,
+    // 4 high of 2t + 1), neighbouring threads on neighbouring words (coalesced); value = d * sc * q - dmin * m, folded into the decoded weight
+    private static void GemvRowsQ4_KImpl(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int n = Grid.IdxX, tid = Group.IdxX;
+        float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, a6 = 0f, a7 = 0f;
+        if (n < N)
+        {
+            int nsb = K >> 8, rowBase = n * nsb * 144, words = nsb * 32;
+            for (int u = tid; u < words; u += GemvGroupSize)
+            {
+                int sb = u >> 5, t = (u >> 3) & 3, j = u & 7, so = rowBase + sb * 144;
+                int dw = w[so >> 2];
+                float d = HalfBits(dw & 0xFFFF), dmin = HalfBits((dw >> 16) & 0xFFFF);
+                int sm0 = GetScaleMinK4(w, so + 4, 2 * t), sm1 = GetScaleMinK4(w, so + 4, 2 * t + 1);
+                float c0 = d * (sm0 & 0xFF), m0 = dmin * (sm0 >> 8), c1 = d * (sm1 & 0xFF), m1 = dmin * (sm1 >> 8);
+                int k0 = (sb << 8) + 64 * t;
+                {
+                    int q = w[((so + 16 + 32 * t) >> 2) + j];
+                    float l0 = c0 * (q & 0xF) - m0, l1 = c0 * ((q >> 8) & 0xF) - m0, l2 = c0 * ((q >> 16) & 0xF) - m0, l3 = c0 * ((q >> 24) & 0xF) - m0;
+                    float h0 = c1 * ((q >> 4) & 0xF) - m1, h1 = c1 * ((q >> 12) & 0xF) - m1, h2 = c1 * ((q >> 20) & 0xF) - m1, h3 = c1 * ((q >> 28) & 0xF) - m1;
+                    int k = k0 + 4 * j;
+                    a0 += Dot4(input, k, l0, l1, l2, l3) + Dot4(input, k + 32, h0, h1, h2, h3);
+                    if (M > 1) a1 += Dot4(input, K + k, l0, l1, l2, l3) + Dot4(input, K + k + 32, h0, h1, h2, h3);
+                    if (M > 2) a2 += Dot4(input, 2 * K + k, l0, l1, l2, l3) + Dot4(input, 2 * K + k + 32, h0, h1, h2, h3);
+                    if (M > 3) a3 += Dot4(input, 3 * K + k, l0, l1, l2, l3) + Dot4(input, 3 * K + k + 32, h0, h1, h2, h3);
+                    if (M > 4) a4 += Dot4(input, 4 * K + k, l0, l1, l2, l3) + Dot4(input, 4 * K + k + 32, h0, h1, h2, h3);
+                    if (M > 5) a5 += Dot4(input, 5 * K + k, l0, l1, l2, l3) + Dot4(input, 5 * K + k + 32, h0, h1, h2, h3);
+                    if (M > 6) a6 += Dot4(input, 6 * K + k, l0, l1, l2, l3) + Dot4(input, 6 * K + k + 32, h0, h1, h2, h3);
+                    if (M > 7) a7 += Dot4(input, 7 * K + k, l0, l1, l2, l3) + Dot4(input, 7 * K + k + 32, h0, h1, h2, h3);
+                }
+            }
+        }
+        ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    // Q6_K (210 B per 256: 128 B low nibbles, 64 B high bit pairs, 16 int8 scales, fp16 d): a thread per 16 values (one half, four l of the 32: values l, l + 32,
+    // l + 64, l + 96 of the half, each l a byte of three words), value = d * sc * (q - 32)
+    private static void GemvRowsQ6_KImpl(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int n = Grid.IdxX, tid = Group.IdxX;
+        float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, a6 = 0f, a7 = 0f;
+        if (n < N)
+        {
+            int nsb = K >> 8, rowBase = n * nsb * 210, units = nsb * 16;
+            for (int u = tid; u < units; u += GemvGroupSize)
+            {
+                int sb = u >> 4, h = (u >> 3) & 1, g = u & 7, so = rowBase + sb * 210, l = 4 * g;
+                float d = HalfBits(ReadU16(w, so + 208));
+                int sc = so + 192 + 8 * h + (l >> 4);
+                float s0 = d * SignExtend8(ReadByte(w, sc)), s2 = d * SignExtend8(ReadByte(w, sc + 2)), s4 = d * SignExtend8(ReadByte(w, sc + 4)), s6 = d * SignExtend8(ReadByte(w, sc + 6));
+                int qa = ReadWordAt(w, so + 64 * h + l), qb = ReadWordAt(w, so + 64 * h + l + 32), qh = ReadWordAt(w, so + 128 + 32 * h + l);
+                // byte i of each word: A = ql[l + i], B = ql[l + 32 + i], H = qh[l + i]
+                float e00 = s0 * ((((qa) & 0xF) | (((qh) & 3) << 4)) - 32), e01 = s0 * ((((qa >> 8) & 0xF) | (((qh >> 8) & 3) << 4)) - 32);
+                float e02 = s0 * ((((qa >> 16) & 0xF) | (((qh >> 16) & 3) << 4)) - 32), e03 = s0 * ((((qa >> 24) & 0xF) | (((qh >> 24) & 3) << 4)) - 32);
+                float e10 = s2 * ((((qb) & 0xF) | (((qh >> 2) & 3) << 4)) - 32), e11 = s2 * ((((qb >> 8) & 0xF) | (((qh >> 10) & 3) << 4)) - 32);
+                float e12 = s2 * ((((qb >> 16) & 0xF) | (((qh >> 18) & 3) << 4)) - 32), e13 = s2 * ((((qb >> 24) & 0xF) | (((qh >> 26) & 3) << 4)) - 32);
+                float e20 = s4 * ((((qa >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) - 32), e21 = s4 * ((((qa >> 12) & 0xF) | (((qh >> 12) & 3) << 4)) - 32);
+                float e22 = s4 * ((((qa >> 20) & 0xF) | (((qh >> 20) & 3) << 4)) - 32), e23 = s4 * ((((qa >> 28) & 0xF) | (((qh >> 28) & 3) << 4)) - 32);
+                float e30 = s6 * ((((qb >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) - 32), e31 = s6 * ((((qb >> 12) & 0xF) | (((qh >> 14) & 3) << 4)) - 32);
+                float e32 = s6 * ((((qb >> 20) & 0xF) | (((qh >> 22) & 3) << 4)) - 32), e33 = s6 * ((((qb >> 28) & 0xF) | (((qh >> 30) & 3) << 4)) - 32);
+                int k = (sb << 8) + 128 * h + l;
+                for (int r = 0; r < M; r++)
+                {
+                    int o = r * K + k;
+                    float v = Dot4(input, o, e00, e01, e02, e03) + Dot4(input, o + 32, e10, e11, e12, e13) + Dot4(input, o + 64, e20, e21, e22, e23) + Dot4(input, o + 96, e30, e31, e32, e33);
+                    if (r == 0) a0 += v; else if (r == 1) a1 += v; else if (r == 2) a2 += v; else if (r == 3) a3 += v;
+                    else if (r == 4) a4 += v; else if (r == 5) a5 += v; else if (r == 6) a6 += v; else a7 += v;
+                }
+            }
+        }
+        ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
     }
 
     /// <summary>The block type as the code <see cref="DecodeOf"/> and <see cref="RowBytesOf"/> take (one kernel for every supported type).</summary>

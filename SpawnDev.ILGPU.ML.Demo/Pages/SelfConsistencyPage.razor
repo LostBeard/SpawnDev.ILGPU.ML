@@ -1,0 +1,285 @@
+@page "/self-consistency"
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.ML.Preprocessing
+@using SpawnDev.SpawnJS
+@using global::ILGPU.Runtime
+@implements IAsyncDisposable
+@inject SpawnJSRuntime JS
+@inject SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource
+
+<PageTitle>Many Answers, One Vote — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="sc">
+    <header class="hdr">
+        <h1>Many Answers, One Vote <span class="badge">100% on-device</span></h1>
+        <p class="sub">A small model gets a maths problem wrong fairly often, but it seldom gets it wrong the same way twice. Ask it several times with
+            sampling and take the most common final answer (self-consistency). The answers are decoded <b>together</b>: each step feeds every answer's
+            next token through the model as one batch, so the weights are read once per step for all of them, and eight answers cost much less than eight
+            times one. On 50 MATH-500 problems, the majority of 8 took Qwen2.5-Math-1.5B from 66% (one greedy answer) to 80%.</p>
+    </header>
+
+    @if (_state == LoadState.Idle)
+    {
+        <div class="optin">
+            <h2>Choose a model</h2>
+            <p>The model downloads once and stays in your browser's cache (manage it on the <a href="/cache">Model Cache</a> page).</p>
+            <ul class="models">
+                @foreach (var m in _models)
+                {
+                    <li @onclick="() => LoadModelAsync(m)">
+                        <span class="name">@m.Label</span>
+                        <span class="meta">@m.Size</span>
+                        <span class="note">@m.Note</span>
+                    </li>
+                }
+            </ul>
+        </div>
+    }
+    else if (_state == LoadState.Loading)
+    {
+        <div class="loading">
+            <div class="spinner"></div>
+            <p>@_status</p>
+            <button class="link" @onclick="() => _loadCts?.Cancel()">Cancel</button>
+        </div>
+    }
+    else if (_state == LoadState.Error)
+    {
+        <div class="error">
+            <h2>Could not load the model</h2>
+            <pre>@_status</pre>
+            <button @onclick="BackToIdle">Back</button>
+        </div>
+    }
+    else
+    {
+        <div class="bar">
+            <span class="model-tag">@_modelLabel</span>
+            <span class="accel">@_acceleratorName</span>
+            <button class="link" @onclick="BackToIdle" disabled="@_busy">Switch model</button>
+        </div>
+
+        <div class="problem">
+            <textarea @bind="_problem" @bind:event="oninput" rows="3" disabled="@_busy" placeholder="A maths problem..."></textarea>
+            <div class="examples">
+                @foreach (var ex in Examples)
+                {
+                    <button class="chip" disabled="@_busy" @onclick="() => _problem = ex">@(ex.Length > 48 ? ex[..48] + "…" : ex)</button>
+                }
+            </div>
+        </div>
+
+        <div class="controls">
+            <label>Answers
+                <select @bind="_n" disabled="@_busy">
+                    @foreach (var k in new[] { 1, 2, 4, 8 }) { <option value="@k">@k</option> }
+                </select>
+            </label>
+            <label>Temperature <input type="number" min="0" max="1.5" step="0.1" @bind="_temperature" disabled="@_busy" /></label>
+            <label>Top-p <input type="number" min="0.1" max="1" step="0.05" @bind="_topP" disabled="@_busy" /></label>
+            <label>Max tokens <input type="number" min="64" max="@MaxTokensLimit" step="64" @bind="_maxTokens" disabled="@_busy" /></label>
+            @if (_busy)
+            {
+                <button class="primary stop" @onclick="() => _genCts?.Cancel()">Stop</button>
+            }
+            else
+            {
+                <button class="primary" @onclick="RunAsync" disabled="@string.IsNullOrWhiteSpace(_problem)">Ask @_n @(_n == 1 ? "time" : "times")</button>
+            }
+        </div>
+
+        @if (_texts.Count > 0)
+        {
+            var vote = SelfConsistency.Vote(_texts.Select(t => t.ToString()).ToList());
+            int boxed = vote.Sum(g => g.Votes);
+            <div class="vote">
+                <div class="vote-head">
+                    <span class="vote-title">@(_busy ? "The vote so far" : "The vote")</span>
+                    <span class="stats">@_tokens tokens · @_seconds.ToString("F1") s · @((_seconds > 0 ? _tokens / _seconds : 0).ToString("F1")) tok/s across all answers</span>
+                </div>
+                @if (vote.Count == 0)
+                {
+                    <p class="none">No answer has boxed a result yet.</p>
+                }
+                else
+                {
+                    @foreach (var (g, i) in vote.Select((g, i) => (g, i)))
+                    {
+                        <div class="group @(i == 0 ? "win" : "")">
+                            <span class="ans">@g.Answer</span>
+                            <span class="track"><span class="fill" style="width:@(100.0 * g.Votes / _texts.Count)%"></span></span>
+                            <span class="count">@g.Votes / @_texts.Count</span>
+                        </div>
+                    }
+                    @if (boxed < _texts.Count)
+                    {
+                        <p class="none">@(_texts.Count - boxed) of @_texts.Count have not boxed an answer@(_busy ? " yet" : "").</p>
+                    }
+                }
+            </div>
+
+            <div class="grid n@(_texts.Count)">
+                @for (int s = 0; s < _texts.Count; s++)
+                {
+                    var text = _texts[s].ToString();
+                    var box = SelfConsistency.ExtractBoxed(text);
+                    bool winner = vote.Count > 0 && box != null && SelfConsistency.Normalize(box) == vote[0].Answer;
+                    <div class="card @(winner ? "win" : "") @(_finished[s] ? "" : "live")">
+                        <div class="card-head">
+                            <span>Answer @(s + 1)</span>
+                            <span class="box">@(box ?? (_finished[s] ? "no boxed answer" : "…"))</span>
+                        </div>
+                        @* column-reverse on the body keeps a growing answer scrolled to its newest line *@
+                        <div class="card-body"><div>@text@if (!_finished[s]) {<span class="caret">▋</span>}</div></div>
+                    </div>
+                }
+            </div>
+        }
+    }
+
+    <PipelineHowTo SourceFile="Pages/SelfConsistencyPage.razor" Note="batched decoding + self-consistency vote" />
+</div>
+
+@code {
+    enum LoadState { Idle, Loading, Ready, Error }
+    LoadState _state = LoadState.Idle;
+    string _status = "";
+
+    sealed record ModelOption(string Label, string Repo, string File, string Size, string Note);
+    readonly List<ModelOption> _models = new()
+    {
+        new("Qwen2.5-Math 1.5B Instruct (Q4_K_M)", "bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF", "Qwen2.5-Math-1.5B-Instruct-Q4_K_M.gguf", "~1.0 GB",
+            "trained for step-by-step maths, boxes its final answer (Apache-2.0)"),
+        new("Qwen2.5 0.5B Instruct (Q8_0)", "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", "~0.5 GB",
+            "a small general model: faster, wrong more often, so the vote matters more (Apache-2.0)"),
+    };
+
+    // our own problems (answers: 2/15, 1170, 9, 130)
+    static readonly string[] Examples =
+    {
+        "A bag holds 4 red and 6 blue marbles. Two marbles are drawn without replacement. What is the probability that both are red? Give the answer as a fraction.",
+        "What is the sum of all positive divisors of 360?",
+        "Find the remainder when 7^100 is divided by 13.",
+        "How many positive integers less than 1000 are divisible by 7 but not by 11?",
+    };
+
+    const int MaxSeq = 1536, MaxTokensLimit = 1280;
+
+    global::ILGPU.Context? _context;
+    Accelerator? _accelerator;
+    GgufBatchDecoder? _decoder;
+    SentencePieceTokenizer? _tokenizer;
+    CancellationTokenSource? _loadCts, _genCts;
+    string _acceleratorName = "", _modelLabel = "";
+
+    string _problem = Examples[0];
+    int _n = 8, _maxTokens = 768;
+    float _temperature = 0.7f, _topP = 0.8f;
+    bool _busy;
+    readonly List<System.Text.StringBuilder> _texts = new();
+    bool[] _finished = Array.Empty<bool>();
+    int _tokens;
+    double _seconds;
+
+    async Task LoadModelAsync(ModelOption model)
+    {
+        _state = LoadState.Loading; _modelLabel = model.Label; _status = "Initializing WebGPU…";
+        _loadCts = new CancellationTokenSource();
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            if (_accelerator == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+                _accelerator = await _context.CreatePreferredAcceleratorAsync();
+                if (_accelerator == null) { Fail("No GPU accelerator is available in this browser."); return; }
+                _acceleratorName = $"{_accelerator.Name} ({_accelerator.AcceleratorType})";
+            }
+            var download = new Progress<ModelDownloadProgress>(p =>
+            {
+                _status = p.Fraction is { } f ? $"Downloading {model.Label} ({model.Size}) — {f:P0}" : $"Downloading {model.Label} ({model.Size}) — {p.BytesReceived / 1048576} MiB";
+                InvokeAsync(StateHasChanged);
+            });
+            _status = $"Streaming {model.Label} ({model.Size}) to the GPU…";
+            await InvokeAsync(StateHasChanged);
+            var stream = await ModelSource.OpenAsync(model.Repo, model.File, download, _loadCts.Token);
+            _decoder?.Dispose();
+            _decoder = await GgufBatchDecoder.CreateAsync(_accelerator, stream, maxSeq: MaxSeq, maxBatch: 8, _loadCts.Token);     // the decoder owns the stream
+            _tokenizer = SentencePieceTokenizer.FromGGUF(_decoder.Model) ?? throw new InvalidOperationException("the GGUF carries no tokenizer");
+            _state = LoadState.Ready; _status = "";
+            JS.Log($"[SelfConsistency] ready: {model.Label} on {_acceleratorName}");
+        }
+        catch (OperationCanceledException) { BackToIdle(); }
+        catch (Exception ex)
+        {
+            JS.LogError($"[SelfConsistency] load failed: {ex}");
+            Fail($"{ex.GetType().Name}: {ex.Message}");
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    void Fail(string msg) { _status = msg; _state = LoadState.Error; }
+
+    void BackToIdle()
+    {
+        _decoder?.Dispose(); _decoder = null; _tokenizer = null;
+        _texts.Clear(); _state = LoadState.Idle; _status = "";
+    }
+
+    async Task RunAsync()
+    {
+        if (_busy || _decoder == null || _tokenizer == null || string.IsNullOrWhiteSpace(_problem)) return;
+        int n = _n;
+        var msgs = new List<(string, string)> { ("system", "Please reason step by step, and put your final answer within \\boxed{}."), ("user", _problem.Trim()) };
+        var (ids, stops) = ChatTemplates.BuildChatPrompt(_decoder.Model, _tokenizer, msgs, thinking: false);
+        var stopSet = stops.ToHashSet(); if (_tokenizer.EosId >= 0) stopSet.Add(_tokenizer.EosId);
+        int room = Math.Min(Math.Clamp(_maxTokens, 16, MaxTokensLimit), MaxSeq - ids.Length - 1);
+        if (room < 16) { _status = "The problem is too long."; return; }
+
+        _texts.Clear(); _tokens = 0; _seconds = 0;
+        var decoders = new SentencePieceStreamingDecoder[n];
+        for (int s = 0; s < n; s++) { _texts.Add(new System.Text.StringBuilder()); decoders[s] = _tokenizer.CreateStreamingDecoder(); }
+        _finished = new bool[n];
+        _busy = true;
+        _genCts = new CancellationTokenSource();
+        StateHasChanged();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long lastPaint = 0;
+        try
+        {
+            // greedy when the temperature is 0 (every answer the same: one is enough to show it)
+            await _decoder.GenerateAsync(ids, n, room, _temperature, _topP, Environment.TickCount, stopSet,
+                onToken: (s, t) =>
+                {
+                    _texts[s].Append(decoders[s].Push(t)); _tokens++;
+                    if (sw.ElapsedMilliseconds - lastPaint > 120) { lastPaint = sw.ElapsedMilliseconds; _seconds = sw.Elapsed.TotalSeconds; StateHasChanged(); }
+                },
+                onFinished: s => { _texts[s].Append(decoders[s].Finish()); _finished[s] = true; },
+                ct: _genCts.Token);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            JS.LogError($"[SelfConsistency] generation failed: {ex}");
+            _status = ex.Message;
+        }
+        _seconds = sw.Elapsed.TotalSeconds;
+        for (int s = 0; s < n; s++) _finished[s] = true;
+        _busy = false;
+        JS.Log($"[SelfConsistency] {n} answers, {_tokens} tokens in {_seconds:F1} s ({_tokens / Math.Max(1e-9, _seconds):F1} tok/s); vote: {string.Join(", ", SelfConsistency.Vote(_texts.Select(t => t.ToString()).ToList()).Select(g => $"{g.Answer} x{g.Votes}"))}");
+        StateHasChanged();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _genCts?.Cancel(); _loadCts?.Cancel();
+        _decoder?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

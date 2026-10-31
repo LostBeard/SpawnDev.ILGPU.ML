@@ -635,4 +635,51 @@ public abstract partial class MLTestBase
         AssertCloseQuant(got, expected, 2e-3f, "Gemv quantized MXFP4 M=1");
         Console.WriteLine($"[Gemv] quantized MXFP4 M=1 K={K} N={N}: matches oracle");
     });
+
+    /// <summary>
+    /// <see cref="Kernels.FusedDequantMatMul.ForwardRows"/> (batched decoding: M sequences, one token each) against the CPU dequant oracle for every block type it
+    /// has a word-wise kernel for (Q8_0, Q4_K, Q6_K) and one that takes the per-element kernel (Q4_0), at M = 1, 3 and 8. N is odd so Q8_0's 34-byte blocks end
+    /// unaligned at the end of the buffer (the kernel's two-word read must stay inside it).
+    /// </summary>
+    [TestMethod]
+    public async Task Gemv_Rows_AllTypes_MatchOracle() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("ForwardRows takes the per-element kernel on WebGL (no shared memory)");
+        const int K = 1536, N = 97;
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0 })
+        {
+            var rng = new Random(53 + (int)type);
+            int bytesPerRow = RowBytes(type, K);
+            var weightBytes = new byte[N * bytesPerRow];
+            var wRows = new float[N][];
+            for (int n = 0; n < N; n++)
+            {
+                var rowBytes = MakeBlocks(type, K, rng);
+                Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                wRows[n] = ReferenceDequant(type, rowBytes, K);
+            }
+            using var weightBuf = AllocatePadded(accelerator, weightBytes);
+            foreach (int M in new[] { 1, 3, 8 })
+            {
+                var input = new float[M * K];
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                var expected = new float[M * N];
+                for (int m = 0; m < M; m++)
+                    for (int n = 0; n < N; n++)
+                    {
+                        double sum = 0;
+                        for (int k = 0; k < K; k++) sum += input[m * K + k] * wRows[n][k];
+                        expected[m * N + n] = (float)sum;
+                    }
+                using var inputBuf = accelerator.Allocate1D(input);
+                using var outBuf = accelerator.Allocate1D<float>(M * N);
+                fused.ForwardRows(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+                await accelerator.SynchronizeAsync();
+                var got = await outBuf.CopyToHostAsync<float>(0, M * N);
+                AssertCloseQuant(got, expected, 2e-3f, $"ForwardRows {type} M={M}");
+            }
+        }
+        Console.WriteLine($"[Gemv] ForwardRows Q8_0 / Q4_K / Q6_K / Q4_0, M = 1, 3, 8, K={K} N={N}: match the oracle");
+    });
 }
