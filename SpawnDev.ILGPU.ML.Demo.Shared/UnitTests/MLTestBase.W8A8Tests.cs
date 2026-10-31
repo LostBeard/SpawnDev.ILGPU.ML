@@ -71,17 +71,19 @@ public abstract partial class MLTestBase
             }
         }
         finally { DiTKernels.EnableTensorCores = savedT; Q8Linear.MaxFlopsPerDispatch = savedChunk; }
-        var head = $"{accelerator.AcceleratorType} (int8 dot {(accelerator.Capabilities.PackedInt8DotProduct ? "native" : "emulated")})";
+        var head = $"{accelerator.AcceleratorType} (int8 dot {(accelerator.Capabilities.PackedInt8DotProduct ? "native" : "emulated")}, activation blocks of {Q8Linear.ActivationBlock})";
         foreach (var l in report) Console.WriteLine($"[W8A8] {head}: {l}");
+        if (!OperatingSystem.IsBrowser()) try { var od = Path.Combine(WanDir, "out"); Directory.CreateDirectory(od); File.AppendAllLines(Path.Combine(od, "wan_tests.log"), report.Select(l => $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [W8A8 linear] {head}: {l}")); } catch (IOException) { }
         if (!ok) throw new Exception(head + ": " + string.Join("; ", report));
         return head + ": " + string.Join("; ", report);
     });
 
     /// <summary>
     /// What W8A8 costs a Wan clip against what the 8-bit weights already cost: the Turbo transformer at the /video page's 832x480 x33 (4 steps, seed 8) as the bf16 export,
-    /// the 8-bit export on the float GEMM, and the 8-bit export with W8A8: the measurement behind <see cref="Flux2Weights.AutoW8A8"/> (a model takes W8A8 automatically
-    /// only when its W8A8 video is within 1.5 dB of the 8-bit float video's PSNR against bf16; MEASURED 2026-10-31: 27.4 vs 30.8 dB, so Wan does not). Fails only on a broken
-    /// W8A8 (under 20 dB). Run it on OpenCL: fp32 float GEMMs like the browser's, and the W8A8 path is integer-exact on every backend. Desktop GPU (the 10 GB bf16 Turbo file).
+    /// the 8-bit export on the float GEMM, and the 8-bit export with W8A8: the gate behind Wan's automatic W8A8 (<see cref="Flux2Weights.AutoW8A8"/>): with the default
+    /// two-level activation scales its W8A8 video must be within 1.5 dB of the 8-bit float video's PSNR against bf16 (MEASURED 2026-10-31: 32.4 vs 30.8 dB; scales per 32
+    /// gave 27.4, which is why they are not the default). Other scales (ML_W8A8_AB) only fail under 20 dB. Run it on OpenCL: fp32 float GEMMs like the browser's, and the
+    /// W8A8 path is integer-exact on every backend. Desktop GPU (the 10 GB bf16 Turbo file).
     /// </summary>
     [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
     public async Task Wan_W8A8_ClipCost() => await RunTest(async accelerator =>
@@ -115,10 +117,10 @@ public abstract partial class MLTestBase
         var q8 = await Run(Wan22Paths.DitFile("turbo_q8"), false);
         var w8 = await Run(Wan22Paths.DitFile("turbo_q8"), true);
         double q8VsBf16 = Psnr(q8, exact), w8VsBf16 = Psnr(w8, exact), w8VsQ8 = Psnr(w8, q8);
-        var report = $"Wan Turbo 832x480 x33 on {accelerator.AcceleratorType}: PSNR vs the bf16 video: 8-bit {q8VsBf16:F1} dB, 8-bit W8A8 {w8VsBf16:F1} dB; W8A8 vs 8-bit {w8VsQ8:F1} dB";
+        var report = $"Wan Turbo 832x480 x33 on {accelerator.AcceleratorType}, activation blocks of {Q8Linear.ActivationBlock}: PSNR vs the bf16 video: 8-bit {q8VsBf16:F1} dB, 8-bit W8A8 {w8VsBf16:F1} dB; W8A8 vs 8-bit {w8VsQ8:F1} dB";
         Console.WriteLine("[W8A8] " + report);
         try { var od = Path.Combine(WanDir, "out"); Directory.CreateDirectory(od); File.AppendAllLines(Path.Combine(od, "wan_tests.log"), new[] { $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [W8A8 clip cost] {report}" }); } catch (IOException) { }
-        if (!(w8VsBf16 > 20)) throw new Exception(report);
+        if (!(w8VsBf16 > (Q8Linear.ActivationBlock == 0 ? q8VsBf16 - 1.5 : 20))) throw new Exception(report);
         return report;
     });
 

@@ -73,7 +73,8 @@ public sealed class Flux2Weights : IDisposable
     /// <summary>
     /// W8A8 (<see cref="Q8Linear"/>): 8-bit matrices multiply straight from their blocks with activations quantised to 8 bits per block of 32, on packed int8 dot products,
     /// instead of a bf16 copy of the matrix and a float GEMM. True turns it on for every 8-bit matrix (ML_W8A8=1): faster on WebGPU with native packed int8 dot products (Chrome:
-    /// the packed_4x8_integer_dot_product feature; a Wan layer up to 3.3x, the Wan Turbo transformer 1.27x per step), at a measured cost in quality (<see cref="AutoW8A8"/>).
+    /// the packed_4x8_integer_dot_product feature; with the default two-level activation scales the Wan Turbo transformer 1.10x per step), at a cost in quality that depends on
+    /// the model (<see cref="AutoW8A8"/>).
     /// Null (the default) = only for a model that opts in on WebGPU with native packed dots; false (ML_W8A8=0) = never.
     /// </summary>
     public static bool? EnableW8A8 { get; set; } = Environment.GetEnvironmentVariable("ML_W8A8") switch { "1" => true, "0" => false, _ => null };
@@ -87,9 +88,9 @@ public sealed class Flux2Weights : IDisposable
 
     /// <summary>
     /// Whether this model takes W8A8 automatically (<see cref="EnableW8A8"/> null): for a model whose W8A8 clips cost no more than its 8-bit weights do (PSNR against the bf16
-    /// output within 1.5 dB of the 8-bit float output's). None does yet. MEASURED: Wan 2.2 Turbo 832x480 x33, 27.4 dB against the bf16 video where the 8-bit weights alone give
-    /// 30.8 dB (Chrome: the transformer 5.0 -> 3.9 s per step); LTX-Video 704x480 x97, 22.8 vs 32.1 dB (its error spread over every layer type); the T5 encoders unstable
-    /// (0.14 on one prompt). Activation blocks of 32 are too coarse for these models' activations: finer or asymmetric activation scales are the next step.
+    /// output within 1.5 dB of the 8-bit float output's). MEASURED with <see cref="Q8Linear"/>'s two-level activation scales: Wan 2.2's DiT qualifies (Turbo 832x480 x33:
+    /// 32.4 dB against the bf16 video, the 8-bit weights alone 30.8 dB; Chrome 5.0 -> 4.5 s per step) and opts in; LTX-Video's does not (25.6 vs 32.1 dB), nor do the T5 encoders
+    /// (unstable: 0.14 on one prompt with scales per 32). With one scale per 32 values Wan did not qualify either (27.4 dB).
     /// </summary>
     public bool AutoW8A8 { get; set; }
 

@@ -101,13 +101,15 @@ clip; 0.12 skips 52, 47.3 s (1.59x), 27.6 dB. In the browser (Chrome WebGPU, `Wa
 (1.43x), 24.2 dB (fewer steps: each skip covers more), so `/video` runs the standard transformer at the reference's 50 steps with MagCache, about the cost of 30 plain
 steps. One extra [tokens, 3072] buffer per guidance branch. Not for Turbo (4 steps: nothing to skip).
 
-**W8A8 (opt-in, not a default).** `Flux2Weights.EnableW8A8 = true` (or `ML_W8A8=1`) runs the 8-bit matrices straight from their blocks with the activations quantised to 8 bits per
-block of 32, on packed int8 dot products (`Q8Linear`; WGSL `dot4I8Packed`, CUDA dp4a; SpawnDev.ILGPU 5.4.14). In Chrome it is faster: a Wan layer at 3510 tokens up to 3.3x
-(3072 -> 3072: 24.4 -> 7.5 ms), the Wan Turbo transformer 5.0 -> 3.9 s per step at 832x480 x33, LTX's 2.73 -> 2.16 s. One forward differs from the float path by 3e-3 (Wan).
-But at the clip level it costs more than the 8-bit weights do, so no model takes it automatically: against the bf16 video, Wan Turbo 8-bit 30.8 dB, 8-bit W8A8 27.4 dB
-(`Wan_W8A8_ClipCost`); LTX 32.1 vs 22.8 dB, its error spread over every layer type; the T5 encoders are excluded outright (one prompt went to 0.14). Activation blocks of 32
-are too coarse for these activations; finer or asymmetric activation scales are the open next step. `Flux2Weights.SkipW8A8` (ML_W8A8_SKIP) keeps named layers on the float
-GEMM for such measurements.
+**W8A8 (Wan, in the browser).** On WebGPU with packed int8 dot products (Chrome), Wan's 8-bit transformer runs its matrices straight from their blocks with 8-bit activations
+(`Q8Linear`; WGSL `dot4I8Packed`, CUDA dp4a; SpawnDev.ILGPU 5.4.14): the Turbo transformer 5.0 -> 4.5 s per step at 832x480 x33, 31.6 dB against the float video. The
+activation scales are two-level: a float scale per block of 32 and a power-of-two exponent per sub-block of 8 that quantises it up to 2^7 times finer, the sub-blocks'
+int32 dots shifted into one integer sum per block so the float work stays one fold per block. Against the bf16 video (the 8-bit weights alone: 30.8 dB) the scale choices
+measured: one per 32 values 27.4 dB (the fastest: Wan layers up to 3.3x), per 16 27.8, per 8 30.2 (about break-even in speed), two-level 32.4 dB at 1.02x to 1.68x per
+layer. A model takes W8A8 automatically only when it costs no more than its 8-bit weights (within 1.5 dB, `Wan_W8A8_ClipCost`, enforced): Wan does; LTX-Video does not
+(25.6 vs 32.1 dB with two-level scales, 22.8 with one per 32; its error is spread over every layer type), and the T5 encoders always use the float GEMM (one prompt went to
+0.14 relRMS). Desktop CUDA keeps its bf16 tensor cores (faster). `Flux2Weights.EnableW8A8` / `ML_W8A8=1|0` force it on or off, `Q8Linear.ActivationBlock` /
+`ML_W8A8_AB` picks the scales, `Flux2Weights.SkipW8A8` / `ML_W8A8_SKIP` keeps named layers on the float GEMM.
 
 ## Limits
 

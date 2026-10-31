@@ -15,8 +15,9 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 /// <para>
 /// Weights: the export's blocks of 32 (quantize_flux2.py ... 8: word 0 = half d | half m, words 1-8 = 32 unsigned bytes q, w = d q + m). XOR 0x80 per byte turns q into the
 /// signed q - 128, so a block's dot with signed activations a is d (sum a (q - 128) + 128 sum a) + m sum a.
-/// Activations: quantised per row and block of 32 like llama.cpp's q8_0 (scale s = max |x| / 127, a = round(x / s), the integer sum S kept): an outlier only coarsens its
-/// own block. A block contributes s (d (dot + 128 S) + m S); the int8 products accumulate exactly in int32 within a block.
+/// Activations (<see cref="ActivationBlock"/>): by default two-level, a float scale per block of 32 (s = max |x| / 127) and a power-of-two exponent per sub-block of 8 that
+/// quantises the sub-block up to 2^7 times finer; the sub-blocks' int32 dots are shifted into one integer sum per block, so the float fold stays one per block. Or a float scale
+/// per 32, 16 or 8 values, like llama.cpp's q8_0 at 32. A block contributes s (d (dot + 128 S) + m S); the int8 products accumulate exactly in int32 within a block.
 /// </para>
 /// </summary>
 public sealed class Q8Linear : IDisposable
@@ -38,18 +39,28 @@ public sealed class Q8Linear : IDisposable
     /// </summary>
     public static long MaxFlopsPerDispatch { get; set; } = 1L << 37;
 
+    /// <summary>
+    /// The activation scales (ML_W8A8_AB): 32, 16 or 8 values per float scale (32 = one per weight block, llama.cpp's q8_0; finer = an outlier coarsens fewer values, more
+    /// float work per block), or 0, the default, two-level. MEASURED on Wan 2.2 Turbo 832x480 x33 against the bf16 video (the 8-bit weights alone 30.8 dB): per 32 27.4 dB,
+    /// per 16 27.8, per 8 30.2, two-level 32.4; in Chrome per 32 is fastest (Wan layers up to 3.3x the float GEMM), per 8 about break-even, two-level 1.02x to 1.68x.
+    /// </summary>
+    /// <para>0 = two-level scales: a float scale per block of 32 and a power-of-two exponent (0..7) per sub-block of 8, the sub-block quantised 2^e times finer; its dots are
+    /// shifted into one integer sum per block, so the kernel folds once per block like 32 while the precision follows the sub-blocks (ML_W8A8_AB=2L).</para>
+    public static int ActivationBlock { get; set; } = Environment.GetEnvironmentVariable("ML_W8A8_AB") is var e && e == "2L" ? 0 : int.TryParse(e, out var ab) && ab is 8 or 16 or 32 ? ab : 0;
+
     public Q8Linear(Accelerator accelerator) { _acc = accelerator; }
 
-    private static void QuantizeImpl(Index1D i, FV x, UV xq, FV xs, IV xsum, int K)
+    // per row and sub-block of ab values: scale s = max |x| / 127, the values rounded to s units and packed four to a word, their integer sum
+    private static void QuantizeImpl(Index1D i, FV x, UV xq, FV xs, IV xsum, int K, int ab)
     {
-        int blocks = K / 32, m = i / blocks, b = i % blocks;
-        long xb = (long)m * K + b * 32;
+        int sub = K / ab, m = i / sub, b = i % sub;
+        long xb = (long)m * K + (long)b * ab;
         float amax = 0f;
-        for (int e = 0; e < 32; e++) amax = MathF.Max(amax, MathF.Abs(x[xb + e]));
+        for (int e = 0; e < ab; e++) amax = MathF.Max(amax, MathF.Abs(x[xb + e]));
         float s = amax / 127f, inv = amax > 0f ? 127f / amax : 0f;
         int sum = 0;
-        long qb = (long)m * (K / 4) + b * 8;
-        for (int wd = 0; wd < 8; wd++)
+        long qb = (long)m * (K / 4) + (long)b * (ab / 4);
+        for (int wd = 0; wd < ab / 4; wd++)
         {
             uint packed = 0u;
             for (int j = 0; j < 4; j++)
@@ -63,9 +74,50 @@ public sealed class Q8Linear : IDisposable
         }
         xs[i] = s; xsum[i] = sum;
     }
-    private Action<Index1D, FV, UV, FV, IV, int>? _quantize;
+    private Action<Index1D, FV, UV, FV, IV, int, int>? _quantize;
 
-    private Action<KernelConfig, UV, FV, IV, UV, BV, FV, int, int, int, int, int, int>? _gemm;
+    // two-level: per row and block of 32, s = max |x| / 127 over the block; per sub-block of 8 the largest e <= 7 with max |x_sub| 2^e <= max |x|, values rounded to
+    // s / 2^e units; xs = s / 2^7, xsum = sum over sub-blocks of (their integer sum) << (7 - e), xe = the shifts (7 - e) packed 3 bits per sub-block
+    private static void QuantizeTwoLevelImpl(Index1D i, FV x, UV xq, FV xs, IV xsum, IV xe, int K)
+    {
+        int blocks = K / 32, m = i / blocks, b = i % blocks;
+        long xb = (long)m * K + (long)b * 32;
+        float amax = 0f;
+        for (int k = 0; k < 32; k++) amax = MathF.Max(amax, MathF.Abs(x[xb + k]));
+        float inv = amax > 0f ? 127f / amax : 0f;
+        int total = 0, shifts = 0;
+        long qb = (long)m * (K / 4) + (long)b * 8;
+        for (int sb = 0; sb < 4; sb++)
+        {
+            float smax = 0f;
+            for (int k = 0; k < 8; k++) smax = MathF.Max(smax, MathF.Abs(x[xb + sb * 8 + k]));
+            int e = 0;
+            while (e < 7 && smax * (1 << (e + 1)) <= amax) e++;
+            float f = inv * (1 << e);
+            int sum = 0;
+            for (int wd = 0; wd < 2; wd++)
+            {
+                uint packed = 0u;
+                for (int j = 0; j < 4; j++)
+                {
+                    int q = (int)MathF.Round(x[xb + sb * 8 + wd * 4 + j] * f);
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    sum += q;
+                    packed |= ((uint)q & 0xFFu) << (8 * j);
+                }
+                xq[qb + sb * 2 + wd] = packed;
+            }
+            int sh = 7 - e;
+            total += sum << sh;
+            shifts |= sh << (3 * sb);
+        }
+        xs[i] = amax / 127f / 128f; xsum[i] = total; xe[i] = shifts;
+    }
+    private Action<Index1D, FV, UV, FV, IV, IV, int>? _quantize2;
+    private Action<KernelConfig, UV, FV, IV, IV, UV, BV, FV, int, int, int, int, int, int>? _gemm2;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _xe;
+
+    private readonly Dictionary<int, Action<KernelConfig, UV, FV, IV, UV, BV, FV, int, int, int, int, int, int>> _gemm = new();
 
     private void Ensure<T>(ref MemoryBuffer1D<T, Stride1D.Dense>? b, long n) where T : unmanaged
     {
@@ -78,25 +130,45 @@ public sealed class Q8Linear : IDisposable
     public void Linear(FV x, UV wq, BV? bias, FV o, int M, int K, int N, DiTKernels.Act act)
     {
         if (K % 32 != 0) throw new ArgumentException("W8A8: K must be a multiple of 32 (the weight block)");
-        int blocks = K / 32;
-        Ensure(ref _xq, (long)M * K / 4); Ensure(ref _xs, (long)M * blocks); Ensure(ref _xsum, (long)M * blocks);
+        if (ActivationBlock == 0) { LinearTwoLevel(x, wq, bias, o, M, K, N, act); return; }
+        int ab = ActivationBlock, sub = K / ab;
+        Ensure(ref _xq, (long)M * K / 4); Ensure(ref _xs, (long)M * sub); Ensure(ref _xsum, (long)M * sub);
         _dummyB ??= _acc.Allocate1D<BFloat16>(2);
-        _quantize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, IV, int>(QuantizeImpl);
-        _gemm ??= _acc.LoadStreamKernel<UV, FV, IV, UV, BV, FV, int, int, int, int, int, int>(Q8Gemm.Kernel);
-        _quantize((int)((long)M * blocks), x, _xq!.View, _xs!.View, _xsum!.View, K);
+        _quantize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, IV, int, int>(QuantizeImpl);
+        if (!_gemm.TryGetValue(ab, out var gemm))
+            _gemm[ab] = gemm = _acc.LoadStreamKernel<UV, FV, IV, UV, BV, FV, int, int, int, int, int, int>(ab == 8 ? Q8Gemm.Kernel8 : ab == 16 ? Q8Gemm.Kernel16 : Q8Gemm.Kernel32);
+        _quantize((int)((long)M * sub), x, _xq!.View, _xs!.View, _xsum!.View, K, ab);
         int tilesN = (N + BN - 1) / BN;
         long perRow = 2L * K * N;
         int chunk = (int)Math.Max(BM, Math.Min(M, MaxFlopsPerDispatch / Math.Max(1, perRow) / BM * BM));
         for (int m0 = 0; m0 < M; m0 += chunk)
         {
             int rows = Math.Min(chunk, M - m0);
-            _gemm(new KernelConfig(((rows + BM - 1) / BM) * tilesN, Threads), _xq.View, _xs.View, _xsum.View, wq, bias ?? _dummyB.View, o, rows, m0, K, N, bias.HasValue ? 1 : 0, (int)act);
+            gemm(new KernelConfig(((rows + BM - 1) / BM) * tilesN, Threads), _xq.View, _xs.View, _xsum.View, wq, bias ?? _dummyB.View, o, rows, m0, K, N, bias.HasValue ? 1 : 0, (int)act);
+        }
+    }
+
+    private void LinearTwoLevel(FV x, UV wq, BV? bias, FV o, int M, int K, int N, DiTKernels.Act act)
+    {
+        int blocks = K / 32;
+        Ensure(ref _xq, (long)M * K / 4); Ensure(ref _xs, (long)M * blocks); Ensure(ref _xsum, (long)M * blocks); Ensure(ref _xe, (long)M * blocks);
+        _dummyB ??= _acc.Allocate1D<BFloat16>(2);
+        _quantize2 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, IV, IV, int>(QuantizeTwoLevelImpl);
+        _gemm2 ??= _acc.LoadStreamKernel<UV, FV, IV, IV, UV, BV, FV, int, int, int, int, int, int>(Q8Gemm.KernelTwoLevel);
+        _quantize2((int)((long)M * blocks), x, _xq!.View, _xs!.View, _xsum!.View, _xe!.View, K);
+        int tilesN = (N + BN - 1) / BN;
+        long perRow = 2L * K * N;
+        int chunk = (int)Math.Max(BM, Math.Min(M, MaxFlopsPerDispatch / Math.Max(1, perRow) / BM * BM));
+        for (int m0 = 0; m0 < M; m0 += chunk)
+        {
+            int rows = Math.Min(chunk, M - m0);
+            _gemm2(new KernelConfig(((rows + BM - 1) / BM) * tilesN, Threads), _xq.View, _xs.View, _xsum.View, _xe.View, wq, bias ?? _dummyB.View, o, rows, m0, K, N, bias.HasValue ? 1 : 0, (int)act);
         }
     }
 
     public void Dispose()
     {
-        _xq?.Dispose(); _xs?.Dispose(); _xsum?.Dispose(); _dummyB?.Dispose();
+        _xq?.Dispose(); _xs?.Dispose(); _xsum?.Dispose(); _xe?.Dispose(); _dummyB?.Dispose();
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();
     }

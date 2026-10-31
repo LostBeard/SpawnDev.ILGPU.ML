@@ -224,4 +224,50 @@ public abstract partial class MLTestBase
         if (video.Frames != 97 || max > 3 || min < -3 || !(max - min > 0.5)) throw new Exception("the LTX browser clip is wrong: " + report);
         return report;
     });
+    /// <summary>
+    /// What W8A8 (<see cref="Flux2.Flux2Weights.EnableW8A8"/>, <see cref="Flux2.Q8Linear.ActivationBlock"/>'s scales) costs an LTX-Video clip in the browser: the 704x480 x97 clip
+    /// of Ltx_Pipeline_OverHttp_Generates three times, the bf16 transformer, the 8-bit one (float GEMM) and the 8-bit one with W8A8; the PSNRs against the bf16 video and the
+    /// time per transformer step are reported. The bar for a model's automatic W8A8 (<see cref="Flux2.Flux2Weights.AutoW8A8"/>): within 1.5 dB of the 8-bit float video. A
+    /// measurement: fails only on a broken W8A8 (under 20 dB). RGBA frames: three float clips exhaust the tab's .NET heap.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Ltx_W8A8_OverHttp() => await RunTest(async accelerator =>
+    {
+        var (_, source) = await LtxHttp();
+        var pipe = new LtxPipeline(accelerator, source, "", LtxPaths.InRepo(LtxPaths.DitFile("q8"), LtxPaths.TextEncoderFile("q8")));
+        var pipe16 = new LtxPipeline(accelerator, source, "", LtxPaths.InRepo(LtxPaths.DitFile("bf16"), LtxPaths.TextEncoderFile("q8")));
+        async Task<(WanVideo Video, double StepS)> Run(bool w8a8, LtxPipeline p)
+        {
+            var saved = Flux2.Flux2Weights.EnableW8A8;
+            Flux2.Flux2Weights.EnableW8A8 = w8a8;
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                double first = -1, last = -1; int steps = 0;
+                var progress = new Progress<WanProgress>(pr => { if (pr.Stage == "denoise" && pr.Message.StartsWith("step ")) { if (first < 0) first = sw.Elapsed.TotalSeconds; last = sw.Elapsed.TotalSeconds; steps++; } });
+                var v = await p.GenerateAsync(new LtxRequest { Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light.", Width = 704, Height = 480, Frames = 97, Seed = 42, RgbaFrames = true }, progress);
+                return (v, steps > 1 ? (last - first) / (steps - 1) : double.NaN);
+            }
+            finally { Flux2.Flux2Weights.EnableW8A8 = saved; }
+        }
+        var bf16 = await Run(false, pipe16);
+        var plain = await Run(false, pipe);
+        var fast = await Run(true, pipe);
+        static double Psnr(WanVideo a, WanVideo b)
+        {
+            double mse = 0; long n = 0;
+            for (int f = 0; f < a.Frames; f++)
+            {
+                byte[] fa = a.GetFrameRgba(f), fb = b.GetFrameRgba(f);
+                for (int i = 0; i < fa.Length; i++) { if ((i & 3) == 3) continue; double d = (fa[i] - fb[i]) / 255.0; mse += d * d; n++; }
+            }
+            return 10 * Math.Log10(1 / (mse / n));
+        }
+        double q8VsBf16 = Psnr(plain.Video, bf16.Video), w8VsBf16 = Psnr(fast.Video, bf16.Video), w8VsQ8 = Psnr(fast.Video, plain.Video);
+        var report = $"browser W8A8 on {accelerator.AcceleratorType} (int8 dot {(accelerator.Capabilities.PackedInt8DotProduct ? "native" : "emulated")}, activation scales {(Flux2.Q8Linear.ActivationBlock == 0 ? "two-level" : $"per {Flux2.Q8Linear.ActivationBlock}")}): LTX 704x480 x97, "
+            + $"transformer {plain.StepS:F2} s per step float GEMM, {fast.StepS:F2} s W8A8 ({plain.StepS / fast.StepS:F2}x); PSNR vs the bf16 video: 8-bit {q8VsBf16:F1} dB, 8-bit W8A8 {w8VsBf16:F1} dB; W8A8 vs 8-bit {w8VsQ8:F1} dB";
+        Console.WriteLine("[Ltx] " + report);
+        if (!(w8VsBf16 > 20)) throw new Exception(report);
+        return report;
+    });
 }

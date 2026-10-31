@@ -12,7 +12,7 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 
 internal static class Q8Gemm
 {
-    public const int BM = 128, BN = 64, Threads = 256, BlocksPerStage = 2;
+    public const int BM = 128, BN = 64, Threads = 256;
 
     private static float HalfToFloat(uint h)
     {
@@ -21,8 +21,8 @@ internal static class Q8Gemm
         return sign == 1u ? -r : r;
     }
 
-    /// <summary>grid = ceil(rows / 128) * ceil(N / 64), group = 256. Rows m0 .. m0 + rows of the quantised activations.</summary>
-    public static void Kernel(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)
+    /// <summary>Activation sub-blocks of 32. grid = ceil(rows / 128) * ceil(N / 64), group = 256. Rows m0 .. m0 + rows of the quantised activations.</summary>
+    public static void Kernel32(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)
     {
         int tilesN = (N + 63) / 64;
         int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;
@@ -41,7 +41,7 @@ internal static class Q8Gemm
         float f5_0 = 0f, f5_1 = 0f, f5_2 = 0f, f5_3 = 0f;
         float f6_0 = 0f, f6_1 = 0f, f6_2 = 0f, f6_3 = 0f;
         float f7_0 = 0f, f7_1 = 0f, f7_2 = 0f, f7_3 = 0f;
-        int blocks = K / 32, kw = K / 4;
+        int blocks = K / 32, kw = K / 4, sub = K / 32;
         int r0 = ty * 8, c0 = tx * 4;
         for (int b0 = 0; b0 < blocks; b0 += 2)
         {
@@ -53,8 +53,8 @@ internal static class Q8Gemm
             { int c = idx / 16, wd = idx % 16, gc = tn * 64 + c, b = b0 + wd / 8;
               sw[c * 17 + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }
             for (int idx = tid; idx < 256; idx += 256)
-            { int r = idx / 2, kb = idx % 2, gr = tm * 128 + r, b = b0 + kb;
-              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * blocks + b;
+            { int r = idx / 2, q = idx % 2, gr = tm * 128 + r, b = b0 + q / 1;
+              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * sub + (long)b0 * 1 + q;
               ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; }
             for (int idx = tid; idx < 128; idx += 256)
             { int c = idx / 2, kb = idx % 2, gc = tn * 64 + c, b = b0 + kb;
@@ -62,252 +62,1311 @@ internal static class Q8Gemm
               sd[idx] = HalfToFloat(h & 0xFFFFu); sm[idx] = HalfToFloat(h >> 16); }
             Group.Barrier();
             {
-                int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
-                int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
-                int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
-                int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
-                int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
-                int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
-                int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
-                int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 0], x1 = sx[(r0 + 1) * 17 + 0], x2 = sx[(r0 + 2) * 17 + 0], x3 = sx[(r0 + 3) * 17 + 0], x4 = sx[(r0 + 4) * 17 + 0], x5 = sx[(r0 + 5) * 17 + 0], x6 = sx[(r0 + 6) * 17 + 0], x7 = sx[(r0 + 7) * 17 + 0];
-                    uint y0 = sw[(c0 + 0) * 17 + 0], y1 = sw[(c0 + 1) * 17 + 0], y2 = sw[(c0 + 2) * 17 + 0], y3 = sw[(c0 + 3) * 17 + 0];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 1], x1 = sx[(r0 + 1) * 17 + 1], x2 = sx[(r0 + 2) * 17 + 1], x3 = sx[(r0 + 3) * 17 + 1], x4 = sx[(r0 + 4) * 17 + 1], x5 = sx[(r0 + 5) * 17 + 1], x6 = sx[(r0 + 6) * 17 + 1], x7 = sx[(r0 + 7) * 17 + 1];
-                    uint y0 = sw[(c0 + 0) * 17 + 1], y1 = sw[(c0 + 1) * 17 + 1], y2 = sw[(c0 + 2) * 17 + 1], y3 = sw[(c0 + 3) * 17 + 1];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 2], x1 = sx[(r0 + 1) * 17 + 2], x2 = sx[(r0 + 2) * 17 + 2], x3 = sx[(r0 + 3) * 17 + 2], x4 = sx[(r0 + 4) * 17 + 2], x5 = sx[(r0 + 5) * 17 + 2], x6 = sx[(r0 + 6) * 17 + 2], x7 = sx[(r0 + 7) * 17 + 2];
-                    uint y0 = sw[(c0 + 0) * 17 + 2], y1 = sw[(c0 + 1) * 17 + 2], y2 = sw[(c0 + 2) * 17 + 2], y3 = sw[(c0 + 3) * 17 + 2];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 3], x1 = sx[(r0 + 1) * 17 + 3], x2 = sx[(r0 + 2) * 17 + 3], x3 = sx[(r0 + 3) * 17 + 3], x4 = sx[(r0 + 4) * 17 + 3], x5 = sx[(r0 + 5) * 17 + 3], x6 = sx[(r0 + 6) * 17 + 3], x7 = sx[(r0 + 7) * 17 + 3];
-                    uint y0 = sw[(c0 + 0) * 17 + 3], y1 = sw[(c0 + 1) * 17 + 3], y2 = sw[(c0 + 2) * 17 + 3], y3 = sw[(c0 + 3) * 17 + 3];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 4], x1 = sx[(r0 + 1) * 17 + 4], x2 = sx[(r0 + 2) * 17 + 4], x3 = sx[(r0 + 3) * 17 + 4], x4 = sx[(r0 + 4) * 17 + 4], x5 = sx[(r0 + 5) * 17 + 4], x6 = sx[(r0 + 6) * 17 + 4], x7 = sx[(r0 + 7) * 17 + 4];
-                    uint y0 = sw[(c0 + 0) * 17 + 4], y1 = sw[(c0 + 1) * 17 + 4], y2 = sw[(c0 + 2) * 17 + 4], y3 = sw[(c0 + 3) * 17 + 4];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 5], x1 = sx[(r0 + 1) * 17 + 5], x2 = sx[(r0 + 2) * 17 + 5], x3 = sx[(r0 + 3) * 17 + 5], x4 = sx[(r0 + 4) * 17 + 5], x5 = sx[(r0 + 5) * 17 + 5], x6 = sx[(r0 + 6) * 17 + 5], x7 = sx[(r0 + 7) * 17 + 5];
-                    uint y0 = sw[(c0 + 0) * 17 + 5], y1 = sw[(c0 + 1) * 17 + 5], y2 = sw[(c0 + 2) * 17 + 5], y3 = sw[(c0 + 3) * 17 + 5];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 6], x1 = sx[(r0 + 1) * 17 + 6], x2 = sx[(r0 + 2) * 17 + 6], x3 = sx[(r0 + 3) * 17 + 6], x4 = sx[(r0 + 4) * 17 + 6], x5 = sx[(r0 + 5) * 17 + 6], x6 = sx[(r0 + 6) * 17 + 6], x7 = sx[(r0 + 7) * 17 + 6];
-                    uint y0 = sw[(c0 + 0) * 17 + 6], y1 = sw[(c0 + 1) * 17 + 6], y2 = sw[(c0 + 2) * 17 + 6], y3 = sw[(c0 + 3) * 17 + 6];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 7], x1 = sx[(r0 + 1) * 17 + 7], x2 = sx[(r0 + 2) * 17 + 7], x3 = sx[(r0 + 3) * 17 + 7], x4 = sx[(r0 + 4) * 17 + 7], x5 = sx[(r0 + 5) * 17 + 7], x6 = sx[(r0 + 6) * 17 + 7], x7 = sx[(r0 + 7) * 17 + 7];
-                    uint y0 = sw[(c0 + 0) * 17 + 7], y1 = sw[(c0 + 1) * 17 + 7], y2 = sw[(c0 + 2) * 17 + 7], y3 = sw[(c0 + 3) * 17 + 7];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                // block -> float: s (d (dot + 128 S) + m S)
                 float d0 = sd[(c0 + 0) * 2 + 0], n0 = sm[(c0 + 0) * 2 + 0], d1 = sd[(c0 + 1) * 2 + 0], n1 = sm[(c0 + 1) * 2 + 0], d2 = sd[(c0 + 2) * 2 + 0], n2 = sm[(c0 + 2) * 2 + 0], d3 = sd[(c0 + 3) * 2 + 0], n3 = sm[(c0 + 3) * 2 + 0];
-                { float s = ss[(r0 + 0) * 2 + 0]; int S = sS[(r0 + 0) * 2 + 0]; float sF = S;
-                  f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 1) * 2 + 0]; int S = sS[(r0 + 1) * 2 + 0]; float sF = S;
-                  f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 2) * 2 + 0]; int S = sS[(r0 + 2) * 2 + 0]; float sF = S;
-                  f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 3) * 2 + 0]; int S = sS[(r0 + 3) * 2 + 0]; float sF = S;
-                  f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 4) * 2 + 0]; int S = sS[(r0 + 4) * 2 + 0]; float sF = S;
-                  f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 5) * 2 + 0]; int S = sS[(r0 + 5) * 2 + 0]; float sF = S;
-                  f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 6) * 2 + 0]; int S = sS[(r0 + 6) * 2 + 0]; float sF = S;
-                  f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 7) * 2 + 0]; int S = sS[(r0 + 7) * 2 + 0]; float sF = S;
-                  f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 0], x1 = sx[(r0 + 1) * 17 + 0], x2 = sx[(r0 + 2) * 17 + 0], x3 = sx[(r0 + 3) * 17 + 0], x4 = sx[(r0 + 4) * 17 + 0], x5 = sx[(r0 + 5) * 17 + 0], x6 = sx[(r0 + 6) * 17 + 0], x7 = sx[(r0 + 7) * 17 + 0];
+                        uint y0 = sw[(c0 + 0) * 17 + 0], y1 = sw[(c0 + 1) * 17 + 0], y2 = sw[(c0 + 2) * 17 + 0], y3 = sw[(c0 + 3) * 17 + 0];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 1], x1 = sx[(r0 + 1) * 17 + 1], x2 = sx[(r0 + 2) * 17 + 1], x3 = sx[(r0 + 3) * 17 + 1], x4 = sx[(r0 + 4) * 17 + 1], x5 = sx[(r0 + 5) * 17 + 1], x6 = sx[(r0 + 6) * 17 + 1], x7 = sx[(r0 + 7) * 17 + 1];
+                        uint y0 = sw[(c0 + 0) * 17 + 1], y1 = sw[(c0 + 1) * 17 + 1], y2 = sw[(c0 + 2) * 17 + 1], y3 = sw[(c0 + 3) * 17 + 1];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 2], x1 = sx[(r0 + 1) * 17 + 2], x2 = sx[(r0 + 2) * 17 + 2], x3 = sx[(r0 + 3) * 17 + 2], x4 = sx[(r0 + 4) * 17 + 2], x5 = sx[(r0 + 5) * 17 + 2], x6 = sx[(r0 + 6) * 17 + 2], x7 = sx[(r0 + 7) * 17 + 2];
+                        uint y0 = sw[(c0 + 0) * 17 + 2], y1 = sw[(c0 + 1) * 17 + 2], y2 = sw[(c0 + 2) * 17 + 2], y3 = sw[(c0 + 3) * 17 + 2];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 3], x1 = sx[(r0 + 1) * 17 + 3], x2 = sx[(r0 + 2) * 17 + 3], x3 = sx[(r0 + 3) * 17 + 3], x4 = sx[(r0 + 4) * 17 + 3], x5 = sx[(r0 + 5) * 17 + 3], x6 = sx[(r0 + 6) * 17 + 3], x7 = sx[(r0 + 7) * 17 + 3];
+                        uint y0 = sw[(c0 + 0) * 17 + 3], y1 = sw[(c0 + 1) * 17 + 3], y2 = sw[(c0 + 2) * 17 + 3], y3 = sw[(c0 + 3) * 17 + 3];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 4], x1 = sx[(r0 + 1) * 17 + 4], x2 = sx[(r0 + 2) * 17 + 4], x3 = sx[(r0 + 3) * 17 + 4], x4 = sx[(r0 + 4) * 17 + 4], x5 = sx[(r0 + 5) * 17 + 4], x6 = sx[(r0 + 6) * 17 + 4], x7 = sx[(r0 + 7) * 17 + 4];
+                        uint y0 = sw[(c0 + 0) * 17 + 4], y1 = sw[(c0 + 1) * 17 + 4], y2 = sw[(c0 + 2) * 17 + 4], y3 = sw[(c0 + 3) * 17 + 4];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 5], x1 = sx[(r0 + 1) * 17 + 5], x2 = sx[(r0 + 2) * 17 + 5], x3 = sx[(r0 + 3) * 17 + 5], x4 = sx[(r0 + 4) * 17 + 5], x5 = sx[(r0 + 5) * 17 + 5], x6 = sx[(r0 + 6) * 17 + 5], x7 = sx[(r0 + 7) * 17 + 5];
+                        uint y0 = sw[(c0 + 0) * 17 + 5], y1 = sw[(c0 + 1) * 17 + 5], y2 = sw[(c0 + 2) * 17 + 5], y3 = sw[(c0 + 3) * 17 + 5];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 6], x1 = sx[(r0 + 1) * 17 + 6], x2 = sx[(r0 + 2) * 17 + 6], x3 = sx[(r0 + 3) * 17 + 6], x4 = sx[(r0 + 4) * 17 + 6], x5 = sx[(r0 + 5) * 17 + 6], x6 = sx[(r0 + 6) * 17 + 6], x7 = sx[(r0 + 7) * 17 + 6];
+                        uint y0 = sw[(c0 + 0) * 17 + 6], y1 = sw[(c0 + 1) * 17 + 6], y2 = sw[(c0 + 2) * 17 + 6], y3 = sw[(c0 + 3) * 17 + 6];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 7], x1 = sx[(r0 + 1) * 17 + 7], x2 = sx[(r0 + 2) * 17 + 7], x3 = sx[(r0 + 3) * 17 + 7], x4 = sx[(r0 + 4) * 17 + 7], x5 = sx[(r0 + 5) * 17 + 7], x6 = sx[(r0 + 6) * 17 + 7], x7 = sx[(r0 + 7) * 17 + 7];
+                        uint y0 = sw[(c0 + 0) * 17 + 7], y1 = sw[(c0 + 1) * 17 + 7], y2 = sw[(c0 + 2) * 17 + 7], y3 = sw[(c0 + 3) * 17 + 7];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
             }
             {
-                int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
-                int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
-                int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
-                int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
-                int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
-                int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
-                int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
-                int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 8], x1 = sx[(r0 + 1) * 17 + 8], x2 = sx[(r0 + 2) * 17 + 8], x3 = sx[(r0 + 3) * 17 + 8], x4 = sx[(r0 + 4) * 17 + 8], x5 = sx[(r0 + 5) * 17 + 8], x6 = sx[(r0 + 6) * 17 + 8], x7 = sx[(r0 + 7) * 17 + 8];
-                    uint y0 = sw[(c0 + 0) * 17 + 8], y1 = sw[(c0 + 1) * 17 + 8], y2 = sw[(c0 + 2) * 17 + 8], y3 = sw[(c0 + 3) * 17 + 8];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 9], x1 = sx[(r0 + 1) * 17 + 9], x2 = sx[(r0 + 2) * 17 + 9], x3 = sx[(r0 + 3) * 17 + 9], x4 = sx[(r0 + 4) * 17 + 9], x5 = sx[(r0 + 5) * 17 + 9], x6 = sx[(r0 + 6) * 17 + 9], x7 = sx[(r0 + 7) * 17 + 9];
-                    uint y0 = sw[(c0 + 0) * 17 + 9], y1 = sw[(c0 + 1) * 17 + 9], y2 = sw[(c0 + 2) * 17 + 9], y3 = sw[(c0 + 3) * 17 + 9];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 10], x1 = sx[(r0 + 1) * 17 + 10], x2 = sx[(r0 + 2) * 17 + 10], x3 = sx[(r0 + 3) * 17 + 10], x4 = sx[(r0 + 4) * 17 + 10], x5 = sx[(r0 + 5) * 17 + 10], x6 = sx[(r0 + 6) * 17 + 10], x7 = sx[(r0 + 7) * 17 + 10];
-                    uint y0 = sw[(c0 + 0) * 17 + 10], y1 = sw[(c0 + 1) * 17 + 10], y2 = sw[(c0 + 2) * 17 + 10], y3 = sw[(c0 + 3) * 17 + 10];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 11], x1 = sx[(r0 + 1) * 17 + 11], x2 = sx[(r0 + 2) * 17 + 11], x3 = sx[(r0 + 3) * 17 + 11], x4 = sx[(r0 + 4) * 17 + 11], x5 = sx[(r0 + 5) * 17 + 11], x6 = sx[(r0 + 6) * 17 + 11], x7 = sx[(r0 + 7) * 17 + 11];
-                    uint y0 = sw[(c0 + 0) * 17 + 11], y1 = sw[(c0 + 1) * 17 + 11], y2 = sw[(c0 + 2) * 17 + 11], y3 = sw[(c0 + 3) * 17 + 11];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 12], x1 = sx[(r0 + 1) * 17 + 12], x2 = sx[(r0 + 2) * 17 + 12], x3 = sx[(r0 + 3) * 17 + 12], x4 = sx[(r0 + 4) * 17 + 12], x5 = sx[(r0 + 5) * 17 + 12], x6 = sx[(r0 + 6) * 17 + 12], x7 = sx[(r0 + 7) * 17 + 12];
-                    uint y0 = sw[(c0 + 0) * 17 + 12], y1 = sw[(c0 + 1) * 17 + 12], y2 = sw[(c0 + 2) * 17 + 12], y3 = sw[(c0 + 3) * 17 + 12];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 13], x1 = sx[(r0 + 1) * 17 + 13], x2 = sx[(r0 + 2) * 17 + 13], x3 = sx[(r0 + 3) * 17 + 13], x4 = sx[(r0 + 4) * 17 + 13], x5 = sx[(r0 + 5) * 17 + 13], x6 = sx[(r0 + 6) * 17 + 13], x7 = sx[(r0 + 7) * 17 + 13];
-                    uint y0 = sw[(c0 + 0) * 17 + 13], y1 = sw[(c0 + 1) * 17 + 13], y2 = sw[(c0 + 2) * 17 + 13], y3 = sw[(c0 + 3) * 17 + 13];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 14], x1 = sx[(r0 + 1) * 17 + 14], x2 = sx[(r0 + 2) * 17 + 14], x3 = sx[(r0 + 3) * 17 + 14], x4 = sx[(r0 + 4) * 17 + 14], x5 = sx[(r0 + 5) * 17 + 14], x6 = sx[(r0 + 6) * 17 + 14], x7 = sx[(r0 + 7) * 17 + 14];
-                    uint y0 = sw[(c0 + 0) * 17 + 14], y1 = sw[(c0 + 1) * 17 + 14], y2 = sw[(c0 + 2) * 17 + 14], y3 = sw[(c0 + 3) * 17 + 14];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                {
-                    uint x0 = sx[(r0 + 0) * 17 + 15], x1 = sx[(r0 + 1) * 17 + 15], x2 = sx[(r0 + 2) * 17 + 15], x3 = sx[(r0 + 3) * 17 + 15], x4 = sx[(r0 + 4) * 17 + 15], x5 = sx[(r0 + 5) * 17 + 15], x6 = sx[(r0 + 6) * 17 + 15], x7 = sx[(r0 + 7) * 17 + 15];
-                    uint y0 = sw[(c0 + 0) * 17 + 15], y1 = sw[(c0 + 1) * 17 + 15], y2 = sw[(c0 + 2) * 17 + 15], y3 = sw[(c0 + 3) * 17 + 15];
-                    a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
-                    a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
-                    a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
-                    a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
-                    a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
-                    a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
-                    a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
-                    a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
-                }
-                // block -> float: s (d (dot + 128 S) + m S)
                 float d0 = sd[(c0 + 0) * 2 + 1], n0 = sm[(c0 + 0) * 2 + 1], d1 = sd[(c0 + 1) * 2 + 1], n1 = sm[(c0 + 1) * 2 + 1], d2 = sd[(c0 + 2) * 2 + 1], n2 = sm[(c0 + 2) * 2 + 1], d3 = sd[(c0 + 3) * 2 + 1], n3 = sm[(c0 + 3) * 2 + 1];
-                { float s = ss[(r0 + 0) * 2 + 1]; int S = sS[(r0 + 0) * 2 + 1]; float sF = S;
-                  f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 1) * 2 + 1]; int S = sS[(r0 + 1) * 2 + 1]; float sF = S;
-                  f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 2) * 2 + 1]; int S = sS[(r0 + 2) * 2 + 1]; float sF = S;
-                  f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 3) * 2 + 1]; int S = sS[(r0 + 3) * 2 + 1]; float sF = S;
-                  f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 4) * 2 + 1]; int S = sS[(r0 + 4) * 2 + 1]; float sF = S;
-                  f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 5) * 2 + 1]; int S = sS[(r0 + 5) * 2 + 1]; float sF = S;
-                  f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 6) * 2 + 1]; int S = sS[(r0 + 6) * 2 + 1]; float sF = S;
-                  f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
-                { float s = ss[(r0 + 7) * 2 + 1]; int S = sS[(r0 + 7) * 2 + 1]; float sF = S;
-                  f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 8], x1 = sx[(r0 + 1) * 17 + 8], x2 = sx[(r0 + 2) * 17 + 8], x3 = sx[(r0 + 3) * 17 + 8], x4 = sx[(r0 + 4) * 17 + 8], x5 = sx[(r0 + 5) * 17 + 8], x6 = sx[(r0 + 6) * 17 + 8], x7 = sx[(r0 + 7) * 17 + 8];
+                        uint y0 = sw[(c0 + 0) * 17 + 8], y1 = sw[(c0 + 1) * 17 + 8], y2 = sw[(c0 + 2) * 17 + 8], y3 = sw[(c0 + 3) * 17 + 8];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 9], x1 = sx[(r0 + 1) * 17 + 9], x2 = sx[(r0 + 2) * 17 + 9], x3 = sx[(r0 + 3) * 17 + 9], x4 = sx[(r0 + 4) * 17 + 9], x5 = sx[(r0 + 5) * 17 + 9], x6 = sx[(r0 + 6) * 17 + 9], x7 = sx[(r0 + 7) * 17 + 9];
+                        uint y0 = sw[(c0 + 0) * 17 + 9], y1 = sw[(c0 + 1) * 17 + 9], y2 = sw[(c0 + 2) * 17 + 9], y3 = sw[(c0 + 3) * 17 + 9];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 10], x1 = sx[(r0 + 1) * 17 + 10], x2 = sx[(r0 + 2) * 17 + 10], x3 = sx[(r0 + 3) * 17 + 10], x4 = sx[(r0 + 4) * 17 + 10], x5 = sx[(r0 + 5) * 17 + 10], x6 = sx[(r0 + 6) * 17 + 10], x7 = sx[(r0 + 7) * 17 + 10];
+                        uint y0 = sw[(c0 + 0) * 17 + 10], y1 = sw[(c0 + 1) * 17 + 10], y2 = sw[(c0 + 2) * 17 + 10], y3 = sw[(c0 + 3) * 17 + 10];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 11], x1 = sx[(r0 + 1) * 17 + 11], x2 = sx[(r0 + 2) * 17 + 11], x3 = sx[(r0 + 3) * 17 + 11], x4 = sx[(r0 + 4) * 17 + 11], x5 = sx[(r0 + 5) * 17 + 11], x6 = sx[(r0 + 6) * 17 + 11], x7 = sx[(r0 + 7) * 17 + 11];
+                        uint y0 = sw[(c0 + 0) * 17 + 11], y1 = sw[(c0 + 1) * 17 + 11], y2 = sw[(c0 + 2) * 17 + 11], y3 = sw[(c0 + 3) * 17 + 11];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 12], x1 = sx[(r0 + 1) * 17 + 12], x2 = sx[(r0 + 2) * 17 + 12], x3 = sx[(r0 + 3) * 17 + 12], x4 = sx[(r0 + 4) * 17 + 12], x5 = sx[(r0 + 5) * 17 + 12], x6 = sx[(r0 + 6) * 17 + 12], x7 = sx[(r0 + 7) * 17 + 12];
+                        uint y0 = sw[(c0 + 0) * 17 + 12], y1 = sw[(c0 + 1) * 17 + 12], y2 = sw[(c0 + 2) * 17 + 12], y3 = sw[(c0 + 3) * 17 + 12];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 13], x1 = sx[(r0 + 1) * 17 + 13], x2 = sx[(r0 + 2) * 17 + 13], x3 = sx[(r0 + 3) * 17 + 13], x4 = sx[(r0 + 4) * 17 + 13], x5 = sx[(r0 + 5) * 17 + 13], x6 = sx[(r0 + 6) * 17 + 13], x7 = sx[(r0 + 7) * 17 + 13];
+                        uint y0 = sw[(c0 + 0) * 17 + 13], y1 = sw[(c0 + 1) * 17 + 13], y2 = sw[(c0 + 2) * 17 + 13], y3 = sw[(c0 + 3) * 17 + 13];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 14], x1 = sx[(r0 + 1) * 17 + 14], x2 = sx[(r0 + 2) * 17 + 14], x3 = sx[(r0 + 3) * 17 + 14], x4 = sx[(r0 + 4) * 17 + 14], x5 = sx[(r0 + 5) * 17 + 14], x6 = sx[(r0 + 6) * 17 + 14], x7 = sx[(r0 + 7) * 17 + 14];
+                        uint y0 = sw[(c0 + 0) * 17 + 14], y1 = sw[(c0 + 1) * 17 + 14], y2 = sw[(c0 + 2) * 17 + 14], y3 = sw[(c0 + 3) * 17 + 14];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 17 + 15], x1 = sx[(r0 + 1) * 17 + 15], x2 = sx[(r0 + 2) * 17 + 15], x3 = sx[(r0 + 3) * 17 + 15], x4 = sx[(r0 + 4) * 17 + 15], x5 = sx[(r0 + 5) * 17 + 15], x6 = sx[(r0 + 6) * 17 + 15], x7 = sx[(r0 + 7) * 17 + 15];
+                        uint y0 = sw[(c0 + 0) * 17 + 15], y1 = sw[(c0 + 1) * 17 + 15], y2 = sw[(c0 + 2) * 17 + 15], y3 = sw[(c0 + 3) * 17 + 15];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+            }
+            Group.Barrier();
+        }
+        int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
+        if (gr0 + 0 < rows)
+        { long ob = (long)(m0 + gr0 + 0) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+        }
+        if (gr0 + 1 < rows)
+        { long ob = (long)(m0 + gr0 + 1) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+        }
+        if (gr0 + 2 < rows)
+        { long ob = (long)(m0 + gr0 + 2) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+        }
+        if (gr0 + 3 < rows)
+        { long ob = (long)(m0 + gr0 + 3) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+        }
+        if (gr0 + 4 < rows)
+        { long ob = (long)(m0 + gr0 + 4) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+        }
+        if (gr0 + 5 < rows)
+        { long ob = (long)(m0 + gr0 + 5) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+        }
+        if (gr0 + 6 < rows)
+        { long ob = (long)(m0 + gr0 + 6) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+        }
+        if (gr0 + 7 < rows)
+        { long ob = (long)(m0 + gr0 + 7) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+        }
+    }
+
+    /// <summary>Activation sub-blocks of 16. grid = ceil(rows / 128) * ceil(N / 64), group = 256. Rows m0 .. m0 + rows of the quantised activations.</summary>
+    public static void Kernel16(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)
+    {
+        int tilesN = (N + 63) / 64;
+        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;
+        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;
+        var sx = SharedMemory.Allocate<uint>(1152);
+        var sw = SharedMemory.Allocate<uint>(576);
+        var ss = SharedMemory.Allocate<float>(256);
+        var sS = SharedMemory.Allocate<int>(256);
+        var sd = SharedMemory.Allocate<float>(64);
+        var sm = SharedMemory.Allocate<float>(64);
+        float f0_0 = 0f, f0_1 = 0f, f0_2 = 0f, f0_3 = 0f;
+        float f1_0 = 0f, f1_1 = 0f, f1_2 = 0f, f1_3 = 0f;
+        float f2_0 = 0f, f2_1 = 0f, f2_2 = 0f, f2_3 = 0f;
+        float f3_0 = 0f, f3_1 = 0f, f3_2 = 0f, f3_3 = 0f;
+        float f4_0 = 0f, f4_1 = 0f, f4_2 = 0f, f4_3 = 0f;
+        float f5_0 = 0f, f5_1 = 0f, f5_2 = 0f, f5_3 = 0f;
+        float f6_0 = 0f, f6_1 = 0f, f6_2 = 0f, f6_3 = 0f;
+        float f7_0 = 0f, f7_1 = 0f, f7_2 = 0f, f7_3 = 0f;
+        int blocks = K / 32, kw = K / 4, sub = K / 16;
+        int r0 = ty * 8, c0 = tx * 4;
+        for (int b0 = 0; b0 < blocks; b0 += 1)
+        {
+            // stage 1 blocks: activation rows and weight columns (signed), outside rows / columns / blocks as zeros
+            for (int idx = tid; idx < 1024; idx += 256)
+            { int r = idx / 8, wd = idx % 8, gr = tm * 128 + r, b = b0 + wd / 8;
+              sx[r * 9 + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }
+            for (int idx = tid; idx < 512; idx += 256)
+            { int c = idx / 8, wd = idx % 8, gc = tn * 64 + c, b = b0 + wd / 8;
+              sw[c * 9 + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }
+            for (int idx = tid; idx < 256; idx += 256)
+            { int r = idx / 2, q = idx % 2, gr = tm * 128 + r, b = b0 + q / 2;
+              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * sub + (long)b0 * 2 + q;
+              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; }
+            for (int idx = tid; idx < 64; idx += 256)
+            { int c = idx / 1, kb = idx % 1, gc = tn * 64 + c, b = b0 + kb;
+              uint h = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u;
+              sd[idx] = HalfToFloat(h & 0xFFFFu); sm[idx] = HalfToFloat(h >> 16); }
+            Group.Barrier();
+            {
+                float d0 = sd[(c0 + 0) * 1 + 0], n0 = sm[(c0 + 0) * 1 + 0], d1 = sd[(c0 + 1) * 1 + 0], n1 = sm[(c0 + 1) * 1 + 0], d2 = sd[(c0 + 2) * 1 + 0], n2 = sm[(c0 + 2) * 1 + 0], d3 = sd[(c0 + 3) * 1 + 0], n3 = sm[(c0 + 3) * 1 + 0];
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 0], x1 = sx[(r0 + 1) * 9 + 0], x2 = sx[(r0 + 2) * 9 + 0], x3 = sx[(r0 + 3) * 9 + 0], x4 = sx[(r0 + 4) * 9 + 0], x5 = sx[(r0 + 5) * 9 + 0], x6 = sx[(r0 + 6) * 9 + 0], x7 = sx[(r0 + 7) * 9 + 0];
+                        uint y0 = sw[(c0 + 0) * 9 + 0], y1 = sw[(c0 + 1) * 9 + 0], y2 = sw[(c0 + 2) * 9 + 0], y3 = sw[(c0 + 3) * 9 + 0];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 1], x1 = sx[(r0 + 1) * 9 + 1], x2 = sx[(r0 + 2) * 9 + 1], x3 = sx[(r0 + 3) * 9 + 1], x4 = sx[(r0 + 4) * 9 + 1], x5 = sx[(r0 + 5) * 9 + 1], x6 = sx[(r0 + 6) * 9 + 1], x7 = sx[(r0 + 7) * 9 + 1];
+                        uint y0 = sw[(c0 + 0) * 9 + 1], y1 = sw[(c0 + 1) * 9 + 1], y2 = sw[(c0 + 2) * 9 + 1], y3 = sw[(c0 + 3) * 9 + 1];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 2], x1 = sx[(r0 + 1) * 9 + 2], x2 = sx[(r0 + 2) * 9 + 2], x3 = sx[(r0 + 3) * 9 + 2], x4 = sx[(r0 + 4) * 9 + 2], x5 = sx[(r0 + 5) * 9 + 2], x6 = sx[(r0 + 6) * 9 + 2], x7 = sx[(r0 + 7) * 9 + 2];
+                        uint y0 = sw[(c0 + 0) * 9 + 2], y1 = sw[(c0 + 1) * 9 + 2], y2 = sw[(c0 + 2) * 9 + 2], y3 = sw[(c0 + 3) * 9 + 2];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 3], x1 = sx[(r0 + 1) * 9 + 3], x2 = sx[(r0 + 2) * 9 + 3], x3 = sx[(r0 + 3) * 9 + 3], x4 = sx[(r0 + 4) * 9 + 3], x5 = sx[(r0 + 5) * 9 + 3], x6 = sx[(r0 + 6) * 9 + 3], x7 = sx[(r0 + 7) * 9 + 3];
+                        uint y0 = sw[(c0 + 0) * 9 + 3], y1 = sw[(c0 + 1) * 9 + 3], y2 = sw[(c0 + 2) * 9 + 3], y3 = sw[(c0 + 3) * 9 + 3];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 4], x1 = sx[(r0 + 1) * 9 + 4], x2 = sx[(r0 + 2) * 9 + 4], x3 = sx[(r0 + 3) * 9 + 4], x4 = sx[(r0 + 4) * 9 + 4], x5 = sx[(r0 + 5) * 9 + 4], x6 = sx[(r0 + 6) * 9 + 4], x7 = sx[(r0 + 7) * 9 + 4];
+                        uint y0 = sw[(c0 + 0) * 9 + 4], y1 = sw[(c0 + 1) * 9 + 4], y2 = sw[(c0 + 2) * 9 + 4], y3 = sw[(c0 + 3) * 9 + 4];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 5], x1 = sx[(r0 + 1) * 9 + 5], x2 = sx[(r0 + 2) * 9 + 5], x3 = sx[(r0 + 3) * 9 + 5], x4 = sx[(r0 + 4) * 9 + 5], x5 = sx[(r0 + 5) * 9 + 5], x6 = sx[(r0 + 6) * 9 + 5], x7 = sx[(r0 + 7) * 9 + 5];
+                        uint y0 = sw[(c0 + 0) * 9 + 5], y1 = sw[(c0 + 1) * 9 + 5], y2 = sw[(c0 + 2) * 9 + 5], y3 = sw[(c0 + 3) * 9 + 5];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 6], x1 = sx[(r0 + 1) * 9 + 6], x2 = sx[(r0 + 2) * 9 + 6], x3 = sx[(r0 + 3) * 9 + 6], x4 = sx[(r0 + 4) * 9 + 6], x5 = sx[(r0 + 5) * 9 + 6], x6 = sx[(r0 + 6) * 9 + 6], x7 = sx[(r0 + 7) * 9 + 6];
+                        uint y0 = sw[(c0 + 0) * 9 + 6], y1 = sw[(c0 + 1) * 9 + 6], y2 = sw[(c0 + 2) * 9 + 6], y3 = sw[(c0 + 3) * 9 + 6];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 7], x1 = sx[(r0 + 1) * 9 + 7], x2 = sx[(r0 + 2) * 9 + 7], x3 = sx[(r0 + 3) * 9 + 7], x4 = sx[(r0 + 4) * 9 + 7], x5 = sx[(r0 + 5) * 9 + 7], x6 = sx[(r0 + 6) * 9 + 7], x7 = sx[(r0 + 7) * 9 + 7];
+                        uint y0 = sw[(c0 + 0) * 9 + 7], y1 = sw[(c0 + 1) * 9 + 7], y2 = sw[(c0 + 2) * 9 + 7], y3 = sw[(c0 + 3) * 9 + 7];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+            }
+            Group.Barrier();
+        }
+        int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
+        if (gr0 + 0 < rows)
+        { long ob = (long)(m0 + gr0 + 0) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+        }
+        if (gr0 + 1 < rows)
+        { long ob = (long)(m0 + gr0 + 1) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+        }
+        if (gr0 + 2 < rows)
+        { long ob = (long)(m0 + gr0 + 2) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+        }
+        if (gr0 + 3 < rows)
+        { long ob = (long)(m0 + gr0 + 3) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+        }
+        if (gr0 + 4 < rows)
+        { long ob = (long)(m0 + gr0 + 4) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+        }
+        if (gr0 + 5 < rows)
+        { long ob = (long)(m0 + gr0 + 5) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+        }
+        if (gr0 + 6 < rows)
+        { long ob = (long)(m0 + gr0 + 6) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+        }
+        if (gr0 + 7 < rows)
+        { long ob = (long)(m0 + gr0 + 7) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+        }
+    }
+
+    /// <summary>Activation sub-blocks of 8. grid = ceil(rows / 128) * ceil(N / 64), group = 256. Rows m0 .. m0 + rows of the quantised activations.</summary>
+    public static void Kernel8(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)
+    {
+        int tilesN = (N + 63) / 64;
+        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;
+        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;
+        var sx = SharedMemory.Allocate<uint>(1152);
+        var sw = SharedMemory.Allocate<uint>(576);
+        var ss = SharedMemory.Allocate<float>(512);
+        var sS = SharedMemory.Allocate<int>(512);
+        var sd = SharedMemory.Allocate<float>(64);
+        var sm = SharedMemory.Allocate<float>(64);
+        float f0_0 = 0f, f0_1 = 0f, f0_2 = 0f, f0_3 = 0f;
+        float f1_0 = 0f, f1_1 = 0f, f1_2 = 0f, f1_3 = 0f;
+        float f2_0 = 0f, f2_1 = 0f, f2_2 = 0f, f2_3 = 0f;
+        float f3_0 = 0f, f3_1 = 0f, f3_2 = 0f, f3_3 = 0f;
+        float f4_0 = 0f, f4_1 = 0f, f4_2 = 0f, f4_3 = 0f;
+        float f5_0 = 0f, f5_1 = 0f, f5_2 = 0f, f5_3 = 0f;
+        float f6_0 = 0f, f6_1 = 0f, f6_2 = 0f, f6_3 = 0f;
+        float f7_0 = 0f, f7_1 = 0f, f7_2 = 0f, f7_3 = 0f;
+        int blocks = K / 32, kw = K / 4, sub = K / 8;
+        int r0 = ty * 8, c0 = tx * 4;
+        for (int b0 = 0; b0 < blocks; b0 += 1)
+        {
+            // stage 1 blocks: activation rows and weight columns (signed), outside rows / columns / blocks as zeros
+            for (int idx = tid; idx < 1024; idx += 256)
+            { int r = idx / 8, wd = idx % 8, gr = tm * 128 + r, b = b0 + wd / 8;
+              sx[r * 9 + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }
+            for (int idx = tid; idx < 512; idx += 256)
+            { int c = idx / 8, wd = idx % 8, gc = tn * 64 + c, b = b0 + wd / 8;
+              sw[c * 9 + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }
+            for (int idx = tid; idx < 512; idx += 256)
+            { int r = idx / 4, q = idx % 4, gr = tm * 128 + r, b = b0 + q / 4;
+              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * sub + (long)b0 * 4 + q;
+              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; }
+            for (int idx = tid; idx < 64; idx += 256)
+            { int c = idx / 1, kb = idx % 1, gc = tn * 64 + c, b = b0 + kb;
+              uint h = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u;
+              sd[idx] = HalfToFloat(h & 0xFFFFu); sm[idx] = HalfToFloat(h >> 16); }
+            Group.Barrier();
+            {
+                float d0 = sd[(c0 + 0) * 1 + 0], n0 = sm[(c0 + 0) * 1 + 0], d1 = sd[(c0 + 1) * 1 + 0], n1 = sm[(c0 + 1) * 1 + 0], d2 = sd[(c0 + 2) * 1 + 0], n2 = sm[(c0 + 2) * 1 + 0], d3 = sd[(c0 + 3) * 1 + 0], n3 = sm[(c0 + 3) * 1 + 0];
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 0], x1 = sx[(r0 + 1) * 9 + 0], x2 = sx[(r0 + 2) * 9 + 0], x3 = sx[(r0 + 3) * 9 + 0], x4 = sx[(r0 + 4) * 9 + 0], x5 = sx[(r0 + 5) * 9 + 0], x6 = sx[(r0 + 6) * 9 + 0], x7 = sx[(r0 + 7) * 9 + 0];
+                        uint y0 = sw[(c0 + 0) * 9 + 0], y1 = sw[(c0 + 1) * 9 + 0], y2 = sw[(c0 + 2) * 9 + 0], y3 = sw[(c0 + 3) * 9 + 0];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 1], x1 = sx[(r0 + 1) * 9 + 1], x2 = sx[(r0 + 2) * 9 + 1], x3 = sx[(r0 + 3) * 9 + 1], x4 = sx[(r0 + 4) * 9 + 1], x5 = sx[(r0 + 5) * 9 + 1], x6 = sx[(r0 + 6) * 9 + 1], x7 = sx[(r0 + 7) * 9 + 1];
+                        uint y0 = sw[(c0 + 0) * 9 + 1], y1 = sw[(c0 + 1) * 9 + 1], y2 = sw[(c0 + 2) * 9 + 1], y3 = sw[(c0 + 3) * 9 + 1];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 2], x1 = sx[(r0 + 1) * 9 + 2], x2 = sx[(r0 + 2) * 9 + 2], x3 = sx[(r0 + 3) * 9 + 2], x4 = sx[(r0 + 4) * 9 + 2], x5 = sx[(r0 + 5) * 9 + 2], x6 = sx[(r0 + 6) * 9 + 2], x7 = sx[(r0 + 7) * 9 + 2];
+                        uint y0 = sw[(c0 + 0) * 9 + 2], y1 = sw[(c0 + 1) * 9 + 2], y2 = sw[(c0 + 2) * 9 + 2], y3 = sw[(c0 + 3) * 9 + 2];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 3], x1 = sx[(r0 + 1) * 9 + 3], x2 = sx[(r0 + 2) * 9 + 3], x3 = sx[(r0 + 3) * 9 + 3], x4 = sx[(r0 + 4) * 9 + 3], x5 = sx[(r0 + 5) * 9 + 3], x6 = sx[(r0 + 6) * 9 + 3], x7 = sx[(r0 + 7) * 9 + 3];
+                        uint y0 = sw[(c0 + 0) * 9 + 3], y1 = sw[(c0 + 1) * 9 + 3], y2 = sw[(c0 + 2) * 9 + 3], y3 = sw[(c0 + 3) * 9 + 3];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 4], x1 = sx[(r0 + 1) * 9 + 4], x2 = sx[(r0 + 2) * 9 + 4], x3 = sx[(r0 + 3) * 9 + 4], x4 = sx[(r0 + 4) * 9 + 4], x5 = sx[(r0 + 5) * 9 + 4], x6 = sx[(r0 + 6) * 9 + 4], x7 = sx[(r0 + 7) * 9 + 4];
+                        uint y0 = sw[(c0 + 0) * 9 + 4], y1 = sw[(c0 + 1) * 9 + 4], y2 = sw[(c0 + 2) * 9 + 4], y3 = sw[(c0 + 3) * 9 + 4];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 5], x1 = sx[(r0 + 1) * 9 + 5], x2 = sx[(r0 + 2) * 9 + 5], x3 = sx[(r0 + 3) * 9 + 5], x4 = sx[(r0 + 4) * 9 + 5], x5 = sx[(r0 + 5) * 9 + 5], x6 = sx[(r0 + 6) * 9 + 5], x7 = sx[(r0 + 7) * 9 + 5];
+                        uint y0 = sw[(c0 + 0) * 9 + 5], y1 = sw[(c0 + 1) * 9 + 5], y2 = sw[(c0 + 2) * 9 + 5], y3 = sw[(c0 + 3) * 9 + 5];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 6], x1 = sx[(r0 + 1) * 9 + 6], x2 = sx[(r0 + 2) * 9 + 6], x3 = sx[(r0 + 3) * 9 + 6], x4 = sx[(r0 + 4) * 9 + 6], x5 = sx[(r0 + 5) * 9 + 6], x6 = sx[(r0 + 6) * 9 + 6], x7 = sx[(r0 + 7) * 9 + 6];
+                        uint y0 = sw[(c0 + 0) * 9 + 6], y1 = sw[(c0 + 1) * 9 + 6], y2 = sw[(c0 + 2) * 9 + 6], y3 = sw[(c0 + 3) * 9 + 6];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 9 + 7], x1 = sx[(r0 + 1) * 9 + 7], x2 = sx[(r0 + 2) * 9 + 7], x3 = sx[(r0 + 3) * 9 + 7], x4 = sx[(r0 + 4) * 9 + 7], x5 = sx[(r0 + 5) * 9 + 7], x6 = sx[(r0 + 6) * 9 + 7], x7 = sx[(r0 + 7) * 9 + 7];
+                        uint y0 = sw[(c0 + 0) * 9 + 7], y1 = sw[(c0 + 1) * 9 + 7], y2 = sw[(c0 + 2) * 9 + 7], y3 = sw[(c0 + 3) * 9 + 7];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    // sub-block -> float: s (d (dot + 128 S) + m S)
+                    { int q = (r0 + 0) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 1) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 2) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 3) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 4) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 5) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 6) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                    { int q = (r0 + 7) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
+                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                }
+            }
+            Group.Barrier();
+        }
+        int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
+        if (gr0 + 0 < rows)
+        { long ob = (long)(m0 + gr0 + 0) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+        }
+        if (gr0 + 1 < rows)
+        { long ob = (long)(m0 + gr0 + 1) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+        }
+        if (gr0 + 2 < rows)
+        { long ob = (long)(m0 + gr0 + 2) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+        }
+        if (gr0 + 3 < rows)
+        { long ob = (long)(m0 + gr0 + 3) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+        }
+        if (gr0 + 4 < rows)
+        { long ob = (long)(m0 + gr0 + 4) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+        }
+        if (gr0 + 5 < rows)
+        { long ob = (long)(m0 + gr0 + 5) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+        }
+        if (gr0 + 6 < rows)
+        { long ob = (long)(m0 + gr0 + 6) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+        }
+        if (gr0 + 7 < rows)
+        { long ob = (long)(m0 + gr0 + 7) * N;
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+        }
+    }
+
+    /// <summary>Two-level activation scales (block float scale, sub-block power-of-two exponents). grid = ceil(rows / 128) * ceil(N / 64), group = 256.</summary>
+    public static void KernelTwoLevel(UV xq, FV xs, IV xsum, IV xe, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)
+    {
+        int tilesN = (N + 63) / 64;
+        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;
+        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;
+        var sx = SharedMemory.Allocate<uint>(2048);
+        var sw = SharedMemory.Allocate<uint>(1088);
+        var ss = SharedMemory.Allocate<float>(256);
+        var sS = SharedMemory.Allocate<int>(256);
+        var sE = SharedMemory.Allocate<int>(256);
+        var sh = SharedMemory.Allocate<uint>(128);
+        float f0_0 = 0f, f0_1 = 0f, f0_2 = 0f, f0_3 = 0f;
+        float f1_0 = 0f, f1_1 = 0f, f1_2 = 0f, f1_3 = 0f;
+        float f2_0 = 0f, f2_1 = 0f, f2_2 = 0f, f2_3 = 0f;
+        float f3_0 = 0f, f3_1 = 0f, f3_2 = 0f, f3_3 = 0f;
+        float f4_0 = 0f, f4_1 = 0f, f4_2 = 0f, f4_3 = 0f;
+        float f5_0 = 0f, f5_1 = 0f, f5_2 = 0f, f5_3 = 0f;
+        float f6_0 = 0f, f6_1 = 0f, f6_2 = 0f, f6_3 = 0f;
+        float f7_0 = 0f, f7_1 = 0f, f7_2 = 0f, f7_3 = 0f;
+        int blocks = K / 32, kw = K / 4;
+        int r0 = ty * 8, c0 = tx * 4;
+        for (int b0 = 0; b0 < blocks; b0 += 2)
+        {
+            for (int idx = tid; idx < 2048; idx += 256)
+            { int r = idx / 16, wd = idx % 16, gr = tm * 128 + r, b = b0 + wd / 8;
+              sx[r * 16 + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }
+            for (int idx = tid; idx < 1024; idx += 256)
+            { int c = idx / 16, wd = idx % 16, gc = tn * 64 + c, b = b0 + wd / 8;
+              sw[c * 17 + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }
+            for (int idx = tid; idx < 256; idx += 256)
+            { int r = idx / 2, kb = idx % 2, gr = tm * 128 + r, b = b0 + kb;
+              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * blocks + b;
+              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; sE[idx] = ok ? xe[at] : 0; }
+            for (int idx = tid; idx < 128; idx += 256)
+            { int c = idx / 2, kb = idx % 2, gc = tn * 64 + c, b = b0 + kb;
+              sh[idx] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u; }
+            Group.Barrier();
+            {
+                int e0 = sE[(r0 + 0) * 2 + 0], e1 = sE[(r0 + 1) * 2 + 0], e2 = sE[(r0 + 2) * 2 + 0], e3 = sE[(r0 + 3) * 2 + 0], e4 = sE[(r0 + 4) * 2 + 0], e5 = sE[(r0 + 5) * 2 + 0], e6 = sE[(r0 + 6) * 2 + 0], e7 = sE[(r0 + 7) * 2 + 0];
+                int t0_0 = 0, t0_1 = 0, t0_2 = 0, t0_3 = 0;
+                int t1_0 = 0, t1_1 = 0, t1_2 = 0, t1_3 = 0;
+                int t2_0 = 0, t2_1 = 0, t2_2 = 0, t2_3 = 0;
+                int t3_0 = 0, t3_1 = 0, t3_2 = 0, t3_3 = 0;
+                int t4_0 = 0, t4_1 = 0, t4_2 = 0, t4_3 = 0;
+                int t5_0 = 0, t5_1 = 0, t5_2 = 0, t5_3 = 0;
+                int t6_0 = 0, t6_1 = 0, t6_2 = 0, t6_3 = 0;
+                int t7_0 = 0, t7_1 = 0, t7_2 = 0, t7_3 = 0;
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 0], x1 = sx[(r0 + 1) * 16 + 0], x2 = sx[(r0 + 2) * 16 + 0], x3 = sx[(r0 + 3) * 16 + 0], x4 = sx[(r0 + 4) * 16 + 0], x5 = sx[(r0 + 5) * 16 + 0], x6 = sx[(r0 + 6) * 16 + 0], x7 = sx[(r0 + 7) * 16 + 0];
+                        uint y0 = sw[(c0 + 0) * 17 + 0], y1 = sw[(c0 + 1) * 17 + 0], y2 = sw[(c0 + 2) * 17 + 0], y3 = sw[(c0 + 3) * 17 + 0];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 1], x1 = sx[(r0 + 1) * 16 + 1], x2 = sx[(r0 + 2) * 16 + 1], x3 = sx[(r0 + 3) * 16 + 1], x4 = sx[(r0 + 4) * 16 + 1], x5 = sx[(r0 + 5) * 16 + 1], x6 = sx[(r0 + 6) * 16 + 1], x7 = sx[(r0 + 7) * 16 + 1];
+                        uint y0 = sw[(c0 + 0) * 17 + 1], y1 = sw[(c0 + 1) * 17 + 1], y2 = sw[(c0 + 2) * 17 + 1], y3 = sw[(c0 + 3) * 17 + 1];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 0) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 0) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 0) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 0) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 0) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 0) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 0) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 0) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 2], x1 = sx[(r0 + 1) * 16 + 2], x2 = sx[(r0 + 2) * 16 + 2], x3 = sx[(r0 + 3) * 16 + 2], x4 = sx[(r0 + 4) * 16 + 2], x5 = sx[(r0 + 5) * 16 + 2], x6 = sx[(r0 + 6) * 16 + 2], x7 = sx[(r0 + 7) * 16 + 2];
+                        uint y0 = sw[(c0 + 0) * 17 + 2], y1 = sw[(c0 + 1) * 17 + 2], y2 = sw[(c0 + 2) * 17 + 2], y3 = sw[(c0 + 3) * 17 + 2];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 3], x1 = sx[(r0 + 1) * 16 + 3], x2 = sx[(r0 + 2) * 16 + 3], x3 = sx[(r0 + 3) * 16 + 3], x4 = sx[(r0 + 4) * 16 + 3], x5 = sx[(r0 + 5) * 16 + 3], x6 = sx[(r0 + 6) * 16 + 3], x7 = sx[(r0 + 7) * 16 + 3];
+                        uint y0 = sw[(c0 + 0) * 17 + 3], y1 = sw[(c0 + 1) * 17 + 3], y2 = sw[(c0 + 2) * 17 + 3], y3 = sw[(c0 + 3) * 17 + 3];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 3) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 3) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 3) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 3) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 3) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 3) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 3) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 3) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 4], x1 = sx[(r0 + 1) * 16 + 4], x2 = sx[(r0 + 2) * 16 + 4], x3 = sx[(r0 + 3) * 16 + 4], x4 = sx[(r0 + 4) * 16 + 4], x5 = sx[(r0 + 5) * 16 + 4], x6 = sx[(r0 + 6) * 16 + 4], x7 = sx[(r0 + 7) * 16 + 4];
+                        uint y0 = sw[(c0 + 0) * 17 + 4], y1 = sw[(c0 + 1) * 17 + 4], y2 = sw[(c0 + 2) * 17 + 4], y3 = sw[(c0 + 3) * 17 + 4];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 5], x1 = sx[(r0 + 1) * 16 + 5], x2 = sx[(r0 + 2) * 16 + 5], x3 = sx[(r0 + 3) * 16 + 5], x4 = sx[(r0 + 4) * 16 + 5], x5 = sx[(r0 + 5) * 16 + 5], x6 = sx[(r0 + 6) * 16 + 5], x7 = sx[(r0 + 7) * 16 + 5];
+                        uint y0 = sw[(c0 + 0) * 17 + 5], y1 = sw[(c0 + 1) * 17 + 5], y2 = sw[(c0 + 2) * 17 + 5], y3 = sw[(c0 + 3) * 17 + 5];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 6) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 6) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 6) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 6) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 6) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 6) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 6) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 6) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 6], x1 = sx[(r0 + 1) * 16 + 6], x2 = sx[(r0 + 2) * 16 + 6], x3 = sx[(r0 + 3) * 16 + 6], x4 = sx[(r0 + 4) * 16 + 6], x5 = sx[(r0 + 5) * 16 + 6], x6 = sx[(r0 + 6) * 16 + 6], x7 = sx[(r0 + 7) * 16 + 6];
+                        uint y0 = sw[(c0 + 0) * 17 + 6], y1 = sw[(c0 + 1) * 17 + 6], y2 = sw[(c0 + 2) * 17 + 6], y3 = sw[(c0 + 3) * 17 + 6];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 7], x1 = sx[(r0 + 1) * 16 + 7], x2 = sx[(r0 + 2) * 16 + 7], x3 = sx[(r0 + 3) * 16 + 7], x4 = sx[(r0 + 4) * 16 + 7], x5 = sx[(r0 + 5) * 16 + 7], x6 = sx[(r0 + 6) * 16 + 7], x7 = sx[(r0 + 7) * 16 + 7];
+                        uint y0 = sw[(c0 + 0) * 17 + 7], y1 = sw[(c0 + 1) * 17 + 7], y2 = sw[(c0 + 2) * 17 + 7], y3 = sw[(c0 + 3) * 17 + 7];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 9) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 9) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 9) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 9) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 9) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 9) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 9) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 9) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                uint h0 = sh[(c0 + 0) * 2 + 0], h1 = sh[(c0 + 1) * 2 + 0], h2 = sh[(c0 + 2) * 2 + 0], h3 = sh[(c0 + 3) * 2 + 0];
+                float d0 = HalfToFloat(h0 & 0xFFFFu), n0 = HalfToFloat(h0 >> 16), d1 = HalfToFloat(h1 & 0xFFFFu), n1 = HalfToFloat(h1 >> 16), d2 = HalfToFloat(h2 & 0xFFFFu), n2 = HalfToFloat(h2 >> 16), d3 = HalfToFloat(h3 & 0xFFFFu), n3 = HalfToFloat(h3 >> 16);
+                { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f0_0 += s * (d0 * (t0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (t0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (t0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (t0_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f1_0 += s * (d0 * (t1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (t1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (t1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (t1_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f2_0 += s * (d0 * (t2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (t2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (t2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (t2_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f3_0 += s * (d0 * (t3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (t3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (t3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (t3_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f4_0 += s * (d0 * (t4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (t4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (t4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (t4_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f5_0 += s * (d0 * (t5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (t5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (t5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (t5_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f6_0 += s * (d0 * (t6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (t6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (t6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (t6_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f7_0 += s * (d0 * (t7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (t7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (t7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (t7_3 + 128 * S) + n3 * sF); }
+            }
+            {
+                int e0 = sE[(r0 + 0) * 2 + 1], e1 = sE[(r0 + 1) * 2 + 1], e2 = sE[(r0 + 2) * 2 + 1], e3 = sE[(r0 + 3) * 2 + 1], e4 = sE[(r0 + 4) * 2 + 1], e5 = sE[(r0 + 5) * 2 + 1], e6 = sE[(r0 + 6) * 2 + 1], e7 = sE[(r0 + 7) * 2 + 1];
+                int t0_0 = 0, t0_1 = 0, t0_2 = 0, t0_3 = 0;
+                int t1_0 = 0, t1_1 = 0, t1_2 = 0, t1_3 = 0;
+                int t2_0 = 0, t2_1 = 0, t2_2 = 0, t2_3 = 0;
+                int t3_0 = 0, t3_1 = 0, t3_2 = 0, t3_3 = 0;
+                int t4_0 = 0, t4_1 = 0, t4_2 = 0, t4_3 = 0;
+                int t5_0 = 0, t5_1 = 0, t5_2 = 0, t5_3 = 0;
+                int t6_0 = 0, t6_1 = 0, t6_2 = 0, t6_3 = 0;
+                int t7_0 = 0, t7_1 = 0, t7_2 = 0, t7_3 = 0;
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 8], x1 = sx[(r0 + 1) * 16 + 8], x2 = sx[(r0 + 2) * 16 + 8], x3 = sx[(r0 + 3) * 16 + 8], x4 = sx[(r0 + 4) * 16 + 8], x5 = sx[(r0 + 5) * 16 + 8], x6 = sx[(r0 + 6) * 16 + 8], x7 = sx[(r0 + 7) * 16 + 8];
+                        uint y0 = sw[(c0 + 0) * 17 + 8], y1 = sw[(c0 + 1) * 17 + 8], y2 = sw[(c0 + 2) * 17 + 8], y3 = sw[(c0 + 3) * 17 + 8];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 9], x1 = sx[(r0 + 1) * 16 + 9], x2 = sx[(r0 + 2) * 16 + 9], x3 = sx[(r0 + 3) * 16 + 9], x4 = sx[(r0 + 4) * 16 + 9], x5 = sx[(r0 + 5) * 16 + 9], x6 = sx[(r0 + 6) * 16 + 9], x7 = sx[(r0 + 7) * 16 + 9];
+                        uint y0 = sw[(c0 + 0) * 17 + 9], y1 = sw[(c0 + 1) * 17 + 9], y2 = sw[(c0 + 2) * 17 + 9], y3 = sw[(c0 + 3) * 17 + 9];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 0) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 0) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 0) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 0) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 0) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 0) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 0) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 0) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 10], x1 = sx[(r0 + 1) * 16 + 10], x2 = sx[(r0 + 2) * 16 + 10], x3 = sx[(r0 + 3) * 16 + 10], x4 = sx[(r0 + 4) * 16 + 10], x5 = sx[(r0 + 5) * 16 + 10], x6 = sx[(r0 + 6) * 16 + 10], x7 = sx[(r0 + 7) * 16 + 10];
+                        uint y0 = sw[(c0 + 0) * 17 + 10], y1 = sw[(c0 + 1) * 17 + 10], y2 = sw[(c0 + 2) * 17 + 10], y3 = sw[(c0 + 3) * 17 + 10];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 11], x1 = sx[(r0 + 1) * 16 + 11], x2 = sx[(r0 + 2) * 16 + 11], x3 = sx[(r0 + 3) * 16 + 11], x4 = sx[(r0 + 4) * 16 + 11], x5 = sx[(r0 + 5) * 16 + 11], x6 = sx[(r0 + 6) * 16 + 11], x7 = sx[(r0 + 7) * 16 + 11];
+                        uint y0 = sw[(c0 + 0) * 17 + 11], y1 = sw[(c0 + 1) * 17 + 11], y2 = sw[(c0 + 2) * 17 + 11], y3 = sw[(c0 + 3) * 17 + 11];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 3) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 3) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 3) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 3) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 3) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 3) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 3) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 3) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 12], x1 = sx[(r0 + 1) * 16 + 12], x2 = sx[(r0 + 2) * 16 + 12], x3 = sx[(r0 + 3) * 16 + 12], x4 = sx[(r0 + 4) * 16 + 12], x5 = sx[(r0 + 5) * 16 + 12], x6 = sx[(r0 + 6) * 16 + 12], x7 = sx[(r0 + 7) * 16 + 12];
+                        uint y0 = sw[(c0 + 0) * 17 + 12], y1 = sw[(c0 + 1) * 17 + 12], y2 = sw[(c0 + 2) * 17 + 12], y3 = sw[(c0 + 3) * 17 + 12];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 13], x1 = sx[(r0 + 1) * 16 + 13], x2 = sx[(r0 + 2) * 16 + 13], x3 = sx[(r0 + 3) * 16 + 13], x4 = sx[(r0 + 4) * 16 + 13], x5 = sx[(r0 + 5) * 16 + 13], x6 = sx[(r0 + 6) * 16 + 13], x7 = sx[(r0 + 7) * 16 + 13];
+                        uint y0 = sw[(c0 + 0) * 17 + 13], y1 = sw[(c0 + 1) * 17 + 13], y2 = sw[(c0 + 2) * 17 + 13], y3 = sw[(c0 + 3) * 17 + 13];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 6) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 6) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 6) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 6) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 6) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 6) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 6) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 6) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                {
+                    int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
+                    int a1_0 = 0, a1_1 = 0, a1_2 = 0, a1_3 = 0;
+                    int a2_0 = 0, a2_1 = 0, a2_2 = 0, a2_3 = 0;
+                    int a3_0 = 0, a3_1 = 0, a3_2 = 0, a3_3 = 0;
+                    int a4_0 = 0, a4_1 = 0, a4_2 = 0, a4_3 = 0;
+                    int a5_0 = 0, a5_1 = 0, a5_2 = 0, a5_3 = 0;
+                    int a6_0 = 0, a6_1 = 0, a6_2 = 0, a6_3 = 0;
+                    int a7_0 = 0, a7_1 = 0, a7_2 = 0, a7_3 = 0;
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 14], x1 = sx[(r0 + 1) * 16 + 14], x2 = sx[(r0 + 2) * 16 + 14], x3 = sx[(r0 + 3) * 16 + 14], x4 = sx[(r0 + 4) * 16 + 14], x5 = sx[(r0 + 5) * 16 + 14], x6 = sx[(r0 + 6) * 16 + 14], x7 = sx[(r0 + 7) * 16 + 14];
+                        uint y0 = sw[(c0 + 0) * 17 + 14], y1 = sw[(c0 + 1) * 17 + 14], y2 = sw[(c0 + 2) * 17 + 14], y3 = sw[(c0 + 3) * 17 + 14];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    {
+                        uint x0 = sx[(r0 + 0) * 16 + 15], x1 = sx[(r0 + 1) * 16 + 15], x2 = sx[(r0 + 2) * 16 + 15], x3 = sx[(r0 + 3) * 16 + 15], x4 = sx[(r0 + 4) * 16 + 15], x5 = sx[(r0 + 5) * 16 + 15], x6 = sx[(r0 + 6) * 16 + 15], x7 = sx[(r0 + 7) * 16 + 15];
+                        uint y0 = sw[(c0 + 0) * 17 + 15], y1 = sw[(c0 + 1) * 17 + 15], y2 = sw[(c0 + 2) * 17 + 15], y3 = sw[(c0 + 3) * 17 + 15];
+                        a0_0 = IntrinsicMath.Dot4I8Packed(x0, y0, a0_0); a0_1 = IntrinsicMath.Dot4I8Packed(x0, y1, a0_1); a0_2 = IntrinsicMath.Dot4I8Packed(x0, y2, a0_2); a0_3 = IntrinsicMath.Dot4I8Packed(x0, y3, a0_3);
+                        a1_0 = IntrinsicMath.Dot4I8Packed(x1, y0, a1_0); a1_1 = IntrinsicMath.Dot4I8Packed(x1, y1, a1_1); a1_2 = IntrinsicMath.Dot4I8Packed(x1, y2, a1_2); a1_3 = IntrinsicMath.Dot4I8Packed(x1, y3, a1_3);
+                        a2_0 = IntrinsicMath.Dot4I8Packed(x2, y0, a2_0); a2_1 = IntrinsicMath.Dot4I8Packed(x2, y1, a2_1); a2_2 = IntrinsicMath.Dot4I8Packed(x2, y2, a2_2); a2_3 = IntrinsicMath.Dot4I8Packed(x2, y3, a2_3);
+                        a3_0 = IntrinsicMath.Dot4I8Packed(x3, y0, a3_0); a3_1 = IntrinsicMath.Dot4I8Packed(x3, y1, a3_1); a3_2 = IntrinsicMath.Dot4I8Packed(x3, y2, a3_2); a3_3 = IntrinsicMath.Dot4I8Packed(x3, y3, a3_3);
+                        a4_0 = IntrinsicMath.Dot4I8Packed(x4, y0, a4_0); a4_1 = IntrinsicMath.Dot4I8Packed(x4, y1, a4_1); a4_2 = IntrinsicMath.Dot4I8Packed(x4, y2, a4_2); a4_3 = IntrinsicMath.Dot4I8Packed(x4, y3, a4_3);
+                        a5_0 = IntrinsicMath.Dot4I8Packed(x5, y0, a5_0); a5_1 = IntrinsicMath.Dot4I8Packed(x5, y1, a5_1); a5_2 = IntrinsicMath.Dot4I8Packed(x5, y2, a5_2); a5_3 = IntrinsicMath.Dot4I8Packed(x5, y3, a5_3);
+                        a6_0 = IntrinsicMath.Dot4I8Packed(x6, y0, a6_0); a6_1 = IntrinsicMath.Dot4I8Packed(x6, y1, a6_1); a6_2 = IntrinsicMath.Dot4I8Packed(x6, y2, a6_2); a6_3 = IntrinsicMath.Dot4I8Packed(x6, y3, a6_3);
+                        a7_0 = IntrinsicMath.Dot4I8Packed(x7, y0, a7_0); a7_1 = IntrinsicMath.Dot4I8Packed(x7, y1, a7_1); a7_2 = IntrinsicMath.Dot4I8Packed(x7, y2, a7_2); a7_3 = IntrinsicMath.Dot4I8Packed(x7, y3, a7_3);
+                    }
+                    { int shf = (e0 >> 9) & 7; t0_0 += a0_0 << shf; t0_1 += a0_1 << shf; t0_2 += a0_2 << shf; t0_3 += a0_3 << shf; }
+                    { int shf = (e1 >> 9) & 7; t1_0 += a1_0 << shf; t1_1 += a1_1 << shf; t1_2 += a1_2 << shf; t1_3 += a1_3 << shf; }
+                    { int shf = (e2 >> 9) & 7; t2_0 += a2_0 << shf; t2_1 += a2_1 << shf; t2_2 += a2_2 << shf; t2_3 += a2_3 << shf; }
+                    { int shf = (e3 >> 9) & 7; t3_0 += a3_0 << shf; t3_1 += a3_1 << shf; t3_2 += a3_2 << shf; t3_3 += a3_3 << shf; }
+                    { int shf = (e4 >> 9) & 7; t4_0 += a4_0 << shf; t4_1 += a4_1 << shf; t4_2 += a4_2 << shf; t4_3 += a4_3 << shf; }
+                    { int shf = (e5 >> 9) & 7; t5_0 += a5_0 << shf; t5_1 += a5_1 << shf; t5_2 += a5_2 << shf; t5_3 += a5_3 << shf; }
+                    { int shf = (e6 >> 9) & 7; t6_0 += a6_0 << shf; t6_1 += a6_1 << shf; t6_2 += a6_2 << shf; t6_3 += a6_3 << shf; }
+                    { int shf = (e7 >> 9) & 7; t7_0 += a7_0 << shf; t7_1 += a7_1 << shf; t7_2 += a7_2 << shf; t7_3 += a7_3 << shf; }
+                }
+                uint h0 = sh[(c0 + 0) * 2 + 1], h1 = sh[(c0 + 1) * 2 + 1], h2 = sh[(c0 + 2) * 2 + 1], h3 = sh[(c0 + 3) * 2 + 1];
+                float d0 = HalfToFloat(h0 & 0xFFFFu), n0 = HalfToFloat(h0 >> 16), d1 = HalfToFloat(h1 & 0xFFFFu), n1 = HalfToFloat(h1 >> 16), d2 = HalfToFloat(h2 & 0xFFFFu), n2 = HalfToFloat(h2 >> 16), d3 = HalfToFloat(h3 & 0xFFFFu), n3 = HalfToFloat(h3 >> 16);
+                { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f0_0 += s * (d0 * (t0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (t0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (t0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (t0_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f1_0 += s * (d0 * (t1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (t1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (t1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (t1_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f2_0 += s * (d0 * (t2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (t2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (t2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (t2_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f3_0 += s * (d0 * (t3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (t3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (t3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (t3_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f4_0 += s * (d0 * (t4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (t4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (t4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (t4_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f5_0 += s * (d0 * (t5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (t5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (t5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (t5_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f6_0 += s * (d0 * (t6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (t6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (t6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (t6_3 + 128 * S) + n3 * sF); }
+                { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
+                  f7_0 += s * (d0 * (t7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (t7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (t7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (t7_3 + 128 * S) + n3 * sF); }
             }
             Group.Barrier();
         }

@@ -81,7 +81,7 @@ public sealed class WanDiT : IDisposable
 
     public WanDiT(Accelerator accelerator, DiTKernels kernels, GpuWeights weights)
     {
-        _acc = accelerator; _k = kernels; _wk = new WanKernels(accelerator); _w = weights; _mat = new Flux2.Flux2Weights(accelerator, weights, ownsWeights: false);
+        _acc = accelerator; _k = kernels; _wk = new WanKernels(accelerator); _w = weights; _mat = new Flux2.Flux2Weights(accelerator, weights, ownsWeights: false) { AutoW8A8 = true };   // W8A8 (two-level scales) costs a Wan clip no more than the 8-bit weights: Wan_W8A8_ClipCost
         _dim = weights.Shape("patch_embedding.weight")[0];
         _inCh = weights.Shape("patch_embedding.weight")[1] / (PatchTime * PatchH * PatchW);
         _outCh = weights.Shape("head.head.weight")[0] / (PatchTime * PatchH * PatchW);

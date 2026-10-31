@@ -3,19 +3,19 @@
 EDIT THIS FILE, NOT THE OUTPUT.
 
 W8A8 GEMM on packed int8 dot products (IntrinsicMath.Dot4I8Packed: WGSL dot4I8Packed, CUDA dp4a, the exact four-term form elsewhere); see Q8Linear.cs for the formats.
-  o[m, n] = act(bias[n] + sum_b s[m, b] (d[n, b] (dot_b + 128 S[m, b]) + mn[n, b] S[m, b]))
+The weights come in blocks of 32 (one d, m per block); the activations are quantised per sub-block of AB = 32, 16 or 8 (one scale s and integer sum S each), so one weight
+block holds 32 / AB activation sub-blocks:
+  o[m, n] = act(bias[n] + sum_b sum_sb s[m, b, sb] (d[n, b] (dot_b,sb + 128 S[m, b, sb]) + mn[n, b] S[m, b, sb]))
+A smaller AB confines an activation outlier to fewer values (finer scales) at the cost of more float folds per block. One kernel per AB: Kernel32, Kernel16, Kernel8.
 Group = 256 threads as 16 x 16; a group owns BM = 16 * TM rows and BN = 16 * TN columns; thread (ty, tx) owns rows ty * TM + i and columns tx * TN + j.
-Per barrier pair KB weight blocks of 32 are staged: activations [BM][8 KB words], weights [BN][8 KB words] made signed (XOR 0x80), row strides padded by one word
-(lanes reading columns tx * TN + j hit different banks). Each block's dots accumulate in int32 registers (TM x TN scalars), then fold into the float accumulators with the
-block's scales. Everything is unrolled into scalars so a shader compiler keeps them in registers.
+Per barrier pair KB weight blocks of 32 are staged (2 for AB = 32, 1 for 16 and 8: shared memory stays within WebGPU's guaranteed 16 KB): activations [BM][8 KB words], weights [BN][8 KB words] made signed (XOR 0x80), row strides padded by one word
+(lanes reading columns tx * TN + j hit different banks). Each sub-block's dots accumulate in int32 registers (TM x TN scalars), then fold into the float accumulators with
+the scales. Everything is unrolled into scalars so a shader compiler keeps them in registers.
 """
 import sys
 
-TM, TN, KB = 8, 4, 2
+TM, TN = 8, 4
 BM, BN, TH = 16 * TM, 16 * TN, 256
-W = 8 * KB                 # words per staged row
-SX = W + 1                 # padded strides
-SW = W + 1
 
 out = []
 w = out.append
@@ -33,7 +33,7 @@ w("using BV = ArrayView1D<BFloat16, Stride1D.Dense>;")
 w("")
 w("internal static class Q8Gemm")
 w("{")
-w(f"    public const int BM = {BM}, BN = {BN}, Threads = {TH}, BlocksPerStage = {KB};")
+w(f"    public const int BM = {BM}, BN = {BN}, Threads = {TH};")
 w("")
 w("    private static float HalfToFloat(uint h)")
 w("    {")
@@ -41,69 +41,165 @@ w("        uint sign = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu
 w("        float r = exp == 0u ? man * (1f / 16777216f) : exp == 31u ? 65504f : Interop.IntAsFloat(((exp + 112u) << 23) | (man << 13));")
 w("        return sign == 1u ? -r : r;")
 w("    }")
-w("")
-w(f"    /// <summary>grid = ceil(rows / {BM}) * ceil(N / {BN}), group = {TH}. Rows m0 .. m0 + rows of the quantised activations.</summary>")
-w("    public static void Kernel(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)")
-w("    {")
-w(f"        int tilesN = (N + {BN - 1}) / {BN};")
-w("        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;")
-w("        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;")
-w(f"        var sx = SharedMemory.Allocate<uint>({BM * SX});")
-w(f"        var sw = SharedMemory.Allocate<uint>({BN * SW});")
-w(f"        var ss = SharedMemory.Allocate<float>({BM * KB});")
-w(f"        var sS = SharedMemory.Allocate<int>({BM * KB});")
-w(f"        var sd = SharedMemory.Allocate<float>({BN * KB});")
-w(f"        var sm = SharedMemory.Allocate<float>({BN * KB});")
-for i in range(TM):
-    w("        float " + ", ".join(f"f{i}_{j} = 0f" for j in range(TN)) + ";")
-w("        int blocks = K / 32, kw = K / 4;")
-w(f"        int r0 = ty * {TM}, c0 = tx * {TN};")
-w(f"        for (int b0 = 0; b0 < blocks; b0 += {KB})")
-w("        {")
-w(f"            // stage {KB} blocks: activation rows and weight columns (signed), outside rows / columns / blocks as zeros")
-w(f"            for (int idx = tid; idx < {BM * W}; idx += {TH})")
-w(f"            {{ int r = idx / {W}, wd = idx % {W}, gr = tm * {BM} + r, b = b0 + wd / 8;")
-w(f"              sx[r * {SX} + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }}")
-w(f"            for (int idx = tid; idx < {BN * W}; idx += {TH})")
-w(f"            {{ int c = idx / {W}, wd = idx % {W}, gc = tn * {BN} + c, b = b0 + wd / 8;")
-w(f"              sw[c * {SW} + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }}")
-w(f"            for (int idx = tid; idx < {BM * KB}; idx += {TH})")
-w(f"            {{ int r = idx / {KB}, kb = idx % {KB}, gr = tm * {BM} + r, b = b0 + kb;")
-w(f"              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * blocks + b;")
-w(f"              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; }}")
-w(f"            for (int idx = tid; idx < {BN * KB}; idx += {TH})")
-w(f"            {{ int c = idx / {KB}, kb = idx % {KB}, gc = tn * {BN} + c, b = b0 + kb;")
-w(f"              uint h = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u;")
-w(f"              sd[idx] = HalfToFloat(h & 0xFFFFu); sm[idx] = HalfToFloat(h >> 16); }}")
-w("            Group.Barrier();")
-for kb in range(KB):
-    w(f"            {{")
+
+
+def kernel(AB, KB):
+    # KB weight blocks staged per barrier pair: 2 for AB = 32, 1 for the finer sub-blocks (their scales would push shared memory past WebGPU's guaranteed 16 KB)
+    W = 8 * KB                 # words per staged row
+    SX = W + 1                 # padded strides
+    SW = W + 1
+    NSB = 32 // AB             # activation sub-blocks per weight block
+    WSB = AB // 4              # words per sub-block
+    w("")
+    w(f"    /// <summary>Activation sub-blocks of {AB}. grid = ceil(rows / {BM}) * ceil(N / {BN}), group = {TH}. Rows m0 .. m0 + rows of the quantised activations.</summary>")
+    w(f"    public static void Kernel{AB}(UV xq, FV xs, IV xsum, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)")
+    w("    {")
+    w(f"        int tilesN = (N + {BN - 1}) / {BN};")
+    w("        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;")
+    w("        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;")
+    w(f"        var sx = SharedMemory.Allocate<uint>({BM * SX});")
+    w(f"        var sw = SharedMemory.Allocate<uint>({BN * SW});")
+    w(f"        var ss = SharedMemory.Allocate<float>({BM * KB * NSB});")
+    w(f"        var sS = SharedMemory.Allocate<int>({BM * KB * NSB});")
+    w(f"        var sd = SharedMemory.Allocate<float>({BN * KB});")
+    w(f"        var sm = SharedMemory.Allocate<float>({BN * KB});")
     for i in range(TM):
-        w("                int " + ", ".join(f"a{i}_{j} = 0" for j in range(TN)) + ";")
-    for wd in range(8):
-        col = kb * 8 + wd
-        w("                {")
-        w("                    uint " + ", ".join(f"x{i} = sx[(r0 + {i}) * {SX} + {col}]" for i in range(TM)) + ";")
-        w("                    uint " + ", ".join(f"y{j} = sw[(c0 + {j}) * {SW} + {col}]" for j in range(TN)) + ";")
-        for i in range(TM):
-            w("                    " + " ".join(f"a{i}_{j} = IntrinsicMath.Dot4I8Packed(x{i}, y{j}, a{i}_{j});" for j in range(TN)))
-        w("                }")
-    w(f"                // block -> float: s (d (dot + 128 S) + m S)")
-    w("                float " + ", ".join(f"d{j} = sd[(c0 + {j}) * {KB} + {kb}], n{j} = sm[(c0 + {j}) * {KB} + {kb}]" for j in range(TN)) + ";")
-    for i in range(TM):
-        w(f"                {{ float s = ss[(r0 + {i}) * {KB} + {kb}]; int S = sS[(r0 + {i}) * {KB} + {kb}]; float sF = S;")
-        w("                  " + " ".join(f"f{i}_{j} += s * (d{j} * (a{i}_{j} + 128 * S) + n{j} * sF);" for j in range(TN)) + " }")
-    w("            }")
-w("            Group.Barrier();")
-w("        }")
-w(f"        int gr0 = tm * {BM} + r0, gc0 = tn * {BN} + c0;")
-for i in range(TM):
-    w(f"        if (gr0 + {i} < rows)")
-    w(f"        {{ long ob = (long)(m0 + gr0 + {i}) * N;")
-    for j in range(TN):
-        w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = DiTKernels.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
+        w("        float " + ", ".join(f"f{i}_{j} = 0f" for j in range(TN)) + ";")
+    w(f"        int blocks = K / 32, kw = K / 4, sub = K / {AB};")
+    w(f"        int r0 = ty * {TM}, c0 = tx * {TN};")
+    w(f"        for (int b0 = 0; b0 < blocks; b0 += {KB})")
+    w("        {")
+    w(f"            // stage {KB} blocks: activation rows and weight columns (signed), outside rows / columns / blocks as zeros")
+    w(f"            for (int idx = tid; idx < {BM * W}; idx += {TH})")
+    w(f"            {{ int r = idx / {W}, wd = idx % {W}, gr = tm * {BM} + r, b = b0 + wd / 8;")
+    w(f"              sx[r * {SX} + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }}")
+    w(f"            for (int idx = tid; idx < {BN * W}; idx += {TH})")
+    w(f"            {{ int c = idx / {W}, wd = idx % {W}, gc = tn * {BN} + c, b = b0 + wd / 8;")
+    w(f"              sw[c * {SW} + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }}")
+    w(f"            for (int idx = tid; idx < {BM * KB * NSB}; idx += {TH})")
+    w(f"            {{ int r = idx / {KB * NSB}, q = idx % {KB * NSB}, gr = tm * {BM} + r, b = b0 + q / {NSB};")
+    w(f"              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * sub + (long)b0 * {NSB} + q;")
+    w(f"              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; }}")
+    w(f"            for (int idx = tid; idx < {BN * KB}; idx += {TH})")
+    w(f"            {{ int c = idx / {KB}, kb = idx % {KB}, gc = tn * {BN} + c, b = b0 + kb;")
+    w(f"              uint h = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u;")
+    w(f"              sd[idx] = HalfToFloat(h & 0xFFFFu); sm[idx] = HalfToFloat(h >> 16); }}")
+    w("            Group.Barrier();")
+    for kb in range(KB):
+        w("            {")
+        w("                float " + ", ".join(f"d{j} = sd[(c0 + {j}) * {KB} + {kb}], n{j} = sm[(c0 + {j}) * {KB} + {kb}]" for j in range(TN)) + ";")
+        for sb in range(NSB):
+            w("                {")
+            for i in range(TM):
+                w("                    int " + ", ".join(f"a{i}_{j} = 0" for j in range(TN)) + ";")
+            for wd in range(WSB):
+                col = kb * 8 + sb * WSB + wd
+                w("                    {")
+                w("                        uint " + ", ".join(f"x{i} = sx[(r0 + {i}) * {SX} + {col}]" for i in range(TM)) + ";")
+                w("                        uint " + ", ".join(f"y{j} = sw[(c0 + {j}) * {SW} + {col}]" for j in range(TN)) + ";")
+                for i in range(TM):
+                    w("                        " + " ".join(f"a{i}_{j} = IntrinsicMath.Dot4I8Packed(x{i}, y{j}, a{i}_{j});" for j in range(TN)))
+                w("                    }")
+            w(f"                    // sub-block -> float: s (d (dot + 128 S) + m S)")
+            for i in range(TM):
+                w(f"                    {{ int q = (r0 + {i}) * {KB * NSB} + {kb * NSB + sb}; float s = ss[q]; int S = sS[q]; float sF = S;")
+                w("                      " + " ".join(f"f{i}_{j} += s * (d{j} * (a{i}_{j} + 128 * S) + n{j} * sF);" for j in range(TN)) + " }")
+            w("                }")
+        w("            }")
+    w("            Group.Barrier();")
     w("        }")
-w("    }")
+    w(f"        int gr0 = tm * {BM} + r0, gc0 = tn * {BN} + c0;")
+    for i in range(TM):
+        w(f"        if (gr0 + {i} < rows)")
+        w(f"        {{ long ob = (long)(m0 + gr0 + {i}) * N;")
+        for j in range(TN):
+            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = DiTKernels.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
+        w("        }")
+    w("    }")
+
+
+def kernel_two_level(KB=2):
+    """Two-level activation scales: one float scale per block of 32 (its largest value) and a power-of-two exponent per sub-block of 8 (the sub-block is quantised 2^e
+    times finer, e = 0..7). Each sub-block's int32 dot is shifted left by its packed (7 - e) and added to the block's integer sum, so the float fold stays one per block:
+    xs = s_block / 2^7, xsum = sum over sub-blocks of (sum q) << (7 - e), xe = the four shifts packed 3 bits each."""
+    W = 8 * KB
+    SX = W                     # activation rows are broadcast reads (every lane of a row group reads the same row): no padding needed
+    SW = W + 1
+    # shared memory: 128 x 16 + 64 x 17 words + 3 x 256 per-row words + 128 packed half pairs = 4032 words, within WebGPU's guaranteed 16 KB
+    w("")
+    w(f"    /// <summary>Two-level activation scales (block float scale, sub-block power-of-two exponents). grid = ceil(rows / {BM}) * ceil(N / {BN}), group = {TH}.</summary>")
+    w("    public static void KernelTwoLevel(UV xq, FV xs, IV xsum, IV xe, UV wq, BV bias, FV o, int rows, int m0, int K, int N, int hasBias, int act)")
+    w("    {")
+    w(f"        int tilesN = (N + {BN - 1}) / {BN};")
+    w("        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX % tilesN;")
+    w("        int tid = Group.IdxX, ty = tid >> 4, tx = tid & 15;")
+    w(f"        var sx = SharedMemory.Allocate<uint>({BM * SX});")
+    w(f"        var sw = SharedMemory.Allocate<uint>({BN * SW});")
+    w(f"        var ss = SharedMemory.Allocate<float>({BM * KB});")
+    w(f"        var sS = SharedMemory.Allocate<int>({BM * KB});")
+    w(f"        var sE = SharedMemory.Allocate<int>({BM * KB});")
+    w(f"        var sh = SharedMemory.Allocate<uint>({BN * KB});")
+    for i in range(TM):
+        w("        float " + ", ".join(f"f{i}_{j} = 0f" for j in range(TN)) + ";")
+    w("        int blocks = K / 32, kw = K / 4;")
+    w(f"        int r0 = ty * {TM}, c0 = tx * {TN};")
+    w(f"        for (int b0 = 0; b0 < blocks; b0 += {KB})")
+    w("        {")
+    w(f"            for (int idx = tid; idx < {BM * W}; idx += {TH})")
+    w(f"            {{ int r = idx / {W}, wd = idx % {W}, gr = tm * {BM} + r, b = b0 + wd / 8;")
+    w(f"              sx[r * {SX} + wd] = gr < rows && b < blocks ? xq[(long)(m0 + gr) * kw + b * 8 + (wd & 7)] : 0u; }}")
+    w(f"            for (int idx = tid; idx < {BN * W}; idx += {TH})")
+    w(f"            {{ int c = idx / {W}, wd = idx % {W}, gc = tn * {BN} + c, b = b0 + wd / 8;")
+    w(f"              sw[c * {SW} + wd] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9 + 1 + (wd & 7)] ^ 0x80808080u : 0u; }}")
+    w(f"            for (int idx = tid; idx < {BM * KB}; idx += {TH})")
+    w(f"            {{ int r = idx / {KB}, kb = idx % {KB}, gr = tm * {BM} + r, b = b0 + kb;")
+    w(f"              bool ok = gr < rows && b < blocks; long at = (long)(m0 + gr) * blocks + b;")
+    w(f"              ss[idx] = ok ? xs[at] : 0f; sS[idx] = ok ? xsum[at] : 0; sE[idx] = ok ? xe[at] : 0; }}")
+    w(f"            for (int idx = tid; idx < {BN * KB}; idx += {TH})")
+    w(f"            {{ int c = idx / {KB}, kb = idx % {KB}, gc = tn * {BN} + c, b = b0 + kb;")
+    w(f"              sh[idx] = gc < N && b < blocks ? wq[((long)gc * blocks + b) * 9] : 0u; }}")
+    w("            Group.Barrier();")
+    for kb in range(KB):
+        w("            {")
+        w("                int " + ", ".join(f"e{i} = sE[(r0 + {i}) * {KB} + {kb}]" for i in range(TM)) + ";")
+        for i in range(TM):
+            w("                int " + ", ".join(f"t{i}_{j} = 0" for j in range(TN)) + ";")
+        for sb in range(4):
+            w("                {")
+            for i in range(TM):
+                w("                    int " + ", ".join(f"a{i}_{j} = 0" for j in range(TN)) + ";")
+            for wd in range(2):
+                col = kb * 8 + sb * 2 + wd
+                w("                    {")
+                w("                        uint " + ", ".join(f"x{i} = sx[(r0 + {i}) * {SX} + {col}]" for i in range(TM)) + ";")
+                w("                        uint " + ", ".join(f"y{j} = sw[(c0 + {j}) * {SW} + {col}]" for j in range(TN)) + ";")
+                for i in range(TM):
+                    w("                        " + " ".join(f"a{i}_{j} = IntrinsicMath.Dot4I8Packed(x{i}, y{j}, a{i}_{j});" for j in range(TN)))
+                w("                    }")
+            for i in range(TM):
+                w(f"                    {{ int shf = (e{i} >> {3 * sb}) & 7; " + " ".join(f"t{i}_{j} += a{i}_{j} << shf;" for j in range(TN)) + " }")
+            w("                }")
+        w("                uint " + ", ".join(f"h{j} = sh[(c0 + {j}) * {KB} + {kb}]" for j in range(TN)) + ";")
+        w("                float " + ", ".join(f"d{j} = HalfToFloat(h{j} & 0xFFFFu), n{j} = HalfToFloat(h{j} >> 16)" for j in range(TN)) + ";")
+        for i in range(TM):
+            w(f"                {{ int q = (r0 + {i}) * {KB} + {kb}; float s = ss[q]; int S = sS[q]; float sF = S;")
+            w("                  " + " ".join(f"f{i}_{j} += s * (d{j} * (t{i}_{j} + 128 * S) + n{j} * sF);" for j in range(TN)) + " }")
+        w("            }")
+    w("            Group.Barrier();")
+    w("        }")
+    w(f"        int gr0 = tm * {BM} + r0, gc0 = tn * {BN} + c0;")
+    for i in range(TM):
+        w(f"        if (gr0 + {i} < rows)")
+        w(f"        {{ long ob = (long)(m0 + gr0 + {i}) * N;")
+        for j in range(TN):
+            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = DiTKernels.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
+        w("        }")
+    w("    }")
+
+
+for ab, kb in ((32, 2), (16, 1), (8, 1)):
+    kernel(ab, kb)
+kernel_two_level()
 w("}")
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
 print("wrote", sys.argv[1], len(out), "lines")
