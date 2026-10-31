@@ -2,7 +2,7 @@
 #:property PublishAot=false
 // Where a GgufBatchDecoder step goes: the time per step unprofiled, then per kernel (GgufBatchDecoder.ProfileKernels: a sync after every launch), for 1 and N sequences.
 //
-//   dotnet run batch_profile.cs -c Release -- GGUF [cuda|opencl] [N=8] [steps=32]
+//   dotnet run batch_profile.cs -c Release -- GGUF [cuda|opencl] [N=8] [steps=32] [context=0]
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
@@ -12,12 +12,19 @@ using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
 
 string gguf = args[0], which = args.Length > 1 ? args[1] : "cuda";
-int N = args.Length > 2 ? int.Parse(args[2]) : 8, steps = args.Length > 3 ? int.Parse(args[3]) : 32;
+int N = args.Length > 2 ? int.Parse(args[2]) : 8, steps = args.Length > 3 ? int.Parse(args[3]) : 32, ctxLen = args.Length > 4 ? int.Parse(args[4]) : 0;
 using var context = MLContext.Create().ToContext();
 using var acc = which == "opencl" ? context.GetCLDevices()[0].CreateAccelerator(context) : context.GetCudaDevices()[0].CreateAccelerator(context);
 using var dec = await GgufBatchDecoder.CreateAsync(acc, File.OpenRead(gguf), maxSeq: 1024, maxBatch: Math.Max(N, 1));
 var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
-var (ids, _) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", "Explain in detail how a rainbow forms.") }, thinking: false);
+// CONTEXT > 0: the question repeated until the prompt is about that long (attention cost grows with the context)
+string question = "Explain in detail how a rainbow forms.";
+var (ids, _) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", question) }, thinking: false);
+while (ctxLen > 0 && ids.Length < ctxLen)
+{
+    question += " Explain in detail how a rainbow forms.";
+    (ids, _) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", question) }, thinking: false);
+}
 Console.WriteLine($"{acc.Name} ({acc.AcceleratorType}), {dec.Model.Architecture} hidden {dec.Hidden} layers {dec.Layers}, prompt {ids.Length} tokens");
 foreach (int n in new[] { 1, N })
 {

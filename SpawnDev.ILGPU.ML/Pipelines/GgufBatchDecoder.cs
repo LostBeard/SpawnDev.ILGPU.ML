@@ -73,6 +73,13 @@ public sealed class GgufBatchDecoder : IDisposable
         KernelTimes[name] = KernelTimes.GetValueOrDefault(name) + (now - _profT) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         _profT = now;
     }
+    /// <summary>
+    /// Attention as two kernels (split-K: per row, head and chunk of 256 keys the scores, their max and exp-sum and P.V in one group; then the chunks merged) instead
+    /// of three (scores, a thread-per-row softmax, P.V with a thread per output walking every key). On by default where a group can be a head wide; set false for the
+    /// three-kernel path (the A/B and the fallback).
+    /// </summary>
+    public bool FusedAttention { get; set; }
+    private const int AttChunk = 256;
     /// <summary>Tokens per row the device keeps after each forward (the nucleus is drawn from these unless it is wider).</summary>
     public const int Candidates = 64;
     /// <summary>Draws since <see cref="PrefillAsync"/> that read their full logits row: the nucleus was wider than the candidates, or more than <see cref="SelectCap"/> tokens reached the floor.</summary>
@@ -86,7 +93,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _logits, _maxV, _selV, _cand;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _logits, _maxV, _selV, _cand;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
@@ -111,6 +118,8 @@ public sealed class GgufBatchDecoder : IDisposable
         if (Vocab >= 1 << 24) throw new NotSupportedException($"vocabulary {Vocab}: candidate ids travel as floats (exact below 2^24)");
         _head = model.Tensors.Any(t => t.Name == "output.weight") ? "output.weight" : "token_embd.weight";
         MaxSeq = maxSeq; MaxBatch = maxBatch;
+        // the fused attention runs a group per head (a power of two up to 256 threads; WebGL has no groups)
+        FusedAttention = accelerator.AcceleratorType != AcceleratorType.WebGL && HeadDim <= AttChunk && (HeadDim & (HeadDim - 1)) == 0 && HeadDim <= accelerator.MaxNumThreadsPerGroup;
         var inv = new float[HeadDim / 2];
         for (int k = 0; k < inv.Length; k++) inv[k] = 1f / MathF.Pow(_theta, 2f * k / HeadDim);
         _invFreq = Own(_acc.Allocate1D(inv));
@@ -234,7 +243,6 @@ public sealed class GgufBatchDecoder : IDisposable
         var att = Buf(ref _att, (long)R * C); var proj = Buf(ref _proj, (long)R * C);
         var gate = Buf(ref _gate, (long)R * FfnDim); var up = Buf(ref _up, (long)R * FfnDim);
         int nk = p + (decode ? 1 : R);
-        var scores = Buf(ref _scores, (long)Heads * R * nk);
         int mode = decode ? 1 : 0;
         // the residual stream alternates between hid and hid2; every residual add is fused with the norm after it (a layer's FFN add with the next layer's
         // attention norm, the last one with the output norm): one group per row, not a thread per row walking the row twice
@@ -248,9 +256,21 @@ public sealed class GgufBatchDecoder : IDisposable
             _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
             _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode); Prof("rope");
             _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
-            _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim)); Prof("scores");
-            _softmax!(Heads * R, scores, nk); Prof("softmax");
-            _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
+            if (FusedAttention)
+            {
+                // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
+                int ach = (nk + AttChunk - 1) / AttChunk;
+                var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
+                _attPartial!(new KernelConfig(R * Heads * ach, HeadDim), q, _kc[l].View, _vc[l].View, seqView, part, ml, Heads, KvHeads, MaxSeq, p, mode, ach, 1f / MathF.Sqrt(HeadDim)); Prof("attn");
+                _attCombine!((int)((long)R * C), part, ml, att, HeadDim, ach); Prof("attn-merge");
+            }
+            else
+            {
+                var scores = Buf(ref _scores, (long)Heads * R * nk);
+                _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim)); Prof("scores");
+                _softmax!(Heads * R, scores, nk); Prof("softmax");
+                _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
+            }
             Gemm(att, b + "attn_output.weight", proj, R, C, C); Prof("o");
             AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
             Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Prof("gate");
@@ -442,6 +462,8 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, int>? _softmax;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
     private Action<Index1D, FV, FV>? _swiglu;
+    private Action<KernelConfig, FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>? _attPartial;
+    private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
     private Action<Index1D, FV, FV, IV, int, int>? _chunkMax;
@@ -460,6 +482,11 @@ public sealed class GgufBatchDecoder : IDisposable
         _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
         _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
+        if (FusedAttention)
+        {
+            _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialImpl);
+            _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
+        }
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
         _chunkMax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
@@ -553,6 +580,80 @@ public sealed class GgufBatchDecoder : IDisposable
             }
             o[ob + pos] = v; o[ob + K + pos] = id;
         }
+    }
+
+    // split-K attention, part 1. Group g = (row r, head h, chunk ch of AttChunk keys), a thread per head dimension (D = group size, a power of two). The chunk's
+    // scores go to shared memory, then its max m and exp-sum l (masked keys contribute 0), then thread d sums p_j * v[j, d] over the chunk (coalesced across d).
+    // part[g, d] = that sum, ml[g] = (m, l).
+    private static void AttnPartialImpl(FV q, FV kc, FV vc, IV seqs, FV part, FV ml, int H, int kvH, int maxSeq, int p, int mode, int nch, float scale)
+    {
+        int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
+        int ch = g % nch, rest = g / nch, h = rest % H, r = rest / H;
+        int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
+        int kvC = kvH * D, hk = h / (H / kvH), j0 = ch * AttChunk;
+        var sc = SharedMemory.Allocate<float>(AttChunk);
+        var red = SharedMemory.Allocate<float>(AttChunk);
+        long qo = ((long)r * H + h) * D;
+        for (int jj = t; jj < AttChunk; jj += D)
+        {
+            int j = j0 + jj;
+            float s = -1e30f;
+            if (j <= pos)
+            {
+                long ko = ((long)seq * maxSeq + j) * kvC + hk * D;
+                float acc = 0f;
+                for (int d = 0; d < D; d++) acc += q[qo + d] * kc[ko + d];
+                s = acc * scale;
+            }
+            sc[jj] = s;
+        }
+        Group.Barrier();
+        float m = -1e30f;
+        for (int jj = t; jj < AttChunk; jj += D) m = MathF.Max(m, sc[jj]);
+        red[t] = m;
+        Group.Barrier();
+        for (int s2 = D / 2; s2 > 0; s2 >>= 1)
+        {
+            if (t < s2) red[t] = MathF.Max(red[t], red[t + s2]);
+            Group.Barrier();
+        }
+        m = red[0];
+        Group.Barrier();
+        float l = 0f;
+        for (int jj = t; jj < AttChunk; jj += D)
+        {
+            float e = sc[jj] <= -1e29f ? 0f : MathF.Exp(sc[jj] - m);
+            sc[jj] = e; l += e;
+        }
+        red[t] = l;
+        Group.Barrier();
+        for (int s2 = D / 2; s2 > 0; s2 >>= 1)
+        {
+            if (t < s2) red[t] += red[t + s2];
+            Group.Barrier();
+        }
+        l = red[0];
+        int keys = Math.Min(AttChunk, pos + 1 - j0);
+        float o = 0f;
+        long vo = (long)seq * maxSeq * kvC + hk * D + t;
+        for (int jj = 0; jj < keys; jj++) o += sc[jj] * vc[vo + (long)(j0 + jj) * kvC];
+        part[(long)g * D + t] = o;
+        if (t == 0) { ml[2L * g] = m; ml[2L * g + 1] = l; }
+    }
+    // split-K attention, part 2: out[r, h * D + d] = sum_ch e^(m_ch - M) part[ch, d] / sum_ch e^(m_ch - M) l_ch (chunks without a key skipped)
+    private static void AttnCombineImpl(Index1D i, FV part, FV ml, FV o, int D, int nch)
+    {
+        int ii = i, d = ii % D, rh = ii / D;
+        long g0 = (long)rh * nch;
+        float M = -1e30f;
+        for (int c = 0; c < nch; c++) if (ml[2 * (g0 + c) + 1] > 0f) M = MathF.Max(M, ml[2 * (g0 + c)]);
+        float num = 0f, den = 0f;
+        for (int c = 0; c < nch; c++)
+        {
+            float lc = ml[2 * (g0 + c) + 1];
+            if (lc > 0f) { float w = MathF.Exp(ml[2 * (g0 + c)] - M); num += w * part[(g0 + c) * D + d]; den += w * lc; }
+        }
+        o[ii] = num / den;
     }
 
     // region 0's first n values into regions 1, 2, ... (sequence s + 1 gets element i of index s * n + i)

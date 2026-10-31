@@ -33,7 +33,7 @@ public abstract partial class MLTestBase
                 want = await pipe.GenerateAsync(messages, new GenerationConfig { MaxNewTokens = maxNew, Strategy = "greedy" }, thinking: false);
         }
         var src = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
-        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 512, maxBatch: 4);
+        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 1024, maxBatch: 4);
         var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
         var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, messages, thinking: false);
         var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
@@ -90,15 +90,36 @@ public abstract partial class MLTestBase
             }
         }
         bool compactSame = Enumerable.Range(0, 4).All(s => compacted[s].SequenceEqual(ridden[s]));
+        // the split-K attention against the three-kernel path past one chunk of keys (a ~600-token prompt: 3 chunks): the prefill's logits and, after four
+        // decode steps of four sequences, every row's logits
+        var longMsgs = new List<(string, string)> { ("user", string.Concat(Enumerable.Repeat("Name three primary colors and say why they are called primary. ", 40))) };
+        var (longIds, _) = ChatTemplates.BuildChatPrompt(dec.Model, tok, longMsgs, thinking: false);
+        async Task<(float[] Prefill, float[] Steps)> LongRun(bool fused)
+        {
+            dec.FusedAttention = fused;
+            await dec.PrefillAsync(longIds, 0f);
+            var pre = await dec.ReadLogitsAsync();
+            dec.Fork(4);
+            var nx = new[] { 11, 22, 33, 44 };
+            for (int s = 0; s < 4; s++) await dec.StepAsync(nx.Select(x => x + s).ToArray(), 0f);
+            return (pre, await dec.ReadLogitsAsync());
+        }
+        bool fusedDefault = dec.FusedAttention;
+        var fusedRun = await LongRun(true);
+        var plainRun = await LongRun(false);
+        dec.FusedAttention = fusedDefault;
+        static float RelDiff(float[] a, float[] b) { float m = 0f, s = 0f; for (int i = 0; i < a.Length; i++) { m = MathF.Max(m, MathF.Abs(a[i] - b[i])); s = MathF.Max(s, MathF.Abs(b[i])); } return m / s; }
+        float attPre = RelDiff(fusedRun.Prefill, plainRun.Prefill), attSteps = RelDiff(fusedRun.Steps, plainRun.Steps);
+        bool attOk = attPre < 1e-3f && attSteps < 1e-3f;
         int lengths = compacted.Select(c => c.Length).Distinct().Count();
         string got = Text(one[0]);
         bool same = got == want, rowsEqual = four.All(r => r.SequenceEqual(one[0]));
         int distinct = sampled.Select(Text).Distinct().Count();
         var report = $"{accelerator.AcceleratorType}: greedy {(same ? "= the generator" : "DIFFERS from the generator")} ({one[0].Length} tokens); four greedy rows {(rowsEqual ? "identical" : "DIFFER")}; four samples {distinct} distinct; "
-            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))})";
+            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps)";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
-        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
+        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2 || !attOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
 }
