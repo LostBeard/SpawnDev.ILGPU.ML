@@ -164,4 +164,67 @@ public abstract partial class MLTestBase
         if (!(worstTc < 0.08 && worstExact < 1e-3 && condExact < 1e-4 && q8 < 0.2)) throw new Exception("image-to-video deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
+
+    /// <summary>
+    /// The other conditioning modes against the real LTXConditionPipeline (ref_condition_dump.py, 480x320 x 25, exact math: CUDA with the tensor cores off, or OpenCL / WebGPU):
+    /// <c>cond_kf.npz</c> = a picture at frame 0 (strength 1) plus a KEYFRAME picture at frame 16 with strength 0.7 (150 extra tokens placed at frame 16, blended with noise, timestep
+    /// 300 throughout); <c>cond_clip.npz</c> = a 17-frame clip at frame 8 (its first two latent frames become 300 extra tokens at frames 8 / 9, its third replaces latent frame 3)
+    /// plus a 9-frame clip at frame 0 with strength 0.6 (latent frames 0 and 1 blended, timestep 400). Every latent frame of the final latent must match to 1e-3 (image to video: 1.4e-4).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx_KeyframeAndClipConditions_MatchReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the 3.9 GB DiT runs on a desktop GPU or WebGPU");
+        if (!File.Exists(Path.Combine(LtxDir, "ltx_dit_bf16.safetensors")) || !File.Exists(Path.Combine(LtxDir, "ltx_vae_encoder_f16.safetensors")) || !File.Exists(Path.Combine(LtxDir, "ref", "cond_kf.npz")))
+            throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var t5 = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", "t5_0.npz"));
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        var report = new List<string>();
+        double worst = 0;
+        bool saved = DiTKernels.EnableTensorCores;
+        try
+        {
+            DiTKernels.EnableTensorCores = false;
+            var pipe = new LtxPipeline(accelerator, LtxPaths.InFolder(LtxDir));
+            foreach (var (tag, specs) in new (string, (int Frames, int FrameIndex, float Strength)[])[]
+            {
+                ("kf", new[] { (1, 0, 1f), (1, 16, 0.7f) }),
+                ("clip", new[] { (17, 8, 1f), (9, 0, 0.6f) }),
+            })
+            {
+                using var fx = ZipFile.OpenRead(Path.Combine(LtxDir, "ref", $"cond_{tag}.npz"));
+                var conditions = specs.Select((s, i) => new LtxCondition { Pixels = WanNpz(fx, $"cond{i}_pixels").Data, Frames = s.Frames, FrameIndex = s.FrameIndex, Strength = s.Strength }).ToArray();
+                var req = new LtxRequest
+                {
+                    Prompt = "", PromptEmbedding = ctx.AsSpan(0, rows * 4096).ToArray(), Width = 480, Height = 320, Frames = 25, FrameRate = LtxFrameRate, Conditions = conditions,
+                    InitialNoise = WanNpz(fx, "noise").Data,
+                    PosteriorNoise = specs.Select((_, i) => WanNpz(fx, $"posterior{i}").Data).ToArray(),
+                    ConditionNoise = specs.Select((s, i) => (s, i)).Where(p => p.s.FrameIndex != 0).Select(p => WanNpz(fx, $"condnoise{p.i}").Data).ToArray(),   // in the order of the extra tokens
+                    StepNoise = Enumerable.Range(0, LtxSampler.DistilledFirstPass.Length).Select(s => WanNpz(fx, $"cond_noise{s}").Data).ToArray(),
+                };
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var got = await pipe.DenoiseAsync(req);
+                var (want, ws) = WanNpz(fx, "final");                                               // [128, Fz, h, w]
+                var m = WanCompare(got, want);
+                // each latent frame on its own: the conditioned ones barely move, so the whole-latent figure alone would hide the generated frames
+                int Fz = ws[1], hw = ws[2] * ws[3];
+                var frames = new List<string>();
+                for (int f = 0; f < Fz; f++)
+                {
+                    var gf = new float[128 * hw]; var wf = new float[128 * hw];
+                    for (int c = 0; c < 128; c++) { Array.Copy(got, ((long)c * Fz + f) * hw, gf, (long)c * hw, hw); Array.Copy(want, ((long)c * Fz + f) * hw, wf, (long)c * hw, hw); }
+                    double r = WanCompare(gf, wf).RelRms;
+                    frames.Add($"{r:E1}");
+                    worst = Math.Max(worst, r);
+                }
+                report.Add($"{tag} ({string.Join(" + ", specs.Select(s => $"{s.Frames} frame(s) at {s.FrameIndex} strength {s.Strength}"))}): final latent relRMS {m.RelRms:E2} (per latent frame {string.Join(" / ", frames)}), maxAbs {m.MaxAbs:F4} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalSeconds:F1} s");
+                worst = Math.Max(worst, m.RelRms);
+            }
+        }
+        finally { DiTKernels.EnableTensorCores = saved; }
+        LtxLog("Conditions", report);
+        if (!(worst < 1e-3)) throw new Exception("LTX conditioning deviates from the reference: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
 }

@@ -104,10 +104,11 @@ Files (`tools/ltx-harness/reference`): `export_dit_bf16.py` (the single-file che
 | VAE decode | 1.4e-4 (video), every stage tap 7e-5 to 3.3e-4 |
 | VAE encode (float32 reference on the CPU) | latent 1.9e-4 (a 256x192 picture) / 1.7e-4 (a 17-frame 128x96 clip: the temporal downsamplers' first-frame repeat), every stage tap 3e-5 to 1.4e-4 |
 | conditioned DiT (`LTXConditionPipeline`'s own calls: 150 tokens at t 0, 450 at t) | **3.5e-5 / 1.0e-5 at steps 0 / 5 with the tensor cores off**; 1.1e-2 / 6.7e-3 with them on |
+| keyframe (picture at 0 + picture at frame 16, strength 0.7: 150 extra tokens) / clips (17 frames at frame 8 + 9 frames at 0, strength 0.6: 300 extra tokens, latent frame 3 replaced) | worst latent frame 2.3e-4 / 7.2e-6 (exact math, CUDA and OpenCL; `Ltx_KeyframeAndClipConditions_MatchReference`) |
 | image to video, the whole sampler (480x320 x 25, the reference's draws) | condition latent 5.6e-6, **final latent 1.4e-4 with the tensor cores off** (OpenCL 1.2e-4, browser WebGPU 1.9e-4); 5.2e-2 with them on (each step 1.1e-2; the reference's own bf16 run is 5e-2 off on one step). The hosted 8-bit DiT: 1.2e-1 after the 7 steps, identical on CUDA and in the browser (the quantisation's cost, not a backend's) |
 
 Red checks: q RoPE off (DiT 0.84), unpatchify offsets swapped (VAE 0.18), a wrong T5 bucket distance (0.14 / 0.28), centred instead of causal time padding in the encoder (0.7), one timestep for every
-token run (1.26), the global timestep for conditioned tokens (0.80).
+token run (1.26), the global timestep for conditioned tokens (0.80), keyframe tokens placed at frame 0 instead of their frame (1.35 / 0.51).
 
 The image-to-video reference (`ref_condition_dump.py`) runs the real `LTXConditionPipeline` and must run with TF32 off: PyTorch's cuDNN convolutions default to TF32 on the GPU, which put 8e-4 of
 error into the reference's own encoding of the picture; the model grew that to 8e-3 over the steps, which looked like a port error until the reference was made float32 for real.
