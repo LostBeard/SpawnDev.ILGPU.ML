@@ -111,15 +111,39 @@ public abstract partial class MLTestBase
         static float RelDiff(float[] a, float[] b) { float m = 0f, s = 0f; for (int i = 0; i < a.Length; i++) { m = MathF.Max(m, MathF.Abs(a[i] - b[i])); s = MathF.Max(s, MathF.Abs(b[i])); } return m / s; }
         float attPre = RelDiff(fusedRun.Prefill, plainRun.Prefill), attSteps = RelDiff(fusedRun.Steps, plainRun.Steps);
         bool attOk = attPre < 1e-3f && attSteps < 1e-3f;
+        // joined projections (q|k|v and gate|up in one GEMV each, bias + rotary + store in one kernel) against separate ones: a second decoder loaded with
+        // JoinProjections off; each output column is computed alike, so the logits must agree after the prefill and four decode steps
+        async Task<(float[] Prefill, float[] Steps)> ShortRun(GgufBatchDecoder d)
+        {
+            await d.PrefillAsync(ids, 0f);
+            var pre = await d.ReadLogitsAsync();
+            d.Fork(4);
+            var nx = new[] { 11, 22, 33, 44 };
+            for (int s = 0; s < 4; s++) await d.StepAsync(nx.Select(x => x + s).ToArray(), 0f);
+            return (pre, await d.ReadLogitsAsync());
+        }
+        var joinedRun = await ShortRun(dec);
+        (float[] Prefill, float[] Steps) separateRun;
+        bool joinSaved = GgufBatchDecoder.JoinProjections;
+        GgufBatchDecoder.JoinProjections = false;
+        try
+        {
+            var src2 = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
+            using var sep = await GgufBatchDecoder.CreateAsync(accelerator, src2.Stream, maxSeq: 1024, maxBatch: 4);
+            separateRun = await ShortRun(sep);
+        }
+        finally { GgufBatchDecoder.JoinProjections = joinSaved; }
+        float joinPre = RelDiff(joinedRun.Prefill, separateRun.Prefill), joinSteps = RelDiff(joinedRun.Steps, separateRun.Steps);
+        bool joinOk = joinPre < 1e-6f && joinSteps < 1e-6f;
         int lengths = compacted.Select(c => c.Length).Distinct().Count();
         string got = Text(one[0]);
         bool same = got == want, rowsEqual = four.All(r => r.SequenceEqual(one[0]));
         int distinct = sampled.Select(Text).Distinct().Count();
         var report = $"{accelerator.AcceleratorType}: greedy {(same ? "= the generator" : "DIFFERS from the generator")} ({one[0].Length} tokens); four greedy rows {(rowsEqual ? "identical" : "DIFFER")}; four samples {distinct} distinct; "
-            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps)";
+            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps); joined projections vs separate: {joinPre:E1} / {joinSteps:E1}";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
-        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2 || !attOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
+        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2 || !attOk || !joinOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
 }

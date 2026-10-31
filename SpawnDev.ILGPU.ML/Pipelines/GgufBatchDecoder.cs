@@ -80,6 +80,12 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public bool FusedAttention { get; set; }
     private const int AttChunk = 256;
+    /// <summary>
+    /// Load-time option (static: read when a decoder is created; env GGUF_BATCH_SEPARATE=1 turns it off): join q, k (and v) into one matrix and gate and up into
+    /// another where their block types agree, and fuse the bias, rotary and cache store into one kernel and SwiGLU into its GEMV's output: about half the kernel
+    /// launches a layer (WebGPU pays per dispatch).
+    /// </summary>
+    public static bool JoinProjections = Environment.GetEnvironmentVariable("GGUF_BATCH_SEPARATE") != "1";
     /// <summary>Tokens per row the device keeps after each forward (the nucleus is drawn from these unless it is wider).</summary>
     public const int Candidates = 64;
     /// <summary>Draws since <see cref="PrefillAsync"/> that read their full logits row: the nucleus was wider than the candidates, or more than <see cref="SelectCap"/> tokens reached the floor.</summary>
@@ -93,7 +99,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _logits, _maxV, _selV, _cand;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
@@ -160,11 +166,29 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         var mats = new List<string> { _head, "token_embd.weight" };          // the embedding rows are gathered on the device (a tied head is the same blocks)
         var vecs = new List<string> { "output_norm.weight" };
+        _qkvAll = new bool[Layers];
         for (int l = 0; l < Layers; l++)
         {
             string p = $"blk.{l}.";
-            mats.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", p + "attn_output.weight", p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight" });
-            vecs.AddRange(new[] { p + "attn_norm.weight", p + "ffn_norm.weight", p + "attn_q.bias", p + "attn_k.bias", p + "attn_v.bias" });
+            var (tq, tk, tv) = (Tensor(p + "attn_q.weight").Type, Tensor(p + "attn_k.weight").Type, Tensor(p + "attn_v.weight").Type);
+            // the projections that share a block type are joined into one matrix (one GEMV a step instead of two or three); v alone when it differs (Q4_K_M)
+            if (JoinProjections && tq == tk)
+            {
+                _qkvAll[l] = tv == tq;
+                await JoinAsync(p + "attn_qkv", _qkvAll[l] ? new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" } : new[] { p + "attn_q.weight", p + "attn_k.weight" }, ct).ConfigureAwait(false);
+                if (!_qkvAll[l]) mats.Add(p + "attn_v.weight");
+                _vecs[p + "attn_qkv.bias"] = Own(_acc.Allocate1D((await VecAsync(p + "attn_q.bias", ct)).Concat(await VecAsync(p + "attn_k.bias", ct)).Concat(await VecAsync(p + "attn_v.bias", ct)).ToArray()));
+            }
+            else
+            {
+                mats.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
+                vecs.AddRange(new[] { p + "attn_q.bias", p + "attn_k.bias", p + "attn_v.bias" });
+            }
+            if (JoinProjections && Tensor(p + "ffn_gate.weight").Type == Tensor(p + "ffn_up.weight").Type)
+                await JoinAsync(p + "ffn_gate_up", new[] { p + "ffn_gate.weight", p + "ffn_up.weight" }, ct).ConfigureAwait(false);
+            else mats.AddRange(new[] { p + "ffn_gate.weight", p + "ffn_up.weight" });
+            mats.AddRange(new[] { p + "attn_output.weight", p + "ffn_down.weight" });
+            vecs.AddRange(new[] { p + "attn_norm.weight", p + "ffn_norm.weight" });
         }
         foreach (var name in mats.Distinct())
         {
@@ -182,6 +206,36 @@ public sealed class GgufBatchDecoder : IDisposable
             _vecs[name] = Own(_acc.Allocate1D(f));
         }
     }
+
+    // matrices of one block type stacked along the output dimension: their rows (the blocks of each output) follow each other, so the bytes simply concatenate
+    private async Task JoinAsync(string name, string[] parts, CancellationToken ct)
+    {
+        var type = Tensor(parts[0]).Type;
+        if (!FusedDequantMatMul.Supports(type)) throw new NotSupportedException($"{parts[0]}: {type} is not a block type the fused GEMM reads");
+        var chunks = new List<byte[]>();
+        long total = 0;
+        foreach (var part in parts)
+        {
+            var t = Tensor(part);
+            long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
+            var raw = await ReadAsync(t, ct).ConfigureAwait(false);
+            chunks.Add(raw.AsSpan(0, (int)n).ToArray()); total += n;
+        }
+        var all = new byte[(total + 3) / 4 * 4];
+        long at = 0;
+        foreach (var c in chunks) { Buffer.BlockCopy(c, 0, all, (int)at, c.Length); at += c.Length; }
+        _mats[name] = (Own(_acc.Allocate1D(all)), type);
+    }
+    private async Task<float[]> VecAsync(string name, CancellationToken ct)
+    {
+        var t = Tensor(name);
+        if (t.Type != GGMLType.F32) throw new NotSupportedException($"{name}: {t.Type} (expected F32)");
+        var raw = await ReadAsync(t, ct).ConfigureAwait(false);
+        var f = new float[_model.GetTensorElementCount(t)];
+        Buffer.BlockCopy(raw, 0, f, 0, f.Length * 4);
+        return f;
+    }
+    private bool[] _qkvAll = Array.Empty<bool>();
 
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _idBufs = new();
     private int _idCall;
@@ -250,12 +304,27 @@ public sealed class GgufBatchDecoder : IDisposable
         for (int l = 0; l < Layers; l++)
         {
             string b = $"blk.{l}.";
-            Gemm(hn, b + "attn_q.weight", q, R, C, C); _bias!((int)((long)R * C), q, _vecs[b + "attn_q.bias"].View, C); Prof("q");
-            Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
-            Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
-            _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
-            _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode); Prof("rope");
-            _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
+            if (_mats.ContainsKey(b + "attn_qkv"))
+            {
+                // one GEMV for q|k(|v), then bias + rotary + the cache store in one kernel (q to its buffer, k and v to the caches)
+                bool all = _qkvAll[l];
+                int n = all ? C + 2 * kvC : C + kvC;
+                var qkv = Buf(ref _qkv, (long)R * (C + 2 * kvC));
+                Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
+                var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
+                if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); vb = v; Prof("v"); }
+                int U = Heads * (HeadDim / 2) + KvHeads * (HeadDim / 2) + kvC;
+                _qkvPost!(R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, _kc[l].View, _vc[l].View, seqView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1), MaxSeq, p); Prof("qkv-post");
+            }
+            else
+            {
+                Gemm(hn, b + "attn_q.weight", q, R, C, C); _bias!((int)((long)R * C), q, _vecs[b + "attn_q.bias"].View, C); Prof("q");
+                Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
+                Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
+                _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
+                _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode); Prof("rope");
+                _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
+            }
             if (FusedAttention)
             {
                 // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
@@ -273,9 +342,18 @@ public sealed class GgufBatchDecoder : IDisposable
             }
             Gemm(att, b + "attn_output.weight", proj, R, C, C); Prof("o");
             AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
-            Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Prof("gate");
-            Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Prof("up");
-            _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
+            if (_mats.ContainsKey(b + "ffn_gate_up"))
+            {
+                var gu = Buf(ref _gateUp, (long)R * 2 * FfnDim);
+                Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim); Prof("gate-up");
+                _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu");
+            }
+            else
+            {
+                Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Prof("gate");
+                Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Prof("up");
+                _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
+            }
             Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Prof("down");
             AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
         }
@@ -462,6 +540,8 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, int>? _softmax;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
     private Action<Index1D, FV, FV>? _swiglu;
+    private Action<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>? _qkvPost;
+    private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>? _attPartial;
     private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
@@ -482,6 +562,8 @@ public sealed class GgufBatchDecoder : IDisposable
         _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
         _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
+        _qkvPost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>(QkvPostImpl);
+        _swigluJoined = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SwigluJoinedImpl);
         if (FusedAttention)
         {
             _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialImpl);
@@ -500,6 +582,42 @@ public sealed class GgufBatchDecoder : IDisposable
     private static void BiasImpl(Index1D i, FV x, FV bias, int C) => x[i] += bias[(int)i % C];
     // gate[i] = silu(gate[i]) * up[i]
     private static void SwigluImpl(Index1D i, FV g, FV u) { float x = g[i]; g[i] = x / (1f + MathF.Exp(-x)) * u[i]; }
+    // o[r, f] = silu(gu[r, f]) * gu[r, F + f] (the joined gate|up GEMV's rows)
+    private static void SwigluJoinedImpl(Index1D i, FV gu, FV o, int F)
+    {
+        int ii = i, r = ii / F, f = ii % F;
+        long b = (long)r * 2 * F;
+        float x = gu[b + f];
+        o[ii] = x / (1f + MathF.Exp(-x)) * gu[b + F + f];
+    }
+    // after the joined q|k(|v) GEMV (row stride sa): bias, rotary (NeoX pairs d, d + D/2) and the store, the arithmetic of BiasImpl + RopeImpl + StoreImpl. Per row the
+    // threads are the q pairs, the k pairs, then v's values; q goes to qOut [r, C], k and v to their sequence's cache row; v comes from qkv (flags bit 0) or from vb
+    // (row kvC); flags bit 1 = decode (row r is sequence seqs[r] at p; prefill: sequence 0 at p + r); heads = H | kvH << 16
+    private static void QkvPostImpl(Index1D i, FV qkv, FV vb, FV bias, FV invFreq, FV qOut, FV kc, FV vc, IV seqs, int heads, int D, int sa, int flags, int maxSeq, int p)
+    {
+        int H = heads & 0xFFFF, kvH = heads >> 16, vInA = flags & 1, mode = flags >> 1;
+        int half = D / 2, C = H * D, kvC = kvH * D, qPairs = H * half, kPairs = kvH * half;
+        int U = qPairs + kPairs + kvC, ii = i, r = ii / U, u = ii % U;
+        int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
+        long cacheRow = ((long)seq * maxSeq + pos) * kvC, row = (long)r * sa;
+        if (u < qPairs + kPairs)
+        {
+            bool isQ = u < qPairs;
+            int uu = isQ ? u : u - qPairs, hh = uu / half, kk = uu % half;
+            int col = (isQ ? 0 : C) + hh * D + kk;
+            float x0 = qkv[row + col] + bias[col], x1 = qkv[row + col + half] + bias[col + half];
+            float ang = pos * invFreq[kk], c = MathF.Cos(ang), s = MathF.Sin(ang);
+            float y0 = x0 * c - x1 * s, y1 = x1 * c + x0 * s;
+            if (isQ) { long qo = (long)r * C + hh * D + kk; qOut[qo] = y0; qOut[qo + half] = y1; }
+            else { long ko = cacheRow + hh * D + kk; kc[ko] = y0; kc[ko + half] = y1; }
+        }
+        else
+        {
+            int c2 = u - qPairs - kPairs;
+            float x = vInA != 0 ? qkv[row + C + kvC + c2] : vb[(long)r * kvC + c2];
+            vc[cacheRow + c2] = x + bias[C + kvC + c2];
+        }
+    }
 
     // o[r, c] = token_embd[ids[r], c], decoded from its blocks
     private static void EmbedImpl(Index1D i, IV ids, ArrayView1D<int, Stride1D.Dense> w, FV o, int C, int code, int rowBytes)
