@@ -118,6 +118,60 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The Turbo DiT's 8-bit and 4-bit exports (the community step-distilled fine-tune: no reference implementation of its own, so they are held against the exact bf16 export of the
+    /// same weights, <c>turbo/wan22_ti2v_5b_turbo_dit_bf16.safetensors</c>) on the reference inputs of the step-0 fixture (640x352 x33, text to video and with a first frame; Turbo runs
+    /// without guidance: the conditional prediction). The Turbo weights quantise worse than the standard model's (measured 2026-10-30: 8-bit 1.6e-2 / 5.7e-2, 4-bit 0.15 / 0.37,
+    /// text / first frame; the standard model's 8-bit costs 3.5e-3 / 1e-2), yet 4-step clips from the 4-bit file look like the 8-bit ones (1280x704 text to video, 832x480 with a
+    /// first frame: same subject and motion, 10/255 mean pixel difference), because the few-step sampler predicts x0 each step. So the bounds guard regressions above the measured
+    /// cost (0.1 / 0.5; a broken dequantisation is ~1) rather than demand the standard model's precision. Desktop GPU (the 10 GB bf16 file).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_TurboDiT_Quantized_MatchesBf16() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
+            throw new UnsupportedTestException("the 10 GB bf16 Turbo DiT runs on a desktop GPU");
+        var bf16 = Path.Combine(WanDir, "turbo", "wan22_ti2v_5b_turbo_dit_bf16.safetensors");
+        var files = new[] { ("q8", "wan22_ti2v_5b_dit_turbo_q8.safetensors", 0.1), ("q4", "wan22_ti2v_5b_dit_turbo_q4.safetensors", 0.5) };
+        if (!File.Exists(bf16) || !files.All(f => File.Exists(Path.Combine(WanDir, f.Item2)))) throw new UnsupportedTestException($"Wan Turbo exports not found in {WanDir}");
+        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz"));
+        var (ctx0, cs0) = WanNpz(t50, "context");
+        var modes = new[] { ("t2v", false), ("i2v", true) };
+        async Task<Dictionary<string, float[]>> Predict(string path)
+        {
+            var o = new Dictionary<string, float[]>();
+            using var weights = GpuWeights.LoadFile(accelerator, path);
+            using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
+            foreach (var (mode, firstFrame) in modes)
+            {
+                using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"dit_{mode}_640x352_f33.npz"));
+                var (lat, ls) = WanNpz(fx, "step0_latent_in"); var (tArr, _) = WanNpz(fx, "step0_t");
+                dit.SetGrid(ls[1], ls[2], ls[3]); dit.SetContext(0, ctx0, cs0[0]);
+                using var lIn = accelerator.Allocate1D(lat); using var lOut = accelerator.Allocate1D<float>(lat.Length);
+                dit.Forward(lIn.View, tArr[0], firstFrame, 0, lOut.View);
+                o[mode] = await lOut.View.CopyToHostAsync();
+            }
+            return o;
+        }
+        var exact = await Predict(bf16);
+        var report = new List<string>();
+        bool ok = true;
+        foreach (var (tag, file, bound) in files)
+        {
+            var got = await Predict(Path.Combine(WanDir, file));
+            foreach (var (mode, _) in modes)
+            {
+                var m = WanCompare(got[mode], exact[mode]);
+                report.Add($"Turbo {tag} {mode}: vs the bf16 Turbo relRMS {m.RelRms:E2}");
+                ok &= m.RelRms < bound;
+            }
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] " + line);
+        try { var od = Path.Combine(WanDir, "out"); Directory.CreateDirectory(od); File.AppendAllLines(Path.Combine(od, "wan_tests.log"), report.Select(l => $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [TurboDiT {accelerator.AcceleratorType}] {l}")); } catch (IOException) { }
+        if (!ok) throw new Exception("a quantised Turbo DiT deviates beyond its bound: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The Wan 2.2 VAE ENCODER for the image-to-video conditioning (one picture, the first chunk of the reference's chunked encode): a random picture [3, 1, 128, 192] to the normalised
     /// latent mean [48, 1, 8, 12], every stage tapped (conv1, the four down-blocks with their stride-2 resamples and average-pooling shortcuts, the middle, the head) against the float32 reference.
     /// </summary>

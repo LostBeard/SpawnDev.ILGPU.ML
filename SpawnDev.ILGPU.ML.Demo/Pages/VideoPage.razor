@@ -20,7 +20,7 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="@(Ltx ? 8100 : _dit == "q4" ? 10900 : 13400)">
+            ModelSizeMB="@(Ltx ? 8100 : _dit is "q4" or "turbo_q4" ? 10900 : 13400)">
 
     <div class="vid-prompt-section">
         <label class="vid-label">Prompt:</label>
@@ -97,7 +97,7 @@
             </div>
             <div class="vid-setting">
                 <label>Guidance:</label>
-                <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@(_isRunning || _dit == "turbo")" title="@(_dit == "turbo" ? "Turbo has the guidance built in (1): one transformer pass per step" : "classifier-free guidance scale, the reference uses 5")" />
+                <input type="number" min="1" max="12" step="0.5" @bind="_guidance" class="vid-input" disabled="@(_isRunning || Turbo)" title="@(Turbo ? "Turbo has the guidance built in (1): one transformer pass per step" : "classifier-free guidance scale, the reference uses 5")" />
             </div>
             }
             <div class="vid-setting">
@@ -122,8 +122,9 @@
             {
             <div class="vid-setting">
                 <label>Transformer:</label>
-                <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Turbo: Wan2.2-TI2V-5B-Turbo, a step-distilled version that draws a clip in 4 steps with one pass each (about 8x faster than the standard 30 steps with guidance, and sharper at 720p). Standard 8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer.">
+                <select @bind="_dit" @bind:after="PrecisionChanged" class="vid-select" disabled="@(_isRunning || _isModelLoading)" title="Turbo: Wan2.2-TI2V-5B-Turbo, a step-distilled version that draws a clip in 4 steps with one pass each (about 8x faster than the standard 30 steps with guidance, and sharper at 720p). Standard 8-bit: 5.6 GB, matches the 16-bit model. 4-bit: 3.1 GB, visibly softer for the standard transformer; the 4-bit Turbo draws clips like the 8-bit one (for 8 GB GPUs, with Tiled decode at 1280x704).">
                     <option value="turbo">Turbo 8-bit (5.6 GB, 4 steps)</option>
+                    <option value="turbo_q4">Turbo 4-bit (3.1 GB, 4 steps)</option>
                     <option value="q8">Standard 8-bit (5.6 GB)</option>
                     <option value="q4">Standard 4-bit (3.1 GB)</option>
                 </select>
@@ -213,11 +214,12 @@
     private int _frames = 17, _steps = 4;
     private double _guidance = 1.0;
     private long? _seed;
-    private string _dit = "turbo";                      // "turbo" | "q8" | "q4"
+    private string _dit = "turbo";                      // "turbo" | "turbo_q4" | "q8" | "q4"
     private string _model = "wan";                      // "wan" | "ltx"
     private bool Ltx => _model == "ltx";
     private bool _ltxUpscale;
     private bool _wanTiled;
+    private bool Turbo => _dit.StartsWith("turbo", StringComparison.Ordinal);       // "turbo" (8-bit) or "turbo_q4"
     private LtxPipeline? _ltxPipeline;
     private string _modelServer = "";
     private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
@@ -251,7 +253,7 @@
     private void PrecisionChanged()
     {
         _pipeline = null; _isModelLoaded = false;
-        if (_dit == "turbo") { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
+        if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
     }
 
     private async Task EnsureAcceleratorAsync()
@@ -286,8 +288,8 @@
                 request = new WanRequest
                 {
                     Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
-                    GuidanceScale = _dit == "turbo" ? 1.0 : _guidance, Seed = seed,
-                    Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled,
+                    GuidanceScale = Turbo ? 1.0 : _guidance, Seed = seed,
+                    Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled,
                 };
             }
             byte[]? firstRgb = null; int firstW = 0, firstH = 0;

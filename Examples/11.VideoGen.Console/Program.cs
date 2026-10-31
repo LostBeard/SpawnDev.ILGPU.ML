@@ -67,7 +67,8 @@ for (int i = 0; i < args.Length; i++)
 string prompt = string.Join(' ', words);
 if (o.Turbo)                                                    // Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, the few-step sampler (each can still be overridden by a later option)
 {
-    o.Dit = "turbo_q8"; o.FewStep = true; o.Guidance = 1.0;
+    if (!args.Contains("--dit")) o.Dit = "turbo_q8";                // --dit turbo_q4: the 4-bit Turbo (3.1 GB)
+    o.FewStep = true; o.Guidance = 1.0;
     if (!args.Contains("--steps")) o.Steps = 4;
 }
 if (o.Ltx)                                                      // LTX-Video 2B 0.9.8 distilled: 7 steps, no guidance, 8n + 1 frames; its own native size

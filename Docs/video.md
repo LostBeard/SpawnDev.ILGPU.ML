@@ -28,6 +28,7 @@ Exported once from the reference checkpoints with `tools/wan-harness/reference` 
 |------|------|-------|
 | `wan22_ti2v_5b_dit_q8.safetensors` | 5.6 GB | 8-bit blocks (the FLUX.2 block format, dequantised one matrix at a time). Matches the 16-bit model within its own rounding |
 | `wan22_ti2v_5b_dit_turbo_q8.safetensors` | 5.6 GB | the Turbo (step-distilled) transformer, 8-bit; exported from the community fp16 checkpoint (`export_dit_bf16.py OUT SRC`, then `quantize_streaming.py`) |
+| `wan22_ti2v_5b_dit_turbo_q4.safetensors` | 3.1 GB | the Turbo, 4-bit (`quantize_streaming.py ... 4`): for 8 GB GPUs. One forward is further from the bf16 Turbo than the standard model's quantisations are from theirs (8-bit 1.6e-2 / 5.7e-2, 4-bit 0.15 / 0.37, text / first frame; `Wan_TurboDiT_Quantized_MatchesBf16`), yet its 4-step clips look like the 8-bit one's (same subject and motion at 1280x704 and with a first frame at 832x480; 10/255 mean pixel difference): the few-step sampler predicts x0 every step |
 | `wan22_ti2v_5b_dit_q4.safetensors` | 3.1 GB | 4-bit; visibly softer |
 | `wan22_ti2v_5b_dit_bf16.safetensors` | 10 GB | as released |
 | `wan22_vae_f16.safetensors` | 1.4 GB | |
@@ -70,7 +71,9 @@ Desktop CUDA, `Examples/11.VideoGen.Console --ci` (320x192, 9 frames, 8 steps): 
   832x480 fits an 8 GB card (the 4-bit DiT, 3.1 GB of weights, leaves more room). At 720p the decoder's causal caches (two frames per convolution at full resolution, as the
   reference keeps them) dominate the untiled decode, so `WanRequest.TiledDecode` (console `--tiled-vae`) decodes in tiles as diffusers' `AutoencoderKLWan.enable_tiling()` does
   (256 px tiles, 192 px stride, blended in the 12-channel space before the pixel unshuffle): the 720p decode needs 2.5 GB instead of 8.4 GB (57 s instead of 37 s: the overlap is
-  decoded twice). 1280x704 x33 with the 4-bit DiT and the tiled decode peaks at 4.8 GB, so the model's own size runs on an 8 GB card; the 8-bit Turbo DiT alone needs 7.4 GB there.
+  decoded twice). 1280x704 x33 with the 4-bit DiT and the tiled decode peaks at 4.8 GB, so the model's own size runs on an 8 GB card; the 8-bit Turbo DiT alone needs 7.4 GB there,
+  the 4-bit Turbo with the tiled decode 4.8 GB (94 s on the RTX 4070: `--turbo --dit turbo_q4 --tiled-vae`). The models host now carries a README with the per-file change notices
+  and the Apache-2.0 text (Wan 2.2's licence), which the repo was missing.
   The tiled decode matches diffusers' tiled decode to 2.9e-4 / 2.5e-4 (CUDA / OpenCL; the untiled gate's accuracy), with the same tiling effect as the reference (1.769e-2 from its
   untiled decode, `Wan_VaeDecodeTiled_MatchesReference`; red-checked without the vertical blend: 8.7e-2).
 - **Seeds.** At small sizes the model itself gives good clips for some seeds and garbage for others (the reference does too: seed 9 at 640x352 is noise-like where seeds 7 and 8 draw a fox). Judge the
