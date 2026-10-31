@@ -52,6 +52,8 @@ batch. What keeps a step on the device:
   sequence map, so nothing is copied.
 - **Fused layers**: each residual add with the norm after it, q|k|v and gate|up joined into one matrix each where their block types agree, bias, rotary and the cache
   store in one kernel, and split-K attention (a group per row, head and chunk of 256 keys, then a merge). About 11 kernel launches a layer.
+- **Captured steps on WebGPU**: a decode step is recorded once per (live sequences, temperature) and replayed with one interop crossing, the position patched
+  into the scalars that carry it (found by diffing captures at two positions).
 
 Measured, RTX 4070 (CUDA unless marked; `tools/llm-bench/batch_profile.cs`, the gate `GgufBatchDecoder_GreedyMatchesGenerator`):
 
@@ -60,14 +62,14 @@ Measured, RTX 4070 (CUDA unless marked; `tools/llm-bench/batch_profile.cs`, the 
 | Qwen2.5-Math-1.5B Q8_0, one sequence, short context | 38.8 tok/s | 85.8 tok/s |
 | same, eight sequences | 226.9 tok/s | 366.2 tok/s |
 | same at a 905-token context, one / eight sequences | 30.8 / 147.8 tok/s | 74.2 / 274.8 tok/s |
-| Qwen2.5-0.5B Q8_0, four sequences: CUDA / OpenCL / WebGPU | 13.3 / 12.9 / 10.7 tok/s | 530.9 / 603.1 / 240.1 tok/s |
+| Qwen2.5-0.5B Q8_0, four sequences: CUDA / OpenCL / WebGPU | 13.3 / 12.9 / 10.7 tok/s | 531.8 / 605.8 / 288.2 tok/s |
 | 50 MATH problems, greedy + 8 samples each | 52.8 min | 22.3 min |
 
 The word-wise GEMVs also serve the single-sequence engine (`Forward` at M = 1): Qwen2.5-0.5B greedy decode went from 94.6 to 140.3 tok/s on CUDA and from 85.7
 to 114.5 tok/s on WebGPU with decode capture, token for token the same.
 
 Options: `FusedAttention` (default on where a group can be a head wide), `JoinProjections` (static, env `GGUF_BATCH_SEPARATE=1` off), `ProfileKernels` /
-`KernelTimes` (desktop: a sync after each kernel, time by kernel), `GGUF_GEMV_ROWS_GENERIC=1` (the per-element GEMVs).
+`KernelTimes` (desktop: a sync after each kernel, time by kernel), `CaptureWebGPU` (default on on WebGPU), `GGUF_GEMV_ROWS_GENERIC=1` (the per-element GEMVs).
 
 ## SelfConsistency
 
@@ -81,14 +83,14 @@ Options: `FusedAttention` (default on where a group can be a head wide), `JoinPr
 ## The page
 
 `/self-consistency` loads Qwen2.5-Math-1.5B-Instruct (Q4_K_M, about 1 GB) or Qwen2.5-0.5B-Instruct (Q8_0) and asks one problem N times. In Chrome on a 4070
-(WebGPU), eight answers to "What is the sum of all positive divisors of 360?" take 21 s (181 tok/s across the answers) and vote 1170, decided after 5 of 8.
+(WebGPU), eight answers to "What is the sum of all positive divisors of 360?" take 19 s (208 tok/s across the answers; 27 s and 141 tok/s before the decoder work) and vote 1170, stopped once the vote was decided.
 `tools/drive-self-consistency-page.cs` drives it the way a visitor does.
 
 ## Gates
 
 | Test | What it proves |
 |---|---|
-| `GgufBatchDecoder_GreedyMatchesGenerator` | greedy = the single-sequence engine word for word; batched greedy rows identical; device draws = the full-row sampler (96 of 96); the shrinking batch = riding along; split-K attention = the three-kernel path (2-4e-6 at 489 tokens); joined projections = separate (bit-identical). CUDA, OpenCL, WebGPU, each check red-checked |
+| `GgufBatchDecoder_GreedyMatchesGenerator` | greedy = the single-sequence engine word for word; batched greedy rows identical; device draws = the full-row sampler (96 of 96); the shrinking batch = riding along; split-K attention = the three-kernel path (2-4e-6 at 489 tokens); joined projections = separate (bit-identical); WebGPU captured steps = encoded ones. CUDA, OpenCL, WebGPU, each check red-checked |
 | `Gemv_Rows_AllTypes_MatchOracle` | the word-wise GEMVs against the CPU dequant oracle, Q8_0 / Q4_K / Q6_K / Q4_0 at M = 1, 3, 8 |
 | `SelfConsistency_ExtractNormalizeVote` | extraction, the spellings that must and must not vote together, the vote order, `IsDecided` |
 
