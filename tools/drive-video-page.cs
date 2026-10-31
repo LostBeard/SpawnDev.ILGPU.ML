@@ -112,12 +112,29 @@ if (Environment.GetEnvironmentVariable("VIDEO_DRIVE_AISTORY") == "1")
     Console.WriteLine($"    shots written at {sw.Elapsed.TotalSeconds:F0} s");
     if (!await WaitResultAsync("ai-story", 45)) failed++;
     // while a story runs the box holds the shot being generated; the whole story is back in it when the story is done
-    shotsText = await page.Locator("textarea.vid-prompt-input").InputValueAsync();
+    shotsText = await page.Locator("textarea.vid-prompt-input").First.InputValueAsync();
     var shotLines = shotsText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
     Console.WriteLine($"    {shotLines.Length} shots:");
     foreach (var l in shotLines) Console.WriteLine($"      | {l}");
     File.WriteAllText(Path.Combine(outDir, "ai-story-shots.txt"), shotsText);
     if (shotLines.Length != 3) { Console.WriteLine($"    FAIL: expected 3 shots, got {shotLines.Length}"); failed++; }
+    // the narration: written with the shots, spoken by Kokoro after the last shot, set as the player's sound
+    var narration = (await page.Locator("textarea.vid-narration").InputValueAsync()).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    Console.WriteLine($"    {narration.Length} narration lines:");
+    foreach (var l in narration) Console.WriteLine($"      > {l}");
+    File.WriteAllText(Path.Combine(outDir, "ai-story-narration.txt"), string.Join("\n", narration));
+    if (narration.Length != 3) { Console.WriteLine($"    FAIL: expected 3 narration lines, got {narration.Length}"); failed++; }
+    var audioSeconds = await page.EvaluateAsync<double>("() => window.videoPlayer.audioSeconds('vid-player')");
+    Console.WriteLine($"    sound track: {audioSeconds:F1} s");
+    if (Math.Abs(audioSeconds - 257 / 24.0) > 0.1) { Console.WriteLine($"    FAIL: the sound track should be as long as the video (10.7 s), got {audioSeconds:F1} s"); failed++; }
+    // the download: a WebM with the sound in it (an Opus track: the codec id A_OPUS in the Matroska header)
+    var download = await page.RunAndWaitForDownloadAsync(() => page.GetByRole(AriaRole.Button, new() { Name = "Download WebM" }).ClickAsync(), new() { Timeout = 120000 });
+    var webm = Path.Combine(outDir, "ai-story.webm");
+    await download.SaveAsAsync(webm);
+    var bytes = await File.ReadAllBytesAsync(webm);
+    bool hasOpus = System.Text.Encoding.ASCII.GetString(bytes, 0, Math.Min(bytes.Length, 4096)).Contains("A_OPUS");
+    Console.WriteLine($"    download: {bytes.Length / 1024} KB, Opus sound track: {hasOpus}");
+    if (!hasOpus) { Console.WriteLine("    FAIL: the downloaded WebM has no sound track"); failed++; }
     var infoS = await InfoAsync();
     int framesS = int.TryParse(Regex.Match(infoS, @"^(\d+) frames").Groups[1].Value, out var fs) ? fs : 0;
     if (framesS != 97 + 2 * 80) { Console.WriteLine($"    FAIL: a three-shot story should be 257 frames, got {framesS}"); failed++; }
@@ -142,7 +159,7 @@ int frames1 = int.TryParse(Regex.Match(info1, @"^(\d+) frames").Groups[1].Value,
 
 Console.WriteLine("--- step 2: Extend this clip");
 await page.GetByRole(AriaRole.Button, new() { Name = "Extend this clip" }).ClickAsync();
-await page.Locator("textarea.vid-prompt-input").FillAsync("The kitten stands up, stretches and walks toward the camera, soft window light.");
+await page.Locator("textarea.vid-prompt-input").First.FillAsync("The kitten stands up, stretches and walks toward the camera, soft window light.");
 await page.Locator(".vid-btn").ClickAsync();
 if (!await WaitResultAsync("2-extend", 30)) failed++;
 var info2 = await InfoAsync();

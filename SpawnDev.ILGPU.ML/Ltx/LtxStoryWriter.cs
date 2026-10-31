@@ -12,6 +12,9 @@ namespace SpawnDev.ILGPU.ML.Ltx;
 /// line has to stand alone: the same character described the same way, the same place, and the action picking up where the last shot stopped.
 /// The model is loaded for the call and freed after it, so it never shares the GPU with the video transformer.
 /// </summary>
+/// <summary>A written story: one video prompt per shot and, when asked for, one narrator line per shot (the same count, or empty).</summary>
+public sealed record LtxStory(string[] Shots, string[] Narration);
+
 public static class LtxStoryWriter
 {
     public const string Repo = Flux3CaptionWriter.Repo, File = Flux3CaptionWriter.File;
@@ -46,11 +49,21 @@ A small rusty orange robot with round blue eyes and dented arms kneels beside th
         return $"Idea: {idea}\nShots: {shots}";
     }
 
+    /// <summary>The instructions for the narration, written after the shots with the same model: one short line per shot, spoken while that shot plays (about 3 seconds).</summary>
+    public const string NarrationPrompt = """
+You are the narrator of a short video. The user gives its shots, numbered. Write exactly one narration line for each shot, in the same order: line 1 is said while shot 1 plays, line 2 while shot 2 plays, and so on, so each line is about what happens in its own shot and the last line is about the last shot. Each line is a single short sentence of 6 to 10 words that a storyteller says. Together the lines tell the story with a beginning, a turn and an end. Do not describe the camera. Use plain words that are easy to say aloud.
+Output only the lines, one per line: no numbering, no quotes, no blank lines, no other text.
+""";
+
+    /// <summary>The user message for the narration: the shots, numbered, so each line is tied to its own shot (unnumbered, Qwen3 4B narrated the first shot twice and never reached the last).</summary>
+    public static string NarrationUserPrompt(IReadOnlyList<string> shots) => string.Join("\n", shots.Select((s, i) => $"Shot {i + 1}: {s}"));
+
     /// <summary>
     /// The shots in the model's answer: the reasoning block, numbering ("1.", "Shot 2:", "- "), quotes and blank lines removed, and short lines (a title, "Here is your story:") dropped.
     /// At most <paramref name="shots"/>; fewer when the model wrote fewer.
     /// </summary>
-    public static string[] Parse(string answer, int shots)
+    /// <param name="minLength">shorter lines are dropped (headings, "Here is your story:"); narration lines are short, so they pass a smaller minimum</param>
+    public static string[] Parse(string answer, int shots, int minLength = 30)
     {
         var text = Flux3PromptUpsampler.Clean(answer);
         var lines = new List<string>();
@@ -60,7 +73,7 @@ A small rusty orange robot with round blue eyes and dented arms kneels beside th
             // "**Shot 2:**" before the bullets: a bullet rule first takes the leading "*" of the bold
             s = Regex.Replace(s, @"^(?:\*{0,2}shot\s*\d+\s*[.:)\-–]*\*{0,2}\s*|[-*•]\s+|\d+\s*[.):]\s*)", "", RegexOptions.IgnoreCase).Trim();
             s = s.Trim('"', '“', '”', '*').Trim();
-            if (s.Length < 30 || s.EndsWith(':')) continue;                 // a heading or an introduction, not a shot
+            if (s.Length < minLength || s.EndsWith(':')) continue;                 // a heading or an introduction, not a shot
             lines.Add(s);
         }
         return lines.Take(shots).ToArray();
@@ -73,8 +86,10 @@ A small rusty orange robot with round blue eyes and dented arms kneels beside th
     /// <param name="status">receives progress text ("Qwen3 4B — downloading 12%") as the model loads and writes</param>
     /// <param name="progress">receives 0 to 100 while the model downloads and loads (100 when it is ready)</param>
     /// <param name="storyText">receives the answer as it is written (the whole text so far, at most every <see cref="Flux3CaptionWriter.CaptionTextIntervalMs"/> ms)</param>
-    public static async Task<string[]> WriteAsync(global::ILGPU.Runtime.Accelerator accelerator, Flux3CaptionWriter.OpenModel open, string idea, int shots, int seed, Action<string> status,
-        Action<double>? progress = null, Action<string>? storyText = null)
+    /// <param name="narrate">also write one narrator line per shot (<see cref="NarrationPrompt"/>, the same model, after the shots)</param>
+    /// <param name="narrationText">receives the narration as it is written</param>
+    public static async Task<LtxStory> WriteAsync(global::ILGPU.Runtime.Accelerator accelerator, Flux3CaptionWriter.OpenModel open, string idea, int shots, int seed, Action<string> status,
+        Action<double>? progress = null, Action<string>? storyText = null, bool narrate = false, Action<string>? narrationText = null)
     {
         Stream? stream = null; GgufTextGenerationPipeline? llm = null;
         try
@@ -112,7 +127,24 @@ A small rusty orange robot with round blue eyes and dented arms kneels beside th
             var lines = Parse(answer, shots);
             status($"{Label} — wrote {lines.Length} shots ({llm.LastStopReason}, {answer.Length} chars)");
             storyText?.Invoke(string.Join("\n", lines));
-            return lines;
+            if (!narrate || lines.Length == 0) return new LtxStory(lines, Array.Empty<string>());
+            status($"{Label} — writing the narration");
+            lastShown = -Flux3CaptionWriter.CaptionTextIntervalMs;
+            var spoken = await llm.GenerateAsync(new List<(string, string)> { ("system", NarrationPrompt), ("user", NarrationUserPrompt(lines)) },
+                new GenerationConfig { MaxNewTokens = 40 * lines.Length + 32, Strategy = "top_p", Temperature = 0.7f, TopP = 0.8f, Seed = seed },
+                thinking: false,
+                onToken: (tokens, soFar) =>
+                {
+                    if (clock.ElapsedMilliseconds - lastShown >= Flux3CaptionWriter.CaptionTextIntervalMs)
+                    {
+                        lastShown = clock.ElapsedMilliseconds;
+                        narrationText?.Invoke(Flux3PromptUpsampler.Clean(soFar));
+                    }
+                    return Task.CompletedTask;
+                });
+            var narration = Parse(spoken, lines.Length, minLength: 8);
+            narrationText?.Invoke(string.Join("\n", narration));
+            return new LtxStory(lines, narration);
         }
         finally
         {

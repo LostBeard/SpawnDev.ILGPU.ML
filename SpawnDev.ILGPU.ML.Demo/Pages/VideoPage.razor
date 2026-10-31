@@ -3,6 +3,7 @@
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Wan
 @using SpawnDev.ILGPU.ML.Ltx
+@using SpawnDev.ILGPU.ML.Pipelines
 @implements IDisposable
 
 <PageTitle>Video Generation - SpawnDev.ILGPU.ML</PageTitle>
@@ -165,6 +166,26 @@
                 <button class="vid-action vid-download" @onclick="WriteStoryAsync" disabled="@(Busy || _isModelLoading || string.IsNullOrWhiteSpace(_storyIdea))">Write the shots</button>
             </div>
             <p class="vid-hint">@LtxStoryWriter.Label (@LtxStoryWriter.SizeText, downloaded once) writes one shot per line, in this tab; edit them, then Generate. Each new idea or click writes a different story.</p>
+            <div class="vid-writer">
+                <label class="vid-check" title="Kokoro (82M) speaks one line per shot, from the moment the shot starts; the sound plays with the clip and goes into the downloaded WebM">
+                    <input type="checkbox" @bind="_narrate" disabled="@Busy" /> Narrate
+                </label>
+                @if (_narrate)
+                {
+                    <select @bind="_voice" class="vid-select" disabled="@Busy" title="The narrator's voice (Kokoro)">
+                        @foreach (var v in NarratorVoices)
+                        {
+                            <option value="@v.Name">@v.Label</option>
+                        }
+                    </select>
+                }
+            </div>
+            @if (_narrate)
+            {
+                <label class="vid-label">Narration, one line per shot (the story writer writes it too):</label>
+                <textarea class="vid-prompt-input vid-narration" rows="3" @bind="_narration" @bind:event="oninput" disabled="@Busy"
+                          placeholder="One short sentence per shot, spoken while it plays."></textarea>
+            }
         }
         @if (_mode == "i2v" || _mode == "morph" || _mode == "story")
         {
@@ -268,6 +289,8 @@
     .vid-preset:disabled { opacity: 0.45; cursor: not-allowed; }
     .vid-writer { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
     .vid-idea { flex: 1 1 18rem; }
+    .vid-check { color: #94a3b8; font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+    .vid-narration { display: block; }
     .vid-snaps { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
     .vid-snap { height: 72px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); }
     .vid-modes { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.9rem 0 0.5rem; }
@@ -356,13 +379,14 @@
     }
 
     /// <summary>An example: a prompt (or, with <c>Idea</c>, the idea the story writer turns into the shots first) and its pictures.</summary>
-    private sealed record Preset(string Label, string Mode, string Prompt, string[] Pictures, bool Upscale = false, string? Idea = null);
+    private sealed record Preset(string Label, string Mode, string Prompt, string[] Pictures, bool Upscale = false, string? Idea = null, string? Narration = null);
     private static readonly Preset[] Presets =
     {
         new("Animate the kitten", "i2v", "The kitten slowly lifts its head, blinks and looks around curiously, its ears twitching, soft window light, shallow depth of field.", new[] { "samples/cat.jpg" }),
         new("Bring a landscape to life", "i2v", "Clouds drift slowly across the sky, the grass and trees sway in a gentle wind, light shifts across the hills, slow cinematic push forward.", new[] { "samples/landscape.jpg" }),
         new("Keyframes: fly into the house", "morph", "The camera glides smoothly toward the house, through the open front door and into the cozy living room, one continuous cinematic shot, warm light.", new[] { "samples/house.jpg", "samples/room.jpg" }),
-        new("A story in three shots", "story", "A small red fox wakes up in a snowy forest at dawn, stretches and yawns, soft golden light.\nThe fox trots through the snowy forest between the trees, the camera follows it from the side.\nThe fox stops at the edge of a frozen lake and watches the sunrise, its breath visible in the cold air.", Array.Empty<string>()),
+        new("A story in three shots", "story", "A small red fox wakes up in a snowy forest at dawn, stretches and yawns, soft golden light.\nThe fox trots through the snowy forest between the trees, the camera follows it from the side.\nThe fox stops at the edge of a frozen lake and watches the sunrise, its breath visible in the cold air.", Array.Empty<string>(),
+            Narration: "A little fox wakes to a winter morning.\nShe sets off through the silent, snowy forest.\nAt the frozen lake, the sun rises just for her."),
         new("AI writes the story", "story", "", Array.Empty<string>(), Idea: "A paper boat sails down a rainy city street and out to the sea"),
         new("A street at dusk", "i2v", "Evening falls on the street: people walk past, cars drive by with their headlights on, shop lights flicker on, slow camera pan.", new[] { "samples/street.jpg" }),
         new("A fox in the snow (two-pass)", "t2v", "A red fox trots through fresh snow at golden hour, its breath visible in the cold air, the camera follows it slowly, soft light, shallow depth of field.", Array.Empty<string>(), Upscale: true),
@@ -374,7 +398,7 @@
     {
         _error = null;
         if (!Ltx) { _model = "ltx"; ModelChanged(); }                      // the presets run on LTX-Video: fast enough to show off in a minute
-        _mode = pr.Mode; _prompt = pr.Prompt; _ltxUpscale = pr.Upscale;
+        _mode = pr.Mode; _prompt = pr.Prompt; _ltxUpscale = pr.Upscale; _narration = pr.Narration ?? "";
         _size = "704x480"; _frames = 97;
         _snaps.Clear();
         try
@@ -394,6 +418,45 @@
 
     private string _storyIdea = "";
     private int _storyShots = 3;
+    private bool _narrate = true;
+    private string _narration = "", _voice = "bm_george";
+    private static readonly (string Name, string Label)[] NarratorVoices =
+    {
+        ("bm_george", "George (British)"), ("bf_emma", "Emma (British)"), ("am_michael", "Michael (American)"), ("af_heart", "Heart (American)"), ("bm_fable", "Fable (British)"),
+    };
+    private KokoroPipeline? _kokoro;
+    private readonly Dictionary<string, KokoroVoicePack> _voicePacks = new();
+    private static readonly Lazy<SpawnDev.Phonemizer.EnglishPhonemizer> Phonemizer = new(SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer, isThreadSafe: true);
+
+    /// <summary>
+    /// The story's narration (<see cref="StoryNarrator"/>): each line of the narration box spoken by Kokoro from the moment its shot starts, set as the clip's sound, and the clip
+    /// played again from the start with it.
+    /// </summary>
+    private async Task NarrateStoryAsync(IReadOnlyList<double> shotStarts, double seconds)
+    {
+        var lines = _narration.Split('\n', StringSplitOptions.TrimEntries).Where(l => l.Length > 0).Take(shotStarts.Count).ToList();
+        if (lines.Count == 0) return;
+        _isRunning = true; _fraction = 0; _stage = "narration"; _stageMessage = "loading the voice (Kokoro 82M)"; StateHasChanged();
+        try
+        {
+            if (_kokoro == null)
+            {
+                await using var stream = await ModelSource.OpenAsync(KokoroVoicePack.VoiceRepoId, "onnx/model.onnx");
+                _kokoro = await KokoroPipeline.CreateFromStreamAsync(_accelerator!, stream);
+            }
+            if (!_voicePacks.TryGetValue(_voice, out var pack))
+                _voicePacks[_voice] = pack = KokoroVoicePack.FromBytes(_voice, await ModelSource.FetchBytesAsync(KokoroVoicePack.VoiceRepoId, KokoroVoicePack.VoicePath(_voice)));
+            _stageMessage = $"speaking {lines.Count} lines"; StateHasChanged();
+            var track = await StoryNarrator.NarrateAsync(_kokoro, pack, Phonemizer.Value, lines, shotStarts, seconds,
+                i => { _fraction = (i + 1.0) / lines.Count; _stageMessage = $"line {i + 1} of {lines.Count}"; _ = InvokeAsync(StateHasChanged); });
+            using var player = JS.Get<SpawnJSObject>("videoPlayer");
+            player.JSRef!.CallVoid("setAudio", "vid-player", track, KokoroPipeline.OutputSampleRate);
+            player.JSRef!.CallVoid("play", "vid-player", _fps);
+            Console.WriteLine($"[Video] narration: {lines.Count} lines, {track.Length / (double)KokoroPipeline.OutputSampleRate:F1} s track, voice {_voice}");
+        }
+        catch (Exception ex) { _error = "The narration failed: " + ex.Message; Console.WriteLine($"[Video] narration: {ex}"); }
+        finally { _isRunning = false; StateHasChanged(); }
+    }
 
     /// <summary>The story writer (<see cref="LtxStoryWriter"/>): the idea becomes one shot per line in the prompt box, shown as it is written. False when it failed or wrote nothing.</summary>
     private async Task<bool> WriteStoryAsync()
@@ -408,14 +471,18 @@
             if (!string.IsNullOrWhiteSpace(_modelServer)) SpawnDev.ILGPU.ML.Hub.ModelsHost.BaseUrl = _modelServer.Trim().TrimEnd('/');
             if (_ltxPipeline != null) _ltxPipeline.KeepLoaded = false;          // the language model and the video transformer never share the GPU; Generate loads it again
             int shots = _storyShots;
-            var lines = await LtxStoryWriter.WriteAsync(_accelerator!, (repo, file, download) => ModelSource.OpenAsync(repo, file, download), _storyIdea, shots,
+            if (_narrate) _narration = "";
+            var story = await LtxStoryWriter.WriteAsync(_accelerator!, (repo, file, download) => ModelSource.OpenAsync(repo, file, download), _storyIdea, shots,
                 _seed is { } s ? (int)(s % int.MaxValue) : Random.Shared.Next(1, int.MaxValue),
                 status => { _stageMessage = status; _ = InvokeAsync(StateHasChanged); },
                 pct => { _fraction = 0.5 * pct / 100; _ = InvokeAsync(StateHasChanged); },
-                text => { _prompt = text; _fraction = 0.5 + 0.5 * Math.Min(1, text.Length / (330.0 * shots)); _ = InvokeAsync(StateHasChanged); });
-            if (lines.Length == 0) { _error = "The story writer wrote no shots; try again or change the idea."; return false; }
-            _prompt = string.Join("\n", lines);
-            Console.WriteLine($"[Video] story: {lines.Length} shots written for \"{_storyIdea}\"");
+                text => { _prompt = text; _fraction = 0.5 + 0.4 * Math.Min(1, text.Length / (330.0 * shots)); _ = InvokeAsync(StateHasChanged); },
+                narrate: _narrate,
+                narrationText: text => { _narration = text; _fraction = 0.9 + 0.1 * Math.Min(1, text.Length / (60.0 * shots)); _ = InvokeAsync(StateHasChanged); });
+            if (story.Shots.Length == 0) { _error = "The story writer wrote no shots; try again or change the idea."; return false; }
+            _prompt = string.Join("\n", story.Shots);
+            if (_narrate) _narration = string.Join("\n", story.Narration);
+            Console.WriteLine($"[Video] story: {story.Shots.Length} shots and {story.Narration.Length} narration lines written for \"{_storyIdea}\"");
             return true;
         }
         catch (Exception ex) { _error = "The story writer failed: " + ex.Message; Console.WriteLine($"[Video] story writer: {ex}"); return false; }
@@ -508,13 +575,20 @@
         var storyClock = System.Diagnostics.Stopwatch.StartNew();
         try
         {
+            var shotStarts = new List<double>();                         // where each shot's new frames begin, in seconds: the narration's timing
             for (int i = 0; i < shots.Count; i++)
             {
                 _mode = i == 0 ? (PictureCount > 0 ? "i2v" : "t2v") : "extend";
                 _prompt = shots[i];
                 _storyStatus = $"shot {i + 1} of {shots.Count}";
+                shotStarts.Add(i == 0 ? 0 : _frameCount / (double)_fps);
                 await GenerateCoreAsync();
                 if (_error != null) break;
+            }
+            if (_error == null && _hasVideo && _narrate)
+            {
+                _storyStatus = "narration";
+                await NarrateStoryAsync(shotStarts, _frameCount / (double)_fps);
             }
         }
         finally
@@ -661,6 +735,7 @@
     {
         try { _camera?.Dispose(); } catch { }
         try { _ltxPipeline?.Dispose(); } catch { }
+        try { _kokoro?.Dispose(); } catch { }
         try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
         try { using var player = JS.Get<SpawnJSObject>("videoPlayer"); player.JSRef!.CallVoid("stop", "vid-player"); } catch { }
         _accelerator?.Dispose(); _accelerator = null;
