@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **`/video`, rebuilt as a studio:** one-click examples (animate the kitten, a landscape, a street at dusk; morph a dog into a cat; a two-pass fox), four modes (text to video; animate a picture; **morph** between a first and a last picture, LTX keyframe conditioning; **extend** the clip on screen from its last 17 frames, LTX clip conditioning, the new frames appended), pictures from files or **the camera**, and a **live preview**: the clip forms on screen at every denoising step (the sampler's x0 estimate through `LatentPreview`, no VAE).
+- **Live previews:** `LtxPipeline.Preview` / `Wan22Pipeline.Preview` hand out every step's x0 estimate (`x - sigma * v`, per token in the conditioned path), and `LatentPreview.Ltx` / `.Wan` turn a latent into colours with linear maps fitted by least squares over clips this library decoded (`tools/ltx-harness/fit_latent_preview.py`; the console's `--save-latent` writes the latents it fits from).
+- **Prompt encodings are cached** (`LtxPipeline`, `Wan22Pipeline`: the last 8 prompts): the 5 to 6 GB text encoders stream once per prompt, so a new seed, another mode, an extension or the second pass of the recipe with the same prompt skips them (in the browser about half the time of a short clip).
+
 ## 5.8.0 - 2026-10-30 - on SpawnDev.ILGPU 5.4.13: LTX-Video in every mode (image to video, keyframes, clips, the x2 upscaler two-pass recipe), video on 8 GB GPUs, SD UNet patches
 
 - **Wan 2.2 Turbo in 4 bits** (`wan22_ti2v_5b_dit_turbo_q4.safetensors`, 3.1 GB, hosted; demo "Turbo 4-bit", console `--turbo --dit turbo_q4`): with the tiled decode, 1280x704 x33 peaks at 4.8 GB (94 s on an RTX 4070), so the fast 4-step model runs at its native size on 8 GB GPUs. New gate `Wan_TurboDiT_Quantized_MatchesBf16` puts the cost on record (one forward vs the bf16 Turbo: 8-bit 1.6e-2 / 5.7e-2, 4-bit 0.15 / 0.37; clips from the 4-bit file match the 8-bit one's subject and motion). The Wan repo on models.spawndev.com gets a README with per-file change notices and the Apache-2.0 licence text.

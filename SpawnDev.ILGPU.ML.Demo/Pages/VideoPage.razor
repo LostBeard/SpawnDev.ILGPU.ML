@@ -8,7 +8,7 @@
 <PageTitle>Video Generation - SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Video Generation"
-            Description="Generate a short video from text, or animate your own picture, on your GPU: Wan 2.2 TI2V-5B (a 5B-parameter diffusion transformer with a 4x16x16 video VAE and the umT5 text encoder) or LTX-Video 2B (a 2B transformer with a 32x32x8 video VAE and the T5 text encoder, 7 steps), the 8-bit exports streamed from the SpawnDev models host. Everything runs in this tab on WebGPU; nothing leaves your machine."
+            Description="Generate video on your GPU, in this tab: from text, from a picture (or your camera), as a morph between two pictures, or by extending the clip you just made; watch it form step by step while it is denoised. LTX-Video 2B (a 2B transformer, 7 steps, the 0.9.8 two-pass recipe with its x2 latent upscaler) or Wan 2.2 TI2V-5B (5B, Turbo 4 steps, up to 1280x704), the 8-bit and 4-bit exports streamed from the SpawnDev models host. Everything runs on WebGPU; nothing leaves your machine."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -21,6 +21,14 @@
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
             ModelSizeMB="@(Ltx ? 8100 : _dit is "q4" or "turbo_q4" ? 10900 : 13400)">
+
+    <div class="vid-presets">
+        <span class="vid-presets-label">Try one:</span>
+        @foreach (var pr in Presets)
+        {
+            <button class="vid-preset" @onclick="@(() => UsePresetAsync(pr))" disabled="@(_isRunning || _isModelLoading)" title="@pr.Prompt">@pr.Label</button>
+        }
+    </div>
 
     <div class="vid-prompt-section">
         <label class="vid-label">Prompt:</label>
@@ -132,8 +140,45 @@
             }
         </div>
 
-        <ReferenceImages @ref="_refs" MaxImages="1" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
-        <p class="vid-hint">@(_references.Count > 0 ? "Image to video: your picture is the first frame." : "Optional: add a picture to animate it (it becomes the first frame).")</p>
+        <div class="vid-modes">
+            <button class="vid-mode @(_mode == "t2v" ? "on" : "")" @onclick="@(() => SetMode("t2v"))" disabled="@_isRunning">Text to video</button>
+            <button class="vid-mode @(_mode == "i2v" ? "on" : "")" @onclick="@(() => SetMode("i2v"))" disabled="@_isRunning">Animate a picture</button>
+            <button class="vid-mode @(_mode == "morph" ? "on" : "")" @onclick="@(() => SetMode("morph"))" disabled="@_isRunning" title="LTX-Video: a first and a last frame, the model fills the motion between them (keyframe conditioning)">Morph start to end</button>
+            <button class="vid-mode @(_mode == "extend" ? "on" : "")" @onclick="@(() => SetMode("extend"))" disabled="@(_isRunning || _lastClip == null)" title="LTX-Video: continue the clip on screen from its last 17 frames with a new prompt (video conditioning); the new frames are appended">Extend this clip</button>
+        </div>
+        @if (_mode == "i2v" || _mode == "morph")
+        {
+            <ReferenceImages @ref="_refs" MaxImages="@(_mode == "morph" ? 2 : 1)" MaxSide="1024" Disabled="@(_isRunning || _isModelLoading)" ReferencesChanged="@OnReferencesChanged" />
+            <div class="vid-camera">
+                @if (!_cameraOn)
+                {
+                    <button class="vid-action" @onclick="StartCameraAsync" disabled="@(_isRunning || PictureCount >= (_mode == "morph" ? 2 : 1))">Use the camera</button>
+                }
+                else
+                {
+                    <img class="vid-camera-view" src="@_camUrl" alt="the camera" />
+                    <button class="vid-action vid-download" @onclick="SnapAsync">Take the picture</button>
+                    <button class="vid-action" @onclick="StopCamera">Close the camera</button>
+                }
+            </div>
+            @if (_snaps.Count > 0)
+            {
+                <div class="vid-snaps">
+                    @foreach (var sn in _snaps)
+                    {
+                        <img class="vid-snap" src="@sn.Url" alt="a picture" />
+                    }
+                    <button class="vid-action" @onclick="@(() => { _snaps.Clear(); StateHasChanged(); })" disabled="@_isRunning">Remove</button>
+                </div>
+            }
+            <p class="vid-hint">@(_mode == "morph"
+                ? (PictureCount == 2 ? "Morph: the first picture is frame 1, the second is the last frame; describe the motion between them." : "Add two pictures: the first frame and the last frame.")
+                : (PictureCount > 0 ? "Your picture is the first frame; describe how it moves." : "Add a picture (or take one with the camera): it becomes the first frame."))</p>
+        }
+        @if (_mode == "extend")
+        {
+            <p class="vid-hint">The clip on screen continues from its last 17 frames; describe what happens next. The new frames are appended (Download saves the whole clip).</p>
+        }
         @if (Ltx)
         {
             <p class="vid-hint">LTX-Video weights are under the LTXV Open Weights License 0.X: use restrictions apply, and entities with $10M+ annual revenue need a commercial licence from Lightricks (see the model repo's LICENSE).</p>
@@ -164,7 +209,12 @@
         <div class="vid-error">@_error</div>
     }
 
-    <div class="vid-result" style="@(_hasVideo ? "" : "display:none")">
+    <div class="vid-live" style="@(_isRunning && _hasPreview ? "" : "display:none")">
+        <img id="vid-preview" class="vid-preview" alt="the clip forming" />
+        <div class="vid-live-label">@_previewLabel</div>
+    </div>
+
+    <div class="vid-result" style="@(_hasVideo && !_isRunning ? "" : "display:none")">
         <img id="vid-player" class="vid-player" alt="the generated video" />
         <div class="vid-info">
             <span class="vid-info-item">@_resultInfo</span>
@@ -191,6 +241,21 @@
     .vid-select { padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.8rem; }
     .vid-select option { background: #1e293b; }
     .vid-hint { color: #64748b; font-size: 0.8rem; margin: 0.4rem 0; }
+    .vid-presets { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.9rem; }
+    .vid-presets-label { color: #64748b; font-size: 0.8rem; }
+    .vid-preset { padding: 0.35rem 0.75rem; border-radius: 8px; border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.08); color: #6ee7b7; font-size: 0.8rem; cursor: pointer; }
+    .vid-preset:disabled { opacity: 0.45; cursor: not-allowed; }
+    .vid-snaps { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
+    .vid-snap { height: 72px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); }
+    .vid-modes { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.9rem 0 0.5rem; }
+    .vid-mode { padding: 0.45rem 0.9rem; border-radius: 999px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #94a3b8; font-size: 0.85rem; cursor: pointer; }
+    .vid-mode.on { border-color: rgba(139,92,246,0.7); background: rgba(139,92,246,0.18); color: #e2e8f0; }
+    .vid-mode:disabled { opacity: 0.45; cursor: not-allowed; }
+    .vid-camera { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
+    .vid-camera-view { width: 240px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); transform: scaleX(-1); }
+    .vid-live { text-align: center; margin: 1.5rem 0; }
+    .vid-preview { width: min(100%, 720px); aspect-ratio: @(PreviewAspect); border-radius: 10px; border: 1px solid rgba(139,92,246,0.35); filter: saturate(1.1); }
+    .vid-live-label { color: #a78bfa; font-size: 0.8rem; margin-top: 0.4rem; font-family: monospace; }
     .vid-advanced { margin-top: 0.5rem; color: #94a3b8; font-size: 0.85rem; }
     .vid-progress { margin: 1rem 0; }
     .vid-progress-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
@@ -218,6 +283,16 @@
     private string _model = "wan";                      // "wan" | "ltx"
     private bool Ltx => _model == "ltx";
     private bool _ltxUpscale;
+    private string _mode = "t2v";                       // "t2v" | "i2v" | "morph" (LTX) | "extend" (LTX)
+    private bool _hasPreview, _cameraOn;
+    private string _previewLabel = "", _camUrl = "";
+    private SpawnDev.ILGPU.ML.Preprocessing.MediaStreamCapture? _camera;
+    private readonly List<(byte[] Rgba, int Width, int Height, string Url)> _snaps = new();      // camera pictures and the presets' pictures
+    /// <summary>The last frames of the clip on screen (what "Extend" conditions on): RGB bytes, frames back to back.</summary>
+    private (byte[] Rgb, int Frames, int Width, int Height)? _lastClip;
+    private const int ExtendFrames = 17;
+    private int PictureCount => _references.Count + _snaps.Count;
+    private string PreviewAspect { get { var p = _size.Split('x'); return $"{p[0]} / {p[1]}"; } }
     private bool _wanTiled;
     private bool Turbo => _dit.StartsWith("turbo", StringComparison.Ordinal);       // "turbo" (8-bit) or "turbo_q4"
     private LtxPipeline? _ltxPipeline;
@@ -256,6 +331,104 @@
         if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 30; if (_guidance <= 1.0) _guidance = 5.0; }     // each transformer's own recipe
     }
 
+    private sealed record Preset(string Label, string Mode, string Prompt, string[] Pictures, bool Upscale = false);
+    private static readonly Preset[] Presets =
+    {
+        new("Animate the kitten", "i2v", "The kitten slowly lifts its head, blinks and looks around curiously, its ears twitching, soft window light, shallow depth of field.", new[] { "samples/cat.jpg" }),
+        new("Bring a landscape to life", "i2v", "Clouds drift slowly across the sky, the grass and trees sway in a gentle wind, light shifts across the hills, slow cinematic push forward.", new[] { "samples/landscape.jpg" }),
+        new("Morph: dog into cat", "morph", "The dog slowly and smoothly transforms into a kitten, a magical seamless transition, soft warm light.", new[] { "samples/dog.jpg", "samples/cat.jpg" }),
+        new("A street at dusk", "i2v", "Evening falls on the street: people walk past, cars drive by with their headlights on, shop lights flicker on, slow camera pan.", new[] { "samples/street.jpg" }),
+        new("A fox in the snow (two-pass)", "t2v", "A red fox trots through fresh snow at golden hour, its breath visible in the cold air, the camera follows it slowly, soft light, shallow depth of field.", Array.Empty<string>(), Upscale: true),
+    };
+
+    [Inject] HttpClient Http { get; set; } = default!;
+
+    private async Task UsePresetAsync(Preset pr)
+    {
+        _error = null;
+        if (!Ltx) { _model = "ltx"; ModelChanged(); }                      // the presets run on LTX-Video: fast enough to show off in a minute
+        _mode = pr.Mode; _prompt = pr.Prompt; _ltxUpscale = pr.Upscale;
+        _size = "704x480"; _frames = 97;
+        _snaps.Clear();
+        try
+        {
+            foreach (var url in pr.Pictures)
+            {
+                var bytes = await Http.GetByteArrayAsync(url);
+                var (w, h, rgba) = await Services.ImageDisplayHelper.DecodeAsync(JS, bytes, 1024);
+                _snaps.Add((rgba, w, h, Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h)));
+            }
+        }
+        catch (Exception ex) { _error = "Could not load the example's picture: " + ex.Message; }
+        StateHasChanged();
+        if (_error == null) await GenerateVideo();
+    }
+
+    private void SetMode(string mode)
+    {
+        _mode = mode;
+        if ((mode == "morph" || mode == "extend") && !Ltx) { _model = "ltx"; ModelChanged(); }        // keyframes and clip conditioning are LTX-Video's
+        StateHasChanged();
+    }
+
+    private IEnumerable<(byte[] Rgba, int Width, int Height)> Pictures() => _references.Select(r => (r.Rgba, r.Width, r.Height)).Concat(_snaps.Select(sn => (sn.Rgba, sn.Width, sn.Height)));
+
+    private static byte[] ToRgb(byte[] rgba, int pixels)
+    {
+        var rgb = new byte[pixels * 3];
+        for (int p = 0; p < pixels; p++) { rgb[p * 3] = rgba[p * 4]; rgb[p * 3 + 1] = rgba[p * 4 + 1]; rgb[p * 3 + 2] = rgba[p * 4 + 2]; }
+        return rgb;
+    }
+
+    private async Task StartCameraAsync()
+    {
+        _error = null;
+        _camera ??= new SpawnDev.ILGPU.ML.Preprocessing.MediaStreamCapture(JS) { TargetFps = 8 };
+        _camera.OnFrameReady -= OnCameraFrame;
+        _camera.OnFrameReady += OnCameraFrame;
+        if (!await _camera.StartWebcamAsync(640, 480)) { _error = "The camera did not start: " + (_camera.LastVideoError?.Message ?? "no stream"); StateHasChanged(); return; }
+        _cameraOn = true;
+        StateHasChanged();
+    }
+
+    private void OnCameraFrame(byte[] rgba, int w, int h)
+    {
+        _camUrl = Services.ImageDisplayHelper.ToDataUrl(JS, rgba, w, h);
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private Task SnapAsync()
+    {
+        var frame = _camera?.CaptureFrame();
+        if (frame != null) _snaps.Add((frame, _camera!.Width, _camera.Height, Services.ImageDisplayHelper.ToDataUrl(JS, frame, _camera.Width, _camera.Height)));
+        if (PictureCount >= (_mode == "morph" ? 2 : 1)) StopCamera();
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private void StopCamera()
+    {
+        if (_camera != null) { _camera.OnFrameReady -= OnCameraFrame; _camera.Stop(); }
+        _cameraOn = false; _camUrl = "";
+        StateHasChanged();
+    }
+
+    /// <summary>A sampler step's x0 estimate as a tiny looping clip (one pixel per latent voxel, scaled up by the browser): the video forming while it is denoised.</summary>
+    private void ShowPreview(float[] x0, int frames, int h, int w, LatentPreview lp, string label)
+    {
+        try
+        {
+            using var player = JS.Get<SpawnJSObject>("videoPlayer");
+            player.JSRef!.CallVoid("clear", "vid-preview");
+            for (int f = 0; f < frames; f++)
+                player.JSRef!.CallVoid("addFrame", "vid-preview", Services.ImageDisplayHelper.ToDataUrl(JS, lp.FrameRgba(x0, frames, h, w, f), w, h));
+            player.JSRef!.CallVoid("play", "vid-preview", Math.Max(1, _fps / lp.TemporalRatio));
+            _previewLabel = label; _hasPreview = true;
+            _ = InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex) { Console.WriteLine($"[Video] preview: {ex.Message}"); }
+    }
+
     private async Task EnsureAcceleratorAsync()
     {
         if (_accelerator != null) return;
@@ -270,7 +443,9 @@
 
     private async Task GenerateVideo()
     {
-        _error = null; _isRunning = true; _hasVideo = false; _fraction = 0; _stage = "starting"; _stageMessage = "";
+        bool extending = _mode == "extend" && _lastClip != null && Ltx;
+        _error = null; _isRunning = true; _hasPreview = false; _fraction = 0; _stage = "starting"; _stageMessage = "";
+        if (!extending) _hasVideo = false;
         StateHasChanged();
         var total = System.Diagnostics.Stopwatch.StartNew();
         try
@@ -292,16 +467,18 @@
                     Sampler = Turbo ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled,
                 };
             }
+            var pics = Pictures().ToList();
             byte[]? firstRgb = null; int firstW = 0, firstH = 0;
-            if (_references.Count > 0)
+            if ((_mode == "i2v" || _mode == "morph") && pics.Count > 0)
             {
-                var pic = _references[0];
-                firstRgb = new byte[pic.Width * pic.Height * 3]; firstW = pic.Width; firstH = pic.Height;
-                for (int p = 0; p < pic.Width * pic.Height; p++) { firstRgb[p * 3] = pic.Rgba[p * 4]; firstRgb[p * 3 + 1] = pic.Rgba[p * 4 + 1]; firstRgb[p * 3 + 2] = pic.Rgba[p * 4 + 2]; }
+                var pic = pics[0];
+                firstRgb = ToRgb(pic.Rgba, pic.Width * pic.Height); firstW = pic.Width; firstH = pic.Height;
             }
+            if (_mode == "morph" && pics.Count < 2) throw new InvalidOperationException("Morph needs two pictures: the first frame and the last frame.");
+            if (_mode == "i2v" && firstRgb == null) throw new InvalidOperationException("Add a picture to animate (or take one with the camera).");
             if (!Ltx && firstRgb != null)
             {
-                var rgb = firstRgb; var pic = _references[0];
+                var rgb = firstRgb; var pic = pics[0];
                 request = new WanRequest
                 {
                     Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
@@ -316,23 +493,49 @@
                 _modelStatusText = $"{(Ltx ? "LTX-Video" : "Wan 2.2")} - {p.Stage}";
                 _ = InvokeAsync(StateHasChanged);
             });
+            // the conditions of the LTX modes: a first frame; a first and a last frame (keyframes); the last frames of the clip on screen (video conditioning)
+            LtxCondition[]? conditions = null;
+            if (Ltx && _mode == "i2v" && firstRgb != null) conditions = new[] { LtxCondition.Image(firstRgb, firstW, firstH) };
+            if (Ltx && _mode == "morph")
+            {
+                var end = pics[1];
+                conditions = new[] { LtxCondition.Image(firstRgb!, firstW, firstH), LtxCondition.Image(ToRgb(end.Rgba, end.Width * end.Height), end.Width, end.Height, frameIndex: _frames - 1) };
+            }
+            if (extending)
+            {
+                var c = _lastClip!.Value;
+                conditions = new[] { new LtxCondition { Rgb = c.Rgb, Width = c.Width, Height = c.Height, Frames = c.Frames } };
+            }
+            if (Ltx) _ltxPipeline!.Preview = p => ShowPreview(p.X0, p.Frames, p.Height, p.Width, LatentPreview.Ltx, $"step {p.Step} of {p.Steps}{(p.Pass.Length > 0 ? $" ({p.Pass})" : "")}: what the model sees so far");
+            else _pipeline!.Preview = p => ShowPreview(p.X0, p.Frames, p.Height, p.Width, LatentPreview.Wan, $"step {p.Step} of {p.Steps}: what the model sees so far");
             var video = Ltx
                 ? await _ltxPipeline!.GenerateAsync(new LtxRequest
                 {
-                    Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps, Upscale = _ltxUpscale,
-                    Conditions = firstRgb != null ? new[] { LtxCondition.Image(firstRgb, firstW, firstH) } : null,
+                    Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps, Upscale = _ltxUpscale, Conditions = conditions,
                 }, progress)
                 : await _pipeline!.GenerateAsync(request, progress);
+            try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
             _stage = "showing"; _stageMessage = "the frames"; StateHasChanged();
             await Task.Yield();
             using var player = JS.Get<SpawnJSObject>("videoPlayer");
-            player.JSRef!.CallVoid("clear", "vid-player");
-            for (int f = 0; f < video.Frames; f++)
+            // extending: the new clip's first frames are the old clip's last ones (the condition): append only what follows
+            int skip = extending ? _lastClip!.Value.Frames : 0;
+            if (!extending) { player.JSRef!.CallVoid("clear", "vid-player"); _frameCount = 0; }
+            for (int f = skip; f < video.Frames; f++)
                 player.JSRef!.CallVoid("addFrame", "vid-player", Services.ImageDisplayHelper.ToDataUrl(JS, video.GetFrameRgba(f), video.Width, video.Height));
-            _frameCount = video.Frames;
+            _frameCount += video.Frames - skip;
+            // remember the last frames for "Extend this clip"
+            if (Ltx && video.Frames >= ExtendFrames)
+            {
+                int px = video.Width * video.Height;
+                var tail = new byte[ExtendFrames * px * 3];
+                for (int f = 0; f < ExtendFrames; f++) Array.Copy(ToRgb(video.GetFrameRgba(video.Frames - ExtendFrames + f), px), 0, tail, (long)f * px * 3, px * 3);
+                _lastClip = (tail, ExtendFrames, video.Width, video.Height);
+            }
+            else if (!Ltx) _lastClip = null;
             _hasVideo = true; _isModelLoaded = true;
             _inferenceMs = total.Elapsed.TotalMilliseconds;
-            _resultInfo = $"{video.Frames} frames {video.Width}x{video.Height} at {_fps} fps, seed {request.Seed}, {total.Elapsed.TotalSeconds:F0} s total";
+            _resultInfo = $"{_frameCount} frames {video.Width}x{video.Height} at {_fps} fps ({_frameCount / (double)_fps:F1} s), seed {request.Seed}, {total.Elapsed.TotalSeconds:F0} s{(extending ? " for the extension" : " total")}";
             _modelStatusText = Ltx ? "LTX-Video 2B" : "Wan 2.2 TI2V-5B";
             StateHasChanged();
             await Task.Yield();
@@ -368,6 +571,8 @@
 
     public void Dispose()
     {
+        try { _camera?.Dispose(); } catch { }
+        try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
         try { using var player = JS.Get<SpawnJSObject>("videoPlayer"); player.JSRef!.CallVoid("stop", "vid-player"); } catch { }
         _accelerator?.Dispose(); _accelerator = null;
     }

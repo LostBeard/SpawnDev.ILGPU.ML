@@ -11,6 +11,7 @@
 //
 //  Options: --size WxH (multiples of 32; the model's own sizes are 1280x704 and 704x1280)  --frames N (4n+1: 17, 33, 49 ... 121 = 5 s at 24 fps)
 //           --steps N (50 is the reference; 20-30 is usually fine)  --seed N  --guidance F (5)  --shift F (5)  --negative TEXT  --image PATH
+//           --save-latent (write the denoised latent beside the frames: latent.f32 + latent.json)
 //           --tiled-vae (Wan: decode in 256 px tiles as diffusers' enable_tiling: 720p on an 8 GB card)
 //           --turbo (the step-distilled Wan2.2-TI2V-5B-Turbo: 4 steps, no guidance, few-step sampler: 720p in about a minute; the best default)
 //           --ltx (LTX-Video 2B 0.9.8 distilled instead of Wan: text to video or --image to video, 7 steps, no guidance, 8n+1 frames, native 704x480; --fps sets the position-embedding frame rate;
@@ -61,6 +62,7 @@ for (int i = 0; i < args.Length; i++)
         case "--ltx": o.Ltx = true; break;
         case "--upscale": o.Upscale = true; break;
         case "--tiled-vae": o.TiledVae = true; break;
+        case "--save-latent": o.SaveLatent = true; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
 }
@@ -196,6 +198,15 @@ int Save(WanVideo video, Options o)
     anim!.SaveAsWebp(webp, new WebpEncoder { FileFormat = WebpFileFormatType.Lossy, Quality = 90 });
     anim?.Dispose();
     Console.WriteLine($"Wrote {webp}" + (o.NoFrames ? "" : $" and {video.Frames} PNG frames in {o.Out}"));
+    if (o.SaveLatent && video.Latent != null)
+    {
+        // the denoised latent (channel-first float32, little-endian) beside the frames: what tools/ltx-harness/fit_latent_preview.py fits the live-preview colours from
+        var bytes = new byte[video.Latent.Length * 4];
+        Buffer.BlockCopy(video.Latent, 0, bytes, 0, bytes.Length);
+        File.WriteAllBytes(Path.Combine(o.Out, "latent.f32"), bytes);
+        File.WriteAllText(Path.Combine(o.Out, "latent.json"), $"{{\"model\": \"{(o.Ltx ? "ltx" : "wan")}\", \"values\": {video.Latent.Length}, \"frames\": {video.Frames}, \"width\": {video.Width}, \"height\": {video.Height}}}");
+        Console.WriteLine($"Wrote the latent ({video.Latent.Length} floats) to {Path.Combine(o.Out, "latent.f32")}");
+    }
 
     if (o.Ci)
     {
@@ -209,7 +220,7 @@ int Save(WanVideo video, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae;
+    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae, SaveLatent;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;
     public double Guidance = 5.0, Shift = 5.0;

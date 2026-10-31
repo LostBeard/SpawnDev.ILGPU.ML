@@ -41,6 +41,9 @@ public sealed class Wan22Paths
 /// is sampled with: predict x0 from the velocity, then re-noise it with FRESH noise to the next sigma (the last step returns x0).</summary>
 public enum WanSampler { UniPC, FewStep }
 
+/// <summary>One denoising step's x0 estimate (<c>x - sigma * v</c>) for a live preview: [48, Frames, Height, Width] channel-first, model space (<see cref="LatentPreview.Wan"/>).</summary>
+public sealed record WanPreview(int Step, int Steps, float[] X0, int Frames, int Height, int Width);
+
 /// <summary>What to generate.</summary>
 public sealed class WanRequest
 {
@@ -119,6 +122,13 @@ public sealed class Wan22Pipeline
     private readonly string _repo;
     private UnigramTokenizer? _tok;
 
+    /// <summary>Called after every denoising step with the sampler's x0 estimate (a live preview; the latent is on the host already). Null = no preview.</summary>
+    public Action<WanPreview>? Preview { get; set; }
+
+    // the last few prompts' umT5 outputs (the encoder streams 6 GB of weights per pass; a new seed or another mode with the same prompts skips it)
+    private readonly List<(string Text, float[] Embedding)> _prompts = new();
+    private const int PromptCacheSize = 8;
+
     /// <summary>The reference's default negative prompt (Chinese; it lists the usual video defects).</summary>
     public const string DefaultNegativePrompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
@@ -184,15 +194,26 @@ public sealed class Wan22Pipeline
         Report("text", 0, "encoding the prompt");
         float[] ctx, ctxNeg; int ctxRows, ctxNegRows;
         bool guided = req.GuidanceScale > 1.0 + 1e-9;                                      // guidance 1 = the conditional prediction alone (no negative prompt, one forward per step)
-        var ids = await TokenizeAsync(req.Prompt, ct);
-        var nids = guided ? await TokenizeAsync(req.NegativePrompt ?? DefaultNegativePrompt, ct) : Array.Empty<int>();
-        ctxRows = ids.Length; ctxNegRows = nids.Length;
-        using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
+        var texts = guided ? new[] { req.Prompt, req.NegativePrompt ?? DefaultNegativePrompt } : new[] { req.Prompt };
+        var enc = new float[texts.Length][];
+        var missing = new List<int>();
+        for (int i = 0; i < texts.Length; i++) { int hit = _prompts.FindIndex(p => p.Text == texts[i]); if (hit >= 0) enc[i] = _prompts[hit].Embedding; else missing.Add(i); }
+        if (missing.Count > 0)
         {
-            var both = await t5.EncodeManyAsync(guided ? new[] { ids, nids } : new[] { ids }, ct);          // one pass over the layers for both prompts
-            ctx = both[0]; ctxNeg = guided ? both[1] : Array.Empty<float>();
+            var idss = new int[missing.Count][];
+            for (int k = 0; k < missing.Count; k++) idss[k] = await TokenizeAsync(texts[missing[k]], ct);
+            using var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct);
+            var got = await t5.EncodeManyAsync(idss, ct);                                  // one pass over the layers for every prompt not cached
+            for (int k = 0; k < missing.Count; k++)
+            {
+                enc[missing[k]] = got[k];
+                _prompts.Add((texts[missing[k]], got[k]));
+                if (_prompts.Count > PromptCacheSize) _prompts.RemoveAt(0);
+            }
         }
-        Report("text", 1, $"{ctxRows} + {ctxNegRows} tokens");
+        ctx = enc[0]; ctxRows = ctx.Length / 4096;
+        ctxNeg = guided ? enc[1] : Array.Empty<float>(); ctxNegRows = ctxNeg.Length / 4096;
+        Report("text", 1, missing.Count == 0 ? "the prompts' encodings are cached" : $"{ctxRows} + {ctxNegRows} tokens");
 
         // 2. the first frame (image to video): the VAE encodes it to the latent that replaces the first latent frame at every step
         float[]? z0 = null;
@@ -229,6 +250,14 @@ public sealed class Wan22Pipeline
                     dit.Forward(lIn.View, sched.Timesteps[s], i2v, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
                     float g = (float)req.GuidanceScale;
                     for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + g * (nc[i] - nu[i]);       // classifier-free guidance, in place
+                }
+                if (Preview != null)
+                {
+                    float sg = sched.Sigmas[s];
+                    var x0p = new float[latent.Length];
+                    for (int i = 0; i < x0p.Length; i++) x0p[i] = latent[i] - sg * nc[i];
+                    PutPicture(x0p);
+                    Preview(new WanPreview(s + 1, req.Steps, x0p, Fz, h, w));
                 }
                 if (req.Sampler == WanSampler.FewStep)
                 {

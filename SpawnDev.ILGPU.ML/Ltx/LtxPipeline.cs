@@ -71,6 +71,12 @@ public sealed class LtxCondition
         => new() { Rgb = rgb, Width = width, Height = height, FrameIndex = frameIndex, Strength = strength };
 }
 
+/// <summary>
+/// One denoising step's x0 estimate (<c>x - sigma * v</c>, the clean latent the sampler is heading for), for a live preview: [128, <see cref="Frames"/>, <see cref="Height"/>,
+/// <see cref="Width"/>] channel-first, model space (<see cref="LatentPreview.Ltx"/> turns it into colours). <see cref="Pass"/> is "first pass" / "second pass" in the two-pass recipe.
+/// </summary>
+public sealed record LtxPreview(string Pass, int Step, int Steps, float[] X0, int Frames, int Height, int Width);
+
 /// <summary>What to generate.</summary>
 public sealed class LtxRequest
 {
@@ -142,6 +148,12 @@ public sealed class LtxPipeline
     private readonly string _repo;
     private UnigramTokenizer? _tok;
 
+    /// <summary>
+    /// Called after every denoising step with the sampler's x0 estimate (a live preview: the latent is read back once per step, which costs a few milliseconds). Null = no preview.
+    /// </summary>
+    public Action<LtxPreview>? Preview { get; set; }
+    private string _pass = "";
+
     /// <summary>Test hook of the conditioned sampler: (step, the DiT's token-major input [tokens, 128], its prediction) after each step's forward; valid only during the call.</summary>
     public Action<int, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? StepTap { get; set; }
 
@@ -160,6 +172,33 @@ public sealed class LtxPipeline
         await using var stream = await _source.OpenAsync(_repo, file, ct);
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
         return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, file, cancellationToken: ct);
+    }
+
+    // the last few prompts' T5 outputs: the encoder streams 5 GB of weights per prompt (in the browser about half of a short clip's time), so a new seed, another mode or an
+    // extension with the same prompt skips it (an embedding is at most 128 x 4096 floats)
+    private readonly List<(string Prompt, float[] Embedding)> _prompts = new();
+    private const int PromptCacheSize = 8;
+
+    /// <summary>The prompt's T5 output [tokens, 4096] (cached by prompt text).</summary>
+    private async Task<float[]> EncodePromptAsync(string prompt, Action<string, double, string> report, CancellationToken ct)
+    {
+        int hit = _prompts.FindIndex(p => p.Prompt == prompt);
+        if (hit >= 0)
+        {
+            var e = _prompts[hit];
+            _prompts.RemoveAt(hit); _prompts.Add(e);
+            report("text", 1, "the prompt's encoding is cached");
+            return e.Embedding;
+        }
+        report("text", 0, "encoding the prompt");
+        var ids = await TokenizeAsync(prompt, ct);
+        float[] ctx;
+        using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
+            ctx = await t5.EncodeAsync(ids, ct);
+        _prompts.Add((prompt, ctx));
+        if (_prompts.Count > PromptCacheSize) _prompts.RemoveAt(0);
+        report("text", 1, $"{ids.Length} tokens");
+        return ctx;
     }
 
     /// <summary>The T5 token ids of a prompt as the reference makes them: truncated to 128 tokens including the end-of-sequence token (the tokenizer cuts before adding it).</summary>
@@ -231,22 +270,17 @@ public sealed class LtxPipeline
         void Report(string stage, double f, string msg) => progress?.Report(new WanProgress(stage, f, msg));
 
         // the prompt once for both passes
-        var embedding = req.PromptEmbedding;
-        if (embedding == null)
-        {
-            Report("text", 0, "encoding the prompt");
-            var ids = await TokenizeAsync(req.Prompt, ct);
-            using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
-                embedding = await t5.EncodeAsync(ids, ct);
-            Report("text", 1, $"{ids.Length} tokens");
-        }
+        var embedding = req.PromptEmbedding ?? await EncodePromptAsync(req.Prompt, Report, ct);
         var inner = progress == null ? null : new Progress<WanProgress>(p => progress.Report(p.Stage == "denoise" ? p with { Message = "first pass: " + p.Message } : p));
+        _pass = "first pass";
         var first = await DenoiseAsync(Pass(req, w1, h1, req.Sigmas, null, req.Seed, embedding), inner, ct);
         Report("upscale", 0, "x2 latent upscaler");
         var up = await UpsampleLatentAsync(first, Fz, h1 / SpatialRatio, w1 / SpatialRatio, req.AdainFactor, ct);
         Report("upscale", 1, "done");
         var inner2 = progress == null ? null : new Progress<WanProgress>(p => progress.Report(p.Stage == "denoise" ? p with { Message = "second pass: " + p.Message } : p));
+        _pass = "second pass";
         var second = await DenoiseAsync(Pass(req, 2 * w1, 2 * h1, req.SecondPassSigmas ?? LtxSampler.DistilledSecondPass, up, req.Seed + 7919L, embedding), inner2, ct);
+        _pass = "";
         return await DecodeAsync(req, second, Fz, 2 * h1 / SpatialRatio, 2 * w1 / SpatialRatio, progress, ct);
     }
 
@@ -270,12 +304,8 @@ public sealed class LtxPipeline
         }
         else
         {
-            Report("text", 0, "encoding the prompt");
-            var ids = await TokenizeAsync(req.Prompt, ct);
-            using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
-                ctx = await t5.EncodeAsync(ids, ct);
-            rows = ids.Length;
-            Report("text", 1, $"{ids.Length} tokens");
+            ctx = await EncodePromptAsync(req.Prompt, Report, ct);
+            rows = ctx.Length / 4096;
         }
 
         var noise = req.InitialNoise != null ? (float[])req.InitialNoise.Clone() : Gaussian(128L * N, req.Seed);
@@ -301,6 +331,13 @@ public sealed class LtxPipeline
         {
             ct.ThrowIfCancellationRequested();
             dit.Forward(lat.View, LtxSampler.Timestep(sigmas[s]), 0, v.View);
+            if (Preview != null)
+            {
+                var xs = await lat.View.CopyToHostAsync(); var vs = await v.View.CopyToHostAsync();
+                float sg = sigmas[s];
+                for (long i = 0; i < xs.Length; i++) xs[i] -= sg * vs[i];
+                Preview(new LtxPreview(_pass, s + 1, steps, xs, Fz, h, w));
+            }
             lk.Axpy(lat.View, v.View, sigmas[s + 1] - sigmas[s], noise.Length);
             await _acc.SynchronizeAsync();                                               // one step at a time: the browser queue must not run ahead
             Report("denoise", (s + 1.0) / steps, $"step {s + 1} of {steps}");
@@ -480,6 +517,18 @@ public sealed class LtxPipeline
             }
             dit.Forward(lat.View, segs, 0, v.View, tokenMajor: true);
             StepTap?.Invoke(s, lat.View, v.View);
+            if (Preview != null)
+            {
+                var xs = await lat.View.CopyToHostAsync(); var vs = await v.View.CopyToHostAsync();
+                var x0 = new float[128L * N];
+                foreach (var r in runs)
+                {
+                    float sg = Math.Min(t, (1f - r.M) * 1000f) / 1000f;                       // the token's own sigma: 0 for a hard-conditioned token
+                    for (int k = Math.Max(r.Start, extraTokens); k < r.Start + r.Count; k++)
+                        for (int c = 0; c < 128; c++) x0[(long)c * N + k - extraTokens] = xs[(long)k * 128 + c] - sg * vs[(long)k * 128 + c];
+                }
+                Preview(new LtxPreview(_pass, s + 1, steps, x0, Fz, h, w));
+            }
             foreach (var r in runs)
             {
                 if (!(t / 1000f - 1e-6f < 1f - r.M)) continue;                                // tokens_to_denoise_mask: a conditioned token waits until the schedule reaches its strength
