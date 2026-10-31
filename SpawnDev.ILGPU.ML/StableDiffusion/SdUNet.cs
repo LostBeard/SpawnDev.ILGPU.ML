@@ -175,6 +175,14 @@ public sealed partial class SdUNet : IDisposable
     public SdHyperTile? HyperTile { get; set; }
     private int _latH, _latW;           // the latent size of the running prediction (HyperTile's original_shape)
 
+    /// <summary>Token merging in the self-attention (<see cref="SdTokenMerge"/>: ToMe for SD, ComfyUI's TomePatchModel by default), null = off. HyperTile takes the layers it tiles.</summary>
+    public SdTokenMerge? TokenMerge { get; set; }
+
+    /// <summary>Token downsampling of the self-attention's keys and values (<see cref="SdTokenDownsample"/>: ToDo), null = off. Layers that <see cref="TokenMerge"/> or HyperTile take keep theirs.</summary>
+    public SdTokenDownsample? TokenDownsample { get; set; }
+    private SdTokenReducer? _reducer;
+    private SdTokenReducer Reducer => _reducer ??= new SdTokenReducer(_acc);
+
     /// <summary>Deep shrink (<see cref="SdDeepShrink"/>), null = off.</summary>
     public SdDeepShrink? DeepShrink { get; set; }
 
@@ -264,6 +272,7 @@ public sealed partial class SdUNet : IDisposable
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
         SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26, SlotSagMass = 27, SlotSagStats = 28, SlotSagPart = 29,
+        SlotTokA = 30, SlotTokB = 31,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -353,6 +362,36 @@ public sealed partial class SdUNet : IDisposable
                 }
                 _k.TileRows(aT, a, rows, tg.Th, tg.Tw, tg.Nw, C, inverse: true);
             }
+            else if (TokenMerge is { } tm && TokenGrid(rows, tm.MaxDownsample) is { } mg && Reducer.Prepare(tm, mg.H, mg.W) is { } plan)
+            {
+                // ToMe: the r best-matched sources averaged into their destinations, attention for the merged rows, every token back to its representative's output
+                var am = Slot(SlotTokB, (long)plan.M * C);
+                if (!tm.MergeKeysAndValues)
+                {
+                    // ComfyUI's TomePatchModel: the similarity of the normalised states, only the queries merged (q = W_q n has no bias: merging q = projecting the merged n)
+                    Reducer.Match(plan, n, C, 0, C);
+                    var qm = Slot(SlotTokA, (long)plan.M * C);
+                    Reducer.Merge(plan, qkv, 3 * C, 0, C, qm);
+                    Attention(qm, C, 0, qkv, 3 * C, C, 2 * C, am, plan.M, rows, C);
+                }
+                else
+                {
+                    // tomesd: the similarity of the block's input, queries, keys and values all merged
+                    Reducer.Match(plan, h, C, 0, C);
+                    var qkvm = Slot(SlotTokA, (long)plan.M * 3 * C);
+                    Reducer.Merge(plan, qkv, 3 * C, 0, 3 * C, qkvm);
+                    Attention(qkvm, 3 * C, 0, qkvm, 3 * C, C, 2 * C, am, plan.M, plan.M, C);
+                }
+                Reducer.Unmerge(plan, am, a, C);
+            }
+            else if (TokenDownsample is { } td && TokenGrid(rows, 2) is { } dg && (dg.Depth == 1 ? td.Factor : td.Factor2) is int df && df > 1)
+            {
+                // ToDo: every query, keys and values on a grid df times coarser per side
+                int oh = Math.Max(1, dg.H / df), ow = Math.Max(1, dg.W / df);
+                var kvd = Slot(SlotTokA, (long)oh * ow * 2 * C);
+                Reducer.DownsampleKv(qkv, kvd, dg.H, dg.W, oh, ow, C, td.Mode);
+                Attention(qkv, 3 * C, 0, kvd, 2 * C, 0, C, a, rows, oh * ow, C);
+            }
             else Attention(qkv, 3 * C, 0, qkv, 3 * C, C, 2 * C, a, rows, rows, C);
             _k.Linear(a, _w[b + "attn1.to_out.0.weight"], _w[b + "attn1.to_out.0.bias"], h, rows, C, C, 0, h);
             // cross attention to the text
@@ -394,6 +433,19 @@ public sealed partial class SdUNet : IDisposable
         int nh = RandomDivisor(h, tile, ht), nw = RandomDivisor(w, tile, ht);
         if (nh * nw <= 1 || h * w != hw) return null;
         return (nh, nw, h / nh, w / nw);
+    }
+
+    /// <summary>
+    /// The token grid of a layer with <paramref name="tokens"/> tokens when its downsampling from the latent is at most <paramref name="maxDownsample"/>: tomesd's
+    /// downsample = ceil(sqrt(latent tokens / tokens)) (integer division first), sides ceil(latent side / downsample); null when the sides do not multiply to the token count.
+    /// Depth = downsample.
+    /// </summary>
+    private (int H, int W, int Depth)? TokenGrid(int tokens, int maxDownsample)
+    {
+        int ds = (int)Math.Ceiling(Math.Sqrt(_latH * _latW / tokens));
+        if (ds < 1 || ds > maxDownsample) return null;
+        int gh = (_latH + ds - 1) / ds, gw = (_latW + ds - 1) / ds;
+        return gh * gw == tokens ? (gh, gw, ds) : null;
     }
 
     private static readonly Random SharedRng = new();
@@ -502,6 +554,7 @@ public sealed partial class SdUNet : IDisposable
         int mc = ModelChannels, rows0 = h * w;
         _latH = h; _latW = w;
         _sagN = 0;
+        _reducer?.BeginPrediction();
         // the largest activation: a level's pixels x the widest concatenated input of that level (output blocks read h | skip)
         long maxElems = (long)rows0 * mc * 2;
         {
@@ -703,6 +756,7 @@ public sealed partial class SdUNet : IDisposable
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
         _patches?.Dispose();
+        _reducer?.Dispose();
         if (_ownsWeights) _w.Dispose();
     }
 }

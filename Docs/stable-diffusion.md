@@ -67,6 +67,20 @@ unet.DeepShrink = new SdDeepShrink(Block: 3, Factor: 2.0, AfterSkip: true);   //
 // ComfyUI applies it only while sigma is in [sigma(end_percent), sigma(start_percent)] (defaults 0 .. 0.35): set it for those steps, null for the rest
 ```
 HyperTile: `unet.HyperTile = new SdHyperTile(TileSize: 256, SwapSize: 2, MaxDepth: 0)` (ComfyUI's defaults; tiles the self-attention of the first MaxDepth + 1 resolutions exactly as ComfyUI's node does, including its token grid for non-square latents). ComfyUI's node tiles only the queries: k and v come from the untiled tokens and its attention reshapes them by q's batch, so query tile t attends to the band of flat tokens [t * L, (t + 1) * L) of its picture, not to its own tile. That is the default (ComfyUI's pictures, 2.7e-6 vs its code); `TileKeysAndValues: true` gives true tiled self-attention (each tile attends to itself).
+Token reduction in the self-attention (faster, approximate; HyperTile takes the layers it tiles):
+```csharp
+unet.TokenDownsample = new SdTokenDownsample(Factor: 2);               // ToDo: every query, keys / values on a 2x coarser grid (full resolution); Factor2 for the second
+unet.TokenMerge = new SdTokenMerge(Ratio: 0.3f);                       // ToMe as ComfyUI's TomePatchModel (queries merged, random destinations)
+unet.TokenMerge = new SdTokenMerge(0.5f, MergeKeysAndValues: true);    // ToMe as tomesd (queries, keys and values merged)
+```
+Both match their references to about 1e-6 with fp32 math (tomesd's own `bipartite_soft_matching_random2d`, deterministic destinations; ToDo's `F.interpolate` nearest /
+nearest-exact / area). Random destinations come from `Rng`; the originals draw from torch's generator, so a random run is not reproducible against them. ToMe's merge
+choices are discrete: CUDA's tensor-core linears (1e-3 per prediction) flip a few of them.
+MEASURED, SD 1.5 on an RTX 4070 (CUDA), one prediction: 512 px plain 85 ms, ToMe queries 0.3 84 ms, ToMe all 0.5 74 ms, ToDo 2x 65 ms; 1024 px plain 606 ms, ToMe
+queries 0.3 567 ms, ToMe all 0.5 373 ms, ToDo 2x 294 ms. The 512 px DDIM-20 picture against the plain one (PSNR): ToMe queries 0.3 21.2 dB, all 0.5 20.2 dB, ToDo nearest
+21.0 dB at 1.25x, ToDo area 18.4 dB (averaged keys blur the background). At 512 px attention is a small part of the UNet, so merging only the queries saves about what the
+matching costs; the savings grow with the square of the token count.
+
 Self-Attention Guidance (ComfyUI's SelfAttentionGuidance; you keep the guidance arithmetic, as for CFG):
 ```csharp
 unet.RecordMiddleSelfAttention = true;                                 // on the unconditional pass
