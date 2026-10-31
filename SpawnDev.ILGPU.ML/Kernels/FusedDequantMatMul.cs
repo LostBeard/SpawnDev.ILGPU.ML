@@ -1808,14 +1808,18 @@ public class FusedDequantMatMul : IDisposable
         if (M < 1 || M > RowsMax) throw new ArgumentOutOfRangeException(nameof(M), $"1..{RowsMax}");
         if (!Supports(type)) throw new NotSupportedException($"ForwardRows: {type}");
         if (_accelerator.AcceleratorType == AcceleratorType.WebGL) { Forward(input, weightQuant, output, M, K, N, type); return; }
-        int code = type switch { GGMLType.Q8_0 => 0, GGMLType.Q4_0 => 1, GGMLType.Q4_1 => 2, GGMLType.Q5_0 => 3, GGMLType.Q4_K => 4, GGMLType.Q6_K => 5, _ => 6 };
+        int code = TypeCode(type);
         if (!_rowsParams.TryGetValue((M, K, N, code), out var pb)) { pb = _accelerator.Allocate1D(new[] { M, K, N, code }); _rowsParams[(M, K, N, code)] = pb; }
         _gemvRows ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvRowsImpl);
         _gemvRows(new KernelConfig(N, GemvGroupSize), input, weightQuant.Cast<byte, int>(), output, pb.View);
     }
 
-    private static int RowBytesOf(int code, int K) => code switch { 0 => K / 32 * 34, 1 => K / 32 * 18, 2 => K / 32 * 20, 3 => K / 32 * 22, 4 => K / 256 * 144, 5 => K / 256 * 210, _ => K / 32 * 17 };
-    private static float DecodeOf(int code, ArrayView1D<int, Stride1D.Dense> w, int rowBase, int k) => code switch
+    /// <summary>The block type as the code <see cref="DecodeOf"/> and <see cref="RowBytesOf"/> take (one kernel for every supported type).</summary>
+    internal static int TypeCode(GGMLType type) => type switch { GGMLType.Q8_0 => 0, GGMLType.Q4_0 => 1, GGMLType.Q4_1 => 2, GGMLType.Q5_0 => 3, GGMLType.Q4_K => 4, GGMLType.Q6_K => 5, _ => 6 };
+    /// <summary>Bytes of one row of K values of the block type <paramref name="code"/>.</summary>
+    internal static int RowBytesOf(int code, int K) => code switch { 0 => K / 32 * 34, 1 => K / 32 * 18, 2 => K / 32 * 20, 3 => K / 32 * 22, 4 => K / 256 * 144, 5 => K / 256 * 210, _ => K / 32 * 17 };
+    /// <summary>Value <paramref name="k"/> of the row starting at byte <paramref name="rowBase"/> of block type <paramref name="code"/> (callable from other kernels).</summary>
+    internal static float DecodeOf(int code, ArrayView1D<int, Stride1D.Dense> w, int rowBase, int k) => code switch
     {
         0 => DecodeQ8_0Element(w, rowBase, k),
         1 => DecodeQ4_0Element(w, rowBase, k),

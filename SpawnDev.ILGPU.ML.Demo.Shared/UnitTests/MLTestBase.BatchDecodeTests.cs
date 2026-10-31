@@ -11,7 +11,9 @@ public abstract partial class MLTestBase
     /// <summary>
     /// <see cref="GgufBatchDecoder"/> against the engine it batches (Qwen2.5-0.5B-Instruct Q8_0, the models host): its greedy answer must be the existing generator's
     /// (<see cref="GgufTextGenerationPipeline"/>, itself checked against Ollama) word for word; four greedy sequences decoded together must all equal it (the batched step, the
-    /// forked caches and the multi-row GEMV change nothing); four sampled sequences (different seeds) must not all agree. Times of one and four sequences are reported.
+    /// forked caches and the multi-row GEMV change nothing); four sampled sequences (different seeds) must not all agree. Every draw from the device's candidates
+    /// (<see cref="GgufBatchDecoder.SampleAsync"/>) over 24 sampled steps of four sequences must equal <see cref="GgufBatchDecoder.SampleLogits"/> on the full logits row
+    /// with the same generator state, and at most a tenth of them may need the full row (the fallback). Times of one and four sequences are reported.
     /// </summary>
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task GgufBatchDecoder_GreedyMatchesGenerator() => await RunTest(async accelerator =>
@@ -42,15 +44,35 @@ public abstract partial class MLTestBase
         sw.Restart();
         var four = await dec.GenerateAsync(ids, 4, maxNew, 0f, 1f, 1, stopSet);
         double t4 = sw.Elapsed.TotalSeconds;
+        var dt = dec.DecodeTimings;
         var sampled = await dec.GenerateAsync(ids, 4, maxNew, 0.8f, 0.95f, 11, stopSet);
+        // the device candidates against the full-row sampler, draw for draw
+        int draws = 0, mismatches = 0;
+        await dec.PrefillAsync(ids, 0.8f);
+        dec.Fork(4);
+        var nextTok = new int[4];
+        for (int step = 0; step < 24; step++)
+        {
+            var full = await dec.ReadLogitsAsync();
+            for (int s = 0; s < 4; s++)
+            {
+                int row = step == 0 ? 0 : s, seed = 1000 * step + s;
+                int a = await dec.SampleAsync(row, 0.95f, new Random(seed));
+                int b = GgufBatchDecoder.SampleLogits(full, row, dec.Vocab, 0.8f, 0.95f, new Random(seed));
+                draws++; if (a != b) mismatches++;
+                nextTok[s] = b;
+            }
+            await dec.StepAsync(nextTok, 0.8f);
+        }
+        int wide = dec.RowReads;
         string got = Text(one[0]);
         bool same = got == want, rowsEqual = four.All(r => r.SequenceEqual(one[0]));
         int distinct = sampled.Select(Text).Distinct().Count();
         var report = $"{accelerator.AcceleratorType}: greedy {(same ? "= the generator" : "DIFFERS from the generator")} ({one[0].Length} tokens); four greedy rows {(rowsEqual ? "identical" : "DIFFER")}; four samples {distinct} distinct; "
-            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s";
+            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row)";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
-        if (!rowsEqual || distinct < 2) throw new Exception(report);
+        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
 }
