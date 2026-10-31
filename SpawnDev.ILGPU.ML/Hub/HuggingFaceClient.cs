@@ -18,7 +18,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// var results = await hf.SearchModelsAsync("squeezenet", pipelineTag: "image-classification", library: "onnx");
 ///
 /// // Get detailed model info
-/// var info = await hf.GetModelInfoAsync("onnx-community/squeezenet1.1-7");
+/// var info = await hf.GetModelInfoAsync("onnxmodelzoo/squeezenet1.1-7");
 /// Console.WriteLine($"{info.Id}: {info.Downloads} downloads, {info.Likes} likes");
 ///
 /// // List files in a repo

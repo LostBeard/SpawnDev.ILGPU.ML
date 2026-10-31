@@ -74,7 +74,7 @@
             <div class="transcription-stats">
                 <span class="stat">@_inferenceMs.ToString("F0")ms</span>
                 <span class="stat">@_audioDurationSeconds.ToString("F1")s audio</span>
-                <span class="stat">@(_audioDurationSeconds / (_inferenceMs / 1000.0)):F1x realtime</span>
+                <span class="stat">@((_audioDurationSeconds / (_inferenceMs / 1000.0)).ToString("F1"))x realtime</span>
             </div>
         </div>
     }
