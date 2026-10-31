@@ -156,6 +156,50 @@ public abstract partial class MLTestBase
         return report;
     });
 
+    /// <summary>
+    /// W8A8 in the browser (<see cref="Flux2.Flux2Weights.EnableW8A8"/>): the Turbo transformer (8-bit) at the /video page's 832x480 x33, 4 steps, seed 8, with the float GEMM
+    /// path and with W8A8. Reported: the transformer's time per step (from the first step's end to the last's) and the PSNR of the W8A8 video against the float one (must be
+    /// over 25 dB: the activation quantisation alone, 3e-3 per forward on the desktop).
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Wan_W8A8_OverHttp() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser pipeline test (the desktop runs Wan_W8A8_MatchesDequantizedGemm)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var source = new WanRangeSource(http);
+        try { await using var probe = await source.OpenAsync("", Wan22Paths.DitFile("turbo_q8")); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running or has no Turbo file ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/wan 8767"); }
+        var pipe = new Wan22Pipeline(accelerator, source, "", Wan22Paths.InRepo(Wan22Paths.DitFile("turbo_q8"), Wan22Paths.TextEncoderFile("q8")));
+        async Task<(WanVideo Video, double StepS)> Run(bool w8a8)
+        {
+            var saved = Flux2.Flux2Weights.EnableW8A8;
+            Flux2.Flux2Weights.EnableW8A8 = w8a8;
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                double first = -1, last = -1;
+                var progress = new Progress<WanProgress>(p => { if (p.Stage == "denoise" && p.Message.StartsWith("step ")) { if (first < 0) first = sw.Elapsed.TotalSeconds; last = sw.Elapsed.TotalSeconds; } });
+                var v = await pipe.GenerateAsync(new WanRequest { Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly, soft light, shallow depth of field.", Width = 832, Height = 480, Frames = 33, Steps = 4, GuidanceScale = 1.0, Sampler = WanSampler.FewStep, Seed = 8 }, progress);
+                return (v, (last - first) / 3);
+            }
+            finally { Flux2.Flux2Weights.EnableW8A8 = saved; }
+        }
+        var plain = await Run(false);
+        var fast = await Run(true);
+        double mse = 0;
+        for (int i = 0; i < fast.Video.Data.Length; i++)
+        {
+            if (!float.IsFinite(fast.Video.Data[i])) throw new Exception("a pixel is not finite");
+            double d = (Math.Clamp(fast.Video.Data[i], -1f, 1f) - Math.Clamp(plain.Video.Data[i], -1f, 1f)) / 2; mse += d * d;
+        }
+        double psnr = 10 * Math.Log10(1 / (mse / fast.Video.Data.Length));
+        var report = $"browser W8A8 on {accelerator.AcceleratorType} (int8 dot {(accelerator.Capabilities.PackedInt8DotProduct ? "native" : "emulated")}): Turbo 832x480 x33, transformer {plain.StepS:F1} s per step float GEMM, {fast.StepS:F1} s W8A8 ({plain.StepS / fast.StepS:F2}x); PSNR {psnr:F1} dB vs the float video";
+        Console.WriteLine("[Wan] " + report);
+        if (!(psnr > 25)) throw new Exception(report);
+        return report;
+    });
+
     /// <summary>The largest video the /video page offers, end to end in the browser: 832x480, 33 frames, 8 steps (a draft: only the memory and the stage times matter), seed 3; the video must be finite and not flat.</summary>
     [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
     public async Task Wan_Pipeline_OverHttp_Large() => await RunTest(async accelerator =>

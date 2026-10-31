@@ -101,6 +101,14 @@ clip; 0.12 skips 52, 47.3 s (1.59x), 27.6 dB. In the browser (Chrome WebGPU, `Wa
 (1.43x), 24.2 dB (fewer steps: each skip covers more), so `/video` runs the standard transformer at the reference's 50 steps with MagCache, about the cost of 30 plain
 steps. One extra [tokens, 3072] buffer per guidance branch. Not for Turbo (4 steps: nothing to skip).
 
+**W8A8 (opt-in, not a default).** `Flux2Weights.EnableW8A8 = true` (or `ML_W8A8=1`) runs the 8-bit matrices straight from their blocks with the activations quantised to 8 bits per
+block of 32, on packed int8 dot products (`Q8Linear`; WGSL `dot4I8Packed`, CUDA dp4a; SpawnDev.ILGPU 5.4.14). In Chrome it is faster: a Wan layer at 3510 tokens up to 3.3x
+(3072 -> 3072: 24.4 -> 7.5 ms), the Wan Turbo transformer 5.0 -> 3.9 s per step at 832x480 x33, LTX's 2.73 -> 2.16 s. One forward differs from the float path by 3e-3 (Wan).
+But at the clip level it costs more than the 8-bit weights do, so no model takes it automatically: against the bf16 video, Wan Turbo 8-bit 30.8 dB, 8-bit W8A8 27.4 dB
+(`Wan_W8A8_ClipCost`); LTX 32.1 vs 22.8 dB, its error spread over every layer type; the T5 encoders are excluded outright (one prompt went to 0.14). Activation blocks of 32
+are too coarse for these activations; finer or asymmetric activation scales are the open next step. `Flux2Weights.SkipW8A8` (ML_W8A8_SKIP) keeps named layers on the float
+GEMM for such measurements.
+
 ## Limits
 
 - **Memory.** The model's own size, 1280x704 with 121 frames (5 s), runs on a 12 GB card: 2 steps took 224 s (text 23 s, DiT 85 s, about 21 s per forward at 27,280 tokens, VAE decode 116 s), so a

@@ -145,22 +145,24 @@ public sealed class UmT5Encoder : IDisposable
                 // self-attention
                 hn.View.CopyFrom(xb.View);
                 _wk.RowRmsNorm(hn.View, w.BF16(p + "norm1.weight"), total, Dim, 0, Dim, 1e-6f);
-                _k.Linear(hn.View, fw.Matrix(p + "attn.qkv.weight"), null, qkv.View, total, Dim, 3 * Dim);
+                // the text encoders stay on the float GEMM, never W8A8: T5-v1.1-XXL's activations (huge, with outliers) made 8-bit activations unstable (MEASURED, LTX T5 prompt 0:
+                // 0.14 relRMS on CUDA, where fc2's float path rounds to bf16, 0.033 on OpenCL; umT5 doubled its error); it runs once per prompt and is cached, so W8A8 bought little
+                fw.Linear(_k, hn.View, p + "attn.qkv.weight", null, qkv.View, total, Dim, 3 * Dim, allowW8A8: false);
                 for (int s = 0; s < count; s++)
                 {
                     int L = sequences[s].Length, off = offsets[s];
                     _wk.T5Attention(qkv.View.SubView((long)off * 3 * Dim, (long)L * 3 * Dim), _sharedBias ? sharedBias!.BF16(SharedBiasName) : w.BF16(p + "pos_embedding.embedding.weight"), buckets[s].View, scores.View,
                         att.View.SubView((long)off * Dim, (long)L * Dim), L, Heads, HeadDim);
                 }
-                _k.Linear(att.View, fw.Matrix(p + "attn.o.weight"), null, proj.View, total, Dim, Dim);
+                fw.Linear(_k, att.View, p + "attn.o.weight", null, proj.View, total, Dim, Dim, allowW8A8: false);
                 _k.GateResidual(xb.View, proj.View, default, -1, total * Dim, Dim);
                 // gated feed-forward
                 hn.View.CopyFrom(xb.View);
                 _wk.RowRmsNorm(hn.View, w.BF16(p + "norm2.weight"), total, Dim, 0, Dim, 1e-6f);
-                _k.Linear(hn.View, fw.Matrix(p + "ffn.gate.weight"), null, gate.View, total, Dim, FfnDim, DiTKernels.Act.GeluTanh);
-                _k.Linear(hn.View, fw.Matrix(p + "ffn.fc1.weight"), null, fc1.View, total, Dim, FfnDim);
+                fw.Linear(_k, hn.View, p + "ffn.gate.weight", null, gate.View, total, Dim, FfnDim, DiTKernels.Act.GeluTanh, allowW8A8: false);
+                fw.Linear(_k, hn.View, p + "ffn.fc1.weight", null, fc1.View, total, Dim, FfnDim, allowW8A8: false);
                 _wk.MulInPlace(fc1.View, gate.View, total * FfnDim);
-                _k.Linear(fc1.View, fw.Matrix(p + "ffn.fc2.weight"), null, proj.View, total, FfnDim, Dim);
+                fw.Linear(_k, fc1.View, p + "ffn.fc2.weight", null, proj.View, total, FfnDim, Dim, allowW8A8: false);
                 _k.GateResidual(xb.View, proj.View, default, -1, total * Dim, Dim);
                 await _acc.SynchronizeAsync();                                         // the layer's weights are freed when `w` goes out of scope
                 if (Tap != null && (b == 0 || b == _layers / 2 || b == _layers - 1)) Tap($"layer_{b}", xb.View, sequences[0].Length * Dim);

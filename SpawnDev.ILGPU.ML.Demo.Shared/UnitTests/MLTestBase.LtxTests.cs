@@ -136,7 +136,7 @@ public abstract partial class MLTestBase
             report.Add($"prompt {name} ({n} tokens): relRMS {m.RelRms:E2}, maxAbs {m.MaxAbs:F3} of {m.RefMaxAbs:F2}; {sw.Elapsed.TotalSeconds:F1} s");
             worst = Math.Max(worst, m.RelRms);
         }
-        LtxLog("T5 " + file, report);
+        LtxLog("T5 " + file + (Flux2.Flux2Weights.EnableW8A8 == true ? " W8A8 " : " ") + accelerator.AcceleratorType, report);
         if (!(worst < bound)) throw new Exception("the T5 encoder deviates from the reference: " + string.Join("; ", report));
         return string.Join("; ", report);
     }
@@ -436,7 +436,9 @@ public abstract partial class MLTestBase
     /// reference's velocity prediction at production size, and the cost of the quantisation on record. Desktop GPU or WebGPU.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Ltx_DiT_Quantized_MatchesReference() => await RunTest(async accelerator =>
+    public async Task Ltx_DiT_Quantized_MatchesReference() => await RunTest(accelerator => LtxDitQ8Check(accelerator, "DiT q8"));
+
+    private async Task<string> LtxDitQ8Check(Accelerator accelerator, string tag)
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the DiT runs on a desktop GPU or WebGPU");
@@ -457,10 +459,10 @@ public abstract partial class MLTestBase
         double ms = sw.Elapsed.TotalMilliseconds;
         var m32 = WanCompare(got, WanNpz(fx32, "step0_pred").Data); var m16 = WanCompare(got, WanNpz(fx, "step0_pred").Data);
         var lines = new[] { $"q8 DiT prediction [128, {ls[1]}, {ls[2]}, {ls[3]}]: vs the fp32 reference relRMS {m32.RelRms:E2}, vs the bf16 reference {m16.RelRms:E2}; weights {weights.Bytes / 1e9:F2} GB on the device; first forward {ms:F0} ms" };
-        LtxLog("DiT q8", lines);
+        LtxLog(tag, lines);
         if (!(m32.RelRms < 0.06 && m16.RelRms < 0.15)) throw new Exception("the 8-bit DiT deviates from the reference beyond its bound: " + string.Join("; ", lines));
         return string.Join("; ", lines);
-    });
+    }
 
     /// <summary>Print the lines and append them to LTX_DIR\out\ltx_tests.log (the PMT summary hides the console output of a passing desktop test).</summary>
     private static void LtxLog(string what, IEnumerable<string> lines)

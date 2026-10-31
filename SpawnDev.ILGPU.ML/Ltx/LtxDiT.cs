@@ -144,13 +144,13 @@ public sealed class LtxDiT : IDisposable
             for (int i = 0; i < _blocks; i++) { var kv = _acc.Allocate1D<float>((long)_textLen * 2 * C); _ctxBufs.Add(kv); _crossKv[slot][i] = kv.View; }
         }
         _rows[slot] = rows;
-        _k.Linear(_ctxIn, _mat.Matrix("text_embedding.0.weight"), _w.BF16("text_embedding.0.bias"), _ctxHid, rows, _textDim, C, DiTKernels.Act.GeluTanh);
-        _k.Linear(_ctxHid, _mat.Matrix("text_embedding.2.weight"), _w.BF16("text_embedding.2.bias"), _textEmb[slot], rows, C, C);
+        _mat.Linear(_k, _ctxIn, "text_embedding.0.weight", _w.BF16("text_embedding.0.bias"), _ctxHid, rows, _textDim, C, DiTKernels.Act.GeluTanh);
+        _mat.Linear(_k, _ctxHid, "text_embedding.2.weight", _w.BF16("text_embedding.2.bias"), _textEmb[slot], rows, C, C);
         for (int b = 0; b < _blocks; b++)
         {
             string p = $"blocks.{b}.";
             var kv = _crossKv[slot][b];
-            _k.Linear(_textEmb[slot], _mat.Matrix(p + "cross_attn.kv.weight"), _w.BF16(p + "cross_attn.kv.bias"), kv, rows, C, 2 * C);
+            _mat.Linear(_k, _textEmb[slot], p + "cross_attn.kv.weight", _w.BF16(p + "cross_attn.kv.bias"), kv, rows, C, 2 * C);
             _wk.RowRmsNorm(kv, _w.BF16(p + "cross_attn.norm_k.weight"), rows, 2 * C, 0, C, 1e-5f);
         }
         _acc.Fence();
@@ -166,10 +166,10 @@ public sealed class LtxDiT : IDisposable
         while (_seg.Count <= i) _seg.Add(new SegmentBuffers(Alloc(_freqDim), Alloc(C), Alloc(C), Alloc(C), Alloc(6 * C), Alloc(6 * C), Alloc(2 * C)));
         var s = _seg[i];
         s.TFreq.CopyFromCPU(WanKernels.SinusoidalEmbedding(t, _freqDim));
-        _k.Linear(s.TFreq, _mat.Matrix("time_embedding.0.weight"), _w.BF16("time_embedding.0.bias"), s.THidden, 1, _freqDim, C, DiTKernels.Act.Silu);
-        _k.Linear(s.THidden, _mat.Matrix("time_embedding.2.weight"), _w.BF16("time_embedding.2.bias"), s.E, 1, C, C);
+        _mat.Linear(_k, s.TFreq, "time_embedding.0.weight", _w.BF16("time_embedding.0.bias"), s.THidden, 1, _freqDim, C, DiTKernels.Act.Silu);
+        _mat.Linear(_k, s.THidden, "time_embedding.2.weight", _w.BF16("time_embedding.2.bias"), s.E, 1, C, C);
         _k.Silu(s.E, s.EAct, C);
-        _k.Linear(s.EAct, _mat.Matrix("time_projection.1.weight"), _w.BF16("time_projection.1.bias"), s.E0, 1, C, 6 * C);
+        _mat.Linear(_k, s.EAct, "time_projection.1.weight", _w.BF16("time_projection.1.bias"), s.E0, 1, C, 6 * C);
         return s;
     }
 
@@ -202,7 +202,7 @@ public sealed class LtxDiT : IDisposable
 
         // tokens: [128, N] -> [N, 128], then the patch projection (a linear layer)
         if (!tokenMajor) _k.Transpose(latent, _tokens, _inCh, N);
-        _k.Linear(tokenMajor ? latent : _tokens, _mat.Matrix("patch_embedding.weight"), _w.BF16("patch_embedding.bias"), _hid, N, _inCh, C);
+        _mat.Linear(_k, tokenMajor ? latent : _tokens, "patch_embedding.weight", _w.BF16("patch_embedding.bias"), _hid, N, _inCh, C);
         Tap?.Invoke("patch_embedding", _hid, N * C);
 
         for (int b = 0; b < _blocks; b++)
@@ -213,26 +213,26 @@ public sealed class LtxDiT : IDisposable
 
             // self attention
             for (int i = 0; i < seg.Length; i++) _lk.RmsNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Mod, 0 * C, 1 * C, segments[i].Count, C, 1e-6f);
-            _k.Linear(_hn, _mat.Matrix(p + "self_attn.qkv.weight"), _w.BF16(p + "self_attn.qkv.bias"), _qkv, N, C, 3 * C);
+            _mat.Linear(_k, _hn, p + "self_attn.qkv.weight", _w.BF16(p + "self_attn.qkv.bias"), _qkv, N, C, 3 * C);
             _wk.RowRmsNorm(_qkv, _w.BF16(p + "self_attn.norm_q.weight"), N, 3 * C, 0 * C, C, 1e-5f);
             _wk.RowRmsNorm(_qkv, _w.BF16(p + "self_attn.norm_k.weight"), N, 3 * C, 1 * C, C, 1e-5f);
             _wk.RopeApply(_qkv, _phases!.View, N, 3 * C, 0 * C, 1, C);          // the rotation runs over the whole q / k vector: one "head" of width C
             _wk.RopeApply(_qkv, _phases.View, N, 3 * C, 1 * C, 1, C);
             _k.Attention(_qkv, 3 * C, 0, _qkv, 3 * C, 1 * C, 2 * C, _scores, _attn, N, N, H, D);
-            _k.Linear(_attn, _mat.Matrix(p + "self_attn.o.weight"), _w.BF16(p + "self_attn.o.bias"), _proj, N, C, C);
+            _mat.Linear(_k, _attn, p + "self_attn.o.weight", _w.BF16(p + "self_attn.o.bias"), _proj, N, C, C);
             for (int i = 0; i < seg.Length; i++) _k.GateResidual(Rows(_hid, i), Rows(_proj, i), seg[i].Mod, 2 * C, segments[i].Count * C, C);
 
             // cross attention: on the raw residual stream (no norm, no modulation, no RoPE), plain residual
-            _k.Linear(_hid, _mat.Matrix(p + "cross_attn.q.weight"), _w.BF16(p + "cross_attn.q.bias"), _q, N, C, C);
+            _mat.Linear(_k, _hid, p + "cross_attn.q.weight", _w.BF16(p + "cross_attn.q.bias"), _q, N, C, C);
             _wk.RowRmsNorm(_q, _w.BF16(p + "cross_attn.norm_q.weight"), N, C, 0, C, 1e-5f);
             _k.Attention(_q, C, 0, _crossKv[slot][b], 2 * C, 0, C, _scores, _attn, N, L, H, D);
-            _k.Linear(_attn, _mat.Matrix(p + "cross_attn.o.weight"), _w.BF16(p + "cross_attn.o.bias"), _proj, N, C, C);
+            _mat.Linear(_k, _attn, p + "cross_attn.o.weight", _w.BF16(p + "cross_attn.o.bias"), _proj, N, C, C);
             _k.GateResidual(_hid, _proj, default, -1, N * C, C);
 
             // feed forward
             for (int i = 0; i < seg.Length; i++) _lk.RmsNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Mod, 3 * C, 4 * C, segments[i].Count, C, 1e-6f);
-            _k.Linear(_hn, _mat.Matrix(p + "ffn.0.weight"), _w.BF16(p + "ffn.0.bias"), _mlp, N, C, _ffn, DiTKernels.Act.GeluTanh);
-            _k.Linear(_mlp, _mat.Matrix(p + "ffn.2.weight"), _w.BF16(p + "ffn.2.bias"), _proj, N, _ffn, C);
+            _mat.Linear(_k, _hn, p + "ffn.0.weight", _w.BF16(p + "ffn.0.bias"), _mlp, N, C, _ffn, DiTKernels.Act.GeluTanh);
+            _mat.Linear(_k, _mlp, p + "ffn.2.weight", _w.BF16(p + "ffn.2.bias"), _proj, N, _ffn, C);
             for (int i = 0; i < seg.Length; i++) _k.GateResidual(Rows(_hid, i), Rows(_proj, i), seg[i].Mod, 5 * C, segments[i].Count * C, C);
 
             if (Tap != null && Array.IndexOf(TapBlocks, b) >= 0) Tap($"block_{b}", _hid, N * C);
@@ -245,7 +245,7 @@ public sealed class LtxDiT : IDisposable
             _k.LayerNormModulate(Rows(_hid, i), Rows(_hn, i), seg[i].Hm, 0, C, segments[i].Count, C, 1e-6f);
         }
         var head = tokenMajor ? o : _headOut;
-        _k.Linear(_hn, _mat.Matrix("head.head.weight"), _w.BF16("head.head.bias"), head, N, C, _outCh);
+        _mat.Linear(_k, _hn, "head.head.weight", _w.BF16("head.head.bias"), head, N, C, _outCh);
         Tap?.Invoke("head", head, N * _outCh);
         if (!tokenMajor) _k.Transpose(_headOut, o, N, _outCh);                   // [N, 128] -> [128, N]
         _acc.Fence();

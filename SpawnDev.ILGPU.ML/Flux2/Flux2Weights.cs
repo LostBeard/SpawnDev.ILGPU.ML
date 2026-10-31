@@ -19,6 +19,8 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 public sealed class Flux2Weights : IDisposable
 {
     private readonly GpuWeights _w;
+    private readonly Accelerator _acc;
+    private Q8Linear? _q8;
     private readonly Flux2Kernels _f;
     private readonly SkinTokensKernels _u;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _scratch;
@@ -35,7 +37,7 @@ public sealed class Flux2Weights : IDisposable
     /// </summary>
     public Flux2Weights(Accelerator accelerator, GpuWeights weights, bool ownsWeights = true)
     {
-        _owns = ownsWeights;
+        _owns = ownsWeights; _acc = accelerator;
         _w = weights; _f = new Flux2Kernels(accelerator); _u = new SkinTokensKernels(accelerator);
         weights.Metadata.TryGetValue("quant", out var quant);
         QuantBits = quant != null && quant.StartsWith("q8", StringComparison.Ordinal) ? 8 : 4;
@@ -68,6 +70,37 @@ public sealed class Flux2Weights : IDisposable
         return _scratch.View.SubView(0, (long)n * k / 2).Cast<uint, BFloat16>();
     }
 
+    /// <summary>
+    /// W8A8 (<see cref="Q8Linear"/>): 8-bit matrices multiply straight from their blocks with activations quantised to 8 bits per block of 32, on packed int8 dot products,
+    /// instead of a bf16 copy of the matrix and a float GEMM. True turns it on for every 8-bit matrix (ML_W8A8=1): faster on WebGPU with native packed int8 dot products (Chrome:
+    /// the packed_4x8_integer_dot_product feature; a Wan layer up to 3.3x, the Wan Turbo transformer 1.27x per step), at a measured cost in quality (<see cref="AutoW8A8"/>).
+    /// Null (the default) = only for a model that opts in on WebGPU with native packed dots; false (ML_W8A8=0) = never.
+    /// </summary>
+    public static bool? EnableW8A8 { get; set; } = Environment.GetEnvironmentVariable("ML_W8A8") switch { "1" => true, "0" => false, _ => null };
+
+    /// <summary>Matrix names containing any of these stay on the float GEMM (ML_W8A8_SKIP, comma separated): for measuring which layers are sensitive.</summary>
+    public static string[] SkipW8A8 { get; set; } = (Environment.GetEnvironmentVariable("ML_W8A8_SKIP") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>Whether <see cref="Linear"/> runs <paramref name="name"/> as W8A8.</summary>
+    public bool UsesW8A8(string name) => QuantBits == 8 && _w.IsU32(name) && !SkipW8A8.Any(s => name.Contains(s, StringComparison.Ordinal))
+        && (EnableW8A8 ?? (AutoW8A8 && _acc.AcceleratorType == AcceleratorType.WebGPU && _acc.Capabilities.PackedInt8DotProduct));
+
+    /// <summary>
+    /// Whether this model takes W8A8 automatically (<see cref="EnableW8A8"/> null): for a model whose W8A8 clips cost no more than its 8-bit weights do (PSNR against the bf16
+    /// output within 1.5 dB of the 8-bit float output's). None does yet. MEASURED: Wan 2.2 Turbo 832x480 x33, 27.4 dB against the bf16 video where the 8-bit weights alone give
+    /// 30.8 dB (Chrome: the transformer 5.0 -> 3.9 s per step); LTX-Video 704x480 x97, 22.8 vs 32.1 dB (its error spread over every layer type); the T5 encoders unstable
+    /// (0.14 on one prompt). Activation blocks of 32 are too coarse for these models' activations: finer or asymmetric activation scales are the next step.
+    /// </summary>
+    public bool AutoW8A8 { get; set; }
+
+    /// <summary>nn.Linear with the matrix <paramref name="name"/> [N, K]: W8A8 when <see cref="UsesW8A8"/>, else <paramref name="kernels"/>' GEMM on <see cref="Matrix"/>.</summary>
+    /// <param name="allowW8A8">false keeps this layer on the float GEMM (mixed precision: a layer whose input carries outliers that 8-bit activations cannot hold)</param>
+    public void Linear(DiTKernels kernels, FV x, string name, BV? bias, FV o, int M, int K, int N, DiTKernels.Act act = DiTKernels.Act.None, bool allowW8A8 = true)
+    {
+        if (allowW8A8 && UsesW8A8(name)) { (_q8 ??= new Q8Linear(_acc)).Linear(x, _w.U32(name), bias, o, M, K, N, act); return; }
+        kernels.Linear(x, Matrix(name), bias, o, M, K, N, act);
+    }
+
     /// <summary>A small bf16 tensor (norm weight, bias).</summary>
     public BV Vector(string name) => _w.BF16(name);
 
@@ -81,6 +114,7 @@ public sealed class Flux2Weights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
+        _q8?.Dispose(); _q8 = null;
         if (_owns) _w.Dispose();
     }
 }

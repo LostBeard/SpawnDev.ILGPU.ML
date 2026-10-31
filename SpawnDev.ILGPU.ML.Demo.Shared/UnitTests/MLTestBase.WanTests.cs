@@ -535,6 +535,8 @@ public abstract partial class MLTestBase
             worstBf16 = Math.Max(worstBf16, mb.RelRms); worstExact = Math.Max(worstExact, me.RelRms);
         }
         foreach (var line in report) Console.WriteLine("[Wan] umT5 vs reference: " + line);
+        string tag = $"umT5 {file}{(Flux2.Flux2Weights.EnableW8A8 == true ? " W8A8" : "")} {accelerator.AcceleratorType}";
+        try { var od = Path.Combine(WanDir, "out"); Directory.CreateDirectory(od); File.AppendAllLines(Path.Combine(od, "wan_tests.log"), report.Select(l => $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{tag}] {l}")); } catch (IOException) { }
         // vs the bf16 reference: its own bf16 rounding (2.2e-2 to 2.8e-2 from exact math on these prompts). vs exact math on the same weights: float rounding with the fp32 GEMM
         // (4e-6 MEASURED with TRELLIS2_MMA=0 and on OpenCL), 5e-3 to 7.5e-3 with the CUDA tensor cores (they round the activations to bf16, as the reference does)
         if (!(worstBf16 < boundBf16 && worstExact < boundExact)) throw new Exception("umT5 deviates from the reference: " + string.Join("; ", report));
