@@ -23,7 +23,7 @@ public sealed class WanVae : IDisposable
     private readonly SparseKernels _sk;
     private readonly WanKernels _wk;
     private readonly DiTKernels _dk;
-    private readonly List<Buf> _live = new();
+    private readonly ActivationPool _pool;
     private readonly Dictionary<(int Kind, int T, int H, int W, int Cnt), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private readonly Dictionary<string, Cache> _caches = new();
     private Buf? _scores;
@@ -38,22 +38,15 @@ public sealed class WanVae : IDisposable
 
     public WanVae(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _sk = new SparseKernels(accelerator); _wk = new WanKernels(accelerator); _dk = new DiTKernels(accelerator);
+        _acc = accelerator; _w = weights; _pool = new ActivationPool(accelerator); _sk = new SparseKernels(accelerator); _wk = new WanKernels(accelerator); _dk = new DiTKernels(accelerator);
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
-    // buffers: temporaries are queued and freed together (after a fence: on WebGPU a buffer must outlive the dispatches that read it)
+    // buffers: see ActivationPool (large activations recycled by size as soon as they are dropped, small ones freed together after a fence)
     // -----------------------------------------------------------------------------------------------------------------------------------
-    private Buf Tmp(long n) { var b = _acc.Allocate1D<float>(n); _live.Add(b); return b; }
-    private void Drop(Buf b) { /* freed at the next Flush */ _drop.Add(b); }
-    private readonly List<Buf> _drop = new();
-    private void Flush()
-    {
-        if (_drop.Count == 0) return;
-        _acc.Fence();
-        foreach (var b in _drop) { _live.Remove(b); b.Dispose(); }
-        _drop.Clear();
-    }
+    private Buf Tmp(long n) => _pool.Get(n);
+    private void Drop(Buf b) => _pool.Drop(b);
+    private void Flush() => _pool.Flush();
 
     private MemoryBuffer1D<int, Stride1D.Dense> Table(int kind, int T, int H, int W, int cnt)
     {
@@ -177,7 +170,7 @@ public sealed class WanVae : IDisposable
                 if (T >= 2) StoreCache(name, x, T, hw, C);
                 else
                 {
-                    var pair = Tmp(2L * hw * C);
+                    var pair = _pool.GetFresh(2L * hw * C);                                     // cleared below by a fill: never a recycled buffer
                     if (c.Rep || c.Frames == 0) pair.View.SubView(0, (long)hw * C).MemSetToZero();
                     else _wk.UnpackHalf2(c.Packed!.View.SubView((long)(c.Frames - 1) * hw * C / 2, (long)hw * C / 2), pair.View.SubView(0, (long)hw * C), hw * C / 2);
                     pair.View.SubView((long)hw * C, (long)hw * C).CopyFrom(x.View.SubView(0, (long)hw * C));
@@ -420,8 +413,7 @@ public sealed class WanVae : IDisposable
 
     public void Dispose()
     {
-        foreach (var b in _live) b.Dispose();
-        _live.Clear(); _drop.Clear();
+        _pool.Dispose();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
         foreach (var c in _caches.Values) c.Packed?.Dispose();

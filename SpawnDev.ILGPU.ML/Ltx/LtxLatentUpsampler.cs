@@ -23,7 +23,7 @@ public sealed class LtxLatentUpsampler : IDisposable
     private readonly SparseKernels _sk;
     private readonly SdKernels _sd;
     private readonly LtxKernels _lk;
-    private readonly LtxTemps _temps;
+    private readonly ActivationPool _temps;
     private readonly Dictionary<(int Taps, int T, int H, int W), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private readonly int _mid, _blocks;
 
@@ -35,13 +35,13 @@ public sealed class LtxLatentUpsampler : IDisposable
 
     public LtxLatentUpsampler(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _temps = new LtxTemps(accelerator); _sk = new SparseKernels(accelerator); _sd = new SdKernels(accelerator); _lk = new LtxKernels(accelerator);
+        _acc = accelerator; _w = weights; _temps = new ActivationPool(accelerator); _sk = new SparseKernels(accelerator); _sd = new SdKernels(accelerator); _lk = new LtxKernels(accelerator);
         _mid = int.Parse(weights.Metadata.GetValueOrDefault("mid_channels", "512"));
         _blocks = int.Parse(weights.Metadata.GetValueOrDefault("num_blocks_per_stage", "4"));
         if (weights.Metadata.GetValueOrDefault("dims", "3") != "3") throw new NotSupportedException("LtxLatentUpsampler: the 3D upsampler (dims 3) only");
     }
 
-    // temporaries: see LtxTemps (large activations recycled by size, small ones freed after a fence)
+    // temporaries: see ActivationPool (large activations recycled by size, small ones freed after a fence)
     private Buf Tmp(long n) => _temps.Get(n);
     private void Drop(Buf b) => _temps.Drop(b);
     private void Flush() => _temps.Flush();

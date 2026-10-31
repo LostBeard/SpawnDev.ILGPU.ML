@@ -24,7 +24,7 @@ public sealed class LtxVae : IDisposable
     private readonly SparseKernels _sk;
     private readonly LtxKernels _lk;
     private readonly DiTKernels _dk;
-    private readonly LtxTemps _temps;
+    private readonly ActivationPool _temps;
     private readonly Dictionary<(int T, int H, int W), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
 
     public const int LatentChannels = 128, Patch = 4;
@@ -35,10 +35,10 @@ public sealed class LtxVae : IDisposable
 
     public LtxVae(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _temps = new LtxTemps(accelerator); _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
+        _acc = accelerator; _w = weights; _temps = new ActivationPool(accelerator); _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
     }
 
-    // temporaries: see LtxTemps (large activations recycled by size, small ones freed after a fence)
+    // temporaries: see ActivationPool (large activations recycled by size, small ones freed after a fence)
     private Buf Tmp(long n) => _temps.Get(n);
     private void Drop(Buf b) => _temps.Drop(b);
     private void Flush() => _temps.Flush();
