@@ -56,6 +56,7 @@
                         <option value="512x288">512x288 (fastest)</option>
                         <option value="640x352">640x352</option>
                         <option value="832x480">832x480</option>
+                        <option value="1280x704">1280x704 (native, slow)</option>
                     }
                 </select>
             </div>
@@ -103,6 +104,13 @@
                 <label>Seed:</label>
                 <input type="number" @bind="_seed" class="vid-input" placeholder="random" disabled="@_isRunning" />
             </div>
+            @if (!Ltx)
+            {
+            <div class="vid-setting">
+                <label>Tiled decode:</label>
+                <input type="checkbox" @bind="_wanTiled" disabled="@_isRunning" title="Decode the video in 256 px tiles (diffusers' enable_tiling): the decoder needs a fraction of the GPU memory (720p: 2.5 GB instead of 8.4 GB) and takes about 1.5x as long. For GPUs with 8 GB or less." />
+            </div>
+            }
             @if (Ltx)
             {
             <div class="vid-setting">
@@ -209,6 +217,7 @@
     private string _model = "wan";                      // "wan" | "ltx"
     private bool Ltx => _model == "ltx";
     private bool _ltxUpscale;
+    private bool _wanTiled;
     private LtxPipeline? _ltxPipeline;
     private string _modelServer = "";
     private bool _isRunning, _isModelLoading, _isModelLoaded, _hasVideo, _recording;
@@ -278,7 +287,7 @@
                 {
                     Prompt = _prompt, NegativePrompt = string.IsNullOrWhiteSpace(_negative) ? null : _negative, Width = width, Height = height, Frames = _frames, Steps = _steps,
                     GuidanceScale = _dit == "turbo" ? 1.0 : _guidance, Seed = seed,
-                    Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC,
+                    Sampler = _dit == "turbo" ? WanSampler.FewStep : WanSampler.UniPC, TiledDecode = _wanTiled,
                 };
             }
             byte[]? firstRgb = null; int firstW = 0, firstH = 0;
@@ -294,7 +303,7 @@
                 request = new WanRequest
                 {
                     Prompt = request.Prompt, NegativePrompt = request.NegativePrompt, Width = width, Height = height, Frames = _frames, Steps = _steps, GuidanceScale = request.GuidanceScale, Seed = request.Seed, Sampler = request.Sampler,
-                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height,
+                    ImageRgb = rgb, ImageWidth = pic.Width, ImageHeight = pic.Height, TiledDecode = request.TiledDecode,
                 };
             }
             var progress = new Progress<WanProgress>(p =>
