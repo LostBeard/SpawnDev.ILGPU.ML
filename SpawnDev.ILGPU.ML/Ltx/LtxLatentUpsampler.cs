@@ -23,8 +23,7 @@ public sealed class LtxLatentUpsampler : IDisposable
     private readonly SparseKernels _sk;
     private readonly SdKernels _sd;
     private readonly LtxKernels _lk;
-    private readonly List<Buf> _live = new();
-    private readonly List<Buf> _drop = new();
+    private readonly LtxTemps _temps;
     private readonly Dictionary<(int Taps, int T, int H, int W), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private readonly int _mid, _blocks;
 
@@ -36,22 +35,16 @@ public sealed class LtxLatentUpsampler : IDisposable
 
     public LtxLatentUpsampler(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _sk = new SparseKernels(accelerator); _sd = new SdKernels(accelerator); _lk = new LtxKernels(accelerator);
+        _acc = accelerator; _w = weights; _temps = new LtxTemps(accelerator); _sk = new SparseKernels(accelerator); _sd = new SdKernels(accelerator); _lk = new LtxKernels(accelerator);
         _mid = int.Parse(weights.Metadata.GetValueOrDefault("mid_channels", "512"));
         _blocks = int.Parse(weights.Metadata.GetValueOrDefault("num_blocks_per_stage", "4"));
         if (weights.Metadata.GetValueOrDefault("dims", "3") != "3") throw new NotSupportedException("LtxLatentUpsampler: the 3D upsampler (dims 3) only");
     }
 
-    // temporaries are queued and freed together after a fence: on WebGPU a buffer must outlive the dispatches that read it
-    private Buf Tmp(long n) { var b = _acc.Allocate1D<float>(n); _live.Add(b); return b; }
-    private void Drop(Buf b) { _drop.Add(b); }
-    private void Flush()
-    {
-        if (_drop.Count == 0) return;
-        _acc.Fence();
-        foreach (var b in _drop) { _live.Remove(b); b.Dispose(); }
-        _drop.Clear();
-    }
+    // temporaries: see LtxTemps (large activations recycled by size, small ones freed after a fence)
+    private Buf Tmp(long n) => _temps.Get(n);
+    private void Drop(Buf b) => _temps.Drop(b);
+    private void Flush() => _temps.Flush();
 
     private MemoryBuffer1D<int, Stride1D.Dense> Table(int taps, int T, int H, int W)
     {
@@ -149,8 +142,7 @@ public sealed class LtxLatentUpsampler : IDisposable
 
     public void Dispose()
     {
-        foreach (var b in _live.ToArray()) b.Dispose();
-        _live.Clear(); _drop.Clear();
+        _temps.Dispose();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
     }

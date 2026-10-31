@@ -132,7 +132,23 @@ RTX 4070 12 GB, CUDA, `Examples/11.VideoGen.Console --ltx --models D:\Projects\l
 
 Browser (Chrome WebGPU, RTX 4070, the hosted 8-bit DiT and T5 read over HTTP): 704x480 x 97 frames **72 s** (T5 26 s, DiT 28 s, decode 18 s; 75 s re-measured after the conditioning changes). Image to video at 480x320 x 25 (the gate, prompt embedding given): denoise incl. the VAE encode 15 s with the 8-bit DiT, 29 s with the bf16 one (`Ltx_ImageToVideo_OverHttp_MatchesReference`).
 The two-pass recipe with a first frame, 704x480 x 97 -> 896x576 (the demo's configuration, 8-bit DiT and T5): **103 s** in the browser (T5 27 s, first pass 15 s, upscaler 2 s, second
-pass 20 s, decode 29 s; `Ltx_MultiScale_OverHttp_MatchesReference`), **35 s** on CUDA (`Examples/11.VideoGen.Console --ltx --upscale --image cat.jpg --dit q8 --text q8`). Every stage gated in the browser against the reference (`Ltx_Stages_OverHttp_MatchReference`: T5 1.5e-2 to 5.1e-2, DiT step 0 vs fp32 2.8e-2, VAE 1.4e-6); `Ltx_Pipeline_OverHttp_Generates` runs the clip (serve the model folder: `node tools/unirig-harness/serve-files.mjs D:/Projects/ltx 8771`).
+pass 20 s, decode 29 s; 92 s after the decode's buffer recycling below; `Ltx_MultiScale_OverHttp_MatchesReference`), **35 s** on CUDA (`Examples/11.VideoGen.Console --ltx --upscale --image cat.jpg --dit q8 --text q8`). Every stage gated in the browser against the reference (`Ltx_Stages_OverHttp_MatchReference`: T5 1.5e-2 to 5.1e-2, DiT step 0 vs fp32 2.8e-2, VAE 1.4e-6); `Ltx_Pipeline_OverHttp_Generates` runs the clip (serve the model folder: `node tools/unirig-harness/serve-files.mjs D:/Projects/ltx 8771`).
+
+## GPU memory (smaller devices)
+
+Peak device memory per stage, RTX 4070 via CUDA, the hosted 8-bit DiT and T5, over the memory in use before the run (`tools/ltx-harness/gpumem.py`, nvidia-smi every 100 ms):
+
+| stage | text to video 704x480 x 97 | two-pass with a first frame, 704x480 x 97 -> 896x576 |
+|---|---|---|
+| T5 (streamed a layer at a time) | 0.7 GB | 0.4 GB |
+| VAE encoder (the picture, per pass) | | 1.5 GB |
+| DiT (2.2 GB of 8-bit weights + activations) | 2.9 GB | 2.7 GB / 3.2 GB (second pass) |
+| x2 latent upscaler | | 1.5 GB |
+| VAE decode | 4.5 GB | 6.2 GB |
+
+So both fit an 8 GB card with room for the desktop. The decode was 6.5 / 9.2 GB until its temporaries were recycled by size and freed as soon as they are consumed (three
+full-size activations live instead of five; same results bit for bit, and the browser decode got faster: two-pass 103 -> 92 s). Longer or larger clips grow the decode linearly
+with the pixels; the denoise stages grow with the token count. Not yet verified on an 8 GB card or measured inside the browser.
 
 ## Licence
 

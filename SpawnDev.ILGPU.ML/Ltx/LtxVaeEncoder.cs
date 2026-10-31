@@ -23,8 +23,7 @@ public sealed class LtxVaeEncoder : IDisposable
     private readonly SparseKernels _sk;
     private readonly LtxKernels _lk;
     private readonly DiTKernels _dk;
-    private readonly List<Buf> _live = new();
-    private readonly List<Buf> _drop = new();
+    private readonly LtxTemps _temps;
     private readonly Dictionary<(int T, int H, int W, int Shift), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private Buf? _zeros;
 
@@ -38,19 +37,13 @@ public sealed class LtxVaeEncoder : IDisposable
 
     public LtxVaeEncoder(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
+        _acc = accelerator; _w = weights; _temps = new LtxTemps(accelerator); _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
     }
 
-    // temporaries are queued and freed together after a fence: on WebGPU a buffer must outlive the dispatches that read it
-    private Buf Tmp(long n) { var b = _acc.Allocate1D<float>(n); _live.Add(b); return b; }
-    private void Drop(Buf b) { _drop.Add(b); }
-    private void Flush()
-    {
-        if (_drop.Count == 0) return;
-        _acc.Fence();
-        foreach (var b in _drop) { _live.Remove(b); b.Dispose(); }
-        _drop.Clear();
-    }
+    // temporaries: see LtxTemps (large activations recycled by size, small ones freed after a fence)
+    private Buf Tmp(long n) => _temps.Get(n);
+    private void Drop(Buf b) => _temps.Drop(b);
+    private void Flush() => _temps.Flush();
 
     private MemoryBuffer1D<int, Stride1D.Dense> Table(int T, int H, int W, int shift)
     {
@@ -83,9 +76,9 @@ public sealed class LtxVaeEncoder : IDisposable
     {
         int rows = T * H * W;
         var a = NormSilu(x, rows, C);
-        var c1 = Conv(p + "conv1", a, T, H, W, C, C); Drop(a);
-        var b = NormSilu(c1, rows, C); Drop(c1);
-        var c2 = Conv(p + "conv2", b, T, H, W, C, C); Drop(b);
+        var c1 = Conv(p + "conv1", a, T, H, W, C, C); Drop(a); Flush();
+        var b = NormSilu(c1, rows, C); Drop(c1); Flush();
+        var c2 = Conv(p + "conv2", b, T, H, W, C, C); Drop(b); Flush();
         _dk.GateResidual(c2.View, x.View, default, -1, rows * C, C);                                          // c2 += x
         Drop(x);
         Flush();
@@ -157,8 +150,7 @@ public sealed class LtxVaeEncoder : IDisposable
 
     public void Dispose()
     {
-        foreach (var b in _live.ToArray()) b.Dispose();
-        _live.Clear(); _drop.Clear();
+        _temps.Dispose();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
         _zeros?.Dispose(); _zeros = null;

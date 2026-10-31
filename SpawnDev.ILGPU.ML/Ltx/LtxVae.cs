@@ -24,8 +24,7 @@ public sealed class LtxVae : IDisposable
     private readonly SparseKernels _sk;
     private readonly LtxKernels _lk;
     private readonly DiTKernels _dk;
-    private readonly List<Buf> _live = new();
-    private readonly List<Buf> _drop = new();
+    private readonly LtxTemps _temps;
     private readonly Dictionary<(int T, int H, int W), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
 
     public const int LatentChannels = 128, Patch = 4;
@@ -36,19 +35,13 @@ public sealed class LtxVae : IDisposable
 
     public LtxVae(Accelerator accelerator, GpuWeights weights)
     {
-        _acc = accelerator; _w = weights; _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
+        _acc = accelerator; _w = weights; _temps = new LtxTemps(accelerator); _sk = new SparseKernels(accelerator); _lk = new LtxKernels(accelerator); _dk = new DiTKernels(accelerator);
     }
 
-    // temporaries are queued and freed together after a fence: on WebGPU a buffer must outlive the dispatches that read it
-    private Buf Tmp(long n) { var b = _acc.Allocate1D<float>(n); _live.Add(b); return b; }
-    private void Drop(Buf b) { _drop.Add(b); }
-    private void Flush()
-    {
-        if (_drop.Count == 0) return;
-        _acc.Fence();
-        foreach (var b in _drop) { _live.Remove(b); b.Dispose(); }
-        _drop.Clear();
-    }
+    // temporaries: see LtxTemps (large activations recycled by size, small ones freed after a fence)
+    private Buf Tmp(long n) => _temps.Get(n);
+    private void Drop(Buf b) => _temps.Drop(b);
+    private void Flush() => _temps.Flush();
 
     private MemoryBuffer1D<int, Stride1D.Dense> Table(int T, int H, int W)
     {
@@ -83,9 +76,10 @@ public sealed class LtxVae : IDisposable
         int rows = T * H * W;
         var mod = Tmp(4L * C); _lk.Add(_w.F32(p + "scale_shift_table"), temb.View, mod.View, 4 * C);       // shift_1, scale_1, shift_2, scale_2
         var a = Tmp((long)rows * C); _lk.RmsNormModulate(x.View, a.View, mod.View, 0 * C, 1 * C, rows, C, PixelNormEps, silu: true);
-        var c1 = Conv(p + "conv1", a, T, H, W, C, C); Drop(a);
-        var b = Tmp((long)rows * C); _lk.RmsNormModulate(c1.View, b.View, mod.View, 2 * C, 3 * C, rows, C, PixelNormEps, silu: true); Drop(c1);
-        var c2 = Conv(p + "conv2", b, T, H, W, C, C); Drop(b);
+        // each temporary is freed as soon as it is consumed: at most three full-size activations live at once (five before: the decode peak of a 704x480 x 97 clip was 6.5 GB)
+        var c1 = Conv(p + "conv1", a, T, H, W, C, C); Drop(a); Flush();
+        var b = Tmp((long)rows * C); _lk.RmsNormModulate(c1.View, b.View, mod.View, 2 * C, 3 * C, rows, C, PixelNormEps, silu: true); Drop(c1); Flush();
+        var c2 = Conv(p + "conv2", b, T, H, W, C, C); Drop(b); Flush();
         _dk.GateResidual(c2.View, x.View, default, -1, rows * C, C);                                          // c2 += x
         Drop(x); Drop(mod);
         Flush();
@@ -167,8 +161,7 @@ public sealed class LtxVae : IDisposable
 
     public void Dispose()
     {
-        foreach (var b in _live.ToArray()) b.Dispose();
-        _live.Clear(); _drop.Clear();
+        _temps.Dispose();
         foreach (var t in _tables.Values) t.Dispose();
         _tables.Clear();
     }
