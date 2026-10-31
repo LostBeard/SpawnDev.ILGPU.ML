@@ -70,7 +70,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _logits, _maxV, _selV, _cand;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
     private int _lastRows;
@@ -186,7 +186,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// token per live sequence at Position. Leaves the final hidden rows' logits (prefill: only the last row's) on the device and their candidates on the host
     /// (with the softmax mass at <paramref name="temperature"/> when it is above 0).
     /// </summary>
-    private async Task ForwardAsync(int[] ids, bool decode, float temperature, CancellationToken ct)
+    private async Task ForwardAsync(int[] ids, int[]? seqs, bool decode, float temperature, CancellationToken ct)
     {
         int R = ids.Length, C = Hidden, kvC = KvHeads * HeadDim, p = Position;
         if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
@@ -194,6 +194,10 @@ public sealed class GgufBatchDecoder : IDisposable
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         // the embedding rows, gathered and dequantised on the device from the token embedding's blocks
         var idBuf = IntBuf(R); idBuf.CopyFromCPU(ids);
+        // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for
+        _seqBuf ??= Own(_acc.Allocate1D<int>((long)MaxSeq + MaxBatch));
+        if (decode) _seqBuf.View.SubView(0, R).CopyFromCPU(seqs!);
+        var seqView = _seqBuf.View;
         var hid = Buf(ref _hid, (long)R * C);
         var (embW, embT) = _mats["token_embd.weight"];
         int code = FusedDequantMatMul.TypeCode(embT);
@@ -214,10 +218,10 @@ public sealed class GgufBatchDecoder : IDisposable
             Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC);
             _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode);
             _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode);
-            _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, kvC, MaxSeq, p, mode);
-            _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim));
+            _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode);
+            _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim));
             _softmax!(Heads * R, scores, nk);
-            _pv!((int)((long)R * C), scores, _vc[l].View, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode);
+            _pv!((int)((long)R * C), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode);
             Gemm(att, b + "attn_output.weight", proj, R, C, C);
             _add!((int)((long)R * C), hid, proj);
             _rms(R, hid, hn, _vecs[b + "ffn_norm.weight"].View, C, _eps);
@@ -269,7 +273,7 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         if (promptIds.Length == 0) throw new ArgumentException("an empty prompt");
         Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0;
-        return ForwardAsync(promptIds, decode: false, temperature, ct);
+        return ForwardAsync(promptIds, null, decode: false, temperature, ct);
     }
 
     /// <summary>Copy sequence 0's cache (the prompt) into sequences 1..count-1: <paramref name="count"/> live sequences from now on, all at the same position.</summary>
@@ -292,7 +296,19 @@ public sealed class GgufBatchDecoder : IDisposable
     public Task StepAsync(int[] tokens, float temperature = 0f, CancellationToken ct = default)
     {
         if (tokens.Length != Batch) throw new ArgumentException($"{Batch} tokens expected (one per live sequence)");
-        return ForwardAsync(tokens, decode: true, temperature, ct);
+        return ForwardAsync(tokens, Enumerable.Range(0, Batch).ToArray(), decode: true, temperature, ct);
+    }
+
+    /// <summary>
+    /// One token for each of <paramref name="sequences"/> (distinct, each below <see cref="Batch"/>) at <see cref="Position"/>: row r of the step is sequence
+    /// <paramref name="sequences"/>[r] (its <see cref="SampleAsync"/> row). The others are left out of the step (finished sequences stop costing compute), their caches
+    /// untouched; a sequence left out falls behind <see cref="Position"/> and cannot be resumed.
+    /// </summary>
+    public Task StepAsync(int[] tokens, int[] sequences, float temperature = 0f, CancellationToken ct = default)
+    {
+        if (tokens.Length != sequences.Length || sequences.Length == 0) throw new ArgumentException("one token per sequence, at least one");
+        if (sequences.Any(s => s < 0 || s >= Batch) || sequences.Distinct().Count() != sequences.Length) throw new ArgumentException($"distinct sequences below {Batch}");
+        return ForwardAsync(tokens, sequences, decode: true, temperature, ct);
     }
 
     /// <summary>The last forward's logits [rows, Vocab] row-major (a prefill: one row), read from the device.</summary>
@@ -331,7 +347,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>
     /// <paramref name="n"/> continuations of <paramref name="promptIds"/> decoded together: prefill once, fork, then one batched step per token. Each sequence samples from
     /// its own logits with its own generator (seed + index): greedy when <paramref name="temperature"/> &lt;= 0, else temperature then nucleus (top-p). A sequence ends at a
-    /// stop token or after <paramref name="maxNew"/> tokens; finished sequences ride along until all are done. Returns the generated token ids per sequence (stop token
+    /// stop token or after <paramref name="maxNew"/> tokens and then leaves the batch (the steps after it run the live sequences only). Returns the generated token ids per sequence (stop token
     /// excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled, <paramref name="onFinished"/> the sequence when it ends.
     /// </summary>
     public async Task<int[][]> GenerateAsync(int[] promptIds, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
@@ -359,8 +375,10 @@ public sealed class GgufBatchDecoder : IDisposable
                 break;
             }
             ct.ThrowIfCancellationRequested();
-            await StepAsync(next, temperature, ct).ConfigureAwait(false);
-            for (int s = 0; s < n; s++) if (!done[s]) next[s] = await SampleAsync(s, topP, rngs[s]).ConfigureAwait(false);
+            // only the live sequences step: a finished one leaves the batch (it used to ride along to the end of the longest)
+            var live = Enumerable.Range(0, n).Where(s => !done[s]).ToArray();
+            await StepAsync(live.Select(s => next[s]).ToArray(), live, temperature, ct).ConfigureAwait(false);
+            for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
         }
         return outs.Select(o => o.ToArray()).ToArray();
     }
@@ -387,16 +405,16 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     // ---------------------------------------------------------------------------------------------------
-    // kernels. Row r: prefill (mode 0) = sequence 0 at position p + r; decode (mode 1) = sequence r at position p.
+    // kernels. Row r: prefill (mode 0) = sequence 0 at position p + r; decode (mode 1) = sequence seqs[r] at position p.
     // Caches: [sequence][MaxSeq][kvHeads * headDim].
     // ---------------------------------------------------------------------------------------------------
     private Action<Index1D, FV, FV, FV, int, float>? _rms;
     private Action<Index1D, FV, FV, int>? _bias;
     private Action<Index1D, FV, FV, int, int, int, int>? _rope;
-    private Action<Index1D, FV, FV, FV, FV, int, int, int, int>? _store;
-    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>? _scoresK;
+    private Action<Index1D, FV, FV, FV, FV, IV, int, int, int, int>? _store;
+    private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>? _scoresK;
     private Action<Index1D, FV, int>? _softmax;
-    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int>? _pv;
+    private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
     private Action<Index1D, FV, FV>? _add;
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, long, long>? _fork;
@@ -412,10 +430,10 @@ public sealed class GgufBatchDecoder : IDisposable
         _rms = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, float>(RmsImpl);
         _bias = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(BiasImpl);
         _rope = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(RopeImpl);
-        _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int, int>(StoreImpl);
-        _scoresK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
+        _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, int, int, int, int>(StoreImpl);
+        _scoresK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
-        _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int>(PvImpl);
+        _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
         _add = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(AddImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
@@ -542,19 +560,19 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     // the row's k / v into its sequence's cache at its position
-    private static void StoreImpl(Index1D i, FV k, FV v, FV kc, FV vc, int kvC, int maxSeq, int p, int mode)
+    private static void StoreImpl(Index1D i, FV k, FV v, FV kc, FV vc, IV seqs, int kvC, int maxSeq, int p, int mode)
     {
         int ii = i, r = ii / kvC, c = ii % kvC;
-        int seq = mode == 0 ? 0 : r, pos = mode == 0 ? p + r : p;
+        int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
         long at = ((long)seq * maxSeq + pos) * kvC + c;
         kc[at] = k[ii]; vc[at] = v[ii];
     }
 
     // scores[h, r, j] = q[r, h] . k[seq(r), j, h / rep] * scale for j <= pos(r), else masked
-    private static void ScoresImpl(Index1D i, FV q, FV kc, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale)
+    private static void ScoresImpl(Index1D i, FV q, FV kc, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale)
     {
         int ii = i, j = ii % nk, rest = ii / nk, r = rest % R, h = rest / R;
-        int seq = mode == 0 ? 0 : r, pos = mode == 0 ? p + r : p;
+        int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
         float s = -1e30f;
         if (j <= pos)
         {
@@ -577,10 +595,10 @@ public sealed class GgufBatchDecoder : IDisposable
         for (int j = 0; j < nk; j++) scores[o + j] *= inv;
     }
     // o[r, h * D + d] = sum_j scores[h, r, j] v[seq(r), j, h / rep, d]
-    private static void PvImpl(Index1D i, FV scores, FV vc, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode)
+    private static void PvImpl(Index1D i, FV scores, FV vc, IV seqs, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode)
     {
         int ii = i, C = H * D, r = ii / C, c = ii % C, h = c / D, d = c % D;
-        int seq = mode == 0 ? 0 : r, kvC = kvH * D, hk = h / (H / kvH);
+        int seq = mode == 0 ? 0 : seqs[r], kvC = kvH * D, hk = h / (H / kvH);
         long so = ((long)h * R + r) * nk, vo = (long)seq * maxSeq * kvC + hk * D + d;
         float acc = 0f;
         for (int j = 0; j < nk; j++) acc += scores[so + j] * vc[vo + (long)j * kvC];

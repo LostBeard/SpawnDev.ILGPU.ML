@@ -65,14 +65,40 @@ public abstract partial class MLTestBase
             await dec.StepAsync(nextTok, 0.8f);
         }
         int wide = dec.RowReads;
+        // finished sequences leave the batch: GenerateAsync must equal a loop that keeps stepping all four (each row's arithmetic does not depend on the others),
+        // with lengths that differ so the batch really shrank
+        const int longNew = 160;
+        var compacted = await dec.GenerateAsync(ids, 4, longNew, 0.8f, 0.95f, 21, stopSet);
+        var ridden = new List<int>[4];
+        {
+            await dec.PrefillAsync(ids, 0.8f);
+            dec.Fork(4);
+            var rngs = Enumerable.Range(0, 4).Select(s => new Random(21 + s)).ToArray();
+            var fin = new bool[4]; var nx = new int[4];
+            for (int s = 0; s < 4; s++) { ridden[s] = new List<int>(); nx[s] = await dec.SampleAsync(0, 0.95f, rngs[s]); }
+            while (true)
+            {
+                for (int s = 0; s < 4; s++)
+                {
+                    if (fin[s]) continue;
+                    if (stopSet.Contains(nx[s]) || ridden[s].Count >= longNew) { fin[s] = true; continue; }
+                    ridden[s].Add(nx[s]);
+                }
+                if (fin.All(f => f)) break;
+                await dec.StepAsync(nx, 0.8f);
+                for (int s = 0; s < 4; s++) if (!fin[s]) nx[s] = await dec.SampleAsync(s, 0.95f, rngs[s]);
+            }
+        }
+        bool compactSame = Enumerable.Range(0, 4).All(s => compacted[s].SequenceEqual(ridden[s]));
+        int lengths = compacted.Select(c => c.Length).Distinct().Count();
         string got = Text(one[0]);
         bool same = got == want, rowsEqual = four.All(r => r.SequenceEqual(one[0]));
         int distinct = sampled.Select(Text).Distinct().Count();
         var report = $"{accelerator.AcceleratorType}: greedy {(same ? "= the generator" : "DIFFERS from the generator")} ({one[0].Length} tokens); four greedy rows {(rowsEqual ? "identical" : "DIFFER")}; four samples {distinct} distinct; "
-            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row)";
+            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))})";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
-        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
+        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
 }
