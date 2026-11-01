@@ -23,7 +23,13 @@ using IV = ArrayView1D<int, Stride1D.Dense>;
 /// Each forward ends on the device with every row's <see cref="Candidates"/> best tokens (exact top-k, ties to the lower id: the K-th best chunk maximum is a floor that
 /// at least K tokens reach, the tokens at or above it are gathered and sorted) and, when a temperature is given, the row's softmax mass in partial sums, so a step reads
 /// back a few thousand floats instead of [B, Vocab] logits. <see cref="SampleAsync"/> draws from
-/// the candidates and is <see cref="SampleLogits"/> on the full row (the same nucleus, the same draw); when the nucleus is wider than the candidates it reads that row.
+/// the candidates and is <see cref="SampleLogits(float[], int, int, float, float, Random)"/> on the full row (the same nucleus, the same draw); when the nucleus is wider than the candidates it reads that row.
+/// </para>
+/// <para>
+/// Device draws (<see cref="Draw"/>, <see cref="StepDrawnAsync"/>, <see cref="ReadDrawnAsync"/>; <see cref="GenerateAsync"/> by default): the draw is a kernel at the
+/// end of the step (from the candidates, or exactly from the whole row when the nucleus is wider), its uniform a hash of (seed, sequence, position)
+/// (<see cref="DrawUniform"/>), the token written where the next step reads its input. No step waits for the host: <see cref="GenerateAsync"/> queues step P before it
+/// reads the tokens of P, so the device always has work while the host streams and stops sequences one step behind.
 /// </para>
 /// </summary>
 public sealed class GgufBatchDecoder : IDisposable
@@ -58,7 +64,11 @@ public sealed class GgufBatchDecoder : IDisposable
     public int MaxBatch { get; }
     /// <summary>The position the next token goes to (the prompt length after <see cref="PrefillAsync"/>, plus one per <see cref="StepAsync"/>).</summary>
     public int Position { get; private set; }
-    /// <summary>Where the time of all decode steps since <see cref="PrefillAsync"/> went, in ms: the token ids up and the gather queued, the forward on the device (to its sync), the candidates read back.</summary>
+    /// <summary>
+    /// Where the time of all decode steps since <see cref="PrefillAsync"/> went, in ms: the token ids and sequence map up, the forward queued (WebGPU: a replay;
+    /// desktop launches overlap the device), then the wait for the device and the candidates read (<see cref="StepAsync(int[], float, CancellationToken)"/>; a
+    /// <see cref="StepDrawnAsync"/> does not wait, its tokens are read by <see cref="ReadDrawnAsync"/>).
+    /// </summary>
     public (double Embed, double Device, double Readback, int Steps) DecodeTimings { get; private set; }
     /// <summary>
     /// Diagnostics (desktop accelerators: it synchronises after every kernel): when set, each forward adds every kernel's time, its own GPU drain included, to
@@ -104,9 +114,16 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds, _posBuf;
-    private FV _lastLogits;
-    private float[] _lastCand = Array.Empty<float>();
-    private int _lastRows;
+    // device draws: the token each sequence drew last (the next step's input, by sequence), its copy for the captures' restores, the draw parameters
+    // (seed, force the full-row path), top-p, and two read rings (WebGPU keeps one staging buffer per source buffer, so two reads in flight need two sources)
+    private MemoryBuffer1D<int, Stride1D.Dense>? _seqIds, _seqIdsSnap, _drawI;
+    private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _ring = new MemoryBuffer1D<int, Stride1D.Dense>?[2];
+    private int _ringAt;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _drawF;
+    private FV _lastLogits, _lastCandView;
+    private float[]? _lastCand = Array.Empty<float>();
+    private int _lastRows, _lastP;
+    private int[] _lastSeqs = Array.Empty<int>();
     private float _lastT;
     private const int Chunk = 256;
     private int Chunks => (Vocab + Chunk - 1) / Chunk;
@@ -137,6 +154,7 @@ public sealed class GgufBatchDecoder : IDisposable
         _head = model.Tensors.Any(t => t.Name == "output.weight") ? "output.weight" : "token_embd.weight";
         MaxSeq = maxSeq; MaxBatch = maxBatch;
         CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
+        DeviceSampling = SupportsDeviceDraws(accelerator);
         // the fused attention runs a group per head (a power of two up to 256 threads; WebGL has no groups)
         FusedAttention = accelerator.AcceleratorType != AcceleratorType.WebGL && HeadDim <= AttChunk && (HeadDim & (HeadDim - 1)) == 0 && HeadDim <= accelerator.MaxNumThreadsPerGroup;
         var inv = new float[HeadDim / 2];
@@ -308,14 +326,14 @@ public sealed class GgufBatchDecoder : IDisposable
         public readonly List<(int Snap, int Ofs, int ValAtP0, int Slope)> Patches = new();
         public bool Failed;
     }
-    private readonly Dictionary<(int R, float T), StepPlan> _plans = new();
+    private readonly Dictionary<(int R, float T, bool Dev), StepPlan> _plans = new();
     /// <summary>Diagnostics: decode steps replayed from a captured plan, and plans captured, since the decoder was created.</summary>
     public (int Replays, int Captures) CaptureStats { get; private set; }
 
-    private async Task<(FV Logits, FV Cand, int OutRows)> CapturedStepAsync(IV idBuf, int R, float temperature, int p)
+    private async Task<(FV Logits, FV Cand, int OutRows)> CapturedStepAsync(IV idBuf, int R, float temperature, int p, bool dev)
     {
         _fixedChunks = true;
-        if (_plans.TryGetValue((R, temperature), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
+        if (_plans.TryGetValue((R, temperature, dev), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
         {
             _posBuf!.View.SubView(0, 1).CopyFromCPU(new[] { p });            // the kernels read the position from this buffer
             foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));   // none left now; kept for any scalar that carries it
@@ -323,11 +341,14 @@ public sealed class GgufBatchDecoder : IDisposable
             CaptureStats = (CaptureStats.Replays + 1, CaptureStats.Captures);
             return (sp.Logits, sp.Cand, sp.OutRows);
         }
-        if (sp is { Failed: true }) return EncodeForward(idBuf, R, true, temperature, p);
+        if (sp is { Failed: true }) return EncodeForward(idBuf, R, true, temperature, p, dev);
         sp?.Plan?.Dispose();
         // warm: a real step (allocates whatever the shape needs), then the captures: one at p + 1 (only for the diff: it writes cache row p + 1, which the real step
-        // at p + 1 overwrites; the cache is position-addressed), then the real one at p, whose results stand
-        var warm = EncodeForward(idBuf, R, true, temperature, p);
+        // at p + 1 overwrites; the cache is position-addressed), then the real one at p, whose results stand.
+        // Device draws: every pass draws, and a draw overwrites the tokens the step reads (_seqIds), so the tokens are kept aside and put back before each pass,
+        // outside the recording windows (a restore recorded into the plan would pin the input to these tokens forever)
+        if (dev) { _seqIdsSnap ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch))); _seqIdsSnap.View.CopyFrom(_seqIds!.View); }
+        var warm = EncodeForward(idBuf, R, true, temperature, p, dev);
         await _acc.SynchronizeAsync().ConfigureAwait(false);
         int gen = _bufGen;
         var wacc = (SpawnDev.ILGPU.WebGPU.WebGPUAccelerator)_acc;
@@ -337,12 +358,14 @@ public sealed class GgufBatchDecoder : IDisposable
         SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = false;
         try
         {
+            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
             b = wacc.BeginDispatchCapture(); b.CaptureScalarSnapshots = true;
-            EncodeForward(idBuf, R, true, temperature, p + 1);
+            EncodeForward(idBuf, R, true, temperature, p + 1, dev);
             wacc.EndDispatchCapture();
             await _acc.SynchronizeAsync().ConfigureAwait(false);
+            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
             a = wacc.BeginDispatchCapture(); a.CaptureScalarSnapshots = true;
-            res = EncodeForward(idBuf, R, true, temperature, p);
+            res = EncodeForward(idBuf, R, true, temperature, p, dev);
             wacc.EndDispatchCapture();
             await _acc.SynchronizeAsync().ConfigureAwait(false);
         }
@@ -363,20 +386,23 @@ public sealed class GgufBatchDecoder : IDisposable
         b.Dispose();
         if (!ok) { a.Dispose(); sp.Failed = true; }
         else { sp.Plan = a; CaptureStats = (CaptureStats.Replays, CaptureStats.Captures + 1); }
-        _plans[(R, temperature)] = sp;
+        _plans[(R, temperature, dev)] = sp;
         return ok ? res : warm;
     }
 
     // every kernel of one forward (no sync): the embedding gather through the candidate kernels. Decode steps on WebGPU are captured from here and replayed.
-    private (FV Logits, FV Cand, int OutRows) EncodeForward(IV idBuf, int R, bool decode, float temperature, int p)
+    private (FV Logits, FV Cand, int OutRows) EncodeForward(IV idBuf, int R, bool decode, float temperature, int p, bool dev = false)
     {
         int C = Hidden, kvC = KvHeads * HeadDim;
         var seqView = _seqBuf!.View;
-        // the position the kernels read (a buffer, not a scalar: a captured step then has nothing to patch, one int written per step). Every forward is synced
-        // before the next starts, so this write never overtakes queued work.
+        // the position the kernels read (a buffer, not a scalar: a captured step then has nothing to patch, one int written per step). The write is ordered
+        // with the queued work on every backend (WebGPU: writeBuffer on the queue timeline after the submits before it; desktop: a synchronous copy), and a
+        // pipelined step's kernels read it before the next step's write lands.
         _posBuf ??= Own(_acc.Allocate1D<int>(64));
         var posView = _posBuf.View.SubView(0, 1);
         posView.CopyFromCPU(new[] { p });
+        // device draws: row r's input is the token its sequence drew last
+        if (dev) _gather!(R, _seqIds!.View, seqView, idBuf);
         var hid = Buf(ref _hid, (long)R * C);
         var (embW, embT) = _mats["token_embd.weight"];
         int code = FusedDequantMatMul.TypeCode(embT);
@@ -477,7 +503,29 @@ public sealed class GgufBatchDecoder : IDisposable
         _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
         _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature); Prof("select");
         _final!(outRows, selV, _selI.View, _selN.View, cand, S); Prof("final");
+        // device draws: each row's next token, into its sequence's slot of _seqIds (the next step's input), then a copy for the host to read
+        if (dev) QueueDraw(R, rowZero: false, tAdd: 1, temperature, logits, cand);
         return (logits, cand, outRows);
+    }
+
+    private void EnsureDrawBuffers()
+    {
+        // loaded on first use, not with the rest: a group kernel (WebGL, which has no groups, never draws on the device)
+        _draw ??= _acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>(DrawImpl);
+        _gather ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV>(GatherIdsImpl);
+        _seqIds ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch)));
+        _drawI ??= Own(_acc.Allocate1D<int>(64));
+        _drawF ??= Own(_acc.Allocate1D<float>(64));
+        for (int i = 0; i < 2; i++) _ring[i] ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch)));
+    }
+
+    // the draw kernel for `slots` sequences (seqs[0..slots), _seqBuf): slot s draws from row s of the forward's logits / candidates, or (rowZero) all from row 0
+    // (the prefill's one row); the token goes to _seqIds[seq]; its position (what the uniform is drawn for) is the forward's position + tAdd
+    private void QueueDraw(int slots, bool rowZero, int tAdd, float temperature, FV logits, FV cand)
+    {
+        EnsureDrawBuffers();
+        _draw!(new KernelConfig(slots, DrawGroup), logits, cand, _seqBuf!.View, _posBuf!.View, _drawF!.View, _drawI!.View, _seqIds!.View, Vocab, Chunks, CandStride, rowZero ? 1 : 0, tAdd, temperature);
+        Prof("draw");
     }
 
     /// <summary>
@@ -485,30 +533,38 @@ public sealed class GgufBatchDecoder : IDisposable
     /// token per live sequence at Position. Leaves the final hidden rows' logits (prefill: only the last row's) on the device and their candidates on the host
     /// (with the softmax mass at <paramref name="temperature"/> when it is above 0).
     /// </summary>
-    private async Task ForwardAsync(int[] ids, int[]? seqs, bool decode, float temperature, CancellationToken ct)
+    /// <param name="ids">The tokens (null: device draws, each row's input is the token its sequence drew last, and the step ends with the rows' next draws).</param>
+    /// <param name="readBack">Read the candidates now (the forward's one wait); false leaves the step queued (they are read when <see cref="SampleAsync"/> needs them).</param>
+    private async Task ForwardAsync(int[]? ids, int[]? seqs, bool decode, float temperature, bool readBack, CancellationToken ct)
     {
-        int R = ids.Length, C = Hidden, kvC = KvHeads * HeadDim, p = Position;
+        bool dev = ids == null;
+        int R = dev ? seqs!.Length : ids!.Length, p = Position;
         if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
         LoadKernels();
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         if (ProfileKernels) { _acc.Synchronize(); _profT = t0; }
-        // the token ids (decode: one stable buffer, the one a captured step binds) and the sequence map; the embedding rows are gathered on the device
+        // the token ids (decode: one stable buffer, the one a captured step binds; device draws: gathered there on the device) and the sequence map; the embedding
+        // rows are gathered on the device
         IV idBuf;
         if (decode) { _stepIds ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch))); idBuf = _stepIds.View.SubView(0, R); }
         else idBuf = IntBuf(R);
-        idBuf.CopyFromCPU(ids);
-        // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for
+        if (!dev) idBuf.CopyFromCPU(ids!);
+        // decode row r advances sequence seqs[r] (its cache region); sized for a prefill's rows too, which the kernels do not read it for. Written only when it
+        // changes (each write is a queue operation; desktop: a stream sync)
         _seqBuf ??= Own(_acc.Allocate1D<int>((long)MaxSeq + MaxBatch));
-        if (decode) _seqBuf.View.SubView(0, R).CopyFromCPU(seqs!);
+        if (decode && !seqs!.AsSpan().SequenceEqual(_seqsOnDevice)) { _seqBuf.View.SubView(0, R).CopyFromCPU(seqs); _seqsOnDevice = (int[])seqs.Clone(); }
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         FV logits, cand; int outRows;
-        if (decode && CaptureActive) (logits, cand, outRows) = await CapturedStepAsync(idBuf, R, temperature, p).ConfigureAwait(false);
-        else (logits, cand, outRows) = EncodeForward(idBuf, R, decode, temperature, p);
-        await _acc.SynchronizeAsync().ConfigureAwait(false);
+        if (decode && CaptureActive) (logits, cand, outRows) = await CapturedStepAsync(idBuf, R, temperature, p, dev).ConfigureAwait(false);
+        else (logits, cand, outRows) = EncodeForward(idBuf, R, decode, temperature, p, dev);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        _lastP = p;
         Position += decode ? 1 : R;
-        _lastCand = await cand.CopyToHostAsync().ConfigureAwait(false);
-        _lastLogits = logits; _lastRows = outRows; _lastT = temperature;
+        _lastLogits = logits; _lastCandView = cand; _lastRows = outRows; _lastT = temperature; _lastSeqs = decode ? (int[])seqs!.Clone() : new[] { 0 }; _lastPrefill = !decode;
+        _lastCand = null;
+        // the readback is the forward's one wait: it is ordered after the queued kernels on every backend (WebGPU: flush, copy, mapAsync; desktop: a synchronous
+        // copy), so a SynchronizeAsync before it only added a second round trip
+        if (readBack) _lastCand = await cand.CopyToHostAsync().ConfigureAwait(false);
         long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         if (decode)
         {
@@ -517,16 +573,17 @@ public sealed class GgufBatchDecoder : IDisposable
             DecodeTimings = (d.Embed + ms(t0, t1), d.Device + ms(t1, t2), d.Readback + ms(t2, t3), d.Steps + 1);
         }
     }
+    private int[] _seqsOnDevice = Array.Empty<int>();
 
     /// <summary>
-    /// Prefill the prompt into sequence 0 from position 0 (one live sequence afterwards). <paramref name="temperature"/>: what the next draw (<see cref="SampleAsync"/>) uses,
-    /// 0 = greedy (the device then skips the softmax mass).
+    /// Prefill the prompt into sequence 0 from position 0 (one live sequence afterwards). <paramref name="temperature"/>: what the next draw (<see cref="SampleAsync"/>
+    /// or <see cref="Draw"/>) uses, 0 = greedy (the device then skips the softmax mass). Queued: nothing is read back until a draw needs it.
     /// </summary>
     public Task PrefillAsync(int[] promptIds, float temperature = 0f, CancellationToken ct = default)
     {
         if (promptIds.Length == 0) throw new ArgumentException("an empty prompt");
-        Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear();
-        return ForwardAsync(promptIds, null, decode: false, temperature, ct);
+        Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear(); _drawPos = -1;
+        return ForwardAsync(promptIds, null, decode: false, temperature, readBack: false, ct);
     }
 
     /// <summary>Copy sequence 0's cache (the prompt) into sequences 1..count-1: <paramref name="count"/> live sequences from now on, all at the same position.</summary>
@@ -549,7 +606,7 @@ public sealed class GgufBatchDecoder : IDisposable
     public Task StepAsync(int[] tokens, float temperature = 0f, CancellationToken ct = default)
     {
         if (tokens.Length != Batch) throw new ArgumentException($"{Batch} tokens expected (one per live sequence)");
-        return ForwardAsync(tokens, Enumerable.Range(0, Batch).ToArray(), decode: true, temperature, ct);
+        return ForwardAsync(tokens, Enumerable.Range(0, Batch).ToArray(), decode: true, temperature, readBack: true, ct);
     }
 
     /// <summary>
@@ -559,23 +616,30 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public Task StepAsync(int[] tokens, int[] sequences, float temperature = 0f, CancellationToken ct = default)
     {
-        if (tokens.Length != sequences.Length || sequences.Length == 0) throw new ArgumentException("one token per sequence, at least one");
+        if (tokens.Length != sequences.Length) throw new ArgumentException("one token per sequence");
+        CheckSequences(sequences);
+        return ForwardAsync(tokens, sequences, decode: true, temperature, readBack: true, ct);
+    }
+
+    private void CheckSequences(int[] sequences)
+    {
+        if (sequences.Length == 0) throw new ArgumentException("at least one sequence");
         if (sequences.Any(s => s < 0 || s >= Batch) || sequences.Distinct().Count() != sequences.Length) throw new ArgumentException($"distinct sequences below {Batch}");
-        return ForwardAsync(tokens, sequences, decode: true, temperature, ct);
     }
 
     /// <summary>The last forward's logits [rows, Vocab] row-major (a prefill: one row), read from the device.</summary>
     public async Task<float[]> ReadLogitsAsync() => await _lastLogits.CopyToHostAsync().ConfigureAwait(false);
 
     /// <summary>
-    /// One token for row <paramref name="row"/> of the last forward, at the temperature that forward was given: argmax when 0, else <see cref="SampleLogits"/>'s draw,
-    /// taken from the device's candidates (the same set and the same draw; the row is read only when its nucleus is wider than <see cref="Candidates"/>).
+    /// One token for row <paramref name="row"/> of the last forward, at the temperature that forward was given: argmax when 0, else <see cref="SampleLogits(float[], int, int, float, float, Random)"/>'s
+    /// draw, taken from the device's candidates (the same set and the same draw; the row is read only when its nucleus is wider than <see cref="Candidates"/>).
+    /// The first draw after a forward reads its candidates (that forward's one wait).
     /// </summary>
     public async ValueTask<int> SampleAsync(int row, float topP, Random rng)
     {
         if ((uint)row >= (uint)_lastRows) throw new ArgumentOutOfRangeException(nameof(row));
         int K = Candidates, o = row * CandStride;
-        var c = _lastCand;
+        var c = _lastCand ??= await _lastCandView.CopyToHostAsync().ConfigureAwait(false);
         float T = _lastT, max = c[o], floor = max - 20f * T;
         double total = 0, keep = 0; int m = 0;
         bool whole = c[o + 2 * K] > SelectCap;                                   // too many tokens reached the floor: the candidates are not the top K
@@ -597,41 +661,154 @@ public sealed class GgufBatchDecoder : IDisposable
         return (int)c[o + K + m - 1];
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // device draws: the token is drawn where the logits are, so a step's input never crosses to the host and back; the host reads the tokens to stream and stop
+    // them, one step behind (GenerateAsync)
+    // ---------------------------------------------------------------------------------------------------
+
     /// <summary>
-    /// <paramref name="n"/> continuations of <paramref name="promptIds"/> decoded together: prefill once, fork, then one batched step per token. Each sequence samples from
-    /// its own logits with its own generator (seed + index): greedy when <paramref name="temperature"/> &lt;= 0, else temperature then nucleus (top-p). A sequence ends at a
-    /// stop token or after <paramref name="maxNew"/> tokens and then leaves the batch (the steps after it run the live sequences only). Returns the generated token ids per sequence (stop token
-    /// excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled, <paramref name="onFinished"/> the sequence when it ends.
+    /// <see cref="GenerateAsync"/> draws on the device and keeps the next step queued while it reads a step's tokens (no wait on the step's critical path); false:
+    /// every token is drawn on the host by <see cref="SampleAsync"/> with a <see cref="Random"/> per sequence (seed + index), a round trip per step. On by default
+    /// where the draw kernel's groups exist (not WebGL).
+    /// </summary>
+    public bool DeviceSampling { get; set; }
+    /// <summary>Diagnostics: device draws take the full-row path (the bisection over every logit) even when the candidates hold the nucleus. Read by <see cref="Draw"/>.</summary>
+    public bool ForceFullRowDraws { get; set; }
+    private int _drawPos = -1;
+    private bool _lastPrefill;
+
+    /// <summary>
+    /// The uniform sequence <paramref name="sequence"/> draws its token for <paramref name="position"/> with under <paramref name="seed"/>: a counter hash (three
+    /// rounds of lowbias32), 24 bits, in [0, 1). The device computes the same float; passed to <see cref="SampleLogits(float[], int, int, float, float, double)"/> it
+    /// gives the host's draw from the same logits.
+    /// </summary>
+    public static float DrawUniform(int seed, int sequence, int position)
+    {
+        uint h = Mix32((uint)seed ^ 0x9E3779B9u);
+        h = Mix32(h ^ ((uint)sequence * 0x85EBCA6Bu));
+        h = Mix32(h ^ ((uint)position * 0xC2B2AE35u));
+        return (h >> 8) * (1f / 16777216f);
+    }
+    private static uint Mix32(uint x)
+    {
+        x ^= x >> 16; x *= 0x7FEB352Du;
+        x ^= x >> 15; x *= 0x846CA68Bu;
+        x ^= x >> 16;
+        return x;
+    }
+
+    /// <summary>
+    /// Draw every live sequence's next token on the device from the last forward (after <see cref="PrefillAsync"/> and <see cref="Fork"/>: all of them from the
+    /// prompt's row; after a step: each row for its sequence), at the temperature that forward was given (0: the argmax), nucleus <paramref name="topP"/> (0, 1],
+    /// uniform <see cref="DrawUniform"/>(<paramref name="seed"/>, sequence, <see cref="Position"/>). Queued, no wait: the tokens stay on the device as the next
+    /// <see cref="StepDrawnAsync"/>'s input, <see cref="ReadDrawnAsync"/> reads them. <paramref name="seed"/> and <paramref name="topP"/> hold for the steps after.
+    /// </summary>
+    public void Draw(float topP, int seed)
+    {
+        if (_lastRows == 0) throw new InvalidOperationException("no forward to draw from");
+        if (!(topP > 0f && topP <= 1f)) throw new ArgumentOutOfRangeException(nameof(topP), "(0, 1]");
+        LoadKernels(); EnsureDrawBuffers();
+        _drawI!.View.SubView(0, 2).CopyFromCPU(new[] { seed, ForceFullRowDraws ? 1 : 0 });
+        _drawF!.View.SubView(0, 1).CopyFromCPU(new[] { topP });
+        var seqs = _lastPrefill ? Enumerable.Range(0, Batch).ToArray() : _lastSeqs;
+        if (!seqs.AsSpan().SequenceEqual(_seqsOnDevice)) { _seqBuf!.View.SubView(0, seqs.Length).CopyFromCPU(seqs); _seqsOnDevice = (int[])seqs.Clone(); }
+        QueueDraw(seqs.Length, rowZero: _lastPrefill, tAdd: Position - _lastP, _lastT, _lastLogits, _lastCandView);
+        CopyDrawnToRing();
+    }
+
+    /// <summary>
+    /// One step for <paramref name="sequences"/> (distinct, below <see cref="Batch"/>) whose inputs are the tokens they drew last (<see cref="Draw"/> or the step before),
+    /// ending with their next draws (as <see cref="Draw"/>: its seed and top-p, this <paramref name="temperature"/>). Queued, no wait (WebGPU: a captured step's replay).
+    /// </summary>
+    public async Task StepDrawnAsync(int[] sequences, float temperature, CancellationToken ct = default)
+    {
+        CheckSequences(sequences);
+        if (_drawPos != Position) throw new InvalidOperationException("the sequences have no drawn token at this position: Draw after the prefill");
+        await ForwardAsync(null, sequences, decode: true, temperature, readBack: false, ct).ConfigureAwait(false);
+        CopyDrawnToRing();
+    }
+
+    // the drawn tokens into the next read ring (a device copy, queued after the draw)
+    private void CopyDrawnToRing()
+    {
+        _ringAt ^= 1;
+        _ring[_ringAt]!.View.SubView(0, MaxBatch).CopyFrom(_seqIds!.View.SubView(0, MaxBatch));
+        _drawPos = Position;
+    }
+
+    /// <summary>
+    /// The tokens the last draw gave, by sequence (length <see cref="MaxBatch"/>; a sequence that was not drawn keeps its last token). The read is queued when this is
+    /// called and waits only for the draw: it may be awaited after the next <see cref="StepDrawnAsync"/> is queued (at most two reads unawaited).
+    /// </summary>
+    public Task<int[]> ReadDrawnAsync() => _ring[_ringAt]!.View.SubView(0, MaxBatch).CopyToHostAsync();
+
+    /// <summary>
+    /// <paramref name="n"/> continuations of <paramref name="promptIds"/> decoded together: prefill once, fork, then one batched step per token: greedy when
+    /// <paramref name="temperature"/> &lt;= 0, else temperature then nucleus (top-p), each sequence with its own uniforms (<see cref="DeviceSampling"/>:
+    /// <see cref="DrawUniform"/>(<paramref name="seed"/>, sequence, position) on the device; off: a <see cref="Random"/>(seed + sequence) on the host). A sequence ends
+    /// at a stop token or after <paramref name="maxNew"/> tokens and then leaves the batch (the steps after it run the live sequences only). Returns the generated token
+    /// ids per sequence (stop token excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled, <paramref name="onFinished"/> the sequence when it ends.
     /// </summary>
     public async Task<int[][]> GenerateAsync(int[] promptIds, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
         Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default)
     {
         await PrefillAsync(promptIds, temperature, ct).ConfigureAwait(false);
         Fork(n);
-        var rngs = Enumerable.Range(0, n).Select(s => new Random(seed + s)).ToArray();
         var outs = Enumerable.Range(0, n).Select(_ => new List<int>()).ToArray();
         var done = new bool[n];
-        var next = new int[n];
-        for (int s = 0; s < n; s++) next[s] = await SampleAsync(0, topP, rngs[s]).ConfigureAwait(false);
-        for (int step = 0; ; step++)
+        // a token for sequence s: true when the sequence goes on
+        bool Take(int s, int token)
         {
-            for (int s = 0; s < n; s++)
+            if (stopIds.Contains(token) || outs[s].Count >= maxNew) { done[s] = true; onFinished?.Invoke(s); return false; }
+            outs[s].Add(token); onToken?.Invoke(s, token);
+            return true;
+        }
+        void FinishAll() { for (int s = 0; s < n; s++) if (!done[s]) { done[s] = true; onFinished?.Invoke(s); } }
+        if (!DeviceSampling)
+        {
+            var rngs = Enumerable.Range(0, n).Select(s => new Random(seed + s)).ToArray();
+            var next = new int[n];
+            for (int s = 0; s < n; s++) next[s] = await SampleAsync(0, topP, rngs[s]).ConfigureAwait(false);
+            while (true)
             {
-                if (done[s]) continue;
-                if (stopIds.Contains(next[s]) || outs[s].Count >= maxNew) { done[s] = true; onFinished?.Invoke(s); continue; }
-                outs[s].Add(next[s]); onToken?.Invoke(s, next[s]);
+                for (int s = 0; s < n; s++) if (!done[s]) Take(s, next[s]);
+                if (done.All(d => d)) break;
+                if (Position + 1 > MaxSeq) { FinishAll(); break; }
+                ct.ThrowIfCancellationRequested();
+                // only the live sequences step: a finished one leaves the batch (it used to ride along to the end of the longest)
+                var live = Enumerable.Range(0, n).Where(s => !done[s]).ToArray();
+                await StepAsync(live.Select(s => next[s]).ToArray(), live, temperature, ct).ConfigureAwait(false);
+                for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
             }
-            if (done.All(d => d)) break;
-            if (Position + 1 > MaxSeq)
+            return outs.Select(o => o.ToArray()).ToArray();
+        }
+        // device draws, one step ahead: step P (its inputs the tokens drawn for P, its draws the tokens for P + 1) is queued before the tokens for P are read, so the
+        // device always has the next step while the host streams the last one. A sequence that drew a stop token rides one step more (its row is thrown away), then
+        // leaves the batch.
+        Draw(temperature > 0f ? topP : 1f, seed);
+        var live2 = Enumerable.Range(0, n).ToArray();
+        Task<int[]>? pending = ReadDrawnAsync(), ahead = null;
+        try
+        {
+            while (true)
             {
-                for (int s = 0; s < n; s++) if (!done[s]) { done[s] = true; onFinished?.Invoke(s); }
-                break;
+                ct.ThrowIfCancellationRequested();
+                ahead = null;
+                if (Position + 1 <= MaxSeq) { await StepDrawnAsync(live2, temperature, ct).ConfigureAwait(false); ahead = ReadDrawnAsync(); }
+                var tokens = await pending!.ConfigureAwait(false);
+                pending = null;
+                foreach (int s in live2) Take(s, tokens[s]);
+                live2 = live2.Where(s => !done[s]).ToArray();
+                if (live2.Length == 0) break;
+                if (ahead == null) { FinishAll(); break; }
+                pending = ahead; ahead = null;
             }
-            ct.ThrowIfCancellationRequested();
-            // only the live sequences step: a finished one leaves the batch (it used to ride along to the end of the longest)
-            var live = Enumerable.Range(0, n).Where(s => !done[s]).ToArray();
-            await StepAsync(live.Select(s => next[s]).ToArray(), live, temperature, ct).ConfigureAwait(false);
-            for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
+        }
+        finally
+        {
+            // the step queued ahead is still on the device: wait for its read, so the decoder is idle (and its staging unmapped) when this returns
+            foreach (var t in new[] { pending, ahead })
+                if (t != null) try { await t.ConfigureAwait(false); } catch { }
         }
         return outs.Select(o => o.ToArray()).ToArray();
     }
@@ -641,7 +818,13 @@ public sealed class GgufBatchDecoder : IDisposable
     /// tokens within e^20 of the best (the rest carry under 2e-9 of the mass each), taken best first (ties: the lower id), the smallest set whose mass reaches
     /// <paramref name="topP"/>, renormalised and drawn. <paramref name="vocab"/>: the row length.
     /// </summary>
-    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, Random rng)
+    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, Random rng) =>
+        SampleLogits(logits, row, vocab, temperature, topP, rng.NextDouble());
+
+    /// <summary>
+    /// <see cref="SampleLogits(float[], int, int, float, float, Random)"/> with the uniform given: <paramref name="u"/> in [0, 1) (the device draws: <see cref="DrawUniform"/>).
+    /// </summary>
+    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, double u)
     {
         int V = vocab, o = row * V, best = 0;
         for (int i = 1; i < V; i++) if (logits[o + i] > logits[o + best]) best = i;
@@ -652,8 +835,8 @@ public sealed class GgufBatchDecoder : IDisposable
         cand.Sort((a, b) => a.L != b.L ? b.L.CompareTo(a.L) : a.Id.CompareTo(b.Id));
         double total = cand.Sum(c => c.P), keep = 0; int m = 0;
         while (m < cand.Count && keep < topP * total) keep += cand[m++].P;
-        double u = rng.NextDouble() * keep, acc = 0;
-        for (int i = 0; i < m; i++) { acc += cand[i].P; if (u < acc) return cand[i].Id; }
+        double x = u * keep, acc = 0;
+        for (int i = 0; i < m; i++) { acc += cand[i].P; if (x < acc) return cand[i].Id; }
         return cand[m - 1].Id;
     }
 
@@ -680,6 +863,8 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, IV, FV, IV, int, int>? _floor;
     private Action<Index1D, FV, FV, IV, FV, IV, int, int, int, float>? _select;
     private Action<Index1D, FV, IV, IV, FV, int>? _final;
+    private Action<KernelConfig, FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>? _draw;
+    private Action<Index1D, IV, IV, IV>? _gather;
 
     private void LoadKernels()
     {
@@ -832,6 +1017,265 @@ public sealed class GgufBatchDecoder : IDisposable
             o[ob + pos] = v; o[ob + K + pos] = id;
         }
     }
+
+    // ---- device draws ----
+    private const int DrawGroup = 256;
+
+    /// <summary>True when <paramref name="accelerator"/> can run the draw kernel (a group of 256 threads per row; WebGL has no groups).</summary>
+    public static bool SupportsDeviceDraws(Accelerator accelerator) =>
+        accelerator.AcceleratorType != AcceleratorType.WebGL && accelerator.MaxNumThreadsPerGroup >= DrawGroup;
+
+    /// <summary>
+    /// The decoder's device draw on given logits, without a model (its gate): [<paramref name="rows"/>, <paramref name="vocab"/>] row-major through the candidate
+    /// kernels and the draw kernel. Row r draws as sequence r for <paramref name="position"/> (uniform <see cref="DrawUniform"/>(<paramref name="seed"/>, r,
+    /// <paramref name="position"/>)); <paramref name="forceFullRow"/> takes the whole-row path for every row. Returns the token per row.
+    /// </summary>
+    public static async Task<int[]> DrawRowsAsync(Accelerator accelerator, float[] logits, int rows, int vocab, float temperature, float topP, int seed, int position, bool forceFullRow = false)
+    {
+        if (!SupportsDeviceDraws(accelerator)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads");
+        if (logits.Length != (long)rows * vocab) throw new ArgumentException("rows x vocab logits");
+        if (vocab >= 1 << 24) throw new NotSupportedException("candidate ids travel as floats (exact below 2^24)");
+        int nch = (vocab + Chunk - 1) / Chunk, S = 2 * Candidates + 1 + nch;
+        var acc = accelerator;
+        using var lg = acc.Allocate1D(logits);
+        using var maxV = acc.Allocate1D<float>((long)rows * nch);
+        using var maxI = acc.Allocate1D<int>((long)rows * nch);
+        using var selV = acc.Allocate1D<float>((long)rows * SelectCap);
+        using var selI = acc.Allocate1D<int>((long)rows * SelectCap);
+        using var selN = acc.Allocate1D<int>(Math.Max(64, rows));
+        using var cand = acc.Allocate1D<float>((long)rows * S);
+        using var seqs = acc.Allocate1D(Enumerable.Range(0, rows).ToArray());
+        using var pos = acc.Allocate1D(new[] { position - 1, 0 });
+        using var dF = acc.Allocate1D(new[] { topP, 0f });
+        using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0 });
+        using var ids = acc.Allocate1D<int>(Math.Max(64, rows));
+        var chunkMax = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
+        var floor = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
+        var select = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
+        var final = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
+        var draw = acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>(DrawImpl);
+        chunkMax(rows * nch, lg.View, maxV.View, maxI.View, vocab, nch);
+        floor(rows, maxV.View, maxI.View, cand.View, selN.View, nch, S);
+        select(rows * nch, lg.View, cand.View, selN.View, selV.View, selI.View, vocab, nch, S, temperature);
+        final(rows, selV.View, selI.View, selN.View, cand.View, S);
+        draw(new KernelConfig(rows, DrawGroup), lg.View, cand.View, seqs.View, pos.View, dF.View, dI.View, ids.View, vocab, nch, S, 0, 1, temperature);
+        var got = await ids.View.SubView(0, rows).CopyToHostAsync().ConfigureAwait(false);      // the read waits for the kernels (every backend), so the buffers may go
+        return got;
+    }
+
+    // a step's input under device draws: row r is the token its sequence drew last
+    private static void GatherIdsImpl(Index1D r, IV seqIds, IV seqs, IV ids) => ids[r] = seqIds[seqs[r]];
+
+    // the draw: group g = slot g (sequence seqs[g], from row g of the forward, or row 0 when rowZero), DrawGroup threads; the token goes to seqIds[sequence]. The
+    // uniform is DrawUniform(seed, sequence, position + tAdd); drawF = [topP], drawI = [seed, force the full-row path].
+    //  T <= 0: the argmax, the floor kernel's best chunk maximum (the lowest id among equals: exact even when the candidates are not the top K).
+    //  T > 0, the nucleus inside the candidates: thread 0 walks them as SampleAsync does.
+    //  Otherwise (more than SelectCap tokens at the floor, a nucleus wider than the candidates, or forced) the whole row, exactly: the nucleus' last token is the
+    //  largest logit tau whose mass at or above it reaches topP x the total, found by bisecting the float's order key (33 passes over the row, each a group sum),
+    //  the ties at tau taken in id order (each thread holds a contiguous id range, so a scan over the threads is the id order); the draw is the same search for
+    //  u x keep. Float sums can disagree with themselves by a hair: a search that finds no tie takes the last one, a draw past the nucleus its last token.
+    // The full-row branch holds barriers: its condition comes from Group.BarrierOr (uniform in WGSL: workgroupUniformLoad), its loops run a fixed count.
+    private static void DrawImpl(FV logits, FV cand, IV seqs, IV posBuf, FV drawF, IV drawI, IV seqIds, int V, int nch, int S, int rowZero, int tAdd, float T)
+    {
+        const int K = Candidates;
+        int slot = Grid.IdxX, t = Group.IdxX;
+        int row = rowZero != 0 ? 0 : slot, seq = seqs[slot];
+        long o = (long)row * S, lb = (long)row * V;
+        var red = SharedMemory.Allocate<float>(DrawGroup + 1);
+        var redI = SharedMemory.Allocate<int>(DrawGroup);
+        float topP = drawF[0], max = cand[o];
+        float u = DrawUniform(drawI[0], seq, posBuf[0] + tAdd);
+        bool forced = drawI[1] != 0, sampling = T > 0f;
+        int tok = (int)cand[o + K];
+        bool needFull = false;
+        if (t == 0 && sampling)
+        {
+            bool wide = forced | (cand[o + 2 * K] > SelectCap);
+            if (wide) needFull = true;
+            else
+            {
+                float total = 0f;
+                for (int ch = 0; ch < nch; ch++) total += cand[o + 2 * K + 1 + ch];
+                float floorT = max - 20f * T, target = topP * total, keep = 0f;
+                int m = 0;
+                for (int j = 0; j < K; j++)
+                {
+                    float cv = cand[o + j];
+                    bool take = (cv >= floorT) & (keep < target);
+                    if (!take) break;
+                    keep += MathF.Exp((cv - max) / T);
+                    m = j + 1;
+                }
+                if (keep < target) needFull = true;                               // the nucleus reaches past the candidates
+                else
+                {
+                    float x = u * keep, acc = 0f;
+                    tok = (int)cand[o + K + m - 1];
+                    for (int j = 0; j < m; j++)
+                    {
+                        acc += MathF.Exp((cand[o + j] - max) / T);
+                        if (x < acc) { tok = (int)cand[o + K + j]; break; }
+                    }
+                }
+            }
+        }
+        bool full = Group.BarrierOr(needFull);
+        if (full)
+        {
+            float floorT = max - 20f * T;
+            float total = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, floorT, false, t));
+            float target = topP * total;
+            // tau: the largest key whose mass at or above reaches the target (true at floorT: its mass is the total)
+            uint lo = OrderKey(floorT), hi = OrderKey(max);
+            for (int it = 0; it < 33; it++)
+            {
+                uint mid = lo + ((hi - lo + 1u) >> 1);
+                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, FromOrderKey(mid), false, t));
+                if (s >= target) lo = mid; else hi = mid - 1u;
+            }
+            float tau = FromOrderKey(lo);
+            float gt = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, tau, true, t));
+            int span = (V + DrawGroup - 1) / DrawGroup, i0 = t * span, i1 = Math.Min(V, i0 + span);
+            float own = 0f; int lastTie = -1;
+            for (int i = i0; i < i1; i++)
+            {
+                float l = logits[lb + i];
+                if (l == tau) { own += MathF.Exp((l - max) / T); lastTie = i; }
+            }
+            float before = GroupExclusive(red, t, own);
+            float tiesTotal = red[DrawGroup];
+            float run = gt + before, cutKeep = 0f; int cut = int.MaxValue;
+            for (int i = i0; i < i1; i++)
+            {
+                float l = logits[lb + i];
+                if (l == tau)
+                {
+                    run += MathF.Exp((l - max) / T);
+                    bool hit = (run >= target) & (cut == int.MaxValue);
+                    if (hit) { cut = i; cutKeep = run; }
+                }
+            }
+            int nucLast = GroupMin(redI, t, cut);
+            int lastTau = GroupMax(redI, t, lastTie);
+            Group.Barrier();
+            bool mine = (cut == nucLast) & (cut != int.MaxValue);
+            if (mine) red[0] = cutKeep;
+            bool none = (nucLast == int.MaxValue) & (t == 0);
+            if (none) red[0] = gt + tiesTotal;
+            Group.Barrier();
+            float keep = red[0];
+            if (nucLast == int.MaxValue) nucLast = lastTau;
+            // the draw: the first token (best first, ties by id) whose running mass passes x = u * keep
+            float x = u * keep;
+            lo = OrderKey(floorT); hi = OrderKey(max);
+            for (int it = 0; it < 33; it++)
+            {
+                uint mid = lo + ((hi - lo + 1u) >> 1);
+                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, FromOrderKey(mid), false, t));
+                if (s > x) lo = mid; else hi = mid - 1u;
+            }
+            float sigma = FromOrderKey(lo);
+            float gt2 = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, sigma, true, t));
+            float own2 = 0f; int lastTie2 = -1;
+            for (int i = i0; i < i1; i++)
+            {
+                float l = logits[lb + i];
+                if (l == sigma) { own2 += MathF.Exp((l - max) / T); lastTie2 = i; }
+            }
+            float before2 = GroupExclusive(red, t, own2);
+            float run2 = gt2 + before2; int pick = int.MaxValue;
+            for (int i = i0; i < i1; i++)
+            {
+                float l = logits[lb + i];
+                if (l == sigma)
+                {
+                    run2 += MathF.Exp((l - max) / T);
+                    bool hit = (run2 > x) & (pick == int.MaxValue);
+                    if (hit) pick = i;
+                }
+            }
+            int drawn = GroupMin(redI, t, pick);
+            int lastSigma = GroupMax(redI, t, lastTie2);
+            if (drawn == int.MaxValue) drawn = lastSigma;
+            bool outside = (sigma < tau) | ((sigma == tau) & (drawn > nucLast));
+            if (outside) drawn = nucLast;
+            tok = drawn;
+        }
+        if (t == 0) seqIds[seq] = tok;
+    }
+
+    // this thread's share of the row's softmax mass at T over the tokens within e^20 of the best (logit >= floorT) and at or above v (strict: above v)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static float MassPart(FV logits, long lb, int V, float max, float T, float floorT, float v, bool strict, int t)
+    {
+        float s = 0f;
+        for (int i = t; i < V; i += DrawGroup)
+        {
+            float l = logits[lb + i];
+            bool inc = (l >= floorT) & (strict ? l > v : l >= v);
+            if (inc) s += MathF.Exp((l - max) / T);
+        }
+        return s;
+    }
+    // the group's sum of x (every thread gets it)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static float GroupSum(ArrayView<float> red, int t, float x)
+    {
+        Group.Barrier();                                                       // the last reads of red are done
+        red[t] = x;
+        Group.Barrier();
+        for (int w = DrawGroup / 2; w > 0; w >>= 1)
+        {
+            if (t < w) red[t] += red[t + w];
+            Group.Barrier();
+        }
+        return red[0];
+    }
+    // the sum of x over the threads below this one; red[DrawGroup] = the sum over all
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static float GroupExclusive(ArrayView<float> red, int t, float x)
+    {
+        Group.Barrier();
+        red[t] = x;
+        Group.Barrier();
+        if (t == 0)
+        {
+            float acc = 0f;
+            for (int i = 0; i < DrawGroup; i++) { float v = red[i]; red[i] = acc; acc += v; }
+            red[DrawGroup] = acc;
+        }
+        Group.Barrier();
+        return red[t];
+    }
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static int GroupMin(ArrayView<int> red, int t, int x)
+    {
+        Group.Barrier();
+        red[t] = x;
+        Group.Barrier();
+        for (int w = DrawGroup / 2; w > 0; w >>= 1)
+        {
+            if (t < w) red[t] = Math.Min(red[t], red[t + w]);
+            Group.Barrier();
+        }
+        return red[0];
+    }
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static int GroupMax(ArrayView<int> red, int t, int x)
+    {
+        Group.Barrier();
+        red[t] = x;
+        Group.Barrier();
+        for (int w = DrawGroup / 2; w > 0; w >>= 1)
+        {
+            if (t < w) red[t] = Math.Max(red[t], red[t + w]);
+            Group.Barrier();
+        }
+        return red[0];
+    }
+    // a float's order as an unsigned key (a < b exactly when OrderKey(a) < OrderKey(b)), and back
+    private static uint OrderKey(float f) { uint b = Interop.FloatAsInt(f); return (b & 0x80000000u) != 0 ? ~b : b | 0x80000000u; }
+    private static float FromOrderKey(uint k) => Interop.IntAsFloat((k & 0x80000000u) != 0 ? k & 0x7FFFFFFFu : ~k);
 
     // split-K attention, part 1. Group g = (row r, head h, chunk ch of AttChunk keys), a thread per head dimension (D = group size, a power of two). The chunk's
     // scores go to shared memory, then its max m and exp-sum l (masked keys contribute 0), then thread d sums p_j * v[j, d] over the chunk (coalesced across d).

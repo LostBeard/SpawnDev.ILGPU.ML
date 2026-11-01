@@ -52,8 +52,13 @@ batch. What keeps a step on the device:
   sequence map, so nothing is copied.
 - **Fused layers**: each residual add with the norm after it, q|k|v and gate|up joined into one matrix each where their block types agree, bias, rotary and the cache
   store in one kernel, and split-K attention (a group per row, head and chunk of 256 keys, then a merge). About 11 kernel launches a layer.
-- **Captured steps on WebGPU**: a decode step is recorded once per (live sequences, temperature) and replayed with one interop crossing, the position patched
-  into the scalars that carry it (found by diffing captures at two positions).
+- **Captured steps on WebGPU**: a decode step is recorded once per (live sequences, temperature) and replayed with one interop crossing; the kernels read the
+  position from a one-int device buffer, so a replay needs no patches.
+- **Tokens drawn on the device, the next step already queued** (`GenerateAsync` by default; `Draw`, `StepDrawnAsync`, `ReadDrawnAsync` to drive it by hand):
+  a kernel at the end of the step draws each row's token from the 64 candidates, or exactly from the whole row when the nucleus is wider (the cut and the draw
+  found by bisecting the float's order key, exact ties taken in id order), with the uniform `DrawUniform(seed, sequence, position)`. The token is written where
+  the next step reads its input, so `GenerateAsync` queues step P before it reads the tokens of P: the device always has the next step while the host streams
+  and stops answers one step behind. `SampleLogits(logits, row, vocab, T, topP, u)` is the same draw on the host.
 
 Measured, RTX 4070 (CUDA unless marked; `tools/llm-bench/batch_profile.cs`, the gate `GgufBatchDecoder_GreedyMatchesGenerator`):
 
@@ -64,12 +69,17 @@ Measured, RTX 4070 (CUDA unless marked; `tools/llm-bench/batch_profile.cs`, the 
 | same at a 905-token context, one / eight sequences | 30.8 / 147.8 tok/s | 74.2 / 274.8 tok/s |
 | Qwen2.5-0.5B Q8_0, four sequences: CUDA / OpenCL / WebGPU | 13.3 / 12.9 / 10.7 tok/s | 531.8 / 605.8 / 288.2 tok/s |
 | 50 MATH problems, greedy + 8 samples each | 52.8 min | 22.3 min |
+| Qwen2.5-0.5B Q8_0 on WebGPU (Chrome), one / four sequences | 105.0 / 315.5 tok/s (host draws, two waits a step) | 146.8 / 560.9 tok/s (device draws, pipelined) |
+
+On desktop the device draws change nothing measurable (CUDA 151.8 / 525.0 against 154.2 / 534.5 tok/s with host draws, OpenCL 175.1 / 588.8 against
+178.0 / 595.2): an ILGPU host write synchronises the stream there and a step's read is a blocking copy, so the host still meets the device once a step.
 
 The word-wise GEMVs also serve the single-sequence engine (`Forward` at M = 1): Qwen2.5-0.5B greedy decode went from 94.6 to 140.3 tok/s on CUDA and from 85.7
 to 114.5 tok/s on WebGPU with decode capture, token for token the same.
 
 Options: `FusedAttention` (default on where a group can be a head wide), `JoinProjections` (static, env `GGUF_BATCH_SEPARATE=1` off), `ProfileKernels` /
-`KernelTimes` (desktop: a sync after each kernel, time by kernel), `CaptureWebGPU` (default on on WebGPU), `GGUF_GEMV_ROWS_GENERIC=1` (the per-element GEMVs).
+`KernelTimes` (desktop: a sync after each kernel, time by kernel), `CaptureWebGPU` (default on on WebGPU), `GGUF_GEMV_ROWS_GENERIC=1` (the per-element GEMVs),
+`DeviceSampling` (default on where a group can be 256 threads: not WebGL), `ForceFullRowDraws` (diagnostics: the whole-row draw for every row).
 
 ## SelfConsistency
 
@@ -83,14 +93,15 @@ Options: `FusedAttention` (default on where a group can be a head wide), `JoinPr
 ## The page
 
 `/self-consistency` loads Qwen2.5-Math-1.5B-Instruct (Q4_K_M, about 1 GB) or Qwen2.5-0.5B-Instruct (Q8_0) and asks one problem N times. In Chrome on a 4070
-(WebGPU), eight answers to "What is the sum of all positive divisors of 360?" take 19 s (208 tok/s across the answers; 27 s and 141 tok/s before the decoder work) and vote 1170, stopped once the vote was decided.
+(WebGPU), eight answers to "What is the sum of all positive divisors of 360?" take 17.1 s (225.8 tok/s across the answers; 27 s and 141 tok/s before the decoder work, 19 s and 208 tok/s before the device draws) and vote 1170, stopped once the vote was decided (after 5 of 8).
 `tools/drive-self-consistency-page.cs` drives it the way a visitor does.
 
 ## Gates
 
 | Test | What it proves |
 |---|---|
-| `GgufBatchDecoder_GreedyMatchesGenerator` | greedy = the single-sequence engine word for word; batched greedy rows identical; device draws = the full-row sampler (96 of 96); the shrinking batch = riding along; split-K attention = the three-kernel path (2-4e-6 at 489 tokens); joined projections = separate (bit-identical); WebGPU captured steps = encoded ones. CUDA, OpenCL, WebGPU, each check red-checked |
+| `GgufBatchDecoder_GreedyMatchesGenerator` | greedy = the single-sequence engine word for word; batched greedy rows identical; greedy device draws = host draws; host draws from the candidates = the full-row sampler (96 of 96); device draws = `SampleLogits(u)` over 24 steps of four sequences (candidates path, whole row forced, T 1.5 top-p 0.99; a mismatch is a float tie only within 1e-5 of the device token's interval); the pipelined, shrinking batch = an unpipelined loop riding all four along; split-K attention = the three-kernel path (2-4e-6 at 489 tokens); joined projections = separate (bit-identical); WebGPU captured steps = encoded ones. CUDA, OpenCL, WebGPU, each check red-checked |
+| `GgufBatchDecoder_DeviceDraws_MatchHostSampler` | the candidate and draw kernels on built logits, no model (`DrawRowsAsync`): 64 rows of 50,003 per case, random, the whole row forced, flat, 300 exact ties at the nucleus cut spread over the row, ties at the maximum (greedy, T 0.3), each = `SampleLogits(u)`. Every backend with 256-thread groups; red-checked (the cut's and the draw's tie scans, a short bisection) |
 | `GgufBatchDecoder_OtherArchs_GreedyMatchesGenerator` | qwen3 (Qwen3-0.6B: per-head q / k norms, a query wider than the model) and llama (SmolLM2-360M: rotary on adjacent pairs): greedy = the single-sequence engine, batched rows identical, CUDA / OpenCL / WebGPU |
 | `Gemv_Rows_AllTypes_MatchOracle` | the word-wise GEMVs against the CPU dequant oracle, Q8_0 / Q4_K / Q6_K / Q4_0 at M = 1, 3, 8 |
 | `SelfConsistency_ExtractNormalizeVote` | extraction, the spellings that must and must not vote together, the vote order, `IsDecided` |
