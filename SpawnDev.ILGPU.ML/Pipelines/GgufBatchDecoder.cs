@@ -103,7 +103,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds, _posBuf;
     private FV _lastLogits;
     private float[] _lastCand = Array.Empty<float>();
     private int _lastRows;
@@ -317,7 +317,8 @@ public sealed class GgufBatchDecoder : IDisposable
         _fixedChunks = true;
         if (_plans.TryGetValue((R, temperature), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
         {
-            foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));
+            _posBuf!.View.SubView(0, 1).CopyFromCPU(new[] { p });            // the kernels read the position from this buffer
+            foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));   // none left now; kept for any scalar that carries it
             await sp.Plan.ReplayAsync().ConfigureAwait(false);
             CaptureStats = (CaptureStats.Replays + 1, CaptureStats.Captures);
             return (sp.Logits, sp.Cand, sp.OutRows);
@@ -371,6 +372,11 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         int C = Hidden, kvC = KvHeads * HeadDim;
         var seqView = _seqBuf!.View;
+        // the position the kernels read (a buffer, not a scalar: a captured step then has nothing to patch, one int written per step). Every forward is synced
+        // before the next starts, so this write never overtakes queued work.
+        _posBuf ??= Own(_acc.Allocate1D<int>(64));
+        var posView = _posBuf.View.SubView(0, 1);
+        posView.CopyFromCPU(new[] { p });
         var hid = Buf(ref _hid, (long)R * C);
         var (embW, embT) = _mats["token_embd.weight"];
         int code = FusedDequantMatMul.TypeCode(embT);
@@ -404,7 +410,7 @@ public sealed class GgufBatchDecoder : IDisposable
                     _headNorm(new KernelConfig(R * KvHeads, HeadDim), qkv, _vecs[b + "attn_k_norm.weight"].View, n, Q, KvHeads, _eps); Prof("qk-norm");
                 }
                 int U = Heads * (HeadDim / 2) + KvHeads * (HeadDim / 2) + kvC;
-                _qkvPost!(R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, _kc[l].View, _vc[l].View, seqView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1) | (rope << 1), MaxSeq, p); Prof("qkv-post");
+                _qkvPost!(R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, _kc[l].View, _vc[l].View, seqView, posView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1) | (rope << 1), MaxSeq); Prof("qkv-post");
             }
             else
             {
@@ -416,9 +422,9 @@ public sealed class GgufBatchDecoder : IDisposable
                     _headNorm!(new KernelConfig(R * Heads, HeadDim), q, _vecs[b + "attn_q_norm.weight"].View, Q, 0, Heads, _eps);
                     _headNorm(new KernelConfig(R * KvHeads, HeadDim), k, _vecs[b + "attn_k_norm.weight"].View, kvC, 0, KvHeads, _eps); Prof("qk-norm");
                 }
-                _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, Heads, HeadDim, p, mode | rope);
-                _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, KvHeads, HeadDim, p, mode | rope); Prof("rope");
-                _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, kvC, MaxSeq, p, mode); Prof("store");
+                _rope!(R * Heads * (HeadDim / 2), q, _invFreq.View, posView, Heads, HeadDim, mode | rope);
+                _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, posView, KvHeads, HeadDim, mode | rope); Prof("rope");
+                _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, posView, kvC, MaxSeq, mode); Prof("store");
             }
             if (FusedAttention)
             {
@@ -426,7 +432,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 // a captured step keeps one shape for the whole generation: every chunk the cache can hold (the ones past the position mask to nothing)
                 int ach = _fixedChunks ? (MaxSeq + AttChunk - 1) / AttChunk : (nk + AttChunk - 1) / AttChunk;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
-                _attPartial!(new KernelConfig(R * Heads * ach, HeadDim), q, _kc[l].View, _vc[l].View, seqView, part, ml, Heads, KvHeads, MaxSeq, p, mode, ach, 1f / MathF.Sqrt(HeadDim)); Prof("attn");
+                _attPartial!(new KernelConfig(R * Heads * ach, HeadDim), q, _kc[l].View, _vc[l].View, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim)); Prof("attn");
                 _attCombine!((int)((long)R * Q), part, ml, att, HeadDim, ach); Prof("attn-merge");
             }
             else
@@ -657,16 +663,16 @@ public sealed class GgufBatchDecoder : IDisposable
     // ---------------------------------------------------------------------------------------------------
     private Action<Index1D, FV, FV, FV>? _add3;
     private Action<Index1D, FV, FV, int>? _bias;
-    private Action<Index1D, FV, FV, int, int, int, int>? _rope;
-    private Action<Index1D, FV, FV, FV, FV, IV, int, int, int, int>? _store;
+    private Action<Index1D, FV, FV, IV, int, int, int>? _rope;
+    private Action<Index1D, FV, FV, FV, FV, IV, IV, int, int, int>? _store;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>? _scoresK;
     private Action<Index1D, FV, int>? _softmax;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
     private Action<Index1D, FV, FV>? _swiglu;
-    private Action<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>? _qkvPost;
+    private Action<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, IV, int, int, int, int, int>? _qkvPost;
     private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
-    private Action<KernelConfig, FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>? _attPartial;
+    private Action<KernelConfig, FV, FV, FV, IV, IV, FV, FV, int, int, int, int, int, float>? _attPartial;
     private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
@@ -680,18 +686,18 @@ public sealed class GgufBatchDecoder : IDisposable
         if (_add3 != null) return;
         _add3 = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV>(Add3Impl);
         _bias = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(BiasImpl);
-        _rope = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(RopeImpl);
-        _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, int, int, int, int>(StoreImpl);
+        _rope = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int>(RopeImpl);
+        _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, IV, int, int, int>(StoreImpl);
         _scoresK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
         _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
-        _qkvPost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, int, int, int, int, int, int>(QkvPostImpl);
+        _qkvPost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, IV, int, int, int, int, int>(QkvPostImpl);
         _swigluJoined = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SwigluJoinedImpl);
         if (_qkNorm) _headNorm = _acc.LoadStreamKernel<FV, FV, int, int, int, float>(HeadNormImpl);
         if (FusedAttention)
         {
-            _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialImpl);
+            _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl);
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
         }
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
@@ -718,8 +724,9 @@ public sealed class GgufBatchDecoder : IDisposable
     // after the joined q|k(|v) GEMV (row stride sa): bias, rotary (NeoX pairs d, d + D/2) and the store, the arithmetic of BiasImpl + RopeImpl + StoreImpl. Per row the
     // threads are the q pairs, the k pairs, then v's values; q goes to qOut [r, C], k and v to their sequence's cache row; v comes from qkv (flags bit 0) or from vb
     // (row kvC); flags bit 1 = decode (row r is sequence seqs[r] at p; prefill: sequence 0 at p + r), bit 2 = rotary on adjacent pairs (llama); heads = H | kvH << 16
-    private static void QkvPostImpl(Index1D i, FV qkv, FV vb, FV bias, FV invFreq, FV qOut, FV kc, FV vc, IV seqs, int heads, int D, int sa, int flags, int maxSeq, int p)
+    private static void QkvPostImpl(Index1D i, FV qkv, FV vb, FV bias, FV invFreq, FV qOut, FV kc, FV vc, IV seqs, IV posBuf, int heads, int D, int sa, int flags, int maxSeq)
     {
+        int p = posBuf[0];
         int H = heads & 0xFFFF, kvH = heads >> 16, vInA = flags & 1, mode = (flags >> 1) & 1, adj = (flags >> 2) & 1;
         int half = D / 2, C = H * D, kvC = kvH * D, qPairs = H * half, kPairs = kvH * half;
         int U = qPairs + kPairs + kvC, ii = i, r = ii / U, u = ii % U;
@@ -829,8 +836,9 @@ public sealed class GgufBatchDecoder : IDisposable
     // split-K attention, part 1. Group g = (row r, head h, chunk ch of AttChunk keys), a thread per head dimension (D = group size, a power of two). The chunk's
     // scores go to shared memory, then its max m and exp-sum l (masked keys contribute 0), then thread d sums p_j * v[j, d] over the chunk (coalesced across d).
     // part[g, d] = that sum, ml[g] = (m, l).
-    private static void AttnPartialImpl(FV q, FV kc, FV vc, IV seqs, FV part, FV ml, int H, int kvH, int maxSeq, int p, int mode, int nch, float scale)
+    private static void AttnPartialImpl(FV q, FV kc, FV vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale)
     {
+        int p = posBuf[0];
         int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
         int ch = g % nch, rest = g / nch, h = rest % H, r = rest / H;
         int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
@@ -909,8 +917,9 @@ public sealed class GgufBatchDecoder : IDisposable
 
     // NeoX / rotate_half rotary in place: element k pairs with k + D/2, at the row's position
     // mode bit 0: decode (row r at p) or prefill (row r at p + r); bit 1: rotary on adjacent pairs (2k, 2k + 1, llama) instead of split halves (k, k + D/2)
-    private static void RopeImpl(Index1D i, FV buf, FV invFreq, int H, int D, int p, int mode)
+    private static void RopeImpl(Index1D i, FV buf, FV invFreq, IV posBuf, int H, int D, int mode)
     {
+        int p = posBuf[0];
         int half = D / 2, ii = i;
         int k = ii % half, rest = ii / half, h = rest % H, r = rest / H;
         int pos = (mode & 1) == 0 ? p + r : p;
@@ -939,8 +948,9 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
     // the row's k / v into its sequence's cache at its position
-    private static void StoreImpl(Index1D i, FV k, FV v, FV kc, FV vc, IV seqs, int kvC, int maxSeq, int p, int mode)
+    private static void StoreImpl(Index1D i, FV k, FV v, FV kc, FV vc, IV seqs, IV posBuf, int kvC, int maxSeq, int mode)
     {
+        int p = posBuf[0];
         int ii = i, r = ii / kvC, c = ii % kvC;
         int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
         long at = ((long)seq * maxSeq + pos) * kvC + c;

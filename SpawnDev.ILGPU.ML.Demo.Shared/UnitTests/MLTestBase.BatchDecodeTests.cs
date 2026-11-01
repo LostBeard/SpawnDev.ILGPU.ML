@@ -44,6 +44,9 @@ public abstract partial class MLTestBase
         sw.Restart();
         var four = await dec.GenerateAsync(ids, 4, maxNew, 0f, 1f, 1, stopSet);
         double t4 = sw.Elapsed.TotalSeconds;
+        sw.Restart();
+        var oneWarm = await dec.GenerateAsync(ids, 1, maxNew, 0f, 1f, 1, stopSet);           // warm (kernels compiled, WebGPU plans captured): the single-sequence speed
+        double t1w = sw.Elapsed.TotalSeconds;
         var dt = dec.DecodeTimings;
         var sampled = await dec.GenerateAsync(ids, 4, maxNew, 0.8f, 0.95f, 11, stopSet);
         // the device candidates against the full-row sampler, draw for draw
@@ -155,7 +158,7 @@ public abstract partial class MLTestBase
         bool same = got == want, rowsEqual = four.All(r => r.SequenceEqual(one[0]));
         int distinct = sampled.Select(Text).Distinct().Count();
         var report = $"{accelerator.AcceleratorType}: greedy {(same ? "= the generator" : "DIFFERS from the generator")} ({one[0].Length} tokens); four greedy rows {(rowsEqual ? "identical" : "DIFFER")}; four samples {distinct} distinct; "
-            + $"one sequence {one[0].Length / t1:F1} tok/s, four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps); joined projections vs separate: {joinPre:E1} / {joinSteps:E1}; {captureNote}";
+            + $"one sequence {one[0].Length / t1:F1} tok/s (warm {oneWarm[0].Length / t1w:F1}), four {four.Sum(r => r.Length) / t4:F1} tok/s; a four-sequence step: embedding {dt.Embed / dt.Steps:F1} ms, device {dt.Device / dt.Steps:F1} ms, candidates read {dt.Readback / dt.Steps:F1} ms; device draws {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); finished sequences leaving the batch: {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps); joined projections vs separate: {joinPre:E1} / {joinSteps:E1}; {captureNote}";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
         if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !compactSame || lengths < 2 || !attOk || !joinOk || !captureOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
