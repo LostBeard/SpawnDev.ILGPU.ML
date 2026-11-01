@@ -22,6 +22,22 @@ open-source derivatives labelled "Skywork Inside"; PRC law) scores every sample 
 noise), and as a best-of-N selector alone it is below plain voting. Consistent with the literature: search helps small policies most, and majority voting is a strong baseline
 (Skywork's own table: Qwen2.5-7B on MATH greedy 75.2, majority@64 78.4, PRM best-of-64 79.8).
 
+## The PRM on 200 problems (same seeded draw extended, same settings)
+
+| Method | Accuracy |
+|---|---|
+| greedy | 73.0 |
+| majority of 8 | 78.5 |
+| PRM best-of-8 (mean / min / last step reward) | 78.5 / 75.5 / 79.0 |
+| PRM-weighted majority of 8 | 80.5 |
+| pass@8 | 86.0 |
+
+Paired against plain majority (exact McNemar): the PRM-weighted vote is right on 5 problems the vote misses and wrong on 1 it gets, p = 0.22, not
+significant; best-of-8 by the last step's reward 6 against 5, p = 1.0. All four net gains are level-5 problems (33 to 37 of 58; levels 1-4 identical),
+a hint that the PRM helps on the hardest problems, not a result. Its price: a second 1.5B model (about 3 GB as the published bf16 weights, not a
+GGUF) scoring every sample. Decision: no PRM in the library or the demo for now; revisit with a larger study restricted to hard problems, or a
+smaller / quantised PRM.
+
 ## Our engine on the same 50 (`tools/prm-harness/sc_eval.cs`, `score_sc.py`)
 
 `GgufBatchDecoder` on CUDA, Qwen2.5-Math-1.5B-Instruct Q8_0 (bartowski's GGUF), the same prompt, sampling and limits, the 8 samples decoded together;
