@@ -104,11 +104,11 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public bool NoCandidates { get; }
     /// <summary>Tokens per row the device keeps after each forward (the nucleus is drawn from these unless it is wider).</summary>
-    public const int Candidates = 64;
+    public const int Candidates = SpawnDev.ILGPU.ML.Kernels.TopKKernels.K;
     /// <summary>Draws since <see cref="PrefillAsync"/> that read their full logits row: the nucleus was wider than the candidates, or more than <see cref="SelectCap"/> tokens reached the floor.</summary>
     public int RowReads { get; private set; }
     /// <summary>Most tokens per row the candidate gather keeps (a flatter row is read whole).</summary>
-    public const int SelectCap = 4096;
+    public const int SelectCap = SpawnDev.ILGPU.ML.Kernels.TopKKernels.SelectCap;
 
     /// <summary>Sequences live since the last <see cref="Fork"/>.</summary>
     public int Batch { get; private set; } = 1;
@@ -523,9 +523,9 @@ public sealed class GgufBatchDecoder : IDisposable
         var cand = Buf(ref _cand, (long)outRows * S);
         // device draws: each row's repetition penalty on its logits first (a no-op at penalty 1), so the candidates and the draw see the penalised row
         if (dev && _penOn) { _penalize!(R * _repCap, logits, seqView, _drawI!.View, _drawF!.View, _rep!.View, Vocab); Prof("penalty"); }
-        _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch); Prof("chunkMax");
+        _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch, Chunk); Prof("chunkMax");
         _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
-        _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature); Prof("select");
+        _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature, Chunk); Prof("select");
         _final!(outRows, selV, _selI.View, _selN.View, cand, S); Prof("final");
         // device draws: each row's next token, into its sequence's slot of _seqIds (the next step's input), then a copy for the host to read
         if (dev) QueueDraw(R, rowZero: false, tAdd: 1, temperature, logits, cand);
@@ -935,9 +935,9 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
-    private Action<Index1D, FV, FV, IV, int, int>? _chunkMax;
+    private Action<Index1D, FV, FV, IV, int, int, int>? _chunkMax;
     private Action<Index1D, FV, IV, FV, IV, int, int>? _floor;
-    private Action<Index1D, FV, FV, IV, FV, IV, int, int, int, float>? _select;
+    private Action<Index1D, FV, FV, IV, FV, IV, int, int, int, float, int>? _select;
     private Action<Index1D, FV, IV, IV, FV, int>? _final;
     private Action<KernelConfig, FV, FV, IV, IV, FV, IV, IV, IV, int, int, int, int, int, float>? _draw;
     private Action<Index1D, FV, IV, IV, FV, IV, int>? _penalize;
@@ -967,10 +967,10 @@ public sealed class GgufBatchDecoder : IDisposable
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
         if (!NoCandidates)
         {
-            _chunkMax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
-            _floor = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
-            _select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
-            _final = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
+            _chunkMax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.ChunkMaxImpl);
+            _floor = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FloorImpl);
+            _select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.SelectImpl);
+            _final = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FinalImpl);
         }
     }
 
@@ -1025,79 +1025,7 @@ public sealed class GgufBatchDecoder : IDisposable
         o[ii] = FusedDequantMatMul.DecodeOf(code, w, ids[r] * rowBytes, c);
     }
 
-    // candidate selection. Per row of the output o (stride S): [0, K) values best first, [K, 2K) their ids as floats, 2K the tokens at or above the floor,
-    // 2K + 1 + chunk the chunk's softmax mass. A token is better than another when its logit is larger, or equal with the lower id.
-
-    // each Chunk's largest logit and its first id
-    private static void ChunkMaxImpl(Index1D i, FV logits, FV maxV, IV maxI, int V, int nch)
-    {
-        int ii = i, r = ii / nch, ch = ii % nch, end = Math.Min(V, (ch + 1) * Chunk), bi = ch * Chunk;
-        float best = logits[(long)r * V + bi];
-        for (int idx = bi + 1; idx < end; idx++) { float v = logits[(long)r * V + idx]; if (v > best) { best = v; bi = idx; } }
-        maxV[ii] = best; maxI[ii] = bi;
-    }
-    // the row's K best chunk maxima into o's value / id slots (o[0] is then the row's best logit); the K-th of them is the floor: those K tokens all reach it.
-    // The gather count is zeroed here, before the gather runs.
-    private static void FloorImpl(Index1D row, FV maxV, IV maxI, FV o, IV selN, int nch, int S)
-    {
-        const int K = Candidates;
-        int r = row;
-        long ob = (long)r * S;
-        for (int j = 0; j < K; j++) { o[ob + j] = float.MinValue; o[ob + K + j] = -1f; }
-        for (int ch = 0; ch < nch; ch++)
-        {
-            float v = maxV[(long)r * nch + ch];
-            if (v <= o[ob + K - 1]) continue;
-            int pos = K - 1;
-            while (pos > 0 && o[ob + pos - 1] < v) { o[ob + pos] = o[ob + pos - 1]; o[ob + K + pos] = o[ob + K + pos - 1]; pos--; }
-            o[ob + pos] = v; o[ob + K + pos] = maxI[(long)r * nch + ch];
-        }
-        selN[r] = 0;
-    }
-    // each Chunk's tokens at or above the floor appended to the row's list (in any order), and (T > 0) the chunk's softmax mass at T over the tokens within e^20 of
-    // the best (the set SampleLogits draws from)
-    private static void SelectImpl(Index1D i, FV logits, FV o, IV selN, FV selV, IV selI, int V, int nch, int S, float T)
-    {
-        const int K = Candidates;
-        int ii = i, r = ii / nch, ch = ii % nch, end = Math.Min(V, (ch + 1) * Chunk);
-        long ob = (long)r * S;
-        float floorK = o[ob + K - 1], max = o[ob], floorT = max - 20f * T, sum = 0f;
-        for (int idx = ch * Chunk; idx < end; idx++)
-        {
-            float v = logits[(long)r * V + idx];
-            if (v >= floorK)
-            {
-                int slot = Atomic.Add(ref selN[r], 1);
-                if (slot < SelectCap) { selV[(long)r * SelectCap + slot] = v; selI[(long)r * SelectCap + slot] = idx; }
-            }
-            if (T > 0f && v >= floorT) sum += MathF.Exp((v - max) / T);
-        }
-        o[ob + 2 * K + 1 + ch] = sum;
-    }
-    // the row's gathered tokens sorted into its K best (skipped when more than SelectCap reached the floor: the host reads that row)
-    private static void FinalImpl(Index1D row, FV selV, IV selI, IV selN, FV o, int S)
-    {
-        const int K = Candidates;
-        int r = row, n = selN[r];
-        long ob = (long)r * S, sb = (long)r * SelectCap;
-        o[ob + 2 * K] = n;
-        if (n > SelectCap) return;
-        for (int j = 0; j < K; j++) { o[ob + j] = float.MinValue; o[ob + K + j] = -1f; }
-        for (int s = 0; s < n; s++)
-        {
-            float v = selV[sb + s]; int id = selI[sb + s];
-            float lv = o[ob + K - 1];
-            if (v < lv || (v == lv && o[ob + 2 * K - 1] >= 0f && id > (int)o[ob + 2 * K - 1])) continue;
-            int pos = K - 1;
-            while (pos > 0)
-            {
-                float pv = o[ob + pos - 1];
-                if (pv > v || (pv == v && (int)o[ob + K + pos - 1] < id)) break;
-                o[ob + pos] = pv; o[ob + K + pos] = o[ob + K + pos - 1]; pos--;
-            }
-            o[ob + pos] = v; o[ob + K + pos] = id;
-        }
-    }
+    // candidate selection: Kernels/TopKKernels (shared with DeviceVectorIndex), at Chunk = 256
 
     // ---- device draws ----
     private const int DrawGroup = 256;
@@ -1141,16 +1069,16 @@ public sealed class GgufBatchDecoder : IDisposable
         using var dF2 = acc.Allocate1D(new[] { topP, repetitionPenalty });
         using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0, active, W, rows });
         using var ids = acc.Allocate1D<int>(Math.Max(64, rows));
-        var chunkMax = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
-        var floor = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
-        var select = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
-        var final = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
+        var chunkMax = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.ChunkMaxImpl);
+        var floor = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FloorImpl);
+        var select = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.SelectImpl);
+        var final = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FinalImpl);
         var draw = acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, IV, int, int, int, int, int, float>(DrawImpl);
         var penalize = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, IV, int>(PenalizeImpl);
         penalize(rows * W, lg.View, seqs.View, dI.View, dF2.View, rep.View, vocab);
-        chunkMax(rows * nch, lg.View, maxV.View, maxI.View, vocab, nch);
+        chunkMax(rows * nch, lg.View, maxV.View, maxI.View, vocab, nch, Chunk);
         floor(rows, maxV.View, maxI.View, cand.View, selN.View, nch, S);
-        select(rows * nch, lg.View, cand.View, selN.View, selV.View, selI.View, vocab, nch, S, temperature);
+        select(rows * nch, lg.View, cand.View, selN.View, selV.View, selI.View, vocab, nch, S, temperature, Chunk);
         final(rows, selV.View, selI.View, selN.View, cand.View, S);
         draw(new KernelConfig(rows, DrawGroup), lg.View, cand.View, seqs.View, pos.View, dF2.View, dI.View, ids.View, rep.View, vocab, nch, S, 0, 1, temperature);
         var got = await ids.View.SubView(0, rows).CopyToHostAsync().ConfigureAwait(false);      // the read waits for the kernels (every backend), so the buffers may go

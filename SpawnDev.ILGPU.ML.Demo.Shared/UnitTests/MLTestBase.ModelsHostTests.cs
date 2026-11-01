@@ -43,7 +43,7 @@ public abstract partial class MLTestBase
         Ur_Expect(ModelsHost.GetOllamaUrl("gemma4", "12b", "model") == $"{b}/ollama/gemma4/12b/gemma4-12b-model.gguf", "an Ollama layer is stored under the name the hub cached it by");
         Ur_Expect(ModelsHost.GetArchiveMemberUrl(SherpaVocoderArchive, SherpaVocoderMember)
             == $"{b}/github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-zh-en-emilia/vocos_24khz.onnx", "an archive member is a plain file under the archive's url minus the extension");
-        // the Ollama-layout install shapes (manifest verbatim, blobs by digest, index); not yet on the host, so not in ModelsHost_ServesEveryUrlShapeItBuilds
+        // the Ollama-layout install shapes (manifest verbatim, blobs by digest, index; served: ModelsHost_ServesEveryUrlShapeItBuilds)
         const string hex = "667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29";
         Ur_Expect(ModelsHost.GetOllamaManifestUrl("llama3.1", "8b") == $"{b}/ollama/llama3.1/8b/manifest", "an Ollama manifest url");
         Ur_Expect(ModelsHost.GetOllamaBlobUrl("sha256:" + hex) == $"{b}/ollama/blobs/sha256-{hex}", "a blob by the digest a manifest writes");
@@ -93,6 +93,10 @@ public abstract partial class MLTestBase
             ("dataset file", ModelsHost.GetUrl("datasets/LostBeard/spawnscene-samples", "pinecone/001.jpg")),
             ("ollama layer", ModelsHost.GetOllamaUrl("gemma3", "4b", "license")),
             ("archive member", ModelsHost.GetArchiveMemberUrl(SherpaVocoderArchive, SherpaVocoderMember)),
+            // the Ollama-layout install shapes (llama3.1:8b, hosted 2026-11-01): the manifest, a blob by digest (the 12 KB license), the index
+            ("ollama manifest", ModelsHost.GetOllamaManifestUrl("llama3.1", "8b")),
+            ("ollama blob", ModelsHost.GetOllamaBlobUrl("sha256:0ba8f0e314b4264dfd19df045cde9d4c394a52474bf92ed6a3de22a4ca31a177")),
+            ("ollama index", ModelsHost.GetOllamaIndexUrl()),
         };
         using var log = new FallbackLog(u => urls.Any(x => x.Url == u));
         foreach (var (what, url) in urls)

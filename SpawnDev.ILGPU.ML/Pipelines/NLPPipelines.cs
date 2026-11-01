@@ -188,22 +188,90 @@ public class FeatureExtractionPipeline : IDisposable
         _hiddenSize = hiddenSize;
     }
 
+    // device buffers reused across calls (a host write into one is ordered after the queued work that reads it on every backend: WebGPU writeBuffer on the
+    // queue timeline, desktop a stream sync, Wasm a deferred write while dispatches are queued), and the pooling kernels
+    private MemoryBuffer1D<float, Stride1D.Dense>? _idsBuf, _maskBuf, _typeBuf, _pooled, _invNorm, _single;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _poolSum;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _poolNorm;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _poolScale;
+
+    /// <summary>Length of an embedding (the model's hidden size).</summary>
+    public int HiddenSize => _hiddenSize;
+
+    /// <summary>Tokens per text the model sees (longer texts are truncated, shorter padded).</summary>
+    public int MaxLength => _maxLength;
+
     /// <summary>
-    /// Embed pre-tokenized text to a dense vector via mean pooling + L2 normalization.
+    /// Embed pre-tokenized text to a dense vector via mean pooling + L2 normalization (on the device; the
+    /// <see cref="HiddenSize"/> numbers are the only read).
     /// </summary>
     public async Task<EmbeddingResult> EmbedAsync(int[] tokenIds)
     {
         var sw = Stopwatch.StartNew();
+        _single ??= _accelerator.Allocate1D<float>(_hiddenSize);
+        await EmbedAsync(tokenIds, _single.View).ConfigureAwait(false);
+        // the read is ordered after the kernels on every backend (no SynchronizeAsync: that would be a second round trip)
+        var embedding = await _single.View.CopyToHostAsync().ConfigureAwait(false);
+        sw.Stop();
+        return new EmbeddingResult { Embedding = embedding, InferenceTimeMs = sw.Elapsed.TotalMilliseconds };
+    }
 
+    /// <summary>
+    /// Embed pre-tokenized text into <paramref name="destination"/> (<see cref="HiddenSize"/> floats) on the device: the model's last hidden state,
+    /// mean-pooled over the attended tokens and L2-normalised, without leaving the device. Queued, no wait: read the destination (or use it on the
+    /// device) when needed.
+    /// </summary>
+    public async Task EmbedAsync(int[] tokenIds, ArrayView1D<float, Stride1D.Dense> destination)
+    {
+        if (destination.Length < _hiddenSize) throw new ArgumentException($"the destination holds {destination.Length} floats, an embedding is {_hiddenSize}", nameof(destination));
+        var (hidden, seq) = await RunModelAsync(tokenIds).ConfigureAwait(false);
+        Pool(hidden, seq, destination.SubView(0, _hiddenSize));
+    }
+
+    /// <summary>Embed raw text into <paramref name="destination"/> on the device (see <see cref="EmbedAsync(int[], ArrayView1D{float, Stride1D.Dense})"/>).</summary>
+    public Task EmbedAsync(string text, LoadedTokenizer tokenizer, ArrayView1D<float, Stride1D.Dense> destination) =>
+        EmbedAsync(Tokenize(text, tokenizer), destination);
+
+    /// <summary>
+    /// Embed several pre-tokenized texts into consecutive rows of <paramref name="destination"/> (texts x <see cref="HiddenSize"/> floats) on the
+    /// device. One model run per text (the session's input is one sequence), every row pooled in place: nothing is read back.
+    /// </summary>
+    public async Task EmbedBatchAsync(IReadOnlyList<int[]> tokenIds, ArrayView1D<float, Stride1D.Dense> destination)
+    {
+        if (destination.Length < (long)tokenIds.Count * _hiddenSize) throw new ArgumentException($"the destination holds {destination.Length} floats, {tokenIds.Count} embeddings are {(long)tokenIds.Count * _hiddenSize}", nameof(destination));
+        for (int i = 0; i < tokenIds.Count; i++)
+        {
+            var (hidden, seq) = await RunModelAsync(tokenIds[i]).ConfigureAwait(false);
+            // the next run overwrites the model's output only after these kernels: they are queued before it
+            Pool(hidden, seq, destination.SubView((long)i * _hiddenSize, _hiddenSize));
+        }
+    }
+
+    // [CLS] + tokens + [SEP], truncated to MaxLength
+    private int[] Tokenize(string text, LoadedTokenizer tokenizer)
+    {
+        int cls = tokenizer.BosTokenId >= 0 ? tokenizer.BosTokenId : 101;
+        int sep = tokenizer.EosTokenId >= 0 ? tokenizer.EosTokenId : 102;
+        var ids = new List<int>(_maxLength) { cls };
+        ids.AddRange(tokenizer.Encode(text));
+        if (ids.Count > _maxLength - 1) ids = ids.Take(_maxLength - 1).ToList(); // leave room for [SEP]
+        ids.Add(sep);
+        return ids.ToArray();
+    }
+
+    // the model on one text: its last hidden state [1, seq, hidden] and seq; the attention mask stays in _maskBuf for the pooling
+    private async Task<(ArrayView1D<float, Stride1D.Dense> Hidden, int Seq)> RunModelAsync(int[] tokenIds)
+    {
         var padded = TextPreprocessor.PadOrTruncate(tokenIds, _maxLength, PAD_TOKEN);
         var mask = TextPreprocessor.CreateAttentionMask(padded, PAD_TOKEN);
-        int realTokenCount = mask.Count(m => m == 1);
+        var idsFloat = new float[_maxLength];
+        var maskFloat = new float[_maxLength];
+        for (int i = 0; i < _maxLength; i++) { idsFloat[i] = padded[i]; maskFloat[i] = mask[i]; }
 
-        var idsFloat = padded.Select(t => (float)t).ToArray();
-        var maskFloat = mask.Select(m => (float)m).ToArray();
-
-        using var idsBuf = _accelerator.Allocate1D(idsFloat);
-        using var maskBuf = _accelerator.Allocate1D(maskFloat);
+        _idsBuf ??= _accelerator.Allocate1D<float>(_maxLength);
+        _maskBuf ??= _accelerator.Allocate1D<float>(_maxLength);
+        _idsBuf.View.CopyFromCPU(idsFloat);
+        _maskBuf.View.CopyFromCPU(maskFloat);
 
         // ⚠️ BIND BY NAME, NOT BY POSITION. This used to feed InputNames[0] and InputNames[1] and stop
         // there, which fails two ways: a model that declares its inputs in another order is handed the mask
@@ -211,8 +279,8 @@ public class FeatureExtractionPipeline : IDisposable
         // embedding model to point this at - declares input_ids, attention_mask AND token_type_ids.
         // Positional binding is kept only as the fallback for a model using non-standard names.
         var inputs = new Dictionary<string, Tensor>();
-        var idsTensor = new Tensor(idsBuf.View, new[] { 1, _maxLength });
-        var maskTensor = new Tensor(maskBuf.View, new[] { 1, _maxLength });
+        var idsTensor = new Tensor(_idsBuf.View, new[] { 1, _maxLength });
+        var maskTensor = new Tensor(_maskBuf.View, new[] { 1, _maxLength });
         string? Named(string want) => _session.InputNames
             .FirstOrDefault(n => string.Equals(n, want, StringComparison.OrdinalIgnoreCase));
         var idsName = Named("input_ids");
@@ -230,18 +298,14 @@ public class FeatureExtractionPipeline : IDisposable
 
         // token_type_ids: a single-sequence embedding is all segment 0, so zeros are correct - but the
         // model still has to be GIVEN them, or it runs against an unwritten buffer.
-        IDisposable? typeBuf = null;
         var typeName = Named("token_type_ids");
         if (typeName != null && !inputs.ContainsKey(typeName))
         {
-            var zeros = _accelerator.Allocate1D(new float[_maxLength]);
-            typeBuf = zeros;
-            inputs[typeName] = new Tensor(zeros.View, new[] { 1, _maxLength });
+            if (_typeBuf == null) { _typeBuf = _accelerator.Allocate1D<float>(_maxLength); _typeBuf.MemSetToZero(); }
+            inputs[typeName] = new Tensor(_typeBuf.View, new[] { 1, _maxLength });
         }
 
-        Dictionary<string, Tensor> outputs;
-        try { outputs = await _session.RunAsync(inputs); }
-        finally { typeBuf?.Dispose(); }
+        var outputs = await _session.RunAsync(inputs).ConfigureAwait(false);
 
         // ⚠️ PREFER last_hidden_state BY NAME. OutputNames[0] is whatever the graph happens to list first.
         var hiddenName = _session.OutputNames
@@ -251,10 +315,9 @@ public class FeatureExtractionPipeline : IDisposable
 
         // 🔴 REFUSE A MODEL THAT DOES NOT PRODUCE HIDDEN STATES, instead of embedding its logits.
         //
-        // This class means [1, seq, hidden]. The pooling below reads `t * _hiddenSize + h` and was bounded
-        // by `Math.Min(output.ElementCount, ...)` plus an `offset + h < hiddenStates.Length` guard, so a
-        // SMALLER output did not fail - it produced a vector that was mostly zeros and then L2-normalised
-        // it into a confident unit vector.
+        // This class means [1, seq, hidden]. The pooling used to read `t * _hiddenSize + h` bounded by
+        // `Math.Min(output.ElementCount, ...)`, so a SMALLER output did not fail - it produced a vector that was
+        // mostly zeros and then L2-normalised it into a confident unit vector.
         //
         // ⚠️ MEASURED 2026-09-08. Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated pointed this at
         // Xenova/distilbert-base-uncased-finetuned-sst-2-english, whose graph declares exactly ONE output,
@@ -272,60 +335,52 @@ public class FeatureExtractionPipeline : IDisposable
                   + "(for example Xenova/all-MiniLM-L6-v2, which declares last_hidden_state)."
                   : $"Construct the pipeline with hiddenSize: {output.Shape[^1]}.")
               + $" Outputs available: [{string.Join(", ", _session.OutputNames)}].");
-
-        // Output shape: [1, seq_len, hidden_size]
-        // Mean pool over real (non-padded) token positions
-        int totalFloats = Math.Min(output.ElementCount, _maxLength * _hiddenSize);
-        using var readBuf = _accelerator.Allocate1D<float>(totalFloats);
-        new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, totalFloats), readBuf.View, totalFloats, 1f);
-        await _accelerator.SynchronizeAsync();
-        var hiddenStates = await readBuf.CopyToHostAsync<float>(0, totalFloats);
-
-        // Mean pooling: average hidden states across token positions (masked)
-        var embedding = new float[_hiddenSize];
-        if (realTokenCount > 0)
-        {
-            for (int t = 0; t < realTokenCount && t < _maxLength; t++)
-            {
-                int offset = t * _hiddenSize;
-                for (int h = 0; h < _hiddenSize && offset + h < hiddenStates.Length; h++)
-                    embedding[h] += hiddenStates[offset + h];
-            }
-            for (int h = 0; h < _hiddenSize; h++)
-                embedding[h] /= realTokenCount;
-        }
-
-        // L2 normalize
-        float norm = 0;
-        for (int i = 0; i < embedding.Length; i++) norm += embedding[i] * embedding[i];
-        norm = MathF.Sqrt(norm);
-        if (norm > 1e-12f)
-            for (int i = 0; i < embedding.Length; i++) embedding[i] /= norm;
-
-        sw.Stop();
-
-        return new EmbeddingResult
-        {
-            Embedding = embedding,
-            InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
-        };
+        int seq = Math.Min(output.Shape[^2], _maxLength);
+        return (output.Data, seq);
     }
+
+    // the attended tokens' mean, L2-normalised, into dst: three kernels of one store per thread (WebGL's transform feedback captures no more)
+    private void Pool(ArrayView1D<float, Stride1D.Dense> hidden, int seq, ArrayView1D<float, Stride1D.Dense> dst)
+    {
+        _poolSum ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(PoolMeanImpl);
+        _poolNorm ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(PoolInvNormImpl);
+        _poolScale ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(PoolScaleImpl);
+        _pooled ??= _accelerator.Allocate1D<float>(_hiddenSize);
+        _invNorm ??= _accelerator.Allocate1D<float>(64);
+        _poolSum(_hiddenSize, hidden, _maskBuf!.View, _pooled.View, seq, _hiddenSize);
+        _poolNorm(1, _pooled.View, _invNorm.View, _hiddenSize);
+        _poolScale(_hiddenSize, _pooled.View, _invNorm.View, dst, _hiddenSize);
+    }
+
+    // pooled[h] = mean over the attended tokens (mask > 0.5) of hidden[t, h]; 0 when none is attended
+    private static void PoolMeanImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> hidden, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<float, Stride1D.Dense> pooled, int seq, int H)
+    {
+        int h = i;
+        float sum = 0f; int n = 0;
+        for (int t = 0; t < seq; t++)
+        {
+            bool on = mask[t] > 0.5f;
+            if (on) { sum += hidden[(long)t * H + h]; n++; }
+        }
+        pooled[h] = n > 0 ? sum / n : 0f;
+    }
+    // inv[0] = 1 / |pooled| (1 for a zero vector, which then stays zero)
+    private static void PoolInvNormImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> pooled, ArrayView1D<float, Stride1D.Dense> inv, int H)
+    {
+        float s = 0f;
+        for (int h = 0; h < H; h++) s += pooled[h] * pooled[h];
+        float norm = MathF.Sqrt(s);
+        inv[0] = norm > 1e-12f ? 1f / norm : 1f;
+    }
+    private static void PoolScaleImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> pooled, ArrayView1D<float, Stride1D.Dense> inv, ArrayView1D<float, Stride1D.Dense> dst, int H)
+        => dst[i] = pooled[i] * inv[0];
 
     /// <summary>
     /// Embed raw text using a real tokenizer (e.g. WordPiece for BERT): <c>[CLS] + tokenize(text) +
     /// [SEP]</c> then mean-pool + L2-normalize. The honest path — prefer it over a hash/whitespace
     /// tokenizer. CLS/SEP come from the loaded tokenizer's resolved special tokens (BERT 101/102 fallback).
     /// </summary>
-    public async Task<EmbeddingResult> EmbedAsync(string text, LoadedTokenizer tokenizer)
-    {
-        int cls = tokenizer.BosTokenId >= 0 ? tokenizer.BosTokenId : 101;
-        int sep = tokenizer.EosTokenId >= 0 ? tokenizer.EosTokenId : 102;
-        var ids = new List<int>(_maxLength) { cls };
-        ids.AddRange(tokenizer.Encode(text));
-        if (ids.Count > _maxLength - 1) ids = ids.Take(_maxLength - 1).ToList(); // leave room for [SEP]
-        ids.Add(sep);
-        return await EmbedAsync(ids.ToArray());
-    }
+    public Task<EmbeddingResult> EmbedAsync(string text, LoadedTokenizer tokenizer) => EmbedAsync(Tokenize(text, tokenizer));
 
     /// <summary>Compute cosine similarity between two pre-tokenized texts.</summary>
     public async Task<float> SimilarityAsync(int[] tokenIdsA, int[] tokenIdsB)
@@ -343,7 +398,11 @@ public class FeatureExtractionPipeline : IDisposable
         return embA.SimilarityTo(embB);
     }
 
-    public void Dispose() => _session?.Dispose();
+    public void Dispose()
+    {
+        _session?.Dispose();
+        _idsBuf?.Dispose(); _maskBuf?.Dispose(); _typeBuf?.Dispose(); _pooled?.Dispose(); _invNorm?.Dispose(); _single?.Dispose();
+    }
 }
 
 /// <summary>

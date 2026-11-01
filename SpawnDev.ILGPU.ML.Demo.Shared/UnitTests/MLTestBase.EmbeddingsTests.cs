@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading.Tasks;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
@@ -95,6 +96,22 @@ public abstract partial class MLTestBase
         // WordPiece ids, mean-pooled over the real tokens: related 0.5387, unrelated -0.0206.
         if (MathF.Abs(simRelated - 0.5387f) > 0.01f || MathF.Abs(simUnrelated - (-0.0206f)) > 0.01f)
             throw new Exception($"Embeddings differ from onnxruntime: related {simRelated:F4} (ort 0.5387), unrelated {simUnrelated:F4} (ort -0.0206)");
+
+        // the device paths (pooled on the device into a caller's view; several texts into consecutive rows) = the embedding above, number for number:
+        // the same kernels on the same inputs
+        using var dest = accelerator.Allocate1D<float>(3 * HiddenSize);
+        await pipe.EmbedAsync(anchor, tok, dest.View.SubView(0, HiddenSize));
+        var viaView = await dest.View.SubView(0, HiddenSize).CopyToHostAsync();
+        var texts = new[] { anchor, related, unrelated };
+        var ids = new List<int[]>();
+        foreach (var t in texts) { var e = tok.Encode(t); var l = new List<int> { tok.BosTokenId >= 0 ? tok.BosTokenId : 101 }; l.AddRange(e); l.Add(tok.EosTokenId >= 0 ? tok.EosTokenId : 102); ids.Add(l.ToArray()); }
+        await pipe.EmbedBatchAsync(ids, dest.View);
+        var batch = await dest.View.CopyToHostAsync();
+        var relatedEmbedding = (await pipe.EmbedAsync(related, tok)).Embedding;
+        bool viewSame = viaView.AsSpan().SequenceEqual(anchorEmbedding);
+        bool batchSame = batch.AsSpan(0, HiddenSize).SequenceEqual(anchorEmbedding) && batch.AsSpan(HiddenSize, HiddenSize).SequenceEqual(relatedEmbedding);
+        Console.WriteLine($"[Embeddings] into a device view: {(viewSame ? "= EmbedAsync" : "DIFFERS")}; batch rows: {(batchSame ? "= EmbedAsync" : "DIFFER")}");
+        if (!viewSame || !batchSame) throw new Exception($"device-destination embeddings differ from EmbedAsync (view {viewSame}, batch {batchSame})");
 
         Console.WriteLine("[Embeddings] real-tokenizer embeddings are semantic (related > unrelated, self ≈ 1.0) and match onnxruntime.");
     });
