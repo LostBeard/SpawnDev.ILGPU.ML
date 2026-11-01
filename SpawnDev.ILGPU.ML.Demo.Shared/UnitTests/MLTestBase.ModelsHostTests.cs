@@ -43,6 +43,19 @@ public abstract partial class MLTestBase
         Ur_Expect(ModelsHost.GetOllamaUrl("gemma4", "12b", "model") == $"{b}/ollama/gemma4/12b/gemma4-12b-model.gguf", "an Ollama layer is stored under the name the hub cached it by");
         Ur_Expect(ModelsHost.GetArchiveMemberUrl(SherpaVocoderArchive, SherpaVocoderMember)
             == $"{b}/github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-zh-en-emilia/vocos_24khz.onnx", "an archive member is a plain file under the archive's url minus the extension");
+        // the Ollama-layout install shapes (manifest verbatim, blobs by digest, index); not yet on the host, so not in ModelsHost_ServesEveryUrlShapeItBuilds
+        const string hex = "667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29";
+        Ur_Expect(ModelsHost.GetOllamaManifestUrl("llama3.1", "8b") == $"{b}/ollama/llama3.1/8b/manifest", "an Ollama manifest url");
+        Ur_Expect(ModelsHost.GetOllamaBlobUrl("sha256:" + hex) == $"{b}/ollama/blobs/sha256-{hex}", "a blob by the digest a manifest writes");
+        Ur_Expect(ModelsHost.GetOllamaBlobUrl("sha256-" + hex.ToUpperInvariant()) == $"{b}/ollama/blobs/sha256-{hex}", "a blob by the cache's file name, lower-cased");
+        Ur_Expect(ModelsHost.GetOllamaIndexUrl() == $"{b}/ollama/index.json", "the install index url");
+        Ur_Expect(ModelsHost.GetFallbackUrl(ModelsHost.GetOllamaBlobUrl("sha256:" + hex)) == null, "an Ollama blob has no Hugging Face twin");
+        foreach (var badDigest in new[] { "sha256:abc", "md5:" + hex, hex + "00", "sha256:" + hex[..63] + "g" })
+        {
+            bool refused = false;
+            try { ModelsHost.GetOllamaBlobUrl(badDigest); } catch (ArgumentException) { refused = true; }
+            Ur_Expect(refused, $"a malformed digest is refused: {badDigest}");
+        }
 
         Ur_Expect(ModelsHost.GetFallbackUrl($"{b}/Xenova/distilgpt2/resolve/main/tokenizer.json") == "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json", "repo file -> Hugging Face twin");
         Ur_Expect(ModelsHost.GetFallbackUrl($"{b}/datasets/LostBeard/spawnscene-samples/resolve/main/a/001.jpg") == "https://huggingface.co/datasets/LostBeard/spawnscene-samples/resolve/main/a/001.jpg", "dataset -> Hugging Face twin");

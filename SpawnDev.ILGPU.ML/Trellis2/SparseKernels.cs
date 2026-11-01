@@ -24,7 +24,8 @@ public sealed class SparseKernels
     private MemoryBuffer1D<float, Stride1D.Dense>? _noRes;
     public SparseKernels(Accelerator accelerator) => _acc = accelerator;
 
-    private bool Cuda => _acc.AcceleratorType == AcceleratorType.Cuda && DiTKernels.EnableTensorCores;
+    // the tensor-core kernels (MmaGemm: sm_80 PTX), only where the device has it (an sm_75 card fails to load them: Kernels/CudaCaps)
+    private bool Cuda => SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && DiTKernels.EnableTensorCores;
 
     // =====================================================================================================
     // Neighbour table: nbr[i*27 + kk] = index of the voxel at coords[i] + offset(kk), or -1.

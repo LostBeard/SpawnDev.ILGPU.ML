@@ -132,6 +132,12 @@ public abstract partial class MLTestBase
             throw new Exception($"negative seen logit not multiplied by penalty: got {logits[1]}, expected {-2.0f * 1.5f}.");
         if (MathF.Abs(logits[2] - 0.5f) > 1e-6f)
             throw new Exception($"unseen logit was modified: got {logits[2]}, expected 0.5 (unchanged).");
+        // a token seen several times is penalised ONCE (transformers' RepetitionPenaltyLogitsProcessor: gather the original logit, penalise, scatter back);
+        // it used to compound penalty^k
+        var dup = new[] { 2.0f, -2.0f, 0.5f };
+        TextGenerationSampler.ApplyRepetitionPenalty(dup, previousTokens: new[] { 0, 1, 0, 0, 1 }, penalty: 1.5f);
+        if (MathF.Abs(dup[0] - 2.0f / 1.5f) > 1e-5f || MathF.Abs(dup[1] + 2.0f * 1.5f) > 1e-5f)
+            throw new Exception($"a repeated token must be penalised once: got {dup[0]} / {dup[1]}, expected {2.0f / 1.5f} / {-2.0f * 1.5f}.");
         return Task.CompletedTask;
     }
 }

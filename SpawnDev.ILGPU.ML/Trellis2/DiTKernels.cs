@@ -48,7 +48,7 @@ public sealed class DiTKernels
     private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;   // placeholder for the gather operand of the dense kernels (never read)
 
     private bool UseMma(int M, int K, int N)
-        => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16;
+        => EnableTensorCores && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && K % MmaGemm.BK == 0 && N >= 64 && N % 2 == 0 && M >= 16;    // sm_80 PTX (Kernels/CudaCaps)
 
     /// <summary>nn.Linear with a bf16 weight [N,K] and optional bf16 bias [N]; x is [M,K] fp32.</summary>
     public void Linear(FV x, BV w, BV? bias, FV o, int M, int K, int N, Act act = Act.None)
@@ -441,7 +441,7 @@ public sealed class DiTKernels
     /// <summary>True when <see cref="Attention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core one or the portable one.</summary>
     public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesTiledAttention(headDim);
     private bool UsesMmaAttention(int headDim)
-        => EnableTensorCores && _acc.AcceleratorType == AcceleratorType.Cuda && headDim == MmaAttention.HeadDim;
+        => EnableTensorCores && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && headDim == MmaAttention.HeadDim;    // sm_80 PTX (Kernels/CudaCaps)
     /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
     private bool UsesTiledAttention(int headDim)
         => EnableTiled && TiledWidth(headDim) >= 0 && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4 && _acc.AcceleratorType != AcceleratorType.WebGL;

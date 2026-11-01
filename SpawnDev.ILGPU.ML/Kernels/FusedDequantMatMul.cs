@@ -208,7 +208,7 @@ public class FusedDequantMatMul : IDisposable
         // M == 1 of Q8_0 / Q4_K / Q6_K on ForwardRows' word-wise kernels: on a 4070 (tools/llm-bench/gemv_rows_bench.cs) 2.2x the Q8_0 GEMV below, 2.5x the Q4_K one,
         // 3x the Q6_K one. They barrier only in the final reduction (WebGPU-uniform), so WebGPU takes them too instead of the per-element kernel. The opt-in CUDA dp4a /
         // warp kernels keep precedence when enabled; GGUF_GEMV_ROWS_GENERIC=1 restores the per-type GEMVs.
-        bool cudaOptIn = (EnableDp4aGemv || EnableWarpGemv) && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        bool cudaOptIn = (EnableDp4aGemv && CudaCaps.Dp4a(_accelerator)) || (EnableWarpGemv && _accelerator.AcceleratorType == AcceleratorType.Cuda);
         if (M == 1 && !ForceGenericRows && !ForcePerElementGemv && !cudaOptIn && _accelerator.AcceleratorType != AcceleratorType.WebGL
             && (type is GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K))
         {
@@ -220,7 +220,7 @@ public class FusedDequantMatMul : IDisposable
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             // dp4a int8-activation Q4_K GEMV: quantize the activation to int8 (block_q8_1) once, then dot in the
             // integer domain via dp4a (the llama.cpp MMVQ path). CUDA only (dp4a inline-PTX intrinsic).
-            if (EnableDp4aGemv && type == GGMLType.Q4_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            if (EnableDp4aGemv && type == GGMLType.Q4_K && CudaCaps.Dp4a(_accelerator))     // dp4a: sm_61 PTX (CudaCaps)
             {
                 int nBlk = K / 32;
                 if (!_actQs.TryGetValue(K, out var qsBuf)) { qsBuf = _accelerator.Allocate1D<int>(nBlk * 8); _actQs[K] = qsBuf; }
@@ -234,7 +234,7 @@ public class FusedDequantMatMul : IDisposable
                 _gemvDp4aQ4_K(new KernelConfig((N + Dp4aWarps - 1) / Dp4aWarps, Dp4aWarps * _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
                 return;
             }
-            if (EnableDp4aGemv && type == GGMLType.Q6_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            if (EnableDp4aGemv && type == GGMLType.Q6_K && CudaCaps.Dp4a(_accelerator))     // dp4a: sm_61 PTX (CudaCaps)
             {
                 int nBlk = K / 32;
                 if (!_actQs.TryGetValue(K, out var qsBuf)) { qsBuf = _accelerator.Allocate1D<int>(nBlk * 8); _actQs[K] = qsBuf; }

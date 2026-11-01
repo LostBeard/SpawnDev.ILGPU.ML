@@ -99,6 +99,10 @@ public sealed class GgufBatchDecoder : IDisposable
     /// launches a layer (WebGPU pays per dispatch).
     /// </summary>
     public static bool JoinProjections = Environment.GetEnvironmentVariable("GGUF_BATCH_SEPARATE") != "1";
+    /// <summary>
+    /// WebGL: the forward ends at the logits (no candidate kernels: their gather takes slots from an atomic add, which WebGL cannot return), and a draw reads its row.
+    /// </summary>
+    public bool NoCandidates { get; }
     /// <summary>Tokens per row the device keeps after each forward (the nucleus is drawn from these unless it is wider).</summary>
     public const int Candidates = 64;
     /// <summary>Draws since <see cref="PrefillAsync"/> that read their full logits row: the nucleus was wider than the candidates, or more than <see cref="SelectCap"/> tokens reached the floor.</summary>
@@ -112,11 +116,15 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly MemoryBuffer1D<float, Stride1D.Dense>[] _kc, _vc;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand, _softStats;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds, _posBuf;
     // device draws: the token each sequence drew last (the next step's input, by sequence), its copy for the captures' restores, the draw parameters
     // (seed, force the full-row path), top-p, and two read rings (WebGPU keeps one staging buffer per source buffer, so two reads in flight need two sources)
     private MemoryBuffer1D<int, Stride1D.Dense>? _seqIds, _seqIdsSnap, _drawI;
+    // the repetition penalty's window: per sequence the tokens it drew, [MaxBatch counts][MaxBatch rings of _repCap], appended by the draw kernel (so it follows
+    // pipelined and captured steps without the host); its copy for the captures' restores
+    private MemoryBuffer1D<int, Stride1D.Dense>? _rep, _repSnap;
+    private int _repCap;
     private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _ring = new MemoryBuffer1D<int, Stride1D.Dense>?[2];
     private int _ringAt;
     private MemoryBuffer1D<float, Stride1D.Dense>? _drawF;
@@ -155,6 +163,7 @@ public sealed class GgufBatchDecoder : IDisposable
         MaxSeq = maxSeq; MaxBatch = maxBatch;
         CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
         DeviceSampling = SupportsDeviceDraws(accelerator);
+        NoCandidates = accelerator.AcceleratorType == AcceleratorType.WebGL;
         // the fused attention runs a group per head (a power of two up to 256 threads; WebGL has no groups)
         FusedAttention = accelerator.AcceleratorType != AcceleratorType.WebGL && HeadDim <= AttChunk && (HeadDim & (HeadDim - 1)) == 0 && HeadDim <= accelerator.MaxNumThreadsPerGroup;
         var inv = new float[HeadDim / 2];
@@ -326,14 +335,16 @@ public sealed class GgufBatchDecoder : IDisposable
         public readonly List<(int Snap, int Ofs, int ValAtP0, int Slope)> Patches = new();
         public bool Failed;
     }
-    private readonly Dictionary<(int R, float T, bool Dev), StepPlan> _plans = new();
+    private readonly Dictionary<(int R, float T, bool Dev, bool Pen), StepPlan> _plans = new();
+    // the drawn steps run the penalty kernel (Draw with a penalty other than 1); off, it is not dispatched at all (WebGPU pays per dispatch)
+    private bool _penOn;
     /// <summary>Diagnostics: decode steps replayed from a captured plan, and plans captured, since the decoder was created.</summary>
     public (int Replays, int Captures) CaptureStats { get; private set; }
 
     private async Task<(FV Logits, FV Cand, int OutRows)> CapturedStepAsync(IV idBuf, int R, float temperature, int p, bool dev)
     {
         _fixedChunks = true;
-        if (_plans.TryGetValue((R, temperature, dev), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
+        if (_plans.TryGetValue((R, temperature, dev, dev && _penOn), out var sp) && sp.Plan != null && sp.Gen == _bufGen)
         {
             _posBuf!.View.SubView(0, 1).CopyFromCPU(new[] { p });            // the kernels read the position from this buffer
             foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));   // none left now; kept for any scalar that carries it
@@ -347,7 +358,13 @@ public sealed class GgufBatchDecoder : IDisposable
         // at p + 1 overwrites; the cache is position-addressed), then the real one at p, whose results stand.
         // Device draws: every pass draws, and a draw overwrites the tokens the step reads (_seqIds), so the tokens are kept aside and put back before each pass,
         // outside the recording windows (a restore recorded into the plan would pin the input to these tokens forever)
-        if (dev) { _seqIdsSnap ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch))); _seqIdsSnap.View.CopyFrom(_seqIds!.View); }
+        // (the penalty windows likewise: every pass appends its draws)
+        if (dev)
+        {
+            _seqIdsSnap ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch))); _seqIdsSnap.View.CopyFrom(_seqIds!.View);
+            if (_repSnap == null || _repSnap.Length != _rep!.Length) _repSnap = Own(_acc.Allocate1D<int>(_rep!.Length));
+            _repSnap.View.CopyFrom(_rep.View);
+        }
         var warm = EncodeForward(idBuf, R, true, temperature, p, dev);
         await _acc.SynchronizeAsync().ConfigureAwait(false);
         int gen = _bufGen;
@@ -358,12 +375,12 @@ public sealed class GgufBatchDecoder : IDisposable
         SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = false;
         try
         {
-            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
+            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); _rep!.View.CopyFrom(_repSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
             b = wacc.BeginDispatchCapture(); b.CaptureScalarSnapshots = true;
             EncodeForward(idBuf, R, true, temperature, p + 1, dev);
             wacc.EndDispatchCapture();
             await _acc.SynchronizeAsync().ConfigureAwait(false);
-            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
+            if (dev) { _seqIds!.View.CopyFrom(_seqIdsSnap!.View); _rep!.View.CopyFrom(_repSnap!.View); await _acc.SynchronizeAsync().ConfigureAwait(false); }
             a = wacc.BeginDispatchCapture(); a.CaptureScalarSnapshots = true;
             res = EncodeForward(idBuf, R, true, temperature, p, dev);
             wacc.EndDispatchCapture();
@@ -386,7 +403,7 @@ public sealed class GgufBatchDecoder : IDisposable
         b.Dispose();
         if (!ok) { a.Dispose(); sp.Failed = true; }
         else { sp.Plan = a; CaptureStats = (CaptureStats.Replays, CaptureStats.Captures + 1); }
-        _plans[(R, temperature, dev)] = sp;
+        _plans[(R, temperature, dev, dev && _penOn)] = sp;
         return ok ? res : warm;
     }
 
@@ -465,7 +482,9 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 var scores = Buf(ref _scores, (long)Heads * R * nk);
                 _scoresK!((int)((long)Heads * R * nk), q, _kc[l].View, seqView, scores, R, nk, Heads, HeadDim, KvHeads, MaxSeq, p, mode, 1f / MathF.Sqrt(HeadDim)); Prof("scores");
-                _softmax!(Heads * R, scores, nk); Prof("softmax");
+                var stats = Buf(ref _softStats, 2L * Heads * R);
+                _softmaxStats!(Heads * R, scores, stats, nk);
+                _softmaxNorm!((int)((long)Heads * R * nk), scores, stats, nk); Prof("softmax");
                 _pv!((int)((long)R * Q), scores, _vc[l].View, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
             }
             Gemm(att, b + "attn_output.weight", proj, R, Q, C); Prof("o");
@@ -490,6 +509,9 @@ public sealed class GgufBatchDecoder : IDisposable
         var hnOut = decode ? hn : hn.SubView((long)(R - 1) * C, C);
         var logits = Buf(ref _logits, (long)outRows * Vocab);
         Gemm(hnOut, _head, logits, outRows, C, Vocab); Prof("head");
+        // WebGL: no candidates (the gather takes its slots from Atomic.Add, which WebGL cannot return: SpawnDev.ILGPU's vote emulation; 5.4.15 refuses the kernel),
+        // a draw reads the row
+        if (NoCandidates) return (logits, default, outRows);
         // each row's best tokens and (sampling) its softmax mass, on the device
         int nch = Chunks, S = CandStride;
         var maxV = Buf(ref _maxV, (long)outRows * nch);
@@ -499,6 +521,8 @@ public sealed class GgufBatchDecoder : IDisposable
         _selN ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch)));
         var maxI = _maxI.View.SubView(0, (long)outRows * nch);
         var cand = Buf(ref _cand, (long)outRows * S);
+        // device draws: each row's repetition penalty on its logits first (a no-op at penalty 1), so the candidates and the draw see the penalised row
+        if (dev && _penOn) { _penalize!(R * _repCap, logits, seqView, _drawI!.View, _drawF!.View, _rep!.View, Vocab); Prof("penalty"); }
         _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch); Prof("chunkMax");
         _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
         _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature); Prof("select");
@@ -511,8 +535,10 @@ public sealed class GgufBatchDecoder : IDisposable
     private void EnsureDrawBuffers()
     {
         // loaded on first use, not with the rest: a group kernel (WebGL, which has no groups, never draws on the device)
-        _draw ??= _acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>(DrawImpl);
+        _draw ??= _acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, IV, int, int, int, int, int, float>(DrawImpl);
         _gather ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, IV, IV>(GatherIdsImpl);
+        _penalize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, IV, int>(PenalizeImpl);
+        EnsurePenaltyWindow(64);
         _seqIds ??= Own(_acc.Allocate1D<int>(Math.Max(64, MaxBatch)));
         _drawI ??= Own(_acc.Allocate1D<int>(64));
         _drawF ??= Own(_acc.Allocate1D<float>(64));
@@ -524,8 +550,18 @@ public sealed class GgufBatchDecoder : IDisposable
     private void QueueDraw(int slots, bool rowZero, int tAdd, float temperature, FV logits, FV cand)
     {
         EnsureDrawBuffers();
-        _draw!(new KernelConfig(slots, DrawGroup), logits, cand, _seqBuf!.View, _posBuf!.View, _drawF!.View, _drawI!.View, _seqIds!.View, Vocab, Chunks, CandStride, rowZero ? 1 : 0, tAdd, temperature);
+        _draw!(new KernelConfig(slots, DrawGroup), logits, cand, _seqBuf!.View, _posBuf!.View, _drawF!.View, _drawI!.View, _seqIds!.View, _rep!.View, Vocab, Chunks, CandStride, rowZero ? 1 : 0, tAdd, temperature);
         Prof("draw");
+    }
+
+    // the penalty windows hold at least `window` tokens per sequence (a larger buffer replaces the old one: captured plans bound it, so they are recaptured)
+    private void EnsurePenaltyWindow(int window)
+    {
+        if (_rep != null && _repCap >= window) return;
+        _repCap = Math.Max(window, _repCap);
+        _rep = Own(_acc.Allocate1D<int>((long)MaxBatch * (_repCap + 1)));       // the old one stays owned: a queued dispatch may read it
+        _rep.MemSetToZero();
+        _bufGen++;
     }
 
     /// <summary>
@@ -564,7 +600,7 @@ public sealed class GgufBatchDecoder : IDisposable
         _lastCand = null;
         // the readback is the forward's one wait: it is ordered after the queued kernels on every backend (WebGPU: flush, copy, mapAsync; desktop: a synchronous
         // copy), so a SynchronizeAsync before it only added a second round trip
-        if (readBack) _lastCand = await cand.CopyToHostAsync().ConfigureAwait(false);
+        if (readBack && !NoCandidates) _lastCand = await cand.CopyToHostAsync().ConfigureAwait(false);
         long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         if (decode)
         {
@@ -638,6 +674,7 @@ public sealed class GgufBatchDecoder : IDisposable
     public async ValueTask<int> SampleAsync(int row, float topP, Random rng)
     {
         if ((uint)row >= (uint)_lastRows) throw new ArgumentOutOfRangeException(nameof(row));
+        if (NoCandidates) return SampleLogits(await _lastLogits.SubView((long)row * Vocab, Vocab).CopyToHostAsync().ConfigureAwait(false), 0, Vocab, _lastT, topP, rng);
         int K = Candidates, o = row * CandStride;
         var c = _lastCand ??= await _lastCandView.CopyToHostAsync().ConfigureAwait(false);
         float T = _lastT, max = c[o], floor = max - 20f * T;
@@ -702,14 +739,25 @@ public sealed class GgufBatchDecoder : IDisposable
     /// prompt's row; after a step: each row for its sequence), at the temperature that forward was given (0: the argmax), nucleus <paramref name="topP"/> (0, 1],
     /// uniform <see cref="DrawUniform"/>(<paramref name="seed"/>, sequence, <see cref="Position"/>). Queued, no wait: the tokens stay on the device as the next
     /// <see cref="StepDrawnAsync"/>'s input, <see cref="ReadDrawnAsync"/> reads them. <paramref name="seed"/> and <paramref name="topP"/> hold for the steps after.
+    /// <para>
+    /// <paramref name="repetitionPenalty"/> (1 = off) applies to the drawn steps after this one, per sequence, over its last <paramref name="repeatLastN"/> drawn tokens
+    /// (0 or less: all of them; this draw starts the window): each distinct token's logit is divided by the penalty when positive, multiplied when not
+    /// (<see cref="TextGenerationSampler.ApplyRepetitionPenalty"/>), before the candidates and the draw.
+    /// </para>
     /// </summary>
-    public void Draw(float topP, int seed)
+    public void Draw(float topP, int seed, float repetitionPenalty = 1f, int repeatLastN = 64)
     {
         if (_lastRows == 0) throw new InvalidOperationException("no forward to draw from");
+        if (!SupportsDeviceDraws(_acc)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads ({_acc.AcceleratorType}): use SampleAsync");
         if (!(topP > 0f && topP <= 1f)) throw new ArgumentOutOfRangeException(nameof(topP), "(0, 1]");
+        if (!(repetitionPenalty > 0f)) throw new ArgumentOutOfRangeException(nameof(repetitionPenalty), "above 0");
         LoadKernels(); EnsureDrawBuffers();
-        _drawI!.View.SubView(0, 2).CopyFromCPU(new[] { seed, ForceFullRowDraws ? 1 : 0 });
-        _drawF!.View.SubView(0, 1).CopyFromCPU(new[] { topP });
+        int window = repeatLastN > 0 ? repeatLastN : MaxSeq;
+        EnsurePenaltyWindow(window);
+        _rep!.View.SubView(0, MaxBatch).MemSetToZero();                          // every sequence's window starts empty
+        _drawI!.View.SubView(0, 5).CopyFromCPU(new[] { seed, ForceFullRowDraws ? 1 : 0, window, _repCap, MaxBatch });
+        _drawF!.View.SubView(0, 2).CopyFromCPU(new[] { topP, repetitionPenalty });
+        _penOn = repetitionPenalty != 1f;
         var seqs = _lastPrefill ? Enumerable.Range(0, Batch).ToArray() : _lastSeqs;
         if (!seqs.AsSpan().SequenceEqual(_seqsOnDevice)) { _seqBuf!.View.SubView(0, seqs.Length).CopyFromCPU(seqs); _seqsOnDevice = (int[])seqs.Clone(); }
         QueueDraw(seqs.Length, rowZero: _lastPrefill, tAdd: Position - _lastP, _lastT, _lastLogits, _lastCandView);
@@ -726,6 +774,17 @@ public sealed class GgufBatchDecoder : IDisposable
         if (_drawPos != Position) throw new InvalidOperationException("the sequences have no drawn token at this position: Draw after the prefill");
         await ForwardAsync(null, sequences, decode: true, temperature, readBack: false, ct).ConfigureAwait(false);
         CopyDrawnToRing();
+    }
+
+    // diagnostics (the gates): sequence's penalty window as the device holds it, oldest first (the last min(drawn, repeatLastN, ring) tokens it drew)
+    internal async Task<int[]> ReadPenaltyWindowAsync(int sequence)
+    {
+        var all = await _rep!.View.CopyToHostAsync().ConfigureAwait(false);
+        var cfg = await _drawI!.View.SubView(0, 5).CopyToHostAsync().ConfigureAwait(false);
+        int W = cfg[3], MB = cfg[4], c = all[sequence], n = Math.Min(Math.Min(c, cfg[2]), W);
+        var w = new int[n];
+        for (int k = 0; k < n; k++) w[n - 1 - k] = all[MB + sequence * W + (c - 1 - k) % W];
+        return w;
     }
 
     // the drawn tokens into the next read ring (a device copy, queued after the draw)
@@ -748,9 +807,11 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <see cref="DrawUniform"/>(<paramref name="seed"/>, sequence, position) on the device; off: a <see cref="Random"/>(seed + sequence) on the host). A sequence ends
     /// at a stop token or after <paramref name="maxNew"/> tokens and then leaves the batch (the steps after it run the live sequences only). Returns the generated token
     /// ids per sequence (stop token excluded). <paramref name="onToken"/> gets (sequence, token) as they are sampled, <paramref name="onFinished"/> the sequence when it ends.
+    /// <paramref name="repetitionPenalty"/> / <paramref name="repeatLastN"/>: as for <see cref="Draw"/>, over each sequence's own generated tokens (the host-draw path
+    /// reads the rows to apply it).
     /// </summary>
     public async Task<int[][]> GenerateAsync(int[] promptIds, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
-        Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default)
+        Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default, float repetitionPenalty = 1f, int repeatLastN = 64)
     {
         await PrefillAsync(promptIds, temperature, ct).ConfigureAwait(false);
         Fork(n);
@@ -778,14 +839,29 @@ public sealed class GgufBatchDecoder : IDisposable
                 // only the live sequences step: a finished one leaves the batch (it used to ride along to the end of the longest)
                 var live = Enumerable.Range(0, n).Where(s => !done[s]).ToArray();
                 await StepAsync(live.Select(s => next[s]).ToArray(), live, temperature, ct).ConfigureAwait(false);
-                for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
+                if (repetitionPenalty == 1f)
+                    for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
+                else
+                {
+                    // the penalty changes the row: read it, penalise each sequence's own window, draw from the whole row (the device path's reference)
+                    var rowsAll = await ReadLogitsAsync().ConfigureAwait(false);
+                    for (int r = 0; r < live.Length; r++)
+                    {
+                        var o = outs[live[r]];
+                        int take = repeatLastN > 0 ? Math.Min(repeatLastN, o.Count) : o.Count;
+                        var row = new float[Vocab];
+                        Array.Copy(rowsAll, (long)r * Vocab, row, 0, Vocab);
+                        TextGenerationSampler.ApplyRepetitionPenalty(row, o.GetRange(o.Count - take, take).ToArray(), repetitionPenalty);
+                        next[live[r]] = SampleLogits(row, 0, Vocab, temperature, topP, rngs[live[r]]);
+                    }
+                }
             }
             return outs.Select(o => o.ToArray()).ToArray();
         }
         // device draws, one step ahead: step P (its inputs the tokens drawn for P, its draws the tokens for P + 1) is queued before the tokens for P are read, so the
         // device always has the next step while the host streams the last one. A sequence that drew a stop token rides one step more (its row is thrown away), then
         // leaves the batch.
-        Draw(temperature > 0f ? topP : 1f, seed);
+        Draw(temperature > 0f ? topP : 1f, seed, repetitionPenalty, repeatLastN);
         var live2 = Enumerable.Range(0, n).ToArray();
         Task<int[]>? pending = ReadDrawnAsync(), ahead = null;
         try
@@ -849,7 +925,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV, IV, int, int, int>? _rope;
     private Action<Index1D, FV, FV, FV, FV, IV, IV, int, int, int>? _store;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>? _scoresK;
-    private Action<Index1D, FV, int>? _softmax;
+    private Action<Index1D, FV, FV, int>? _softmaxStats, _softmaxNorm;
     private Action<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>? _pv;
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, IV, int, int, int, int, int>? _qkvPost;
@@ -863,7 +939,8 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, IV, FV, IV, int, int>? _floor;
     private Action<Index1D, FV, FV, IV, FV, IV, int, int, int, float>? _select;
     private Action<Index1D, FV, IV, IV, FV, int>? _final;
-    private Action<KernelConfig, FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>? _draw;
+    private Action<KernelConfig, FV, FV, IV, IV, FV, IV, IV, IV, int, int, int, int, int, float>? _draw;
+    private Action<Index1D, FV, IV, IV, FV, IV, int>? _penalize;
     private Action<Index1D, IV, IV, IV>? _gather;
 
     private void LoadKernels()
@@ -874,7 +951,8 @@ public sealed class GgufBatchDecoder : IDisposable
         _rope = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int>(RopeImpl);
         _store = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, IV, IV, int, int, int>(StoreImpl);
         _scoresK = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
-        _softmax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
+        _softmaxStats = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SoftmaxStatsImpl);
+        _softmaxNorm = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SoftmaxNormImpl);
         _pv = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, int, int, int, int>(PvImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
         _qkvPost = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, FV, IV, IV, int, int, int, int, int>(QkvPostImpl);
@@ -887,10 +965,13 @@ public sealed class GgufBatchDecoder : IDisposable
         }
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
-        _chunkMax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
-        _floor = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
-        _select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
-        _final = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
+        if (!NoCandidates)
+        {
+            _chunkMax = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
+            _floor = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
+            _select = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
+            _final = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
+        }
     }
 
     // o[r] = x[r] / rms(x[r]) * w (Qwen2RMSNorm: mean of squares + eps)
@@ -1028,9 +1109,12 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>
     /// The decoder's device draw on given logits, without a model (its gate): [<paramref name="rows"/>, <paramref name="vocab"/>] row-major through the candidate
     /// kernels and the draw kernel. Row r draws as sequence r for <paramref name="position"/> (uniform <see cref="DrawUniform"/>(<paramref name="seed"/>, r,
-    /// <paramref name="position"/>)); <paramref name="forceFullRow"/> takes the whole-row path for every row. Returns the token per row.
+    /// <paramref name="position"/>)); <paramref name="forceFullRow"/> takes the whole-row path for every row. <paramref name="windows"/>[r]: row r's previous
+    /// tokens, oldest first, penalised by <paramref name="repetitionPenalty"/> (the decoder's penalty kernel) before the draw: the last <paramref name="repeatLastN"/> of them (0: all
+    /// the ring holds), the ring <paramref name="ringCapacity"/> tokens long (0: the longest window; shorter, the ring wraps as the decoder's does). Returns the token per row.
     /// </summary>
-    public static async Task<int[]> DrawRowsAsync(Accelerator accelerator, float[] logits, int rows, int vocab, float temperature, float topP, int seed, int position, bool forceFullRow = false)
+    public static async Task<int[]> DrawRowsAsync(Accelerator accelerator, float[] logits, int rows, int vocab, float temperature, float topP, int seed, int position, bool forceFullRow = false,
+        int[][]? windows = null, float repetitionPenalty = 1f, int repeatLastN = 0, int ringCapacity = 0)
     {
         if (!SupportsDeviceDraws(accelerator)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads");
         if (logits.Length != (long)rows * vocab) throw new ArgumentException("rows x vocab logits");
@@ -1046,19 +1130,29 @@ public sealed class GgufBatchDecoder : IDisposable
         using var cand = acc.Allocate1D<float>((long)rows * S);
         using var seqs = acc.Allocate1D(Enumerable.Range(0, rows).ToArray());
         using var pos = acc.Allocate1D(new[] { position - 1, 0 });
-        using var dF = acc.Allocate1D(new[] { topP, 0f });
-        using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0 });
+        int W = ringCapacity > 0 ? ringCapacity : Math.Max(1, windows?.Max(w => w.Length) ?? 1), active = repeatLastN > 0 ? repeatLastN : W;
+        var repHost = new int[rows + rows * W];
+        for (int r = 0; windows != null && r < rows; r++)
+        {
+            repHost[r] = windows[r].Length;
+            for (int j = 0; j < windows[r].Length; j++) repHost[rows + r * W + j % W] = windows[r][j];
+        }
+        using var rep = acc.Allocate1D(repHost);
+        using var dF2 = acc.Allocate1D(new[] { topP, repetitionPenalty });
+        using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0, active, W, rows });
         using var ids = acc.Allocate1D<int>(Math.Max(64, rows));
         var chunkMax = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int>(ChunkMaxImpl);
         var floor = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(FloorImpl);
         var select = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, IV, int, int, int, float>(SelectImpl);
         var final = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, int>(FinalImpl);
-        var draw = acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, int, int, int, int, int, float>(DrawImpl);
+        var draw = acc.LoadStreamKernel<FV, FV, IV, IV, FV, IV, IV, IV, int, int, int, int, int, float>(DrawImpl);
+        var penalize = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, IV, int>(PenalizeImpl);
+        penalize(rows * W, lg.View, seqs.View, dI.View, dF2.View, rep.View, vocab);
         chunkMax(rows * nch, lg.View, maxV.View, maxI.View, vocab, nch);
         floor(rows, maxV.View, maxI.View, cand.View, selN.View, nch, S);
         select(rows * nch, lg.View, cand.View, selN.View, selV.View, selI.View, vocab, nch, S, temperature);
         final(rows, selV.View, selI.View, selN.View, cand.View, S);
-        draw(new KernelConfig(rows, DrawGroup), lg.View, cand.View, seqs.View, pos.View, dF.View, dI.View, ids.View, vocab, nch, S, 0, 1, temperature);
+        draw(new KernelConfig(rows, DrawGroup), lg.View, cand.View, seqs.View, pos.View, dF2.View, dI.View, ids.View, rep.View, vocab, nch, S, 0, 1, temperature);
         var got = await ids.View.SubView(0, rows).CopyToHostAsync().ConfigureAwait(false);      // the read waits for the kernels (every backend), so the buffers may go
         return got;
     }
@@ -1075,7 +1169,7 @@ public sealed class GgufBatchDecoder : IDisposable
     //  the ties at tau taken in id order (each thread holds a contiguous id range, so a scan over the threads is the id order); the draw is the same search for
     //  u x keep. Float sums can disagree with themselves by a hair: a search that finds no tie takes the last one, a draw past the nucleus its last token.
     // The full-row branch holds barriers: its condition comes from Group.BarrierOr (uniform in WGSL: workgroupUniformLoad), its loops run a fixed count.
-    private static void DrawImpl(FV logits, FV cand, IV seqs, IV posBuf, FV drawF, IV drawI, IV seqIds, int V, int nch, int S, int rowZero, int tAdd, float T)
+    private static void DrawImpl(FV logits, FV cand, IV seqs, IV posBuf, FV drawF, IV drawI, IV seqIds, IV rep, int V, int nch, int S, int rowZero, int tAdd, float T)
     {
         const int K = Candidates;
         int slot = Grid.IdxX, t = Group.IdxX;
@@ -1201,7 +1295,37 @@ public sealed class GgufBatchDecoder : IDisposable
             if (outside) drawn = nucLast;
             tok = drawn;
         }
-        if (t == 0) seqIds[seq] = tok;
+        if (t == 0)
+        {
+            seqIds[seq] = tok;
+            // the token joins its sequence's penalty window (rep: [MB counts][MB rings of W]; drawI[3] = W, drawI[4] = MB)
+            int W = drawI[3], MB = drawI[4], c = rep[seq];
+            rep[MB + seq * W + c % W] = tok;
+            rep[seq] = c + 1;
+        }
+    }
+
+    // the repetition penalty on row r (sequence seqs[r]) of the logits: thread (r, k) takes the sequence's k-th most recent drawn token (k below the window
+    // drawI[2] and the tokens drawn), skips it when a more recent slot holds the same token (so each distinct token is penalised once, by one thread), and
+    // divides its logit by the penalty drawF[1] when positive, multiplies it when not (TextGenerationSampler.ApplyRepetitionPenalty). Threads per row: W = drawI[3].
+    private static void PenalizeImpl(Index1D i, FV logits, IV seqs, IV drawI, FV drawF, IV rep, int V)
+    {
+        float pen = drawF[1];
+        if (pen == 1f) return;
+        int W = drawI[3], MB = drawI[4], ii = i, r = ii / W, k = ii % W;
+        int seq = seqs[r], c = rep[seq], n = Math.Min(Math.Min(c, drawI[2]), W);
+        if (k >= n) return;
+        int b = MB + seq * W, tok = rep[b + (c - 1 - k) % W];
+        bool dup = false;
+        for (int k2 = 0; k2 < k; k2++)
+        {
+            bool same = rep[b + (c - 1 - k2) % W] == tok;
+            if (same) { dup = true; break; }
+        }
+        if (dup) return;
+        long at = (long)r * V + tok;
+        float v = logits[at];
+        logits[at] = v > 0f ? v / pen : v * pen;
     }
 
     // this thread's share of the row's softmax mass at T over the tokens within e^20 of the best (logit >= floorT) and at or above v (strict: above v)
@@ -1417,15 +1541,22 @@ public sealed class GgufBatchDecoder : IDisposable
         }
         scores[ii] = s;
     }
-    private static void SoftmaxImpl(Index1D row, FV scores, int nk)
+    // the softmax of each score row in two kernels, so every thread stores one element per store site (WebGL's transform feedback captures no more; the
+    // one-kernel version rewrote the row from a loop): the row's max and the inverse of its exp-sum, then each score normalised
+    private static void SoftmaxStatsImpl(Index1D row, FV scores, FV stats, int nk)
     {
         long o = (long)(int)row * nk;
         float max = scores[o];
         for (int j = 1; j < nk; j++) max = MathF.Max(max, scores[o + j]);
         float sum = 0f;
-        for (int j = 0; j < nk; j++) { float e = MathF.Exp(scores[o + j] - max); scores[o + j] = e; sum += e; }
-        float inv = 1f / sum;
-        for (int j = 0; j < nk; j++) scores[o + j] *= inv;
+        for (int j = 0; j < nk; j++) sum += MathF.Exp(scores[o + j] - max);
+        stats[2L * row] = max;
+        stats[2L * row + 1] = 1f / sum;
+    }
+    private static void SoftmaxNormImpl(Index1D i, FV scores, FV stats, int nk)
+    {
+        long ii = i, row = ii / nk;
+        scores[ii] = MathF.Exp(scores[ii] - stats[2 * row]) * stats[2 * row + 1];
     }
     // o[r, h * D + d] = sum_j scores[h, r, j] v[seq(r), j, h / rep, d]
     private static void PvImpl(Index1D i, FV scores, FV vc, IV seqs, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode)

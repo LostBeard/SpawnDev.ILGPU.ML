@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
@@ -124,6 +125,112 @@ public abstract partial class MLTestBase
         if (same.Min() < 0.45f) throw new Exception($"the same person scored {same.Min():0.000} (expected >= 0.45) on {BackendName}");
         if (different.Max() > 0.35f) throw new Exception($"two different people scored {different.Max():0.000} (expected <= 0.35) on {BackendName}");
         if (same.Min() - different.Max() < 0.15f) throw new Exception($"identity margin {same.Min() - different.Max():0.000} is under 0.15 on {BackendName}");
+    });
+
+    /// <summary>
+    /// The face pipelines' device stages against their host references, no model, every backend: on the six portraits the letterbox kernel = the host letterbox (to 0.02,
+    /// the same scale and padding) and the same picture as R, G, B, A gives the same input; the alignment kernel = <see cref="SFaceRecognizer.AlignCrop"/> within one
+    /// level (float on the device, double on the host; under 0.05 on average) and within OpenCV's own crops as the host is; the aligned-face conversion is exact. The
+    /// anchor decode on built network outputs (scores spilling past [0, 1], two thresholds: thousands of faces, which take a second read, and a few) = the host
+    /// decode, field for field, in both its modes (appending above the threshold; dense, the only one WebGL can run, one thread per field).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Face_DeviceStages_MatchHostReference() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var (images, _) = await LoadFaceFixture(http);
+        if (images.Count != 6) throw new Exception($"{images.Count} fixture images, expected 6");
+        const int In = 640, N = SFaceRecognizer.AlignedSize, Plane = N * N;
+        var stages = new FaceStages(accelerator);
+        using var pixels = new FacePixels(accelerator);
+        using var blob = accelerator.Allocate1D<float>(3 * In * In);
+        using var crop = accelerator.Allocate1D<float>(3 * Plane);
+        var notes = new List<string>();
+        bool ok = true;
+        foreach (var img in images)
+        {
+            var (scale, padX, padY) = stages.Letterbox(pixels.FromManaged(img.Bgra, img.Width, img.Height), img.Width, img.Height, PixelOrder.Bgra, blob.View, In, In);
+            var lb = await blob.View.CopyToHostAsync();
+            var lbHost = YuNetFaceDetector.Letterbox(img.Bgra, img.Width, img.Height, In, In, out var hScale, out var hPadX, out var hPadY);
+            float lbMax = 0f;
+            for (int i = 0; i < lb.Length; i++) lbMax = MathF.Max(lbMax, MathF.Abs(lb[i] - lbHost[i]));
+            var rgba = (byte[])img.Bgra.Clone();
+            for (int i = 0; i < rgba.Length; i += 4) (rgba[i], rgba[i + 2]) = (rgba[i + 2], rgba[i]);
+            stages.Letterbox(pixels.FromManaged(rgba, img.Width, img.Height), img.Width, img.Height, PixelOrder.Rgba, blob.View, In, In);
+            bool rgbaSame = (await blob.View.CopyToHostAsync()).AsSpan().SequenceEqual(lb);
+            // 0.02 levels: CUDA / OpenCL contract (x + 0.5) * sx - 0.5 into a fused multiply-add, which moves the sample coordinate by up to an ulp of the
+            // picture width (3e-5 at 360 px) and the bilinear value by up to 255 times that (8e-3); measured 1.0e-3 on trump_2017 (CUDA, OpenCL), 0 elsewhere
+            bool lbOk = lbMax <= 0.02f && scale == hScale && padX == hPadX && padY == hPadY && rgbaSame;
+
+            stages.Align(pixels.FromManaged(img.Bgra, img.Width, img.Height), img.Width, img.Height, img.Landmarks, PixelOrder.Bgra, crop.View);
+            var al = await crop.View.CopyToHostAsync();
+            var alHost = SFaceRecognizer.AlignCrop(img.Bgra, img.Width, img.Height, img.Landmarks);
+            int alMax = 0; double alSum = 0, cvSum = 0;
+            for (int i = 0; i < Plane; i++)
+                for (int ch = 0; ch < 3; ch++)          // host bytes B, G, R; device planes R, G, B
+                {
+                    int dev = (int)al[(2 - ch) * Plane + i];
+                    int d = Math.Abs(dev - alHost[i * 3 + ch]);
+                    alMax = Math.Max(alMax, d); alSum += d;
+                    cvSum += Math.Abs(dev - img.AlignedBgr[i * 3 + ch]);
+                }
+            double alMean = alSum / (3 * Plane), cvMean = cvSum / (3 * Plane);
+            bool alOk = alMax <= 1 && alMean <= 0.05 && cvMean <= 2.5;
+
+            stages.AlignedBgr(pixels.FromManagedWords(img.AlignedBgr), crop.View);
+            var cv = await crop.View.CopyToHostAsync();
+            bool convOk = true;
+            for (int i = 0; i < Plane && convOk; i++)
+                convOk = cv[i] == img.AlignedBgr[i * 3 + 2] && cv[Plane + i] == img.AlignedBgr[i * 3 + 1] && cv[2 * Plane + i] == img.AlignedBgr[i * 3];
+
+            ok &= lbOk && alOk && convOk;
+            notes.Add($"{img.Name}: letterbox max |d| {lbMax:E1}{(rgbaSame ? "" : " RGBA DIFFERS")}{(scale == hScale && padX == hPadX && padY == hPadY ? "" : " PLACEMENT DIFFERS")}, align max {alMax} mean {alMean:0.000} (OpenCV {cvMean:0.00}), conversion {(convOk ? "exact" : "DIFFERS")}");
+        }
+
+        // the anchor decode on built outputs: cls / obj in [-0.1, 1.1] (the clamps matter), boxes and landmarks in a few strides
+        var rng = new Random(5);
+        var host = new float[12][];
+        var bufs = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        var o = new ArrayView1D<float, Stride1D.Dense>[12];
+        for (int s = 0; s < 3; s++)
+        {
+            int n = (In / YuNetFaceDetector.Strides[s]) * (In / YuNetFaceDetector.Strides[s]);
+            host[s] = Enumerable.Range(0, n).Select(_ => (float)(rng.NextDouble() * 1.2 - 0.1)).ToArray();
+            host[3 + s] = Enumerable.Range(0, n).Select(_ => (float)(rng.NextDouble() * 1.2 - 0.1)).ToArray();
+            host[6 + s] = Enumerable.Range(0, 4 * n).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
+            host[9 + s] = Enumerable.Range(0, 10 * n).Select(_ => (float)(rng.NextDouble() * 4 - 2)).ToArray();
+        }
+        for (int k = 0; k < 12; k++) { var b = accelerator.Allocate1D(host[k]); bufs.Add(b); o[k] = b.View; }
+        using var found = FaceStages.AllocateFound(accelerator, In, In);
+        try
+        {
+            // WebGL runs only the dense mode: its Atomic.Add cannot hand out slots (the appending mode is impossible there, and FaceStages never uses it there)
+            foreach (bool dense in accelerator.AcceleratorType == AcceleratorType.WebGL ? new[] { true } : new[] { false, true })
+                foreach (float thr in new[] { 0.5f, 0.97f })
+                {
+                    stages.Dense = dense;
+                    var dev = YuNetFaceDetector.Suppress(await stages.DecodeAsync(o, In, In, found, 0.8f, 10f, 20f, thr), 2f, int.MaxValue);     // IoU <= 1 < 2: suppression keeps all
+                    var want = YuNetFaceDetector.Decode(host, In, In, 0.8f, 10f, 20f, thr, 2f, int.MaxValue);
+                    float worst = 0f;
+                    bool same = dev.Count == want.Count;
+                    for (int k = 0; same && k < dev.Count; k++)
+                    {
+                        var a = dev[k]; var b = want[k];
+                        var fa = new[] { a.X, a.Y, a.Width, a.Height, a.Score }.Concat(a.Landmarks).ToArray();
+                        var fb = new[] { b.X, b.Y, b.Width, b.Height, b.Score }.Concat(b.Landmarks).ToArray();
+                        for (int j = 0; j < fa.Length; j++) worst = MathF.Max(worst, MathF.Abs(fa[j] - fb[j]) / MathF.Max(1f, MathF.Abs(fb[j])));
+                    }
+                    same &= worst <= 1e-4f;
+                    ok &= same;
+                    notes.Add($"decode {(dense ? "dense" : "appending")} at {thr}: {dev.Count} faces (host {want.Count}), worst relative difference {worst:E1}{(same ? "" : " DIFFERS")}");
+                }
+        }
+        finally { foreach (var b in bufs) b.Dispose(); }
+        var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        Console.WriteLine("[FaceStages] " + report);
+        if (!ok) throw new Exception(report);
+        return report;
     });
 
     private static float Iou(float ax, float ay, float aw, float ah, float bx, float by, float bw, float bh)

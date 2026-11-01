@@ -12,6 +12,20 @@ using System.Text.Json;
 // Auto-flush stdout so PlaywrightMultiTest sees output immediately
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
 
+// Offline WGSL of an ML kernel (no GPU: SpawnDev.ILGPU's ShaderCompiler against the WebGPUFull profile), to read or feed to naga.exe; diagnostics on stderr.
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- WGSLDUMP SpawnDev.ILGPU.ML.Pipelines.FaceKernels DecodeImpl <out.wgsl> [grouped]
+if (args.Length >= 4 && args[0] == "WGSLDUMP")
+{
+    var type = typeof(SpawnDev.ILGPU.ML.InferenceSession).Assembly.GetType(args[1]) ?? typeof(WgslRepro).Assembly.GetType(args[1], throwOnError: true)!;
+    var method = type.GetMethod(args[2], System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new MissingMethodException(args[1], args[2]);
+    var gen = SpawnDev.ILGPU.ShaderCompiler.Generate(method, SpawnDev.ILGPU.CapabilityProfiles.WebGPUFull, null, explicitlyGrouped: args.Length > 4 && args[4] == "grouped");
+    File.WriteAllText(args[3], gen.Source ?? "");
+    foreach (var d in gen.Diagnostics) Console.Error.WriteLine($"{d}");
+    Console.WriteLine($"WGSLDUMP {args[1]}.{args[2]} -> {args[3]} ({(gen.Source ?? "").Length} chars, {gen.Diagnostics.Count} diagnostics)");
+    return 0;
+}
+
 // Live-bug probes (NOT PMT): dump box geometry for /face portrait and /detect street.
 //   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- FACEDETECT [CUDA]
 //   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- DETECTPROBE [CUDA]

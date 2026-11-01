@@ -155,9 +155,13 @@ public static class TextGenerationSampler
     public static void ApplyRepetitionPenalty(float[] logits, int[] previousTokens, float penalty = 1.2f)
     {
         if (penalty == 1.0f) return;
+        // once per DISTINCT token: transformers' RepetitionPenaltyLogitsProcessor gathers every listed id's ORIGINAL logit, penalises it and scatters it
+        // back, so a token listed k times is penalised once (llama.cpp's penalties sampler likewise). This loop used to compound penalty^k (1.3^5 = 3.7x for
+        // a token seen five times in the window).
+        var seen = new HashSet<int>();
         foreach (int token in previousTokens)
         {
-            if (token >= 0 && token < logits.Length)
+            if (token >= 0 && token < logits.Length && seen.Add(token))
             {
                 if (logits[token] > 0)
                     logits[token] /= penalty;

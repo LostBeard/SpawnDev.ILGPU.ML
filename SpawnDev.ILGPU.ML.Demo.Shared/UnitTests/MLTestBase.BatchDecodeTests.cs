@@ -22,13 +22,16 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task GgufBatchDecoder_GreedyMatchesGenerator() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
+        if (accelerator.AcceleratorType is AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("a GPU decode test");
+        // WebGL (no groups, no slots from atomics: no candidate kernels, no device draws; a draw reads its row) runs the short form: 8 greedy tokens, one
+        // sequence and two rows, = the generator's
+        bool webgl = accelerator.AcceleratorType == AcceleratorType.WebGL;
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
         var hub = new ModelsHostStreamLoader(http);
         var messages = new List<(string, string)> { ("user", "Name three primary colors and say why they are called primary.") };
-        const int maxNew = 48;
+        int maxNew = webgl ? 8 : 48;
         string want;
         {
             var m = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
@@ -42,6 +45,18 @@ public abstract partial class MLTestBase
         var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, messages, thinking: false);
         var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
         string Text(int[] t) { var d = tok.CreateStreamingDecoder(); var sb = new System.Text.StringBuilder(); foreach (var x in t) sb.Append(d.Push(x)); sb.Append(d.Finish()); return sb.ToString(); }
+        if (webgl)
+        {
+            if (dec.DeviceSampling || !dec.NoCandidates) throw new Exception("WebGL: device draws or candidate kernels are on");
+            var w1 = await dec.GenerateAsync(ids, 1, maxNew, 0f, 1f, 1, stopSet);
+            var w2 = await dec.GenerateAsync(ids, 2, maxNew, 0f, 1f, 1, stopSet);
+            string g = Text(w1[0]);
+            bool wSame = g == want, wRows = w2.All(r => r.SequenceEqual(w1[0]));
+            var wReport = $"WebGL: greedy {(wSame ? "= the generator" : "DIFFERS from the generator")} ({w1[0].Length} tokens), two rows {(wRows ? "identical" : "DIFFER")} (no candidate kernels, rows read)";
+            Console.WriteLine("[BatchDecode] " + wReport);
+            if (!wSame || !wRows) throw new Exception(wReport + $" | want: {want} | got: {g}");
+            return wReport;
+        }
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var one = await dec.GenerateAsync(ids, 1, maxNew, 0f, 1f, 1, stopSet);
         double t1 = sw.Elapsed.TotalSeconds;
@@ -161,6 +176,57 @@ public abstract partial class MLTestBase
             }
         }
         bool compactSame = Enumerable.Range(0, 4).All(s => compacted[s].SequenceEqual(ridden[s]));
+        // the repetition penalty (1.3 over the last 8 tokens: the window wraps within the answer). Greedy: the device draws (penalty kernel, windows appended by
+        // the draw kernel through pipelined and captured steps) = the host path reading each row and applying TextGenerationSampler.ApplyRepetitionPenalty, and
+        // different from unpenalised greedy (the penalty is live). Sampled: pipelined and shrinking = the unpipelined loop riding all four along.
+        var penDev = await dec.GenerateAsync(ids, 2, maxNew, 0f, 1f, 1, stopSet, repetitionPenalty: 1.3f, repeatLastN: 8);
+        dec.DeviceSampling = false;
+        var penHost = await dec.GenerateAsync(ids, 2, maxNew, 0f, 1f, 1, stopSet, repetitionPenalty: 1.3f, repeatLastN: 8);
+        dec.DeviceSampling = true;
+        bool penGreedySame = penDev.All(r => r.SequenceEqual(penHost[0])) && penHost.All(r => r.SequenceEqual(penHost[0])), penLive = !penDev[0].SequenceEqual(one[0]);
+        var penCompacted = await dec.GenerateAsync(ids, 4, longNew, 0.8f, 0.95f, 23, stopSet, repetitionPenalty: 1.3f, repeatLastN: 8);
+        var penRidden = new List<int>[4];
+        {
+            await dec.PrefillAsync(ids, 0.8f);
+            dec.Fork(4);
+            dec.Draw(0.95f, 23, 1.3f, 8);
+            var fin = new bool[4];
+            var all = new[] { 0, 1, 2, 3 };
+            for (int s = 0; s < 4; s++) penRidden[s] = new List<int>();
+            while (true)
+            {
+                var nx = await dec.ReadDrawnAsync();
+                for (int s = 0; s < 4; s++)
+                {
+                    if (fin[s]) continue;
+                    if (stopSet.Contains(nx[s]) || penRidden[s].Count >= longNew) { fin[s] = true; continue; }
+                    penRidden[s].Add(nx[s]);
+                }
+                if (fin.All(f => f)) break;
+                await dec.StepDrawnAsync(all, 0.8f);
+            }
+        }
+        bool penCompactSame = Enumerable.Range(0, 4).All(s => penCompacted[s].SequenceEqual(penRidden[s]));
+        // the window itself: after 70 drawn steps of four sequences (the 64-token ring wraps; WebGPU: replayed captured plans, whose capture passes must not
+        // leave tokens in it) each sequence's device window = the last 8 tokens it drew
+        bool windowSame = true;
+        {
+            await dec.PrefillAsync(ids, 0.8f);
+            dec.Fork(4);
+            dec.Draw(0.95f, 29, 1.3f, 8);
+            var drawnBy = Enumerable.Range(0, 4).Select(_ => new List<int>()).ToArray();
+            var all = new[] { 0, 1, 2, 3 };
+            for (int step = 0; ; step++)
+            {
+                var t = await dec.ReadDrawnAsync();
+                for (int s = 0; s < 4; s++) drawnBy[s].Add(t[s]);
+                if (step == 70) break;
+                await dec.StepDrawnAsync(all, 0.8f);
+            }
+            for (int s = 0; s < 4; s++) windowSame &= (await dec.ReadPenaltyWindowAsync(s)).SequenceEqual(drawnBy[s].TakeLast(8));
+        }
+        bool penOk = penGreedySame && penLive && penCompactSame && windowSame;
+        string penNote = $"repetition penalty 1.3 / last 8: greedy device {(penGreedySame ? "= host" : "DIFFERS from host")} ({penDev[0].Length} tokens, {(penLive ? "differs from unpenalised greedy" : "SAME as unpenalised greedy")}), sampled pipelined {(penCompactSame ? "= riding along" : "DIFFERS from riding along")} (lengths {string.Join("/", penCompacted.Select(c => c.Length))}), device window after 71 draws {(windowSame ? "= the last 8 drawn" : "DIFFERS from the last 8 drawn")}";
         // the split-K attention against the three-kernel path past one chunk of keys (a ~600-token prompt: 3 chunks): the prefill's logits and, after four
         // decode steps of four sequences, every row's logits
         var longMsgs = new List<(string, string)> { ("user", string.Concat(Enumerable.Repeat("Name three primary colors and say why they are called primary. ", 40))) };
@@ -229,10 +295,10 @@ public abstract partial class MLTestBase
             + $"one sequence {one[0].Length / t1:F1} tok/s; warm, device draws one {oneWarm[0].Length / t1w:F1} / four {fourWarm.Sum(r => r.Length) / t4w:F1} tok/s, host draws one {oneHost[0].Length / t1h:F1} / four {fourHost.Sum(r => r.Length) / t4h:F1} tok/s (greedy {(hostSame ? "identical" : "DIFFERS")}); "
             + $"a host-draw step: ids up {dt.Embed / dt.Steps:F2} ms, queued {dt.Device / dt.Steps:F2} ms, wait + candidates read {dt.Readback / dt.Steps:F2} ms; host draws from the candidates {draws - mismatches}/{draws} = the full-row sampler ({wide} read the row); "
             + $"device draws vs the host sampler: candidates path {DrawNote(drawCand)}; full row forced {DrawNote(drawForced)}; T 1.5 top-p 0.99 {DrawNote(drawFlat)}; float ties at most {maxTie:E1} from u (window {TieWindow:E0}) {string.Join(" ", badNotes)}; "
-            + $"finished sequences leaving the batch (pipelined): {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps); joined projections vs separate: {joinPre:E1} / {joinSteps:E1}; {captureNote}";
+            + $"{penNote}; finished sequences leaving the batch (pipelined): {(compactSame ? "same tokens as riding along" : "DIFFERENT from riding along")} (lengths {string.Join("/", compacted.Select(c => c.Length))}); split-K attention vs three kernels at {longIds.Length} tokens: logits differ by {attPre:E1} (prefill), {attSteps:E1} (4 decode steps); joined projections vs separate: {joinPre:E1} / {joinSteps:E1}; {captureNote}";
         Console.WriteLine("[BatchDecode] " + report);
         if (!same) throw new Exception(report + $"\nwant: {want}\ngot:  {got}");
-        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !hostSame || !drawsOk || !compactSame || lengths < 2 || !attOk || !joinOk || !captureOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
+        if (!rowsEqual || distinct < 2 || mismatches > 0 || wide * 10 > draws || !hostSame || !drawsOk || !penOk || !compactSame || lengths < 2 || !attOk || !joinOk || !captureOk) throw new Exception(report);      // the row read is a safety net: a device path that keeps falling back is broken
         return report;
     });
 
@@ -255,27 +321,43 @@ public abstract partial class MLTestBase
         var notes = new List<string>();
         bool ok = true;
         // returns how many rows' host draws satisfy `counted` (proof the case exercised what it is for)
-        async Task<int> Case(string name, float[] lg, float T, float topP, bool force, int seed, Func<int, int, bool>? counted = null)
+        async Task<int> Case(string name, float[] lg, float T, float topP, bool force, int seed, Func<int, int, bool>? counted = null, int[][]? windows = null, float penalty = 1f,
+            int lastN = 0, int ring = 0)
         {
-            var got = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force);
+            var got = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force, windows, penalty, lastN, ring);
+            // the host reference: TextGenerationSampler.ApplyRepetitionPenalty on each row's window, then SampleLogits
+            var hl = lg;
+            if (windows != null && penalty != 1f)
+            {
+                hl = (float[])lg.Clone();
+                var row = new float[V];
+                for (int r = 0; r < R; r++)
+                {
+                    Array.Copy(hl, (long)r * V, row, 0, V);
+                    // the window the decoder penalises: the last min(lastN, ring) tokens (0: all the ring holds)
+                    int keep = Math.Min(windows[r].Length, Math.Min(lastN > 0 ? lastN : int.MaxValue, ring > 0 ? ring : int.MaxValue));
+                    TextGenerationSampler.ApplyRepetitionPenalty(row, windows[r][^keep..], penalty);
+                    Array.Copy(row, 0, hl, (long)r * V, V);
+                }
+            }
             int eq = 0, ties = 0, bad = 0, wide = 0, hits = 0; double maxD = 0;
             var badNotes = new List<string>();
             for (int r = 0; r < R; r++)
             {
                 double u = GgufBatchDecoder.DrawUniform(seed, r, Pos);
-                int want = GgufBatchDecoder.SampleLogits(lg, r, V, T, topP, u);
-                if (T > 0f && NucleusSize(lg, r, V, T, topP) > GgufBatchDecoder.Candidates) wide++;
+                int want = GgufBatchDecoder.SampleLogits(hl, r, V, T, topP, u);
+                if (T > 0f && NucleusSize(hl, r, V, T, topP) > GgufBatchDecoder.Candidates) wide++;
                 if (counted != null && counted(r, want)) hits++;
                 if (got[r] == want) { eq++; continue; }
                 if (T > 0f)
                 {
-                    var di = DrawInterval(lg, r, V, T, Math.Min(1f, topP + (float)TieWindow), got[r]);
-                    var dn = DrawInterval(lg, r, V, T, topP, got[r]);
+                    var di = DrawInterval(hl, r, V, T, Math.Min(1f, topP + (float)TieWindow), got[r]);
+                    var dn = DrawInterval(hl, r, V, T, topP, got[r]);
                     double dist = Math.Max(0, Math.Max(dn.Lo - u, u - dn.Hi));
                     if (di.Rank >= 0 && di.Rank < di.Nucleus && dist <= TieWindow) { ties++; maxD = Math.Max(maxD, dist); continue; }
                 }
                 bad++;
-                if (badNotes.Count < 3) badNotes.Add($"[row {r}: u {u:R}, host {want} {RankNote(lg, r, V, T, topP, want, u)}, device {got[r]} {RankNote(lg, r, V, T, topP, got[r], u)}]");
+                if (badNotes.Count < 3) badNotes.Add($"[row {r}: u {u:R}, host {want} {RankNote(hl, r, V, T, topP, want, u)}, device {got[r]} {RankNote(hl, r, V, T, topP, got[r], u)}]");
             }
             bool caseOk = bad == 0 && ties * 20 <= R;
             ok &= caseOk;
@@ -318,8 +400,35 @@ public abstract partial class MLTestBase
         }
         await Case("3 ties at the maximum, greedy", top, 0f, 1f, false, 16);
         int topDrawn = await Case("3 ties at the maximum, T 0.3", top, 0.3f, 0.9f, false, 17, (r, t) => topIds[r].Contains(t));
-        bool covered = flatWide >= R / 2 && inTies >= R / 4 && inTiesForced >= R / 4 && topDrawn == R;
-        var report = $"{accelerator.AcceleratorType}: device draws vs the host sampler, {R} rows of {V}: " + string.Join("; ", notes) + (covered ? "" : $"; COVERAGE short (flat wide {flatWide}, draws in the ties {inTies}/{inTiesForced}, at the maximum {topDrawn})");
+        // the repetition penalty (the decoder's penalty kernel before the candidates): each row's window holds its five best tokens, two of them twice (a token
+        // repeated in the window is penalised once) and three with negative logits (multiplied), penalty 1.3; counted = rows whose draw the penalty changed
+        var win = new int[R][];
+        for (int r = 0; r < R; r++)
+        {
+            int o = r * V;
+            var order = Enumerable.Range(0, V).OrderByDescending(i => rnd[o + i]).ToArray();
+            var neg = Enumerable.Range(0, V).Where(i => rnd[o + i] < -1f).Take(3).ToArray();
+            win[r] = new[] { order[0], order[1], order[2], order[0], order[3], neg[0], order[1], order[4], neg[1], neg[2] };
+        }
+        Func<int, int, bool> Changed(float T, float topP, int seed) => (r, t) => t != GgufBatchDecoder.SampleLogits(rnd, r, V, T, topP, GgufBatchDecoder.DrawUniform(seed, r, Pos));
+        int penGreedy = await Case("penalty 1.3, greedy", rnd, 0f, 1f, false, 18, Changed(0f, 1f, 18), win, 1.3f);
+        int penSampled = await Case("penalty 1.3, T 0.5 top-p 0.9", rnd, 0.5f, 0.9f, false, 19, Changed(0.5f, 0.9f, 19), win, 1.3f);
+        int penForced = await Case("penalty 1.3, T 0.5 top-p 0.9, whole row forced", rnd, 0.5f, 0.9f, true, 20, Changed(0.5f, 0.9f, 20), win, 1.3f);
+        // the window's edges: a 20-token history in a 12-token ring (it wrapped), the last 8 penalised. The best token is the NEWEST (penalised), the 2nd and 3rd
+        // best sit only outside the last 8 (not penalised): a window one token short at either end, too long, or read from the wrong ring slot changes draws
+        var hist = new int[R][];
+        for (int r = 0; r < R; r++)
+        {
+            int o = r * V;
+            var order = Enumerable.Range(0, V).OrderByDescending(i => rnd[o + i]).ToArray();
+            var neg = Enumerable.Range(0, V).Where(i => rnd[o + i] < -1f).Take(3).ToArray();
+            hist[r] = new[] { order[1], order[2], order[6], order[7], neg[0], order[8], order[9], neg[1], order[10], order[11], order[12], order[13],
+                              order[3], neg[2], order[4], order[3], order[14], order[15], order[16], order[0] };
+        }
+        int penEdgeGreedy = await Case("penalty window edges (20 drawn, ring 12, last 8), greedy", rnd, 0f, 1f, false, 21, Changed(0f, 1f, 21), hist, 1.3f, 8, 12);
+        int penEdgeSampled = await Case("same, T 0.5 top-p 0.9", rnd, 0.5f, 0.9f, false, 22, Changed(0.5f, 0.9f, 22), hist, 1.3f, 8, 12);
+        bool covered = flatWide >= R / 2 && inTies >= R / 4 && inTiesForced >= R / 4 && topDrawn == R && penGreedy >= R / 2 && penSampled >= R / 4 && penForced >= R / 4 && penEdgeGreedy >= R / 2 && penEdgeSampled >= R / 4;
+        var report = $"{accelerator.AcceleratorType}: device draws vs the host sampler, {R} rows of {V}: " + string.Join("; ", notes) + (covered ? "" : $"; COVERAGE short (flat wide {flatWide}, draws in the ties {inTies}/{inTiesForced}, at the maximum {topDrawn}, changed by the penalty {penGreedy}/{penSampled}/{penForced}/{penEdgeGreedy}/{penEdgeSampled})");
         Console.WriteLine("[BatchDecodeDraws] " + report);
         if (!ok || !covered) throw new Exception(report);
         return report;

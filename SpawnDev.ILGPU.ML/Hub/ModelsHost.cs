@@ -44,6 +44,30 @@ public static class ModelsHost
     public static string GetOllamaUrl(string model, string tag, string layer)
         => $"{BaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/{model.Trim('/')}-{tag.Trim('/')}-{layer.Trim('/')}.gguf";
 
+    // ---- Ollama-layout installs (an installer writes the cache Ollama reads: the registry manifest and every blob it references, by digest) ----
+
+    /// <summary>
+    /// Where the registry manifest of an Ollama model lives: <c>{base}/ollama/{model}/{tag}/manifest</c>, the registry's bytes verbatim (so the digests in it
+    /// are the registry's).
+    /// </summary>
+    public static string GetOllamaManifestUrl(string model, string tag)
+        => $"{BaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/manifest";
+
+    /// <summary>
+    /// Where an Ollama blob lives by its digest: <c>{base}/ollama/blobs/sha256-{hex}</c> (content-addressed, shared by every model and tag that references it,
+    /// immutable). <paramref name="digest"/>: <c>sha256:{hex}</c> as a manifest writes it, or <c>sha256-{hex}</c> as the cache names files.
+    /// </summary>
+    public static string GetOllamaBlobUrl(string digest)
+    {
+        var d = digest.Trim();
+        if (d.StartsWith("sha256:", StringComparison.Ordinal) || d.StartsWith("sha256-", StringComparison.Ordinal)) d = d[7..];
+        if (d.Length != 64 || !d.All(Uri.IsHexDigit)) throw new ArgumentException($"'{digest}' is not a sha256 digest (sha256:<64 hex>)", nameof(digest));
+        return $"{BaseUrl.TrimEnd('/')}/ollama/blobs/sha256-{d.ToLowerInvariant()}";
+    }
+
+    /// <summary>The list of Ollama models hosted for install: <c>{base}/ollama/index.json</c>.</summary>
+    public static string GetOllamaIndexUrl() => $"{BaseUrl.TrimEnd('/')}/ollama/index.json";
+
     private static readonly string[] ArchiveExtensions = { ".tar.bz2", ".tar.gz", ".tgz", ".zip" };
 
     /// <summary>
