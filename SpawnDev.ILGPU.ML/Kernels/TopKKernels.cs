@@ -28,22 +28,34 @@ internal static class TopKKernels
         for (int idx = bi + 1; idx < end; idx++) { float v = logits[(long)r * V + idx]; if (v > best) { best = v; bi = idx; } }
         maxV[ii] = best; maxI[ii] = bi;
     }
+    /// <summary>Threads for <see cref="FloorImpl"/>: one per chunk maximum of each row (at least <see cref="K"/>, so every slot is written).</summary>
+    public static int FloorThreads(int rows, int nch) => rows * Math.Max(nch, K);
+
     // the row's K best chunk maxima into o's value / id slots (o[0] is then the row's best value); the K-th of them is the floor: those K values all reach it.
-    // The gather count is zeroed here, before the gather runs.
-    public static void FloorImpl(Index1D row, FV maxV, IV maxI, FV o, IV selN, int nch, int S)
+    // One thread per chunk (FloorThreads): its maximum's rank among the row's (better = larger, or equal from an earlier chunk) is its slot when below K;
+    // thread j also fills slot j when fewer than j + 1 maxima are above float.MinValue. The gather count is zeroed here, before the gather runs. (It was one thread per row
+    // insertion-sorting all the maxima through device memory: about a millisecond per draw on an RTX 4070, measured 2026-11-01.)
+    public static void FloorImpl(Index1D i, FV maxV, IV maxI, FV o, IV selN, int nch, int S)
     {
-        int r = row;
-        long ob = (long)r * S;
-        for (int j = 0; j < K; j++) { o[ob + j] = float.MinValue; o[ob + K + j] = -1f; }
-        for (int ch = 0; ch < nch; ch++)
+        int w = Math.Max(nch, K), ii = i, r = ii / w, ch = ii % w;
+        long ob = (long)r * S, mb = (long)r * nch;
+        if (ch == 0) selN[r] = 0;
+        // only maxima above float.MinValue take a slot (-Infinity never reaches the floor): with fewer than K of them the floor stays float.MinValue
+        bool mine = ch < nch;
+        float v = mine ? maxV[mb + ch] : float.MinValue;
+        mine &= v > float.MinValue;
+        int rank = 0, valid = 0;
+        for (int c = 0; c < nch; c++)
         {
-            float v = maxV[(long)r * nch + ch];
-            if (v <= o[ob + K - 1]) continue;
-            int pos = K - 1;
-            while (pos > 0 && o[ob + pos - 1] < v) { o[ob + pos] = o[ob + pos - 1]; o[ob + K + pos] = o[ob + K + pos - 1]; pos--; }
-            o[ob + pos] = v; o[ob + K + pos] = maxI[(long)r * nch + ch];
+            float u = maxV[mb + c];
+            bool counts = u > float.MinValue;
+            if (counts) valid++;
+            bool better = counts & ((u > v) | ((u == v) & (c < ch)));
+            if (better) rank++;
         }
-        selN[r] = 0;
+        if (mine & (rank < K)) { o[ob + rank] = v; o[ob + K + rank] = maxI[mb + ch]; }
+        // the slots no maximum takes
+        if ((ch < K) & (ch >= valid)) { o[ob + ch] = float.MinValue; o[ob + K + ch] = -1f; }
     }
     // each chunk's values at or above the floor appended to the row's list (in any order), and (T > 0) the chunk's softmax mass at T over the values within
     // e^20 of the best (the set GgufBatchDecoder.SampleLogits draws from)
@@ -64,27 +76,27 @@ internal static class TopKKernels
         }
         o[ob + 2 * K + 1 + ch] = sum;
     }
-    // the row's gathered values sorted into its K best (skipped when more than SelectCap reached the floor)
-    public static void FinalImpl(Index1D row, FV selV, IV selI, IV selN, FV o, int S)
+    /// <summary>Threads for <see cref="FinalImpl"/>: one per gather slot of each row.</summary>
+    public static int FinalThreads(int rows) => rows * SelectCap;
+
+    // the row's gathered values sorted into its K best (skipped when more than SelectCap reached the floor). One thread per gathered value (FinalThreads):
+    // its rank among the gathered (better = larger, or equal with the lower index; indices are distinct) is its slot when below K; the slots none
+    // takes already hold FloorImpl's fill. (It was one thread per row insertion-sorting the gathered values through device memory.)
+    public static void FinalImpl(Index1D i, FV selV, IV selI, IV selN, FV o, int S)
     {
-        int r = row, n = selN[r];
+        int ii = i, r = ii / SelectCap, s = ii % SelectCap, n = selN[r];
         long ob = (long)r * S, sb = (long)r * SelectCap;
-        o[ob + 2 * K] = n;
+        if (s == 0) o[ob + 2 * K] = n;
         if (n > SelectCap) return;
-        for (int j = 0; j < K; j++) { o[ob + j] = float.MinValue; o[ob + K + j] = -1f; }
-        for (int s = 0; s < n; s++)
+        if (s >= n) return;                 // the slots past the gathered keep FloorImpl's float.MinValue / -1 fill (n is at least its count of valid maxima)
+        float v = selV[sb + s]; int id = selI[sb + s];
+        int rank = 0;
+        for (int t = 0; t < n; t++)
         {
-            float v = selV[sb + s]; int id = selI[sb + s];
-            float lv = o[ob + K - 1];
-            if (v < lv || (v == lv && o[ob + 2 * K - 1] >= 0f && id > (int)o[ob + 2 * K - 1])) continue;
-            int pos = K - 1;
-            while (pos > 0)
-            {
-                float pv = o[ob + pos - 1];
-                if (pv > v || (pv == v && (int)o[ob + K + pos - 1] < id)) break;
-                o[ob + pos] = pv; o[ob + K + pos] = o[ob + K + pos - 1]; pos--;
-            }
-            o[ob + pos] = v; o[ob + K + pos] = id;
+            float u = selV[sb + t];
+            bool better = (u > v) | ((u == v) & (selI[sb + t] < id));
+            if (better) rank++;
         }
+        if (rank < K) { o[ob + rank] = v; o[ob + K + rank] = id; }
     }
 }

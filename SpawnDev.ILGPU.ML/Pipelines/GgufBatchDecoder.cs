@@ -524,9 +524,9 @@ public sealed class GgufBatchDecoder : IDisposable
         // device draws: each row's repetition penalty on its logits first (a no-op at penalty 1), so the candidates and the draw see the penalised row
         if (dev && _penOn) { _penalize!(R * _repCap, logits, seqView, _drawI!.View, _drawF!.View, _rep!.View, Vocab); Prof("penalty"); }
         _chunkMax!(outRows * nch, logits, maxV, maxI, Vocab, nch, Chunk); Prof("chunkMax");
-        _floor!(outRows, maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
+        _floor!(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FloorThreads(outRows, nch), maxV, maxI, cand, _selN.View, nch, S); Prof("floor");
         _select!(outRows * nch, logits, cand, _selN.View, selV, _selI.View, Vocab, nch, S, temperature, Chunk); Prof("select");
-        _final!(outRows, selV, _selI.View, _selN.View, cand, S); Prof("final");
+        _final!(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FinalThreads(outRows), selV, _selI.View, _selN.View, cand, S); Prof("final");
         // device draws: each row's next token, into its sequence's slot of _seqIds (the next step's input), then a copy for the host to read
         if (dev) QueueDraw(R, rowZero: false, tAdd: 1, temperature, logits, cand);
         return (logits, cand, outRows);
@@ -1077,9 +1077,9 @@ public sealed class GgufBatchDecoder : IDisposable
         var penalize = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, FV, IV, int>(PenalizeImpl);
         penalize(rows * W, lg.View, seqs.View, dI.View, dF2.View, rep.View, vocab);
         chunkMax(rows * nch, lg.View, maxV.View, maxI.View, vocab, nch, Chunk);
-        floor(rows, maxV.View, maxI.View, cand.View, selN.View, nch, S);
+        floor(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FloorThreads(rows, nch), maxV.View, maxI.View, cand.View, selN.View, nch, S);
         select(rows * nch, lg.View, cand.View, selN.View, selV.View, selI.View, vocab, nch, S, temperature, Chunk);
-        final(rows, selV.View, selI.View, selN.View, cand.View, S);
+        final(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FinalThreads(rows), selV.View, selI.View, selN.View, cand.View, S);
         draw(new KernelConfig(rows, DrawGroup), lg.View, cand.View, seqs.View, pos.View, dF2.View, dI.View, ids.View, rep.View, vocab, nch, S, 0, 1, temperature);
         var got = await ids.View.SubView(0, rows).CopyToHostAsync().ConfigureAwait(false);      // the read waits for the kernels (every backend), so the buffers may go
         return got;

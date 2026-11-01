@@ -130,6 +130,17 @@ public abstract partial class MLTestBase
         w = 0.7f;
         await Check("allow + addend, w 0.7", 6, allowBuf.View, addBuf.View);
         allowHost = null; addHost = null; w = 1f;
+        // one search's floor must not carry into the next: a search whose scores all sit near 10 (an addend of 10 everywhere), then a plain one (scores
+        // near 0). A stale floor of ~10 would gather nothing on the second search.
+        using (var high = accelerator.Allocate1D(Enumerable.Repeat(10f, 16384).ToArray()))
+        {
+            await index.SearchAsync(Unit(), 64, null, high.View, 1f);
+            var q1 = Unit();
+            var dev = await index.SearchAsync(q1, 64);
+            bool good = Same(dev, Host(q1, 64));
+            notes.Add($"a plain search after one scoring near 10: {(good ? "= host" : $"WRONG ({dev.Length} results, best {dev.FirstOrDefault().Score:F4})")}");
+            ok &= good;
+        }
 
         var removed = Enumerable.Range(0, N).Where(_ => rng.NextDouble() < 0.1).Take(1000).ToList();
         foreach (int s in removed) { index.Remove(s); live.Remove(s); }

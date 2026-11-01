@@ -60,6 +60,16 @@ public sealed class GgufTextGenerationPipeline : IDisposable
         set => _gen.EnableWebGPUDecodeCapture = value;
     }
 
+    /// <summary>Sampled steps draw on the device (one int read per token) - see <see cref="GgufGenerator.DeviceSampling"/>. Default true.</summary>
+    public bool DeviceSampling
+    {
+        get => _gen.DeviceSampling;
+        set => _gen.DeviceSampling = value;
+    }
+
+    /// <summary>Tokens drawn on the device so far, and steps the host sampled instead (diagnostics; see <see cref="GgufGenerator.DeviceSampledTokens"/>).</summary>
+    public (int Device, int Fallbacks) DeviceSamplerCounts => (_gen.DeviceSampledTokens, _gen.DeviceSamplerFallbacks);
+
     /// <summary>Diagnostics for the active decode capture (ops + patch counts), or null.</summary>
     public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo => _gen.DecodeCaptureInfo;
 

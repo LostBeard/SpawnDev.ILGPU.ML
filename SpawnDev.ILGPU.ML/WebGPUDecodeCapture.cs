@@ -494,6 +494,21 @@ public sealed class WebGPUDecodeCapture : IDisposable
         return logits;
     }
 
+    /// <summary>
+    /// SAMPLED decode step that leaves the logits ON THE DEVICE: patch + replay, no read. Returns the last
+    /// position's logits view (vocab floats) for a device sampler (<see cref="Kernels.DeviceSampler"/>), whose
+    /// one-int read is then the per-token fence instead of the ~vocab*4-byte logits read.
+    /// </summary>
+    public async Task<ArrayView1D<float, Stride1D.Dense>> PatchAndReplayKeepLogitsAsync(float tokenId, int pastLen)
+    {
+        var t1 = await PatchAllAsync(tokenId, pastLen);
+        await _plan.ReplayAsync();
+        LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, System.Diagnostics.Stopwatch.GetTimestamp()).TotalMilliseconds;
+        LastSyncMs = 0;
+        _session.SetGGUFDecodePastLen(pastLen + 1);
+        return _lastLogitsView;
+    }
+
     // Shared patch phase: input token + scalar bytes + slot arrays + copy destinations, with the
     // sub-phase diagnostics. Returns the end-of-patch timestamp.
     private async Task<long> PatchAllAsync(float tokenId, int pastLen)

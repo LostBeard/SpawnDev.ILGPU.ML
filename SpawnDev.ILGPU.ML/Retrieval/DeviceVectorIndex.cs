@@ -204,9 +204,9 @@ public sealed class DeviceVectorIndex : IDisposable
         Ensure(ref _maxV, nch); EnsureI(ref _maxI, nch); Ensure(ref _cand, S);
         Ensure(ref _selV, TopKKernels.SelectCap); EnsureI(ref _selI, TopKKernels.SelectCap); EnsureI(ref _selN, 64);
         _chunkMax(nch, scores, _maxV!.View, _maxI!.View, n, nch, chunk);
-        _floor(1, _maxV.View, _maxI.View, _cand!.View, _selN!.View, nch, S);
+        _floor(TopKKernels.FloorThreads(1, nch), _maxV.View, _maxI.View, _cand!.View, _selN!.View, nch, S);
         _select(nch, scores, _cand.View, _selN.View, _selV!.View, _selI!.View, n, nch, S, 0f, chunk);
-        _final(1, _selV.View, _selI.View, _selN.View, _cand.View, S);
+        _final(TopKKernels.FinalThreads(1), _selV.View, _selI.View, _selN.View, _cand.View, S);
         // the read is ordered after the kernels (no SynchronizeAsync: a second round trip)
         var c = await _cand.View.SubView(0, 2 * TopKKernels.K + 1).CopyToHostAsync().ConfigureAwait(false);
         if (c[2 * TopKKernels.K] > TopKKernels.SelectCap)

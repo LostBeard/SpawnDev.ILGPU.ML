@@ -55,21 +55,70 @@ public sealed class HttpRangeStream : Stream
         return _position;
     }
 
+    /// <summary>
+    /// How long a read may wait for the next bytes of a response before the connection counts as stalled and the range is requested again from the bytes
+    /// already received. It restarts with every chunk that arrives, so a slow transfer that is moving never trips it. Without it a response whose body
+    /// stopped mid-way blocked forever: <see cref="HttpClient.Timeout"/> stops applying once the headers arrive (2026-11-01: a test held an idle
+    /// connection to the models host for 25 minutes).
+    /// </summary>
+    public TimeSpan StallTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>Failed attempts (a stall, a dropped connection, a short or refused response) a read survives before it throws.</summary>
+    public int Attempts { get; set; } = 4;
+
+    /// <summary>Times a read resumed after a stall, a dropped connection or a short response (diagnostics).</summary>
+    public int Resumes { get; private set; }
+
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
         if (_position >= _length || buffer.Length == 0) return 0;
-        long end = Math.Min(_position + buffer.Length, _length) - 1;   // clamp to EOF (RFC 7233)
-        using var req = new HttpRequestMessage(HttpMethod.Get, _url);
-        req.Headers.Range = new RangeHeaderValue(_position, end);
-        using var resp = await ModelsHost.SendAsync(_http, req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
-        var bytes = await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
-        int n = Math.Min(bytes.Length, buffer.Length);
-        bytes.AsSpan(0, n).CopyTo(buffer.Span);
-        _position += n;
-        BytesFetched += n;
-        return n;
+        int want = (int)Math.Min(buffer.Length, _length - _position);
+        int got = 0, failures = 0;
+        Exception? last = null;
+        while (got < want)
+        {
+            long start = _position + got, end = _position + want - 1;   // clamp to EOF (RFC 7233)
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, _url);
+                req.Headers.Range = new RangeHeaderValue(start, end);
+                stall.CancelAfter(StallTimeout);
+                using var resp = await ModelsHost.SendAsync(_http, req, HttpCompletionOption.ResponseHeadersRead, stall.Token).ConfigureAwait(false);
+                resp.EnsureSuccessStatusCode();
+                // a server that ignores Range answers 200 with the whole file: its first bytes are not the ones asked for
+                bool whole = start == 0 && end == _length - 1;
+                if (resp.StatusCode != System.Net.HttpStatusCode.PartialContent && !whole)
+                    throw new RangeRefusedException($"GET {_url} bytes={start}-{end}: HTTP {(int)resp.StatusCode}, not 206 (the server ignored the range)");
+                if (resp.Content.Headers.ContentRange is { From: long from } cr && from != start)
+                    throw new RangeRefusedException($"GET {_url} bytes={start}-{end}: the server sent bytes from {from} ({cr})");
+                using var body = await resp.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
+                int before = got;
+                while (got < want)
+                {
+                    stall.CancelAfter(StallTimeout);                     // the stall clock restarts with every chunk
+                    int n = await body.ReadAsync(buffer.Slice(got, want - got), stall.Token).ConfigureAwait(false);
+                    if (n == 0) break;                                    // the body ended early (a dropped connection)
+                    got += n;
+                    BytesFetched += n;
+                }
+                if (got < want) throw new IOException($"GET {_url} bytes={start}-{end}: the body ended after {got - before} of {end - start + 1} bytes");
+            }
+            catch (RangeRefusedException) { throw; }
+            catch (Exception ex) when (!ct.IsCancellationRequested && ex is IOException or HttpRequestException or OperationCanceledException)
+            {
+                last = ex is OperationCanceledException ? new TimeoutException($"GET {_url} bytes={start}-{end}: no bytes for {StallTimeout.TotalSeconds:F0} s", ex) : ex;
+                if (++failures >= Attempts) throw new IOException($"GET {_url}: {failures} failed attempts at byte {_position + got}", last);
+                Resumes++;
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * failures), ct).ConfigureAwait(false);
+            }
+        }
+        _position += got;
+        return got;
     }
+
+    // a response that cannot be resumed from: retrying the same request would get the same wrong bytes
+    private sealed class RangeRefusedException(string message) : IOException(message);
 
     public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
         => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();

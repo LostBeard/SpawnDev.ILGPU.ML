@@ -267,8 +267,11 @@ public sealed class GgufGenerator : IDisposable
             IReadOnlyDictionary<string, Tensor>? outputs;
             int? fastToken = null;        // greedy single-fence replay token (skips the logits section)
             float[]? fastLogits = null;   // sampled single-fence replay logits (host array, skips the GPU read)
+            bool penaltyApplied = false;  // the device sampler already penalised the row these logits came from
             bool wantSampling = config?.Strategy is "top_k" or "top_p";
             bool wantRepPen = config?.RepetitionPenalty is float rpv && rpv != 1.0f;
+            // a device draw this step: its settings go up NOW, before the forward is queued (on CUDA/OpenCL a later upload waits for the forward)
+            double stagedU = UseDeviceSampling && (wantSampling || (wantRepPen && generated.Count > 0)) ? StageDeviceSample(config, generated, rng) : 0.0;
             {
                 if (EnableWebGPUDecodeCapture && stepIds.Length == 1)
                 {
@@ -315,10 +318,20 @@ public sealed class GgufGenerator : IDisposable
                         fastToken = await _decodeCapture.PatchAndDecodeGreedyAsync(stepIds[0], _session.DecodePastLen);
                         outputs = null;
                     }
+                    else if (UseDeviceSampling)
+                    {
+                        // Sampled fast path (the /ai-chat top_p + repetition-penalty config): patch + replay, then the
+                        // draw ON THE DEVICE (penalty, candidates, draw): the one-int read is the per-token fence, not
+                        // the ~vocab*4-byte logits read
+                        var lv = await _decodeCapture.PatchAndReplayKeepLogitsAsync(stepIds[0], _session.DecodePastLen);
+                        var (tok, row) = await DeviceSampleAsync(lv, _vocabSize(lv), stagedU);
+                        if (tok is int dt) fastToken = dt; else { fastLogits = row; penaltyApplied = true; }
+                        outputs = null;
+                    }
                     else
                     {
-                        // Sampled fast path (the /ai-chat top_p + repetition-penalty config): patch +
-                        // replay + direct host logits read - still ONE fence per token.
+                        // Sampled fast path, host draw (DeviceSampling off): patch + replay + direct host logits read -
+                        // still ONE fence per token.
                         fastLogits = await _decodeCapture.PatchAndReadLogitsAsync(stepIds[0], _session.DecodePastLen);
                         outputs = null;
                     }
@@ -342,13 +355,15 @@ public sealed class GgufGenerator : IDisposable
             }
             else if (fastLogits != null)
             {
-                // Sampled replay already produced host logits (one fence) - sample on the host.
-                if (wantRepPen && generated.Count > 0)
+                // Sampled replay already produced host logits (one fence) - sample on the host (a device-sampler fallback:
+                // the row is already penalised, and the draw uses the uniform the device was given).
+                if (wantRepPen && generated.Count > 0 && !penaltyApplied)
                     TextGenerationSampler.ApplyRepetitionPenalty(fastLogits, RepeatWindow(generated, config!.RepeatLastN), config!.RepetitionPenalty);
+                var r = penaltyApplied ? _fallbackRng : rng;
                 next = config?.Strategy switch
                 {
-                    "top_k" => TextGenerationSampler.TopK(fastLogits, config.TopK, config.Temperature, rng),
-                    "top_p" => TextGenerationSampler.TopP(fastLogits, config.TopP, config.Temperature, rng),
+                    "top_k" => TextGenerationSampler.TopK(fastLogits, config.TopK, config.Temperature, r),
+                    "top_p" => TextGenerationSampler.TopP(fastLogits, config.TopP, config.Temperature, r),
                     _ => TextGenerationSampler.Greedy(fastLogits),
                 };
             }
@@ -365,6 +380,18 @@ public sealed class GgufGenerator : IDisposable
             if (!sampling && !repPen)
             {
                 next = await _argmax.ArgMaxAsync(lastLogits, vocab); // greedy on the GPU, read back one int
+            }
+            else if (UseDeviceSampling)
+            {
+                // penalty, candidates and draw on the device: one int read (it used to copy the row, synchronise, then read the
+                // whole vocabulary: two waits and ~vocab*4 bytes per token)
+                var (tok, row) = await DeviceSampleAsync(lastLogits, vocab, stagedU);
+                next = tok ?? (config?.Strategy switch
+                {
+                    "top_k" => TextGenerationSampler.TopK(row!, config.TopK, config.Temperature, _fallbackRng),
+                    "top_p" => TextGenerationSampler.TopP(row!, config.TopP, config.Temperature, _fallbackRng),
+                    _ => TextGenerationSampler.Greedy(row!),
+                });
             }
             else
             {
@@ -497,6 +524,54 @@ public sealed class GgufGenerator : IDisposable
     /// tokens (Ollama's repeat_last_n semantics), or the full history when n &lt;= 0. Penalizing the
     /// FULL history permanently punishes every common grammar token and decays long generations
     /// into word salad - the window keeps the penalty anti-loop, not anti-language.</summary>
+    /// <summary>
+    /// Sampled steps (and greedy steps with a repetition penalty) draw on the device (<see cref="DeviceSampler"/>: penalty, candidates and draw, one
+    /// int read per token) instead of reading the vocabulary's logits to the host. Same strategies and semantics as <see cref="TextGenerationSampler"/>,
+    /// the uniform from the generation's own <see cref="Random"/> (seeded runs stay reproducible); ties go to the lower id. Off: the host draws.
+    /// Not on WebGL (the host draws there).
+    /// </summary>
+    public bool DeviceSampling { get; set; } = true;
+    private bool UseDeviceSampling => DeviceSampling && DeviceSampler.Supports(_accelerator);
+    private DeviceSampler? _deviceSampler;
+    private readonly FixedUniform _fallbackRng = new();
+    private static int _vocabSize(ArrayView1D<float, Stride1D.Dense> logits) => (int)logits.Length;
+
+    // a Random whose next uniform is set by the caller: a device-sampler fallback samples the row on the host with the uniform the device was given
+    private sealed class FixedUniform : Random
+    {
+        public double U;
+        public override double NextDouble() => U;
+        protected override double Sample() => U;
+    }
+
+    /// <summary>Tokens the device sampler drew since the generator was made (diagnostics: which path a generation took).</summary>
+    public int DeviceSampledTokens { get; private set; }
+    /// <summary>Steps where the device sampler's candidates could not answer and the host sampled the row (diagnostics).</summary>
+    public int DeviceSamplerFallbacks { get; private set; }
+
+    // the step's draw settings to the device (before its forward is queued); returns the uniform (one per sampled token, as the host sampler draws;
+    // greedy draws none)
+    private double StageDeviceSample(GenerationConfig? config, List<int> generated, Random rng)
+    {
+        var strategy = config?.Strategy switch { "top_k" => DeviceSampler.Strategy.TopK, "top_p" => DeviceSampler.Strategy.TopP, _ => DeviceSampler.Strategy.Greedy };
+        double u = strategy == DeviceSampler.Strategy.Greedy ? 0.0 : rng.NextDouble();
+        bool repPen = config?.RepetitionPenalty is float rp && rp != 1f && generated.Count > 0;
+        _deviceSampler ??= new DeviceSampler(_accelerator);
+        _deviceSampler.Stage(strategy, config?.Temperature ?? 1f, config?.TopP ?? 1f, config?.TopK ?? 0, u,
+            repPen ? RepeatWindow(generated, config!.RepeatLastN) : Array.Empty<int>(), repPen ? config!.RepetitionPenalty : 1f);
+        return u;
+    }
+
+    // the staged draw: the token, or (null, the penalised row) when the candidates cannot answer (the caller samples the row with _fallbackRng)
+    private async Task<(int? Token, float[]? Row)> DeviceSampleAsync(ArrayView1D<float, Stride1D.Dense> logits, int vocab, double u)
+    {
+        int tok = await _deviceSampler!.SampleAsync(logits, vocab);
+        if (tok >= 0) { DeviceSampledTokens++; return (tok, null); }
+        DeviceSamplerFallbacks++;
+        _fallbackRng.U = u;
+        return (null, await logits.SubView(0, vocab).CopyToHostAsync());
+    }
+
     private static int[] RepeatWindow(List<int> generated, int repeatLastN)
     {
         if (repeatLastN <= 0 || generated.Count <= repeatLastN) return generated.ToArray();
