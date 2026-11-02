@@ -3,7 +3,7 @@
 // Decode GEMV throughput: FusedDequantMatMul.Forward (M = 1) and ForwardRows (M = 1..8) on the shapes of Qwen2.5-1.5B (hidden 1536, kv 256, ffn 8960, vocab 151936),
 // per block type, as effective weight bandwidth (weight bytes read / time). Weights are random blocks with valid fp16 scales (values do not change the time).
 //
-//   dotnet run gemv_rows_bench.cs -c Release -- [cuda|opencl] [reps=50]
+//   dotnet run gemv_rows_bench.cs -c Release -- [cuda|opencl] [reps=50] [llama8b]   (llama8b: llama3.1:8b shapes, gate+up joined)
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
@@ -20,7 +20,9 @@ using var mm = new FusedDequantMatMul(acc);
 Console.WriteLine($"{acc.Name} ({acc.AcceleratorType}), {reps} reps per point");
 
 var rng = new Random(1);
-var shapes = new (string Name, int K, int N)[] { ("q/o 1536x1536", 1536, 1536), ("k/v 1536x256", 1536, 256), ("gate/up 1536x8960", 1536, 8960), ("down 8960x1536", 8960, 1536), ("head 1536x151936", 1536, 151936) };
+var shapes = args.Length > 2 && args[2] == "llama8b"
+    ? new (string Name, int K, int N)[] { ("q/o 4096x4096", 4096, 4096), ("k/v 4096x1024", 4096, 1024), ("gate+up 4096x28672", 4096, 28672), ("down 14336x4096", 14336, 4096), ("head 4096x128256", 4096, 128256) }
+    : new (string Name, int K, int N)[] { ("q/o 1536x1536", 1536, 1536), ("k/v 1536x256", 1536, 256), ("gate/up 1536x8960", 1536, 8960), ("down 8960x1536", 8960, 1536), ("head 1536x151936", 1536, 151936) };
 foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K })
 {
     Console.WriteLine($"--- {type}");
@@ -54,6 +56,16 @@ foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K })
             {
                 double f = Time(() => mm.Forward(x.View, w.View, o.View, 1, K, N, type));
                 line += $"  Forward M=1 {f * 1000,6:F0} us {bytes / (f * 1e6),5:F0} GB/s |";
+                if (acc.AcceleratorType == AcceleratorType.Cuda && type != GGMLType.Q8_0)
+                {
+                    // the opt-in CUDA kernels: warp-cooperative (float) and dp4a (int8 activations)
+                    FusedDequantMatMul.EnableWarpGemv = true;
+                    double wv = Time(() => mm.Forward(x.View, w.View, o.View, 1, K, N, type));
+                    FusedDequantMatMul.EnableWarpGemv = false; FusedDequantMatMul.EnableDp4aGemv = true;
+                    double dv = Time(() => mm.Forward(x.View, w.View, o.View, 1, K, N, type));
+                    FusedDequantMatMul.EnableDp4aGemv = false;
+                    line += $"  warp {bytes / (wv * 1e6),5:F0} GB/s  dp4a {bytes / (dv * 1e6),5:F0} GB/s |";
+                }
             }
             double t = Time(() => mm.ForwardRows(x.View, w.View, o.View, M, K, N, type));
             line += $"  Rows M={M} {t * 1000,6:F0} us {bytes / (t * 1e6),5:F0} GB/s";

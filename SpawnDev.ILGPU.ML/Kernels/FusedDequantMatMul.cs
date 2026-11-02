@@ -893,7 +893,8 @@ public class FusedDequantMatMul : IDisposable
     // weight-bandwidth lever (PROVEN by Geordi, VectorizedLoadPtxDump). Sequential layout: a,b,c,d = the 4
     // consecutive int words. See GemvDp4aQ4_KImpl.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    private struct W16 { public int a, b, c, d; }
+    /// <summary>16 bytes as four ints: the 128-bit weight load unit (public: ILGPU maps it as a kernel parameter).</summary>
+    public struct W16 { public int a, b, c, d; }
 
     // Wrapper for the dp4a (4x int8 dot-accumulate) PTX intrinsic: d = c + Σ a.s8[i]·b.s8[i]. CUDA-only.
     private static int Dp4a(int a, int b, int c)
@@ -1868,6 +1869,16 @@ public class FusedDequantMatMul : IDisposable
             GGMLType.Q6_K => _gemvRowsQ6_K ??= LoadRows(GemvRowsQ6_KImpl),
             _ => null,
         };
+        if (M == 1 && type == GGMLType.Q4_K && !ForceGenericRows && Q4KVec && K % 256 == 0
+            && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
+        {
+            _gemvQ4KVec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ4_KVecImpl);
+            _gemvQ4KVec(new KernelConfig((N + Q4KVecCols * Q4KVecRows - 1) / (Q4KVecCols * Q4KVecRows), Q4KVecCols * 32),
+                input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, pb.View);
+            LastRowsKernel = "q4k-vec";
+            return;
+        }
+        LastRowsKernel = kernel == null ? "per-element" : $"rows-{type}";
         kernel ??= _gemvRows ??= LoadRows(GemvRowsImpl);
         kernel(new KernelConfig(N, GemvGroupSize), input, weightQuant.Cast<byte, int>(), output, pb.View);
     }
@@ -1875,6 +1886,17 @@ public class FusedDequantMatMul : IDisposable
     /// <summary>A/B switch (env GGUF_GEMV_ROWS_GENERIC=1): <see cref="ForwardRows"/> on its per-element kernel for every type instead of the word-wise Q8_0 / Q4_K / Q6_K ones.</summary>
     public static bool ForceGenericRows = Environment.GetEnvironmentVariable("GGUF_GEMV_ROWS_GENERIC") == "1";
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvRowsQ8_0, _gemvRowsQ4_K, _gemvRowsQ6_K;
+    /// <summary>The kernel <see cref="ForwardRows"/> last launched ("q4k-vec", "rows-Q4_K", "per-element", ...): tests check the route they mean to cover was taken.</summary>
+    public string LastRowsKernel { get; private set; } = "";
+    /// <summary>
+    /// One Q4_K row (M = 1, a decode step) on <see cref="GemvQ4_KVecImpl"/>: 128-bit loads, a lane per t-unit, four outputs a warp sharing the lane's inputs. Needs
+    /// 16-byte-aligned input and weight views (else the word-wise kernel). MEASURED 2026-11-02 RTX 4070 CUDA, llama3.1:8b shapes: 411-460 GB/s against the word-wise
+    /// kernel's 135-144 (float, not the int8-activation dp4a kernel's approximation). Default on; GGUF_Q4K_VEC=0 is the A/B.
+    /// </summary>
+    public static bool Q4KVec = Environment.GetEnvironmentVariable("GGUF_Q4K_VEC") != "0";
+    private const int Q4KVecCols = 2;      // warps a group holds: 32 lanes each
+    private const int Q4KVecRows = 4;      // outputs a warp computes: each lane's inputs are read once for all of them
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> LoadRows(
         Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> impl) =>
         _accelerator.LoadStreamKernel(impl);
@@ -1983,6 +2005,84 @@ public class FusedDequantMatMul : IDisposable
             }
         }
         ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    // byte i (0..11) of a Q4_K super-block's scale bytes, held in the header's last three words
+    private static int ScaleByte(int b0, int b1, int b2, int i)
+    {
+        int word = (i >> 2) == 0 ? b0 : (i >> 2) == 1 ? b1 : b2;
+        return (word >> ((i & 3) << 3)) & 0xFF;
+    }
+    // sub-block j's 6-bit scale (low byte) and min (high byte), from the scale bytes in registers (GetScaleMinK4's packing)
+    private static int ScaleMinRegs(int b0, int b1, int b2, int j)
+    {
+        bool low = j < 4;
+        int bj = ScaleByte(b0, b1, b2, j), bj4 = ScaleByte(b0, b1, b2, j + 4), bjm4 = ScaleByte(b0, b1, b2, low ? j : j - 4);
+        int sc = low ? (bj & 63) : ((bj4 & 0xF) | ((bjm4 >> 6) << 4));
+        int mn = low ? (bj4 & 63) : ((bj4 >> 4) | ((bj >> 6) << 4));
+        return sc | (mn << 8);
+    }
+    // 4 nibbles (byte lanes, shifted by sh) of q against an input quad
+    private static float Nib4(int q, int sh, Vec4LoadMatMul.F4 x) =>
+        x.A * ((q >> sh) & 0xF) + x.B * ((q >> (sh + 8)) & 0xF) + x.C * ((q >> (sh + 16)) & 0xF) + x.D * ((q >> (sh + 24)) & 0xF);
+
+    // one output's t-unit (header and two nibble chunks at W16 index so16, sub-blocks 2t, 2t + 1) against the lane's 64 inputs (sl, shh: their two sums)
+    private static float Q4KTUnit(ArrayView<W16> w16, int so16, int t,
+        Vec4LoadMatMul.F4 xl0, Vec4LoadMatMul.F4 xl1, Vec4LoadMatMul.F4 xl2, Vec4LoadMatMul.F4 xl3, Vec4LoadMatMul.F4 xl4, Vec4LoadMatMul.F4 xl5, Vec4LoadMatMul.F4 xl6, Vec4LoadMatMul.F4 xl7,
+        Vec4LoadMatMul.F4 xh0, Vec4LoadMatMul.F4 xh1, Vec4LoadMatMul.F4 xh2, Vec4LoadMatMul.F4 xh3, Vec4LoadMatMul.F4 xh4, Vec4LoadMatMul.F4 xh5, Vec4LoadMatMul.F4 xh6, Vec4LoadMatMul.F4 xh7,
+        float sl, float shh)
+    {
+        W16 h = w16.AsAligned16()[so16];
+        float d = HalfBits(h.a & 0xFFFF), dmin = HalfBits((h.a >> 16) & 0xFFFF);
+        int sm0 = ScaleMinRegs(h.b, h.c, h.d, 2 * t), sm1 = ScaleMinRegs(h.b, h.c, h.d, 2 * t + 1);
+        W16 c0 = w16.AsAligned16()[so16 + 1 + 2 * t], c1 = w16.AsAligned16()[so16 + 2 + 2 * t];
+        float lo = Nib4(c0.a, 0, xl0) + Nib4(c0.b, 0, xl1) + Nib4(c0.c, 0, xl2) + Nib4(c0.d, 0, xl3) + Nib4(c1.a, 0, xl4) + Nib4(c1.b, 0, xl5) + Nib4(c1.c, 0, xl6) + Nib4(c1.d, 0, xl7);
+        float hi = Nib4(c0.a, 4, xh0) + Nib4(c0.b, 4, xh1) + Nib4(c0.c, 4, xh2) + Nib4(c0.d, 4, xh3) + Nib4(c1.a, 4, xh4) + Nib4(c1.b, 4, xh5) + Nib4(c1.c, 4, xh6) + Nib4(c1.d, 4, xh7);
+        return d * (sm0 & 0xFF) * lo - dmin * (sm0 >> 8) * sl + d * (sm1 & 0xFF) * hi - dmin * (sm1 >> 8) * shh;
+    }
+    private static float Sum16(Vec4LoadMatMul.F4 a, Vec4LoadMatMul.F4 b, Vec4LoadMatMul.F4 c, Vec4LoadMatMul.F4 d) =>
+        a.A + a.B + a.C + a.D + b.A + b.B + b.C + b.D + c.A + c.B + c.C + c.D + d.A + d.B + d.C + d.D;
+
+    // M = 1, Q4_K, 128-bit loads: a warp per Q4KVecRows outputs, a lane per t-unit (sub-blocks 2t, 2t + 1 of a super-block: 8 nibble words, 64 values). The
+    // lane reads its 64 inputs once (sixteen float4 loads) and applies them to each output's t-unit: the super-block header (d, dmin, 12 scale bytes: 16 B,
+    // 16-aligned) is one 128-bit load, the nibbles two; the scales are decoded in registers. value = d * sc * q - dmin * m, summed per sub-block as
+    // d*sc*sum(x*q) - dmin*m*sum(x).
+    private static void GemvQ4_KVecImpl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView<W16> w16, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, n0 = (Grid.IdxX * Q4KVecCols + (tid >> 5)) * Q4KVecRows;
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
+        int nsb = K >> 8, rowW = nsb * 9, nTU = nsb * 4;           // a super-block is 144 B = 9 W16
+        bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
+        if (r0)
+        {
+            for (int tu = lane; tu < nTU; tu += 32)
+            {
+                int sb = tu >> 2, t = tu & 3, so16 = n0 * rowW + sb * 9;
+                int xb = (sb << 6) + 16 * t;                                 // float4 index of value sb*256 + 64t
+                var xl0 = x4.AsAligned16()[xb]; var xl1 = x4.AsAligned16()[xb + 1]; var xl2 = x4.AsAligned16()[xb + 2]; var xl3 = x4.AsAligned16()[xb + 3];
+                var xl4 = x4.AsAligned16()[xb + 4]; var xl5 = x4.AsAligned16()[xb + 5]; var xl6 = x4.AsAligned16()[xb + 6]; var xl7 = x4.AsAligned16()[xb + 7];
+                var xh0 = x4.AsAligned16()[xb + 8]; var xh1 = x4.AsAligned16()[xb + 9]; var xh2 = x4.AsAligned16()[xb + 10]; var xh3 = x4.AsAligned16()[xb + 11];
+                var xh4 = x4.AsAligned16()[xb + 12]; var xh5 = x4.AsAligned16()[xb + 13]; var xh6 = x4.AsAligned16()[xb + 14]; var xh7 = x4.AsAligned16()[xb + 15];
+                float sl = Sum16(xl0, xl1, xl2, xl3) + Sum16(xl4, xl5, xl6, xl7), shh = Sum16(xh0, xh1, xh2, xh3) + Sum16(xh4, xh5, xh6, xh7);
+                p0 += Q4KTUnit(w16, so16, t, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7, sl, shh);
+                if (r1) p1 += Q4KTUnit(w16, so16 + rowW, t, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7, sl, shh);
+                if (r2) p2 += Q4KTUnit(w16, so16 + 2 * rowW, t, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7, sl, shh);
+                if (r3) p3 += Q4KTUnit(w16, so16 + 3 * rowW, t, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7, sl, shh);
+            }
+        }
+        // per warp, per output: the 32 lanes' sums
+        var sh = SharedMemory.Allocate<float>(Q4KVecCols * 32 * Q4KVecRows);
+        int wb = (tid >> 5) * 32 * Q4KVecRows;
+        sh[wb + lane] = p0; sh[wb + 32 + lane] = p1; sh[wb + 64 + lane] = p2; sh[wb + 96 + lane] = p3;
+        Group.Barrier();
+        for (int stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                for (int r = 0; r < Q4KVecRows; r++) sh[wb + 32 * r + lane] += sh[wb + 32 * r + lane + stride];
+            Group.Barrier();
+        }
+        if (lane < Q4KVecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
     }
 
     // Q6_K (210 B per 256: 128 B low nibbles, 64 B high bit pairs, 16 int8 scales, fp16 d): a thread per 16 values (one half, four l of the 32: values l, l + 32,

@@ -1,0 +1,63 @@
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.GGUF;
+using SpawnDev.UnitTesting;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+
+public abstract partial class MLTestBase
+{
+    /// <summary>
+    /// The one-row Q4_K decode GEMV on 128-bit loads (<c>GemvQ4_KVecImpl</c>: a lane per t-unit, four outputs a warp, the super-block header as one 16-byte load,
+    /// its scales decoded in registers) against the CPU dequant oracle: K = 4096 with N = 203 and K = 1536 with N = 9 (outputs that do not fill the last warp or group),
+    /// and it must be the kernel that ran. A 16-byte-misaligned input view must take the word-wise kernel and still match. Added 2026-11-02 with the kernel
+    /// (llama3.1:8b decode GEMVs 135-144 -> 411-460 GB/s on an RTX 4070).
+    /// </summary>
+    [TestMethod]
+    public async Task Gemv_Q4KVec_MatchesOracle_AndIsTaken() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("ForwardRows takes the per-element kernel on WebGL (no shared memory)");
+        var type = GGMLType.Q4_K;
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        var notes = new List<string>();
+        foreach (var (K, N) in new[] { (4096, 203), (1536, 9) })
+        {
+            var rng = new Random(71 + K + N);
+            int bytesPerRow = RowBytes(type, K);
+            var weightBytes = new byte[N * bytesPerRow];
+            var wRows = new float[N][];
+            for (int n = 0; n < N; n++)
+            {
+                var rowBytes = MakeBlocks(type, K, rng);
+                Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                wRows[n] = ReferenceDequant(type, rowBytes, K);
+            }
+            var input = new float[K + 1];
+            for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+            float[] Expected(int off)
+            {
+                var e = new float[N];
+                for (int n = 0; n < N; n++) { double s = 0; for (int k = 0; k < K; k++) s += input[off + k] * wRows[n][k]; e[n] = (float)s; }
+                return e;
+            }
+            using var weightBuf = AllocatePadded(accelerator, weightBytes);
+            using var inputBuf = accelerator.Allocate1D(input);
+            using var outBuf = accelerator.Allocate1D<float>(N);
+            // aligned (offset 0): the vector kernel
+            fused.ForwardRows(inputBuf.View.SubView(0, K), weightBuf.View, outBuf.View, 1, K, N, type);
+            string route = fused.LastRowsKernel;
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.CopyToHostAsync<float>(0, N);
+            if (route != "q4k-vec") throw new Exception($"K={K} N={N}: an aligned one-row Q4_K GEMV ran on '{route}', not the vector kernel");
+            AssertCloseQuant(got, Expected(0), 2e-3f, $"Q4_K vector GEMV K={K} N={N}");
+            // misaligned by one float: the word-wise kernel, same answer
+            fused.ForwardRows(inputBuf.View.SubView(1, K), weightBuf.View, outBuf.View, 1, K, N, type);
+            string route2 = fused.LastRowsKernel;
+            await accelerator.SynchronizeAsync();
+            var got2 = await outBuf.CopyToHostAsync<float>(0, N);
+            if (route2 == "q4k-vec") throw new Exception($"K={K} N={N}: a misaligned input view took the vector kernel (its loads assume 16-byte alignment)");
+            AssertCloseQuant(got2, Expected(1), 2e-3f, $"Q4_K word-wise GEMV (misaligned input) K={K} N={N}");
+            notes.Add($"K={K} N={N}: {route} and {route2} match the oracle");
+        }
+        return string.Join("; ", notes);
+    });
+}
