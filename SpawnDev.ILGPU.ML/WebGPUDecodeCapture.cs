@@ -365,9 +365,17 @@ public sealed class WebGPUDecodeCapture : IDisposable
             // advanced it past the real cursor. Put back the post-P0 state so the first replay (at P0+1) reads
             // the true history - otherwise LFM2 decodes fluent but wrong text (2026-07-16).
             if (conv != null && convAtP1 != null) conv.RestoreSnapshot(convAtP1);
+            // 🔴 THE CAPTURE PASS'S OUTPUTS ARE NOT THIS STEP'S ANSWER ANY MORE. Plan B's passes ran at P0+1 (this token fed again) into the same pinned
+            // buffers, so capOut now holds THEIR logits: what the model predicts after seeing the token twice. The generator took the capture step's token from
+            // them, so every first answer after a load was decoded from a wrong second token (SmolLM2: "1" again, then "1111..."; Qwen2.5 survived by luck: its
+            // repeated token predicted the same next word). MEASURED 2026-11-01: max |logit difference| from the direct step 8.9 (SmolLM2), 12.9 (Qwen2.5).
+            // Re-run this step from the state it must see (conv-state: the P0 snapshot; it leaves the post-P0 state, as above) for the caller's answer.
+            var stepOut = await StepAt(p0, false, convAtP0);
+            await acc.SynchronizeAsync();
             session.SetGGUFDecodePastLen(p0 + 1);
             var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
+            cap._stepOutputs = stepOut;
             cap._arena = arena;
             cap._poolPins = poolPins;
             arenaHandedOff = true;
@@ -406,9 +414,14 @@ public sealed class WebGPUDecodeCapture : IDisposable
         }
     }
 
-    /// <summary>The capture pass's outputs (the P0 step's REAL logits) - stable tensors, also
-    /// returned by every <see cref="PatchAndReplayAsync"/>.</summary>
+    /// <summary>The plan's output tensors (stable: every <see cref="PatchAndReplayAsync"/> writes and returns them). After <see cref="TryCaptureAsync"/> they hold
+    /// its last probe pass (P0+1), NOT the captured step's answer: that is <see cref="StepOutputs"/>.</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
+
+    /// <summary>The captured step's own outputs (the step at P0 with the token the capture was given), recomputed after the probe passes: the caller's answer
+    /// for the step that built the capture.</summary>
+    public IReadOnlyDictionary<string, Tensor> StepOutputs => _stepOutputs ?? _outputs;
+    private IReadOnlyDictionary<string, Tensor>? _stepOutputs;
 
     /// <summary>
     /// Decode ONE token via patched plan replay: writes <paramref name="tokenId"/> into the stable

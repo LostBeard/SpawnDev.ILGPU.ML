@@ -2221,13 +2221,14 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static async Task<InferenceSession> CreateFromGGUFStreamAsync(
         Accelerator accelerator, Stream stream,
-        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false)
+        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false, GGUF.GGUFModel? parsedHeader = null)
     {
         if (!stream.CanSeek)
             throw new ArgumentException("CreateFromGGUFStreamAsync requires a seekable stream.", nameof(stream));
 
         onProgress?.Invoke("parse", 0);
-        var ggufModel = await GGUF.GGUFParser.ParseHeaderAsync(stream, ct).ConfigureAwait(false);
+        // parsedHeader: the caller already parsed this stream's header (GgufGenerator.CreateAsync chose its engine from it): the bytes are not parsed twice
+        var ggufModel = parsedHeader ?? await GGUF.GGUFParser.ParseHeaderAsync(stream, ct).ConfigureAwait(false);
         ggufModel.SourceStream = stream; // small F32/F16 tensors are read on demand during BuildGraph
         // Pre-read the small non-quantized tensors ASYNC so BuildGraph's synchronous dequant never does a
         // sync Stream.Read — which throws on an async-only browser stream (TorrentReadStream/OPFS). The big

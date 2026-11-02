@@ -181,16 +181,38 @@ public sealed class GgufBatchDecoder : IDisposable
     /// Load a GGUF from a seekable stream (kept open for the embedding rows; disposed with the decoder). <paramref name="maxSeq"/>: prompt plus generation;
     /// <paramref name="maxBatch"/>: most sequences at once (the caches take layers x 2 x maxBatch x maxSeq x kvHeads x headDim floats).
     /// </summary>
-    public static async Task<GgufBatchDecoder> CreateAsync(Accelerator accelerator, Stream gguf, int maxSeq = 2048, int maxBatch = 8, CancellationToken ct = default)
+    public static Task<GgufBatchDecoder> CreateAsync(Accelerator accelerator, Stream gguf, int maxSeq = 2048, int maxBatch = 8, CancellationToken ct = default)
+        => CreateAsync(accelerator, gguf, maxSeq, maxBatch, null, ct);
+
+    /// <summary><see cref="CreateAsync(Accelerator, Stream, int, int, CancellationToken)"/> with load progress: <paramref name="onProgress"/>("parse" | "weights", percent).</summary>
+    public static async Task<GgufBatchDecoder> CreateAsync(Accelerator accelerator, Stream gguf, int maxSeq, int maxBatch, Action<string, int>? onProgress, CancellationToken ct = default)
     {
         if (!gguf.CanSeek) throw new ArgumentException("the GGUF stream must be seekable");
         gguf.Seek(0, SeekOrigin.Begin);
+        onProgress?.Invoke("parse", 0);
         var model = await GGUFParser.ParseHeaderAsync(gguf, ct).ConfigureAwait(false);
+        onProgress?.Invoke("parse", 100);
+        return await CreateAsync(accelerator, gguf, model, maxSeq, maxBatch, onProgress, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Load from a stream whose header was already parsed into <paramref name="model"/> (the bytes are not parsed twice).</summary>
+    public static async Task<GgufBatchDecoder> CreateAsync(Accelerator accelerator, Stream gguf, GGUFModel model, int maxSeq, int maxBatch, Action<string, int>? onProgress = null,
+        CancellationToken ct = default)
+    {
+        if (!gguf.CanSeek) throw new ArgumentException("the GGUF stream must be seekable");
         model.SourceStream = gguf;
-        var d = new GgufBatchDecoder(accelerator, model, gguf, maxSeq, maxBatch);
-        await d.LoadAsync(ct).ConfigureAwait(false);
+        var d = new GgufBatchDecoder(accelerator, model, gguf, maxSeq, maxBatch) { _progress = onProgress };
+        foreach (var t in model.Tensors) d._totalBytes += GGMLTypes.TypeSize(t.Type, model.GetTensorElementCount(t));
+        try { await d.LoadAsync(ct).ConfigureAwait(false); }
+        catch { d.Dispose(); throw; }
+        onProgress?.Invoke("weights", 100);
         return d;
     }
+
+    // load progress: bytes read over the file's tensor bytes
+    private Action<string, int>? _progress;
+    private long _readBytes, _totalBytes;
+    private int _lastPct = -1;
 
     private async Task<byte[]> ReadAsync(GGUFTensorInfo t, CancellationToken ct)
     {
@@ -199,6 +221,44 @@ public sealed class GgufBatchDecoder : IDisposable
         _stream.Seek(_model.GetTensorDataOffset(t), SeekOrigin.Begin);
         int got = 0;
         while (got < n) { int r = await _stream.ReadAsync(buf.AsMemory(got, (int)(n - got)), ct).ConfigureAwait(false); if (r == 0) throw new EndOfStreamException(t.Name); got += r; }
+        Progress(n);
+        return buf;
+    }
+
+    // a tensor's bytes into dst (at least its size, padded to 4) straight from the stream: SpawnDev.ILGPU's stream copy takes a browser JS stream JS -> GPU
+    // (queue.writeBuffer) without the bytes entering the .NET heap (the weight census: a chat model's matrices used to arrive as managed arrays, ~145 MB for
+    // Qwen2.5-0.5B's embedding alone). writeBuffer moves 4-byte words: the up to 3 trailing bytes of a size that is not a multiple of 4 go through one word.
+    private async Task UploadAsync(GGUFTensorInfo t, ArrayView1D<byte, Stride1D.Dense> dst, CancellationToken ct)
+    {
+        long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
+        _stream.Seek(_model.GetTensorDataOffset(t), SeekOrigin.Begin);
+        long aligned = n & ~3L;
+        if (aligned > 0) await dst.SubView(0, aligned).CopyFromStreamAsync(_stream, cancellationToken: ct).ConfigureAwait(false);
+        if (n > aligned)
+        {
+            var w = new byte[4];
+            int got = 0;
+            while (got < n - aligned) { int r = await _stream.ReadAsync(w.AsMemory(got, (int)(n - aligned - got)), ct).ConfigureAwait(false); if (r == 0) throw new EndOfStreamException(t.Name); got += r; }
+            dst.SubView(aligned, 4).CopyFromCPU(w);
+        }
+        Progress(n);
+    }
+
+    private void Progress(long bytes)
+    {
+        if (_progress == null || _totalBytes <= 0) return;
+        _readBytes += bytes;
+        int pct = (int)Math.Min(99, _readBytes * 100 / _totalBytes);
+        if (pct != _lastPct) { _lastPct = pct; _progress("weights", pct); }
+    }
+
+    // a tensor in its own device buffer (padded to 4 bytes: the GEMM reads the blocks as int words)
+    private async Task<MemoryBuffer1D<byte, Stride1D.Dense>> UploadAsync(GGUFTensorInfo t, CancellationToken ct)
+    {
+        long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
+        var buf = _acc.Allocate1D<byte>((n + 3) / 4 * 4);
+        try { await UploadAsync(t, buf.View, ct).ConfigureAwait(false); }
+        catch { buf.Dispose(); throw; }
         return buf;
     }
 
@@ -239,7 +299,7 @@ public sealed class GgufBatchDecoder : IDisposable
         {
             var t = Tensor(name);
             if (!FusedDequantMatMul.Supports(t.Type)) throw new NotSupportedException($"{name}: {t.Type} is not a block type the fused GEMM reads");
-            _mats[name] = (Own(_acc.Allocate1D(await ReadAsync(t, ct).ConfigureAwait(false))), t.Type);
+            _mats[name] = (Own(await UploadAsync(t, ct).ConfigureAwait(false)), t.Type);
         }
         foreach (var name in vecs)
         {
@@ -257,6 +317,16 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         var type = Tensor(parts[0]).Type;
         if (!FusedDequantMatMul.Supports(type)) throw new NotSupportedException($"{parts[0]}: {type} is not a block type the fused GEMM reads");
+        var sizes = parts.Select(n => GGMLTypes.TypeSize(Tensor(n).Type, _model.GetTensorElementCount(Tensor(n)))).ToArray();
+        if (sizes.Take(sizes.Length - 1).All(z => z % 4 == 0))
+        {
+            // each part streamed into its place (the offsets stay word aligned)
+            var joined = Own(_acc.Allocate1D<byte>((sizes.Sum() + 3) / 4 * 4));
+            long off = 0;
+            for (int i = 0; i < parts.Length; i++) { await UploadAsync(Tensor(parts[i]), joined.View.SubView(off, joined.Length - off), ct).ConfigureAwait(false); off += sizes[i]; }
+            _mats[name] = (joined, type);
+            return;
+        }
         var chunks = new List<byte[]>();
         long total = 0;
         foreach (var part in parts)
@@ -615,12 +685,70 @@ public sealed class GgufBatchDecoder : IDisposable
     /// Prefill the prompt into sequence 0 from position 0 (one live sequence afterwards). <paramref name="temperature"/>: what the next draw (<see cref="SampleAsync"/>
     /// or <see cref="Draw"/>) uses, 0 = greedy (the device then skips the softmax mass). Queued: nothing is read back until a draw needs it.
     /// </summary>
-    public Task PrefillAsync(int[] promptIds, float temperature = 0f, CancellationToken ct = default)
+    public Task PrefillAsync(int[] promptIds, float temperature = 0f, CancellationToken ct = default) => PrefillAsync(promptIds, temperature, false, ct);
+
+    /// <summary>
+    /// <see cref="PrefillAsync(int[], float, CancellationToken)"/>; <paramref name="reusePrefix"/>: keep the cache rows of the longest prefix this prompt shares
+    /// with the last <see cref="GenerateAsync"/>'s prompt and sequence 0's tokens, and run only the rest (a chat's next turn re-sends the whole conversation:
+    /// only the new part costs a prefill). At least the prompt's last token always runs (its logits start the answer). <see cref="LastReusedPrefix"/> says
+    /// how many rows were kept.
+    /// </summary>
+    public Task PrefillAsync(int[] promptIds, float temperature, bool reusePrefix, CancellationToken ct = default)
     {
         if (promptIds.Length == 0) throw new ArgumentException("an empty prompt");
-        Position = 0; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear(); _drawPos = -1;
-        return ForwardAsync(promptIds, null, decode: false, temperature, readBack: false, ct);
+        int keep = 0;
+        if (reusePrefix && _cacheIds != null)
+        {
+            int max = Math.Min(_cacheIds.Length, promptIds.Length - 1);
+            while (keep < max && _cacheIds[keep] == promptIds[keep]) keep++;
+        }
+        LastReusedPrefix = keep;
+        _cacheIds = null;                                                        // GenerateAsync records what the rows hold when it ends
+        Position = keep; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear(); _drawPos = -1;
+        return ForwardAsync(keep == 0 ? promptIds : promptIds[keep..], null, decode: false, temperature, readBack: false, ct);
     }
+
+    /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
+    public int LastReusedPrefix { get; private set; }
+
+    /// <summary>The accelerator the decoder runs on.</summary>
+    public Accelerator Accelerator => _acc;
+
+    /// <summary>Per sequence of the last <see cref="GenerateAsync"/>: the stop token that ended it, or -1 (the length, <c>shouldContinue</c>, or a cancel).</summary>
+    public int[] LastStopTokens { get; private set; } = Array.Empty<int>();
+
+    /// <summary>
+    /// True when <paramref name="model"/> can load here (checked on the header, before any weight is read): the architecture (qwen2, qwen3, llama), rotary over
+    /// the whole head without per-frequency factors (no llama 3 rope_freqs), a vocabulary below 2^24, and every matrix in a block type the fused GEMM reads
+    /// (norms F32). <paramref name="reason"/> says what does not fit.
+    /// </summary>
+    public static bool Supports(GGUFModel model, out string reason)
+    {
+        string a = model.Architecture;
+        if (a is not ("qwen2" or "qwen3" or "llama")) { reason = $"architecture '{a}' (supported: qwen2, qwen3, llama)"; return false; }
+        int hidden = (int)model.EmbeddingLength, heads = (int)model.AttentionHeadCount;
+        int headDim = (int)model.GetMetadataInt($"{a}.attention.key_length", heads > 0 ? hidden / heads : 0);
+        if ((int)model.GetMetadataInt($"{a}.rope.dimension_count", headDim) != headDim) { reason = "rotary over part of the head"; return false; }
+        if (model.Tensors.Any(t => t.Name == "rope_freqs.weight")) { reason = "per-frequency rotary factors (rope_freqs, llama 3 scaling)"; return false; }
+        var embd = model.Tensors.FirstOrDefault(t => t.Name == "token_embd.weight");
+        if (embd == null) { reason = "no token_embd.weight"; return false; }
+        if (embd.Dimensions[1] >= 1 << 24) { reason = $"vocabulary {embd.Dimensions[1]} (candidate ids travel as floats, exact below 2^24)"; return false; }
+        foreach (var t in model.Tensors)
+        {
+            bool block = t.Name.StartsWith("blk.", StringComparison.Ordinal), vec = t.Dimensions.Length == 1 || t.Name.EndsWith(".bias", StringComparison.Ordinal);
+            bool head = t.Name is "output.weight" or "token_embd.weight";
+            if (!(block || head)) continue;
+            if (vec) { if (t.Type != GGMLType.F32 && t.Name.EndsWith("norm.weight", StringComparison.Ordinal)) { reason = $"{t.Name}: {t.Type} (norms are read as F32)"; return false; } continue; }
+            if (!FusedDequantMatMul.Supports(t.Type)) { reason = $"{t.Name}: {t.Type} is not a block type the fused GEMM reads"; return false; }
+        }
+        reason = "";
+        return true;
+    }
+
+    // the tokens whose K/V rows sequence 0's cache region holds, rows 0..length-1 (set by GenerateAsync when it ends; null: nothing to reuse). A generation's
+    // last token is never in it: drawing token k needs token k - 1 as an input, so k tokens prove k - 1 of them reached the cache (a step queued ahead may have
+    // written one more row, which a later prefill simply overwrites)
+    private int[]? _cacheIds;
 
     /// <summary>Copy sequence 0's cache (the prompt) into sequences 1..count-1: <paramref name="count"/> live sequences from now on, all at the same position.</summary>
     public void Fork(int count)
@@ -671,27 +799,43 @@ public sealed class GgufBatchDecoder : IDisposable
     /// draw, taken from the device's candidates (the same set and the same draw; the row is read only when its nucleus is wider than <see cref="Candidates"/>).
     /// The first draw after a forward reads its candidates (that forward's one wait).
     /// </summary>
-    public async ValueTask<int> SampleAsync(int row, float topP, Random rng)
+    public ValueTask<int> SampleAsync(int row, float topP, Random rng) => SampleAsync(row, topP, rng, 0);
+
+    /// <summary>
+    /// <see cref="SampleAsync(int, float, Random)"/> with top-k first (<see cref="SampleLogits(float[], int, int, float, float, double, int)"/>'s rule): k up to
+    /// <see cref="Candidates"/> is drawn from the candidates; a larger k, or a row whose candidates overflowed, reads the row.
+    /// </summary>
+    public async ValueTask<int> SampleAsync(int row, float topP, Random rng, int topK)
     {
         if ((uint)row >= (uint)_lastRows) throw new ArgumentOutOfRangeException(nameof(row));
-        if (NoCandidates) return SampleLogits(await _lastLogits.SubView((long)row * Vocab, Vocab).CopyToHostAsync().ConfigureAwait(false), 0, Vocab, _lastT, topP, rng);
+        if (NoCandidates) return SampleLogits(await _lastLogits.SubView((long)row * Vocab, Vocab).CopyToHostAsync().ConfigureAwait(false), 0, Vocab, _lastT, topP, rng.NextDouble(), topK);
         int K = Candidates, o = row * CandStride;
         var c = _lastCand ??= await _lastCandView.CopyToHostAsync().ConfigureAwait(false);
         float T = _lastT, max = c[o], floor = max - 20f * T;
         double total = 0, keep = 0; int m = 0;
-        bool whole = c[o + 2 * K] > SelectCap;                                   // too many tokens reached the floor: the candidates are not the top K
+        bool whole = c[o + 2 * K] > SelectCap || topK > K;                       // too many tokens reached the floor (the candidates are not the top K), or k past them
         if (!whole)
         {
             if (T <= 0f) return (int)c[o + K];
-            for (int ch = 0; ch < Chunks; ch++) total += c[o + 2 * K + 1 + ch];
-            while (m < K && c[o + m] >= floor && keep < topP * total) { keep += Math.Exp((c[o + m] - max) / T); m++; }
-            whole = keep < topP * total;                                         // the nucleus reaches past the candidates (or the device's float sums end it a hair later)
+            if (topK > 0)
+            {
+                // the k best within the window are the first candidates: the nucleus runs over their mass only
+                int kk = 0;
+                while (kk < topK && c[o + kk] >= floor) total += Math.Exp((c[o + kk++] - max) / T);
+                while (m < kk && keep < topP * total) { keep += Math.Exp((c[o + m] - max) / T); m++; }
+            }
+            else
+            {
+                for (int ch = 0; ch < Chunks; ch++) total += c[o + 2 * K + 1 + ch];
+                while (m < K && c[o + m] >= floor && keep < topP * total) { keep += Math.Exp((c[o + m] - max) / T); m++; }
+                whole = keep < topP * total;                                     // the nucleus reaches past the candidates (or the device's float sums end it a hair later)
+            }
         }
         if (whole)
         {
             RowReads++;
             var full = await _lastLogits.SubView((long)row * Vocab, Vocab).CopyToHostAsync().ConfigureAwait(false);
-            return SampleLogits(full, 0, Vocab, T, topP, rng);
+            return SampleLogits(full, 0, Vocab, T, topP, rng.NextDouble(), topK);
         }
         double u = rng.NextDouble() * keep, acc = 0;
         for (int i = 0; i < m; i++) { acc += Math.Exp((c[o + i] - max) / T); if (u < acc) return (int)c[o + K + i]; }
@@ -811,28 +955,45 @@ public sealed class GgufBatchDecoder : IDisposable
     /// reads the rows to apply it).
     /// </summary>
     public async Task<int[][]> GenerateAsync(int[] promptIds, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
-        Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default, float repetitionPenalty = 1f, int repeatLastN = 64)
+        Action<int, int>? onToken = null, Action<int>? onFinished = null, CancellationToken ct = default, float repetitionPenalty = 1f, int repeatLastN = 64,
+        bool reusePrefix = false, Func<int, int, ValueTask<bool>>? shouldContinue = null, int topK = 0)
     {
-        await PrefillAsync(promptIds, temperature, ct).ConfigureAwait(false);
+        await PrefillAsync(promptIds, temperature, reusePrefix, ct).ConfigureAwait(false);
         Fork(n);
         var outs = Enumerable.Range(0, n).Select(_ => new List<int>()).ToArray();
-        var done = new bool[n];
-        // a token for sequence s: true when the sequence goes on
-        bool Take(int s, int token)
+        try { return await GenerateForkedAsync(outs, n, maxNew, temperature, topP, seed, stopIds, onToken, onFinished, ct, repetitionPenalty, repeatLastN, shouldContinue, topK).ConfigureAwait(false); }
+        finally
         {
-            if (stopIds.Contains(token) || outs[s].Count >= maxNew) { done[s] = true; onFinished?.Invoke(s); return false; }
+            // what sequence 0's cache rows now hold, for the next reusePrefix prefill (also after a cancel: the rows written so far are valid)
+            var o = outs[0];
+            _cacheIds = o.Count > 1 ? promptIds.Concat(o.Take(o.Count - 1)).ToArray() : promptIds;
+        }
+    }
+
+    private async Task<int[][]> GenerateForkedAsync(List<int>[] outs, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
+        Action<int, int>? onToken, Action<int>? onFinished, CancellationToken ct, float repetitionPenalty, int repeatLastN, Func<int, int, ValueTask<bool>>? shouldContinue, int topK)
+    {
+        var done = new bool[n];
+        LastStopTokens = Enumerable.Repeat(-1, n).ToArray();
+        // a token for sequence s: true when the sequence goes on (a stop token, the length, or shouldContinue saying no ends it; the stop token is not kept)
+        async ValueTask<bool> Take(int s, int token)
+        {
+            if (stopIds.Contains(token)) { LastStopTokens[s] = token; done[s] = true; onFinished?.Invoke(s); return false; }
+            if (outs[s].Count >= maxNew) { done[s] = true; onFinished?.Invoke(s); return false; }
             outs[s].Add(token); onToken?.Invoke(s, token);
+            if (shouldContinue != null && !await shouldContinue(s, token).ConfigureAwait(false)) { done[s] = true; onFinished?.Invoke(s); return false; }
             return true;
         }
         void FinishAll() { for (int s = 0; s < n; s++) if (!done[s]) { done[s] = true; onFinished?.Invoke(s); } }
-        if (!DeviceSampling)
+        // top-k draws on the host (the device draw kernel is top-p only): the candidates are read each step (~KB), the row only when k passes them
+        if (!DeviceSampling || (topK > 0 && temperature > 0f))
         {
             var rngs = Enumerable.Range(0, n).Select(s => new Random(seed + s)).ToArray();
             var next = new int[n];
-            for (int s = 0; s < n; s++) next[s] = await SampleAsync(0, topP, rngs[s]).ConfigureAwait(false);
+            for (int s = 0; s < n; s++) next[s] = await SampleAsync(0, topP, rngs[s], topK).ConfigureAwait(false);
             while (true)
             {
-                for (int s = 0; s < n; s++) if (!done[s]) Take(s, next[s]);
+                for (int s = 0; s < n; s++) if (!done[s]) await Take(s, next[s]).ConfigureAwait(false);
                 if (done.All(d => d)) break;
                 if (Position + 1 > MaxSeq) { FinishAll(); break; }
                 ct.ThrowIfCancellationRequested();
@@ -840,7 +1001,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 var live = Enumerable.Range(0, n).Where(s => !done[s]).ToArray();
                 await StepAsync(live.Select(s => next[s]).ToArray(), live, temperature, ct).ConfigureAwait(false);
                 if (repetitionPenalty == 1f)
-                    for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]]).ConfigureAwait(false);
+                    for (int r = 0; r < live.Length; r++) next[live[r]] = await SampleAsync(r, topP, rngs[live[r]], topK).ConfigureAwait(false);
                 else
                 {
                     // the penalty changes the row: read it, penalise each sequence's own window, draw from the whole row (the device path's reference)
@@ -852,7 +1013,7 @@ public sealed class GgufBatchDecoder : IDisposable
                         var row = new float[Vocab];
                         Array.Copy(rowsAll, (long)r * Vocab, row, 0, Vocab);
                         TextGenerationSampler.ApplyRepetitionPenalty(row, o.GetRange(o.Count - take, take).ToArray(), repetitionPenalty);
-                        next[live[r]] = SampleLogits(row, 0, Vocab, temperature, topP, rngs[live[r]]);
+                        next[live[r]] = SampleLogits(row, 0, Vocab, temperature, topP, rngs[live[r]].NextDouble(), topK);
                     }
                 }
             }
@@ -873,7 +1034,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 if (Position + 1 <= MaxSeq) { await StepDrawnAsync(live2, temperature, ct).ConfigureAwait(false); ahead = ReadDrawnAsync(); }
                 var tokens = await pending!.ConfigureAwait(false);
                 pending = null;
-                foreach (int s in live2) Take(s, tokens[s]);
+                foreach (int s in live2) await Take(s, tokens[s]).ConfigureAwait(false);
                 live2 = live2.Where(s => !done[s]).ToArray();
                 if (live2.Length == 0) break;
                 if (ahead == null) { FinishAll(); break; }
@@ -900,7 +1061,13 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>
     /// <see cref="SampleLogits(float[], int, int, float, float, Random)"/> with the uniform given: <paramref name="u"/> in [0, 1) (the device draws: <see cref="DrawUniform"/>).
     /// </summary>
-    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, double u)
+    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, double u) => SampleLogits(logits, row, vocab, temperature, topP, u, 0);
+
+    /// <summary>
+    /// <see cref="SampleLogits(float[], int, int, float, float, double)"/> with top-k first: <paramref name="topK"/> &gt; 0 keeps the k best of the tokens within e^20
+    /// of the best (ties: the lower id), then the nucleus of <paramref name="topP"/> over their mass (1: all k), renormalised and drawn (Hugging Face's order).
+    /// </summary>
+    public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, double u, int topK)
     {
         int V = vocab, o = row * V, best = 0;
         for (int i = 1; i < V; i++) if (logits[o + i] > logits[o + best]) best = i;
@@ -909,6 +1076,7 @@ public sealed class GgufBatchDecoder : IDisposable
         var cand = new List<(int Id, float L, double P)>();
         for (int i = 0; i < V; i++) if (logits[o + i] >= floor) cand.Add((i, logits[o + i], Math.Exp((logits[o + i] - max) / temperature)));
         cand.Sort((a, b) => a.L != b.L ? b.L.CompareTo(a.L) : a.Id.CompareTo(b.Id));
+        if (topK > 0 && cand.Count > topK) cand.RemoveRange(topK, cand.Count - topK);
         double total = cand.Sum(c => c.P), keep = 0; int m = 0;
         while (m < cand.Count && keep < topP * total) keep += cand[m++].P;
         double x = u * keep, acc = 0;

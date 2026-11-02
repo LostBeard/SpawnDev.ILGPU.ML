@@ -425,7 +425,7 @@ public abstract partial class MLTestBase
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 var messages = new[] { ("user", "Write one sentence about the ocean.") };
                 var cfg = new GenerationConfig { MaxNewTokens = 32, Strategy = "greedy" };

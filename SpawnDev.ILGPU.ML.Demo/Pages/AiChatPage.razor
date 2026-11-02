@@ -67,7 +67,7 @@
     {
         <div class="chat">
             <div class="bar">
-                <span class="model-tag">@_modelLabel <span class="fmt">@_arch · @_chatFormat</span></span>
+                <span class="model-tag">@_modelLabel <span class="fmt">@_arch · @_chatFormat · @_engine</span></span>
                 <span class="accel">@_acceleratorName</span>
                 <button class="link" @onclick="ResetChat" disabled="@_busy">New conversation</button>
                 <button class="link" @onclick="BackToIdle" disabled="@_busy">Switch model</button>
@@ -137,6 +137,7 @@
     string _modelLabel = "";
     string _arch = "";
     string _chatFormat = "";
+    string _engine = "";        // the decode engine the pipeline chose (BatchDecoder for qwen2 / qwen3 / llama on WebGPU)
 
     sealed class ChatMessage { public string Role = "user"; public string Content = ""; }
     readonly List<ChatMessage> _messages = new();
@@ -202,10 +203,11 @@
             SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWebGPUGemv = true;
             _arch = _pipeline.Architecture;
             _chatFormat = _pipeline.ChatFormat.ToString();
+            _engine = _pipeline.Engine.ToString();
             _messages.Clear();
             _state = LoadState.Ready;
             _status = "";
-            JS.Log($"[AiChat] ready: {model.Label} arch={_arch} format={_chatFormat}");
+            JS.Log($"[AiChat] ready: {model.Label} arch={_arch} format={_chatFormat} engine={_engine}{(_pipeline.EngineReason.Length > 0 ? " (" + _pipeline.EngineReason + ")" : "")}");
         }
         catch (OperationCanceledException) { BackToIdle(); }
         catch (Exception ex)
@@ -312,7 +314,7 @@
                 gaps.Sort();
                 double median = gaps[gaps.Count / 2];
                 var split = _pipeline.LastDecodeCaptureStepMs;
-                JS.Log($"[AiChat-Perf] {tokStamps.Count} toks | TTFT {ttft:F0}ms | avg {avg:F1}ms/tok = {1000.0 / avg:F1} tok/s | last-50 median {median:F1}ms/tok"
+                JS.Log($"[AiChat-Perf] {_engine} | {tokStamps.Count} toks | TTFT {ttft:F0}ms | avg {avg:F1}ms/tok = {1000.0 / avg:F1} tok/s | last-50 median {median:F1}ms/tok"
                     + (split is { } s ? $" | engine last step: patch {s.Patch:F1} + plan {s.Replay:F1} + fence {s.Sync:F1}ms" : " | engine split n/a (direct path)"));
             }
             // On Stop, the generator returns the partial text (StopReason.Cancelled) — keep what was generated.

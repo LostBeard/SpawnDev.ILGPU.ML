@@ -71,7 +71,7 @@ public partial class MLTestBase
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))   // the PAGE's maxSeqLen
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))   // the PAGE's maxSeqLen
             {
                 var messages = new[] { ("user", "Tell a long story about a ship, its crew, and a storm. Keep going in detail.") };
                 var greedyCfg = new GenerationConfig { MaxNewTokens = 200, Strategy = "greedy" };
@@ -160,7 +160,7 @@ public partial class MLTestBase
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 var messages = new[] { ("user", "Describe a lighthouse in two sentences.") };
                 var cfg = new GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" };
@@ -229,7 +229,7 @@ public partial class MLTestBase
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 // Warm the decode state: a short greedy generation advances the KV cursor + JIT + pools.
                 await pipe.GenerateAsync(new[] { ("user", "Write one sentence about the ocean.") },

@@ -294,7 +294,7 @@ public abstract partial class MLTestBase
             var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 const string system = "You are a friendly assistant who answers briefly and clearly.";
                 var a = new[] { ("system", system), ("user", "In two sentences, what is a chicken?") };
@@ -375,7 +375,7 @@ public abstract partial class MLTestBase
             var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
                 var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" };
@@ -539,7 +539,7 @@ public abstract partial class MLTestBase
 
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
                 // Depth matters and is measured, not guessed: 1 step and 12 steps are BOTH bit-identical on
@@ -641,7 +641,7 @@ public abstract partial class MLTestBase
 
             await using (model.Stream)
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
-                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
             {
                 var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
                 var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" };

@@ -35,7 +35,7 @@ public abstract partial class MLTestBase
                     FusedDequantMatMul.ForceGenericRows = generic;
                     var m = await hub.OpenAsync(repo, file, deselect: false);
                     await using (m.Stream)
-                    using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512))
+                    using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
                     {
                         if (accelerator.AcceleratorType == AcceleratorType.WebGPU) pipe.EnableWebGPUDecodeCapture = true;
                         return await pipe.GenerateAsync(messages, new GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" }, thinking: false);

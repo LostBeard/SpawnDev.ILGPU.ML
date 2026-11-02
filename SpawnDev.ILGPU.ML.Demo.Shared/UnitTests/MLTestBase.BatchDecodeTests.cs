@@ -36,7 +36,7 @@ public abstract partial class MLTestBase
         {
             var m = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
             await using (m.Stream)
-            using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512))
+            using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
                 want = await pipe.GenerateAsync(messages, new GenerationConfig { MaxNewTokens = maxNew, Strategy = "greedy" }, thinking: false);
         }
         var src = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
@@ -502,7 +502,7 @@ public abstract partial class MLTestBase
             {
                 var m = await hub.OpenAsync(repo, file, deselect: false);
                 await using (m.Stream)
-                using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512))
+                using (var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 512, engine: SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator))
                     want = await pipe.GenerateAsync(messages, new GenerationConfig { MaxNewTokens = maxNew, Strategy = "greedy" }, thinking: false);
             }
             var src = await hub.OpenAsync(repo, file, deselect: false);

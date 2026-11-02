@@ -38,9 +38,75 @@ public sealed record GenerationResult(string Text, int PromptTokens, int Generat
 public sealed class GgufGenerator : IDisposable
 {
     private readonly InferenceSession _session;
+    // the batch decoder's engine (CreateAsync chose it): every public member routes to it; the session-path fields are then unset
+    private readonly GgufBatchTextEngine? _batch;
+    private InferenceSession? _ownedSession;   // CreateAsync's session (the generator engine), disposed with this generator
+    private Stream? _ownedStream;
 
-    /// <summary>The underlying decode-enabled <see cref="InferenceSession"/> (owned by the pipeline/creator).</summary>
-    public InferenceSession Session => _session;
+    /// <summary>The underlying decode-enabled <see cref="InferenceSession"/> (owned by the pipeline/creator). The generator engine only: a generator on the batch
+    /// decoder (<see cref="Engine"/>) has no session.</summary>
+    public InferenceSession Session => _batch == null ? _session
+        : throw new InvalidOperationException("this generator decodes with the batch decoder (Engine = BatchDecoder), which has no InferenceSession: create it with engine: GgufEngine.Generator");
+
+    /// <summary>The engine that decodes (<see cref="CreateAsync"/> resolves Auto; the session constructor is always <see cref="GgufEngine.Generator"/>).</summary>
+    public GgufEngine Engine => _batch != null ? GgufEngine.BatchDecoder : GgufEngine.Generator;
+
+    /// <summary>Why <see cref="CreateAsync"/> with <see cref="GgufEngine.Auto"/> chose the generator engine ("" when it chose the batch decoder or the caller chose).</summary>
+    public string EngineReason { get; private set; } = "";
+
+    /// <summary>The batch decoder when <see cref="Engine"/> is <see cref="GgufEngine.BatchDecoder"/>, else null.</summary>
+    public GgufBatchDecoder? BatchDecoder => _batch?.Decoder;
+
+    /// <summary>The model's parsed GGUF header (the chat template, architecture and tokenizer metadata come from it).</summary>
+    public GGUFModel Gguf { get; }
+
+    /// <summary>
+    /// Load a GGUF chat model from a seekable stream and pick the faster engine for it: <see cref="GgufBatchDecoder"/> (one sequence, prefix reuse) for qwen2,
+    /// qwen3 and llama without rope_freqs on CUDA, OpenCL and WebGPU (<see cref="GgufTextGenerationPipeline.ChooseEngine"/>; MEASURED 2026-11-01, Qwen2.5-0.5B,
+    /// one chat answer: WebGPU 67.8 -> 260.8 tok/s, CUDA 104.6 -> 165.1, OpenCL 47.3 -> 184.0), the session engine otherwise (other architectures, WebGL, Wasm,
+    /// the CPU backends). Same <see cref="GenerateAsync"/>: stop tokens and strings, streamed text, the prefix cache (<see cref="LastReusedPrefix"/>), cancel.
+    /// <paramref name="model"/>: the header if the caller already parsed it (it is not parsed twice). The weights stream to the GPU (a browser JS stream goes
+    /// JS -> GPU, never the .NET heap). Keep <paramref name="gguf"/> open until this generator is disposed: the session engine reads it on demand; the batch
+    /// engine disposes it with itself. <paramref name="ownsStream"/>: dispose it with this generator on either engine.
+    /// </summary>
+    /// <remarks>Seeded sampling is reproducible on each engine, not across them (the batch decoder's device draws take their uniform from seed, sequence and position).</remarks>
+    public static async Task<GgufGenerator> CreateAsync(Accelerator accelerator, Stream gguf, int maxSeqLen = 4096, GGUFModel? model = null,
+        Action<string, int>? onProgress = null, GgufEngine engine = GgufEngine.Auto, bool ownsStream = false, CancellationToken ct = default)
+    {
+        if (!gguf.CanSeek) throw new ArgumentException("GgufGenerator.CreateAsync requires a seekable stream.", nameof(gguf));
+        if (model == null)
+        {
+            gguf.Seek(0, SeekOrigin.Begin);
+            onProgress?.Invoke("parse", 0);
+            model = await GGUFParser.ParseHeaderAsync(gguf, ct).ConfigureAwait(false);
+            onProgress?.Invoke("parse", 100);
+        }
+        string reason = "";
+        if (engine != GgufEngine.Generator)
+        {
+            var chosen = GgufTextGenerationPipeline.ChooseEngine(accelerator, model, out reason);
+            if (chosen == GgufEngine.BatchDecoder)
+            {
+                var dec = await GgufBatchDecoder.CreateAsync(accelerator, gguf, model, maxSeqLen, 1, onProgress, ct).ConfigureAwait(false);
+                return new GgufGenerator(dec, accelerator, model);
+            }
+            if (engine == GgufEngine.BatchDecoder) throw new NotSupportedException("GgufEngine.BatchDecoder: " + reason);
+        }
+        gguf.Seek(0, SeekOrigin.Begin);
+        var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, gguf, onProgress, ct, parsedHeader: model).ConfigureAwait(false);
+        return new GgufGenerator(session, accelerator, model, maxSeqLen) { _ownedSession = session, _ownedStream = ownsStream ? gguf : null, EngineReason = reason };
+    }
+
+    private GgufGenerator(GgufBatchDecoder decoder, Accelerator accelerator, GGUFModel model)
+    {
+        _session = null!; _cache = null!; _argmax = null!;              // the session engine's; never touched on this engine
+        _accelerator = accelerator;
+        _tokenizer = SentencePieceTokenizer.FromGGUF(model) ?? throw new InvalidOperationException("GGUF model has no SentencePiece tokenizer metadata.");
+        _eosId = _tokenizer.EosId;
+        _maxSeqLen = decoder.MaxSeq;
+        Gguf = model;
+        _batch = new GgufBatchTextEngine(decoder, _tokenizer);
+    }
     private readonly Accelerator _accelerator;
     private readonly SentencePieceTokenizer _tokenizer;
     private readonly GGUFDecodeKVCache _cache;
@@ -127,7 +193,12 @@ public sealed class GgufGenerator : IDisposable
     /// multi-token steps always run the direct path. Gate:
     /// GGUF_WebGPU_DecodeCapture_TokenIdentical (greedy decode token-identical to the direct path).
     /// </summary>
-    public bool EnableWebGPUDecodeCapture { get; set; }
+    public bool EnableWebGPUDecodeCapture
+    {
+        get => _batch != null ? _batch.Decoder.CaptureWebGPU : _enableCapture;
+        set { if (_batch != null) _batch.Decoder.CaptureWebGPU = value; else _enableCapture = value; }
+    }
+    private bool _enableCapture;
     private WebGPUDecodeCapture? _decodeCapture;
     /// <summary>Recycled input_ids upload buffer (capacity = maxSeqLen). Avoids per-token Allocate1D.</summary>
     private MemoryBuffer1D<float, Stride1D.Dense>? _inputIdsBuf;
@@ -160,6 +231,7 @@ public sealed class GgufGenerator : IDisposable
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _accelerator = accelerator ?? throw new ArgumentNullException(nameof(accelerator));
+        Gguf = model;
         _tokenizer = SentencePieceTokenizer.FromGGUF(model)
             ?? throw new InvalidOperationException("GGUF model has no SentencePiece tokenizer metadata.");
 
@@ -196,33 +268,22 @@ public sealed class GgufGenerator : IDisposable
         Func<string, Task>? onDelta = null,
         CancellationToken ct = default)
     {
+        if (_batch != null)
+        {
+            _batch.EnablePrefixCache = EnablePrefixCache;
+            var br = await _batch.GenerateAsync(promptIds, config, stopStrings, stopTokenIds, onDelta, ct).ConfigureAwait(false);
+            LastReusedPrefix = _batch.LastReusedPrefix;
+            return br;
+        }
         int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 128;
 
-        // Fit prompt + generation into the KV cache. Agentic clients (Claude CLI) routinely send prompts far
-        // larger than a small local model's context (they assume a 200K-context Claude) and ask for huge
-        // max_tokens — so an over-long prompt is TAIL-truncated (keep the most recent tokens, which hold the
-        // actual question) and maxNew is capped, rather than overflowing the cache and crashing.
-        bool truncated = false;
-        if (promptIds.Length + maxNew > _maxSeqLen - 1)
-        {
-            int reserve = Math.Clamp(maxNew, 64, Math.Max(64, _maxSeqLen / 8));
-            int keep = _maxSeqLen - 1 - reserve;
-            if (keep >= 1 && promptIds.Length > keep)
-            {
-                promptIds = promptIds[^keep..];
-                truncated = true;
-            }
-            maxNew = Math.Min(maxNew, _maxSeqLen - 1 - promptIds.Length);
-            if (maxNew < 1) maxNew = 1;
-        }
+        // Fit prompt + generation into the KV cache (an over-long prompt keeps its most recent tokens: GenerationText.FitPrompt)
+        bool truncated;
+        (promptIds, maxNew, truncated) = GenerationText.FitPrompt(promptIds, maxNew, _maxSeqLen);
 
         var rng = config?.Seed is int seed ? new Random(seed) : Random.Shared;
-        var detok = _tokenizer.CreateStreamingDecoder();
         var generated = new List<int>();
-        var full = new StringBuilder();
-        int emitted = 0;
-        int maxStopLen = 0;
-        if (stopStrings != null) foreach (var s in stopStrings) if (s.Length > maxStopLen) maxStopLen = s.Length;
+        var text = new TextStream(_tokenizer, stopStrings, onDelta);
 
         // KV-prefix cache: reuse the bit-identical K/V of the longest common token prefix that this prompt
         // shares with the sequence already resident in the cache (same tokens, same absolute positions, so
@@ -305,7 +366,7 @@ public sealed class GgufGenerator : IDisposable
                         }
 
                         if (_decodeCapture != null)
-                            outputs = _decodeCapture.Outputs;   // the capture pass IS this step's forward
+                            outputs = _decodeCapture.StepOutputs;   // this step's answer (recomputed after the capture's probe passes)
                         else
                         {
                             EnableWebGPUDecodeCapture = false;  // non-WebGPU, or uncapturable: don't retry
@@ -415,45 +476,22 @@ public sealed class GgufGenerator : IDisposable
             if (stopTokenIds != null && stopTokenIds.Contains(next)) { stop = StopReason.StopToken; break; }
 
             generated.Add(next);
-            full.Append(detok.Push(next));
-
-            // Stop strings: if any appears, truncate at the FIRST match, emit up to it, stop.
-            int cut = EarliestStopMatch(full, emitted, stopStrings);
-            if (cut >= 0)
-            {
-                if (cut > emitted && onDelta != null) await onDelta(full.ToString(emitted, cut - emitted));
-                full.Length = cut;
-                emitted = cut;
-                stop = StopReason.StopString;
-                break;
-            }
-
-            // Stream everything that can't still be the prefix of a stop string (hold back the tail).
-            int safe = full.Length - PartialStopSuffix(full, maxStopLen, stopStrings);
-            if (safe > emitted && onDelta != null)
-            {
-                await onDelta(full.ToString(emitted, safe - emitted));
-                emitted = safe;
-            }
+            // the text: a stop string cuts it at its first match and ends the turn; what cannot still start one is streamed
+            if (!await text.PushAsync(next)) { stop = StopReason.StopString; break; }
 
             stepIds = new[] { next }; // incremental decode: after the prefill, feed only the new token
             }
             // _inputIdsBuf / _logitsReadBuf are instance-owned — disposed in Dispose(), never per-token
         }
 
-        // Flush the detokenizer + any held-back safe tail (only if we didn't stop on a stop string).
-        if (stop != StopReason.StopString)
-        {
-            full.Append(detok.Finish());
-            if (full.Length > emitted && onDelta != null)
-                await onDelta(full.ToString(emitted, full.Length - emitted));
-        }
+        // Flush the detokenizer + any held-back safe tail (a no-op after a stop string).
+        await text.FinishAsync();
 
         // Record what the KV cache now holds (only rows a step wrote: see RecordResident) so the NEXT request can
         // reuse this turn's prompt+response as its prefix.
         RecordResident(promptIds, generated, written);
 
-        return new GenerationResult(full.ToString(), promptIds.Length, generated.Count, stop);
+        return new GenerationResult(text.Text, promptIds.Length, generated.Count, stop);
     }
 
     /// <summary>
@@ -465,17 +503,11 @@ public sealed class GgufGenerator : IDisposable
     /// </summary>
     public async Task<(int[] ids, double ttftMs)> GenerateFirstTokenIdsAsync(int[] promptIds, GenerationConfig? config = null)
     {
+        if (_batch != null) throw new NotSupportedException("GenerateFirstTokenIdsAsync drives the session engine's decode (create the generator with engine: GgufEngine.Generator)");
         int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 10;
 
-        bool truncated = false;
-        if (promptIds.Length + maxNew > _maxSeqLen - 1)
-        {
-            int reserve = Math.Clamp(maxNew, 64, Math.Max(64, _maxSeqLen / 8));
-            int keep = _maxSeqLen - 1 - reserve;
-            if (keep >= 1 && promptIds.Length > keep) { promptIds = promptIds[^keep..]; truncated = true; }
-            maxNew = Math.Min(maxNew, _maxSeqLen - 1 - promptIds.Length);
-            if (maxNew < 1) maxNew = 1;
-        }
+        bool truncated;
+        (promptIds, maxNew, truncated) = GenerationText.FitPrompt(promptIds, maxNew, _maxSeqLen);
 
         // Same prefix-cache reuse decision as GenerateAsync (see that method for the correctness rationale).
         int P = 0;
@@ -530,7 +562,12 @@ public sealed class GgufGenerator : IDisposable
     /// the uniform from the generation's own <see cref="Random"/> (seeded runs stay reproducible); ties go to the lower id. Off: the host draws.
     /// Not on WebGL (the host draws there).
     /// </summary>
-    public bool DeviceSampling { get; set; } = true;
+    public bool DeviceSampling
+    {
+        get => _batch != null ? _batch.Decoder.DeviceSampling : _deviceSampling;
+        set { if (_batch != null) _batch.Decoder.DeviceSampling = value && GgufBatchDecoder.SupportsDeviceDraws(_accelerator); else _deviceSampling = value; }
+    }
+    private bool _deviceSampling = true;
     private bool UseDeviceSampling => DeviceSampling && DeviceSampler.Supports(_accelerator);
     private DeviceSampler? _deviceSampler;
     private readonly FixedUniform _fallbackRng = new();
@@ -607,51 +644,17 @@ public sealed class GgufGenerator : IDisposable
         return _logitsReadBuf;
     }
 
-    /// <summary>Index of the earliest stop-string match at or after <paramref name="from"/>, or -1.</summary>
-    private static int EarliestStopMatch(StringBuilder sb, int from, IReadOnlyList<string>? stops)
-    {
-        if (stops == null || stops.Count == 0) return -1;
-        string s = sb.ToString();
-        int best = -1;
-        foreach (var stopStr in stops)
-        {
-            if (string.IsNullOrEmpty(stopStr)) continue;
-            // Search a little before `from` so a stop string straddling the last emit boundary is still found.
-            int searchFrom = Math.Max(0, from - stopStr.Length + 1);
-            int idx = s.IndexOf(stopStr, searchFrom, StringComparison.Ordinal);
-            if (idx >= 0 && (best < 0 || idx < best)) best = idx;
-        }
-        return best;
-    }
-
-    /// <summary>
-    /// Length of the suffix of <paramref name="sb"/> that is a (possibly full) prefix of some stop string —
-    /// the tail that must be held back from streaming until we know it isn't the start of a stop match.
-    /// </summary>
-    private static int PartialStopSuffix(StringBuilder sb, int maxStopLen, IReadOnlyList<string>? stops)
-    {
-        if (stops == null || stops.Count == 0 || maxStopLen == 0) return 0;
-        string s = sb.ToString();
-        int maxCheck = Math.Min(maxStopLen, s.Length);
-        for (int len = maxCheck; len > 0; len--)
-        {
-            var tail = s.AsSpan(s.Length - len);
-            foreach (var stopStr in stops)
-            {
-                if (string.IsNullOrEmpty(stopStr) || stopStr.Length < len) continue;
-                if (stopStr.AsSpan(0, len).SequenceEqual(tail)) return len; // tail is a prefix of this stop
-            }
-        }
-        return 0;
-    }
-
-    /// <summary>Releases the decode KV-cache + argmax + recycled decode buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
+    /// <summary>Releases the decode KV-cache + argmax + recycled decode buffers, the session and stream <see cref="CreateAsync"/> made this generator own, or the
+    /// batch decoder. Never a session passed to the constructor, nor the accelerator (caller-owned).</summary>
     public void Dispose()
     {
+        if (_batch != null) { _batch.Dispose(); _ownedStream?.Dispose(); return; }
         _decodeCapture?.Dispose(); _decodeCapture = null;
         _inputIdsBuf?.Dispose(); _inputIdsBuf = null;
         _logitsReadBuf?.Dispose(); _logitsReadBuf = null;
         _cache.Dispose();
         _argmax.Dispose();
+        _ownedSession?.Dispose(); _ownedSession = null;
+        _ownedStream?.Dispose(); _ownedStream = null;
     }
 }

@@ -32,11 +32,10 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// </summary>
 public sealed class GgufTextGenerationPipeline : IDisposable
 {
-    private readonly GgufGenerator _gen;
+    private readonly GgufGenerator _gen;            // owned: the session engine or the batch decoder (GgufGenerator.CreateAsync chose)
     private readonly GGUFModel _model;
     private readonly SentencePieceTokenizer _tokenizer;
     private readonly ChatTemplates.ChatFormat _format;
-    private readonly InferenceSession? _ownedSession; // non-null only when WE created the session (factory path)
 
     /// <summary>The model's tokenizer (SentencePiece, from the GGUF vocab).</summary>
     public SentencePieceTokenizer Tokenizer => _tokenizer;
@@ -47,37 +46,51 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     /// <summary>The model architecture string from the GGUF metadata (e.g. "qwen2", "llama", "gemma3").</summary>
     public string Architecture => _model.Architecture;
 
+    /// <summary>The generator underneath (its engine, prefix cache and diagnostics); owned by this pipeline.</summary>
+    public GgufGenerator Generator => _gen;
+
+    /// <summary>The engine that decodes: <see cref="GgufEngine.BatchDecoder"/> or <see cref="GgufEngine.Generator"/> (never Auto: the factory resolves it).</summary>
+    public GgufEngine Engine => _gen.Engine;
+
+    /// <summary>Why <see cref="GgufEngine.Auto"/> chose the generator engine for this model ("" when it chose the batch decoder or the caller chose).</summary>
+    public string EngineReason => _gen.EngineReason;
+
     /// <summary>The underlying decode-enabled <see cref="InferenceSession"/>. Advanced consumers -
     /// capture/replay probes, the Ollama-server model runner - drive decode state directly through it;
-    /// the pipeline still owns its lifetime (do not dispose).</summary>
+    /// the pipeline still owns its lifetime (do not dispose). The generator engine only: a pipeline on the batch decoder has no session
+    /// (create it with <see cref="GgufEngine.Generator"/> to get one).</summary>
     public InferenceSession Session => _gen.Session;
 
-    /// <summary>Opt-in WebGPU decode capture/replay - see <see cref="GgufGenerator.EnableWebGPUDecodeCapture"/>
-    /// (686ms/tok -> ~21ms/tok measured; no-op on non-WebGPU backends).</summary>
+    /// <summary>The batch decoder, when <see cref="Engine"/> is <see cref="GgufEngine.BatchDecoder"/> (null otherwise): its decode timings, row reads and settings.</summary>
+    public GgufBatchDecoder? BatchDecoder => _gen.BatchDecoder;
+
+    /// <summary>WebGPU decode capture/replay - see <see cref="GgufGenerator.EnableWebGPUDecodeCapture"/> (686ms/tok -> ~21ms/tok measured; no-op on non-WebGPU
+    /// backends). The batch decoder: <see cref="GgufBatchDecoder.CaptureWebGPU"/> (on by default on WebGPU).</summary>
     public bool EnableWebGPUDecodeCapture
     {
         get => _gen.EnableWebGPUDecodeCapture;
         set => _gen.EnableWebGPUDecodeCapture = value;
     }
 
-    /// <summary>Sampled steps draw on the device (one int read per token) - see <see cref="GgufGenerator.DeviceSampling"/>. Default true.</summary>
+    /// <summary>Sampled steps draw on the device (one int read per token) - see <see cref="GgufGenerator.DeviceSampling"/>. Default true where supported.</summary>
     public bool DeviceSampling
     {
         get => _gen.DeviceSampling;
         set => _gen.DeviceSampling = value;
     }
 
-    /// <summary>Tokens drawn on the device so far, and steps the host sampled instead (diagnostics; see <see cref="GgufGenerator.DeviceSampledTokens"/>).</summary>
+    /// <summary>The session engine: tokens drawn on the device so far, and steps the host sampled instead (see <see cref="GgufGenerator.DeviceSampledTokens"/>);
+    /// (0, 0) on the batch decoder (its draws: <see cref="GgufBatchDecoder.RowReads"/>).</summary>
     public (int Device, int Fallbacks) DeviceSamplerCounts => (_gen.DeviceSampledTokens, _gen.DeviceSamplerFallbacks);
 
-    /// <summary>Diagnostics for the active decode capture (ops + patch counts), or null.</summary>
+    /// <summary>Diagnostics for the active decode capture (ops + patch counts), or null (always on the batch decoder).</summary>
     public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo => _gen.DecodeCaptureInfo;
 
     /// <summary>Length of the KV-prefix the last request reused (0 = full prefill). Diagnostic - lets a test
     /// assert WHICH path a generation took (see Lfm2_PrefixCacheReuse_SamePromptTwice_IsIdentical).</summary>
     public int LastReusedPrefix => _gen.LastReusedPrefix;
 
-    /// <summary>Per-phase ms of the most recent patched replay step (diagnostics), or null.</summary>
+    /// <summary>Per-phase ms of the most recent patched replay step (diagnostics), or null (always on the batch decoder: <see cref="GgufBatchDecoder.DecodeTimings"/>).</summary>
     public (double Patch, double Replay, double Sync)? LastDecodeCaptureStepMs => _gen.LastDecodeCaptureStepMs;
 
     /// <summary>Patch sub-phases of the most recent replay step (diagnostics), or null.</summary>
@@ -87,69 +100,61 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     public int MaxNewTokens { get; set; } = 256;
 
     /// <summary>
-    /// Wrap an already-loaded <paramref name="session"/> for <paramref name="model"/>. The caller OWNS the
+    /// Wrap an already-loaded <paramref name="session"/> for <paramref name="model"/> (the session engine). The caller OWNS the
     /// session (this pipeline does NOT dispose it). Allocates the decode KV-cache (sized to
     /// <paramref name="maxSeqLen"/>) and enables incremental decode via <see cref="GgufGenerator"/>.
     /// </summary>
     public GgufTextGenerationPipeline(InferenceSession session, Accelerator accelerator, GGUFModel model, int maxSeqLen = 4096)
-        : this(session, accelerator, model, maxSeqLen, ownedSession: null) { }
+        : this(new GgufGenerator(session, accelerator, model ?? throw new ArgumentNullException(nameof(model)), maxSeqLen)) { }
 
-    private GgufTextGenerationPipeline(InferenceSession session, Accelerator accelerator, GGUFModel model,
-        int maxSeqLen, InferenceSession? ownedSession)
+    private GgufTextGenerationPipeline(GgufGenerator generator)
     {
-        _model = model ?? throw new ArgumentNullException(nameof(model));
-        _tokenizer = SentencePieceTokenizer.FromGGUF(model)
-            ?? throw new InvalidOperationException("GGUF model has no SentencePiece tokenizer metadata.");
-        _format = ChatTemplates.DetectChatFormat(model);
-        _gen = new GgufGenerator(session, accelerator, model, maxSeqLen);
-        _ownedSession = ownedSession;
+        _gen = generator;
+        _model = generator.Gguf;
+        _tokenizer = generator.Tokenizer;
+        _format = ChatTemplates.DetectChatFormat(_model);
     }
 
     /// <summary>
-    /// One-call factory: load a GGUF model from a file and build a ready-to-use text-generation pipeline
-    /// (streams the weights to the GPU, allocates the decode cache, and takes the tokenizer + chat format
-    /// from the header the session already parsed). The returned pipeline OWNS the underlying session and disposes it on
+    /// The engine <see cref="GgufEngine.Auto"/> picks for <paramref name="model"/> on <paramref name="accelerator"/>: the batch decoder when it loads the model
+    /// (<see cref="GgufBatchDecoder.Supports"/>) and the backend is CUDA, OpenCL or WebGPU (MEASURED 2026-11-01, Qwen2.5-0.5B, one chat answer: WebGPU 260.8 tok/s
+    /// against 67.8 on the session engine, CUDA 165.1 against 104.6, OpenCL 184.0 against 47.3); the session engine otherwise (other architectures, WebGL, Wasm,
+    /// the CPU backends).
+    /// </summary>
+    public static GgufEngine ChooseEngine(Accelerator accelerator, GGUFModel model, out string reason)
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+        { reason = $"{accelerator.AcceleratorType}: the batch decoder is gated on CUDA, OpenCL and WebGPU"; return GgufEngine.Generator; }
+        if (!GgufBatchDecoder.Supports(model, out var why)) { reason = "the batch decoder cannot load it: " + why; return GgufEngine.Generator; }
+        reason = "";
+        return GgufEngine.BatchDecoder;
+    }
+
+    /// <summary>
+    /// One-call factory: load a GGUF model from a file and build a ready-to-use text-generation pipeline on the engine
+    /// <paramref name="engine"/> picks (<see cref="GgufGenerator.CreateAsync"/>). The pipeline owns the file and the engine and disposes them on
     /// <see cref="Dispose"/>. Mirrors Transformers.js <c>pipeline('text-generation', path)</c>.
     /// </summary>
     public static async Task<GgufTextGenerationPipeline> CreateFromFileAsync(Accelerator accelerator, string ggufPath,
-        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default)
+        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default, GgufEngine engine = GgufEngine.Auto)
     {
-        var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, ggufPath, onProgress, ct).ConfigureAwait(false);
-        // Same duplicate as CreateFromStreamAsync, and worse: it opened a SECOND FileStream purely to
-        // re-read a header the session had already parsed. See the note there.
-        var model = session.GgufModel
-            ?? throw new InvalidOperationException(
-                "CreateFromGGUFFileAsync returned a session without its parsed GGUF header - library defect.");
-        return new GgufTextGenerationPipeline(session, accelerator, model, maxSeqLen, ownedSession: session);
+        var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        try { return new GgufTextGenerationPipeline(await GgufGenerator.CreateAsync(accelerator, fs, maxSeqLen, null, onProgress, engine, ownsStream: true, ct).ConfigureAwait(false)); }
+        catch { fs.Dispose(); throw; }
     }
 
     /// <summary>
-    /// One-call factory from a SEEKABLE .gguf stream (browser / hub torrent / OPFS delivery): streams the
-    /// weights to the GPU without ever materializing the whole model as a byte[]. The stream must outlive
-    /// this call and be seekable. The returned pipeline OWNS the session. (The session keeps the stream for
-    /// on-demand small-tensor reads, and hands back the header it parsed - the tokenizer and chat format
-    /// come from THAT, so these bytes are parsed exactly once per load.)
+    /// One-call factory from a SEEKABLE .gguf stream (browser / hub / OPFS delivery) on the engine <paramref name="engine"/> picks
+    /// (<see cref="GgufGenerator.CreateAsync"/>): the weights stream to the GPU without ever materializing the model as a byte[] (a browser JS stream goes
+    /// JS -> GPU, never the .NET heap). The header is parsed once. Keep the stream open until the pipeline is disposed (the session engine reads it on
+    /// demand; the batch engine disposes it with itself).
     /// </summary>
     public static async Task<GgufTextGenerationPipeline> CreateFromStreamAsync(Accelerator accelerator, Stream seekableGguf,
-        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default)
+        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default, GgufEngine engine = GgufEngine.Auto)
     {
         if (!seekableGguf.CanSeek)
             throw new ArgumentException("CreateFromStreamAsync requires a seekable stream.", nameof(seekableGguf));
-        seekableGguf.Seek(0, SeekOrigin.Begin);
-        // 🔴 This used to parse the header here for the tokenizer and chat format, throw that model away,
-        // and then let CreateFromGGUFStreamAsync parse the SAME BYTES again for the graph. The session now
-        // hands back the header it already parsed. MEASURED 2026-09-16 on WebGPU, Qwen3-1.7B-Q8_0:
-        //   header parses  2 (421 ms)  ->  1 (220 ms)
-        //   "parse" stage  0.6 s       ->  0.3 s
-        //   WARM LOAD      2.8 s       ->  2.6 s
-        // and one fewer live copy of a 303K-string vocab on the WASM heap.
-        var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, seekableGguf, onProgress, ct).ConfigureAwait(false);
-        var model = session.GgufModel
-            ?? throw new InvalidOperationException(
-                "CreateFromGGUFStreamAsync returned a session without its parsed GGUF header. That is a "
-                + "library defect - do NOT re-parse here to paper over it, because a silent fallback is "
-                + "exactly how the duplicate parse this replaced survived unnoticed.");
-        return new GgufTextGenerationPipeline(session, accelerator, model, maxSeqLen, ownedSession: session);
+        return new GgufTextGenerationPipeline(await GgufGenerator.CreateAsync(accelerator, seekableGguf, maxSeqLen, null, onProgress, engine, ownsStream: false, ct).ConfigureAwait(false));
     }
 
     /// <summary>
@@ -194,14 +199,13 @@ public sealed class GgufTextGenerationPipeline : IDisposable
 
         var sb = onToken != null ? new StringBuilder() : null;
         int count = 0;
-        var res = await _gen.GenerateAsync(promptIds, config, stopTokenIds: stopIds,
-            onDelta: onToken == null ? null : async delta =>
-            {
-                sb!.Append(delta);
-                count++;
-                await onToken(count, sb.ToString()).ConfigureAwait(false);
-            },
-            ct: ct).ConfigureAwait(false);
+        Func<string, Task>? onDelta = onToken == null ? null : async delta =>
+        {
+            sb!.Append(delta);
+            count++;
+            await onToken(count, sb.ToString()).ConfigureAwait(false);
+        };
+        var res = await _gen.GenerateAsync(promptIds, config, stopTokenIds: stopIds, onDelta: onDelta, ct: ct).ConfigureAwait(false);
         LastStopReason = res.Stop;
         return res.Text;
     }
@@ -213,9 +217,16 @@ public sealed class GgufTextGenerationPipeline : IDisposable
 
     /// <summary>Releases the decode KV-cache + argmax buffers, and the session ONLY if this pipeline created
     /// it (factory path). Never disposes a session/accelerator passed into the constructor (caller-owned).</summary>
-    public void Dispose()
-    {
-        _gen.Dispose();
-        _ownedSession?.Dispose();
-    }
+    public void Dispose() => _gen.Dispose();
+}
+
+/// <summary>The decode engine of a <see cref="GgufTextGenerationPipeline"/>.</summary>
+public enum GgufEngine
+{
+    /// <summary>The batch decoder when it loads the model on a backend it is gated on (<see cref="GgufTextGenerationPipeline.ChooseEngine"/>), else the generator.</summary>
+    Auto,
+    /// <summary><see cref="GgufGenerator"/> over an <see cref="InferenceSession"/>: every architecture the graph builder knows; exposes the session.</summary>
+    Generator,
+    /// <summary><see cref="GgufBatchDecoder"/> with one sequence (qwen2, qwen3, llama without rope_freqs): the faster engine; throws when it cannot load the model.</summary>
+    BatchDecoder,
 }
