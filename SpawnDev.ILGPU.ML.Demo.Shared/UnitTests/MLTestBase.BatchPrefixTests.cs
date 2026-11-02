@@ -235,6 +235,13 @@ public abstract partial class MLTestBase
         var notes = new List<string>();
         bool ok = true;
         var text = string.Concat(Enumerable.Repeat("The lighthouse keeper watched the storm roll in over the grey water, counting the waves and the seconds between the flashes. ", 30));
+        // F32 caches: this compares two attention kernels, so their inputs must not carry 16-bit rounding. Each run computes its own prefill; with F16 caches a
+        // layer's float-order difference (1e-7) moves the next layer's K / V across F16 rounding boundaries (a 1e-3 step), MEASURED 2026-11-02 at 4-7e-3 in the
+        // logits. The F16 cache is gated on its own (GgufBatchDecoder_HalfKvCache_MatchesF32).
+        bool halfSaved = GgufBatchDecoder.HalfKvCache;
+        GgufBatchDecoder.HalfKvCache = false;
+        try
+        {
         foreach (var (repo, file) in new[] { ("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"), ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf") })
         {
             var src = await hub.OpenAsync(repo, file, deselect: false);
@@ -264,6 +271,8 @@ public abstract partial class MLTestBase
             ok &= good;
             notes.Add($"{file}: prompt {ids.Length}, logits max |diff| {d1:G3}, second part ({more.Length} over the first) {d2:G3}, tokens {(flash.T.SequenceEqual(three.T) ? "same" : "DIFFER")}{(good ? "" : " (WRONG)")}");
         }
+        }
+        finally { GgufBatchDecoder.HalfKvCache = halfSaved; }
         var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
         Console.WriteLine("[FlashPrefill] " + report);
         if (!ok) throw new Exception(report);

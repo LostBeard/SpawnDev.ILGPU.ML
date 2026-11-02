@@ -198,8 +198,31 @@ public class FeatureExtractionPipeline : IDisposable
     /// <summary>Length of an embedding (the model's hidden size).</summary>
     public int HiddenSize => _hiddenSize;
 
-    /// <summary>Tokens per text the model sees (longer texts are truncated, shorter padded).</summary>
+    /// <summary>Tokens per text the model sees at most (longer texts are truncated).</summary>
     public int MaxLength => _maxLength;
+
+    /// <summary>
+    /// Run each text at a bucketed length (the next power of two at or above its token count, at least <see cref="MinRunLength"/>, at most
+    /// <see cref="MaxLength"/>) instead of padding every text to <see cref="MaxLength"/>: the session recompiles once per bucket and shares the weights
+    /// (<see cref="InferenceSession.SupportsShapeRecompile"/>; off when the session cannot). The vector is the same: padding is masked out of the
+    /// attention and the pooling. Default on. MEASURED (Data, SpawnDev.AI embed-bench, all-MiniLM-L6-v2 on Velocity): the run time is linear in the
+    /// padded length (128: 374 ms, 32: 99 ms) and a memory is ~15 tokens, so ~4x of every embedding was padding.
+    /// </summary>
+    public bool BucketLengths { get; set; } = true;
+
+    /// <summary>The shortest bucket <see cref="BucketLengths"/> runs at.</summary>
+    public int MinRunLength { get; set; } = 16;
+
+    /// <summary>The length the last text ran at (its bucket, or <see cref="MaxLength"/>).</summary>
+    public int LastRunLength { get; private set; }
+
+    private int RunLength(int tokens)
+    {
+        if (!BucketLengths || !_session.SupportsShapeRecompile) return _maxLength;
+        int len = Math.Max(1, MinRunLength);
+        while (len < tokens) len <<= 1;
+        return Math.Min(len, _maxLength);
+    }
 
     /// <summary>
     /// Embed pre-tokenized text to a dense vector via mean pooling + L2 normalization (on the device; the
@@ -262,16 +285,18 @@ public class FeatureExtractionPipeline : IDisposable
     // the model on one text: its last hidden state [1, seq, hidden] and seq; the attention mask stays in _maskBuf for the pooling
     private async Task<(ArrayView1D<float, Stride1D.Dense> Hidden, int Seq)> RunModelAsync(int[] tokenIds)
     {
-        var padded = TextPreprocessor.PadOrTruncate(tokenIds, _maxLength, PAD_TOKEN);
+        int len = RunLength(Math.Min(tokenIds.Length, _maxLength));
+        LastRunLength = len;
+        var padded = TextPreprocessor.PadOrTruncate(tokenIds, len, PAD_TOKEN);
         var mask = TextPreprocessor.CreateAttentionMask(padded, PAD_TOKEN);
-        var idsFloat = new float[_maxLength];
-        var maskFloat = new float[_maxLength];
-        for (int i = 0; i < _maxLength; i++) { idsFloat[i] = padded[i]; maskFloat[i] = mask[i]; }
+        var idsFloat = new float[len];
+        var maskFloat = new float[len];
+        for (int i = 0; i < len; i++) { idsFloat[i] = padded[i]; maskFloat[i] = mask[i]; }
 
         _idsBuf ??= _accelerator.Allocate1D<float>(_maxLength);
         _maskBuf ??= _accelerator.Allocate1D<float>(_maxLength);
-        _idsBuf.View.CopyFromCPU(idsFloat);
-        _maskBuf.View.CopyFromCPU(maskFloat);
+        _idsBuf.View.SubView(0, len).CopyFromCPU(idsFloat);
+        _maskBuf.View.SubView(0, len).CopyFromCPU(maskFloat);
 
         // ⚠️ BIND BY NAME, NOT BY POSITION. This used to feed InputNames[0] and InputNames[1] and stop
         // there, which fails two ways: a model that declares its inputs in another order is handed the mask
@@ -279,8 +304,8 @@ public class FeatureExtractionPipeline : IDisposable
         // embedding model to point this at - declares input_ids, attention_mask AND token_type_ids.
         // Positional binding is kept only as the fallback for a model using non-standard names.
         var inputs = new Dictionary<string, Tensor>();
-        var idsTensor = new Tensor(_idsBuf.View, new[] { 1, _maxLength });
-        var maskTensor = new Tensor(_maskBuf.View, new[] { 1, _maxLength });
+        var idsTensor = new Tensor(_idsBuf.View.SubView(0, len), new[] { 1, len });
+        var maskTensor = new Tensor(_maskBuf.View.SubView(0, len), new[] { 1, len });
         string? Named(string want) => _session.InputNames
             .FirstOrDefault(n => string.Equals(n, want, StringComparison.OrdinalIgnoreCase));
         var idsName = Named("input_ids");
@@ -302,7 +327,7 @@ public class FeatureExtractionPipeline : IDisposable
         if (typeName != null && !inputs.ContainsKey(typeName))
         {
             if (_typeBuf == null) { _typeBuf = _accelerator.Allocate1D<float>(_maxLength); _typeBuf.MemSetToZero(); }
-            inputs[typeName] = new Tensor(_typeBuf.View, new[] { 1, _maxLength });
+            inputs[typeName] = new Tensor(_typeBuf.View.SubView(0, len), new[] { 1, len });
         }
 
         var outputs = await _session.RunAsync(inputs).ConfigureAwait(false);
@@ -335,7 +360,7 @@ public class FeatureExtractionPipeline : IDisposable
                   + "(for example Xenova/all-MiniLM-L6-v2, which declares last_hidden_state)."
                   : $"Construct the pipeline with hiddenSize: {output.Shape[^1]}.")
               + $" Outputs available: [{string.Join(", ", _session.OutputNames)}].");
-        int seq = Math.Min(output.Shape[^2], _maxLength);
+        int seq = Math.Min(output.Shape[^2], len);
         return (output.Data, seq);
     }
 

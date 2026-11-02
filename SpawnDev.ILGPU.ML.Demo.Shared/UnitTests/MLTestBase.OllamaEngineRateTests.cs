@@ -33,8 +33,12 @@ public abstract partial class MLTestBase
             return null;
         }
         var models = (Environment.GetEnvironmentVariable("OLLAMA_BENCH_MODELS") is { Length: > 0 } list ? list : "llama3.1:8b,qwen3:8b").Split(',');
-        var q = new List<(string, string)> { ("user", "Write a long story about a lighthouse keeper and a storm.") };
-        const int MaxNew = 128, MaxSeq = 1024;
+        // OLLAMA_BENCH_FILLER_WORDS: a long prompt (context cost: each decode step's attention reads the whole K / V cache), as SpawnDev.AI chat-bench's third argument
+        int filler = int.TryParse(Environment.GetEnvironmentVariable("OLLAMA_BENCH_FILLER_WORDS"), out var fw) ? fw : 0;
+        string fillerText = filler > 0 ? string.Join(" ", Enumerable.Range(0, filler).Select(i => new[] { "the", "keeper", "watched", "storm", "light", "over", "grey", "water" }[i % 8])) + "\n\n" : "";
+        var q = new List<(string, string)> { ("user", fillerText + "Write a long story about a lighthouse keeper and a storm.") };
+        const int MaxNew = 128;
+        int MaxSeq = filler > 0 ? filler * 2 + 512 : 1024;
         var notes = new List<string>();
         foreach (var spec in models)
         {
@@ -84,8 +88,41 @@ public abstract partial class MLTestBase
                 double sum = dec.KernelTimes.Values.Sum();
                 prof = timings + " | profiled kernels (32 steps, ms/step, share): " + string.Join(", ", dec.KernelTimes.OrderByDescending(kv => kv.Value).Take(10)
                     .Select(kv => $"{kv.Key} {kv.Value / 32:F2} ({kv.Value * 100 / sum:F0}%)")) + $"; sum {sum / 32:F1} ms/step";
+                // the prefix-reuse prefill (Vertex's case, Data 2026-11-02: 104-346 new tokens over a reused 3-5k prefix took 2.2-5.6 s): a generation records the
+                // cache, then the same prompt with a different ~200-token tail just before the question is prefilled with reuse on (timed alone, synchronised), and
+                // the same prompt prefilled from row 0 as the reference
+                if (filler > 0)
+                {
+                    var q2 = new List<(string, string)> { ("user", fillerText + string.Join(" ", Enumerable.Range(0, 150).Select(i => new[] { "a", "gull", "cried", "near", "the", "rocks" }[i % 6])) + "\n\nWrite a long story about a lighthouse keeper and a storm.") };
+                    var (prompt2, _) = ChatTemplates.BuildChatPrompt(gguf, tok, q2, thinking: false);
+                    await dec.GenerateAsync(prompt, 1, 8, 0f, 1f, 1, stops);                 // records the cache rows
+                    var swR = Stopwatch.StartNew();
+                    await dec.PrefillAsync(prompt2, 0f, reusePrefix: true);
+                    await accelerator.SynchronizeAsync();
+                    double reuseMs = swR.Elapsed.TotalMilliseconds;
+                    int reused = dec.LastReusedPrefix;
+                    var swF = Stopwatch.StartNew();
+                    await dec.PrefillAsync(prompt2, 0f, reusePrefix: false);
+                    await accelerator.SynchronizeAsync();
+                    double fullMs = swF.Elapsed.TotalMilliseconds;
+                    int fresh = prompt2.Length - reused;
+                    prof += $" | prefix reuse: {prompt2.Length}-token prompt, {reused} rows reused, {fresh} new rows prefilled in {reuseMs:F0} ms ({fresh * 1000.0 / reuseMs:F0} new tok/s); the whole prompt from row 0 in {fullMs:F0} ms ({prompt2.Length * 1000.0 / fullMs:F0} tok/s)";
+                    // where each prefill's time goes (synchronised per kernel, so the shares matter): the reuse prefill, then the whole prompt
+                    string Shares(string what)
+                    {
+                        double total = dec.KernelTimes.Values.Sum();
+                        return $" | {what} profiled ({total:F0} ms): " + string.Join(", ", dec.KernelTimes.OrderByDescending(kv => kv.Value).Take(12).Select(kv => $"{kv.Key} {kv.Value:F0} ({kv.Value * 100 / total:F0}%)"));
+                    }
+                    await dec.GenerateAsync(prompt, 1, 8, 0f, 1f, 1, stops);
+                    dec.ProfileKernels = true;
+                    await dec.PrefillAsync(prompt2, 0f, reusePrefix: true);
+                    prof += Shares($"reuse prefill ({dec.LastReusedPrefix} reused)");
+                    await dec.PrefillAsync(prompt2, 0f, reusePrefix: false);
+                    prof += Shares("whole prefill");
+                    dec.ProfileKernels = false;
+                }
             }
-            notes.Add($"{spec}: session {sessRate:F1} tok/s, batch {batchRate:F1} tok/s | {census} | {prof}");
+            notes.Add($"{spec}: prompt {prompt.Length} tokens, KV {(GgufBatchDecoder.HalfKvCache ? "F16" : "F32")}: session {sessRate:F1} tok/s, batch {batchRate:F1} tok/s | {census} | {prof}");
         }
         var report = $"{accelerator.AcceleratorType}: " + string.Join(" || ", notes);
         Console.WriteLine("[OllamaEngineRate] " + report);

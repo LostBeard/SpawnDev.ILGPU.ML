@@ -88,6 +88,12 @@ public class InferenceSession : IDisposable
     /// fresh-pool churn rather than CPU recompile or forward compute.</summary>
     public int LastExecutorBufferCount { get; private set; }
 
+    /// <summary>
+    /// True when a run at input shapes other than the compiled ones is recompiled for them (an executor per shape, the weights shared: see
+    /// ResolveExecutor). False for load paths without a recompile graph (TFLite, GGUF, ...): there a different input shape runs the base executor.
+    /// </summary>
+    public bool SupportsShapeRecompile => _recompileGraph != null;
+
     /// <summary>Model input names and shapes.</summary>
     public string[] InputNames => _compiled.InputNames;
     public Dictionary<string, int[]> InputShapes => _compiled.InputShapes;

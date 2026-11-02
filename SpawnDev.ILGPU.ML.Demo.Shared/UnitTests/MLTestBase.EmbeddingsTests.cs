@@ -113,6 +113,40 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[Embeddings] into a device view: {(viewSame ? "= EmbedAsync" : "DIFFERS")}; batch rows: {(batchSame ? "= EmbedAsync" : "DIFFER")}");
         if (!viewSame || !batchSame) throw new Exception($"device-destination embeddings differ from EmbedAsync (view {viewSame}, batch {batchSame})");
 
+        // run at the token count's bucket, not padded to 128 (BucketLengths, default on): the anchor is ~13 tokens -> 16. The vector must be the one the
+        // 128-token run gives (padding is masked out of the attention and the pooling); the onnxruntime check above already ran bucketed.
+        var anchorAgain = (await pipe.EmbedAsync(anchor, tok)).Embedding;
+        int bucket = pipe.LastRunLength;
+        pipe.BucketLengths = false;
+        var padded128 = (await pipe.EmbedAsync(anchor, tok)).Embedding;
+        int full = pipe.LastRunLength;
+        pipe.BucketLengths = true;
+        double dot = 0; for (int i = 0; i < HiddenSize; i++) dot += anchorAgain[i] * padded128[i];
+        Console.WriteLine($"[Embeddings] bucketed run at {bucket} tokens vs padded to {full}: cosine {dot:F6}");
+        if (session.SupportsShapeRecompile && (bucket != 16 || full != 128))
+            throw new Exception($"the anchor ran at {bucket} tokens bucketed (expected 16) and {full} unbucketed (expected 128)");
+        if (dot < 0.99999)
+            throw new Exception($"the bucketed embedding differs from the 128-token one: cosine {dot:F6}");
+        // the bucket edge (Data's ask): exactly 16 ids with [CLS] and [SEP] run at 16, 17 at 32, each the 128-token vector
+        var words = tok.Encode("The lighthouse keeper watched the storm roll in over the grey water, counting the waves and the seconds between the flashes of light.");
+        foreach (int total in new[] { 16, 17 })
+        {
+            var edge = new List<int> { tok.BosTokenId >= 0 ? tok.BosTokenId : 101 };
+            edge.AddRange(words.Take(total - 2));
+            edge.Add(tok.EosTokenId >= 0 ? tok.EosTokenId : 102);
+            if (edge.Count != total) throw new Exception($"the edge text has {edge.Count} ids, wanted {total} (the sentence is too short)");
+            var bucketed = (await pipe.EmbedAsync(edge.ToArray())).Embedding;
+            int at = pipe.LastRunLength;
+            pipe.BucketLengths = false;
+            var full128 = (await pipe.EmbedAsync(edge.ToArray())).Embedding;
+            pipe.BucketLengths = true;
+            double c = 0; for (int i = 0; i < HiddenSize; i++) c += bucketed[i] * full128[i];
+            int wantAt = total <= 16 ? 16 : 32;
+            Console.WriteLine($"[Embeddings] {total} ids ran at {at}: cosine {c:F6} to the 128-token run");
+            if (session.SupportsShapeRecompile && at != wantAt) throw new Exception($"{total} ids ran at {at}, expected {wantAt}");
+            if (c < 0.99999) throw new Exception($"{total} ids at {at}: cosine {c:F6} to the 128-token run");
+        }
+
         Console.WriteLine("[Embeddings] real-tokenizer embeddings are semantic (related > unrelated, self ≈ 1.0) and match onnxruntime.");
     });
 }
