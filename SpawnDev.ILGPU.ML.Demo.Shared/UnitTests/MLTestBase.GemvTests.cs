@@ -682,4 +682,64 @@ public abstract partial class MLTestBase
         }
         Console.WriteLine($"[Gemv] ForwardRows Q8_0 / Q4_K / Q6_K / Q4_0, M = 1, 3, 8, K={K} N={N}: match the oracle");
     });
+
+    /// <summary>
+    /// FusedDequantMatMul's tiled GEMM (M &gt; 1: a prefill's rows; <c>ForceTiledGemm</c> so every backend runs it, CUDA's tuned Q4_K / Q6_K kernels included)
+    /// against the host oracle: Q8_0, Q4_K, Q6_K, Q4_0, M = 9, 64, 65 and 200 (a tile, past a tile, several), N = 97 and 130 (past a tile), K = 1536. Added when
+    /// it replaced the per-element kernel for prefills (2026-11-01: a qwen3-4b prefill took 111 s on WebGPU on that kernel).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task TiledGemm_AllTypes_MatchOracle() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("the tiled GEMM needs shared memory (not WebGL)");
+        if (accelerator.MaxGroupSize.X < 256) throw new UnsupportedTestException("the tiled GEMM's groups are 256 threads");
+        const int K = 1536;
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        bool saved = Kernels.FusedDequantMatMul.ForceTiledGemm;
+        Kernels.FusedDequantMatMul.ForceTiledGemm = true;
+        try
+        {
+            foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0 })
+                foreach (int N in new[] { 97, 130 })
+                {
+                    var rng = new Random(71 + (int)type + N);
+                    int bytesPerRow = RowBytes(type, K);
+                    var weightBytes = new byte[N * bytesPerRow];
+                    var wRows = new float[N][];
+                    for (int n = 0; n < N; n++)
+                    {
+                        var rowBytes = MakeBlocks(type, K, rng);
+                        Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                        wRows[n] = ReferenceDequant(type, rowBytes, K);
+                    }
+                    using var weightBuf = AllocatePadded(accelerator, weightBytes);
+                    foreach (int M in new[] { 9, 64, 65, 200 })
+                    {
+                        var input = new float[M * K];
+                        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                        var expected = new double[M * N];
+                        var scale = new double[M * N];                  // sum of |terms|: a float32 sum of K terms is off by up to ~K * eps of it, in any order
+                        for (int m = 0; m < M; m++)
+                            for (int n = 0; n < N; n++)
+                            {
+                                double sum = 0, abs = 0;
+                                for (int k = 0; k < K; k++) { double v = input[m * K + k] * wRows[n][k]; sum += v; abs += Math.Abs(v); }
+                                expected[m * N + n] = sum; scale[m * N + n] = abs;
+                            }
+                        using var inputBuf = accelerator.Allocate1D(input);
+                        using var outBuf = accelerator.Allocate1D<float>(M * N);
+                        fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+                        var got = await outBuf.CopyToHostAsync<float>(0, M * N);
+                        for (int i = 0; i < got.Length; i++)
+                        {
+                            double tol = 2e-3 + 1e-5 * scale[i];
+                            if (!(Math.Abs(got[i] - expected[i]) <= tol))
+                                throw new Exception($"tiled GEMM {type} M={M} N={N} mismatch @{i}: got {got[i]}, want {expected[i]:G9} (tol {tol:G3}: 2e-3 + 1e-5 x sum|terms| {scale[i]:G4})");
+                        }
+                    }
+                }
+        }
+        finally { Kernels.FusedDequantMatMul.ForceTiledGemm = saved; }
+        Console.WriteLine($"[TiledGemm] {accelerator.AcceleratorType}: Q8_0 / Q4_K / Q6_K / Q4_0, M = 9, 64, 65, 200, N = 97, 130, K = {K}: match the oracle");
+    });
 }

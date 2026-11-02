@@ -318,6 +318,19 @@ public class FusedDequantMatMul : IDisposable
             }
         }
 
+        // M > 1 (a prefill's rows) on the tiled GEMM for every block type, wherever the tuned CUDA / OpenCL Q4_K / Q6_K kernels below do not take it: WebGPU (all
+        // types), Q8_0 / Q4_0 / Q4_1 / Q5_0 everywhere but WebGL (no shared memory). It replaced the per-element kernel (a thread per output walking K): MEASURED
+        // 2026-11-01, a qwen3-4b Q4_K_M prefill of 600 tokens took 111 s on WebGPU on it (~43 GFLOPS), and SpawnDev.AI lost the WebGPU device on such prefills.
+        bool tunedMultiRow = M > 1 && EnableMultiRowGemm && !gpuBrowser && _accelerator.AcceleratorType != AcceleratorType.WebGPU && (type == GGMLType.Q4_K || type == GGMLType.Q6_K);
+        if (M > 1 && EnableTiledGemm && (!tunedMultiRow || ForceTiledGemm) && _accelerator.AcceleratorType != AcceleratorType.WebGL && _accelerator.MaxGroupSize.X >= TgThreads
+            && K % TgK == 0)
+        {
+            _tiledGemm ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int>(TiledGemmImpl);
+            _tiledGemm(new KernelConfig(((M + TgM - 1) / TgM) * ((N + TgN - 1) / TgN), TgThreads), input, intView, output, M, K, N, TypeCode(type));
+            return;
+        }
+
         // Multi-row dequant GEMM for M>1 (prefill) — opt-in (GGUF_GEMM_MR=1) until A/B-verified. Same shared-mem
         // /barrier shape as the GEMV, so it's gated to non-browser-GPU backends (WebGL has no workgroup shared
         // memory; WebGPU's workgroup reduction is slow on Tint/Dawn — both keep the per-element kernel below).
@@ -1981,6 +1994,67 @@ public class FusedDequantMatMul : IDisposable
             }
         }
         ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    /// <summary>M &gt; 1 on <see cref="TiledGemmImpl"/> where the tuned kernels do not take it (default on). GGUF_GEMM_TILED=0 turns it off (the per-element kernel: the A/B).</summary>
+    public static bool EnableTiledGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_TILED") != "0";
+    /// <summary>Tests: M &gt; 1 on <see cref="TiledGemmImpl"/> even where a tuned kernel would take it (its gate runs it on every backend).</summary>
+    public static bool ForceTiledGemm;
+    private const int TgM = 64, TgN = 64, TgK = 16, TgThreads = 256;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _tiledGemm;
+
+    // The tiled GEMM for every block type: group g = (64 rows of M) x (64 outputs of N), 256 threads, each a 4 x 4 block of outputs in registers. Each K step of 16
+    // loads the 64 x 16 input tile and dequantizes the 64 x 16 weight tile (DecodeOf: 4 values a thread) into shared memory once, both read from global memory
+    // with consecutive threads on consecutive k and stored k-major, then every thread takes 16 FMAs per k from 8 shared reads. 8 KB of shared memory (WebGPU
+    // allows 16 KB); the K loop's bound is a kernel scalar (the WGSL backend keeps its barriers in uniform control flow).
+    private static void TiledGemmImpl(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, int code)
+    {
+        int g = Grid.IdxX, t = Group.IdxX;
+        int tilesN = (N + TgN - 1) / TgN;
+        int m0 = (g / tilesN) * TgM, n0 = (g % tilesN) * TgN;
+        var As = SharedMemory.Allocate<float>(TgK * TgM);           // [k][m]
+        var Ws = SharedMemory.Allocate<float>(TgK * TgN);           // [k][n]
+        int tm = (t / 16) * 4, tn = (t % 16) * 4;
+        int rowBytes = RowBytesOf(code, K);
+        float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f;
+        float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c30 = 0f, c31 = 0f, c32 = 0f, c33 = 0f;
+        for (int k0 = 0; k0 < K; k0 += TgK)
+        {
+            for (int e = t; e < TgM * TgK; e += TgThreads)
+            {
+                int r = e / TgK, kk = e % TgK, k = k0 + kk;
+                int m = m0 + r, n = n0 + r;
+                As[kk * TgM + r] = m < M ? input[(long)m * K + k] : 0f;
+                Ws[kk * TgN + r] = n < N ? DecodeOf(code, w, n * rowBytes, k) : 0f;
+            }
+            Group.Barrier();
+            for (int kk = 0; kk < TgK; kk++)
+            {
+                float a0 = As[kk * TgM + tm], a1 = As[kk * TgM + tm + 1], a2 = As[kk * TgM + tm + 2], a3 = As[kk * TgM + tm + 3];
+                float b0 = Ws[kk * TgN + tn], b1 = Ws[kk * TgN + tn + 1], b2 = Ws[kk * TgN + tn + 2], b3 = Ws[kk * TgN + tn + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+            Group.Barrier();
+        }
+        StoreTile(output, M, N, m0 + tm, n0 + tn, c00, c01, c02, c03);
+        StoreTile(output, M, N, m0 + tm + 1, n0 + tn, c10, c11, c12, c13);
+        StoreTile(output, M, N, m0 + tm + 2, n0 + tn, c20, c21, c22, c23);
+        StoreTile(output, M, N, m0 + tm + 3, n0 + tn, c30, c31, c32, c33);
+    }
+
+    // one row of a thread's 4 x 4 block, the outputs past M or N left out
+    private static void StoreTile(ArrayView1D<float, Stride1D.Dense> output, int M, int N, int m, int n, float v0, float v1, float v2, float v3)
+    {
+        if (m >= M) return;
+        long o = (long)m * N;
+        if (n < N) output[o + n] = v0;
+        if (n + 1 < N) output[o + n + 1] = v1;
+        if (n + 2 < N) output[o + n + 2] = v2;
+        if (n + 3 < N) output[o + n + 3] = v3;
     }
 
     /// <summary>The block type as the code <see cref="DecodeOf"/> and <see cref="RowBytesOf"/> take (one kernel for every supported type).</summary>

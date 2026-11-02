@@ -539,7 +539,14 @@ public sealed class GgufBatchDecoder : IDisposable
                 _rope!(R * KvHeads * (HeadDim / 2), k, _invFreq.View, posView, KvHeads, HeadDim, mode | rope); Prof("rope");
                 _store!((int)((long)R * kvC), k, v, _kc[l].View, _vc[l].View, seqView, posView, kvC, MaxSeq, mode); Prof("store");
             }
-            if (FusedAttention)
+            // split-K attention for decode rows only: it gives each (row, head, chunk of keys) a group that walks its keys one by one, which is right for a few decode
+            // rows and ruinous for a prefill's hundreds (MEASURED 2026-11-01, CUDA, qwen3-0.6b, 600 rows over a 3k cache: attention 3.1 s of a 5.8 s prefill). A
+            // prefill takes the three-kernel path (scores, softmax, P.V: a thread per score / per output)
+            if (!decode && _flash != null && FlashPrefill)
+            {
+                _flash(new KernelConfig(((R + FaRows - 1) / FaRows) * Heads, FaThreads), q, _kc[l].View, _vc[l].View, att, R, Heads, KvHeads, HeadDim, p, 1f / MathF.Sqrt(HeadDim)); Prof("attn-flash");
+            }
+            else if (FusedAttention && decode)
             {
                 // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
                 // a captured step keeps one shape for the whole generation: every chunk the cache can hold (the ones past the position mask to nothing)
@@ -573,6 +580,9 @@ public sealed class GgufBatchDecoder : IDisposable
             }
             Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Prof("down");
             AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
+            // a prefill submits each layer on its own (WebGPU): one submission is then at most one layer of one PrefillChunk, whatever the model's size (SpawnDev.AI
+            // lost the device on qwen3:4b with a prefill encoded as one command buffer, 2026-11-01). A decode step is untouched (its captured plan replays it).
+            if (!decode) (_acc as SpawnDev.ILGPU.WebGPU.WebGPUAccelerator)?.FlushPendingCommands();
         }
         // the LM head on the output norm's rows: every row when decoding, the last row of a prefill
         int outRows = decode ? R : 1;
@@ -693,7 +703,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// only the new part costs a prefill). At least the prompt's last token always runs (its logits start the answer). <see cref="LastReusedPrefix"/> says
     /// how many rows were kept.
     /// </summary>
-    public Task PrefillAsync(int[] promptIds, float temperature, bool reusePrefix, CancellationToken ct = default)
+    public async Task PrefillAsync(int[] promptIds, float temperature, bool reusePrefix, CancellationToken ct = default)
     {
         if (promptIds.Length == 0) throw new ArgumentException("an empty prompt");
         int keep = 0;
@@ -705,8 +715,29 @@ public sealed class GgufBatchDecoder : IDisposable
         LastReusedPrefix = keep;
         _cacheIds = null;                                                        // GenerateAsync records what the rows hold when it ends
         Position = keep; Batch = 1; DecodeTimings = default; RowReads = 0; KernelTimes.Clear(); _drawPos = -1;
-        return ForwardAsync(keep == 0 ? promptIds : promptIds[keep..], null, decode: false, temperature, readBack: false, ct);
+        // in chunks of at most PrefillChunk rows: a chunk is a prefill at the next position (causal over the cache rows before it, as a reused prefix is), so the
+        // result is the same; it bounds the row buffers (one submission's work is bounded by the per-layer submit in EncodeForward)
+        int chunk = Math.Max(1, PrefillChunk);
+        for (int at = keep; at < promptIds.Length; at += chunk)
+        {
+            int n = Math.Min(chunk, promptIds.Length - at);
+            await ForwardAsync(promptIds[at..(at + n)], null, decode: false, temperature, readBack: false, ct).ConfigureAwait(false);
+        }
     }
+
+    /// <summary>
+    /// Most prompt rows one prefill forward runs; a longer prompt (or the new part of one) runs in chunks of this many. It bounds the row buffers; one
+    /// submission's work is bounded by the per-layer submit of a WebGPU prefill (SpawnDev.AI lost the WebGPU device on a ~600-token turn over a ~3k-token
+    /// history encoded as one command buffer while other applications loaded the GPU: Windows resets a GPU whose command buffer runs past the driver's
+    /// timeout; 2026-11-01. The cause was the per-element GEMM and the split-K attention: TiledGemmImpl / FlashPrefillImpl). The chunks give
+    /// the same rows as one forward (GgufBatchDecoder_ChunkedPrefill_MatchesOneForward). Default 1024: a WebGPU prefill also submits after every layer, which is what
+    /// bounds one submission; smaller chunks only cost (MEASURED: 600 rows over 3k, 811 ms in one forward, 1061 ms in chunks of 256).
+    /// </summary>
+    public int PrefillChunk { get; set; } = 1024;
+
+    /// <summary>A prefill's attention on the tiled kernel (default; groups with shared memory, head width up to 128): off, the three-kernel path (scores, softmax,
+    /// P.V), the reference the tiled kernel is gated against (GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath).</summary>
+    public bool FlashPrefill { get; set; } = true;
 
     /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
     public int LastReusedPrefix { get; private set; }
@@ -1100,6 +1131,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
     private Action<KernelConfig, FV, FV, FV, IV, IV, FV, FV, int, int, int, int, int, float>? _attPartial;
+    private Action<KernelConfig, FV, FV, FV, FV, int, int, int, int, int, float>? _flash;      // the prefill's tiled attention (groups with shared memory: not WebGL)
     private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
     private Action<Index1D, FV, long, long>? _fork;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
@@ -1131,6 +1163,8 @@ public sealed class GgufBatchDecoder : IDisposable
             _attPartial = _acc.LoadStreamKernel<FV, FV, FV, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl);
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
         }
+        if (_acc.AcceleratorType != AcceleratorType.WebGL && HeadDim <= FaMaxD && FaThreads <= _acc.MaxNumThreadsPerGroup)
+            _flash = _acc.LoadStreamKernel<FV, FV, FV, FV, int, int, int, int, int, float>(FlashPrefillImpl);
         _fork = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, long, long>(ForkImpl);
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
         if (!NoCandidates)
@@ -1496,6 +1530,91 @@ public sealed class GgufBatchDecoder : IDisposable
     // a float's order as an unsigned key (a < b exactly when OrderKey(a) < OrderKey(b)), and back
     private static uint OrderKey(float f) { uint b = Interop.FloatAsInt(f); return (b & 0x80000000u) != 0 ? ~b : b | 0x80000000u; }
     private static float FromOrderKey(uint k) => Interop.IntAsFloat((k & 0x80000000u) != 0 ? k & 0x7FFFFFFFu : ~k);
+
+    private const int FaRows = 8, FaKeys = 8, FaThreads = FaRows * FaKeys, FaMaxD = 128;
+
+    // prefill attention, tiled (flash). Group g = (block of FaRows query rows, head h), FaThreads threads. The block's queries (scaled) sit in shared memory; each
+    // tile of FaKeys keys is loaded into shared memory once (coalesced) and serves all FaRows rows (thread (row, key) one score), each row's running max and
+    // exp-sum take the tile (online softmax: the output so far is rescaled), then the tile's values replace its keys in the same buffer and the FaRows x D outputs
+    // in shared memory take them. Causal: row r (position p + r) sees keys 0..p + r; a prefill is sequence 0. 12.6 KB of shared memory (WebGPU allows 16 KB).
+    // MEASURED 2026-11-01 before it: a prefill on the split-K kernel (built for decode rows) spent 3.1 s in attention for 600 rows over a 3k cache (CUDA).
+    private static void FlashPrefillImpl(FV q, FV kc, FV vc, FV att, int R, int H, int kvH, int D, int p, float scale)
+    {
+        int g = Grid.IdxX, t = Group.IdxX;
+        int h = g % H, r0 = (g / H) * FaRows;
+        int kvC = kvH * D, hk = h / (H / kvH);
+        var qs = SharedMemory.Allocate<float>(FaRows * FaMaxD);
+        var kv = SharedMemory.Allocate<float>(FaKeys * FaMaxD);
+        var os = SharedMemory.Allocate<float>(FaRows * FaMaxD);
+        var ps = SharedMemory.Allocate<float>(FaRows * FaKeys);
+        var st = SharedMemory.Allocate<float>(3 * FaRows);          // per row: running max, exp-sum, this tile's rescale of the output so far
+        for (int idx = t; idx < FaRows * D; idx += FaThreads)
+        {
+            int i = idx / D, d = idx % D, r = r0 + i;
+            qs[idx] = r < R ? q[((long)r * H + h) * D + d] * scale : 0f;
+            os[idx] = 0f;
+        }
+        if (t < FaRows) { st[t] = -1e30f; st[FaRows + t] = 0f; st[2 * FaRows + t] = 0f; }
+        Group.Barrier();
+        int last = p + Math.Min(R, r0 + FaRows) - 1;                 // the block's last query position: keys past it are masked for every row of the block
+        int ti = t / FaKeys, tc = t % FaKeys;
+        for (int j0 = 0; j0 <= last; j0 += FaKeys)
+        {
+            for (int idx = t; idx < FaKeys * D; idx += FaThreads)
+            {
+                int jj = idx / D, d = idx % D, j = j0 + jj;
+                kv[idx] = j <= last ? kc[(long)j * kvC + hk * D + d] : 0f;
+            }
+            Group.Barrier();
+            {
+                int r = r0 + ti, j = j0 + tc;
+                float sc = -1e30f;
+                bool live = (r < R) & (j <= p + r);
+                if (live)
+                {
+                    float acc = 0f;
+                    for (int d = 0; d < D; d++) acc += qs[ti * D + d] * kv[tc * D + d];
+                    sc = acc;
+                }
+                ps[ti * FaKeys + tc] = sc;
+            }
+            Group.Barrier();
+            if (t < FaRows)
+            {
+                float mo = st[t], mt = -1e30f;
+                for (int c = 0; c < FaKeys; c++) mt = MathF.Max(mt, ps[t * FaKeys + c]);
+                float mn = MathF.Max(mo, mt), sum = 0f;
+                for (int c = 0; c < FaKeys; c++)
+                {
+                    float sv = ps[t * FaKeys + c];
+                    float e = sv <= -1e29f ? 0f : MathF.Exp(sv - mn);
+                    ps[t * FaKeys + c] = e; sum += e;
+                }
+                float corr = mo <= -1e29f ? 0f : MathF.Exp(mo - mn);
+                st[t] = mn; st[FaRows + t] = st[FaRows + t] * corr + sum; st[2 * FaRows + t] = corr;
+            }
+            Group.Barrier();
+            for (int idx = t; idx < FaKeys * D; idx += FaThreads)
+            {
+                int jj = idx / D, d = idx % D, j = j0 + jj;
+                kv[idx] = j <= last ? vc[(long)j * kvC + hk * D + d] : 0f;
+            }
+            Group.Barrier();
+            for (int idx = t; idx < FaRows * D; idx += FaThreads)
+            {
+                int i = idx / D, d = idx % D;
+                float o = os[idx] * st[2 * FaRows + i];
+                for (int c = 0; c < FaKeys; c++) o += ps[i * FaKeys + c] * kv[c * D + d];
+                os[idx] = o;
+            }
+            Group.Barrier();
+        }
+        for (int idx = t; idx < FaRows * D; idx += FaThreads)
+        {
+            int i = idx / D, d = idx % D, r = r0 + i;
+            if (r < R) { float l = st[FaRows + i]; att[((long)r * H + h) * D + d] = l > 0f ? os[idx] / l : 0f; }
+        }
+    }
 
     // split-K attention, part 1. Group g = (row r, head h, chunk ch of AttChunk keys), a thread per head dimension (D = group size, a power of two). The chunk's
     // scores go to shared memory, then its max m and exp-sum l (masked keys contribute 0), then thread d sums p_j * v[j, d] over the chunk (coalesced across d).

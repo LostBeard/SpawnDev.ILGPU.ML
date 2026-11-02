@@ -163,4 +163,110 @@ public abstract partial class MLTestBase
         if (!ok) throw new Exception(report);
         return report;
     });
+
+    /// <summary>
+    /// <see cref="GgufBatchDecoder.PrefillChunk"/>: a ~700-token prompt prefilled as one forward, in 256-row chunks and in 64-row chunks (each chunk its own
+    /// WebGPU submission), then 32 greedy tokens: the same tokens, and the prefill's last-row logits within 1e-3. Then a turn whose new part (~700 tokens) runs
+    /// in chunks over a reused prefix: the same tokens as a full one-forward prefill. Qwen3-0.6B. Added after SpawnDev.AI lost the WebGPU device on a ~600-token
+    /// turn over a ~3k history prefilled as one forward (2026-11-01).
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task GgufBatchDecoder_ChunkedPrefill_MatchesOneForward() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("the fast lanes (CUDA, OpenCL, WebGPU)");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var src = await hub.OpenAsync("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", deselect: false);
+        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 2048, maxBatch: 1);
+        var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
+        var text = string.Concat(Enumerable.Repeat("The lighthouse keeper watched the storm roll in over the grey water, counting the waves and the seconds between the flashes. ", 30));
+        var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", text + "Summarise this in one sentence.") }, thinking: false);
+        var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
+        var notes = new List<string> { $"prompt {ids.Length} tokens" };
+        bool ok = true;
+        async Task<(int[] Tokens, float[] Logits)> Run(int chunk)
+        {
+            dec.PrefillChunk = chunk;
+            await dec.PrefillAsync(ids, 0f);
+            var logits = await dec.ReadLogitsAsync();
+            var t = (await dec.GenerateAsync(ids, 1, 32, 0f, 1f, 1, stopSet))[0];
+            return (t, logits);
+        }
+        var one = await Run(100000);
+        foreach (int chunk in new[] { 256, 64 })
+        {
+            var r = await Run(chunk);
+            float d = 0; for (int i = 0; i < one.Logits.Length; i++) d = Math.Max(d, Math.Abs(one.Logits[i] - r.Logits[i]));
+            bool same = r.Tokens.SequenceEqual(one.Tokens) && d <= 1e-3f;
+            ok &= same;
+            notes.Add($"chunks of {chunk}: {(same ? "same tokens" : "DIFFERS")}, last-row logits max |diff| {d:G3}");
+        }
+        // a turn whose long new part runs in chunks over a reused prefix
+        dec.PrefillChunk = 256;
+        var a1 = (await dec.GenerateAsync(ids, 1, 16, 0f, 1f, 1, stopSet, reusePrefix: true))[0];
+        var (ids2, _) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", text + "Summarise this in one sentence."),
+            ("assistant", tok.Decode(a1)), ("user", text + "Now count the sentences.") }, thinking: false);
+        var reused = (await dec.GenerateAsync(ids2, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: true))[0];
+        int kept = dec.LastReusedPrefix;
+        dec.PrefillChunk = 100000;
+        var full = (await dec.GenerateAsync(ids2, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: false))[0];
+        bool turnOk = reused.SequenceEqual(full) && kept > 0 && ids2.Length - kept > 256;
+        ok &= turnOk;
+        notes.Add($"turn 2: {ids2.Length - kept} new over {kept} reused in chunks of 256: {(turnOk ? "same tokens as one full forward" : "DIFFERS")}");
+        var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        Console.WriteLine("[ChunkedPrefill] " + report);
+        if (!ok) throw new Exception(report);
+        return report;
+    });
+
+    /// <summary>
+    /// <see cref="GgufBatchDecoder.FlashPrefill"/> (the prefill's tiled attention) against the three-kernel path it replaced for prefills: Qwen3-0.6B (head width
+    /// 128) and Qwen2.5-0.5B (64, two kv heads for fourteen query heads), a ~740-token prompt prefilled in one forward, then a second ~770-token part over it
+    /// (rows that start past position 0); the last row's logits within 1e-3 and the same 24 greedy tokens.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("the fast lanes (CUDA, OpenCL, WebGPU)");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var notes = new List<string>();
+        bool ok = true;
+        var text = string.Concat(Enumerable.Repeat("The lighthouse keeper watched the storm roll in over the grey water, counting the waves and the seconds between the flashes. ", 30));
+        foreach (var (repo, file) in new[] { ("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"), ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf") })
+        {
+            var src = await hub.OpenAsync(repo, file, deselect: false);
+            using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 2048, maxBatch: 1);
+            dec.PrefillChunk = 100000;
+            var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
+            var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", text + "Summarise this in one sentence.") }, thinking: false);
+            var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
+            var more = tok.Encode(text + " And again, briefly.");
+            async Task<(float[] L1, float[] L2, int[] T)> Run(bool flash)
+            {
+                dec.FlashPrefill = flash;
+                await dec.PrefillAsync(ids, 0f);
+                var l1 = await dec.ReadLogitsAsync();
+                var t = (await dec.GenerateAsync(ids, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: false))[0];
+                var all = ids.Concat(t).Concat(more).ToArray();
+                await dec.GenerateAsync(ids, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: false);
+                await dec.PrefillAsync(all, 0f, reusePrefix: true);                      // the second part over the first's rows
+                var l2 = await dec.ReadLogitsAsync();
+                return (l1, l2, t);
+            }
+            var flash = await Run(true);
+            var three = await Run(false);
+            static float Diff(float[] a, float[] b) { float d = 0; for (int i = 0; i < a.Length; i++) d = Math.Max(d, Math.Abs(a[i] - b[i])); return d; }
+            float d1 = Diff(flash.L1, three.L1), d2 = Diff(flash.L2, three.L2);
+            bool good = d1 <= 1e-3f && d2 <= 1e-3f && flash.T.SequenceEqual(three.T);
+            ok &= good;
+            notes.Add($"{file}: prompt {ids.Length}, logits max |diff| {d1:G3}, second part ({more.Length} over the first) {d2:G3}, tokens {(flash.T.SequenceEqual(three.T) ? "same" : "DIFFER")}{(good ? "" : " (WRONG)")}");
+        }
+        var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        Console.WriteLine("[FlashPrefill] " + report);
+        if (!ok) throw new Exception(report);
+        return report;
+    });
 }

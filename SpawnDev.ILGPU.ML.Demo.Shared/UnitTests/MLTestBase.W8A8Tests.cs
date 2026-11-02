@@ -10,6 +10,8 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 public abstract partial class MLTestBase
 {
+    private const int ChunkElems = 4 << 20;    // elements a W8A8 test generates or reads back at a time (16 MB)
+
     /// <summary>
     /// Wan 2.2's linear layers at the 832x480 x33 clip's 3510 tokens (attention projections 3072 -> 3072 and -> 9216, feed forward 3072 -> 14336 and 14336 -> 3072, the text's
     /// 512 rows -> 6144) from synthetic 8-bit blocks: the bf16 matrix + float GEMM path against W8A8 (and W8A8 in one dispatch, no row chunks), on every GPU lane. The two must
@@ -42,19 +44,35 @@ public abstract partial class MLTestBase
             foreach (var (M, K, N) in shapes)
             {
                 int blocks = K / 32;
-                var words = new uint[(long)N * blocks * 9];
-                for (long i = 0; i < words.Length; i++)
+                // generated and uploaded in chunks of a reused buffer (the same random sequence as one array): the whole input, 3510 x 14336 floats, was 200 MB of
+                // .NET heap, which a browser page late in a full sweep could not find (OutOfMemoryException on WebGPU, 2026-11-02)
+                long nWords = (long)N * blocks * 9, nX = (long)M * K;
+                using var wq = accelerator.Allocate1D<uint>(nWords); using var xb = accelerator.Allocate1D<float>(nX);
                 {
-                    if (i % 9 == 0)
+                    var wChunk = new uint[Math.Min(nWords, ChunkElems)];
+                    for (long at = 0; at < nWords; at += wChunk.Length)
                     {
-                        ushort d = (ushort)BitConverter.HalfToUInt16Bits((System.Half)(rng.NextDouble() * 0.002 + 0.0005)), mn = (ushort)BitConverter.HalfToUInt16Bits((System.Half)(-(rng.NextDouble() * 0.15)));
-                        words[i] = d | ((uint)mn << 16);
+                        int n = (int)Math.Min(wChunk.Length, nWords - at);
+                        for (int c = 0; c < n; c++)
+                        {
+                            long i = at + c;
+                            if (i % 9 == 0)
+                            {
+                                ushort d = (ushort)BitConverter.HalfToUInt16Bits((System.Half)(rng.NextDouble() * 0.002 + 0.0005)), mn = (ushort)BitConverter.HalfToUInt16Bits((System.Half)(-(rng.NextDouble() * 0.15)));
+                                wChunk[c] = d | ((uint)mn << 16);
+                            }
+                            else wChunk[c] = (uint)rng.Next() ^ ((uint)rng.Next(4) << 30);
+                        }
+                        wq.View.SubView(at, n).CopyFromCPU(wChunk.AsSpan(0, n).ToArray());
                     }
-                    else words[i] = (uint)rng.Next() ^ ((uint)rng.Next(4) << 30);
+                    var xChunk = new float[Math.Min(nX, ChunkElems)];
+                    for (long at = 0; at < nX; at += xChunk.Length)
+                    {
+                        int n = (int)Math.Min(xChunk.Length, nX - at);
+                        for (int c = 0; c < n; c++) { long i = at + c; xChunk[c] = (float)((rng.NextDouble() * 2 - 1) * (i % 97 == 0 ? 8 : 1)); }   // a few outliers per row
+                        xb.View.SubView(at, n).CopyFromCPU(xChunk.AsSpan(0, n).ToArray());
+                    }
                 }
-                var x = new float[(long)M * K];
-                for (long i = 0; i < x.Length; i++) x[i] = (float)((rng.NextDouble() * 2 - 1) * (i % 97 == 0 ? 8 : 1));      // a few outliers per row
-                using var wq = accelerator.Allocate1D(words); using var xb = accelerator.Allocate1D(x);
                 using var o1 = accelerator.Allocate1D<float>((long)M * N); using var o2 = accelerator.Allocate1D<float>((long)M * N);
                 using var bf = accelerator.Allocate1D<uint>((long)N * K / 2);               // the float path's bf16 copy of the matrix (Flux2Weights.Matrix)
                 double tFloat = await Time(() => { fk.DequantQ8(wq.View, bf.View, N, K); dk.Linear(xb.View, bf.View.Cast<uint, BFloat16>(), null, o1.View, M, K, N); });
@@ -63,8 +81,15 @@ public abstract partial class MLTestBase
                 Q8Linear.MaxFlopsPerDispatch = long.MaxValue;
                 double tOne = await Time(() => q8.Linear(xb.View, wq.View, null, o2.View, M, K, N, DiTKernels.Act.None));
                 Q8Linear.MaxFlopsPerDispatch = savedChunk;
-                var a = await o1.View.CopyToHostAsync(); var b = await o2.View.CopyToHostAsync();
-                var m = WanCompare(b, a);
+                // relative RMS of W8A8 against the float path, read back in chunks (each output is M x N floats: 200 MB at 3510 x 14336)
+                double se = 0, sr = 0;
+                for (long at = 0; at < (long)M * N; at += ChunkElems)
+                {
+                    int n = (int)Math.Min(ChunkElems, (long)M * N - at);
+                    var a = await o1.View.SubView(at, n).CopyToHostAsync(); var b = await o2.View.SubView(at, n).CopyToHostAsync();
+                    for (int i = 0; i < n; i++) { double dd = b[i] - a[i]; se += dd * dd; sr += (double)a[i] * a[i]; }
+                }
+                var m = (RelRms: Math.Sqrt(se / Math.Max(1e-30, sr)), 0.0, 0.0);
                 if (pass == 0) continue;
                 report.Add($"{M}x{K}x{N}: float {tFloat:F1} ms, W8A8 {tInt:F1} ms ({tFloat / tInt:F2}x), W8A8 one dispatch {tOne:F1} ms; relRMS {m.RelRms:E2}");
                 ok &= m.RelRms < 1e-2;
