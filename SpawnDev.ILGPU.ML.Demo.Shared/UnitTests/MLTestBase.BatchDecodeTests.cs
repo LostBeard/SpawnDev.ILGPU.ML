@@ -1,4 +1,4 @@
-using ILGPU.Runtime;
+﻿using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
@@ -307,7 +307,8 @@ public abstract partial class MLTestBase
     /// <see cref="GgufBatchDecoder.SampleLogits(float[], int, int, float, float, double)"/> with the same uniform, 64 rows per case over a 50,003-token row (not a
     /// multiple of a chunk or of a thread's id range): random logits (the candidates path), the same with the whole-row path forced, a flat row (T 1.5, top-p 0.99:
     /// nuclei of thousands, the whole-row path on its own), 300 exactly tied logits spread over the row with the nucleus cut inside them (the tie scans at the
-    /// cut and at the draw, across thread ranges), and ties at the maximum (greedy: the lowest id; T 0.3: drawn in id order). A mismatch within
+    /// cut and at the draw, across thread ranges), ties at the maximum (greedy: the lowest id; T 0.3: drawn in id order), and top-k (on the candidates, forced
+    /// whole-row, k past the candidates, k cutting through 300 ties, k past the window). A mismatch within
     /// <see cref="TieWindow"/> of a boundary is a float tie (at most 5% of a case); anything else fails.
     /// </summary>
     [TestMethod(Timeout = 300000)]
@@ -322,9 +323,9 @@ public abstract partial class MLTestBase
         bool ok = true;
         // returns how many rows' host draws satisfy `counted` (proof the case exercised what it is for)
         async Task<int> Case(string name, float[] lg, float T, float topP, bool force, int seed, Func<int, int, bool>? counted = null, int[][]? windows = null, float penalty = 1f,
-            int lastN = 0, int ring = 0)
+            int lastN = 0, int ring = 0, int topK = 0)
         {
-            var got = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force, windows, penalty, lastN, ring);
+            var got = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force, windows, penalty, lastN, ring, topK);
             // the host reference: TextGenerationSampler.ApplyRepetitionPenalty on each row's window, then SampleLogits
             var hl = lg;
             if (windows != null && penalty != 1f)
@@ -340,24 +341,26 @@ public abstract partial class MLTestBase
                     Array.Copy(row, 0, hl, (long)r * V, V);
                 }
             }
+            // top-k: the host reference is SampleLogits with k; the float-tie intervals are measured on the rows cut to their k kept tokens
+            var hi = topK > 0 && T > 0f ? KeepTopK(hl, R, V, T, topK) : hl;
             int eq = 0, ties = 0, bad = 0, wide = 0, hits = 0; double maxD = 0;
             var badNotes = new List<string>();
             for (int r = 0; r < R; r++)
             {
                 double u = GgufBatchDecoder.DrawUniform(seed, r, Pos);
-                int want = GgufBatchDecoder.SampleLogits(hl, r, V, T, topP, u);
-                if (T > 0f && NucleusSize(hl, r, V, T, topP) > GgufBatchDecoder.Candidates) wide++;
+                int want = GgufBatchDecoder.SampleLogits(hl, r, V, T, topP, u, topK);
+                if (T > 0f && NucleusSize(hi, r, V, T, topP) > GgufBatchDecoder.Candidates) wide++;
                 if (counted != null && counted(r, want)) hits++;
                 if (got[r] == want) { eq++; continue; }
                 if (T > 0f)
                 {
-                    var di = DrawInterval(hl, r, V, T, Math.Min(1f, topP + (float)TieWindow), got[r]);
-                    var dn = DrawInterval(hl, r, V, T, topP, got[r]);
+                    var di = DrawInterval(hi, r, V, T, Math.Min(1f, topP + (float)TieWindow), got[r]);
+                    var dn = DrawInterval(hi, r, V, T, topP, got[r]);
                     double dist = Math.Max(0, Math.Max(dn.Lo - u, u - dn.Hi));
                     if (di.Rank >= 0 && di.Rank < di.Nucleus && dist <= TieWindow) { ties++; maxD = Math.Max(maxD, dist); continue; }
                 }
                 bad++;
-                if (badNotes.Count < 3) badNotes.Add($"[row {r}: u {u:R}, host {want} {RankNote(hl, r, V, T, topP, want, u)}, device {got[r]} {RankNote(hl, r, V, T, topP, got[r], u)}]");
+                if (badNotes.Count < 3) badNotes.Add($"[row {r}: u {u:R}, host {want} {RankNote(hi, r, V, T, topP, want, u)}, device {got[r]} {RankNote(hi, r, V, T, topP, got[r], u)}]");
             }
             bool caseOk = bad == 0 && ties * 20 <= R;
             ok &= caseOk;
@@ -427,12 +430,51 @@ public abstract partial class MLTestBase
         }
         int penEdgeGreedy = await Case("penalty window edges (20 drawn, ring 12, last 8), greedy", rnd, 0f, 1f, false, 21, Changed(0f, 1f, 21), hist, 1.3f, 8, 12);
         int penEdgeSampled = await Case("same, T 0.5 top-p 0.9", rnd, 0.5f, 0.9f, false, 22, Changed(0.5f, 0.9f, 22), hist, 1.3f, 8, 12);
-        bool covered = flatWide >= R / 2 && inTies >= R / 4 && inTiesForced >= R / 4 && topDrawn == R && penGreedy >= R / 2 && penSampled >= R / 4 && penForced >= R / 4 && penEdgeGreedy >= R / 2 && penEdgeSampled >= R / 4;
-        var report = $"{accelerator.AcceleratorType}: device draws vs the host sampler, {R} rows of {V}: " + string.Join("; ", notes) + (covered ? "" : $"; COVERAGE short (flat wide {flatWide}, draws in the ties {inTies}/{inTiesForced}, at the maximum {topDrawn}, changed by the penalty {penGreedy}/{penSampled}/{penForced}/{penEdgeGreedy}/{penEdgeSampled})");
+        // top-k on the device (2026-11-02; it drew on the host before): the k best within e^20 (ties: the lower id), then the nucleus over their mass. On the
+        // candidates (k at most K), the same with the whole row forced (kappa = the k-th best, ties cut by id), k past the candidates (the whole row on its
+        // own), k cutting through 300 tied logits (the tie cut by id across thread ranges; top-p 1: every kept token can be drawn), and k past the window
+        int kCand = await Case("top-k 40, T 0.7 top-p 0.95 (candidates)", rnd, 0.7f, 0.95f, false, 23, topK: 40);
+        await Case("top-k 40, T 0.7 top-p 0.95, whole row forced", rnd, 0.7f, 0.95f, true, 24, topK: 40);
+        int kWide;
+        {
+            var flatK = RandomRows(1f);
+            kWide = await Case("top-k 1000 (past the candidates), flat T 1.5 top-p 0.99", flatK, 1.5f, 0.99f, false, 25, (r, t) => true, topK: 1000);
+        }
+        // in the tie rows (best at 6, 300 at 2, the rest past e^20) top-k 50 keeps the best and the 49 lowest-id ties
+        var keptTies = new HashSet<int>[R];
+        for (int r = 0; r < R; r++) keptTies[r] = tieIds[r].OrderBy(i => i).Take(49).ToHashSet();
+        int inK = await Case("top-k 50 cutting 300 ties, T 1 top-p 1", tie, 1f, 1f, false, 26, (r, t) => keptTies[r].Contains(t), topK: 50);
+        int inKForced = await Case("same, whole row forced", tie, 1f, 1f, true, 27, (r, t) => keptTies[r].Contains(t), topK: 50);
+        await Case("top-k 100000 (past the window), T 0.5 top-p 0.9, whole row forced", rnd, 0.5f, 0.9f, true, 28, topK: 100000);
+        // the nucleus cut INSIDE the kept ties (the best at 3, so the ties hold most of the mass; top-p 0.5): the 251 cut ties must not count toward the
+        // nucleus mass (with them, the nucleus would run past the kept set)
+        var tie3 = (float[])tie.Clone();
+        for (int r = 0; r < R; r++) tie3[r * V + (r * 131 + 5) % V] = 3f;
+        int inKNuc = await Case("top-k 50 in 300 ties, nucleus cut inside them, T 1 top-p 0.5", tie3, 1f, 0.5f, false, 29, (r, t) => keptTies[r].Contains(t), topK: 50);
+        int inKNucForced = await Case("same, whole row forced", tie3, 1f, 0.5f, true, 30, (r, t) => keptTies[r].Contains(t), topK: 50);
+        bool covered = flatWide >= R / 2 && inTies >= R / 4 && inTiesForced >= R / 4 && topDrawn == R && penGreedy >= R / 2 && penSampled >= R / 4 && penForced >= R / 4 && penEdgeGreedy >= R / 2 && penEdgeSampled >= R / 4
+            && inK >= R / 4 && inKForced >= R / 4 && inKNuc >= R / 2 && inKNucForced >= R / 2;
+        var report = $"{accelerator.AcceleratorType}: device draws vs the host sampler, {R} rows of {V}: " + string.Join("; ", notes) + (covered ? "" : $"; COVERAGE short (flat wide {flatWide}, draws in the ties {inTies}/{inTiesForced}, at the maximum {topDrawn}, changed by the penalty {penGreedy}/{penSampled}/{penForced}/{penEdgeGreedy}/{penEdgeSampled}, top-k draws in the kept ties {inK}/{inKForced}/{inKNuc}/{inKNucForced})");
         Console.WriteLine("[BatchDecodeDraws] " + report);
         if (!ok || !covered) throw new Exception(report);
         return report;
     });
+
+    // the rows cut to SampleLogits' top-k set (the k best within e^20 of the best, ties by the lower id): the rest at -infinity, so the top-p helpers below
+    // describe a top-k draw
+    private static float[] KeepTopK(float[] logits, int rows, int vocab, float T, int k)
+    {
+        var m = (float[])logits.Clone();
+        for (int r = 0; r < rows; r++)
+        {
+            int o = r * vocab;
+            float max = float.MinValue;
+            for (int i = 0; i < vocab; i++) max = MathF.Max(max, logits[o + i]);
+            var kept = Enumerable.Range(0, vocab).Where(i => logits[o + i] >= max - 20f * T).OrderByDescending(i => logits[o + i]).ThenBy(i => i).Take(k).ToHashSet();
+            for (int i = 0; i < vocab; i++) if (!kept.Contains(i)) m[o + i] = float.NegativeInfinity;
+        }
+        return m;
+    }
 
     // how far u may sit from the device token's interval for a mismatch to count as a float tie (the device's float sums against the host's doubles). Measured:
     // the largest distance seen is reported with the checks

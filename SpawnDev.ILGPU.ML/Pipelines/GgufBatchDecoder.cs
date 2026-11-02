@@ -938,17 +938,18 @@ public sealed class GgufBatchDecoder : IDisposable
     /// (<see cref="TextGenerationSampler.ApplyRepetitionPenalty"/>), before the candidates and the draw.
     /// </para>
     /// </summary>
-    public void Draw(float topP, int seed, float repetitionPenalty = 1f, int repeatLastN = 64)
+    public void Draw(float topP, int seed, float repetitionPenalty = 1f, int repeatLastN = 64, int topK = 0)
     {
         if (_lastRows == 0) throw new InvalidOperationException("no forward to draw from");
         if (!SupportsDeviceDraws(_acc)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads ({_acc.AcceleratorType}): use SampleAsync");
         if (!(topP > 0f && topP <= 1f)) throw new ArgumentOutOfRangeException(nameof(topP), "(0, 1]");
         if (!(repetitionPenalty > 0f)) throw new ArgumentOutOfRangeException(nameof(repetitionPenalty), "above 0");
+        if (topK < 0) throw new ArgumentOutOfRangeException(nameof(topK), "0 (off) or more");
         LoadKernels(); EnsureDrawBuffers();
         int window = repeatLastN > 0 ? repeatLastN : MaxSeq;
         EnsurePenaltyWindow(window);
         _rep!.View.SubView(0, MaxBatch).MemSetToZero();                          // every sequence's window starts empty
-        _drawI!.View.SubView(0, 5).CopyFromCPU(new[] { seed, ForceFullRowDraws ? 1 : 0, window, _repCap, MaxBatch });
+        _drawI!.View.SubView(0, 6).CopyFromCPU(new[] { seed, ForceFullRowDraws ? 1 : 0, window, _repCap, MaxBatch, topK });
         _drawF!.View.SubView(0, 2).CopyFromCPU(new[] { topP, repetitionPenalty });
         _penOn = repetitionPenalty != 1f;
         var seqs = _lastPrefill ? Enumerable.Range(0, Batch).ToArray() : _lastSeqs;
@@ -1034,8 +1035,8 @@ public sealed class GgufBatchDecoder : IDisposable
             return true;
         }
         void FinishAll() { for (int s = 0; s < n; s++) if (!done[s]) { done[s] = true; onFinished?.Invoke(s); } }
-        // top-k draws on the host (the device draw kernel is top-p only): the candidates are read each step (~KB), the row only when k passes them
-        if (!DeviceSampling || (topK > 0 && temperature > 0f))
+        // host draws when the device does not draw (WebGL; DeviceSampling off): the candidates are read each step (~KB), the row only when the nucleus passes them
+        if (!DeviceSampling)
         {
             var rngs = Enumerable.Range(0, n).Select(s => new Random(seed + s)).ToArray();
             var next = new int[n];
@@ -1071,7 +1072,7 @@ public sealed class GgufBatchDecoder : IDisposable
         // device draws, one step ahead: step P (its inputs the tokens drawn for P, its draws the tokens for P + 1) is queued before the tokens for P are read, so the
         // device always has the next step while the host streams the last one. A sequence that drew a stop token rides one step more (its row is thrown away), then
         // leaves the batch.
-        Draw(temperature > 0f ? topP : 1f, seed, repetitionPenalty, repeatLastN);
+        Draw(temperature > 0f ? topP : 1f, seed, repetitionPenalty, repeatLastN, temperature > 0f ? topK : 0);
         var live2 = Enumerable.Range(0, n).ToArray();
         Task<int[]>? pending = ReadDrawnAsync(), ahead = null;
         try
@@ -1262,7 +1263,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// the ring holds), the ring <paramref name="ringCapacity"/> tokens long (0: the longest window; shorter, the ring wraps as the decoder's does). Returns the token per row.
     /// </summary>
     public static async Task<int[]> DrawRowsAsync(Accelerator accelerator, float[] logits, int rows, int vocab, float temperature, float topP, int seed, int position, bool forceFullRow = false,
-        int[][]? windows = null, float repetitionPenalty = 1f, int repeatLastN = 0, int ringCapacity = 0)
+        int[][]? windows = null, float repetitionPenalty = 1f, int repeatLastN = 0, int ringCapacity = 0, int topK = 0)
     {
         if (!SupportsDeviceDraws(accelerator)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads");
         if (logits.Length != (long)rows * vocab) throw new ArgumentException("rows x vocab logits");
@@ -1287,7 +1288,7 @@ public sealed class GgufBatchDecoder : IDisposable
         }
         using var rep = acc.Allocate1D(repHost);
         using var dF2 = acc.Allocate1D(new[] { topP, repetitionPenalty });
-        using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0, active, W, rows });
+        using var dI = acc.Allocate1D(new[] { seed, forceFullRow ? 1 : 0, active, W, rows, topK });
         using var ids = acc.Allocate1D<int>(Math.Max(64, rows));
         var chunkMax = acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, int, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.ChunkMaxImpl);
         var floor = acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, FV, IV, int, int>(SpawnDev.ILGPU.ML.Kernels.TopKKernels.FloorImpl);
@@ -1309,7 +1310,9 @@ public sealed class GgufBatchDecoder : IDisposable
     private static void GatherIdsImpl(Index1D r, IV seqIds, IV seqs, IV ids) => ids[r] = seqIds[seqs[r]];
 
     // the draw: group g = slot g (sequence seqs[g], from row g of the forward, or row 0 when rowZero), DrawGroup threads; the token goes to seqIds[sequence]. The
-    // uniform is DrawUniform(seed, sequence, position + tAdd); drawF = [topP], drawI = [seed, force the full-row path].
+    // uniform is DrawUniform(seed, sequence, position + tAdd); drawF = [topP, penalty], drawI = [seed, force the full-row path, penalty window, ring, MaxBatch, topK].
+    //  top-k (drawI[5] > 0): the k best within the window (ties: the lower id), then the nucleus over their mass, as SampleLogits; on the candidates when
+    //  k is at most K and they are the top K, else on the whole row (kappa / tieCut below).
     //  T <= 0: the argmax, the floor kernel's best chunk maximum (the lowest id among equals: exact even when the candidates are not the top K).
     //  T > 0, the nucleus inside the candidates: thread 0 walks them as SampleAsync does.
     //  Otherwise (more than SelectCap tokens at the floor, a nucleus wider than the candidates, or forced) the whole row, exactly: the nucleus' last token is the
@@ -1328,27 +1331,53 @@ public sealed class GgufBatchDecoder : IDisposable
         float topP = drawF[0], max = cand[o];
         float u = DrawUniform(drawI[0], seq, posBuf[0] + tAdd);
         bool forced = drawI[1] != 0, sampling = T > 0f;
+        int topK = drawI[5];
         int tok = (int)cand[o + K];
         bool needFull = false;
         if (t == 0 && sampling)
         {
-            bool wide = forced | (cand[o + 2 * K] > SelectCap);
+            bool wide = forced | (cand[o + 2 * K] > SelectCap) | (topK > K);
             if (wide) needFull = true;
             else
             {
-                float total = 0f;
-                for (int ch = 0; ch < nch; ch++) total += cand[o + 2 * K + 1 + ch];
-                float floorT = max - 20f * T, target = topP * total, keep = 0f;
+                float floorT = max - 20f * T, keep = 0f, target;
                 int m = 0;
-                for (int j = 0; j < K; j++)
+                if (topK > 0)
                 {
-                    float cv = cand[o + j];
-                    bool take = (cv >= floorT) & (keep < target);
-                    if (!take) break;
-                    keep += MathF.Exp((cv - max) / T);
-                    m = j + 1;
+                    // top-k: the k best within the window are the first candidates, and the nucleus runs over their mass only (SampleAsync's order)
+                    float total = 0f;
+                    int kk = 0;
+                    for (int j = 0; j < K; j++)
+                    {
+                        float cv = cand[o + j];
+                        bool take = (cv >= floorT) & (kk < topK);
+                        if (!take) break;
+                        total += MathF.Exp((cv - max) / T);
+                        kk = j + 1;
+                    }
+                    target = topP * total;
+                    for (int j = 0; j < kk; j++)
+                    {
+                        if (keep >= target) break;
+                        keep += MathF.Exp((cand[o + j] - max) / T);
+                        m = j + 1;
+                    }
                 }
-                if (keep < target) needFull = true;                               // the nucleus reaches past the candidates
+                else
+                {
+                    float total = 0f;
+                    for (int ch = 0; ch < nch; ch++) total += cand[o + 2 * K + 1 + ch];
+                    target = topP * total;
+                    for (int j = 0; j < K; j++)
+                    {
+                        float cv = cand[o + j];
+                        bool take = (cv >= floorT) & (keep < target);
+                        if (!take) break;
+                        keep += MathF.Exp((cv - max) / T);
+                        m = j + 1;
+                    }
+                }
+                if (keep < target & topK <= 0) needFull = true;                  // the nucleus reaches past the candidates
                 else
                 {
                     float x = u * keep, acc = 0f;
@@ -1365,24 +1394,63 @@ public sealed class GgufBatchDecoder : IDisposable
         if (full)
         {
             float floorT = max - 20f * T;
-            float total = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, floorT, false, t));
+            int span = (V + DrawGroup - 1) / DrawGroup, i0 = t * span, i1 = Math.Min(V, i0 + span);
+            // the kept set: logits above kappa, and those equal to kappa up to id tieCut. No top-k: kappa = the e^20 floor and every tie (l >= floorT).
+            // Top-k: kappa = the k-th best value (the largest key with at least k tokens at or above it), the ties at kappa taken in id order up to the k-th token
+            // (SampleLogits' order: the lower id first); the nucleus and the draw below run over this set.
+            float kappa = floorT;
+            int tieCut = int.MaxValue;
+            // the branch holds barriers, so its condition must be uniform in WGSL: topK is read from a storage buffer and the count from shared memory, neither
+            // uniform there, so the decision goes through Group.BarrierOr (workgroupUniformLoad) and the count is taken unconditionally (one pass, whole-row path only)
+            float inWindow = GroupSum(red, t, CountPart(logits, lb, V, floorT, floorT, false, t));
+            bool cutK = Group.BarrierOr((topK > 0) & (inWindow > topK));
+            {
+                if (cutK)
+                {
+                    uint klo = OrderKey(floorT), khi = OrderKey(max);
+                    for (int it = 0; it < 33; it++)
+                    {
+                        uint mid = klo + ((khi - klo + 1u) >> 1);
+                        float c = GroupSum(red, t, CountPart(logits, lb, V, floorT, FromOrderKey(mid), false, t));
+                        if (c >= topK) klo = mid; else khi = mid - 1u;
+                    }
+                    kappa = FromOrderKey(klo);
+                    float above = GroupSum(red, t, CountPart(logits, lb, V, floorT, kappa, true, t));
+                    float need = topK - above;                                    // 1 or more ties at kappa join (exact: counts below 2^24)
+                    float ownTies = 0f;
+                    for (int i = i0; i < i1; i++) if (logits[lb + i] == kappa) ownTies += 1f;
+                    float rank = GroupExclusive(red, t, ownTies);
+                    int cutHere = int.MaxValue;
+                    for (int i = i0; i < i1; i++)
+                    {
+                        if (logits[lb + i] == kappa)
+                        {
+                            rank += 1f;
+                            bool hit = (rank >= need) & (cutHere == int.MaxValue);
+                            if (hit) cutHere = i;
+                        }
+                    }
+                    tieCut = GroupMin(redI, t, cutHere);
+                }
+            }
+            float total = GroupSum(red, t, MassPart(logits, lb, V, max, T, kappa, tieCut, kappa, false, t));
             float target = topP * total;
-            // tau: the largest key whose mass at or above reaches the target (true at floorT: its mass is the total)
-            uint lo = OrderKey(floorT), hi = OrderKey(max);
+            // tau: the largest key whose mass at or above reaches the target (true at kappa: its mass is the total)
+            uint lo = OrderKey(kappa), hi = OrderKey(max);
             for (int it = 0; it < 33; it++)
             {
                 uint mid = lo + ((hi - lo + 1u) >> 1);
-                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, FromOrderKey(mid), false, t));
+                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, kappa, tieCut, FromOrderKey(mid), false, t));
                 if (s >= target) lo = mid; else hi = mid - 1u;
             }
             float tau = FromOrderKey(lo);
-            float gt = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, tau, true, t));
-            int span = (V + DrawGroup - 1) / DrawGroup, i0 = t * span, i1 = Math.Min(V, i0 + span);
+            float gt = GroupSum(red, t, MassPart(logits, lb, V, max, T, kappa, tieCut, tau, true, t));
             float own = 0f; int lastTie = -1;
             for (int i = i0; i < i1; i++)
             {
                 float l = logits[lb + i];
-                if (l == tau) { own += MathF.Exp((l - max) / T); lastTie = i; }
+                bool tie = (l == tau) & ((l > kappa) | (i <= tieCut));
+                if (tie) { own += MathF.Exp((l - max) / T); lastTie = i; }
             }
             float before = GroupExclusive(red, t, own);
             float tiesTotal = red[DrawGroup];
@@ -1390,7 +1458,8 @@ public sealed class GgufBatchDecoder : IDisposable
             for (int i = i0; i < i1; i++)
             {
                 float l = logits[lb + i];
-                if (l == tau)
+                bool tie = (l == tau) & ((l > kappa) | (i <= tieCut));
+                if (tie)
                 {
                     run += MathF.Exp((l - max) / T);
                     bool hit = (run >= target) & (cut == int.MaxValue);
@@ -1409,27 +1478,29 @@ public sealed class GgufBatchDecoder : IDisposable
             if (nucLast == int.MaxValue) nucLast = lastTau;
             // the draw: the first token (best first, ties by id) whose running mass passes x = u * keep
             float x = u * keep;
-            lo = OrderKey(floorT); hi = OrderKey(max);
+            lo = OrderKey(kappa); hi = OrderKey(max);
             for (int it = 0; it < 33; it++)
             {
                 uint mid = lo + ((hi - lo + 1u) >> 1);
-                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, FromOrderKey(mid), false, t));
+                float s = GroupSum(red, t, MassPart(logits, lb, V, max, T, kappa, tieCut, FromOrderKey(mid), false, t));
                 if (s > x) lo = mid; else hi = mid - 1u;
             }
             float sigma = FromOrderKey(lo);
-            float gt2 = GroupSum(red, t, MassPart(logits, lb, V, max, T, floorT, sigma, true, t));
+            float gt2 = GroupSum(red, t, MassPart(logits, lb, V, max, T, kappa, tieCut, sigma, true, t));
             float own2 = 0f; int lastTie2 = -1;
             for (int i = i0; i < i1; i++)
             {
                 float l = logits[lb + i];
-                if (l == sigma) { own2 += MathF.Exp((l - max) / T); lastTie2 = i; }
+                bool tie = (l == sigma) & ((l > kappa) | (i <= tieCut));
+                if (tie) { own2 += MathF.Exp((l - max) / T); lastTie2 = i; }
             }
             float before2 = GroupExclusive(red, t, own2);
             float run2 = gt2 + before2; int pick = int.MaxValue;
             for (int i = i0; i < i1; i++)
             {
                 float l = logits[lb + i];
-                if (l == sigma)
+                bool tie = (l == sigma) & ((l > kappa) | (i <= tieCut));
+                if (tie)
                 {
                     run2 += MathF.Exp((l - max) / T);
                     bool hit = (run2 > x) & (pick == int.MaxValue);
@@ -1478,16 +1549,29 @@ public sealed class GgufBatchDecoder : IDisposable
 
     // this thread's share of the row's softmax mass at T over the tokens within e^20 of the best (logit >= floorT) and at or above v (strict: above v)
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static float MassPart(FV logits, long lb, int V, float max, float T, float floorT, float v, bool strict, int t)
+    private static float MassPart(FV logits, long lb, int V, float max, float T, float kappa, int tieCut, float v, bool strict, int t)
     {
+        // the kept set (DrawImpl): above kappa, or equal to it up to id tieCut
         float s = 0f;
         for (int i = t; i < V; i += DrawGroup)
         {
             float l = logits[lb + i];
-            bool inc = (l >= floorT) & (strict ? l > v : l >= v);
+            bool inc = ((l > kappa) | ((l == kappa) & (i <= tieCut))) & (strict ? l > v : l >= v);
             if (inc) s += MathF.Exp((l - max) / T);
         }
         return s;
+    }
+    // this thread's count of the window's tokens (at or above floorT) at or above v (strict: above)
+    private static float CountPart(FV logits, long lb, int V, float floorT, float v, bool strict, int t)
+    {
+        float c = 0f;
+        for (int i = t; i < V; i += DrawGroup)
+        {
+            float l = logits[lb + i];
+            bool inc = (l >= floorT) & (strict ? l > v : l >= v);
+            if (inc) c += 1f;
+        }
+        return c;
     }
     // the group's sum of x (every thread gets it)
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
