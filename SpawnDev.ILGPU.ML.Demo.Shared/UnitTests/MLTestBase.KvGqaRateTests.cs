@@ -39,6 +39,9 @@ public abstract partial class MLTestBase
                     for (int c = 0; c < configs.Length; c++)
                     {
                         GgufBatchDecoder.HalfKvCache = configs[c].Half;
+                        var swP = Stopwatch.StartNew();
+                        void Progress(string what) => Console.WriteLine($"[KvGqaRate] progress {file} round {round} {configs[c].Name}: {what} at {swP.Elapsed.TotalSeconds:F1} s");
+                        Progress("opening");
                         var m = await hub.OpenAsync(repo, file, deselect: false);
                         await using (m.Stream)
                         {
@@ -48,13 +51,16 @@ public abstract partial class MLTestBase
                             var stopSet = new HashSet<int>(stops);
                             m.Stream.Seek(0, SeekOrigin.Begin);
                             using var dec = await GgufBatchDecoder.CreateAsync(accelerator, m.Stream, maxSeq: 1024, maxBatch: 1);
+                            Progress("created");
                             if (accelerator.AcceleratorType == AcceleratorType.WebGPU) dec.CaptureWebGPU = true;
                             dec.GqaAttention = configs[c].Gqa;
                             await dec.GenerateAsync(prompt, 1, 16, 0f, 1f, 1, stopSet);
+                            Progress("warm run done");
                             int n = 0; double firstMs = 0; var sw = Stopwatch.StartNew();
                             var got = await dec.GenerateAsync(prompt, 1, MaxNew, 0f, 1f, 1, stopSet, onToken: (_, _) => { if (n++ == 0) firstMs = sw.Elapsed.TotalMilliseconds; });
                             double rate = n > 1 ? (n - 1) * 1000.0 / (sw.Elapsed.TotalMilliseconds - firstMs) : 0;
                             best[c] = Math.Max(best[c], rate);
+                            Progress($"measured {rate:F1} tok/s ({n} tokens)");
                             tokens[c] ??= got[0];
                         }
                     }

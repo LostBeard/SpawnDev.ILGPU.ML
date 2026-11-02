@@ -130,6 +130,11 @@ public class FusedDequantMatMul : IDisposable
     // 32 (one Q4_K sub-block: one scale and one min per column) so there are two barriers per 32 k instead of three per 16, and the B tile is dequantised from whole 32-bit words.
     // MEASURED 2026-10-16 (RTX 4070): the 64 x 64 kernel ran a llama3.1:8b prefill's matrix multiplies at ~1.4 TFLOPS of the 29 the card does. GGUF_GEMM_FAST=0 turns it off (the A/B).
     public static bool EnableFastGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_FAST") != "0";
+    /// <summary>M &gt; 1 of Q4_K on the tensor-core GEMM (<see cref="MmaQ4KGemm"/>) on CUDA sm_80+ (default on). GGUF_GEMM_MMA=0 turns it off (the SIMT kernels: the A/B).</summary>
+    public static bool EnableMmaGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA") != "0";
+    /// <summary>The kernel family <see cref="Forward"/> last took for M &gt; 1 ("mma-q4k" or "simt"): tests check the route they mean to cover.</summary>
+    public string LastGemmKernel { get; private set; } = "";
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ4K;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _fastQ4_K;
     private const int FgBm = 128, FgBn = 128, FgBk = 32, FgThreads = 256, FgPer = 8;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
@@ -349,6 +354,19 @@ public class FusedDequantMatMul : IDisposable
         // M > 1 (a prefill's rows) on the tiled GEMM for every block type, wherever the tuned CUDA / OpenCL Q4_K / Q6_K kernels below do not take it: WebGPU (all
         // types), Q8_0 / Q4_0 / Q4_1 / Q5_0 everywhere but WebGL (no shared memory). It replaced the per-element kernel (a thread per output walking K): MEASURED
         // 2026-11-01, a qwen3-4b Q4_K_M prefill of 600 tokens took 111 s on WebGPU on it (~43 GFLOPS), and SpawnDev.AI lost the WebGPU device on such prefills.
+        // M > 1 of Q4_K on CUDA sm_80+: the tensor-core GEMM (MmaQ4KGemm: weights dequantised to f16 in shared memory, f16 x f16 -> f32 mma.sync). MEASURED
+        // 2026-11-02 before it (RTX 4070, llama3.1:8b, a 4,400-token prefill): the SIMT GEMMs ran gate-up at ~7.6 TFLOPS and down at ~4.8, 67% of the prefill.
+        LastGemmKernel = "simt";
+        if (M > 1 && type == GGMLType.Q4_K && EnableMmaGemm && K % 256 == 0 && CudaCaps.TensorCores(_accelerator)
+            && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
+        {
+            _mmaQ4K ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaQ4KGemm.Kernel);
+            _mmaQ4K(new KernelConfig(((M + MmaQ4KGemm.BM - 1) / MmaQ4KGemm.BM) * ((N + MmaQ4KGemm.BN - 1) / MmaQ4KGemm.BN), MmaQ4KGemm.Threads),
+                input.SubView(0, (long)M * K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, M, K, N);
+            LastGemmKernel = "mma-q4k";
+            return;
+        }
+
         bool tunedMultiRow = M > 1 && EnableMultiRowGemm && !gpuBrowser && _accelerator.AcceleratorType != AcceleratorType.WebGPU && (type == GGMLType.Q4_K || type == GGMLType.Q6_K);
         if (M > 1 && EnableTiledGemm && (!tunedMultiRow || ForceTiledGemm) && _accelerator.AcceleratorType != AcceleratorType.WebGL && _accelerator.MaxGroupSize.X >= TgThreads
             && K % TgK == 0)

@@ -263,23 +263,37 @@ public class ProjectTest
             // silently overrode. Allow raising it for a run via PMT_BROWSER_DONE_TIMEOUT_MS (parallel to the
             // console lane's PMT_CONSOLE_TIMEOUT_MS). Default unchanged so routine runs behave identically.
             int doneTimeoutMs = DoneTimeoutMs;
-            await page.WaitForConditionAsync(async () =>
+            try
             {
-                // A dead runtime can never reach Done, so stop waiting the moment it says so. Without this
-                // the catch below - correctly, for a BUSY page - reads every failure as "not yet" and the
-                // wait runs its full 600s against a page that will never answer.
-                if (PageRuntimeDied) return true;
-                try
+                await page.WaitForConditionAsync(async () =>
                 {
-                    return await page.EvaluateAsync<bool>(
-                        "sel => { const el = document.querySelector(sel); return el != null && el.classList.contains('test-state-done'); }",
-                        rowSelector);
-                }
-                catch
-                {
-                    return false; // page busy / transient — keep waiting, never advance
-                }
-            }, doneTimeoutMs);
+                    // A dead runtime can never reach Done, so stop waiting the moment it says so. Without this
+                    // the catch below - correctly, for a BUSY page - reads every failure as "not yet" and the
+                    // wait runs its full 600s against a page that will never answer.
+                    if (PageRuntimeDied) return true;
+                    try
+                    {
+                        return await page.EvaluateAsync<bool>(
+                            "sel => { const el = document.querySelector(sel); return el != null && el.classList.contains('test-state-done'); }",
+                            rowSelector);
+                    }
+                    catch
+                    {
+                        return false; // page busy / transient — keep waiting, never advance
+                    }
+                }, doneTimeoutMs);
+            }
+            catch
+            {
+                // A TIMEOUT is the other failure whose cause only the console holds (a stalled await, a lost device, a test's own progress
+                // lines): dump the unfiltered tail before the exception ends the test. MEASURED 2026-11-02: a WebGPU measurement timed out
+                // twice at 28 min and printed nothing, its progress lines (PMT_CONSOLE_LOG matched them) dropped with the exception.
+                page.Console -= OnConsole;
+                Console.Error.WriteLine($"[{Name}] *** DONE-WAIT TIMED OUT after {doneTimeoutMs / 1000} s - console tail follows (unfiltered, oldest first) ***");
+                foreach (var line in recentConsole)
+                    Console.Error.WriteLine($"  TIMEOUT: {line}");
+                throw;
+            }
 
             // Stop capturing console
             page.Console -= OnConsole;
