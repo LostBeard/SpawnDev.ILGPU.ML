@@ -223,7 +223,9 @@ public abstract partial class MLTestBase
     /// <summary>
     /// <see cref="GgufBatchDecoder.FlashPrefill"/> (the prefill's tiled attention) against the three-kernel path it replaced for prefills: Qwen3-0.6B (head width
     /// 128) and Qwen2.5-0.5B (64, two kv heads for fourteen query heads), a ~740-token prompt prefilled in one forward, then a second ~770-token part over it
-    /// (rows that start past position 0); the last row's logits within 1e-3 and the same 24 greedy tokens.
+    /// (rows that start past position 0); the last row's logits within 1e-3 and the same 24 greedy tokens. Both tiled kernels are checked, each by the route it
+    /// reports (<see cref="GgufBatchDecoder.LastFlashKernel"/>): the grouped-query kernel (<see cref="GgufBatchDecoder.FlashGqa"/>, 2026-11-02: G = 2 and G = 7,
+    /// the latter with idle query vectors in each block) and the older one.
     /// </summary>
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath() => await RunTest(async accelerator =>
@@ -251,25 +253,33 @@ public abstract partial class MLTestBase
             var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", text + "Summarise this in one sentence.") }, thinking: false);
             var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
             var more = tok.Encode(text + " And again, briefly.");
-            async Task<(float[] L1, float[] L2, int[] T)> Run(bool flash)
+            async Task<(float[] L1, float[] L2, int[] T, string? K)> Run(bool flash, bool gqa)
             {
                 dec.FlashPrefill = flash;
+                dec.FlashGqa = gqa;
                 await dec.PrefillAsync(ids, 0f);
+                string? kernel = dec.LastFlashKernel;
                 var l1 = await dec.ReadLogitsAsync();
                 var t = (await dec.GenerateAsync(ids, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: false))[0];
                 var all = ids.Concat(t).Concat(more).ToArray();
                 await dec.GenerateAsync(ids, 1, 24, 0f, 1f, 1, stopSet, reusePrefix: false);
                 await dec.PrefillAsync(all, 0f, reusePrefix: true);                      // the second part over the first's rows
                 var l2 = await dec.ReadLogitsAsync();
-                return (l1, l2, t);
+                return (l1, l2, t, kernel);
             }
-            var flash = await Run(true);
-            var three = await Run(false);
             static float Diff(float[] a, float[] b) { float d = 0; for (int i = 0; i < a.Length; i++) d = Math.Max(d, Math.Abs(a[i] - b[i])); return d; }
-            float d1 = Diff(flash.L1, three.L1), d2 = Diff(flash.L2, three.L2);
-            bool good = d1 <= 1e-3f && d2 <= 1e-3f && flash.T.SequenceEqual(three.T);
-            ok &= good;
-            notes.Add($"{file}: prompt {ids.Length}, logits max |diff| {d1:G3}, second part ({more.Length} over the first) {d2:G3}, tokens {(flash.T.SequenceEqual(three.T) ? "same" : "DIFFER")}{(good ? "" : " (WRONG)")}");
+            var three = await Run(false, false);
+            // both tiled kernels against the three-kernel path: the grouped-query one (default; G = 2 with D = 128 on qwen3-0.6b, G = 7 with D = 64 and idle query
+            // vectors on qwen2.5-0.5b) and the older one; each must be the kernel that ran
+            foreach (var (gqa, want) in new[] { (true, "gqa-tiled"), (false, "tiled") })
+            {
+                var flash = await Run(true, gqa);
+                float d1 = Diff(flash.L1, three.L1), d2 = Diff(flash.L2, three.L2);
+                bool good = d1 <= 1e-3f && d2 <= 1e-3f && flash.T.SequenceEqual(three.T) && flash.K == want;
+                ok &= good;
+                notes.Add($"{file} {flash.K ?? "none"}: prompt {ids.Length}, logits max |diff| {d1:G3}, second part ({more.Length} over the first) {d2:G3}, tokens {(flash.T.SequenceEqual(three.T) ? "same" : "DIFFER")}{(flash.K == want ? "" : $" (wanted {want})")}{(good ? "" : " (WRONG)")}");
+            }
+            dec.FlashGqa = true;
         }
         }
         finally { GgufBatchDecoder.HalfKvCache = halfSaved; }

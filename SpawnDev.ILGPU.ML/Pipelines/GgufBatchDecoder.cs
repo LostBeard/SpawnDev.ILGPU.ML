@@ -122,7 +122,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly KvStore _kv;
-    private bool _hasFlash;
+    private bool _hasFlash, _hasFlashGqa;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand, _softStats;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds, _posBuf;
     // device draws: the token each sequence drew last (the next step's input, by sequence), its copy for the captures' restores, the draw parameters
@@ -202,6 +202,7 @@ public sealed class GgufBatchDecoder : IDisposable
         public abstract void QkvPost(int l, int n, FV qkv, FV vb, FV bias, FV invFreq, FV qOut, IV seqs, IV pos, int heads, int D, int sa, int flags, int maxSeq);
         public abstract void Store(int l, int n, FV k, FV v, IV seqs, IV pos, int kvC, int maxSeq, int mode);
         public abstract void Flash(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
+        public abstract void FlashGqa(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
         public abstract void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
         public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
         public abstract void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale);
@@ -215,7 +216,7 @@ public sealed class GgufBatchDecoder : IDisposable
         private readonly MemoryBuffer1D<T, Stride1D.Dense>[] _k, _v;
         private Action<Index1D, FV, FV, FV, FV, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, int, int, int, int, int>? _qkvPost;
         private Action<Index1D, FV, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, int, int, int>? _store;
-        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>? _flash;
+        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>? _flash, _flashGqa;
         private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>? _att, _attGqa;
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int, int, float>? _scores;
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int>? _pv;
@@ -237,6 +238,9 @@ public sealed class GgufBatchDecoder : IDisposable
                 n, k, v, _k[l].View, _v[l].View, seqs, pos, kvC, maxSeq, mode);
         public override void Flash(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale) =>
             (_flash ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>(FlashPrefillImpl<T>))(
+                cfg, q, _k[l].View, _v[l].View, att, R, H, kvH, D, p, scale);
+        public override void FlashGqa(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale) =>
+            (_flashGqa ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>(FlashPrefillGqaImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, att, R, H, kvH, D, p, scale);
         public override void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale) =>
             (_att ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl<T>))(
@@ -649,7 +653,18 @@ public sealed class GgufBatchDecoder : IDisposable
             // prefill takes the three-kernel path (scores, softmax, P.V: a thread per score / per output)
             if (!decode && _hasFlash && FlashPrefill)
             {
-                _kv.Flash(l, new KernelConfig(((R + FaRows - 1) / FaRows) * Heads, FaThreads), q, att, R, Heads, KvHeads, HeadDim, p, 1f / MathF.Sqrt(HeadDim)); Prof("attn-flash");
+                if (_hasFlashGqa && FlashGqa)
+                {
+                    int rowsPer = FgQ / (Heads / KvHeads);
+                    _kv.FlashGqa(l, new KernelConfig(((R + rowsPer - 1) / rowsPer) * KvHeads, FgThreads), q, att, R, Heads, KvHeads, HeadDim, p, 1f / MathF.Sqrt(HeadDim));
+                    LastFlashKernel = "gqa-tiled";
+                }
+                else
+                {
+                    _kv.Flash(l, new KernelConfig(((R + FaRows - 1) / FaRows) * Heads, FaThreads), q, att, R, Heads, KvHeads, HeadDim, p, 1f / MathF.Sqrt(HeadDim));
+                    LastFlashKernel = "tiled";
+                }
+                Prof("attn-flash");
             }
             else if (FusedAttention && decode)
             {
@@ -767,7 +782,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (p + (decode ? 1 : R) > MaxSeq) throw new InvalidOperationException($"past the cache length ({MaxSeq})");
         LoadKernels();
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (ProfileKernels) { _acc.Synchronize(); _profT = t0; }
+        if (ProfileKernels) { _acc.Synchronize(); _profT = System.Diagnostics.Stopwatch.GetTimestamp(); }
         // the token ids (decode: one stable buffer, the one a captured step binds; device draws: gathered there on the device) and the sequence map; the embedding
         // rows are gathered on the device
         IV idBuf;
@@ -847,6 +862,15 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>A prefill's attention on the tiled kernel (default; groups with shared memory, head width up to 128): off, the three-kernel path (scores, softmax,
     /// P.V), the reference the tiled kernel is gated against (GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath).</summary>
     public bool FlashPrefill { get; set; } = true;
+    /// <summary>
+    /// A prefill's attention on <c>FlashPrefillGqaImpl</c> (default; env GGUF_FLASH_GQA=0 for the older tiled kernel): 32 query vectors a group (the rows of a block
+    /// times the query heads that share one kv head), 32 keys a tile, so each K / V row is read once for all of them. Taken when the head width is a multiple of 32 up
+    /// to 128 and a kv head has at most 32 query heads. MEASURED 2026-11-02 before it (CUDA, RTX 4070, llama3.1:8b): the older kernel spent 8.5 s of an 18.3 s
+    /// 4,400-token prefill (~0.6 TFLOPS) and 59% of a 194-row prefill over a reused 4,206-row prefix.
+    /// </summary>
+    public bool FlashGqa { get; set; } = Environment.GetEnvironmentVariable("GGUF_FLASH_GQA") != "0";
+    /// <summary>The kernel the last prefill's attention ran on: "gqa-tiled", "tiled", or null before any flash prefill.</summary>
+    public string? LastFlashKernel { get; private set; }
 
     /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
     public int LastReusedPrefix { get; private set; }
@@ -1261,6 +1285,8 @@ public sealed class GgufBatchDecoder : IDisposable
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
         }
         _hasFlash = _acc.AcceleratorType != AcceleratorType.WebGL && HeadDim <= FaMaxD && FaThreads <= _acc.MaxNumThreadsPerGroup;
+        _hasFlashGqa = _hasFlash && HeadDim % FgDc == 0 && HeadDim <= FgMaxD && Heads % KvHeads == 0 && Heads / KvHeads <= FgQ
+            && FgThreads <= _acc.MaxNumThreadsPerGroup && FgShared * sizeof(float) <= _acc.MaxSharedMemoryPerGroup;
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
         if (!NoCandidates)
         {
@@ -1792,6 +1818,123 @@ public sealed class GgufBatchDecoder : IDisposable
             int i = idx / D, d = idx % D, r = r0 + i;
             if (r < R) { float l = st[FaRows + i]; att[((long)r * H + h) * D + d] = l > 0f ? os[idx] / l : 0f; }
         }
+    }
+
+    private const int FgQ = 32, FgKeys = 32, FgThreads = 256, FgDc = 32, FgPad = FgDc + 1, FgHalf = FgKeys / 2, FgMaxD = 128;
+    // one shared array, regions: U (the Q and K chunks of the score phase, then half a tile of V rows), P (the tile's probabilities), PM / PS (per query the eight
+    // partial maxima / sums of its score threads), SM / SL (running max, exp-sum), CR (this tile's rescale), MN (the new max)
+    private const int FgU = 0, FgP = 2 * FgQ * FgPad, FgPM = FgP + FgQ * FgPad, FgPS = FgPM + FgQ * 8, FgSM = FgPS + FgQ * 8, FgSL = FgSM + FgQ, FgCR = FgSL + FgQ,
+        FgMN = FgCR + FgQ, FgShared = FgMN + FgQ;                     // 3,808 floats = 15,232 bytes (WebGPU guarantees 16,384)
+    private struct FgAcc { public float X, Y, Z, W; }
+
+    // prefill attention, tiled for grouped-query heads. Group g = (block of rowsPer = 32 / G query rows, kv head hk), 256 threads, 32 query vectors: vector v is
+    // row r0 + v / G of query head hk * G + v % G (G = H / kvH; vectors past rowsPer * G idle). Per tile of 32 keys: the scores in four 32-wide D chunks (the Q and K
+    // chunks staged in shared memory, rows padded to 33 floats; thread t scores vector t / 8 against keys 4 (t % 8) .. +3), the tile's softmax (online: each query's
+    // max from its eight score threads' partial maxima, the probabilities written over the scores, the exp-sum kept per query), then P.V with V staged 16 keys at a
+    // time (thread t accumulates vectors 4 (t / 32) .. +3 at d = t % 32 + 32 x in registers). Causal: vector at position p + row sees keys 0..p + row; a prefill is
+    // sequence 0. Each K / V row is read once per block for all the G heads that share it (the older FlashPrefillImpl read it once per query head).
+    private static void FlashPrefillGqaImpl<T>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, FV att, int R, int H, int kvH, int D, int p, float scale) where T : unmanaged, System.Numerics.INumber<T>
+    {
+        int g = Grid.IdxX, t = Group.IdxX;
+        int G = H / kvH, rowsPer = FgQ / G, hk = g % kvH, r0 = (g / kvH) * rowsPer;
+        int nv = rowsPer * G, kvC = kvH * D;
+        int rowsHere = Math.Min(rowsPer, R - r0);
+        int last = p + r0 + rowsHere - 1;                            // the block's last query position: no key past it is live for any of its vectors
+        var sh = SharedMemory.Allocate<float>(FgShared);
+        if (t < FgQ) { sh[FgSM + t] = -1e30f; sh[FgSL + t] = 0f; }
+        int sq = t >> 3, sk = (t & 7) * 4;                             // score phase: vector sq, keys sk..sk+3 of the tile
+        int sqRow = sq / G;
+        bool sqLive = sq < nv && sqRow < rowsHere;
+        int sqPos = p + r0 + sqRow;
+        int oq = (t >> 5) * 4, dl = t & 31;                            // P.V phase: vectors oq..oq+3, d = dl + 32 x
+        var o0 = new FgAcc(); var o1 = new FgAcc(); var o2 = new FgAcc(); var o3 = new FgAcc();
+        for (int j0 = 0; j0 <= last; j0 += FgKeys)
+        {
+            float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+            for (int dc = 0; dc < D; dc += FgDc)
+            {
+                for (int e = t; e < FgQ * FgDc; e += FgThreads)
+                {
+                    int v = e >> 5, d = e & 31, i = v / G, j = j0 + v;
+                    sh[FgU + v * FgPad + d] = v < nv && i < rowsHere ? q[((long)(r0 + i) * H + hk * G + v % G) * D + dc + d] * scale : 0f;
+                    sh[FgU + FgQ * FgPad + v * FgPad + d] = j <= last ? PrecisionConvert.ConvertToSingle(kc[(long)j * kvC + hk * D + dc + d]) : 0f;
+                }
+                Group.Barrier();
+                int qb = FgU + sq * FgPad, kb = FgU + FgQ * FgPad + sk * FgPad;
+                for (int d = 0; d < FgDc; d++)
+                {
+                    float qv = sh[qb + d];
+                    s0 += qv * sh[kb + d];
+                    s1 += qv * sh[kb + FgPad + d];
+                    s2 += qv * sh[kb + 2 * FgPad + d];
+                    s3 += qv * sh[kb + 3 * FgPad + d];
+                }
+                Group.Barrier();
+            }
+            int jb = j0 + sk;
+            bool live = sqLive;
+            if (!(live && jb <= sqPos)) s0 = -1e30f;
+            if (!(live && jb + 1 <= sqPos)) s1 = -1e30f;
+            if (!(live && jb + 2 <= sqPos)) s2 = -1e30f;
+            if (!(live && jb + 3 <= sqPos)) s3 = -1e30f;
+            sh[FgPM + sq * 8 + (t & 7)] = MathF.Max(MathF.Max(s0, s1), MathF.Max(s2, s3));
+            Group.Barrier();
+            float mt = -1e30f;
+            for (int c = 0; c < 8; c++) mt = MathF.Max(mt, sh[FgPM + sq * 8 + c]);
+            float mo = sh[FgSM + sq], mn = MathF.Max(mo, mt);
+            float e0 = s0 <= -1e29f ? 0f : MathF.Exp(s0 - mn), e1 = s1 <= -1e29f ? 0f : MathF.Exp(s1 - mn);
+            float e2 = s2 <= -1e29f ? 0f : MathF.Exp(s2 - mn), e3 = s3 <= -1e29f ? 0f : MathF.Exp(s3 - mn);
+            int pb = FgP + sq * FgPad + sk;
+            sh[pb] = e0; sh[pb + 1] = e1; sh[pb + 2] = e2; sh[pb + 3] = e3;
+            sh[FgPS + sq * 8 + (t & 7)] = e0 + e1 + e2 + e3;
+            if ((t & 7) == 0) { sh[FgCR + sq] = mo <= -1e29f ? 0f : MathF.Exp(mo - mn); sh[FgMN + sq] = mn; }
+            Group.Barrier();
+            if (t < FgQ)
+            {
+                float sum = 0f;
+                for (int c = 0; c < 8; c++) sum += sh[FgPS + t * 8 + c];
+                sh[FgSL + t] = sh[FgSL + t] * sh[FgCR + t] + sum;
+                sh[FgSM + t] = sh[FgMN + t];
+            }
+            o0 = FgScale(o0, sh[FgCR + oq]); o1 = FgScale(o1, sh[FgCR + oq + 1]); o2 = FgScale(o2, sh[FgCR + oq + 2]); o3 = FgScale(o3, sh[FgCR + oq + 3]);
+            for (int half = 0; half < 2; half++)
+            {
+                int jh = j0 + half * FgHalf;
+                for (int e = t; e < FgHalf * D; e += FgThreads)
+                {
+                    int jj = e / D, d = e - jj * D, j = jh + jj;
+                    sh[FgU + e] = j <= last ? PrecisionConvert.ConvertToSingle(vc[(long)j * kvC + hk * D + d]) : 0f;
+                }
+                Group.Barrier();
+                for (int c = 0; c < FgHalf; c++)
+                {
+                    int vb = FgU + c * D + dl, col = half * FgHalf + c;
+                    float v0 = sh[vb], v1 = D > 32 ? sh[vb + 32] : 0f, v2 = D > 64 ? sh[vb + 64] : 0f, v3 = D > 96 ? sh[vb + 96] : 0f;
+                    o0 = FgMac(o0, sh[FgP + oq * FgPad + col], v0, v1, v2, v3);
+                    o1 = FgMac(o1, sh[FgP + (oq + 1) * FgPad + col], v0, v1, v2, v3);
+                    o2 = FgMac(o2, sh[FgP + (oq + 2) * FgPad + col], v0, v1, v2, v3);
+                    o3 = FgMac(o3, sh[FgP + (oq + 3) * FgPad + col], v0, v1, v2, v3);
+                }
+                Group.Barrier();
+            }
+        }
+        FgStore(att, o0, sh[FgSL + oq], oq, G, nv, rowsHere, r0, hk, H, D, dl);
+        FgStore(att, o1, sh[FgSL + oq + 1], oq + 1, G, nv, rowsHere, r0, hk, H, D, dl);
+        FgStore(att, o2, sh[FgSL + oq + 2], oq + 2, G, nv, rowsHere, r0, hk, H, D, dl);
+        FgStore(att, o3, sh[FgSL + oq + 3], oq + 3, G, nv, rowsHere, r0, hk, H, D, dl);
+    }
+    private static FgAcc FgScale(FgAcc a, float c) { a.X *= c; a.Y *= c; a.Z *= c; a.W *= c; return a; }
+    private static FgAcc FgMac(FgAcc a, float pr, float v0, float v1, float v2, float v3) { a.X += pr * v0; a.Y += pr * v1; a.Z += pr * v2; a.W += pr * v3; return a; }
+    private static void FgStore(FV att, FgAcc a, float l, int v, int G, int nv, int rowsHere, int r0, int hk, int H, int D, int dl)
+    {
+        int row = v / G;
+        if (v >= nv || row >= rowsHere) return;
+        float inv = l > 0f ? 1f / l : 0f;
+        long b = ((long)(r0 + row) * H + hk * G + v % G) * D + dl;
+        att[b] = a.X * inv;
+        if (D > 32) att[b + 32] = a.Y * inv;
+        if (D > 64) att[b + 64] = a.Z * inv;
+        if (D > 96) att[b + 96] = a.W * inv;
     }
 
     // split-K attention, part 1. Group g = (row r, head h, chunk ch of AttChunk keys), a thread per head dimension (D = group size, a power of two). The chunk's
