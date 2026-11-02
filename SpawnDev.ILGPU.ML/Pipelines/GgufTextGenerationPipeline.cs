@@ -227,6 +227,6 @@ public enum GgufEngine
     Auto,
     /// <summary><see cref="GgufGenerator"/> over an <see cref="InferenceSession"/>: every architecture the graph builder knows; exposes the session.</summary>
     Generator,
-    /// <summary><see cref="GgufBatchDecoder"/> with one sequence (qwen2, qwen3, llama without rope_freqs): the faster engine; throws when it cannot load the model.</summary>
+    /// <summary><see cref="GgufBatchDecoder"/> with one sequence (qwen2, qwen3, llama, llama 3 rope_freqs included): the faster engine; throws when it cannot load the model.</summary>
     BatchDecoder,
 }

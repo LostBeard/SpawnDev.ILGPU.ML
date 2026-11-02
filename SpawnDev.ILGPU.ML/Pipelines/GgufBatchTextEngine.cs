@@ -6,7 +6,7 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// One answer at a time on <see cref="GgufBatchDecoder"/> (one sequence), with what a chat needs from <see cref="GgufGenerator"/>: the prompt fitted into the
 /// cache, the conversation's prefix reused across requests (only the new part of the next turn is prefilled), greedy / top-k / top-p with the repetition
 /// penalty, stop tokens and stop strings, UTF-8-safe streamed text and the stop reason. <see cref="GgufTextGenerationPipeline"/> uses it for the architectures
-/// the decoder loads (qwen2, qwen3, llama without rope_freqs) on CUDA, OpenCL and WebGPU.
+/// the decoder loads (qwen2, qwen3, llama, llama 3 rope_freqs included) on CUDA, OpenCL and WebGPU.
 /// </summary>
 /// <remarks>
 /// Seeded sampling is reproducible on this engine, not across engines: the decoder's device draws take their uniform from (seed, sequence, position), the

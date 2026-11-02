@@ -289,10 +289,13 @@ public static class GGUFGraphBuilder
             // Weightless V RMS-norm is a gemma4 (and gemma3n) behavior ONLY — see UsesWeightlessVNorm.
             bool gemmaVNorm = gemmaAttn && UsesWeightlessVNorm(arch);
 
-            // rope_freqs (NTK / proportional rope) — global (full-attention) gemma4 layers only. Shared
-            // model-level tensor; extract once, reference per global layer.
+            // rope_freqs (per-frequency rotary factors): every layer of the llama lineage (llama 3.x's long-context
+            // scaling, ggml's llama graph passes them to each layer's rope), the global (full-attention) layers only
+            // of gemma4 (NTK / proportional rope). Shared model-level tensor; extract once, reference per layer.
+            // Until 2026-11-02 only the gemma4 case applied them: llama3.1:8b ignored its factors, which changes
+            // nothing at short range and changes the answer once positions reach the scaled frequencies.
             string? freqFactors = null;
-            if (gemmaAttn && cfg.IsGlobal)
+            if (!gemmaAttn || cfg.IsGlobal)
             {
                 var rf = FindTensor(model, "rope_freqs.weight");
                 if (rf != null)

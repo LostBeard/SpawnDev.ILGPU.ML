@@ -152,8 +152,7 @@ public sealed class GgufBatchDecoder : IDisposable
         _qkNorm = model.Tensors.Any(t => t.Name == "blk.0.attn_q_norm.weight");
         if ((int)model.GetMetadataInt($"{a}.rope.dimension_count", HeadDim) != HeadDim)
             throw new NotSupportedException($"GgufBatchDecoder: rotary over part of the head ({a}.rope.dimension_count)");
-        if (model.Tensors.Any(t => t.Name == "rope_freqs.weight"))
-            throw new NotSupportedException("GgufBatchDecoder: per-frequency rotary factors (rope_freqs, llama 3 scaling)");
+        if (!RopeFactorsFit(model, HeadDim, out var rfWhy)) throw new NotSupportedException("GgufBatchDecoder: " + rfWhy);
         _eps = model.GetMetadataFloat($"{a}.attention.layer_norm_rms_epsilon", 1e-6f);
         _theta = model.GetMetadataFloat($"{a}.rope.freq_base", 10000f);
         _embd = Tensor("token_embd.weight");
@@ -262,8 +261,27 @@ public sealed class GgufBatchDecoder : IDisposable
         return buf;
     }
 
+    // rope_freqs (llama 3.x): per-frequency factors that divide each rotary pair's angle, ggml's theta / freq_factors[i] (the session engine's RoPE kernel)
+    private static bool RopeFactorsFit(GGUFModel model, int headDim, out string reason)
+    {
+        reason = "";
+        var rf = model.Tensors.FirstOrDefault(t => t.Name == "rope_freqs.weight");
+        if (rf == null) return true;
+        if (rf.Type != GGMLType.F32) { reason = $"rope_freqs.weight: {rf.Type} (expected F32)"; return false; }
+        if (model.GetTensorElementCount(rf) != headDim / 2) { reason = $"rope_freqs.weight: {model.GetTensorElementCount(rf)} factors (expected one per rotary pair, {headDim / 2})"; return false; }
+        return true;
+    }
+
     private async Task LoadAsync(CancellationToken ct)
     {
+        if (_model.Tensors.Any(t => t.Name == "rope_freqs.weight"))
+        {
+            // the rotary table divided by llama 3's per-frequency factors: angle = pos * invFreq[k] / factor[k]
+            var factors = await VecAsync("rope_freqs.weight", ct).ConfigureAwait(false);
+            var inv = new float[HeadDim / 2];
+            for (int k = 0; k < inv.Length; k++) inv[k] = 1f / MathF.Pow(_theta, 2f * k / HeadDim) / factors[k];
+            _invFreq.View.CopyFromCPU(inv);
+        }
         var mats = new List<string> { _head, "token_embd.weight" };          // the embedding rows are gathered on the device (a tied head is the same blocks)
         var vecs = new List<string> { "output_norm.weight" };
         _qkvAll = new bool[Layers];
@@ -750,7 +768,7 @@ public sealed class GgufBatchDecoder : IDisposable
 
     /// <summary>
     /// True when <paramref name="model"/> can load here (checked on the header, before any weight is read): the architecture (qwen2, qwen3, llama), rotary over
-    /// the whole head without per-frequency factors (no llama 3 rope_freqs), a vocabulary below 2^24, and every matrix in a block type the fused GEMM reads
+    /// the whole head (per-frequency factors, llama 3's rope_freqs, as F32 with one per pair), a vocabulary below 2^24, and every matrix in a block type the fused GEMM reads
     /// (norms F32). <paramref name="reason"/> says what does not fit.
     /// </summary>
     public static bool Supports(GGUFModel model, out string reason)
@@ -760,7 +778,7 @@ public sealed class GgufBatchDecoder : IDisposable
         int hidden = (int)model.EmbeddingLength, heads = (int)model.AttentionHeadCount;
         int headDim = (int)model.GetMetadataInt($"{a}.attention.key_length", heads > 0 ? hidden / heads : 0);
         if ((int)model.GetMetadataInt($"{a}.rope.dimension_count", headDim) != headDim) { reason = "rotary over part of the head"; return false; }
-        if (model.Tensors.Any(t => t.Name == "rope_freqs.weight")) { reason = "per-frequency rotary factors (rope_freqs, llama 3 scaling)"; return false; }
+        if (!RopeFactorsFit(model, headDim, out reason)) return false;
         var embd = model.Tensors.FirstOrDefault(t => t.Name == "token_embd.weight");
         if (embd == null) { reason = "no token_embd.weight"; return false; }
         if (embd.Dimensions[1] >= 1 << 24) { reason = $"vocabulary {embd.Dimensions[1]} (candidate ids travel as floats, exact below 2^24)"; return false; }

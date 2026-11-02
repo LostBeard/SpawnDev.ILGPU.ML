@@ -62,7 +62,7 @@ public sealed class GgufGenerator : IDisposable
 
     /// <summary>
     /// Load a GGUF chat model from a seekable stream and pick the faster engine for it: <see cref="GgufBatchDecoder"/> (one sequence, prefix reuse) for qwen2,
-    /// qwen3 and llama without rope_freqs on CUDA, OpenCL and WebGPU (<see cref="GgufTextGenerationPipeline.ChooseEngine"/>; MEASURED 2026-11-01, Qwen2.5-0.5B,
+    /// qwen3 and llama (llama 3 rope_freqs included) on CUDA, OpenCL and WebGPU (<see cref="GgufTextGenerationPipeline.ChooseEngine"/>; MEASURED 2026-11-01, Qwen2.5-0.5B,
     /// one chat answer: WebGPU 67.8 -> 260.8 tok/s, CUDA 104.6 -> 165.1, OpenCL 47.3 -> 184.0), the session engine otherwise (other architectures, WebGL, Wasm,
     /// the CPU backends). Same <see cref="GenerateAsync"/>: stop tokens and strings, streamed text, the prefix cache (<see cref="LastReusedPrefix"/>), cancel.
     /// <paramref name="model"/>: the header if the caller already parsed it (it is not parsed twice). The weights stream to the GPU (a browser JS stream goes

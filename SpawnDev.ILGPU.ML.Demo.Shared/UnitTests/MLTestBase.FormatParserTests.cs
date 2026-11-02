@@ -395,7 +395,7 @@ public abstract partial class MLTestBase
         // (gemma-3-270m-it then ignored the second question of a conversation). Vocab: "▁" (3), "\n" (4), "user" (5), "▁user" (6).
         var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\n", "user", "\u2581user" };
         var scores = new float[] { 0, 0, 0, -1, -1, -1, -1 };
-        var types = new int[] { 1, 2, 2, 0, 0, 0, 0 };
+        var types = new int[] { 2, 3, 3, 0, 0, 0, 0 };
         var llama = new SentencePieceTokenizer(tokens, scores, types);              // default: the llama dummy prefix
         var gemma = new SentencePieceTokenizer(tokens, scores, types) { AddSpacePrefix = false };
         string Ids(int[] a) => string.Join(",", a);
@@ -413,7 +413,7 @@ public abstract partial class MLTestBase
         // Minimal SentencePiece vocab: special tokens + a few words
         var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\u2581hello", "\u2581world", "h", "e", "l", "o" };
         var scores = new float[] { 0, 0, 0, -1, -2, -2, -3, -3, -3, -3 };
-        var types = new int[] { 1, 2, 2, 0, 0, 0, 0, 0, 0, 0 }; // 1=unk, 2=control, 0=normal
+        var types = new int[] { 2, 3, 3, 0, 0, 0, 0, 0, 0, 0 }; // the GGUF enum: 2 = unknown, 3 = control (0 = undefined, read as normal)
 
         var sp = new SentencePieceTokenizer(tokens, scores, types);
 
@@ -445,7 +445,7 @@ public abstract partial class MLTestBase
         //   input "abc":  greedy longest → ["ab","c"]=[4,3];  BPE (merge b+c first) → ["a","bc"]=[1,5]
         var tokens = new[] { "<unk>", "a", "b", "c", "ab", "bc" };
         var scores = new float[tokens.Length];
-        var types = new[] { 1, 0, 0, 0, 0, 0 };
+        var types = new[] { 2, 0, 0, 0, 0, 0 };
         var merges = new[] { "b c" };
 
         var bpe = new SentencePieceTokenizer(tokens, scores, types, byteLevelBpe: true, merges: merges);
@@ -471,13 +471,13 @@ public abstract partial class MLTestBase
         // Vocab with byte fallback tokens
         var tokens = new List<string> { "<unk>", "<s>", "</s>", "\u2581" };
         var scores = new List<float> { 0, 0, 0, -1 };
-        var types = new List<int> { 1, 2, 2, 0 };
+        var types = new List<int> { 2, 3, 3, 0 };
         // Add byte tokens <0x00> through <0xFF>
         for (int b = 0; b < 256; b++)
         {
             tokens.Add($"<0x{b:X2}>");
             scores.Add(-10);
-            types.Add(5); // byte type
+            types.Add(6); // byte type
         }
 
         var sp = new SentencePieceTokenizer(tokens.ToArray(), scores.ToArray(), types.ToArray());
@@ -496,8 +496,8 @@ public abstract partial class MLTestBase
         // Vocab: specials + the normal piece "▁caf" + byte-fallback tokens <0x00>..<0xFF>.
         var tokens = new List<string> { "<unk>", "<s>", "</s>", "▁", "▁caf" };
         var scores = new List<float> { 0, 0, 0, -1, -2 };
-        var types = new List<int> { 1, 2, 2, 0, 0 };
-        for (int b = 0; b < 256; b++) { tokens.Add($"<0x{b:X2}>"); scores.Add(-10); types.Add(5); }
+        var types = new List<int> { 2, 3, 3, 0, 0 };
+        for (int b = 0; b < 256; b++) { tokens.Add($"<0x{b:X2}>"); scores.Add(-10); types.Add(6); }
         var sp = new SentencePieceTokenizer(tokens.ToArray(), scores.ToArray(), types.ToArray());
 
         int bos = sp.BosId;                         // control (id 1) → contributes no bytes
@@ -545,7 +545,7 @@ public abstract partial class MLTestBase
         // unicode (space→Ġ U+0120, newline→Ċ U+010A, and 0xC3/0xA9 → Ã/© for a multi-byte glyph). Decode reverses it.
         var tokens = new[] { "<unk>", "<s>", "</s>", "ĠHello", "Ġworld", "Ċ", "Ã©" };
         var scores = new float[tokens.Length];
-        var types = new[] { 1, 2, 2, 0, 0, 0, 0 };
+        var types = new[] { 2, 3, 3, 0, 0, 0, 0 };
         var sp = new SentencePieceTokenizer(tokens, scores, types, byteLevelBpe: true);
         if (!sp.ByteLevelBpe) throw new Exception("ByteLevelBpe flag not set");
 
@@ -566,7 +566,7 @@ public abstract partial class MLTestBase
     {
         var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581hello" };
         var scores = new float[] { 0, 0, 0, -1 };
-        var types = new int[] { 1, 2, 2, 0 };
+        var types = new int[] { 2, 3, 3, 0 };
         var sp = new SentencePieceTokenizer(tokens, scores, types);
         var loaded = sp.ToLoadedTokenizer();
 

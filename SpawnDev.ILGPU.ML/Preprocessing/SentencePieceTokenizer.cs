@@ -20,9 +20,23 @@ public class SentencePieceTokenizer : ITokenizer
     private readonly float[] _scores;
     private readonly int[] _tokenTypes;
     private readonly Dictionary<string, int> _tokenToId;
-    private readonly int _bosId;
-    private readonly int _eosId;
-    private readonly int _unkId;
+    private int _bosId;
+    private int _eosId;
+    private int _unkId;
+
+    // token types, the GGUF / SentencePiece enum (llama.cpp's llama_token_type; sentencepiece_model.proto's Type)
+    /// <summary>GGUF <c>tokenizer.ggml.token_type</c>: an ordinary piece.</summary>
+    public const int TypeNormal = 1;
+    /// <summary>GGUF token type: the unknown token.</summary>
+    public const int TypeUnknown = 2;
+    /// <summary>GGUF token type: a control token (BOS, EOS, turn markers): no text when decoded.</summary>
+    public const int TypeControl = 3;
+    /// <summary>GGUF token type: a user-defined special piece (qwen's &lt;think&gt;, gemma4's &lt;|tool_call&gt;): decoded as its text.</summary>
+    public const int TypeUserDefined = 4;
+    /// <summary>GGUF token type: an unused slot.</summary>
+    public const int TypeUnused = 5;
+    /// <summary>GGUF token type: a byte-fallback piece (&lt;0xHH&gt;).</summary>
+    public const int TypeByte = 6;
     private readonly bool _byteLevelBpe;
     // Byte-level BPE merge ranks ("A B" → rank). Lower rank = higher priority. Null when the GGUF carries no
     // merges (then the byte-level path falls back to score-greedy longest-match). Real GPT-2/qwen/llama3/smollm
@@ -104,17 +118,20 @@ public class SentencePieceTokenizer : ITokenizer
         for (int i = 0; i < tokens.Length; i++)
             _tokenToId[tokens[i]] = i;
 
-        // Find special token IDs by type or content
+        // Find special token IDs by type and content (FromGGUF then takes the GGUF's own bos / eos / unknown ids). Until 2026-11-02 this read
+        // type 2 as control and type 1 as unknown (the enum is 1 normal, 2 unknown, 3 control): no control token was found, the unknown id was the
+        // last ordinary piece, and BOS / EOS fell back to ids 1 / 2, which are '"' and '#' in llama 3's and qwen's vocabularies (GgufGenerator
+        // stopped at a '#') and <eos> / <bos> swapped in gemma's.
         _bosId = -1; _eosId = -1; _unkId = -1;
         for (int i = 0; i < _tokenTypes.Length; i++)
         {
-            if (_tokenTypes[i] == 2) // control token
+            if (_tokenTypes[i] == TypeControl)
             {
                 var t = tokens[i];
-                if (t == "<s>" || t == "<|begin_of_text|>") _bosId = i;
-                else if (t == "</s>" || t == "<|end_of_text|>") _eosId = i;
+                if (t is "<s>" or "<bos>" or "<|begin_of_text|>") _bosId = i;
+                else if (t is "</s>" or "<eos>" or "<|end_of_text|>") _eosId = i;
             }
-            if (_tokenTypes[i] == 1) _unkId = i; // unknown
+            if (_tokenTypes[i] == TypeUnknown) _unkId = i;
         }
         // Fallback: common positions
         if (_bosId < 0 && _tokenToId.TryGetValue("<s>", out int bid)) _bosId = bid;
@@ -250,32 +267,17 @@ public class SentencePieceTokenizer : ITokenizer
     }
 
     /// <summary>
-    /// Decode token IDs back to text.
+    /// Decode token IDs back to text: each token's bytes (<see cref="TokenToBytes"/>) concatenated and read as UTF-8. A SentencePiece vocab drops
+    /// the leading space of its word-start marker; a byte-level BPE vocab keeps the text exactly.
+    /// Until 2026-11-02 this appended the vocab strings as they are: a byte-level BPE vocab (llama 3, qwen, smollm) came back in GPT-2's byte
+    /// alphabet ("TheĠthreeĠprimary...Ċ") and a byte-fallback run (<c>&lt;0xHH&gt;</c>) came back as one char per byte, not as its UTF-8 glyph.
     /// </summary>
     public string Decode(int[] tokenIds)
     {
-        var sb = new System.Text.StringBuilder();
-        foreach (int id in tokenIds)
-        {
-            if (id < 0 || id >= _vocab.Length) continue;
-            int tokenType = id < _tokenTypes.Length ? _tokenTypes[id] : 0;
-            if (tokenType == 2) continue; // skip control tokens (BOS, EOS)
-
-            string token = _vocab[id];
-            // Handle byte tokens: <0xHH>
-            if (token.StartsWith("<0x") && token.EndsWith(">") && token.Length == 6)
-            {
-                if (byte.TryParse(token.AsSpan(3, 2), System.Globalization.NumberStyles.HexNumber, null, out byte b))
-                    sb.Append((char)b);
-            }
-            else
-            {
-                sb.Append(token);
-            }
-        }
-        // Replace ▁ with space and trim leading space
-        string result = sb.ToString().Replace('\u2581', ' ');
-        if (result.StartsWith(' ')) result = result[1..];
+        var bytes = new List<byte>();
+        foreach (int id in tokenIds) bytes.AddRange(TokenToBytes(id));
+        string result = System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+        if (!_byteLevelBpe && result.StartsWith(' ')) result = result[1..];
         return result;
     }
 
@@ -291,7 +293,7 @@ public class SentencePieceTokenizer : ITokenizer
     {
         if (id < 0 || id >= _vocab.Length) return Array.Empty<byte>();
         int tokenType = id < _tokenTypes.Length ? _tokenTypes[id] : 0;
-        if (tokenType == 2) return Array.Empty<byte>(); // control token (BOS/EOS/turn markers)
+        if (tokenType == TypeControl) return Array.Empty<byte>(); // control token (BOS/EOS/turn markers): no text, as llama.cpp renders it
 
         string token = _vocab[id];
 
@@ -346,6 +348,12 @@ public class SentencePieceTokenizer : ITokenizer
         // trained (greedy longest-match diverges on multi-token words and breaks sensitive models).
         var merges = byteLevelBpe ? model.GetMetadataStringArray("tokenizer.ggml.merges") : null;
         var tok = new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe, merges);
+        // the GGUF's own special ids win over the guesses by name (llama 3.1: eos = <|eot_id|>, not <|end_of_text|>; gemma: bos 2, eos 1)
+        int Special(string key, int current) =>
+            model.Metadata.TryGetValue(key, out var v) && v is not null && Convert.ToInt64(v) is long id && id >= 0 && id < tokens.Length ? (int)id : current;
+        tok._bosId = Special("tokenizer.ggml.bos_token_id", tok._bosId);
+        tok._eosId = Special("tokenizer.ggml.eos_token_id", tok._eosId);
+        tok._unkId = Special("tokenizer.ggml.unknown_token_id", tok._unkId);
         if (model.Metadata.TryGetValue("tokenizer.ggml.add_space_prefix", out var asp) && asp is bool addSpace)
             tok.AddSpacePrefix = addSpace;                  // absent = the llama SentencePiece default (true)
         return tok;
