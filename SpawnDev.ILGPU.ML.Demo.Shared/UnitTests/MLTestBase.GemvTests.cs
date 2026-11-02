@@ -647,7 +647,7 @@ public abstract partial class MLTestBase
         if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("ForwardRows takes the per-element kernel on WebGL (no shared memory)");
         const int K = 1536, N = 97;
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
-        foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0 })
+        foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0, GGMLType.F16, GGMLType.BF16 })
         {
             var rng = new Random(53 + (int)type);
             int bytesPerRow = RowBytes(type, K);
@@ -680,7 +680,7 @@ public abstract partial class MLTestBase
                 AssertCloseQuant(got, expected, 2e-3f, $"ForwardRows {type} M={M}");
             }
         }
-        Console.WriteLine($"[Gemv] ForwardRows Q8_0 / Q4_K / Q6_K / Q4_0, M = 1, 3, 8, K={K} N={N}: match the oracle");
+        Console.WriteLine($"[Gemv] ForwardRows Q8_0 / Q4_K / Q6_K / Q4_0 / F16 / BF16, M = 1, 3, 8, K={K} N={N}: match the oracle");
     });
 
     /// <summary>
@@ -699,7 +699,7 @@ public abstract partial class MLTestBase
         Kernels.FusedDequantMatMul.ForceTiledGemm = true;
         try
         {
-            foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0 })
+            foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q4_0, GGMLType.F16, GGMLType.BF16 })
                 foreach (int N in new[] { 97, 130 })
                 {
                     var rng = new Random(71 + (int)type + N);
@@ -740,6 +740,50 @@ public abstract partial class MLTestBase
                 }
         }
         finally { Kernels.FusedDequantMatMul.ForceTiledGemm = saved; }
-        Console.WriteLine($"[TiledGemm] {accelerator.AcceleratorType}: Q8_0 / Q4_K / Q6_K / Q4_0, M = 9, 64, 65, 200, N = 97, 130, K = {K}: match the oracle");
+        Console.WriteLine($"[TiledGemm] {accelerator.AcceleratorType}: Q8_0 / Q4_K / Q6_K / Q4_0 / F16 / BF16, M = 9, 64, 65, 200, N = 97, 130, K = {K}: match the oracle");
+    });
+
+    /// <summary>
+    /// <see cref="Kernels.FusedDequantMatMul.Forward"/> with F16 and BF16 matrices (Ollama's Q4_K_M / Q8_0 exports keep some in F16: qwen3's attn_v, smollm2's
+    /// token_embd) against the host reference, on every lane: M = 1 and 5 (ForwardRows' kernel; WebGL: the per-element one) and 70 (the tiled GEMM), K = 512,
+    /// N = 75. Values include F16 subnormals.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task FusedDequant_F16BF16_MatchOracle() => await RunTest(async accelerator =>
+    {
+        const int K = 512, N = 75;
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        foreach (var type in new[] { GGMLType.F16, GGMLType.BF16 })
+        {
+            var rng = new Random(91 + (int)type);
+            var weightBytes = new byte[N * K * 2];
+            var wRows = new float[N][];
+            for (int n = 0; n < N; n++)
+            {
+                var rowBytes = MakeBlocks(type, K, rng);
+                Buffer.BlockCopy(rowBytes, 0, weightBytes, n * K * 2, K * 2);
+                wRows[n] = ReferenceDequant(type, rowBytes, K);
+            }
+            using var weightBuf = AllocatePadded(accelerator, weightBytes);
+            foreach (int M in new[] { 1, 5, 70 })
+            {
+                var input = new float[M * K];
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                var expected = new float[M * N];
+                for (int m = 0; m < M; m++)
+                    for (int n = 0; n < N; n++)
+                    {
+                        double sum = 0;
+                        for (int k = 0; k < K; k++) sum += input[m * K + k] * wRows[n][k];
+                        expected[m * N + n] = (float)sum;
+                    }
+                using var inputBuf = accelerator.Allocate1D(input);
+                using var outBuf = accelerator.Allocate1D<float>(M * N);
+                fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+                var got = await outBuf.CopyToHostAsync<float>(0, M * N);
+                AssertCloseQuant(got, expected, 2e-3f, $"Forward {type} M={M}");
+            }
+        }
+        Console.WriteLine($"[F16BF16] {accelerator.AcceleratorType}: F16 / BF16, M = 1, 5, 70: match the oracle");
     });
 }

@@ -150,9 +150,16 @@ public class FusedDequantMatMul : IDisposable
     public static bool Supports(GGMLType type) =>
         type is GGMLType.Q4_0 or GGMLType.Q4_1 or GGMLType.Q5_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
 
+    /// <summary>
+    /// Every type <see cref="Forward"/> / <see cref="ForwardRows"/> multiply by: <see cref="Supports"/>'s block types and F16 / BF16 (two bytes a value; Ollama's
+    /// Q4_K_M / Q8_0 exports keep some tensors in F16: qwen3's attn_v, smollm2's token_embd). <see cref="Supports"/> stays the GGUF loader's routing (the session
+    /// engine dequantizes what it does not list to F32 at load); a caller that keeps F16 / BF16 matrices as they are (GgufBatchDecoder) checks this.
+    /// </summary>
+    public static bool Accepts(GGMLType type) => Supports(type) || type is GGMLType.F16 or GGMLType.BF16;
+
     /// <summary>Elements per quantization block for a supported type.</summary>
     private static int BlockElements(GGMLType type) =>
-        type is GGMLType.Q4_K or GGMLType.Q6_K ? 256 : 32;
+        type is GGMLType.Q4_K or GGMLType.Q6_K ? 256 : type is GGMLType.F16 or GGMLType.BF16 ? 2 : 32;      // F16 / BF16: rows of whole words
 
     /// <summary>
     /// MatMul with a GGUF-quantized weight matrix.
@@ -164,7 +171,7 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int M, int K, int N, GGMLType type)
     {
-        if (!Supports(type))
+        if (!Accepts(type))
             throw new NotSupportedException(
                 $"FusedDequantMatMul does not support GGML type {type}. The loader must " +
                 "CPU-dequantize this tensor to F32 (gate on FusedDequantMatMul.Supports).");
@@ -183,6 +190,27 @@ public class FusedDequantMatMul : IDisposable
         // All backends read bytes from packed int words (see class doc). The upload
         // must be padded to a 4-byte multiple or the tail bytes vanish in the Cast.
         var intView = weightQuant.Cast<byte, int>();
+
+        // F16 / BF16 (two bytes a value): one row to eight on ForwardRows' kernel, more on the tiled GEMM, WebGL on the per-element kernel; all through DecodeOf
+        if (type is GGMLType.F16 or GGMLType.BF16)
+        {
+            int wcode = TypeCode(type);
+            if (_accelerator.AcceleratorType != AcceleratorType.WebGL)
+            {
+                if (M <= RowsMax) { ForwardRows(input, weightQuant, output, M, K, N, type); return; }
+                if (EnableTiledGemm && _accelerator.MaxGroupSize.X >= TgThreads && K % TgK == 0)
+                {
+                    _tiledGemm ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        int, int, int, int>(TiledGemmImpl);
+                    _tiledGemm(new KernelConfig(((M + TgM - 1) / TgM) * ((N + TgN - 1) / TgN), TgThreads), input, intView, output, M, K, N, wcode);
+                    return;
+                }
+            }
+            _perElementOf ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(PerElementOfImpl);
+            _perElementOf(M * N, input, intView, output, M, K, N, wcode);
+            return;
+        }
 
         // M==1 GEMV: coalesced group-per-column path (see field comment). Per-type; types without a
         // GEMV kernel yet fall through to the general M*N kernel below (correct, just not coalesced).
@@ -1829,7 +1857,7 @@ public class FusedDequantMatMul : IDisposable
     public void ForwardRows(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> weightQuant, ArrayView1D<float, Stride1D.Dense> output, int M, int K, int N, GGMLType type)
     {
         if (M < 1 || M > RowsMax) throw new ArgumentOutOfRangeException(nameof(M), $"1..{RowsMax}");
-        if (!Supports(type)) throw new NotSupportedException($"ForwardRows: {type}");
+        if (!Accepts(type)) throw new NotSupportedException($"ForwardRows: {type}");
         if (_accelerator.AcceleratorType == AcceleratorType.WebGL) { Forward(input, weightQuant, output, M, K, N, type); return; }
         int code = TypeCode(type);
         if (!_rowsParams.TryGetValue((M, K, N, code), out var pb)) { pb = _accelerator.Allocate1D(new[] { M, K, N, code }); _rowsParams[(M, K, N, code)] = pb; }
@@ -2058,9 +2086,11 @@ public class FusedDequantMatMul : IDisposable
     }
 
     /// <summary>The block type as the code <see cref="DecodeOf"/> and <see cref="RowBytesOf"/> take (one kernel for every supported type).</summary>
-    internal static int TypeCode(GGMLType type) => type switch { GGMLType.Q8_0 => 0, GGMLType.Q4_0 => 1, GGMLType.Q4_1 => 2, GGMLType.Q5_0 => 3, GGMLType.Q4_K => 4, GGMLType.Q6_K => 5, _ => 6 };
+    internal static int TypeCode(GGMLType type) => type switch { GGMLType.Q8_0 => 0, GGMLType.Q4_0 => 1, GGMLType.Q4_1 => 2, GGMLType.Q5_0 => 3, GGMLType.Q4_K => 4, GGMLType.Q6_K => 5,
+        GGMLType.F16 => 7, GGMLType.BF16 => 8, _ => 6 };
     /// <summary>Bytes of one row of K values of the block type <paramref name="code"/>.</summary>
-    internal static int RowBytesOf(int code, int K) => code switch { 0 => K / 32 * 34, 1 => K / 32 * 18, 2 => K / 32 * 20, 3 => K / 32 * 22, 4 => K / 256 * 144, 5 => K / 256 * 210, _ => K / 32 * 17 };
+    internal static int RowBytesOf(int code, int K) => code switch { 0 => K / 32 * 34, 1 => K / 32 * 18, 2 => K / 32 * 20, 3 => K / 32 * 22, 4 => K / 256 * 144, 5 => K / 256 * 210,
+        7 or 8 => K * 2, _ => K / 32 * 17 };
     /// <summary>Value <paramref name="k"/> of the row starting at byte <paramref name="rowBase"/> of block type <paramref name="code"/> (callable from other kernels).</summary>
     internal static float DecodeOf(int code, ArrayView1D<int, Stride1D.Dense> w, int rowBase, int k) => code switch
     {
@@ -2070,6 +2100,8 @@ public class FusedDequantMatMul : IDisposable
         3 => DecodeQ5_0Element(w, rowBase, k),
         4 => DecodeQ4KElement(w, rowBase, k),
         5 => DecodeQ6KElement(w, rowBase, k),
+        7 => DecodeF16Element(w, rowBase, k),
+        8 => DecodeBF16Element(w, rowBase, k),
         _ => DecodeMXFP4Element(w, rowBase, k),
     };
 
@@ -2136,6 +2168,34 @@ public class FusedDequantMatMul : IDisposable
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q8_0 row (34B/32: [d:fp16][32×int8]; value = q·d).</summary>
+    /// <summary>Value <paramref name="col"/> of an F16 row (two little-endian bytes, exact incl. subnormals).</summary>
+    internal static float DecodeF16Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int o = rowByteBase + 2 * col;
+        return HalfBits(ReadByte(w, o) | (ReadByte(w, o + 1) << 8));
+    }
+
+    /// <summary>Value <paramref name="col"/> of a BF16 row (the float's high half).</summary>
+    internal static float DecodeBF16Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int o = rowByteBase + 2 * col;
+        return Interop.IntAsFloat((uint)((ReadByte(w, o) | (ReadByte(w, o + 1) << 8)) << 16));
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _perElementOf;
+
+    // a thread per output, any type through DecodeOf (F16 / BF16 on WebGL: no shared memory)
+    private static void PerElementOfImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, int code)
+    {
+        int m = idx / N, n = idx % N;
+        if (m >= M) return;
+        int rowBase = n * RowBytesOf(code, K);
+        float sum = 0f;
+        for (int k = 0; k < K; k++) sum += input[(long)m * K + k] * DecodeOf(code, w, rowBase, k);
+        output[idx] = sum;
+    }
+
     internal static float DecodeQ8_0Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
     {
         int bOff = rowByteBase + (col >> 5) * 34;   // 32 values per block

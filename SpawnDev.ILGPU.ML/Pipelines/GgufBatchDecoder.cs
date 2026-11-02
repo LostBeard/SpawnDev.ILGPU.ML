@@ -298,7 +298,7 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var name in mats.Distinct())
         {
             var t = Tensor(name);
-            if (!FusedDequantMatMul.Supports(t.Type)) throw new NotSupportedException($"{name}: {t.Type} is not a block type the fused GEMM reads");
+            if (!FusedDequantMatMul.Accepts(t.Type)) throw new NotSupportedException($"{name}: {t.Type} is not a type the fused GEMM reads");
             _mats[name] = (Own(await UploadAsync(t, ct).ConfigureAwait(false)), t.Type);
         }
         foreach (var name in vecs)
@@ -316,7 +316,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private async Task JoinAsync(string name, string[] parts, CancellationToken ct)
     {
         var type = Tensor(parts[0]).Type;
-        if (!FusedDequantMatMul.Supports(type)) throw new NotSupportedException($"{parts[0]}: {type} is not a block type the fused GEMM reads");
+        if (!FusedDequantMatMul.Accepts(type)) throw new NotSupportedException($"{parts[0]}: {type} is not a type the fused GEMM reads");
         var sizes = parts.Select(n => GGMLTypes.TypeSize(Tensor(n).Type, _model.GetTensorElementCount(Tensor(n)))).ToArray();
         if (sizes.Take(sizes.Length - 1).All(z => z % 4 == 0))
         {
@@ -770,7 +770,7 @@ public sealed class GgufBatchDecoder : IDisposable
             bool head = t.Name is "output.weight" or "token_embd.weight";
             if (!(block || head)) continue;
             if (vec) { if (t.Type != GGMLType.F32 && t.Name.EndsWith("norm.weight", StringComparison.Ordinal)) { reason = $"{t.Name}: {t.Type} (norms are read as F32)"; return false; } continue; }
-            if (!FusedDequantMatMul.Supports(t.Type)) { reason = $"{t.Name}: {t.Type} is not a block type the fused GEMM reads"; return false; }
+            if (!FusedDequantMatMul.Accepts(t.Type)) { reason = $"{t.Name}: {t.Type} is not a type the fused GEMM reads"; return false; }
         }
         reason = "";
         return true;

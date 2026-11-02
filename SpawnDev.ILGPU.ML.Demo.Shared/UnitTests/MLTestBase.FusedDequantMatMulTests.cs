@@ -563,6 +563,7 @@ public abstract partial class MLTestBase
 
     private static int BlockBytes(GGMLType t) => t switch
     {
+        GGMLType.F16 or GGMLType.BF16 => 2,
         GGMLType.Q4_0 => 18, GGMLType.Q4_1 => 20, GGMLType.Q5_0 => 22, GGMLType.Q5_1 => 24,
         GGMLType.Q8_0 => 34,
         GGMLType.Q2_K => 84, GGMLType.Q3_K => 110, GGMLType.Q4_K => 144,
@@ -572,7 +573,7 @@ public abstract partial class MLTestBase
     };
 
     private static int BlockElems(GGMLType t) =>
-        t is GGMLType.Q2_K or GGMLType.Q3_K or GGMLType.Q4_K or GGMLType.Q5_K or GGMLType.Q6_K ? 256 : 32;
+        t is GGMLType.Q2_K or GGMLType.Q3_K or GGMLType.Q4_K or GGMLType.Q5_K or GGMLType.Q6_K ? 256 : t is GGMLType.F16 or GGMLType.BF16 ? 1 : 32;
 
     private static int RowBytes(GGMLType t, int k) => k / BlockElems(t) * BlockBytes(t);
 
@@ -585,6 +586,17 @@ public abstract partial class MLTestBase
         int bs = BlockBytes(type);
         var bytes = new byte[nBlocks * bs];
         rng.NextBytes(bytes);
+        // F16 / BF16: real values in [-1, 1) (random bits would hold NaN / Inf), a few tiny ones (F16 subnormals)
+        if (type is GGMLType.F16 or GGMLType.BF16)
+        {
+            for (int i = 0; i < elements; i++)
+            {
+                float v = (float)(rng.NextDouble() * 2 - 1) * (i % 53 == 0 ? 1e-6f : 1f);
+                ushort h = type == GGMLType.F16 ? BitConverter.HalfToUInt16Bits((System.Half)v) : (ushort)(BitConverter.SingleToUInt32Bits(v) >> 16);
+                bytes[2 * i] = (byte)h; bytes[2 * i + 1] = (byte)(h >> 8);
+            }
+            return bytes;
+        }
         // MXFP4: the per-block scale is a single E8M0 byte (no fp16 fields). Random bytes decode fine, but
         // patch the scale byte to a sane exponent (~127 -> scale ~O(1)) so magnitudes stay comparable to the
         // other types (a random e up to 255 would give 2^127). The 16 nibble bytes stay fully random.
@@ -627,6 +639,8 @@ public abstract partial class MLTestBase
         GGMLType.Q5_K => RefQ5_K(data, elements),
         GGMLType.Q6_K => RefQ6_K(data, elements),
         GGMLType.MXFP4 => RefMXFP4(data, elements),
+        GGMLType.F16 => Enumerable.Range(0, elements).Select(i => (float)BitConverter.UInt16BitsToHalf((ushort)(data[2 * i] | (data[2 * i + 1] << 8)))).ToArray(),
+        GGMLType.BF16 => Enumerable.Range(0, elements).Select(i => BitConverter.UInt32BitsToSingle((uint)(data[2 * i] | (data[2 * i + 1] << 8)) << 16)).ToArray(),
         _ => throw new ArgumentException($"{type}"),
     };
 
