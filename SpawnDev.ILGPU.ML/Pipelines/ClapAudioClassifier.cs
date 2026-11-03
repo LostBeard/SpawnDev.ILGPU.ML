@@ -32,16 +32,35 @@ public readonly record struct ClapScore(string Label, float Logit, float Probabi
 /// LibriVox speech clips as "music" at 0.90-0.98 (transformers itself, not only this port); with the template, speech came first at 0.91 / 0.68 /
 /// 0.41 (MEASURED 2026-11-03).
 /// </para>
+/// <para>
+/// Checkpoints (both Apache-2.0, same feature extractor and tokenizer): <see cref="DefaultRepo"/> (HTSAT-tiny audio tower, 118 MB) and
+/// <see cref="LargerGeneralRepo"/> (larger_clap_general, 282 MB audio tower, trained on more general audio). Neither wins everywhere: on a DayZ
+/// recording (AssistZ lab run 2026-11-03, 1 s windows of an automatic-rifle burst) the larger one read 17 of 18 windows as "machine gun fire" where
+/// the default read 6 as "footsteps", but it scored clean read speech (LibriSpeech / LibriVox) as "a dog barking" or "rain" under every label
+/// wording tried, where the default with the template put speech first. Evaluate on your own audio.
+/// </para>
 /// </remarks>
 public sealed class ClapAudioClassifier : IDisposable
 {
-    /// <summary>The default model repository on the models host.</summary>
+    /// <summary>The default model repository on the models host: Xenova/clap-htsat-unfused.</summary>
     public const string DefaultRepo = "Xenova/clap-htsat-unfused";
+    /// <summary>The larger general-audio checkpoint: Xenova/larger_clap_general (laion/larger_clap_general).</summary>
+    public const string LargerGeneralRepo = "Xenova/larger_clap_general";
     /// <summary>
     /// laion/clap-htsat-unfused's <c>logit_scale_a.exp()</c> (transformers 5.20.2). The exported towers do not carry it; ClapModel scales its
     /// audio-to-text logits by it.
     /// </summary>
     public const float DefaultLogitScale = 18.661177f;
+    /// <summary>laion/larger_clap_general's <c>logit_scale_a.exp()</c> (transformers 5.20.2).</summary>
+    public const float LargerGeneralLogitScale = 38.664719f;
+
+    /// <summary>The logit scale of a known checkpoint repository, or null when it is not one of the checkpoints this class has been gated on.</summary>
+    public static float? KnownLogitScale(string repoId) => repoId switch
+    {
+        DefaultRepo => DefaultLogitScale,
+        LargerGeneralRepo => LargerGeneralLogitScale,
+        _ => null,
+    };
     /// <summary>Embedding width of both towers.</summary>
     public const int EmbedDim = 512;
     /// <summary>The sample rate the audio must be at.</summary>
@@ -55,12 +74,15 @@ public sealed class ClapAudioClassifier : IDisposable
     private readonly Dictionary<string, float[]> _textCache = new();
     private bool _disposed;
 
-    /// <summary>Scale applied to the cosine similarities to form logits (and so the softmax temperature).</summary>
-    public float LogitScale { get; set; } = DefaultLogitScale;
+    /// <summary>Scale applied to the cosine similarities to form logits (and so the softmax temperature): the checkpoint's own.</summary>
+    public float LogitScale { get; set; }
 
     /// <summary>Wrap already-created sessions and a tokenizer. The classifier owns and disposes them.</summary>
-    public ClapAudioClassifier(Accelerator accelerator, InferenceSession audioTower, InferenceSession textTower, BPETokenizer tokenizer)
+    /// <param name="logitScale">The checkpoint's <c>logit_scale_a.exp()</c> (<see cref="KnownLogitScale"/>); the towers do not carry it.</param>
+    public ClapAudioClassifier(Accelerator accelerator, InferenceSession audioTower, InferenceSession textTower, BPETokenizer tokenizer,
+        float logitScale = DefaultLogitScale)
     {
+        LogitScale = logitScale;
         _accelerator = accelerator ?? throw new ArgumentNullException(nameof(accelerator));
         _audio = audioTower ?? throw new ArgumentNullException(nameof(audioTower));
         _text = textTower ?? throw new ArgumentNullException(nameof(textTower));
@@ -74,13 +96,17 @@ public sealed class ClapAudioClassifier : IDisposable
 
     /// <summary>
     /// Download (once; the source caches) and load the towers and tokenizer from <paramref name="repoId"/>: <c>onnx/audio_model.onnx</c>
-    /// (118 MB), <c>onnx/text_model.onnx</c> (502 MB), <c>tokenizer.json</c>.
+    /// (118 MB default, 282 MB larger), <c>onnx/text_model.onnx</c> (502 MB), <c>tokenizer.json</c>.
     /// </summary>
     /// <param name="source">A model source: <see cref="Hub.HubModelSource"/> in the browser (OPFS cache), <see cref="Hub.HttpClientModelSource"/> on desktop.</param>
+    /// <param name="repoId"><see cref="DefaultRepo"/>, <see cref="LargerGeneralRepo"/>, or another CLAP export with the same file layout.</param>
+    /// <param name="logitScale">The checkpoint's logit scale; required for a repository <see cref="KnownLogitScale"/> does not know.</param>
     public static async Task<ClapAudioClassifier> CreateFromHubAsync(Accelerator accelerator, Hub.IModelSource source,
-        string repoId = DefaultRepo, Action<string, int>? onProgress = null, CancellationToken ct = default)
+        string repoId = DefaultRepo, Action<string, int>? onProgress = null, CancellationToken ct = default, float? logitScale = null)
     {
         ArgumentNullException.ThrowIfNull(source);
+        float scale = logitScale ?? KnownLogitScale(repoId)
+            ?? throw new ArgumentException($"no known logit scale for '{repoId}': pass logitScale (the checkpoint's logit_scale_a.exp())", nameof(logitScale));
         onProgress?.Invoke("tokenizer", 0);
         var tokenizer = BPETokenizer.LoadFromTokenizerJson(System.Text.Encoding.UTF8.GetString(
             await source.FetchBytesAsync(repoId, "tokenizer.json", ct).ConfigureAwait(false)));
@@ -90,7 +116,7 @@ public sealed class ClapAudioClassifier : IDisposable
         {
             audio = await LoadAsync("audio", "onnx/audio_model.onnx").ConfigureAwait(false);
             text = await LoadAsync("text", "onnx/text_model.onnx").ConfigureAwait(false);
-            return new ClapAudioClassifier(accelerator, audio, text, tokenizer);
+            return new ClapAudioClassifier(accelerator, audio, text, tokenizer, scale);
         }
         catch
         {

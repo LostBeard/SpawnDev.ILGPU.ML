@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.2-local.1</Version>
+		<Version>5.8.2-local.2</Version>
 		<PackageReleaseNotes>v5.8.1 - on SpawnDev.ILGPU 5.4.15: tensor-core GGUF prefill on CUDA sm_75+ (Q4_K / Q6_K GEMMs, causal grouped-query flash attention; llama3.1:8b 4,400-token prefill 18.3 -> 2.7 s on an RTX 4070), F16 KV cache + grouped-query decode attention, a 3x Q4_K decode GEMV, llama 3 rope_freqs and GGUF tokenizer fixes, device top-k, SpectralFrontend (GPU STFT from a ring buffer, mel / log bands, per-band level difference), GraphExecutor.ImmediateRelease (a 2.1 GB -> 0.7 GB working pool on ReDimNet2) and the subgraph refcount fix. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

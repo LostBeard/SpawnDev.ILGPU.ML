@@ -46,16 +46,23 @@ public abstract partial class MLTestBase
     /// prompt. Fast lanes (CUDA, OpenCL, WebGPU). Added 2026-11-03.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Clap_Towers_MatchTransformers() => await RunTest(async accelerator =>
+    public async Task Clap_Towers_MatchTransformers() => await RunTest(accelerator => ClapTowersCheck(accelerator, "test-audio/clap-fixture.json", ClapAudioClassifier.DefaultRepo));
+
+    /// <summary>The same tower gate for <see cref="ClapAudioClassifier.LargerGeneralRepo"/> (laion/larger_clap_general; fixture from
+    /// tools/clap-reference/make_fixtures.py with that repo). Added 2026-11-03.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Clap_Towers_Larger_MatchTransformers() => await RunTest(accelerator => ClapTowersCheck(accelerator, "test-audio/clap-larger-fixture.json", ClapAudioClassifier.LargerGeneralRepo));
+
+    private async Task<string> ClapTowersCheck(Accelerator accelerator, string fixture, string repo)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
             throw new UnsupportedTestException("the fast lanes (CUDA, OpenCL, WebGPU)");
         var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
-        using var doc = JsonDocument.Parse(await assets.GetStringAsync("test-audio/clap-fixture.json"));
+        using var doc = JsonDocument.Parse(await assets.GetStringAsync(fixture));
         var root = doc.RootElement;
         using var http = CreateHuggingFaceHttpClient();
         http.Timeout = TimeSpan.FromMinutes(20);
-        string Url(string f) => "https://models.spawndev.com/Xenova/clap-htsat-unfused/resolve/main/onnx/" + f;
+        string Url(string f) => $"https://models.spawndev.com/{repo}/resolve/main/onnx/" + f;
         static float[] Unit(float[] v) { double n = Math.Sqrt(v.Sum(x => (double)x * x)); return v.Select(x => (float)(x / n)).ToArray(); }
         static double Cos(float[] a, float[] b) { double d = 0, na = 0, nb = 0; for (int i = 0; i < a.Length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return d / Math.Sqrt(na * nb); }
         async Task<float[]> ReadOut(Tensor t, int n)
@@ -122,27 +129,39 @@ public abstract partial class MLTestBase
                 notes.Add($"{kind}: cosine {c1:F6} / {c2:F6} end to end, logits within {worstLogit:F4}");
             }
         }
-        return $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
-    });
+        return $"{accelerator.AcceleratorType} {repo}: " + string.Join("; ", notes);
+    }
 
     /// <summary>
     /// <see cref="ClapAudioClassifier"/> end to end through its public API (models host -> <see cref="ClapAudioClassifier.CreateFromHubAsync"/> ->
     /// <see cref="ClapAudioClassifier.ClassifyAsync(float[], IReadOnlyList{string})"/>): on the fixture's four clips against its six prompts, the
     /// probabilities within 0.01 of transformers' ClapModel and the same best label; then a real recording (LibriSpeech speech, 16 kHz resampled
-    /// to 48 kHz) within 0.03 of transformers on six "This is a sound of ..." labels, with speech on top. Prints warm per-clip timings. Fast
+    /// to 48 kHz) within 0.03 of transformers on six "This is a sound of ..." labels, with transformers' best label on top (speech, for this checkpoint). Prints warm per-clip timings. Fast
     /// lanes. Added 2026-11-03.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Clap_Classifier_EndToEnd() => await RunTest(async accelerator =>
+    public async Task Clap_Classifier_EndToEnd() => await RunTest(accelerator => ClapClassifierCheck(accelerator, "test-audio/clap-fixture.json", ClapAudioClassifier.DefaultRepo,
+        new[] { 0.912714f, 0.016061f, 0.041725f, 0.013036f, 0.015693f, 0.000771f }));
+
+    /// <summary>
+    /// The same end-to-end gate for <see cref="ClapAudioClassifier.LargerGeneralRepo"/>. Its LibriSpeech reference is transformers'
+    /// larger_clap_general, which calls the speech clip "a dog barking" (0.990) under the template - a parity gate, not a claim about the label.
+    /// Added 2026-11-03.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Clap_Classifier_Larger_EndToEnd() => await RunTest(accelerator => ClapClassifierCheck(accelerator, "test-audio/clap-larger-fixture.json", ClapAudioClassifier.LargerGeneralRepo,
+        new[] { 0.009282f, 0.000557f, 0.989933f, 0.000076f, 0.000123f, 0.000029f }));
+
+    private async Task<string> ClapClassifierCheck(Accelerator accelerator, string fixture, string repo, float[] wantReal)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
             throw new UnsupportedTestException("the fast lanes (CUDA, OpenCL, WebGPU)");
         var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
-        using var doc = JsonDocument.Parse(await assets.GetStringAsync("test-audio/clap-fixture.json"));
+        using var doc = JsonDocument.Parse(await assets.GetStringAsync(fixture));
         var root = doc.RootElement;
         using var modelHttp = new System.Net.Http.HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        using var clap = await ClapAudioClassifier.CreateFromHubAsync(accelerator, new SpawnDev.ILGPU.ML.Hub.HttpClientModelSource(modelHttp));
+        using var clap = await ClapAudioClassifier.CreateFromHubAsync(accelerator, new SpawnDev.ILGPU.ML.Hub.HttpClientModelSource(modelHttp), repo);
         double loadS = sw.Elapsed.TotalSeconds;
         var prompts = root.GetProperty("prompts").EnumerateArray().Select(p => p.GetString()!).ToArray();
         var notes = new List<string> { $"load {loadS:F1} s" };
@@ -169,7 +188,6 @@ public abstract partial class MLTestBase
         int rate = BitConverter.ToInt32(wav, 24);
         var speech = AudioPreprocessor.Resample(WavDecoder.DecodeWavFile(wav) ?? throw new Exception("could not decode the LibriSpeech clip"), rate, ClapAudioClassifier.SampleRate);
         var labels = new[] { "speech", "music", "a dog barking", "a gunshot", "a car engine", "rain" }.Select(l => "This is a sound of " + l).ToArray();
-        var wantReal = new[] { 0.912714f, 0.016061f, 0.041725f, 0.013036f, 0.015693f, 0.000771f };
         var real = await clap.ClassifyAsync(speech, labels);
         sw.Restart();
         real = await clap.ClassifyAsync(speech, labels);
@@ -177,13 +195,14 @@ public abstract partial class MLTestBase
         var top = real.MaxBy(s => s.Probability);
         double worstReal = real.Select((s, i) => Math.Abs(s.Probability - wantReal[i])).Max();
         Console.WriteLine($"[Clap] {BackendName} LibriSpeech: " + string.Join(", ", real.OrderByDescending(s => s.Probability).Select(s => $"{s.Label} {s.Probability:F3}")));
-        if (top.Label != labels[0] || worstReal > 0.03)
-            throw new Exception($"LibriSpeech: best '{top.Label}' ({top.Probability:F3}), probabilities off transformers' by {worstReal:F4}");
+        string wantTop = labels[Array.IndexOf(wantReal, wantReal.Max())];
+        if (top.Label != wantTop || worstReal > 0.03)
+            throw new Exception($"LibriSpeech: best '{top.Label}' ({top.Probability:F3}) vs transformers' '{wantTop}', probabilities off by {worstReal:F4}");
         notes.Add($"LibriSpeech -> '{top.Label}' {top.Probability:F3} (|dp| {worstReal:F4}, warm {realMs:F0} ms)");
-        var line = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        var line = $"{accelerator.AcceleratorType} {repo}: " + string.Join("; ", notes);
         Console.WriteLine($"[Clap] {line}");
         return line;
-    });
+    }
 
     /// <summary>
     /// CLAP's RoBERTa tokenizer (<see cref="BPETokenizer.EncodeRoberta"/> on Xenova/clap-htsat-unfused tokenizer.json, from models.spawndev.com)

@@ -6,7 +6,8 @@ clips and fixed prompts, and writes one JSON with everything each ML stage is ga
     repeatpad), audio_embeds (512, L2-normalised by the model's projection), and the clip's logits_per_audio against the prompts;
   - per prompt: input_ids, attention_mask, text_embeds;
   - logit_scale (exp of the model's audio logit scale).
-Usage (WSL, an env with torch + transformers):  python make_fixtures.py out.json
+Usage (WSL, an env with torch + transformers):  python make_fixtures.py out.json [repo]   (repo: laion/clap-htsat-unfused default,
+  laion/larger_clap_general)
 """
 import json, math, sys
 import numpy as np
@@ -47,10 +48,10 @@ CLIPS = [("tone", 10.0), ("clicks", 10.0), ("noise", 10.0), ("chirp", 3.3)]   # 
 PROMPTS = ["a gunshot", "footsteps on gravel", "a car engine", "a pure musical tone", "white noise", "a zombie groaning"]
 
 
-def main(out_path):
-    proc = ClapProcessor.from_pretrained(REPO)
-    model = ClapModel.from_pretrained(REPO).eval()
-    out = {"repo": REPO, "sample_rate": SR, "prompts": PROMPTS, "clips": []}
+def main(out_path, repo=REPO):
+    proc = ClapProcessor.from_pretrained(repo)
+    model = ClapModel.from_pretrained(repo).eval()
+    out = {"repo": repo, "sample_rate": SR, "prompts": PROMPTS, "clips": []}
     with torch.no_grad():
         # each prompt tokenised ALONE (no padding): Xenova's text_model.onnx has no attention_mask input, so a padded batch attends to its
         # pad tokens (MEASURED 2026-11-03 with onnxruntime: padded prompts at cosine 0.990-0.999 to transformers, unpadded at 1.0)
@@ -79,4 +80,4 @@ def main(out_path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], *sys.argv[2:3])
