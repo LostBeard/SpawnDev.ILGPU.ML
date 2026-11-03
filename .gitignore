@@ -411,3 +411,6 @@ kokoro-*.wav
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-base.en/
 
 PlaywrightMultiTest/WGSLDumps/
+
+# Full-precision CLAP reference (tools/clap-reference/make_fixtures.py); the committed, rounded copy is SpawnDev.ILGPU.ML.Demo/wwwroot/test-audio/clap-fixture.json
+tools/clap-reference/clap_fixtures.json

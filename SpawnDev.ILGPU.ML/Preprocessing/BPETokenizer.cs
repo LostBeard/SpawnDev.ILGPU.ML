@@ -121,13 +121,13 @@ public class BPETokenizer : ITokenizer
     {
         var tokens = new List<int>();
 
-        // Pre-tokenize: split on whitespace and punctuation boundaries
-        var words = PreTokenize(text);
-
-        foreach (var word in words)
+        // GPT-2 byte-level pre-tokenization (the tokenizers ByteLevel pre-tokenizer, use_regex=true, add_prefix_space=false): the GPT-2
+        // split regex, then each piece's UTF-8 BYTES mapped through bytes_to_unicode. This used to be a hand-written splitter that cast
+        // each UTF-16 char to a byte (any non-ASCII character encoded as the wrong byte) and kept digits / contractions / runs of
+        // spaces differently from GPT-2; CLAP's RoBERTa text tower is gated on transformers' exact input_ids (2026-11-03).
+        foreach (System.Text.RegularExpressions.Match m in Gpt2Pat.Matches(text))
         {
-            // Convert to byte-level representation
-            var byteWord = string.Concat(word.Select(c => ByteToUnicode((byte)c)));
+            var byteWord = string.Concat(System.Text.Encoding.UTF8.GetBytes(m.Value).Select(ByteToUnicode));
 
             // Apply BPE
             var bpeResult = ApplyBPE(byteWord);
@@ -190,6 +190,30 @@ public class BPETokenizer : ITokenizer
 
         return result.Take(maxLength).ToArray();
     }
+
+    /// <summary>
+    /// Encode for a RoBERTa-family text model (RobertaProcessing): <c>&lt;s&gt;</c> + the byte-level BPE ids + <c>&lt;/s&gt;</c>, unpadded. CLAP's
+    /// text tower (Xenova/clap-htsat-unfused text_model.onnx) has no attention_mask input, so a prompt must be run alone at its own length:
+    /// padding it attends the pads (cosine 0.990 to transformers, MEASURED 2026-11-03).
+    /// </summary>
+    public int[] EncodeRoberta(string text)
+    {
+        if (!_encoder.TryGetValue("<s>", out int bos) || !_encoder.TryGetValue("</s>", out int eos))
+            throw new InvalidOperationException("EncodeRoberta: the vocabulary has no <s> / </s> tokens (not a RoBERTa tokenizer)");
+        var ids = Encode(text);
+        var result = new int[ids.Length + 2];
+        result[0] = bos;
+        ids.CopyTo(result, 1);
+        result[^1] = eos;
+        return result;
+    }
+
+    // GPT-2's pre-tokenization pattern (openai/gpt-2 encoder.py; tokenizers' ByteLevel pre-tokenizer with use_regex=true): contractions,
+    // an optional leading space plus a run of letters / of digits / of other non-space characters, trailing whitespace not followed by a
+    // non-space, then any remaining whitespace.
+    private static readonly System.Text.RegularExpressions.Regex Gpt2Pat = new(
+        @"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     // ── CLIP BPE (OpenAI CLIP simple_tokenizer) ──
     // Distinct from the GPT-2 Encode(): CLIP whitespace-cleans + regex-pretokenizes so spaces are NOT
@@ -293,53 +317,6 @@ public class BPETokenizer : ITokenizer
         var result = string.Join(" ", word);
         _cache[token] = result;
         return result;
-    }
-
-    /// <summary>
-    /// Simple pre-tokenization: split on whitespace, keeping whitespace as part of following token.
-    /// GPT-2 style: spaces become "Ġ" (byte 0x20 → unicode Ġ).
-    /// </summary>
-    private static List<string> PreTokenize(string text)
-    {
-        // GPT-2 style: spaces attach to the FOLLOWING word, not the preceding one.
-        // "The cat sat" → ["The", " cat", " sat"]
-        // Punctuation stays with the preceding word or becomes its own token.
-        var words = new List<string>();
-        var current = new List<char>();
-
-        for (int i = 0; i < text.Length; i++)
-        {
-            char c = text[i];
-            if (char.IsWhiteSpace(c))
-            {
-                // Flush current word
-                if (current.Count > 0)
-                {
-                    words.Add(new string(current.ToArray()));
-                    current.Clear();
-                }
-                // Space attaches to the next word
-                current.Add(c);
-            }
-            else if (char.IsPunctuation(c))
-            {
-                if (current.Count > 0)
-                {
-                    words.Add(new string(current.ToArray()));
-                    current.Clear();
-                }
-                words.Add(c.ToString());
-            }
-            else
-            {
-                current.Add(c);
-            }
-        }
-
-        if (current.Count > 0)
-            words.Add(new string(current.ToArray()));
-
-        return words;
     }
 
     // Byte-to-unicode mapping (GPT-2 style)

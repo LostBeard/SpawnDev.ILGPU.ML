@@ -52,17 +52,19 @@ def main(out_path):
     model = ClapModel.from_pretrained(REPO).eval()
     out = {"repo": REPO, "sample_rate": SR, "prompts": PROMPTS, "clips": []}
     with torch.no_grad():
-        text = proc(text=PROMPTS, return_tensors="pt", padding=True)
-        out["input_ids"] = text["input_ids"].tolist()
-        out["attention_mask"] = text["attention_mask"].tolist()
+        # each prompt tokenised ALONE (no padding): Xenova's text_model.onnx has no attention_mask input, so a padded batch attends to its
+        # pad tokens (MEASURED 2026-11-03 with onnxruntime: padded prompts at cosine 0.990-0.999 to transformers, unpadded at 1.0)
+        texts = [proc(text=[p], return_tensors="pt") for p in PROMPTS]
+        out["input_ids"] = [t["input_ids"][0].tolist() for t in texts]
         out["logit_scale"] = model.logit_scale_a.exp().item()
         for kind, seconds in CLIPS:
             wav = clip(kind, seconds)
             feats = proc(audio=[wav], sampling_rate=SR, return_tensors="pt")
-            # the model's own forward: normalised text / audio embeddings and logits_per_audio, the reference definition ML matches
-            o = model(input_ids=text["input_ids"], attention_mask=text["attention_mask"], input_features=feats["input_features"])
-            if "text_embeds" not in out: out["text_embeds"] = o.text_embeds.tolist()
-            audio_embeds, logits = o.audio_embeds, o.logits_per_audio
+            # the model's own forward, one prompt at a time: normalised text / audio embeddings and logits_per_audio
+            os_ = [model(input_ids=t["input_ids"], attention_mask=t["attention_mask"], input_features=feats["input_features"]) for t in texts]
+            if "text_embeds" not in out: out["text_embeds"] = [o.text_embeds[0].tolist() for o in os_]
+            audio_embeds = os_[0].audio_embeds
+            logits = torch.stack([o.logits_per_audio[0, 0] for o in os_])[None]
             out["clips"].append({
                 "kind": kind, "seconds": seconds, "samples": int(wav.shape[0]),
                 "input_features_shape": list(feats["input_features"].shape),

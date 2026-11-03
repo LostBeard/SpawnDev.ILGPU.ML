@@ -84,7 +84,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleACKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bicubicResizeKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, float, int>? _bicubicResizeKernel;
 
     public ElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -492,37 +492,61 @@ public class ElementWiseKernels : IDisposable
         return 0f;
     }
 
-    // ONNX Resize mode="cubic" (bicubic, cubic_coeff_a=-0.75, coordinate_transformation_mode=half_pixel,
-    // clamp-to-edge for out-of-bounds taps). DAv3's DINOv2 backbone interpolates the pretrained position
-    // embeddings (37x37 grid -> the input's patch grid) with CUBIC; approximating it with bilinear seeded a
-    // ~0.003 error at the pos-embed Add that the first LayerNorm amplified ~4x and 12 blocks accumulated into
-    // the depth output's ~1% scale (the Conv itself is bit-exact vs ORT). 4x4 cubic tap per output pixel.
+    // ONNX Resize mode="cubic": Keys cubic convolution, 4x4 taps per output pixel. DAv3's DINOv2 backbone interpolates the pretrained
+    // position embeddings (37x37 -> the patch grid) with cubic half_pixel; approximating it with bilinear seeded a ~0.003 error at the
+    // pos-embed Add that 12 blocks accumulated into the depth output's ~1% scale. CLAP's HTSAT stretches its 1001-frame log-mel to 1024
+    // with cubic ALIGN_CORNERS (torch interpolate bicubic, align_corners=True): the operator used to fall back to bilinear for that mode,
+    // 2.6% off at the Resize and audio_embeds at cosine 0.9996 to onnxruntime (MEASURED 2026-11-03).
+    //   ctMode: 0 half_pixel, 1 align_corners, 2 asymmetric, 3 pytorch_half_pixel (the ONNX coordinate_transformation_mode, sizes form:
+    //   scale = out / in). a = cubic_coeff_a. excludeOutside = 1: taps outside the input get weight 0 and the rest are renormalised;
+    //   0: an outside tap reads the edge sample (onnxruntime's clamp).
+    private static float ResizeSourceCoord(int o, int inLen, int outLen, int ctMode)
+    {
+        if (ctMode == 1) return outLen > 1 ? (float)o * (inLen - 1) / (outLen - 1) : 0f;
+        if (ctMode == 2) return (float)o * inLen / outLen;
+        if (ctMode == 3 && outLen <= 1) return 0f;
+        return ((float)o + 0.5f) * inLen / outLen - 0.5f;
+    }
+
     private static void BicubicResizeImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int C, int inH, int inW, int outH, int outW)
+        int C, int inH, int inW, int outH, int outW, int ctMode, float a, int excludeOutside)
     {
         int ox = idx % outW; int rem = idx / outW; int oy = rem % outH; int c = rem / outH;
-        const float a = -0.75f;
-        float fy = ((float)oy + 0.5f) * inH / outH - 0.5f;
-        float fx = ((float)ox + 0.5f) * inW / outW - 0.5f;
+        float fy = ResizeSourceCoord(oy, inH, outH, ctMode);
+        float fx = ResizeSourceCoord(ox, inW, outW, ctMode);
         int iy = (int)MathF.Floor(fy); int ix = (int)MathF.Floor(fx);
         float dy = fy - iy; float dx = fx - ix;
         int bC = c * inH * inW;
-        float acc = 0f;
+        float acc = 0f, wySum = 0f;
         for (int m = -1; m <= 2; m++)
         {
-            int yy = iy + m; if (yy < 0) yy = 0; if (yy >= inH) yy = inH - 1;
+            int yy = iy + m;
             float wy = CubicWeight((float)m - dy, a);
-            float row = 0f;
+            if (yy < 0 || yy >= inH)
+            {
+                if (excludeOutside != 0) continue;
+                yy = yy < 0 ? 0 : inH - 1;
+            }
+            float row = 0f, wxSum = 0f;
             for (int n = -1; n <= 2; n++)
             {
-                int xx = ix + n; if (xx < 0) xx = 0; if (xx >= inW) xx = inW - 1;
-                row += input[bC + yy * inW + xx] * CubicWeight((float)n - dx, a);
+                int xx = ix + n;
+                float wx = CubicWeight((float)n - dx, a);
+                if (xx < 0 || xx >= inW)
+                {
+                    if (excludeOutside != 0) continue;
+                    xx = xx < 0 ? 0 : inW - 1;
+                }
+                row += input[bC + yy * inW + xx] * wx;
+                wxSum += wx;
             }
+            if (excludeOutside != 0) row /= wxSum;
             acc += row * wy;
+            wySum += wy;
         }
-        output[idx] = acc;
+        output[idx] = excludeOutside != 0 ? acc / wySum : acc;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -950,14 +974,18 @@ public class ElementWiseKernels : IDisposable
         _bilinearUpsampleACKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
     }
 
-    /// <summary>ONNX Resize mode="cubic" — bicubic (Keys, coeff -0.75, half_pixel). See BicubicResizeImpl.</summary>
+    /// <summary>
+    /// ONNX Resize mode="cubic" over the last two axes of [C, inH, inW] -> [C, outH, outW]: Keys cubic convolution with coefficient
+    /// <paramref name="a"/> (cubic_coeff_a, default -0.75). <paramref name="ctMode"/>: 0 half_pixel, 1 align_corners, 2 asymmetric,
+    /// 3 pytorch_half_pixel. <paramref name="excludeOutside"/>: drop and renormalise taps outside the input instead of clamping them.
+    /// </summary>
     public void BicubicResize(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int C, int inH, int inW, int outH, int outW)
+        int C, int inH, int inW, int outH, int outW, int ctMode = 0, float a = -0.75f, bool excludeOutside = false)
     {
         EnsureLoaded();
-        _bicubicResizeKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
+        _bicubicResizeKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW, ctMode, a, excludeOutside ? 1 : 0);
     }
 
     /// <summary>In-place add: data[i] += other[i]. Two separate buffers required.</summary>
@@ -2271,7 +2299,7 @@ public class ElementWiseKernels : IDisposable
             int, int, int, int, int>(BilinearUpsampleACImpl);
         _bicubicResizeKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int>(BicubicResizeImpl);
+            int, int, int, int, int, int, float, int>(BicubicResizeImpl);
     }
 
     // ─────────────────────────────────────────────────────────────

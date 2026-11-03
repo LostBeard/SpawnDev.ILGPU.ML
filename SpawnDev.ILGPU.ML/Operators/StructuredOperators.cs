@@ -1991,12 +1991,22 @@ public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
             return;
         }
         var ctMode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
-        // cubic → true bicubic (Keys -0.75). DAv3's DINOv2 pos-embed interpolation is cubic; a bilinear
-        // approximation seeded the depth's ~1% divergence (the pos-embed Add diverged 0.003 → LayerNorm ~4x →
-        // 12-block accumulation). Bicubic uses half_pixel; align_corners cubic is rare — fall back if seen.
-        if (mode == "cubic" && ctMode != "align_corners")
+        // cubic → true bicubic (Keys, cubic_coeff_a). DAv3's DINOv2 pos-embed interpolation is cubic half_pixel; a bilinear
+        // approximation seeded the depth's ~1% divergence. CLAP's HTSAT is cubic ALIGN_CORNERS, which used to fall back to bilinear
+        // here: 2.6% off at its Resize, audio_embeds at cosine 0.9996 to onnxruntime (MEASURED 2026-11-03). Every coordinate mode the
+        // kernel implements is routed to it; any other one throws rather than resizing by a different rule.
+        if (mode == "cubic")
         {
-            reg.ElementWise.BicubicResize(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
+            int ct = ctMode switch
+            {
+                "half_pixel" => 0,
+                "align_corners" => 1,
+                "asymmetric" => 2,
+                "pytorch_half_pixel" => 3,
+                _ => throw new NotSupportedException($"Resize mode=cubic with coordinate_transformation_mode={ctMode} is not implemented"),
+            };
+            reg.ElementWise.BicubicResize(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW,
+                ct, ctx.GetFloat("cubic_coeff_a", -0.75f), ctx.GetInt("exclude_outside", 0) != 0);
             return;
         }
         // linear → bilinear. align_corners per the coordinate-transform mode.
