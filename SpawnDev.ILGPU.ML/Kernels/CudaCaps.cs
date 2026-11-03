@@ -35,7 +35,7 @@ public static class CudaCaps
 
     /// <summary>
     /// Turing's tensor cores: <c>mma.sync.aligned.m16n8k8</c> with f16 operands and fp32 accumulation exists from sm_75 (no m16n8k16, no bf16, no
-    /// <c>cvt.rn.f16x2.f32</c>). <see cref="MmaQ4KGemm"/>'s KernelSm75 is built from those instructions only (RTX 20 / GTX 16; Data, Vertex's RTX 2060, 2026-11-02).
+    /// <c>cvt.rn.f16x2.f32</c>). <see cref="MmaKQuantGemm"/>'s Sm75 kernels are built from those instructions only (RTX 20 / GTX 16; Data, Vertex's RTX 2060, 2026-11-02).
     /// </summary>
     public static bool TuringTensorCores(Accelerator accelerator) => AtLeast(accelerator, TuringTensorCoreMajor, TuringTensorCoreMinor);
     /// <summary>The minimum compute capability of <see cref="TuringTensorCores"/>.</summary>

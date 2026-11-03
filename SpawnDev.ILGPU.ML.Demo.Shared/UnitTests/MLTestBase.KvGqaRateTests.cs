@@ -84,6 +84,43 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// WebGPU decode capture and the attention route: a generation captures its step, the same generation again replays it (no new capture), and after
+    /// <see cref="GgufBatchDecoder.GqaAttention"/> or <see cref="GgufBatchDecoder.GqaChunk"/> changes the next generation must capture again (a replay would run
+    /// the kernels recorded before the change). Before 2026-11-02 only a buffer reallocation forced a new capture. Qwen3-0.6B (G = 2).
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task GgufBatchDecoder_RouteChange_CapturesAgain() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("decode capture is WebGPU's");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var m = await hub.OpenAsync("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", deselect: false);
+        await using var _s = m.Stream;
+        var gguf = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(m.Stream);
+        var tok = SentencePieceTokenizer.FromGGUF(gguf)!;
+        var (prompt, stops) = ChatTemplates.BuildChatPrompt(gguf, tok, new List<(string, string)> { ("user", "Name three colors.") }, thinking: false);
+        var stopSet = new HashSet<int>(stops);
+        m.Stream.Seek(0, SeekOrigin.Begin);
+        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, m.Stream, maxSeq: 512, maxBatch: 1);
+        dec.CaptureWebGPU = true;
+        var notes = new List<string>();
+        async Task<(int Replays, int Captures)> Gen() { await dec.GenerateAsync(prompt, 1, 12, 0f, 1f, 1, stopSet); return dec.CaptureStats; }
+        await Gen();
+        foreach (var (what, change) in new (string, Action)[] { ("GqaAttention", () => dec.GqaAttention = !dec.GqaAttention), ("GqaChunk", () => dec.GqaChunk = dec.GqaChunk == 32 ? 64 : 32) })
+        {
+            var a = await Gen();
+            var b = await Gen();                                        // nothing changed: must replay
+            if (b.Captures != a.Captures || b.Replays <= a.Replays)
+                throw new Exception($"{what}: an unchanged repeat did not replay (captures {a.Captures} -> {b.Captures}, replays {a.Replays} -> {b.Replays}); the case this test guards cannot arise as written");
+            change();
+            var c = await Gen();
+            notes.Add($"{what}: captures {b.Captures} -> {c.Captures} after the change (replays {b.Replays} -> {c.Replays})");
+            if (c.Captures <= b.Captures) throw new Exception($"{what} changed but the next generation replayed the old capture: " + string.Join("; ", notes));
+        }
+        return string.Join("; ", notes);
+    });
+
+    /// <summary>
     /// A measurement, not a gate: the grouped-query decode attention's chunk size (<see cref="GgufBatchDecoder.GqaChunk"/>) against the per-head kernel at a short
     /// prompt, one F16-cache decoder a round (Qwen3-0.6B Q8_0, G = 2, captured steps on WebGPU), the routes switched on it (each switch captures again), two
     /// rounds in reversed order, best each. MEASURED 2026-11-02 on CUDA (llama3.1:8b): chunk size made no difference there; this is the WebGPU side.
