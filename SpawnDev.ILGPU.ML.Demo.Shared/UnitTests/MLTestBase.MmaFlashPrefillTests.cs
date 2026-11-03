@@ -12,16 +12,20 @@ public abstract partial class MLTestBase
     /// double-precision oracle on the same f16 K / V: rows at positions p .. p + R - 1 attend keys 0 .. their position. Cases: a reused prefix (p = 77) with
     /// R = 200 rows (two row tiles, the second partial) and G = 4; p = 0 with R = 37 (one partial tile) and G = 1; p = 300 with R = 129 and G = 2 (a row tile of
     /// one row). Q and the probabilities are rounded to f16 inside the kernel, so each output is held to 4e-3 x sum_j p_j |v_jd| + 1e-5 (f16 keeps 11 significant
-    /// bits). Added 2026-11-02 with the kernel.
+    /// bits). Added 2026-11-02 with the kernel. Both variants: sm_80+ (m16n8k16) where the card has it, the Turing one (sm_75: two m16n8k8 per 16 k, scalar f16
+    /// packs) on any sm_75+ card.
     /// </summary>
     [TestMethod]
     public async Task MmaFlashPrefill_MatchesCausalGqaOracle() => await RunTest(async accelerator =>
     {
-        if (!CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core flash prefill runs on CUDA sm_80+");
+        if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core flash prefill runs on CUDA sm_75+");
         const int D = 128;
-        var kernel = accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>,
-            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.Kernel);
+        var variants = new List<(string Name, Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int> K)>();
+        if (CudaCaps.TensorCores(accelerator))
+            variants.Add(("sm80", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.Kernel)));
+        variants.Add(("sm75", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.KernelSm75)));
         var notes = new List<string>();
+        foreach (var (vname, kernel) in variants)
         foreach (var (p, R, H, kvH) in new[] { (77, 200, 8, 2), (0, 37, 4, 4), (300, 129, 4, 2) })
         {
             var rng = new Random(5 + p + R + H);
@@ -64,8 +68,8 @@ public abstract partial class MLTestBase
                 }
                 return acc;
             }, acc => { lock (notes) { bad += acc.bad; worst = Math.Max(worst, acc.worst); } });
-            if (bad > 0) throw new Exception($"p={p} R={R} H={H} kvH={kvH}: {bad} of {got.Length} outputs past the bound (worst {worst:F2}x)");
-            notes.Add($"p={p} R={R} H={H} kvH={kvH}: worst {worst:F3}x the bound");
+            if (bad > 0) throw new Exception($"{vname} p={p} R={R} H={H} kvH={kvH}: {bad} of {got.Length} outputs past the bound (worst {worst:F2}x)");
+            notes.Add($"{vname} p={p} R={R} H={H} kvH={kvH}: worst {worst:F3}x the bound");
         }
         return string.Join("; ", notes);
     });
