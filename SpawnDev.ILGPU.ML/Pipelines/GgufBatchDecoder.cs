@@ -139,7 +139,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly float _eps, _theta;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _invFreq;
     private readonly KvStore _kv;
-    private bool _hasFlash, _hasFlashGqa;
+    private bool _hasFlash, _hasFlashGqa, _hasFlashMma;
     private MemoryBuffer1D<float, Stride1D.Dense>? _hid, _hid2, _hn, _q, _k, _v, _att, _proj, _gate, _up, _scores, _attPart, _attMl, _qkv, _gateUp, _logits, _maxV, _selV, _cand, _softStats;
     private MemoryBuffer1D<int, Stride1D.Dense>? _maxI, _selI, _selN, _seqBuf, _stepIds, _posBuf;
     // device draws: the token each sequence drew last (the next step's input, by sequence), its copy for the captures' restores, the draw parameters
@@ -220,6 +220,8 @@ public sealed class GgufBatchDecoder : IDisposable
         public abstract void Store(int l, int n, FV k, FV v, IV seqs, IV pos, int kvC, int maxSeq, int mode);
         public abstract void Flash(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
         public abstract void FlashGqa(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
+        /// <summary>The tensor-core flash prefill (<see cref="MmaFlashPrefill"/>; F16 caches only, head dim 128): false when this store cannot take it.</summary>
+        public abstract bool FlashMma(int l, FV q, FV att, int R, int H, int kvH, int p);
         public abstract void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
         public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale);
         public abstract void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale);
@@ -260,6 +262,15 @@ public sealed class GgufBatchDecoder : IDisposable
         public override void Flash(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale) =>
             (_flash ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>(FlashPrefillImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, att, R, H, kvH, D, p, scale);
+        private Action<KernelConfig, FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>? _flashMma;
+        public override bool FlashMma(int l, FV q, FV att, int R, int H, int kvH, int p)
+        {
+            if (typeof(T) != typeof(global::ILGPU.Half)) return false;
+            (_flashMma ??= _a.LoadStreamKernel<FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>(MmaFlashPrefill.Kernel))(
+                new KernelConfig(((R + MmaFlashPrefill.QTile - 1) / MmaFlashPrefill.QTile) * H, MmaFlashPrefill.Threads),
+                q, _k[l].View.BaseView.Cast<uint>(), _v[l].View.BaseView.Cast<uint>(), att, R, H, kvH, p);
+            return true;
+        }
         public override void FlashGqa(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale) =>
             (_flashGqa ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>(FlashPrefillGqaImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, att, R, H, kvH, D, p, scale);
@@ -677,7 +688,9 @@ public sealed class GgufBatchDecoder : IDisposable
             // prefill takes the three-kernel path (scores, softmax, P.V: a thread per score / per output)
             if (!decode && _hasFlash && FlashPrefill)
             {
-                if (_hasFlashGqa && FlashGqa)
+                if (_hasFlashMma && FlashMma && _kv.FlashMma(l, q, att, R, Heads, KvHeads, p))
+                    LastFlashKernel = "mma";
+                else if (_hasFlashGqa && FlashGqa)
                 {
                     int rowsPer = FgQ / (Heads / KvHeads);
                     _kv.FlashGqa(l, new KernelConfig(((R + rowsPer - 1) / rowsPer) * KvHeads, FgThreads), q, att, R, Heads, KvHeads, HeadDim, p, 1f / MathF.Sqrt(HeadDim));
@@ -895,7 +908,12 @@ public sealed class GgufBatchDecoder : IDisposable
     /// 4,400-token prefill (~0.6 TFLOPS) and 59% of a 194-row prefill over a reused 4,206-row prefix.
     /// </summary>
     public bool FlashGqa { get; set; } = Environment.GetEnvironmentVariable("GGUF_FLASH_GQA") != "0";
-    /// <summary>The kernel the last prefill's attention ran on: "gqa-tiled", "tiled", or null before any flash prefill.</summary>
+    /// <summary>
+    /// A prefill's attention on the tensor cores (<see cref="MmaFlashPrefill"/>, default; env GGUF_FLASH_MMA=0 for <see cref="FlashGqa"/>'s kernel): CUDA sm_80+,
+    /// head dim 128, F16 caches. MEASURED 2026-11-02 before it (RTX 4070, llama3.1:8b, 4,400-token prefill): the tiled SIMT kernel's 1,643 ms were 40% of it.
+    /// </summary>
+    public bool FlashMma { get; set; } = Environment.GetEnvironmentVariable("GGUF_FLASH_MMA") != "0";
+    /// <summary>The kernel the last prefill's attention ran on: "mma", "gqa-tiled", "tiled", or null before any flash prefill.</summary>
     public string? LastFlashKernel { get; private set; }
 
     /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
@@ -1311,6 +1329,8 @@ public sealed class GgufBatchDecoder : IDisposable
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
         }
         _hasFlash = _acc.AcceleratorType != AcceleratorType.WebGL && HeadDim <= FaMaxD && FaThreads <= _acc.MaxNumThreadsPerGroup;
+        // the tensor-core flash prefill: CUDA sm_80+, head dim 128 (the F16-cache check is the store's: FlashMma returns false on F32 caches)
+        _hasFlashMma = _hasFlash && HeadDim == MmaFlashPrefill.HeadDim && Heads % KvHeads == 0 && CudaCaps.TensorCores(_acc);
         _hasFlashGqa = _hasFlash && HeadDim % FgDc == 0 && HeadDim <= FgMaxD && Heads % KvHeads == 0 && Heads / KvHeads <= FgQ
             && FgThreads <= _acc.MaxNumThreadsPerGroup && FgShared * sizeof(float) <= _acc.MaxSharedMemoryPerGroup;
         _embed = _acc.LoadAutoGroupedStreamKernel<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>(EmbedImpl);
