@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.2-local.1 - 2026-11-03 (local feed) - CLAP zero-shot audio classifier, cubic Resize align_corners, exact GPT-2 BPE
 
 - **`Resize` mode="cubic" honours every coordinate mode, `cubic_coeff_a` and `exclude_outside` (correctness)**: cubic with `coordinate_transformation_mode=align_corners` fell back to BILINEAR, and the kernel hard-coded half_pixel, a = -0.75 and edge clamping. CLAP's HTSAT stretches its 1001-frame log-mel to 1024 with torch bicubic, align_corners=True: that Resize was 2.6% off onnxruntime and the audio tower's embedding at cosine 0.9996 (found node by node with `tools/ort_node_reference.py` + `first_divergence.py`; every one of 4,211 compared nodes now agrees). half_pixel, align_corners, asymmetric and pytorch_half_pixel run on the kernel; any other mode throws instead of resizing by a different rule. Gate: `Resize_CubicModes_MatchOnnxRuntime` (five mode / coefficient / exclude_outside cases against onnxruntime 1.24.3, `tools/gen_resize_cubic_reference.py`), red with the old bilinear routing (|d| 0.79).
 - **`BPETokenizer.Encode` is GPT-2's exact byte-level pre-tokenization (correctness)**: the GPT-2 split regex over UTF-8 bytes. The hand-written splitter it replaces cast each UTF-16 char to a byte (any non-ASCII character encoded as the wrong byte) and split digits, contractions and runs of whitespace differently from GPT-2. Affects every `Encode` caller (GPT-2, Whisper prompts, zero-shot). New `EncodeRoberta` (`<s>` ids `</s>`, unpadded). Gate: `Clap_Tokenizer_MatchesTransformers` (11 strings token-identical to transformers' RoBERTa tokenizer, accents and an emoji included), red without the whitespace-lookahead alternative.
