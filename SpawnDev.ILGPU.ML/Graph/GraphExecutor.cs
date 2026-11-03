@@ -538,6 +538,14 @@ public class GraphExecutor : IDisposable
     /// </remarks>
     public static bool ImmediateRelease = Environment.GetEnvironmentVariable("ML_IMMEDIATE_RELEASE") is not ("0" or "false");
 
+    /// <summary>
+    /// This run may record / replay a planned-reuse plan (<see cref="Tensors.BufferPool.PlannedReuse"/>): the ordered-queue desktop backends with
+    /// <see cref="ImmediateRelease"/> on, and no capture regime (a capture-flagged run drops the executor's plan for good, so capture priming is unchanged).
+    /// WebGPU is left on the buckets for now (its bind-group cache and decode capture key on buffer identity across runs).
+    /// </summary>
+    private bool PlannedReuseEligible => ImmediateReleaseActive && !UseCaptureParamSlots
+        && _accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity;
+
     /// <summary>True when <see cref="ImmediateRelease"/> applies to this executor's backend right now.</summary>
     private bool ImmediateReleaseActive => ImmediateRelease && !SuppressDrains
         && _accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity;
@@ -1489,8 +1497,9 @@ public class GraphExecutor : IDisposable
         int prevNode = CurrentRunNodeIndex;
         string? prevOp = CurrentRunOpType;
         var prevSink = _pool.SwapScratchSink(SuppressDrains || UseCaptureParamSlots ? null : nodeScratch);
+        _pool.BeginPlannedRun(this, PlannedReuseEligible);
         try { return RunCore(inputs, nodeScratch); }
-        finally { CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
+        finally { _pool.EndPlannedRun(this); CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
     }
 
     private Dictionary<string, Tensor> RunCore(Dictionary<string, Tensor> inputs, List<MemoryBuffer1D<float, Stride1D.Dense>> nodeScratch)
@@ -3218,8 +3227,9 @@ public class GraphExecutor : IDisposable
         int prevNode = CurrentRunNodeIndex;
         string? prevOp = CurrentRunOpType;
         var prevSink = _pool.SwapScratchSink(null);
+        _pool.BeginPlannedRun(this, PlannedReuseEligible);
         try { return await RunAsyncCore(inputs); }
-        finally { CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
+        finally { _pool.EndPlannedRun(this); CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
     }
 
     private async Task<Dictionary<string, Tensor>> RunAsyncCore(Dictionary<string, Tensor> inputs)
@@ -5801,6 +5811,7 @@ public class GraphExecutor : IDisposable
     {
         // ⚠️ Only if we made it. A shared pool outlives this executor by design - see the constructor.
         if (_ownsPool) _pool.Dispose();
+        else _pool.ForgetPlannedReuse(this);   // a shared pool must not keep this executor's plan (and its slots) alive
         if (_optimizerFoldedBuffers != null)
         {
             foreach (var b in _optimizerFoldedBuffers) b.Dispose();

@@ -16,7 +16,7 @@ namespace SpawnDev.ILGPU.ML.Tensors;
 ///   // ... use tensor ...
 ///   pool.Return(tensor);
 /// </summary>
-public class BufferPool : IDisposable, IDeviceMemoryReclaimer
+public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
 {
     private readonly Accelerator _accelerator;
     // Every pool registers with its accelerator as a holder of reclaimable memory (ILGPU MemoryPressure), so an
@@ -505,6 +505,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
 
     private void PushFree(MemoryBuffer1D<float, Stride1D.Dense> buffer)
     {
+        if (NotePlannedFree(buffer)) return;   // a planned slot: free again, never in a bucket
         if (PoisonFreedBuffers && (buffer.IsDisposed || !_rentable.Contains(buffer.Buffer)))
             Console.WriteLine($"[POOL] FREE-OF-{(buffer.IsDisposed ? "DISPOSED" : "FOREIGN")} {Bid(buffer)} len={buffer.Length} " +
                               $"node {Graph.GraphExecutor.CurrentRunNodeIndex}\n{Environment.StackTrace}");
@@ -612,14 +613,16 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
             return new Tensor(cbuf.View.SubView(0, count), shape, null);
         }
 
-        if (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
+        bool planned = TryRentPlanned(bucketSize, out var buffer);
+        if (planned || (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0 && (buffer = stack.Pop()) != null))
         {
-            var buffer = stack.Pop();
-            Interlocked.Add(ref _freeBucketedBytesCounter, -buffer.LengthInBytes);
+            if (!planned) Interlocked.Add(ref _freeBucketedBytesCounter, -buffer.LengthInBytes);
+            NoteRecordedRent(bucketSize, buffer);
             // 0xFF bytes = NaN as float32. Only the REUSED path needs this: a fresh allocation holds no
             // previous tensor's values, and it is precisely the plausible leftovers that hide an unwritten read.
             if (PoisonRentedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
-            var tensor = new Tensor(buffer.View, shape, name);
+            // a slot can be larger than this rent's bucket: view exactly the bucket, as a bucket buffer is
+            var tensor = new Tensor(planned && buffer.Length != bucketSize ? buffer.View.SubView(0, bucketSize) : buffer.View, shape, name);
             if (name != null) Record(name, buffer);
             else _scratchSink?.Add(buffer);
             if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(buffer)} reuse");
@@ -666,6 +669,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         TotalDeviceAllocationMs += _allocSw.Elapsed.TotalMilliseconds;
         _allBuffers.Add(newBuffer);
         _rentable.Add(newBuffer.Buffer);
+        NoteRecordedRent(bucketSize, newBuffer);
         // DIAGNOSTIC (Tuvok 2026-07-11): a NEW (not bucket-reused) large allocation DURING a run. On a warm,
         // resident pipeline these should be ~0 per gen (the working set reuses returned buckets). A buffer that
         // allocates fresh EVERY gen = a not-Returned leak (the +128MiB/gen SD-Turbo 2nd-gen OOM). Logs name+MiB.
@@ -731,6 +735,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     private long DisposeLargestBucketedLocked(long target)
     {
         if (Graph.GraphExecutor.SuppressDrains) return 0;   // capture window: see DisposeAllBucketedLocked
+        DropAllPlansLocked();   // planned slots become free buffers the reclaim can take
         var sizes = new List<(long Bytes, bool Half, int Key)>();
         // A bucket's key is its buffers' element count (Rent allocates exactly bucketSize elements).
         foreach (var kv in _buckets) if (kv.Value.Count > 0) sizes.Add((kv.Key * 4L, false, kv.Key));
@@ -797,6 +802,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         // VRAM pressure, 2026-07-03). Reclaiming nothing makes the OOM throw cleanly instead; the
         // capture wrapper falls back to the direct forward.
         if (Graph.GraphExecutor.SuppressDrains) return 0;
+        DropAllPlansLocked();   // planned slots become free buffers the reclaim can take
 
         // Nothing bucketed → nothing to reclaim (and no need to flush).
         bool anyToDispose = false;

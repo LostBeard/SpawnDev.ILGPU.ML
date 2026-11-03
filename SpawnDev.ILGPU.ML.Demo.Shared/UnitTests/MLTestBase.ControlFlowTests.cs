@@ -90,10 +90,11 @@ public abstract partial class MLTestBase
                     feeds[p.Name] = new Tensor(buf.View, shape);
                 }
 
-                long warmAllocations = 0;
+                long warmAllocations = 0, warmPlanAllocations = 0;
                 for (int run = 0; run < runs; run++)
                 {
-                long allocsBefore = BufferPool.TotalDeviceAllocations;
+                long allocsBefore = BufferPool.TotalDeviceAllocations, planAllocsBefore = BufferPool.PlannedReuseAllocations;
+                if (noWarmAllocations && run == 2) { BufferPool.RecentFreshAllocNames.Clear(); BufferPool.TraceFreshAllocNames = true; }
                 var outputs = await session.RunAsync(feeds);
 
                 foreach (var p in root.GetProperty("outputs").EnumerateObject())
@@ -132,12 +133,20 @@ public abstract partial class MLTestBase
                     if (run == 0) Console.WriteLine($"[ControlFlow] {name} {p.Name}: {expected.Length} values, max |d| {worst:E2}");
                 }
                 session.ReturnOutputs(outputs);
-                if (run >= 2) warmAllocations += BufferPool.TotalDeviceAllocations - allocsBefore;
+                // a plan build (BufferPool.PlannedReuse) may allocate once; that is not a forward's rent, and a leak would show in the forwards after it
+                if (run >= 2)
+                {
+                    long planAllocs = BufferPool.PlannedReuseAllocations - planAllocsBefore;
+                    warmAllocations += BufferPool.TotalDeviceAllocations - allocsBefore - planAllocs;
+                    warmPlanAllocations += planAllocs;
                 }
+                }
+                BufferPool.TraceFreshAllocNames = false;
                 if (noWarmAllocations && warmAllocations != 0)
                     throw new Exception($"{name}: {warmAllocations} fresh device allocation(s) across {runs - 2} warm forward(s) "
                         + $"on {BackendName} - a buffer is not handed back each forward (it leaks, and on WebGPU every "
-                        + "forward then binds different buffers).");
+                        + $"forward then binds different buffers). Fresh rents: [{string.Join(", ", BufferPool.RecentFreshAllocNames)}]; "
+                        + $"planned reuse {(BufferPool.PlannedReuse ? "on" : "off")}: plans {BufferPool.PlannedReusePlans}, planned rents {BufferPool.PlannedReuseRents}, deviations {BufferPool.PlannedReuseDeviations}, plan-build allocations in the warm forwards {warmPlanAllocations}.");
             }
             finally
             {

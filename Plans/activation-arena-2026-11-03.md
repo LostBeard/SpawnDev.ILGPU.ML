@@ -40,3 +40,15 @@ Constraints and steps:
    bugs); in-place ops whose input and output intervals touch; If/Loop bodies sharing the pool (plan per body, or leave bodies on the pool first).
 
 Expected for ReDimNet2: pool ~256-300 MiB instead of 682 (about 400 MiB back on a 6 GB card).
+
+## Built instead (2026-11-03): planned slot reuse from recorded runs
+Offsets in one arena would break the pool's identity-keyed records (`_live`, `_namedBuffers`, `_rentable`) and WebGPU's read_write aliasing rule. So:
+`BufferPool.PlannedReuse` (Tensors/BufferPool.PlannedReuse.cs) RECORDS each executor's runs (every fp32 rent's bucket and [rent, return] interval on one
+clock) until two consecutive rent sequences match (run 1 is not steady state: measured), then packs every rent returned within the run into SLOTS,
+greedy by size (largest first, first slot with no overlapping interval). A slot is a real buffer, so every pool record holds; a slot is handed out only
+after the recorded Return that freed it (the pool's own safety); a runtime busy guard catches any plan/run mismatch and falls back to the buckets.
+Slots are shared across all plans of a pool (runs never overlap), refcounted, so alternating input shapes cost the larger plan, not the sum.
+Capture-regime runs drop their executor's plan (capture priming unchanged); a reclaim drops every plan first; a disposed executor's plan is forgotten.
+Measured: ReDimNet2-B6 steady state 682 -> 372 MiB on CUDA, bit-identical. Remaining gap to live (256) is greedy-by-size's slot rounding.
+Gates: PlannedReuse_RepeatedRuns_BitIdenticalAndPlanned (red with overlapping lifetimes sharing slots unguarded), PlannedReuse_TwoExecutorsOnePool_ShareSlots,
+Bench_SpeakerEmbedding_PoolPeak; desktop sweeps with ML_PLANNED_REUSE=1.

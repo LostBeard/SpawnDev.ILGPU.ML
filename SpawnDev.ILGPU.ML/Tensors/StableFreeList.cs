@@ -54,6 +54,21 @@ internal sealed class StableFreeList<T> : IEnumerable<T> where T : class
         return item;
     }
 
+    /// <summary>Is <paramref name="item"/> (by reference) in the list?</summary>
+    public bool Contains(T item)
+    {
+        foreach (var (_, it) in _items) if (ReferenceEquals(it, item)) return true;
+        return false;
+    }
+
+    /// <summary>Remove <paramref name="item"/> (by reference) if it is in the list; true if it was.</summary>
+    public bool Remove(T item)
+    {
+        for (int i = _items.Count - 1; i >= 0; i--)
+            if (ReferenceEquals(_items[i].Item, item)) { _items.RemoveAt(i); return true; }
+        return false;
+    }
+
     public IEnumerator<T> GetEnumerator()
     {
         for (int i = _items.Count - 1; i >= 0; i--) yield return _items[i].Item;

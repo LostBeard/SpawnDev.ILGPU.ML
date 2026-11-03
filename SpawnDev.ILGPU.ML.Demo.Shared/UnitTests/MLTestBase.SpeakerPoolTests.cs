@@ -30,16 +30,27 @@ public abstract partial class MLTestBase
             using var pipeline = new SpeakerEmbeddingPipeline(session, accelerator);
             var rng = new Random(3);
             var clip = Enumerable.Range(0, 96000).Select(i => (float)(0.3 * Math.Sin(i * 0.05) + 0.05 * (rng.NextDouble() * 2 - 1))).ToArray();
-            BufferPool.ResetPeaks();
-            await pipeline.EmbedAsync(clip, 16000);
-            long total1 = BufferPool.PeakTotalBytes, live1 = BufferPool.PeakLiveBytes, free1 = session.PooledFreeBytes;
-            await pipeline.EmbedAsync(clip, 16000);
-            long total2 = BufferPool.PeakTotalBytes, live2 = BufferPool.PeakLiveBytes, free2 = session.PooledFreeBytes;
+            // Five embeddings, peaks reset before each: with BufferPool.PlannedReuse the runs record until two consecutive rent sequences match, then plan;
+            // the later ones replay the plan. Each must
+            // equal the first bit for bit: which buffer serves a tensor never changes a result.
+            const double MiB = 1048576.0;
+            var pool = session.Executor.Pool;
+            long plansBefore = BufferPool.PlannedReusePlans, rentsBefore = BufferPool.PlannedReuseRents, devBefore = BufferPool.PlannedReuseDeviations;
+            var parts = new List<string>();
+            float[]? first = null;
+            for (int run = 1; run <= 5; run++)
+            {
+                BufferPool.ResetPeaks();
+                var emb = await pipeline.EmbedAsync(clip, 16000);
+                if (first == null) first = emb;
+                else if (!emb.SequenceEqual(first)) throw new Exception($"embedding {run} differs from embedding 1 (max |d| {emb.Zip(first).Max(z => Math.Abs(z.First - z.Second)):G3})");
+                parts.Add($"embedding {run}: peak total {BufferPool.PeakTotalBytes / MiB:F0} MiB, peak live {BufferPool.PeakLiveBytes / MiB:F0} MiB, pool free {session.PooledFreeBytes / MiB:F0} MiB, planned slots {pool.PlannedSlotBytes / MiB:F0} MiB");
+            }
             var top = (BufferPool.PeakLiveSnapshot ?? new()).OrderByDescending(s => s.bytes).Take(12)
                 .Select(s => $"{s.name} {s.bytes / 1048576.0:F1} MiB");
-            const double MiB = 1048576.0;
-            var report = $"{accelerator.AcceleratorType}: weights {modelBytes.Length / MiB:F0} MiB | after embedding 1: peak total {total1 / MiB:F0} MiB, peak live {live1 / MiB:F0} MiB, pool free {free1 / MiB:F0} MiB"
-                + $" | after embedding 2: peak total {total2 / MiB:F0} MiB, peak live {live2 / MiB:F0} MiB, pool free {free2 / MiB:F0} MiB | largest live at the peak: {string.Join(", ", top)}";
+            var report = $"{accelerator.AcceleratorType}: weights {modelBytes.Length / MiB:F0} MiB, planned reuse {(BufferPool.PlannedReuse ? "on" : "off")} "
+                + $"(plans +{BufferPool.PlannedReusePlans - plansBefore}, planned rents +{BufferPool.PlannedReuseRents - rentsBefore}, deviations +{BufferPool.PlannedReuseDeviations - devBefore}) | "
+                + string.Join(" | ", parts) + $" | largest live at the last peak: {string.Join(", ", top)}";
             Console.WriteLine("[SpeakerPool] " + report);
             return report;
         }
