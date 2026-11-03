@@ -111,6 +111,8 @@ public partial class MLTestBase
     [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task GGUFDecodeKVCache_IncrementalMatchesFullRecompute() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
         // Reuse the tiny quantized llama GGUF from the recompile suite (same partial class). Its
         // FusedAttention nodes carry the "layer" tag the decode intercept needs; the cache is
@@ -206,6 +208,8 @@ public partial class MLTestBase
     [TestMethod]
     public async Task GGUFLastPositionLogits_MatchesFullLastPosition() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
         var bytes = BuildTinyQuantizedLlamaGGUF(embd, vocab, ffn, ctx, new Random(7));
         var seq = new float[] { 3, 9, 21, 5 };

@@ -355,7 +355,7 @@ public class GraphExecutor : IDisposable
         if (_baseRefCounts != null) return;
         var rc = new Dictionary<string, int>();
         foreach (var node in _graph.Nodes)
-            foreach (var inputName in node.InputNames)
+            foreach (var inputName in node.RefInputNames)              // implicit (subgraph outer-scope) reads count too
                 if (!string.IsNullOrEmpty(inputName))
                     rc[inputName] = rc.GetValueOrDefault(inputName, 0) + 1;
         foreach (var name in _graph.OutputNames) rc[name] = int.MaxValue;
@@ -524,6 +524,23 @@ public class GraphExecutor : IDisposable
     /// </para>
     /// </remarks>
     public static bool QueueOrderedDrains = true;
+
+    /// <summary>
+    /// Return a buffer to the pool at its last use instead of at the next drain, on backends whose work is ordered against later use of the same buffer:
+    /// CUDA (one stream), OpenCL (an in-order queue), WebGPU (the queue; plain forwards only), CPU and Velocity (synchronous). Never during a capture pass and
+    /// never on Wasm (its worker pool is not ordered against the host) or WebGL. Default on; env ML_IMMEDIATE_RELEASE=0 for the deferred schedule (the A/B).
+    /// </summary>
+    /// <remarks>
+    /// The deferral exists so a kernel still queued against a dead buffer cannot see a later Rent's writes; on an ordered queue that later write executes after
+    /// the queued read by construction, the same argument the CUDA capture path's immediate return rests on. MEASURED 2026-11-03 before it (CUDA, ReDimNet2-B6,
+    /// 51 MB of weights, one 6 s embedding): peak live 846 MiB of which up to <see cref="MaxPendingReleaseBytes"/> (512 MiB) was dead buffers waiting for a
+    /// drain, and a 2,141 MiB pool (Data, SpawnDev.AI).
+    /// </remarks>
+    public static bool ImmediateRelease = Environment.GetEnvironmentVariable("ML_IMMEDIATE_RELEASE") is not ("0" or "false");
+
+    /// <summary>True when <see cref="ImmediateRelease"/> applies to this executor's backend right now.</summary>
+    private bool ImmediateReleaseActive => ImmediateRelease && !SuppressDrains
+        && _accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity;
 
     /// <summary>Per-session override of <see cref="SyncIntervalNodes"/>. Null = use the static default.</summary>
     /// <remarks>
@@ -1497,7 +1514,7 @@ public class GraphExecutor : IDisposable
         var outputNameSet = new HashSet<string>(_graph.OutputNames);
         foreach (var node in _graph.Nodes)
         {
-            foreach (var inputName in node.InputNames)
+            foreach (var inputName in node.RefInputNames)
             {
                 if (!string.IsNullOrEmpty(inputName))
                     refCounts[inputName] = refCounts.GetValueOrDefault(inputName, 0) + 1;
@@ -2438,7 +2455,7 @@ public class GraphExecutor : IDisposable
             }
 
             // Release input tensors whose ref count reached 0
-            foreach (var inputName in node.InputNames)
+            foreach (var inputName in node.RefInputNames)
             {
                 if (string.IsNullOrEmpty(inputName)) continue;
                 if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
@@ -3477,7 +3494,7 @@ public class GraphExecutor : IDisposable
         // precision-aware pass-through below — single source of truth for input lifetime.
         void ReleaseConsumedInputs(CompiledNode n)
         {
-            foreach (var inputName in n.InputNames)
+            foreach (var inputName in n.RefInputNames)
             {
                 if (string.IsNullOrEmpty(inputName)) continue;
                 if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
@@ -3505,8 +3522,8 @@ public class GraphExecutor : IDisposable
                         // forward it recorded. REUSE INSIDE THE CAPTURE is the fault - not the buffer escaping to
                         // the shared pool afterwards, which was built, measured and REFUTED (identical 16900,
                         // worst 3.873695) before landing this.
-                        bool captureImmediate = SuppressDrains && CaptureImmediateReturn
-                                             && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+                        bool captureImmediate = (SuppressDrains && CaptureImmediateReturn
+                                             && _accelerator.AcceleratorType == AcceleratorType.Cuda) || ImmediateReleaseActive;
                         if (halfTensors.TryGetValue(inputName, out var hrel))
                         {
                             halfTensors.Remove(inputName);
@@ -3543,14 +3560,14 @@ public class GraphExecutor : IDisposable
                 if (halfTensors.TryGetValue(outName, out var hdead))
                 {
                     halfTensors.Remove(outName);
-                    pendingHalfReleases.Add(hdead);
-                    pendingReleaseBytes += (long)hdead.ElementCount * 2;
+                    if (ImmediateReleaseActive) _pool.ReturnHalf(hdead);
+                    else { pendingHalfReleases.Add(hdead); pendingReleaseBytes += (long)hdead.ElementCount * 2; }
                 }
                 else if (tensors.TryGetValue(outName, out var dead))
                 {
                     tensors.Remove(outName);
-                    pendingReleases.Add(dead);
-                    pendingReleaseBytes += (long)dead.ElementCount * sizeof(float);
+                    if (ImmediateReleaseActive) _pool.Return(dead);
+                    else { pendingReleases.Add(dead); pendingReleaseBytes += (long)dead.ElementCount * sizeof(float); }
                 }
             }
         }
@@ -3565,6 +3582,7 @@ public class GraphExecutor : IDisposable
             if (nodeScratch.Count == 0) return;
             foreach (var b in TakeReleasableScratch(nodeScratch, n, tensors, halfTensors, hostValues))
             {
+                if (ImmediateReleaseActive) { _pool.ReturnScratch(b); continue; }
                 pendingScratch.Add(b);
                 pendingReleaseBytes += b.LengthInBytes;
             }

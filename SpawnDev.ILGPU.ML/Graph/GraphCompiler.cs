@@ -1367,6 +1367,7 @@ public class GraphCompiler
                 OpType = node.OpType,
                 Operator = op,
                 InputNames = node.Inputs.ToArray(),
+                ImplicitInputNames = CompiledNode.OuterScopeReads(node),
                 OutputNames = node.Outputs.ToArray(),
                 Attributes = attrs,
                 OutputShapes = outputShapes,
@@ -1550,6 +1551,51 @@ public class CompiledNode
     public required string OpType { get; init; }
     public required IOnnxOperator Operator { get; init; }
     public required string[] InputNames { get; init; }
+
+    /// <summary>
+    /// Outer-scope tensors this node's subgraphs (If branches, Loop / Scan bodies, nested) read without declaring them as node inputs. They are real
+    /// uses: the executor's reference counts and releases count them like <see cref="InputNames"/> (see <see cref="RefInputNames"/>).
+    /// </summary>
+    /// <remarks>
+    /// 🔴 Before 2026-11-03 they were not counted, so a tensor whose last reader was a branch went back to the pool BEFORE the If ran: a use-after-release
+    /// that the deferred-release schedule hid (the buffer stayed intact until the next drain). Found when GraphExecutor.ImmediateRelease returned it at its
+    /// counted last use: <c>ControlFlow_IfSqueeze_NoLeakAcrossForwards</c> on WebGPU rented the branch's output into the input's own buffer
+    /// ("Storage buffer aliasing detected in kernel 'Kernel_ScaleImpl'").
+    /// </remarks>
+    public string[] ImplicitInputNames { get; init; } = Array.Empty<string>();
+
+    /// <summary><see cref="InputNames"/> and then <see cref="ImplicitInputNames"/>: every tensor this node reads, for reference counting.</summary>
+    public string[] RefInputNames => _refInputNames ??= ImplicitInputNames.Length == 0 ? InputNames : InputNames.Concat(ImplicitInputNames).ToArray();
+    private string[]? _refInputNames;
+
+    /// <summary>The names a node's subgraph attributes read from the enclosing scope (recursively through nested subgraphs).</summary>
+    public static string[] OuterScopeReads(GraphNode node)
+    {
+        var free = new HashSet<string>(StringComparer.Ordinal);
+        // subgraph attributes (then_branch / else_branch / body) live in RawAttributes (they do not survive the JSON attributes)
+        if (node.RawAttributes != null)
+            foreach (var v in node.RawAttributes.Values)
+                if (v is Onnx.OnnxGraphProto g) free.UnionWith(FreeNames(g));
+        free.Remove("");
+        return free.ToArray();
+    }
+
+    private static HashSet<string> FreeNames(Onnx.OnnxGraphProto g)
+    {
+        var defined = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var i in g.Inputs) defined.Add(i.Name);
+        foreach (var t in g.Initializers) defined.Add(t.Name);
+        foreach (var n in g.Nodes) foreach (var o in n.Outputs) if (!string.IsNullOrEmpty(o)) defined.Add(o);
+        var free = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in g.Nodes)
+        {
+            foreach (var i in n.Inputs) if (!string.IsNullOrEmpty(i) && !defined.Contains(i)) free.Add(i);
+            foreach (var a in n.Attributes)
+                if (a.G != null)
+                    foreach (var f in FreeNames(a.G)) if (!defined.Contains(f)) free.Add(f);
+        }
+        return free;
+    }
     public required string[] OutputNames { get; init; }
     public required Dictionary<string, object> Attributes { get; init; }
     public required int[][] OutputShapes { get; init; }

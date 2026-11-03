@@ -737,8 +737,8 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         foreach (var kv in _halfBuckets) if (kv.Value.Count > 0) sizes.Add((kv.Key * 2L, true, kv.Key));
         if (sizes.Count == 0) return 0;
         sizes.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
-        // Submit pending work first: see the encoder-safety note in DisposeAllBucketedLocked.
-        try { _accelerator.Flush(); } catch { /* desktop: no-op; browser: already-flushed is harmless */ }
+        // Submit pending work first (browser), wait for it (CUDA / OpenCL): see DrainBeforeFree.
+        DrainBeforeFree();
 
         long freed = 0; int nBuf = 0;
         foreach (var (_, half, key) in sizes)
@@ -776,6 +776,20 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
     }
 
     /// <summary>Full reclaim under <see cref="_sync"/>: every free buffer.</summary>
+    /// <summary>
+    /// Before free buffers are disposed: on CUDA and OpenCL WAIT for the queued work (a free buffer may still be read by a queued kernel since
+    /// <see cref="Graph.GraphExecutor.ImmediateRelease"/> returns buffers at their last use, not after a drain, and freeing device memory a queued kernel reads is
+    /// undefined); on the browser backends SUBMIT the pending encoder (destroying a buffer of submitted work is legal; see DisposeAllBucketedLocked's note).
+    /// Reclaims are rare (memory pressure), so the wait costs nothing in the common case. Any later use of a freed bucket has to Rent it under _sync first.
+    /// </summary>
+    private void DrainBeforeFree()
+    {
+        if (_accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL)
+            _accelerator.Synchronize();
+        else
+            try { _accelerator.Flush(); } catch { /* desktop CPU: no-op; browser: already-flushed is harmless */ }
+    }
+
     private long DisposeAllBucketedLocked()
     {
         // NEVER free during a graph-capture window: cuMemFree while CUDA stream capture is active
@@ -801,7 +815,7 @@ public class BufferPool : IDisposable, IDeviceMemoryReclaimer
         // the queued work completes). AllocateWithReclaim's OWN pre-reclaim flush is Accelerator.Synchronize(),
         // which THROWS on WebGPU and is swallowed (MemoryPressure.cs) → the encoder was never submitted before
         // this reclaim disposed. Flushing HERE makes the reclaim self-safe regardless of the caller.
-        try { _accelerator.Flush(); } catch { /* desktop: no-op; browser: already-flushed is harmless */ }
+        DrainBeforeFree();
 
         long freed = 0; int nBuf = 0;
         foreach (var stack in _buckets.Values)

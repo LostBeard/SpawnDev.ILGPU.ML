@@ -691,6 +691,8 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task TiledGemm_AllTypes_MatchOracle() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("the tiled GEMM needs shared memory (not WebGL)");
         if (accelerator.MaxGroupSize.X < 256) throw new UnsupportedTestException("the tiled GEMM's groups are 256 threads");
         const int K = 1536;

@@ -27,6 +27,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task GGUFSession_Recompile_KeepsQuantizedWeights_MultiToken() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
         var bytes = BuildTinyQuantizedLlamaGGUF(embd, vocab, ffn, ctx, new Random(2026));
 

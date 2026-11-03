@@ -88,6 +88,8 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 600000)]
     public async Task FusedDequantMatMul_WebGpuGemvOn_AllTypes_CompileAndMatchOracle() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         bool saved = FusedDequantMatMul.EnableWebGPUGemv;
         try
         {
@@ -132,6 +134,8 @@ public abstract partial class MLTestBase
 
     private async Task FusedMatMulOracle(GGMLType type) => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         // K is a multiple of 256 so the same dims serve legacy and K-quant blocks.
         const int M = 2, K = 512, N = 3;
         var rng = new Random(42 + (int)type);
@@ -199,6 +203,8 @@ public abstract partial class MLTestBase
 
     private async Task MultiRowMatMulOracle(GGMLType type, int M) => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         const int K = 512, N = 70;  // N not a 64-multiple → padding path; M=40 multi-row, M=80 register-blocked
         var rng = new Random(77 + (int)type + M);
 

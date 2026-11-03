@@ -200,6 +200,8 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task Lfm2Decode_IncrementalMatchesFullRecompute() => await RunTest(async accelerator =>
     {
+        // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
+        using var _simt = PinSimtGemm();
         // embd must be a multiple of the Q6_K block size (256) - token_embd is Q6_K and the gather
         // dequantizes whole blocks per row.
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64, L = 3;
