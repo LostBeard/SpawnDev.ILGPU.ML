@@ -91,14 +91,31 @@ public sealed class GgufBatchDecoder : IDisposable
     /// of three (scores, a thread-per-row softmax, P.V with a thread per output walking every key). On by default where a group can be a head wide; set false for the
     /// three-kernel path (the A/B and the fallback).
     /// </summary>
-    public bool FusedAttention { get; set; }
+    public bool FusedAttention { get => _fusedAttention; set { if (_fusedAttention != value) { _fusedAttention = value; _bufGen++; } } }
+    private bool _fusedAttention;
     private const int AttChunk = 256;
     /// <summary>
     /// The split-K attention over the K / V caches grouped by kv head (<c>AttnPartialGqaImpl</c>): the query heads sharing a kv head (grouped-query attention:
     /// 4 on llama3 / qwen3 8B) in one group, so each cached K / V row is read once a step instead of once per query head. Where the heads are grouped (at most
     /// 8 a kv head, head width at most 128). Default on; GGUF_BATCH_GQA=0 (or false) is the A/B.
     /// </summary>
-    public bool GqaAttention { get; set; } = Environment.GetEnvironmentVariable("GGUF_BATCH_GQA") != "0";
+    // a captured WebGPU step replays the kernels it recorded: changing the route bumps _bufGen so the next step captures again (before 2026-11-02 a decoder
+    // that had captured kept replaying the old route after the property changed)
+    public bool GqaAttention { get => _gqaAttention; set { if (_gqaAttention != value) { _gqaAttention = value; _bufGen++; } } }
+    private bool _gqaAttention = Environment.GetEnvironmentVariable("GGUF_BATCH_GQA") != "0";
+    /// <summary>
+    /// Keys per chunk of the grouped-query decode attention (0: AttChunk / G rounded up to a power of two, so a step has as many groups as the per-head kernel's and
+    /// each group the same work). Settable for the A/B (env GGUF_GQA_CHUNK; AttChunk = the chunking before 2026-11-02); clamped to [16, AttChunk] (the shared
+    /// scores hold GqaMaxG x AttChunk).
+    /// </summary>
+    public int GqaChunk { get => _gqaChunk; set { if (_gqaChunk != value) { _gqaChunk = value; _bufGen++; } } }
+    private int _gqaChunk = int.TryParse(Environment.GetEnvironmentVariable("GGUF_GQA_CHUNK"), out var gc) ? gc : 0;
+    private int GqaChunkKeys(int G)
+    {
+        int gp = 1; while (gp < G) gp <<= 1;
+        int max = AttChunk / gp;
+        return _gqaChunk <= 0 ? max : Math.Clamp(_gqaChunk, 16, AttChunk);
+    }
     /// <summary>
     /// Load-time option (static: read when a decoder is created; env GGUF_BATCH_SEPARATE=1 turns it off): join q, k (and v) into one matrix and gate and up into
     /// another where their block types agree, and fuse the bias, rotary and cache store into one kernel and SwiGLU into its GEMV's output: about half the kernel
@@ -204,7 +221,7 @@ public sealed class GgufBatchDecoder : IDisposable
         public abstract void Flash(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
         public abstract void FlashGqa(int l, KernelConfig cfg, FV q, FV att, int R, int H, int kvH, int D, int p, float scale);
         public abstract void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
-        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
+        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale);
         public abstract void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale);
         public abstract void Pv(int l, int n, FV scores, IV seqs, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode);
         public abstract void Fork(int l, int n, long count, long region);
@@ -217,7 +234,11 @@ public sealed class GgufBatchDecoder : IDisposable
         private Action<Index1D, FV, FV, FV, FV, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, int, int, int, int, int>? _qkvPost;
         private Action<Index1D, FV, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, int, int, int>? _store;
         private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, FV, int, int, int, int, int, float>? _flash, _flashGqa;
-        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>? _att, _attGqa;
+        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>? _att;
+        private readonly Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqa =
+            new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
+        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqa<TG>() where TG : struct, IGqaGroup =>
+            _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaImpl<T, TG>);
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int, int, float>? _scores;
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int>? _pv;
         private Action<Index1D, ArrayView1D<T, Stride1D.Dense>, long, long>? _fork;
@@ -245,9 +266,12 @@ public sealed class GgufBatchDecoder : IDisposable
         public override void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale) =>
             (_att ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, scale);
-        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale) =>
-            (_attGqa ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialGqaImpl<T>))(
-                cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, scale);
+        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale) =>
+            (_attGqa[H / kvH] ??= (H / kvH) switch
+            {
+                2 => LoadGqa<Gqa2>(), 3 => LoadGqa<Gqa3>(), 4 => LoadGqa<Gqa4>(), 5 => LoadGqa<Gqa5>(), 6 => LoadGqa<Gqa6>(), 7 => LoadGqa<Gqa7>(), 8 => LoadGqa<Gqa8>(),
+                _ => throw new ArgumentOutOfRangeException(nameof(H), $"grouped-query attention takes 2..{GqaMaxG} query heads a kv head, not {H / kvH}"),
+            })(cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, ck, scale);
         public override void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale) =>
             (_scores ??= _a.LoadAutoGroupedStreamKernel<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl<T>))(
                 n, q, _k[l].View, seqs, scores, R, nk, H, D, kvH, maxSeq, p, mode, scale);
@@ -670,10 +694,12 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
                 // a captured step keeps one shape for the whole generation: every chunk the cache can hold (the ones past the position mask to nothing)
-                int ach = _fixedChunks ? (MaxSeq + AttChunk - 1) / AttChunk : (nk + AttChunk - 1) / AttChunk;
+                bool gqa = GqaAttention && Heads > KvHeads && Heads / KvHeads <= GqaMaxG && HeadDim <= GqaMaxD;
+                int ck = gqa ? GqaChunkKeys(Heads / KvHeads) : AttChunk;
+                int ach = _fixedChunks ? (MaxSeq + ck - 1) / ck : (nk + ck - 1) / ck;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
-                if (GqaAttention && Heads > KvHeads && Heads / KvHeads <= GqaMaxG && HeadDim <= GqaMaxD)
-                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim));
+                if (gqa)
+                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim));
                 else
                     _kv.AttPartial(l, new KernelConfig(R * Heads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim));
                 Prof("attn");
@@ -1949,16 +1975,19 @@ public sealed class GgufBatchDecoder : IDisposable
         int kvC = kvH * D, hk = h / (H / kvH), j0 = ch * AttChunk;
         var sc = SharedMemory.Allocate<float>(AttChunk);
         var red = SharedMemory.Allocate<float>(AttChunk);
-        long qo = ((long)r * H + h) * D;
+        int qo = (r * H + h) * D;
+        // this sequence's cache rows: 32-bit offsets in the loops (see AttnPartialGqaImpl)
+        var kq = kc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
+        var vq = vc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
         for (int jj = t; jj < AttChunk; jj += D)
         {
             int j = j0 + jj;
             float s = -1e30f;
             if (j <= pos)
             {
-                long ko = ((long)seq * maxSeq + j) * kvC + hk * D;
+                int ko = j * kvC + hk * D;
                 float acc = 0f;
-                for (int d = 0; d < D; d++) acc += q[qo + d] * PrecisionConvert.ConvertToSingle(kc[ko + d]);
+                for (int d = 0; d < D; d++) acc += q[qo + d] * PrecisionConvert.ConvertToSingle(kq[ko + d]);
                 s = acc * scale;
             }
             sc[jj] = s;
@@ -1991,8 +2020,8 @@ public sealed class GgufBatchDecoder : IDisposable
         l = red[0];
         int keys = Math.Min(AttChunk, pos + 1 - j0);
         float o = 0f;
-        long vo = (long)seq * maxSeq * kvC + hk * D + t;
-        for (int jj = 0; jj < keys; jj++) o += sc[jj] * PrecisionConvert.ConvertToSingle(vc[vo + (long)(j0 + jj) * kvC]);
+        int vo = hk * D + t;
+        for (int jj = 0; jj < keys; jj++) o += sc[jj] * PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
         part[(long)g * D + t] = o;
         if (t == 0) { ml[2L * g] = m; ml[2L * g + 1] = l; }
     }
@@ -2000,32 +2029,36 @@ public sealed class GgufBatchDecoder : IDisposable
     // GqaMaxD). The G = H / kvH query heads that share kv head hk are staged in shared memory; each key's K row is read ONCE and dotted against all G of them,
     // each V row read once for all G (the per-head kernel reads every K / V row G times: 4x on llama3 / qwen3, 7x on qwen2.5). Writes the same per-head partials
     // (part, ml) as AttnPartialImpl, so AttnCombineImpl merges them unchanged. G <= GqaMaxG.
-    private static void AttnPartialGqaImpl<T>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale)
-        where T : unmanaged, System.Numerics.INumber<T>
+    private static void AttnPartialGqaImpl<T, TG>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
+        where T : unmanaged, System.Numerics.INumber<T> where TG : struct, IGqaGroup
     {
         int p = posBuf[0];
         int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
-        int G = H / kvH;
+        int G = default(TG).G;                                      // a compile-time constant: the per-head guards below fold away (H / kvH == G)
         int ch = g % nch, rest = g / nch, hk = rest % kvH, r = rest / kvH;
         int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
-        int kvC = kvH * D, j0 = ch * AttChunk;
+        int kvC = kvH * D, j0 = ch * ck;                             // ck keys a chunk (at most AttChunk: sc holds G x AttChunk scores)
         var qs = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxD);
         var sc = SharedMemory.Allocate<float>(GqaMaxG * AttChunk);
-        var red = SharedMemory.Allocate<float>(GqaMaxD);
+        var mxs = SharedMemory.Allocate<float>(GqaMaxG);              // each head's chunk max (the reductions run in qs, free after the scores)
+        // this sequence's rows of the caches: the offsets below stay 32-bit (a sequence's maxSeq x kvC is far below 2^31), so the inner loops carry no 64-bit
+        // arithmetic (emulated on WebGPU: an i64 add per K element and an i64 multiply per V row before 2026-11-02)
+        var kq = kc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
+        var vq = vc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
         for (int gi = 0; gi < G; gi++) qs[gi * D + t] = q[((long)r * H + hk * G + gi) * D + t];
         Group.Barrier();
         // scores: each key's row once, against the G heads
-        for (int jj = t; jj < AttChunk; jj += D)
+        for (int jj = t; jj < ck; jj += D)
         {
             int j = j0 + jj;
             float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f, s4 = 0f, s5 = 0f, s6 = 0f, s7 = 0f;
             bool live = j <= pos;
             if (live)
             {
-                long ko = ((long)seq * maxSeq + j) * kvC + hk * D;
+                int ko = j * kvC + hk * D;
                 for (int d = 0; d < D; d++)
                 {
-                    float kv = PrecisionConvert.ConvertToSingle(kc[ko + d]);
+                    float kv = PrecisionConvert.ConvertToSingle(kq[ko + d]);
                     s0 += qs[d] * kv;
                     if (G > 1) s1 += qs[D + d] * kv;
                     if (G > 2) s2 += qs[2 * D + d] * kv;
@@ -2046,48 +2079,53 @@ public sealed class GgufBatchDecoder : IDisposable
             if (G > 7) sc[7 * AttChunk + jj] = live ? s7 * scale : -1e30f;
         }
         Group.Barrier();
-        int keys = Math.Min(AttChunk, pos + 1 - j0);
-        long vo = (long)seq * maxSeq * kvC + hk * D + t;
-        // per head: the chunk's max and exp-sum (the probabilities replace the scores in place), then P.V for the G heads with each V row read once
+        int keys = Math.Min(ck, pos + 1 - j0);
+        int vo = hk * D + t;
+        // every head's chunk max, then exp-sum, in ONE tree reduction each (the probabilities replace the scores in place); the G heads reduce side by side, so
+        // the barriers do not grow with G. MEASURED 2026-11-02 before it (WebGPU, qwen3-0.6b, G = 2, short prompt, captured steps): a reduction pair per head
+        // made this kernel 14% slower per token than the per-head kernel (216 against 251 tok/s): half the groups, each with G times the barrier chain.
         for (int gi = 0; gi < G; gi++)
         {
-            int sb = gi * AttChunk;
             float m = -1e30f;
-            for (int jj = t; jj < AttChunk; jj += D) m = MathF.Max(m, sc[sb + jj]);
-            red[t] = m;
+            for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
+            qs[gi * D + t] = m;
+        }
+        Group.Barrier();
+        for (int w = D / 2; w > 0; w >>= 1)
+        {
+            if (t < w)
+                for (int gi = 0; gi < G; gi++) qs[gi * D + t] = MathF.Max(qs[gi * D + t], qs[gi * D + t + w]);
             Group.Barrier();
-            for (int w = D / 2; w > 0; w >>= 1)
+        }
+        if (t < G) mxs[t] = qs[t * D];
+        Group.Barrier();
+        for (int gi = 0; gi < G; gi++)
+        {
+            float m = mxs[gi], l = 0f;
+            for (int jj = t; jj < ck; jj += D)
             {
-                if (t < w) red[t] = MathF.Max(red[t], red[t + w]);
-                Group.Barrier();
+                int si = gi * AttChunk + jj;
+                float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
+                sc[si] = e; l += e;
             }
-            m = red[0];
+            qs[gi * D + t] = l;
+        }
+        Group.Barrier();
+        for (int w = D / 2; w > 0; w >>= 1)
+        {
+            if (t < w)
+                for (int gi = 0; gi < G; gi++) qs[gi * D + t] += qs[gi * D + t + w];
             Group.Barrier();
-            float l = 0f;
-            for (int jj = t; jj < AttChunk; jj += D)
-            {
-                float e = sc[sb + jj] <= -1e29f ? 0f : MathF.Exp(sc[sb + jj] - m);
-                sc[sb + jj] = e; l += e;
-            }
-            red[t] = l;
-            Group.Barrier();
-            for (int w = D / 2; w > 0; w >>= 1)
-            {
-                if (t < w) red[t] += red[t + w];
-                Group.Barrier();
-            }
-            l = red[0];
-            Group.Barrier();
-            if (t == 0)
-            {
-                long gq = ((long)r * H + hk * G + gi) * nch + ch;
-                ml[2 * gq] = m; ml[2 * gq + 1] = l;
-            }
+        }
+        if (t < G)
+        {
+            long gq = ((long)r * H + hk * G + t) * nch + ch;
+            ml[2 * gq] = mxs[t]; ml[2 * gq + 1] = qs[t * D];
         }
         float o0 = 0f, o1 = 0f, o2 = 0f, o3 = 0f, o4 = 0f, o5 = 0f, o6 = 0f, o7 = 0f;
         for (int jj = 0; jj < keys; jj++)
         {
-            float v = PrecisionConvert.ConvertToSingle(vc[vo + (long)(j0 + jj) * kvC]);
+            float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
             o0 += sc[jj] * v;
             if (G > 1) o1 += sc[AttChunk + jj] * v;
             if (G > 2) o2 += sc[2 * AttChunk + jj] * v;
@@ -2108,6 +2146,15 @@ public sealed class GgufBatchDecoder : IDisposable
         if (G > 7) part[(pb + 7L * nch) * D + t] = o7;
     }
     private const int GqaMaxG = 8, GqaMaxD = 128;
+    /// <summary>The query heads per kv head of <see cref="AttnPartialGqaImpl"/>, as a type: the kernel is compiled per G, so its G-way guards are constants.</summary>
+    internal interface IGqaGroup { int G { get; } }
+    internal struct Gqa2 : IGqaGroup { public int G => 2; }
+    internal struct Gqa3 : IGqaGroup { public int G => 3; }
+    internal struct Gqa4 : IGqaGroup { public int G => 4; }
+    internal struct Gqa5 : IGqaGroup { public int G => 5; }
+    internal struct Gqa6 : IGqaGroup { public int G => 6; }
+    internal struct Gqa7 : IGqaGroup { public int G => 7; }
+    internal struct Gqa8 : IGqaGroup { public int G => 8; }
 
     // split-K attention, part 2: out[r, h * D + d] = sum_ch e^(m_ch - M) part[ch, d] / sum_ch e^(m_ch - M) l_ch (chunks without a key skipped)
     private static void AttnCombineImpl(Index1D i, FV part, FV ml, FV o, int D, int nch)

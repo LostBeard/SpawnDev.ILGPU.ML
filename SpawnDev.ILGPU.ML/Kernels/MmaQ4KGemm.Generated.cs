@@ -23,6 +23,13 @@ internal static class MmaQ4KGemm
         return packed;
     }
 
+    // sm_75: no cvt.rn.f16x2.f32 (sm_80+); two round-to-nearest-even conversions packed low / high
+    private static uint PackF16Sm75(float lo, float hi)
+    {
+        CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, lo, hi);
+        return packed;
+    }
+
     private struct ScaleMin { public float S, M; }
     // byte i (0..11) of the header's packed scales: header bytes 4..15 = words b, c, d
     private static int ScaleByte(W16 h, int i) { int v = i < 4 ? h.b : i < 8 ? h.c : h.d; return (v >> (8 * (i & 3))) & 0xFF; }
@@ -43,7 +50,14 @@ internal static class MmaQ4KGemm
         return PackF16(s.S * q0 - s.M, s.S * q1 - s.M);
     }
 
-    /// <summary>One 128 x 128 output tile per group: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A and W 16-byte aligned.</summary>
+    // two values of a nibble word: bytes 2p and 2p + 1 of v, the nibble at shift sh (0 low, 4 high)
+    private static uint PairSm75(int v, int p, int sh, ScaleMin s)
+    {
+        float q0 = (v >> (16 * p + sh)) & 15, q1 = (v >> (16 * p + 8 + sh)) & 15;
+        return PackF16Sm75(s.S * q0 - s.M, s.S * q1 - s.M);
+    }
+
+    /// <summary>One 128 x 128 output tile per group: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A and W 16-byte aligned. sm_80+: m16n8k16.</summary>
     public static void Kernel(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
     {
         int numTilesN = (N + BN - 1) / BN;
@@ -241,6 +255,548 @@ internal static class MmaQ4KGemm
                 CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
                     out float d0, out float d1, out float d2, out float d3, a30, a31, a32, a33, b30, b31, c330, c331, c332, c333);
                 c330 = d0; c331 = d1; c332 = d2; c333 = d3;
+                }
+            }
+            Group.Barrier();
+        }
+
+        // guarded stores
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c000;
+                if (n1 < N) C[(long)m0 * N + n1] = c001;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c002;
+                if (n1 < N) C[(long)m1 * N + n1] = c003;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c010;
+                if (n1 < N) C[(long)m0 * N + n1] = c011;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c012;
+                if (n1 < N) C[(long)m1 * N + n1] = c013;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c020;
+                if (n1 < N) C[(long)m0 * N + n1] = c021;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c022;
+                if (n1 < N) C[(long)m1 * N + n1] = c023;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c030;
+                if (n1 < N) C[(long)m0 * N + n1] = c031;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c032;
+                if (n1 < N) C[(long)m1 * N + n1] = c033;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c100;
+                if (n1 < N) C[(long)m0 * N + n1] = c101;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c102;
+                if (n1 < N) C[(long)m1 * N + n1] = c103;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c110;
+                if (n1 < N) C[(long)m0 * N + n1] = c111;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c112;
+                if (n1 < N) C[(long)m1 * N + n1] = c113;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c120;
+                if (n1 < N) C[(long)m0 * N + n1] = c121;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c122;
+                if (n1 < N) C[(long)m1 * N + n1] = c123;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c130;
+                if (n1 < N) C[(long)m0 * N + n1] = c131;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c132;
+                if (n1 < N) C[(long)m1 * N + n1] = c133;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c200;
+                if (n1 < N) C[(long)m0 * N + n1] = c201;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c202;
+                if (n1 < N) C[(long)m1 * N + n1] = c203;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c210;
+                if (n1 < N) C[(long)m0 * N + n1] = c211;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c212;
+                if (n1 < N) C[(long)m1 * N + n1] = c213;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c220;
+                if (n1 < N) C[(long)m0 * N + n1] = c221;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c222;
+                if (n1 < N) C[(long)m1 * N + n1] = c223;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c230;
+                if (n1 < N) C[(long)m0 * N + n1] = c231;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c232;
+                if (n1 < N) C[(long)m1 * N + n1] = c233;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c300;
+                if (n1 < N) C[(long)m0 * N + n1] = c301;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c302;
+                if (n1 < N) C[(long)m1 * N + n1] = c303;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c310;
+                if (n1 < N) C[(long)m0 * N + n1] = c311;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c312;
+                if (n1 < N) C[(long)m1 * N + n1] = c313;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c320;
+                if (n1 < N) C[(long)m0 * N + n1] = c321;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c322;
+                if (n1 < N) C[(long)m1 * N + n1] = c323;
+            }
+        }
+        {
+            int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
+            if (m0 < M)
+            {
+                if (n0 < N) C[(long)m0 * N + n0] = c330;
+                if (n1 < N) C[(long)m0 * N + n1] = c331;
+            }
+            if (m1 < M)
+            {
+                if (n0 < N) C[(long)m1 * N + n0] = c332;
+                if (n1 < N) C[(long)m1 * N + n1] = c333;
+            }
+        }
+    }
+
+    /// <summary>One 128 x 128 output tile per group: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A and W 16-byte aligned. Turing (sm_75): two m16n8k8 per 16 k.</summary>
+    public static void KernelSm75(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
+    {
+        int numTilesN = (N + BN - 1) / BN;
+        int tileRow = Grid.IdxX / numTilesN;
+        int tileCol = Grid.IdxX % numTilesN;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = warp >> 2, wn = warp & 3;
+        var aS = SharedMemory.Allocate<uint>(BM * RowWords);
+        var bS = SharedMemory.Allocate<uint>(BN * RowWords);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c020 = 0f, c021 = 0f, c022 = 0f, c023 = 0f;
+        float c030 = 0f, c031 = 0f, c032 = 0f, c033 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        float c120 = 0f, c121 = 0f, c122 = 0f, c123 = 0f;
+        float c130 = 0f, c131 = 0f, c132 = 0f, c133 = 0f;
+        float c200 = 0f, c201 = 0f, c202 = 0f, c203 = 0f;
+        float c210 = 0f, c211 = 0f, c212 = 0f, c213 = 0f;
+        float c220 = 0f, c221 = 0f, c222 = 0f, c223 = 0f;
+        float c230 = 0f, c231 = 0f, c232 = 0f, c233 = 0f;
+        float c300 = 0f, c301 = 0f, c302 = 0f, c303 = 0f;
+        float c310 = 0f, c311 = 0f, c312 = 0f, c313 = 0f;
+        float c320 = 0f, c321 = 0f, c322 = 0f, c323 = 0f;
+        float c330 = 0f, c331 = 0f, c332 = 0f, c333 = 0f;
+
+        // staging: A tile = 128 rows x 32 k fp32 = 1024 float4, 4 per thread; B tile = 128 weight rows x one Q4_K sub-block, thread t: row t / 2, half t % 2
+        int arow = tid >> 3, a4 = tid & 7;
+        int brow = tid >> 1, bh = tid & 1;
+        int aRg0 = tileRow * BM + arow + 0; int aOk0 = aRg0 < M ? 1 : 0;
+        long aBase0 = (long)aRg0 * (K >> 2) + a4;
+        int aRg1 = tileRow * BM + arow + 32; int aOk1 = aRg1 < M ? 1 : 0;
+        long aBase1 = (long)aRg1 * (K >> 2) + a4;
+        int aRg2 = tileRow * BM + arow + 64; int aOk2 = aRg2 < M ? 1 : 0;
+        long aBase2 = (long)aRg2 * (K >> 2) + a4;
+        int aRg3 = tileRow * BM + arow + 96; int aOk3 = aRg3 < M ? 1 : 0;
+        long aBase3 = (long)aRg3 * (K >> 2) + a4;
+        int bRg = tileCol * BN + brow; int bOk = bRg < N ? 1 : 0;
+        long bRow = (long)bRg * ((K >> 8) * 9);                            // a super-block is 144 bytes = 9 W16
+        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;
+        W16 ph = default, pq = default;
+
+        {
+            pa0 = aOk0 != 0 ? A.AsAligned16()[aBase0 + ((0) >> 2)] : default(F4);
+            pa1 = aOk1 != 0 ? A.AsAligned16()[aBase1 + ((0) >> 2)] : default(F4);
+            pa2 = aOk2 != 0 ? A.AsAligned16()[aBase2 + ((0) >> 2)] : default(F4);
+            pa3 = aOk3 != 0 ? A.AsAligned16()[aBase3 + ((0) >> 2)] : default(F4);
+            { int ktL = 0; long sbL = bRow + (ktL >> 8) * 9; int jL = (ktL >> 5) & 7;
+              ph = bOk != 0 ? Wq.AsAligned16()[sbL] : default(W16); pq = bOk != 0 ? Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh] : default(W16); }
+        }
+
+        for (int kt = 0; kt < K; kt += BK)
+        {
+            aS[(arow + 0) * RowWords + a4 * 2] = PackF16Sm75(pa0.A, pa0.B);
+            aS[(arow + 0) * RowWords + a4 * 2 + 1] = PackF16Sm75(pa0.C, pa0.D);
+            aS[(arow + 32) * RowWords + a4 * 2] = PackF16Sm75(pa1.A, pa1.B);
+            aS[(arow + 32) * RowWords + a4 * 2 + 1] = PackF16Sm75(pa1.C, pa1.D);
+            aS[(arow + 64) * RowWords + a4 * 2] = PackF16Sm75(pa2.A, pa2.B);
+            aS[(arow + 64) * RowWords + a4 * 2 + 1] = PackF16Sm75(pa2.C, pa2.D);
+            aS[(arow + 96) * RowWords + a4 * 2] = PackF16Sm75(pa3.A, pa3.B);
+            aS[(arow + 96) * RowWords + a4 * 2 + 1] = PackF16Sm75(pa3.C, pa3.D);
+            {
+                int j = (kt >> 5) & 7, sh = (j & 1) * 4;
+                ScaleMin s = SubBlockScale(ph, j);
+                int bw = brow * RowWords + bh * 8;
+                bS[bw + 0] = PairSm75(pq.a, 0, sh, s); bS[bw + 1] = PairSm75(pq.a, 1, sh, s);
+                bS[bw + 2] = PairSm75(pq.b, 0, sh, s); bS[bw + 3] = PairSm75(pq.b, 1, sh, s);
+                bS[bw + 4] = PairSm75(pq.c, 0, sh, s); bS[bw + 5] = PairSm75(pq.c, 1, sh, s);
+                bS[bw + 6] = PairSm75(pq.d, 0, sh, s); bS[bw + 7] = PairSm75(pq.d, 1, sh, s);
+            }
+            Group.Barrier();
+            if (kt + BK < K)
+            {
+                pa0 = aOk0 != 0 ? A.AsAligned16()[aBase0 + ((kt + BK) >> 2)] : default(F4);
+                pa1 = aOk1 != 0 ? A.AsAligned16()[aBase1 + ((kt + BK) >> 2)] : default(F4);
+                pa2 = aOk2 != 0 ? A.AsAligned16()[aBase2 + ((kt + BK) >> 2)] : default(F4);
+                pa3 = aOk3 != 0 ? A.AsAligned16()[aBase3 + ((kt + BK) >> 2)] : default(F4);
+                { int ktL = kt + BK; long sbL = bRow + (ktL >> 8) * 9; int jL = (ktL >> 5) & 7;
+                  ph = bOk != 0 ? Wq.AsAligned16()[sbL] : default(W16); pq = bOk != 0 ? Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh] : default(W16); }
+            }
+
+            for (int s = 0; s < 2; s++)
+            {
+                int kw = s * 8;
+                int ar0 = (wm * 64 + 0 + g) * RowWords + kw + t;
+                uint a00 = aS[ar0];
+                uint a01 = aS[ar0 + 8 * RowWords];
+                uint a02 = aS[ar0 + 4];
+                uint a03 = aS[ar0 + 8 * RowWords + 4];
+                int ar1 = (wm * 64 + 16 + g) * RowWords + kw + t;
+                uint a10 = aS[ar1];
+                uint a11 = aS[ar1 + 8 * RowWords];
+                uint a12 = aS[ar1 + 4];
+                uint a13 = aS[ar1 + 8 * RowWords + 4];
+                int ar2 = (wm * 64 + 32 + g) * RowWords + kw + t;
+                uint a20 = aS[ar2];
+                uint a21 = aS[ar2 + 8 * RowWords];
+                uint a22 = aS[ar2 + 4];
+                uint a23 = aS[ar2 + 8 * RowWords + 4];
+                int ar3 = (wm * 64 + 48 + g) * RowWords + kw + t;
+                uint a30 = aS[ar3];
+                uint a31 = aS[ar3 + 8 * RowWords];
+                uint a32 = aS[ar3 + 4];
+                uint a33 = aS[ar3 + 8 * RowWords + 4];
+                int br0 = (wn * 32 + 0 + g) * RowWords + kw + t;
+                uint b00 = bS[br0];
+                uint b01 = bS[br0 + 4];
+                int br1 = (wn * 32 + 8 + g) * RowWords + kw + t;
+                uint b10 = bS[br1];
+                uint b11 = bS[br1 + 4];
+                int br2 = (wn * 32 + 16 + g) * RowWords + kw + t;
+                uint b20 = bS[br2];
+                uint b21 = bS[br2 + 4];
+                int br3 = (wn * 32 + 24 + g) * RowWords + kw + t;
+                uint b30 = bS[br3];
+                uint b31 = bS[br3 + 4];
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, b00, c000, c001, c002, c003);
+                c000 = d0; c001 = d1; c002 = d2; c003 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a02, a03, b01, c000, c001, c002, c003);
+                c000 = d0; c001 = d1; c002 = d2; c003 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, b10, c010, c011, c012, c013);
+                c010 = d0; c011 = d1; c012 = d2; c013 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a02, a03, b11, c010, c011, c012, c013);
+                c010 = d0; c011 = d1; c012 = d2; c013 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, b20, c020, c021, c022, c023);
+                c020 = d0; c021 = d1; c022 = d2; c023 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a02, a03, b21, c020, c021, c022, c023);
+                c020 = d0; c021 = d1; c022 = d2; c023 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, b30, c030, c031, c032, c033);
+                c030 = d0; c031 = d1; c032 = d2; c033 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a02, a03, b31, c030, c031, c032, c033);
+                c030 = d0; c031 = d1; c032 = d2; c033 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, b00, c100, c101, c102, c103);
+                c100 = d0; c101 = d1; c102 = d2; c103 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a12, a13, b01, c100, c101, c102, c103);
+                c100 = d0; c101 = d1; c102 = d2; c103 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, b10, c110, c111, c112, c113);
+                c110 = d0; c111 = d1; c112 = d2; c113 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a12, a13, b11, c110, c111, c112, c113);
+                c110 = d0; c111 = d1; c112 = d2; c113 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, b20, c120, c121, c122, c123);
+                c120 = d0; c121 = d1; c122 = d2; c123 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a12, a13, b21, c120, c121, c122, c123);
+                c120 = d0; c121 = d1; c122 = d2; c123 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, b30, c130, c131, c132, c133);
+                c130 = d0; c131 = d1; c132 = d2; c133 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a12, a13, b31, c130, c131, c132, c133);
+                c130 = d0; c131 = d1; c132 = d2; c133 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a20, a21, b00, c200, c201, c202, c203);
+                c200 = d0; c201 = d1; c202 = d2; c203 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a22, a23, b01, c200, c201, c202, c203);
+                c200 = d0; c201 = d1; c202 = d2; c203 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a20, a21, b10, c210, c211, c212, c213);
+                c210 = d0; c211 = d1; c212 = d2; c213 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a22, a23, b11, c210, c211, c212, c213);
+                c210 = d0; c211 = d1; c212 = d2; c213 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a20, a21, b20, c220, c221, c222, c223);
+                c220 = d0; c221 = d1; c222 = d2; c223 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a22, a23, b21, c220, c221, c222, c223);
+                c220 = d0; c221 = d1; c222 = d2; c223 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a20, a21, b30, c230, c231, c232, c233);
+                c230 = d0; c231 = d1; c232 = d2; c233 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a22, a23, b31, c230, c231, c232, c233);
+                c230 = d0; c231 = d1; c232 = d2; c233 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a30, a31, b00, c300, c301, c302, c303);
+                c300 = d0; c301 = d1; c302 = d2; c303 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a32, a33, b01, c300, c301, c302, c303);
+                c300 = d0; c301 = d1; c302 = d2; c303 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a30, a31, b10, c310, c311, c312, c313);
+                c310 = d0; c311 = d1; c312 = d2; c313 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a32, a33, b11, c310, c311, c312, c313);
+                c310 = d0; c311 = d1; c312 = d2; c313 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a30, a31, b20, c320, c321, c322, c323);
+                c320 = d0; c321 = d1; c322 = d2; c323 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a32, a33, b21, c320, c321, c322, c323);
+                c320 = d0; c321 = d1; c322 = d2; c323 = d3;
+                }
+                }
+                {
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a30, a31, b30, c330, c331, c332, c333);
+                c330 = d0; c331 = d1; c332 = d2; c333 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                    out float d0, out float d1, out float d2, out float d3, a32, a33, b31, c330, c331, c332, c333);
+                c330 = d0; c331 = d1; c332 = d2; c333 = d3;
+                }
                 }
             }
             Group.Barrier();

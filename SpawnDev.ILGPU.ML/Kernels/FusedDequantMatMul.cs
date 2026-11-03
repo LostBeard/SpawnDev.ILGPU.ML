@@ -132,9 +132,11 @@ public class FusedDequantMatMul : IDisposable
     public static bool EnableFastGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_FAST") != "0";
     /// <summary>M &gt; 1 of Q4_K on the tensor-core GEMM (<see cref="MmaQ4KGemm"/>) on CUDA sm_80+ (default on). GGUF_GEMM_MMA=0 turns it off (the SIMT kernels: the A/B).</summary>
     public static bool EnableMmaGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA") != "0";
-    /// <summary>The kernel family <see cref="Forward"/> last took for M &gt; 1 ("mma-q4k" or "simt"): tests check the route they mean to cover.</summary>
+    /// <summary>The kernel family <see cref="Forward"/> last took for M &gt; 1 ("mma-q4k", "mma-q4k-sm75" or "simt"): tests check the route they mean to cover.</summary>
     public string LastGemmKernel { get; private set; } = "";
-    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ4K;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ4K, _mmaQ4KSm75;
+    /// <summary>Tests: the Turing (sm_75, m16n8k8) variant of the tensor-core GEMM on an sm_80+ card too (its instructions run there), so it is gated where no Turing card is.</summary>
+    public static bool ForceSm75Mma = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_SM75") == "1";
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _fastQ4_K;
     private const int FgBm = 128, FgBn = 128, FgBk = 32, FgThreads = 256, FgPer = 8;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
@@ -357,13 +359,18 @@ public class FusedDequantMatMul : IDisposable
         // M > 1 of Q4_K on CUDA sm_80+: the tensor-core GEMM (MmaQ4KGemm: weights dequantised to f16 in shared memory, f16 x f16 -> f32 mma.sync). MEASURED
         // 2026-11-02 before it (RTX 4070, llama3.1:8b, a 4,400-token prefill): the SIMT GEMMs ran gate-up at ~7.6 TFLOPS and down at ~4.8, 67% of the prefill.
         LastGemmKernel = "simt";
-        if (M > 1 && type == GGMLType.Q4_K && EnableMmaGemm && K % 256 == 0 && CudaCaps.TensorCores(_accelerator)
+        // sm_75 (Turing) on the same kernel built from m16n8k8 (KernelSm75); ForceSm75Mma runs that variant on a newer card (the tests)
+        bool sm80 = CudaCaps.TensorCores(_accelerator), sm75 = CudaCaps.TuringTensorCores(_accelerator);
+        if (M > 1 && type == GGMLType.Q4_K && EnableMmaGemm && K % 256 == 0 && (sm80 || sm75)
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
         {
-            _mmaQ4K ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaQ4KGemm.Kernel);
-            _mmaQ4K(new KernelConfig(((M + MmaQ4KGemm.BM - 1) / MmaQ4KGemm.BM) * ((N + MmaQ4KGemm.BN - 1) / MmaQ4KGemm.BN), MmaQ4KGemm.Threads),
+            bool turing = !sm80 || ForceSm75Mma;
+            var kernel = turing
+                ? _mmaQ4KSm75 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaQ4KGemm.KernelSm75)
+                : _mmaQ4K ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaQ4KGemm.Kernel);
+            kernel(new KernelConfig(((M + MmaQ4KGemm.BM - 1) / MmaQ4KGemm.BM) * ((N + MmaQ4KGemm.BN - 1) / MmaQ4KGemm.BN), MmaQ4KGemm.Threads),
                 input.SubView(0, (long)M * K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, M, K, N);
-            LastGemmKernel = "mma-q4k";
+            LastGemmKernel = turing ? "mma-q4k-sm75" : "mma-q4k";
             return;
         }
 

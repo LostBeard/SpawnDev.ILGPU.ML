@@ -21,7 +21,15 @@ public abstract partial class MLTestBase
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
         var hub = new ModelsHostStreamLoader(http);
         var src = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
-        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 1536, maxBatch: 4);
+        // F32 caches: this compares two attention kernels whose chunking differs (GqaChunk), so a step's float-order difference (1e-7) must not cross the F16
+        // rounding of the K / V rows the next step writes: MEASURED 2026-11-02 with F16 caches, 1.7-2.2e-4 relative RMS after four steps (greedy unchanged).
+        // The F16 cache has its own gate (GgufBatchDecoder_HalfKvCache_MatchesF32).
+        bool halfSaved = GgufBatchDecoder.HalfKvCache;
+        GgufBatchDecoder.HalfKvCache = false;
+        GgufBatchDecoder dec;
+        try { dec = await GgufBatchDecoder.CreateAsync(accelerator, src.Stream, maxSeq: 1536, maxBatch: 4); }
+        finally { GgufBatchDecoder.HalfKvCache = halfSaved; }
+        using var _dec = dec;
         if (!dec.FusedAttention) throw new UnsupportedTestException("no split-K attention on this accelerator");
         var tok = SentencePieceTokenizer.FromGGUF(dec.Model)!;
         var text = string.Concat(Enumerable.Repeat("The keeper climbed the stairs of the lighthouse every evening to light the lamp. ", 34));
@@ -39,14 +47,18 @@ public abstract partial class MLTestBase
             return (steps, greedy);
         }
         var perHead = await Run(false);
+        int capturesBefore = dec.CaptureStats.Captures;
         var grouped = await Run(true);
+        // WebGPU replays captured steps: switching the route must capture again, or the "grouped" run replays the per-head kernels and this compares
+        // per-head with itself (it did before 2026-11-02: GqaAttention did not invalidate the captured plans)
+        bool recaptured = !dec.CaptureWebGPU || capturesBefore == 0 || dec.CaptureStats.Captures > capturesBefore;
         double se = 0, sr = 0;
         for (int i = 0; i < perHead.Steps.Length; i++) { double d = grouped.Steps[i] - perHead.Steps[i]; se += d * d; sr += (double)perHead.Steps[i] * perHead.Steps[i]; }
         float rel = (float)Math.Sqrt(se / Math.Max(1e-30, sr));
         bool same = grouped.Greedy.SequenceEqual(perHead.Greedy);
-        var report = $"{accelerator.AcceleratorType}: {ids.Length}-token prompt, G = {dec.Model.AttentionHeadCount / dec.Model.AttentionHeadCountKV}: grouped vs per-head attention, 4 batched steps' logits rel RMS {rel:E2}; 32 greedy tokens {(same ? "same" : "DIFFER")}";
+        var report = $"{accelerator.AcceleratorType}: {ids.Length}-token prompt, G = {dec.Model.AttentionHeadCount / dec.Model.AttentionHeadCountKV}: grouped vs per-head attention, 4 batched steps' logits rel RMS {rel:E2}; 32 greedy tokens {(same ? "same" : "DIFFER")}; captures {capturesBefore} -> {dec.CaptureStats.Captures}{(recaptured ? "" : " (the switch did NOT capture again)")}";
         Console.WriteLine("[GqaAttn] " + report);
-        if (rel > 1e-5f || !same) throw new Exception(report);
+        if (rel > 1e-5f || !same || !recaptured) throw new Exception(report);
         return report;
     });
 
