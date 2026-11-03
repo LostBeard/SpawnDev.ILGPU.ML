@@ -35,3 +35,15 @@ Goal: `Classify(clip, string[] labels) -> probabilities` on the device, labels d
 5. `ClapAudioClassifier`: cached text embeddings per label set, logit scale, softmax; gate logits; a real-clip check
    (gunshot / footsteps / engine) for sanity.
 6. Speed on CUDA / WebGPU; tell Riker.
+
+## Status (2026-11-03, 341fcbd7) - all six steps DONE
+1. Fixtures: tools/clap-reference/make_fixtures.py, each prompt tokenised alone (text_model.onnx has no attention_mask).
+2. Features: `Clap_Features_MatchTransformers` green (signal within 0.0014 dB).
+3. Towers: `Clap_Towers_MatchTransformers` green on CUDA / OpenCL / WebGPU after the cubic Resize align_corners fix (the operator fell back
+   to bilinear; found with ort_node_reference.py + first_divergence.py).
+4. Tokenizer: `BPETokenizer.Encode` now exact GPT-2 byte-level; `EncodeRoberta`; `Clap_Tokenizer_MatchesTransformers` green.
+5. `ClapAudioClassifier` + `Clap_Classifier_EndToEnd` green. Real clip: bare labels score speech as "music" in transformers itself; the
+   "This is a sound of X" template fixes it (speech 0.929).
+6. Warm classify per clip (RTX 4070): CUDA 11-18 ms, OpenCL 11-12 ms, WebGPU 50-76 ms. Riker told (API, timings, template).
+
+Later: GPU-side logits (skip the 512-float readback when only the top label is wanted); batch several clips per audio run.
