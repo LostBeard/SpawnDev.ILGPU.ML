@@ -166,6 +166,32 @@ public sealed class SpectralFrontend : IDisposable
     }
 
     /// <summary>
+    /// Band filters from a dense matrix, bin-major <c>filters[bin * bands + b]</c> over <see cref="Bins"/> bins (e.g. <see cref="MelFilters.Build"/>: the
+    /// exact filters a model's feature extractor uses). Each band keeps the span from its first to its last non-zero weight; a band with no non-zero
+    /// weight pools to 0 (as the dense product does).
+    /// </summary>
+    public void SetBandFilters(float[] filters, int bands)
+    {
+        if (bands < 1 || filters.Length != Bins * bands) throw new ArgumentException($"filters must hold Bins x bands = {Bins} x {bands} values", nameof(filters));
+        var ranges = new int[2 * bands + 1];
+        var weights = new List<float>();
+        for (int b = 0; b < bands; b++)
+        {
+            int first = -1, last = -1;
+            for (int k = 0; k < Bins; k++) if (filters[k * bands + b] != 0f) { if (first < 0) first = k; last = k; }
+            ranges[2 * b] = Math.Max(first, 0); ranges[2 * b + 1] = weights.Count;
+            if (first >= 0) for (int k = first; k <= last; k++) weights.Add(filters[k * bands + b]);
+        }
+        ranges[2 * bands] = weights.Count;
+        if (weights.Count == 0) weights.Add(0f);                      // an all-zero bank still needs a non-empty buffer
+        _bandWeights?.Dispose(); _bandRanges?.Dispose();
+        _bandWeights = _acc.Allocate1D(weights.ToArray());
+        _bandRanges = _acc.Allocate1D(ranges);
+        _bands ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, FV, int, int, int, float>(BandsImpl);
+        Bands = bands;
+    }
+
+    /// <summary>
     /// The host band filters: ranges[2b] = first bin, ranges[2b + 1] = offset of band b's weights in the weight array (band b covers bins
     /// first .. first + (offset[b + 1] - offset[b]) - 1); one extra offset closes the array. Public: the tests' oracle uses the same filters.
     /// </summary>
