@@ -50,6 +50,8 @@ public class OperatorRegistry : IDisposable
         "QLinearConv", "QLinearMatMul", "QuantizeLinear", "RNN", "RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike",
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
         "RoPE", "ShortConv", "GatedDeltaNet",
+        // gradient ops emitted by the training autograd (Training/BackwardKernels.cs)
+        "RMSNormGrad", "SwiGLUGrad", "RoPEGrad", "SoftmaxCrossEntropyLossGrad", "FusedAttentionGrad",
         "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
         "RMSNormalization",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
@@ -79,6 +81,8 @@ public class OperatorRegistry : IDisposable
     public ReductionKernels Reductions { get; }
     public PoolingKernels Pooling { get; }
     public NormalizationKernels Normalization { get; }
+    /// <summary>Gradient kernels for the training autograd.</summary>
+    public Training.BackwardKernels Backward { get; }
     public TransposeKernel Transpose { get; }
     public GatherKernel Gather { get; }
     /// <summary>The 2D Conv as an implicit GEMM (fp16 weights): see <see cref="Kernels.Conv2DGemm"/>.</summary>
@@ -136,6 +140,7 @@ public class OperatorRegistry : IDisposable
         Reductions = new ReductionKernels(accelerator);
         Pooling = new PoolingKernels(accelerator);
         Normalization = new NormalizationKernels(accelerator);
+        Backward = new Training.BackwardKernels(accelerator);
         Transpose = new TransposeKernel(accelerator);
         Gather = new GatherKernel(accelerator);
         ConvGemm = new Kernels.Conv2DGemm(accelerator);
@@ -407,6 +412,12 @@ public class OperatorRegistry : IDisposable
         // True RMSNorm (every RMS decoder: llama/mistral/qwen/gemma). Distinct from the
         // mean-centered LayerNormalization — see RMSNormOperator.
         Register(new RMSNormOperator(this));
+        // Training autograd gradient ops (Operators/TrainingOperators.cs)
+        Register(new RMSNormGradOperator(this));
+        Register(new SwiGLUGradOperator(this));
+        Register(new RoPEGradOperator(this));
+        Register(new SoftmaxCrossEntropyLossGradOperator(this));
+        Register(new FusedAttentionGradOperator(this));
         // ORT contrib alias of RMSNorm (Florence / Phi vision encoders, etc.).
         Register(new SimplifiedLayerNormalizationOperator(this));
         Register(new ShortConvOperator(this));
@@ -513,6 +524,7 @@ public class OperatorRegistry : IDisposable
         try { (Concat as IDisposable)?.Dispose(); } catch { }
         try { (MissingElementWise as IDisposable)?.Dispose(); } catch { }
         try { (PrecisionAware as IDisposable)?.Dispose(); } catch { }
+        try { Backward.Dispose(); } catch { }
 
         // Dispose cached zero-bias buffers (one per distinct outC seen).
         foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }
