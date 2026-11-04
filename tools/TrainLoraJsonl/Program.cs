@@ -6,7 +6,7 @@
 //
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
-//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch]
+//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch] [--no-dev-loss]
 // --eval-only: skip training; evaluate the adapters already in --out. Every run writes <out>/generation_eval.jsonl: per dev line the
 // prompt, the target and the generated ids of the base model and of the adapters (a fixture for SpawnDev.AI's adapter test).
 using System.Diagnostics;
@@ -74,9 +74,12 @@ if (!evalOnly)
 using var trainer = await GgufLoraTrainer.CreateFromFileAsync(accelerator, args[0], options);
 Console.WriteLine($"{accelerator.Name} ({accelerator.AcceleratorType}): loaded in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters rank {rank} alpha {alpha} on {string.Join(",", targets)}; lr {lr}, accum {accum}, checkpoint {options.CheckpointLayers}");
 
+// --no-dev-loss: a dev loss runs the training graph's backward too (~3x a forward); long runs skip it, save every epoch and rely on
+// the final generation eval
+bool noDevLoss = args.Contains("--no-dev-loss");
 async Task<double> DevLossAsync()
 {
-    if (dev.Count == 0) return double.NaN;
+    if (dev.Count == 0 || noDevLoss) return double.NaN;
     double sum = 0;
     foreach (var (_, ids, labels) in dev) sum += await trainer.StepAsync(ids, labels, update: false);
     return sum / dev.Count;
@@ -99,7 +102,7 @@ for (int ep = 1; ep <= epochs; ep++)
     double devLoss = await DevLossAsync();
     Console.WriteLine($"epoch {ep}: train loss {trainSum / order.Count:F4}, dev loss {devLoss:F4}, {trainer.Step} AdamW steps, {sw.Elapsed.TotalSeconds:F0} s");
     log.Add(new { epoch = ep, train_loss = trainSum / order.Count, dev_loss = devLoss, steps = trainer.Step, seconds = sw.Elapsed.TotalSeconds });
-    if (dev.Count == 0 || devLoss < best)
+    if (dev.Count == 0 || noDevLoss || devLoss < best)
     {
         best = devLoss;
         var (st, cfgJson) = await trainer.SaveAdaptersAsync(Path.GetFileName(args[0]));

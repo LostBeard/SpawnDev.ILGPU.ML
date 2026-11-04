@@ -209,9 +209,10 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Backward_MatMulTransposedQuant_MatchesDequantReference() => await RunTest(async accelerator =>
     {
-        int M = 3, K = 256, N = 40;
+        const int K = 256, N = 40;
         var notes = new List<string>();
-        foreach (var type in new[] { GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q8_0 })
+        // M = 70 crosses the tiled kernel's 64-row tile (partial second tile); M = 3 is a single partial tile
+        foreach (var (type, M) in new[] { (GGMLType.Q4_K, 3), (GGMLType.Q6_K, 3), (GGMLType.Q8_0, 3), (GGMLType.Q4_K, 70), (GGMLType.Q6_K, 70) })
         {
             var rng = new Random(560 + (int)type);
             int rb = RowBytes(type, K);
@@ -239,7 +240,7 @@ public abstract partial class MLTestBase
                 }
             }
             finally { BackwardKernels.UseTiledQuantT = saved; }
-            notes.Add(type.ToString());
+            notes.Add($"{type} M={M}");
         }
         return "dx = dy W^T through quantized W matches the CPU dequant reference: " + string.Join(", ", notes);
     });

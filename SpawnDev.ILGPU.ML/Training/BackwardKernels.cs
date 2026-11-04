@@ -271,13 +271,16 @@ public sealed class BackwardKernels : IDisposable
 
     /// <summary>The shared-memory tiled kernel for <see cref="MatMulTransposedQuant"/> (default on; false = the per-element kernel, the A/B control).</summary>
     public static bool UseTiledQuantT { get; set; } = true;
-    private const int TqM = 16, TqK = 64, TqN = 32, TqThreads = 256;
+    // MEASURED 2026-11-04 (llama3.1:8b training step, 1,600 tokens, per-op sync): with TqM = 16 the transposed matmul was 60% of the step
+    // (25.5 s, 16x the forward GEMMs): each decoded weight served only 16 rows, and every one of the 100 row tiles decoded the same weight
+    // tile again - decode-bound. TqM = 64 with a 4 x 4 register block per thread: each decode serves 64 rows.
+    private const int TqM = 64, TqK = 64, TqN = 16, TqThreads = 256;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int, int, int, int>? _matmulQuantTTiled;
 
-    // One group = a TqM x TqK tile of dx. Per chunk of TqN weight rows: the group stages dy[TqM, TqN] and DECODES W[TqN rows, TqK cols] once into
-    // shared memory (each W value is decoded once per group instead of once per output row), then every thread accumulates its 4 outputs
-    // (one row m, four consecutive k). Bounds are zero-filled, so any M, K, N.
+    // One group = a TqM x TqK (64 x 64) tile of dx; thread (tr, tc) of the 16 x 16 group owns rows tr*4..+3 and columns tc*4..+3 (a 4 x 4
+    // register block). Per chunk of TqN weight rows: the group stages dy[TqM, TqN] and DECODES W[TqN rows, TqK cols] once into shared
+    // memory (each W value is decoded once per 64 output rows), then every thread accumulates its 16 outputs. Bounds are zero-filled.
     private static void MatMulTransposedQuantTiledImpl(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<int, Stride1D.Dense> w,
         ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes, int tilesK)
     {
@@ -286,8 +289,10 @@ public sealed class BackwardKernels : IDisposable
         int tile = Grid.IdxX;
         int m0 = (tile / tilesK) * TqM, k0 = (tile % tilesK) * TqK;
         int tid = Group.IdxX;
-        int mm = tid / 16, kq = (tid % 16) * 4;
-        float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f;
+        int tr = tid / 16, tc = tid % 16;
+        int mb = tr * 4, kb = tc * 4;
+        float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f;
+        float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c30 = 0f, c31 = 0f, c32 = 0f, c33 = 0f;
         for (int n0 = 0; n0 < N; n0 += TqN)
         {
             for (int e = tid; e < TqM * TqN; e += TqThreads)
@@ -305,15 +310,25 @@ public sealed class BackwardKernels : IDisposable
             Group.Barrier();
             for (int nn = 0; nn < TqN; nn++)
             {
-                float d = dyT[mm * TqN + nn];
-                int wb = nn * TqK + kq;
-                a0 += d * wT[wb]; a1 += d * wT[wb + 1]; a2 += d * wT[wb + 2]; a3 += d * wT[wb + 3];
+                float d0 = dyT[(mb + 0) * TqN + nn], d1 = dyT[(mb + 1) * TqN + nn], d2 = dyT[(mb + 2) * TqN + nn], d3 = dyT[(mb + 3) * TqN + nn];
+                int wb = nn * TqK + kb;
+                float w0 = wT[wb], w1 = wT[wb + 1], w2 = wT[wb + 2], w3 = wT[wb + 3];
+                c00 += d0 * w0; c01 += d0 * w1; c02 += d0 * w2; c03 += d0 * w3;
+                c10 += d1 * w0; c11 += d1 * w1; c12 += d1 * w2; c13 += d1 * w3;
+                c20 += d2 * w0; c21 += d2 * w1; c22 += d2 * w2; c23 += d2 * w3;
+                c30 += d3 * w0; c31 += d3 * w1; c32 += d3 * w2; c33 += d3 * w3;
             }
             Group.Barrier();
         }
-        int mo = m0 + mm, ko = k0 + kq;
-        if (mo < M)
+        int ko = k0 + kb;
+        for (int i = 0; i < 4; i++)
         {
+            int mo = m0 + mb + i;
+            if (mo >= M) break;
+            float a0 = i == 0 ? c00 : i == 1 ? c10 : i == 2 ? c20 : c30;
+            float a1 = i == 0 ? c01 : i == 1 ? c11 : i == 2 ? c21 : c31;
+            float a2 = i == 0 ? c02 : i == 1 ? c12 : i == 2 ? c22 : c32;
+            float a3 = i == 0 ? c03 : i == 1 ? c13 : i == 2 ? c23 : c33;
             int ob = mo * K + ko;
             if (ko < K) dx[ob] = a0;
             if (ko + 1 < K) dx[ob + 1] = a1;
@@ -473,26 +488,33 @@ public sealed class BackwardKernels : IDisposable
     /// of keys (or queries) in shared memory and walk the other side once, so each score is computed once per block, not once per output.
     /// </summary>
     public static bool UseBlockedAttentionBackward { get; set; } = true;
-    private const int FaB = 16, FaThreads = 256, FaMaxHd = 128;
+    // FaB = the block a group keeps resident (keys for dk/dv, query rows for dq); FaS = the rows of the OTHER side processed per iteration.
+    // MEASURED 2026-11-04 (llama3.1:8b, 1,600 tokens): one row per iteration (3 barriers each, 16 of 256 threads scoring) made attention
+    // backward 52% of a training step (13.3 s, ~415 ms per layer). FaS = 8: 128 threads score 8 x 16 pairs per iteration, 8x fewer rounds.
+    private const int FaB = 16, FaS = 8, FaThreads = 256, FaMaxHd = 128;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, AttnDims>? _faDkDv;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, AttnDims>? _faDq;
 
-    // Group = (kv head, block of FaB keys). K/V of the block live in shared memory; the group walks every query row of the heads that share
-    // this kv head. Per row: FaB threads compute the FaB scores and dP values (head_dim MACs each), then every thread updates its outputs:
-    // FaB * head_dim values of dk and of dv, spread over the 256 threads (at most FaB * FaMaxHd / 256 = 8 each).
+    // 8 accumulators per thread (FaB * FaMaxHd / FaThreads): slot t holds output e = tid + t * FaThreads.
+    private static float Slot(int t, float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7)
+        => t == 0 ? a0 : t == 1 ? a1 : t == 2 ? a2 : t == 3 ? a3 : t == 4 ? a4 : t == 5 ? a5 : t == 6 ? a6 : a7;
+
+    // Group = (kv head, block of FaB keys), resident in shared memory with dk/dv accumulators in registers. The group walks the query rows of
+    // every head sharing this kv head, FaS rows per iteration: 128 threads score the FaS x FaB (row, key) pairs (p and dS), then every thread
+    // adds the FaS rows' contributions to its outputs.
     private static void FaDkDvImpl(ArrayView1D<float, Stride1D.Dense> q, ArrayView1D<float, Stride1D.Dense> k, ArrayView1D<float, Stride1D.Dense> v,
         ArrayView1D<float, Stride1D.Dense> dout, ArrayView1D<float, Stride1D.Dense> stats, ArrayView1D<float, Stride1D.Dense> dk,
         ArrayView1D<float, Stride1D.Dense> dv, AttnDims d)
     {
         var kB = SharedMemory.Allocate<float>(FaB * FaMaxHd);
         var vB = SharedMemory.Allocate<float>(FaB * FaMaxHd);
-        var qi = SharedMemory.Allocate<float>(FaMaxHd);
-        var doi = SharedMemory.Allocate<float>(FaMaxHd);
-        var pS = SharedMemory.Allocate<float>(FaB);
-        var dsS = SharedMemory.Allocate<float>(FaB);
+        var qS = SharedMemory.Allocate<float>(FaS * FaMaxHd);
+        var doS = SharedMemory.Allocate<float>(FaS * FaMaxHd);
+        var pS = SharedMemory.Allocate<float>(FaS * FaB);
+        var dsS = SharedMemory.Allocate<float>(FaS * FaB);
         int hd = d.HeadDim;
         int blocks = (d.SeqKV + FaB - 1) / FaB;
         int kvh = Grid.IdxX / blocks, j0 = (Grid.IdxX % blocks) * FaB;
@@ -508,38 +530,47 @@ public sealed class BackwardKernels : IDisposable
         float v0 = 0f, v1 = 0f, v2 = 0f, v3 = 0f, v4 = 0f, v5 = 0f, v6 = 0f, v7 = 0f;
         Group.Barrier();
         int group = d.Heads / d.KvHeads;
+        // causal: row i sees key j only when j <= i + kv_offset; rows below j0 - kv_offset see none of this block (a uniform bound)
+        int iStart = d.Causal == 1 ? Math.Max(0, j0 - d.KvOffset) : 0;
         for (int g = 0; g < group; g++)
         {
             int h = kvh * group + g;
-            // causal: query row i sees key j only when j <= i + kv_offset, so rows below j0 - kv_offset see none of this block (a uniform bound)
-            int iStart = d.Causal == 1 ? Math.Max(0, j0 - d.KvOffset) : 0;
-            for (int i = iStart; i < d.SeqQ; i++)
+            for (int i0 = iStart; i0 < d.SeqQ; i0 += FaS)
             {
-                int ob = (i * d.Heads + h) * hd;
-                for (int c = tid; c < hd; c += FaThreads) { qi[c] = q[ob + c]; doi[c] = dout[ob + c]; }
-                Group.Barrier();
-                if (tid < FaB)
+                for (int e = tid; e < FaS * hd; e += FaThreads)
                 {
-                    int j = j0 + tid;
+                    int ii = e / hd, c = e - ii * hd, i = i0 + ii;
+                    int ob = (i * d.Heads + h) * hd + c;
+                    qS[e] = i < d.SeqQ ? q[ob] : 0f;
+                    doS[e] = i < d.SeqQ ? dout[ob] : 0f;
+                }
+                Group.Barrier();
+                if (tid < FaS * FaB)
+                {
+                    int ii = tid / FaB, jj = tid - ii * FaB, i = i0 + ii, j = j0 + jj;
                     float p = 0f, ds = 0f;
-                    if (j < d.SeqKV && Allowed(i, j, d))
+                    if (i < d.SeqQ && j < d.SeqKV && Allowed(i, j, d))
                     {
-                        float s = 0f, dp = 0f;
-                        for (int c = 0; c < hd; c++) { s += qi[c] * kB[tid * hd + c]; dp += doi[c] * vB[tid * hd + c]; }
+                        float sc = 0f, dp = 0f;
+                        for (int c = 0; c < hd; c++) { sc += qS[ii * hd + c] * kB[jj * hd + c]; dp += doS[ii * hd + c] * vB[jj * hd + c]; }
                         int sr = h * d.SeqQ + i;
-                        p = MathF.Exp(s * d.Scale - stats[sr]);
+                        p = MathF.Exp(sc * d.Scale - stats[sr]);
                         ds = p * (dp - stats[d.Heads * d.SeqQ + sr]);
                     }
                     pS[tid] = p; dsS[tid] = ds;
                 }
                 Group.Barrier();
-                // output slot t of this thread = e = tid + t * FaThreads -> (key jj = e / hd, column c = e % hd)
                 for (int t = 0; t < 8; t++)
                 {
                     int e = tid + t * FaThreads;
                     if (e >= nOut) break;
                     int jj = e / hd, c = e - jj * hd;
-                    float addK = dsS[jj] * qi[c], addV = pS[jj] * doi[c];
+                    float addK = 0f, addV = 0f;
+                    for (int ii = 0; ii < FaS; ii++)
+                    {
+                        addK += dsS[ii * FaB + jj] * qS[ii * hd + c];
+                        addV += pS[ii * FaB + jj] * doS[ii * hd + c];
+                    }
                     switch (t)
                     {
                         case 0: k0 += addK; v0 += addV; break;
@@ -561,24 +592,22 @@ public sealed class BackwardKernels : IDisposable
             if (e >= nOut) break;
             int jj = e / hd, c = e - jj * hd, j = j0 + jj;
             if (j >= d.SeqKV) continue;
-            float ak = t == 0 ? k0 : t == 1 ? k1 : t == 2 ? k2 : t == 3 ? k3 : t == 4 ? k4 : t == 5 ? k5 : t == 6 ? k6 : k7;
-            float av = t == 0 ? v0 : t == 1 ? v1 : t == 2 ? v2 : t == 3 ? v3 : t == 4 ? v4 : t == 5 ? v5 : t == 6 ? v6 : v7;
             int o = (j * d.KvHeads + kvh) * hd + c;
-            dk[o] = ak * d.Scale;
-            dv[o] = av;
+            dk[o] = Slot(t, k0, k1, k2, k3, k4, k5, k6, k7) * d.Scale;
+            dv[o] = Slot(t, v0, v1, v2, v3, v4, v5, v6, v7);
         }
     }
 
-    // Group = (head, block of FaB query rows). The block's q rows and dout rows live in shared memory; the group walks the keys. Per key:
-    // FaB threads compute the FaB scores and dP values, then every thread updates its dq outputs (FaB * head_dim spread over 256 threads).
+    // Group = (head, block of FaB query rows), resident in shared memory with dq accumulators in registers. The group walks the keys FaS per
+    // iteration: 128 threads compute the FaB x FaS (row, key) dS values, then every thread adds them times the keys to its outputs.
     private static void FaDqImpl(ArrayView1D<float, Stride1D.Dense> q, ArrayView1D<float, Stride1D.Dense> k, ArrayView1D<float, Stride1D.Dense> v,
         ArrayView1D<float, Stride1D.Dense> dout, ArrayView1D<float, Stride1D.Dense> stats, ArrayView1D<float, Stride1D.Dense> dq, AttnDims d)
     {
         var qB = SharedMemory.Allocate<float>(FaB * FaMaxHd);
         var doB = SharedMemory.Allocate<float>(FaB * FaMaxHd);
-        var kj = SharedMemory.Allocate<float>(FaMaxHd);
-        var vj = SharedMemory.Allocate<float>(FaMaxHd);
-        var dsS = SharedMemory.Allocate<float>(FaB);
+        var kS = SharedMemory.Allocate<float>(FaS * FaMaxHd);
+        var vS = SharedMemory.Allocate<float>(FaS * FaMaxHd);
+        var dsS = SharedMemory.Allocate<float>(FaB * FaS);
         int hd = d.HeadDim;
         int blocks = (d.SeqQ + FaB - 1) / FaB;
         int h = Grid.IdxX / blocks, i0 = (Grid.IdxX % blocks) * FaB;
@@ -593,23 +622,28 @@ public sealed class BackwardKernels : IDisposable
         }
         float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f, a4 = 0f, a5 = 0f, a6 = 0f, a7 = 0f;
         Group.Barrier();
-        // causal: the block's last row sees keys up to (i0 + FaB - 1) + kv_offset; later keys are masked for every row here (a uniform bound)
+        // causal: the block's last row sees keys up to (i0 + FaB - 1) + kv_offset (a uniform bound)
         int jEnd = d.Causal == 1 ? Math.Min(d.SeqKV, i0 + FaB + d.KvOffset) : d.SeqKV;
-        for (int j = 0; j < jEnd; j++)
+        for (int j0 = 0; j0 < jEnd; j0 += FaS)
         {
-            int kb = (j * d.KvHeads + kvh) * hd;
-            for (int c = tid; c < hd; c += FaThreads) { kj[c] = k[kb + c]; vj[c] = v[kb + c]; }
-            Group.Barrier();
-            if (tid < FaB)
+            for (int e = tid; e < FaS * hd; e += FaThreads)
             {
-                int i = i0 + tid;
+                int jj = e / hd, c = e - jj * hd, j = j0 + jj;
+                int kb = (j * d.KvHeads + kvh) * hd + c;
+                kS[e] = j < d.SeqKV ? k[kb] : 0f;
+                vS[e] = j < d.SeqKV ? v[kb] : 0f;
+            }
+            Group.Barrier();
+            if (tid < FaB * FaS)
+            {
+                int ii = tid / FaS, jj = tid - ii * FaS, i = i0 + ii, j = j0 + jj;
                 float ds = 0f;
-                if (i < d.SeqQ && Allowed(i, j, d))
+                if (i < d.SeqQ && j < d.SeqKV && Allowed(i, j, d))
                 {
-                    float s = 0f, dp = 0f;
-                    for (int c = 0; c < hd; c++) { s += qB[tid * hd + c] * kj[c]; dp += doB[tid * hd + c] * vj[c]; }
+                    float sc = 0f, dp = 0f;
+                    for (int c = 0; c < hd; c++) { sc += qB[ii * hd + c] * kS[jj * hd + c]; dp += doB[ii * hd + c] * vS[jj * hd + c]; }
                     int sr = h * d.SeqQ + i;
-                    float p = MathF.Exp(s * d.Scale - stats[sr]);
+                    float p = MathF.Exp(sc * d.Scale - stats[sr]);
                     ds = p * (dp - stats[d.Heads * d.SeqQ + sr]);
                 }
                 dsS[tid] = ds;
@@ -620,7 +654,8 @@ public sealed class BackwardKernels : IDisposable
                 int e = tid + t * FaThreads;
                 if (e >= nOut) break;
                 int ii = e / hd, c = e - ii * hd;
-                float add = dsS[ii] * kj[c];
+                float add = 0f;
+                for (int jj = 0; jj < FaS; jj++) add += dsS[ii * FaS + jj] * kS[jj * hd + c];
                 switch (t)
                 {
                     case 0: a0 += add; break;
@@ -641,8 +676,7 @@ public sealed class BackwardKernels : IDisposable
             if (e >= nOut) break;
             int ii = e / hd, c = e - ii * hd, i = i0 + ii;
             if (i >= d.SeqQ) continue;
-            float a = t == 0 ? a0 : t == 1 ? a1 : t == 2 ? a2 : t == 3 ? a3 : t == 4 ? a4 : t == 5 ? a5 : t == 6 ? a6 : a7;
-            dq[(i * d.Heads + h) * hd + c] = a * d.Scale;
+            dq[(i * d.Heads + h) * hd + c] = Slot(t, a0, a1, a2, a3, a4, a5, a6, a7) * d.Scale;
         }
     }
 

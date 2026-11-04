@@ -52,6 +52,26 @@ await trainer.SetAdaptersAsync(start);
 var ids = Enumerable.Range(0, seq).Select(_ => rng.Next(100, trainer.VocabSize - 100)).ToArray();
 var labels = ids.Select((_, t) => t >= seq / 2 && t < seq - 1 ? ids[t + 1] : -100).ToArray();
 
+if (args.Contains("--profile"))
+{
+    // one warm step, then one step with per-op sync and per-node timing: where a training step's GPU time goes, by op type
+    await trainer.StepAsync(ids, labels, update: false);
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true;
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+    var psw = Stopwatch.StartNew();
+    await trainer.StepAsync(ids, labels, update: false);
+    double total = psw.Elapsed.TotalMilliseconds;
+    var t = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs;
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = false;
+    static string Op(string key) { var parts = key.Split('_', 3); return parts.Length > 1 ? parts[1] : key; }
+    Console.WriteLine($"profile (seq {seq}, per-op sync): {t.Count} nodes, {t.Values.Sum():F0} ms in nodes of {total:F0} ms");
+    foreach (var g in t.GroupBy(kv => Op(kv.Key)).Select(g => (Op: g.Key, Ms: g.Sum(kv => kv.Value), N: g.Count())).OrderByDescending(x => x.Ms).Take(14))
+        Console.WriteLine($"  {g.Op,-28} {g.Ms,9:F0} ms  {g.N,5} nodes  {100 * g.Ms / t.Values.Sum(),5:F1}%");
+    foreach (var kv in t.OrderByDescending(kv => kv.Value).Take(8))
+        Console.WriteLine($"    {kv.Value,8:F1} ms  {kv.Key}");
+    return 0;
+}
 sw.Restart();
 float loss0 = await trainer.StepAsync(ids, labels, update: false);
 double firstMs = sw.Elapsed.TotalMilliseconds;
