@@ -24,7 +24,16 @@ public enum StopReason
 }
 
 /// <summary>The result of a generation: the decoded text and accounting.</summary>
-public sealed record GenerationResult(string Text, int PromptTokens, int GeneratedTokens, StopReason Stop);
+public sealed record GenerationResult(string Text, int PromptTokens, int GeneratedTokens, StopReason Stop)
+{
+    /// <summary>
+    /// The ids the model generated, in order: exactly the tokens <see cref="Text"/> was decoded from, as the model emitted them (which can be
+    /// a non-canonical tokenization of the text, so re-encoding the text does not reproduce them). The terminating stop / EOS token is NOT
+    /// included (neither engine keeps it); a stop STRING's tokens are, as the text before trimming held them. Training pairs use these
+    /// (Plans/training-autograd-lora-2026-11-04.md).
+    /// </summary>
+    public int[] GeneratedTokenIds { get; init; } = Array.Empty<int>();
+}
 
 /// <summary>
 /// General GGUF text generator on top of <see cref="InferenceSession"/>: the O(n) incremental KV-cache
@@ -491,7 +500,7 @@ public sealed class GgufGenerator : IDisposable
         // reuse this turn's prompt+response as its prefix.
         RecordResident(promptIds, generated, written);
 
-        return new GenerationResult(text.Text, promptIds.Length, generated.Count, stop);
+        return new GenerationResult(text.Text, promptIds.Length, generated.Count, stop) { GeneratedTokenIds = generated.ToArray() };
     }
 
     /// <summary>

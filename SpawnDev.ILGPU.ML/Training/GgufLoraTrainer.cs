@@ -68,17 +68,36 @@ public sealed class GgufLoraTrainer : IDisposable
     /// <summary>Load <paramref name="gguf"/>, add the adapters and the backward pass, and compile.</summary>
     public static GgufLoraTrainer Create(Accelerator accelerator, byte[] gguf, LoraOptions options)
     {
-        List<LoraAdapter>? adapters = null;
-        TrainingGraphInfo? info = null;
-        int vocab = 0;
-        var session = InferenceSession.CreateFromGGUF(accelerator, gguf, null, false, (graph, weights) =>
+        var t = new Transform(options);
+        var session = InferenceSession.CreateFromGGUF(accelerator, gguf, null, false, t.Apply);
+        return new GgufLoraTrainer(accelerator, session, options, t.Adapters!, t.Info!, t.Vocab);
+    }
+
+    /// <summary>
+    /// <see cref="Create"/> for a .gguf FILE, streamed to the device - the only way to load a model past ~2 GB (a byte[] caps there;
+    /// llama3.1:8b Q4_K_M is 4.9 GB).
+    /// </summary>
+    public static async Task<GgufLoraTrainer> CreateFromFileAsync(Accelerator accelerator, string ggufPath, LoraOptions options, CancellationToken ct = default)
+    {
+        var t = new Transform(options);
+        var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, ggufPath, null, ct, false, t.Apply).ConfigureAwait(false);
+        return new GgufLoraTrainer(accelerator, session, options, t.Adapters!, t.Info!, t.Vocab);
+    }
+
+    // The graph rewrite both loaders apply: adapters, then loss + backward.
+    private sealed class Transform(LoraOptions options)
+    {
+        public List<LoraAdapter>? Adapters;
+        public TrainingGraphInfo? Info;
+        public int Vocab;
+        public void Apply(Graph.ModelGraph graph, Dictionary<string, float[]> weights)
         {
-            adapters = GraphAutograd.AddLora(graph, weights, options.Targets, options.Rank, options.Alpha, options.Initial, options.Seed);
+            var adapters = GraphAutograd.AddLora(graph, weights, options.Targets, options.Rank, options.Alpha, options.Initial, options.Seed);
             var logits = graph.Outputs.FirstOrDefault(o => o.Name == "logits") ?? throw new InvalidOperationException("the graph has no 'logits' output");
-            vocab = logits.Shape[^1];
-            info = GraphAutograd.AddBackward(graph, "logits", logits.Shape[^1], adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex);
-        });
-        return new GgufLoraTrainer(accelerator, session, options, adapters!, info!, vocab);
+            Vocab = logits.Shape[^1];
+            Info = GraphAutograd.AddBackward(graph, "logits", Vocab, adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex);
+            Adapters = adapters;
+        }
     }
 
     /// <summary>
@@ -114,6 +133,13 @@ public sealed class GgufLoraTrainer : IDisposable
         }
         await _acc.SynchronizeAsync();
         return loss;
+    }
+
+    /// <summary>The logits of the last <see cref="StepAsync"/> at <paramref name="position"/> (one row of <see cref="VocabSize"/>), computed with the adapters as they were for that step.</summary>
+    public async Task<float[]> GetLogitsAsync(int position)
+    {
+        if (_lastOutputs == null) throw new InvalidOperationException("no step has run");
+        return await _lastOutputs["logits"].Data.SubView((long)position * VocabSize, VocabSize).CopyToHostAsync();
     }
 
     /// <summary>The gradients of the last <see cref="StepAsync"/> in PEFT layout (<c>{module}.lora_A.weight</c> [rank, in], <c>lora_B</c> [out, rank]).</summary>

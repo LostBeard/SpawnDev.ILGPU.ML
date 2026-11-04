@@ -527,6 +527,12 @@ public sealed class GgufBatchDecoder : IDisposable
         _norm.RMSNorm(sum, normed, w, rows, C, _eps);
     }
 
+    /// <summary>
+    /// LoRA adapters applied unmerged after each adapted projection (<see cref="Training.LoraRuntime"/>; PEFT tensors). Null = the base model.
+    /// Set before generating; the prefix cache is the caller's to reset when it changes (cached K/V were computed with the old adapters).
+    /// </summary>
+    public Training.LoraRuntime? Lora { get; set; }
+
     // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM
     private void Gemm(FV x, string name, FV o, int rows, int K, int N)
     {
@@ -662,8 +668,15 @@ public sealed class GgufBatchDecoder : IDisposable
                 int n = all ? Q + 2 * kvC : Q + kvC;
                 var qkv = Buf(ref _qkv, (long)R * (Q + 2 * kvC));
                 Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
+                if (Lora != null)
+                {
+                    // LoRA deltas into the fused q|k|v columns, before the bias / rotary / cache-store kernel reads them
+                    Lora.Apply(l, "attn_q", hn, qkv, R, 0, n);
+                    Lora.Apply(l, "attn_k", hn, qkv, R, Q, n);
+                    if (all) Lora.Apply(l, "attn_v", hn, qkv, R, Q + kvC, n);
+                }
                 var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
-                if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); vb = v; Prof("v"); }
+                if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
                 if (_qkNorm)
                 {
                     // qwen3: an RMS norm per head of q and of k (weight [head width]) before the rotary; no biases, so the post kernel's zero bias changes nothing
@@ -675,9 +688,9 @@ public sealed class GgufBatchDecoder : IDisposable
             }
             else
             {
-                Gemm(hn, b + "attn_q.weight", q, R, C, Q); _bias!((int)((long)R * Q), q, _vecs[b + "attn_q.bias"].View, Q); Prof("q");
-                Gemm(hn, b + "attn_k.weight", k, R, C, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
-                Gemm(hn, b + "attn_v.weight", v, R, C, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
+                Gemm(hn, b + "attn_q.weight", q, R, C, Q); Lora?.Apply(l, "attn_q", hn, q, R, 0, Q); _bias!((int)((long)R * Q), q, _vecs[b + "attn_q.bias"].View, Q); Prof("q");
+                Gemm(hn, b + "attn_k.weight", k, R, C, kvC); Lora?.Apply(l, "attn_k", hn, k, R, 0, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
+                Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
                 if (_qkNorm)
                 {
                     _headNorm!(new KernelConfig(R * Heads, HeadDim), q, _vecs[b + "attn_q_norm.weight"].View, Q, 0, Heads, _eps);
@@ -731,21 +744,22 @@ public sealed class GgufBatchDecoder : IDisposable
                 _softmaxNorm!((int)((long)Heads * R * nk), scores, stats, nk); Prof("softmax");
                 _kv.Pv(l, (int)((long)R * Q), scores, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
             }
-            Gemm(att, b + "attn_output.weight", proj, R, Q, C); Prof("o");
+            Gemm(att, b + "attn_output.weight", proj, R, Q, C); Lora?.Apply(l, "attn_output", att, proj, R, 0, C); Prof("o");
             AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
             if (_mats.ContainsKey(b + "ffn_gate_up"))
             {
                 var gu = Buf(ref _gateUp, (long)R * 2 * FfnDim);
                 Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim); Prof("gate-up");
+                if (Lora != null) { Lora.Apply(l, "ffn_gate", hn, gu, R, 0, 2 * FfnDim); Lora.Apply(l, "ffn_up", hn, gu, R, FfnDim, 2 * FfnDim); }
                 _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu");
             }
             else
             {
-                Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Prof("gate");
-                Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Prof("up");
+                Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Lora?.Apply(l, "ffn_gate", hn, gate, R, 0, FfnDim); Prof("gate");
+                Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Lora?.Apply(l, "ffn_up", hn, up, R, 0, FfnDim); Prof("up");
                 _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
             }
-            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Prof("down");
+            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Lora?.Apply(l, "ffn_down", gate, proj, R, 0, C); Prof("down");
             AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
             // a prefill submits each layer on its own (WebGPU): one submission is then at most one layer of one PrefillChunk, whatever the model's size (SpawnDev.AI
             // lost the device on qwen3:4b with a prefill encoded as one command buffer, 2026-11-01). A decode step is untouched (its captured plan replays it).

@@ -137,9 +137,9 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Backward_Attention_MatchesFiniteDifference() => await RunTest(async accelerator =>
     {
-        int heads = 4, kvHeads = 2, seq = 5, hd = 8;
+        int heads = 4, kvHeads = 2, hd = 8;
         var notes = new List<string>();
-        foreach (var (kvOffset, window, seqKV) in new[] { (0, 0, 5), (2, 0, 7), (0, 3, 5) })
+        foreach (var (seq, kvOffset, window, seqKV) in new[] { (5, 0, 0, 5), (5, 2, 0, 7), (5, 0, 3, 5), (19, 0, 0, 19), (19, 3, 0, 22) })
         {
             var q = RandomFloats(seq * heads * hd, seed: 541 + kvOffset); var k = RandomFloats(seqKV * kvHeads * hd, seed: 542 + window);
             var v = RandomFloats(seqKV * kvHeads * hd, seed: 543); var dout = RandomFloats(seq * heads * hd, seed: 544);
@@ -179,13 +179,25 @@ public abstract partial class MLTestBase
             using var ob = accelerator.Allocate1D(outp); using var dob = accelerator.Allocate1D(dout);
             using var dq = accelerator.Allocate1D<float>(q.Length); using var dk = accelerator.Allocate1D<float>(k.Length); using var dv = accelerator.Allocate1D<float>(v.Length);
             using var stats = accelerator.Allocate1D<float>(2 * heads * seq);
-            reg.Backward.Attention(qb.View, kb.View, vb.View, ob.View, dob.View, dq.View, dk.View, dv.View, stats.View,
-                new BackwardKernels.AttnDims { Heads = heads, KvHeads = kvHeads, SeqQ = seq, SeqKV = seqKV, HeadDim = hd, Causal = 1, Window = window, KvOffset = kvOffset, Scale = (float)scale });
-            string tag = $"kvOffset={kvOffset} window={window} seqKV={seqKV}";
-            AssertGrad($"attention dq ({tag})", await dq.View.CopyToHostAsync(), Fd(D(q), qv => Dot(Fwd(qv, D(k), D(v)))));
-            AssertGrad($"attention dk ({tag})", await dk.View.CopyToHostAsync(), Fd(D(k), kv => Dot(Fwd(D(q), kv, D(v)))));
-            AssertGrad($"attention dv ({tag})", await dv.View.CopyToHostAsync(), Fd(D(v), vv => Dot(Fwd(D(q), D(k), vv))));
-            notes.Add(tag);
+            var fdq = Fd(D(q), qv => Dot(Fwd(qv, D(k), D(v))));
+            var fdk = Fd(D(k), kv => Dot(Fwd(D(q), kv, D(v))));
+            var fdv = Fd(D(v), vv => Dot(Fwd(D(q), D(k), vv)));
+            bool savedBlocked = BackwardKernels.UseBlockedAttentionBackward;
+            try
+            {
+                foreach (bool blocked in new[] { true, false })
+                {
+                    BackwardKernels.UseBlockedAttentionBackward = blocked;
+                    reg.Backward.Attention(qb.View, kb.View, vb.View, ob.View, dob.View, dq.View, dk.View, dv.View, stats.View,
+                        new BackwardKernels.AttnDims { Heads = heads, KvHeads = kvHeads, SeqQ = seq, SeqKV = seqKV, HeadDim = hd, Causal = 1, Window = window, KvOffset = kvOffset, Scale = (float)scale });
+                    string tag = $"seq={seq} kvOffset={kvOffset} window={window} seqKV={seqKV} blocked={blocked}";
+                    AssertGrad($"attention dq ({tag})", await dq.View.CopyToHostAsync(), fdq);
+                    AssertGrad($"attention dk ({tag})", await dk.View.CopyToHostAsync(), fdk);
+                    AssertGrad($"attention dv ({tag})", await dv.View.CopyToHostAsync(), fdv);
+                }
+            }
+            finally { BackwardKernels.UseBlockedAttentionBackward = savedBlocked; }
+            notes.Add($"seq={seq} kvOffset={kvOffset} window={window} seqKV={seqKV}");
         }
         return "attention dq, dk, dv match finite differences: " + string.Join("; ", notes);
     });
@@ -216,8 +228,17 @@ public abstract partial class MLTestBase
             for (int m = 0; m < M; m++) for (int k = 0; k < K; k++) { double s = 0; for (int n = 0; n < N; n++) s += (double)dy[m * N + n] * W[n * K + k]; want[m * K + k] = s; }
             using var reg = new OperatorRegistry(accelerator);
             using var qb = accelerator.Allocate1D(bytes); using var db = accelerator.Allocate1D(dy); using var dx = accelerator.Allocate1D<float>(M * K);
-            reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
-            AssertGrad($"dy W^T {type}", await dx.View.CopyToHostAsync(), want, 1e-5);
+            bool saved = BackwardKernels.UseTiledQuantT;
+            try
+            {
+                foreach (bool tiled in new[] { true, false })
+                {
+                    BackwardKernels.UseTiledQuantT = tiled;
+                    reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
+                    AssertGrad($"dy W^T {type} tiled={tiled}", await dx.View.CopyToHostAsync(), want, 1e-5);
+                }
+            }
+            finally { BackwardKernels.UseTiledQuantT = saved; }
             notes.Add(type.ToString());
         }
         return "dx = dy W^T through quantized W matches the CPU dequant reference: " + string.Join(", ", notes);

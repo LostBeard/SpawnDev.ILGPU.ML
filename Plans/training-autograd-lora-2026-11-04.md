@@ -124,3 +124,19 @@ moves (24.4 -> 26.7 tok/s), but turn time-to-first-token 1,175 -> 682 ms median 
 names-only prompt with TTFT/prefill down, and (2) beats the base on the held-out honesty set. Data (Seven): ~30 synthetic
 requests per tool + ~15% no-tool lines, 20% synthetic dev split, targets DISTILLED from base + full prompt and kept only when
 the strict scorer passes; honesty targets are the corrected sentence, not the live one.
+
+## M3 log (llama3.1:8b Q4_K_M, RTX 4070, tools/TrainLoraProbe)
+
+- 2026-11-04 11:11-11:16, naive transposed kernels, seq 128, rank 8 on q/v (64 adapters): load + compile 4.5 s; process VRAM
+  +6.05 GB (weights + one step's activations); directional derivative grad . v 1.35489 vs central difference 1.35522
+  (2.4e-4 relative: gradients correct through Q4_K / Q6_K, GQA 32/8, rope_freqs); 3 AdamW steps 12.66 -> 12.05 -> 11.48;
+  39.5 s per step (the naive MatMulTransposedQuant decodes every weight once per output row).
+- Large files: GgufLoraTrainer.CreateFromFileAsync streams (CreateFromGGUFStreamAsync / FileAsync gained graphTransform).
+- Inference with adapters: LoraRuntime (unmerged, two small kernels per adapted projection) hooked into GgufBatchDecoder
+  (the engine GgufEngine.Auto picks for llama on CUDA/OpenCL/WebGPU: Vertex's), including the fused q|k|v and gate|up outputs.
+- Training pairs: GenerationResult.GeneratedTokenIds (both engines, stop token excluded) so Data's PassObserver can record
+  the ids the model generated; prompt_ids already in Seven's format 3.
+- 2026-11-04 11:18-11:20, tiled transposed-quant kernel: identical loss / gradient check / trajectory, 6.5 s per step (6x).
+  GgufBatchDecoder + LoraRuntime vs the training forward with the same adapters: max |diff| 9.3e-3 (max |logit| 8.5),
+  same argmax; the base decoder differs by 14.6 (the adapters' effect). Blocked (shared-memory) attention backward added
+  for long prompts (the per-element one is O(seq^2 hd) per output value); FD-checked across block boundaries, 7/7 lanes.

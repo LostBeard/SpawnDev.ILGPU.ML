@@ -2223,11 +2223,12 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static async Task<InferenceSession> CreateFromGGUFFileAsync(
         Accelerator accelerator, string ggufPath,
-        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false)
+        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false,
+        Action<ModelGraph, Dictionary<string, float[]>>? graphTransform = null)
     {
         await using var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 1 << 20, useAsync: true);
-        return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct, acceptInputsEmbeds);
+        return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct, acceptInputsEmbeds, graphTransform: graphTransform);
     }
 
     /// <summary>
@@ -2240,7 +2241,8 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static async Task<InferenceSession> CreateFromGGUFStreamAsync(
         Accelerator accelerator, Stream stream,
-        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false, GGUF.GGUFModel? parsedHeader = null)
+        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false, GGUF.GGUFModel? parsedHeader = null,
+        Action<ModelGraph, Dictionary<string, float[]>>? graphTransform = null)
     {
         if (!stream.CanSeek)
             throw new ArgumentException("CreateFromGGUFStreamAsync requires a seekable stream.", nameof(stream));
@@ -2257,6 +2259,7 @@ public class InferenceSession : IDisposable
 
         onProgress?.Invoke("build_graph", 0);
         var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload, lowPWeightsTyped) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
+        graphTransform?.Invoke(graph, cpuWeightsAll);   // as CreateFromGGUF(..., graphTransform): before compile and upload
         onProgress?.Invoke("build_graph", 100);
 
         // Small constants (identical to CreateFromGGUF).

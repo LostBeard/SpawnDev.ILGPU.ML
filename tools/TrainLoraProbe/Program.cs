@@ -39,7 +39,7 @@ Console.WriteLine($"accelerator: {accelerator.Name} ({accelerator.AcceleratorTyp
 
 var sw = Stopwatch.StartNew();
 var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank, LearningRate = 1e-3f, Seed = 7 };
-using var trainer = GgufLoraTrainer.Create(accelerator, File.ReadAllBytes(args[0]), options);
+using var trainer = await GgufLoraTrainer.CreateFromFileAsync(accelerator, args[0], options);
 Console.WriteLine($"loaded + compiled in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters, rank {rank}; VRAM {VramMiB()} MiB");
 
 // B nonzero (PEFT starts it at zero, which makes every A gradient exactly zero and the check vacuous for A).
@@ -96,4 +96,31 @@ for (int s = 0; s < steps; s++)
 }
 Console.WriteLine($"{steps} AdamW steps (lr {options.LearningRate}): loss " + string.Join(" -> ", losses.Select(l => l.ToString("F4")))
     + $"; median step {times.OrderBy(t => t).ElementAt(times.Count / 2):F0} ms; VRAM {VramMiB()} MiB");
+
+// ── the adapters at inference: GgufBatchDecoder + LoraRuntime (unmerged) against the training graph's forward, same adapters ──
+float lossNow = await trainer.StepAsync(ids, labels, update: false);
+var trainLogits = await trainer.GetLogitsAsync(seq - 1);
+var adapters = await trainer.GetAdaptersAsync();
+await using (var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true))
+{
+    if (!SpawnDev.ILGPU.ML.Pipelines.GgufBatchDecoder.Supports(await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(fs), out var why))
+        Console.WriteLine($"batch decoder: not supported for this model ({why}); skipped");
+    else
+    {
+        fs.Seek(0, SeekOrigin.Begin);
+        using var dec = await SpawnDev.ILGPU.ML.Pipelines.GgufBatchDecoder.CreateAsync(accelerator, fs, Math.Max(256, seq + 8), 1, null);
+        await dec.PrefillAsync(ids);
+        var baseLogits = await dec.ReadLogitsAsync();
+        using var lora = new LoraRuntime(accelerator, adapters, rank, options.Alpha);
+        dec.Lora = lora;
+        await dec.PrefillAsync(ids);
+        var decLogits = await dec.ReadLogitsAsync();
+        double scale = trainLogits.Max(Math.Abs), diff = 0, moved = 0;
+        for (int i = 0; i < trainLogits.Length; i++) { diff = Math.Max(diff, Math.Abs(decLogits[i] - trainLogits[i])); moved = Math.Max(moved, Math.Abs(baseLogits[i] - trainLogits[i])); }
+        int am(float[] a) { int b = 0; for (int i = 1; i < a.Length; i++) if (a[i] > a[b]) b = i; return b; }
+        Console.WriteLine($"batch decoder + LoraRuntime vs training forward (last position): max |diff| {diff:E2} (max |logit| {scale:F2}); "
+            + $"base decoder differs by {moved:E2} (the adapters' effect); argmax {am(decLogits)} vs {am(trainLogits)}");
+        if (diff > 2e-3 * Math.Max(1, scale) || moved < 10 * diff) { Console.WriteLine("FAIL: the decoder's adapters do not reproduce the training forward"); return 1; }
+    }
+}
 return 0;
