@@ -9,6 +9,11 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 public abstract partial class MLTestBase
 {
+    // Mirrors GraphExecutor.PlannedReuseEligible for a plain forward.
+    private static bool PlannedReuseEligibleFor(Accelerator accelerator) => GraphExecutor.ImmediateRelease
+        && (accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity
+            || (GraphExecutor.PlannedReuseOnWebGPU && accelerator.AcceleratorType == AcceleratorType.WebGPU));
+
     private static ModelGraph PlannedReuseGraph(int n)
     {
         static Dictionary<string, JsonElement> Axis0() => new() { ["axis"] = JsonSerializer.SerializeToElement(0) };
@@ -40,8 +45,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task PlannedReuse_TwoExecutorsOnePool_ShareSlots() => await RunTest(async accelerator =>
     {
-        if (!(GraphExecutor.ImmediateRelease && accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity))
-            throw new UnsupportedTestException("planned reuse runs on CUDA / OpenCL / CPU / Velocity with ImmediateRelease");
+        if (!PlannedReuseEligibleFor(accelerator))
+            throw new UnsupportedTestException("planned reuse runs on CUDA / OpenCL / CPU / Velocity (and WebGPU with GraphExecutor.PlannedReuseOnWebGPU) with ImmediateRelease");
         const int big = 1 << 16, small = 1 << 15;
         var rng = new Random(5);
         var xv = Enumerable.Range(0, big).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
@@ -129,8 +134,7 @@ public abstract partial class MLTestBase
                         throw new Exception($"run {run}: y[{i}] = {got[i]:R}, planning off gives {want[i]:R} (plans +{BufferPool.PlannedReusePlans - plans0}, planned rents +{BufferPool.PlannedReuseRents - rents0})");
             }
             long plans = BufferPool.PlannedReusePlans - plans0, rents = BufferPool.PlannedReuseRents - rents0, devs = BufferPool.PlannedReuseDeviations - dev0;
-            bool eligible = GraphExecutor.ImmediateRelease
-                && accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity;
+            bool eligible = PlannedReuseEligibleFor(accelerator);
             if (eligible && (plans != 1 || rents == 0 || devs != 0))
                 throw new Exception($"{accelerator.AcceleratorType}: expected one plan serving rents with no deviation; plans +{plans}, planned rents +{rents}, deviations +{devs}");
             if (!eligible && (plans != 0 || rents != 0))

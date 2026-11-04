@@ -548,10 +548,19 @@ public class GraphExecutor : IDisposable
     /// <summary>
     /// This run may record / replay a planned-reuse plan (<see cref="Tensors.BufferPool.PlannedReuse"/>): the ordered-queue desktop backends with
     /// <see cref="ImmediateRelease"/> on, and no capture regime (a capture-flagged run drops the executor's plan for good, so capture priming is unchanged).
-    /// WebGPU is left on the buckets for now (its bind-group cache and decode capture key on buffer identity across runs).
+    /// WebGPU: see <see cref="PlannedReuseOnWebGPU"/>. Never WebGL / Wasm (their release paths differ).
     /// </summary>
     private bool PlannedReuseEligible => ImmediateReleaseActive && !UseCaptureParamSlots
-        && _accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity;
+        && (_accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity
+            || (PlannedReuseOnWebGPU && _accelerator.AcceleratorType == AcceleratorType.WebGPU));
+
+    /// <summary>
+    /// Planned buffer reuse on WebGPU plain forwards. Both WebGPU captures (WebGPUGraphCapture, WebGPUDecodeCapture) set UseCaptureParamSlots for
+    /// their whole window, so a capturing executor's plan is dropped for good, as on CUDA; outside captures a plan hands rent k the SAME slot buffer
+    /// every run, which keeps buffer identity (and the bind-group cache) more stable than the buckets do. A static switch, not an environment
+    /// variable: those do not reach the Blazor WASM runtime.
+    /// </summary>
+    public static bool PlannedReuseOnWebGPU = true;
 
     /// <summary>True when <see cref="ImmediateRelease"/> applies to this executor's backend right now.</summary>
     private bool ImmediateReleaseActive => ImmediateRelease && !SuppressDrains

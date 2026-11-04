@@ -18,8 +18,10 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task Bench_SpeakerEmbedding_PoolPeak() => await RunTest(async accelerator =>
     {
-        if (OperatingSystem.IsBrowser() || accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL))
-            throw new UnsupportedTestException("a desktop measurement (CUDA / OpenCL)");
+        // CUDA / OpenCL, and WebGPU (2026-11-04: planned reuse on WebGPU). The pool's byte counts are backend-neutral. Read the browser lane's line
+        // with PMT_CONSOLE_LOG=SpeakerPool.
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("a CUDA / OpenCL / WebGPU measurement");
         using var http = CreateHuggingFaceHttpClient();
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("soniqo/ReDimNet2-B6-ONNX-FP32", "ReDimNet2B6.onnx"));
         bool trackSaved = BufferPool.TrackPeaks, compSaved = BufferPool.TrackLivePeakComposition;
