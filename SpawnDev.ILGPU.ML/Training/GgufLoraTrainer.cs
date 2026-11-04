@@ -132,6 +132,23 @@ public sealed class GgufLoraTrainer : IDisposable
         return r;
     }
 
+    /// <summary>
+    /// The current adapters as PEFT's two files: <c>adapter_model.safetensors</c> bytes and <c>adapter_config.json</c> text
+    /// (<see cref="LoraAdapterFile"/>). Load them back with <see cref="LoraAdapterFile.ReadSafeTensors"/> into <see cref="LoraOptions.Initial"/>.
+    /// </summary>
+    public async Task<(byte[] SafeTensors, string ConfigJson)> SaveAdaptersAsync(string? baseModel = null)
+    {
+        var current = await GetAdaptersAsync();
+        var tensors = new Dictionary<string, (float[] Data, int[] Shape)>();
+        foreach (var a in Adapters)
+        {
+            tensors[$"{a.PeftName}.lora_A.weight"] = (current[$"{a.PeftName}.lora_A.weight"], new[] { a.Rank, a.In });
+            tensors[$"{a.PeftName}.lora_B.weight"] = (current[$"{a.PeftName}.lora_B.weight"], new[] { a.Out, a.Rank });
+        }
+        var meta = new Dictionary<string, string> { ["format"] = "pt", ["trainer"] = "SpawnDev.ILGPU.ML GgufLoraTrainer", ["steps"] = _step.ToString() };
+        return (LoraAdapterFile.WriteSafeTensors(tensors, meta), LoraAdapterFile.PeftConfigJson(Adapters, _opt.Rank, _opt.Alpha, baseModel));
+    }
+
     private static float[] Transpose(float[] src, int rows, int cols)
     {
         var t = new float[src.Length];

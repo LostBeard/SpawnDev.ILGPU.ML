@@ -106,6 +106,24 @@ public abstract partial class MLTestBase
         if (worstGrad > 1e-3) throw new Exception("adapter gradients differ from torch: " + line);
         // One AdamW step moves each element by ~lr (1e-2) in the gradient's sign direction; a sign error or a wrong bias correction is ~1e-2.
         if (worstAfter > 1e-4) throw new Exception("AdamW step differs from torch: " + line);
+
+        // PEFT files: save, read back with the engine's safetensors parser, equal to the live adapters; a trainer started from the file
+        // reproduces the same forward loss (no update) as the trained one.
+        var (st, configJson) = await trainer.SaveAdaptersAsync("tiny-llama-train");
+        var loaded = SpawnDev.ILGPU.ML.Training.LoraAdapterFile.ReadSafeTensors(st);
+        foreach (var (name, v) in after)
+            if (!loaded.TryGetValue(name, out var l) || !l.SequenceEqual(v)) throw new Exception($"safetensors round trip changed {name}");
+        using var cfgDoc = JsonDocument.Parse(configJson);
+        if (cfgDoc.RootElement.GetProperty("r").GetInt32() != options.Rank || cfgDoc.RootElement.GetProperty("peft_type").GetString() != "LORA")
+            throw new Exception("adapter_config.json: " + configJson);
+        float lossTrained = await trainer.StepAsync(tokens, labels, update: false);
+        options.Initial = loaded;
+        using (var reloaded = SpawnDev.ILGPU.ML.Training.GgufLoraTrainer.Create(accelerator, gguf, options))
+        {
+            float lossReloaded = await reloaded.StepAsync(tokens, labels, update: false);
+            if (lossReloaded != lossTrained) throw new Exception($"reloaded adapters give loss {lossReloaded}, the trained ones {lossTrained}");
+            line += $"; saved {st.Length} B PEFT safetensors, reloaded loss {lossReloaded:F6} == trained";
+        }
         return line;
     });
 }
