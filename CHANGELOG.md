@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.8.2-local.6 - 2026-11-04 (local feed) - PadKernel params-buffer leak
+
+- **`PadKernel` leaked a parameters buffer per call (memory)**: every Pad allocated a fresh params buffer and kept it until the kernel was disposed (to dodge a params race under async Wasm dispatch). Found by Riker in AssistZ with `WebGPUBufferAccounting.TopCreationSites`: 12 x 88-byte buffers per CLAP forward, +3,600 live buffers over 300 audio events, Chrome's dedicated GPU memory +0.95 MB per event (on local.3 too: not new). The buffers are now cached by CONTENT, as `TransposeKernel` already did: each is written once and never overwritten, so the race stays impossible, and a fixed-shape workload allocates each distinct pad once. `Bench_ClapAudioTower_PoolPeak` now also gates every live WebGPU buffer (`WebGPUBufferAccounting.LiveBufferCount`), not only the pool's: +0 over 200 forwards; red with the old PadKernel (+2,400). Pad tests 135/0 on all six lanes.
+
 ## 5.8.2-local.5 - 2026-11-04 (local feed) - planned reuse on WebGPU, ZipVoice leak fix, ReferenceAttention guard
 
 - **Planned buffer reuse on WebGPU too (memory, browser)**: `GraphExecutor.PlannedReuseOnWebGPU` (static, default on; environment variables do not reach Blazor WASM). Both WebGPU captures set `UseCaptureParamSlots` for their whole window, so a capturing executor's plan is dropped as on CUDA; outside captures a plan gives rent k the same slot buffer every run (more stable buffer identity than the buckets, for the bind-group cache). ReDimNet2-B6 in Chrome WebGPU: steady-state pool 682 -> 372 MiB, embeddings bit-identical (`Bench_SpeakerEmbedding_PoolPeak` now runs on WebGPU). Gate: the WebGPU lane, 1,076 passed / 0 failed. WebGL / Wasm stay on the buckets.

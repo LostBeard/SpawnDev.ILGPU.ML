@@ -12,7 +12,7 @@ public abstract partial class MLTestBase
     /// CLAP audio tower (Xenova/clap-htsat-unfused audio_model.onnx, 118 MB) pool memory per forward, five forwards of the fixture's tone clip: with
     /// <see cref="BufferPool.PlannedReuse"/> the first runs record and later ones replay a plan, so the line shows the pool before and after planning,
     /// the plan counters, and that every embedding is bit-identical. Asked by Riker (AssistZ, 2026-11-04): whether reuse engages for
-    /// ClapAudioClassifier and what cut to expect. CUDA / OpenCL / WebGPU; read the browser line with PMT_CONSOLE_LOG=ClapPool.
+    /// ClapAudioClassifier and what cut to expect. CUDA / OpenCL / WebGPU; read the browser line with PMT_CONSOLE_LOG=ClapPool. On WebGPU it also gates every live buffer (WebGPUBufferAccounting), not just the pool's.
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Bench_ClapAudioTower_PoolPeak() => await RunTest(async accelerator =>
@@ -51,6 +51,11 @@ public abstract partial class MLTestBase
             // A long run, as AssistZ does one forward per audio event: does anything grow per forward? (Riker saw Chrome's dedicated GPU memory climb
             // ~160 MB over 130 events, on local.3 and local.5 alike.) Device allocations by the pool must stay flat once the plan is in place.
             long allocs0 = BufferPool.TotalDeviceAllocations;
+            // Buffers OUTSIDE the pool (kernel params, scratch) are invisible to TotalDeviceAllocations: on WebGPU the backend's own accounting
+            // sees every buffer. MEASURED 2026-11-04 (Riker, AssistZ): PadKernel allocated a fresh 88-byte params buffer per call and kept it -
+            // 12 per CLAP forward, Chrome's dedicated GPU memory +0.95 MB per audio event - while the pool counter stayed flat.
+            bool webgpu = accelerator.AcceleratorType == AcceleratorType.WebGPU;
+            int live0 = webgpu ? global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount : 0;
             const int LongRuns = 200;
             for (int run = 0; run < LongRuns; run++)
             {
@@ -58,8 +63,13 @@ public abstract partial class MLTestBase
                 await outs[session.OutputNames[0]].Data.SubView(0, 512).CopyToHostAsync();
             }
             long grew = BufferPool.TotalDeviceAllocations - allocs0;
-            parts.Add($"{LongRuns} more forwards: pool device allocations +{grew}, planned slots {session.Executor.Pool.PlannedSlotBytes / MiB:F0} MiB, free {session.PooledFreeBytes / MiB:F0} MiB");
+            int liveGrew = webgpu ? global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount - live0 : 0;
+            parts.Add($"{LongRuns} more forwards: pool device allocations +{grew}" + (webgpu ? $", live WebGPU buffers +{liveGrew}" : "")
+                + $", planned slots {session.Executor.Pool.PlannedSlotBytes / MiB:F0} MiB, free {session.PooledFreeBytes / MiB:F0} MiB");
             if (grew > 0) throw new Exception($"the pool allocated {grew} device buffers over {LongRuns} identical forwards: " + string.Join(" | ", parts));
+            if (liveGrew > 0)
+                throw new Exception($"{liveGrew} live WebGPU buffers more after {LongRuns} identical forwards (outside the pool): top creation sites need "
+                    + "WebGPUBufferAccounting.CaptureCreationSites; " + string.Join(" | ", parts));
             var line = $"{accelerator.AcceleratorType}: weights {bytes.Length / MiB:F0} MiB, planned reuse {(BufferPool.PlannedReuse ? "on" : "off")} "
                 + $"(plans +{BufferPool.PlannedReusePlans - plans0}, planned rents +{BufferPool.PlannedReuseRents - rents0}, deviations +{BufferPool.PlannedReuseDeviations - dev0}) | "
                 + string.Join(" | ", parts);

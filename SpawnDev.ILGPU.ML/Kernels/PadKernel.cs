@@ -18,6 +18,8 @@ public class PadKernel : IDisposable
     // All allocations live until Dispose() (typical InferenceSession lifetime). Per-call cost
     // is small (paramsSize is 2 + 5*rank ints, e.g. rank=4 → 22 ints = 88 bytes).
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _allParamsBufs = new();
+    // Params buffers by content: see Forward.
+    private readonly Dictionary<string, MemoryBuffer1D<int, Stride1D.Dense>> _paramsCache = new();
 
     public PadKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -25,6 +27,7 @@ public class PadKernel : IDisposable
     {
         foreach (var buf in _allParamsBufs) buf.Dispose();
         _allParamsBufs.Clear();
+        _paramsCache.Clear();
     }
 
     private static void PadImpl(Index1D idx,
@@ -101,8 +104,10 @@ public class PadKernel : IDisposable
         int totalOut = 1;
         for (int i = 0; i < rank; i++) totalOut *= outShape[i];
 
-        // Pack params - fresh allocation per call to eliminate the params-buffer race
-        // under async dispatch on Wasm. Buffer stays alive in _allParamsBufs until Dispose.
+        // Pack params. Cached by CONTENT (as TransposeKernel does): each buffer is written exactly once, on its miss, and never overwritten, so
+        // there is no params-buffer race under async dispatch on Wasm. This used to allocate a FRESH buffer per call and keep it until Dispose -
+        // MEASURED 2026-11-04 by Riker (AssistZ, WebGPUBufferAccounting): 12 x 88-byte buffers per CLAP forward, +3,600 live buffers over 300 audio
+        // events, and Chrome's dedicated GPU memory +0.95 MB per event. A fixed-shape workload now allocates each distinct pad once.
         int paramsSize = 2 + 5 * rank;
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
@@ -119,9 +124,14 @@ public class PadKernel : IDisposable
         }
         else
         {
-            var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
-            paramsBuf.CopyFromCPU(paramsData);
-            _allParamsBufs.Add(paramsBuf);
+            var key = string.Join(",", paramsData);
+            if (!_paramsCache.TryGetValue(key, out var paramsBuf))
+            {
+                paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+                paramsBuf.CopyFromCPU(paramsData);
+                _paramsCache[key] = paramsBuf;
+                _allParamsBufs.Add(paramsBuf);
+            }
             paramsView = paramsBuf.View;
         }
 
