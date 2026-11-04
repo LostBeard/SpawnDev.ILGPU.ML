@@ -13,12 +13,15 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// Outputs: [result]
 /// Attributes: activation ("none", "Relu", "Gelu", "Sigmoid", "Tanh", "Clip")
 /// </summary>
-public class FusedLinearOperator : IOnnxOperator
+public class FusedLinearOperator : IOnnxOperator, IDisposable
 {
     private readonly OperatorRegistry _registry;
     private FusedLinearKernel? _kernel;
 
     public FusedLinearOperator(OperatorRegistry registry) => _registry = registry;
+
+    /// <summary>Releases the kernel's split-K scratch (OperatorRegistry.Dispose disposes IDisposable operators).</summary>
+    public void Dispose() { _kernel?.Dispose(); _kernel = null; }
 
     public string OpType => "FusedLinear";
 

@@ -22,7 +22,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// below. The register-blocked GELU is the erf approximation (A&amp;S 5-term) — bit-faithful to
 /// <c>ElementWiseKernels.GELUImpl</c> and the per-element path here, so it preserves the ORT-matched logits.
 /// </summary>
-public class FusedLinearKernel
+public class FusedLinearKernel : IDisposable
 {
     // Register-blocked tile geometry — must match RegisterBlockedMatMul (BLOCK=16 → 256-thread group,
     // REG=4 per thread, 64×64 output tile). Kept in sync so the fused GEMM has identical launch shape.
@@ -64,6 +64,206 @@ public class FusedLinearKernel
 
     public FusedLinearKernel(Accelerator accelerator) => _accelerator = accelerator;
 
+    // ── Split-K ──────────────────────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Split the K reduction across groups when a GEMM has too few 64x64 output tiles to fill the GPU. Default on; false = A/B control.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED 2026-11-04 (CLAP HTSAT audio tower, RTX 4070 CUDA, per-op sync): FusedLinear was 51% of the forward, and its slowest node -
+    /// layers.3 output dense, M=64 tokens, K=3072, N=768 - took 0.65 ms for 0.30 GFLOP (~0.46 TFLOPS): 12 output tiles = 12 groups of 256
+    /// threads on a 46-SM card, each walking 192 K-tiles serially. Splitting K gives every SM work; a second pass sums the partials in a FIXED
+    /// order (s = 0..S-1), so the result is deterministic and the same on every device (S depends only on M, K, N, never on the GPU).
+    /// </remarks>
+    public static bool SplitK { get; set; } = true;
+
+    /// <summary>Engage split-K below this many output tiles (and only with K &gt;= <see cref="SplitKMinK"/>).</summary>
+    public const int SplitKMaxTiles = 64;
+    /// <summary>Minimum K for split-K: each split keeps at least 256 of it.</summary>
+    public const int SplitKMinK = 512;
+    private const int SplitKTargetGroups = 128;
+    private const int SplitKMinKPerSplit = 256;
+
+    /// <summary>The split count for a GEMM: 1 = no split. A function of the shape only (deterministic across devices).</summary>
+    public static int SplitKCount(int M, int K, int N)
+    {
+        if (!SplitK || K < SplitKMinK) return 1;
+        int tiles = ((M + RbTile - 1) / RbTile) * ((N + RbTile - 1) / RbTile);
+        if (tiles >= SplitKMaxTiles) return 1;
+        int s = Math.Min((SplitKTargetGroups + tiles - 1) / tiles, K / SplitKMinKPerSplit);
+        if (s < 2) return 1;
+        // Even K-tile ranges: recompute S from the per-split tile count so no split is empty.
+        int numKTiles = (K + RbBlock - 1) / RbBlock;
+        int perSplit = (numKTiles + s - 1) / s;
+        return (numKTiles + perSplit - 1) / perSplit;
+    }
+
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int>? _splitKPartialKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _splitKReduceKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _splitScratch;
+    // A replaced scratch is kept until Dispose: a queued launch (WebGPU encoder, Wasm worker pool) may still reference it.
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _retiredSplitScratch = new();
+
+    /// <summary>Calls that took the split-K path (diagnostic).</summary>
+    public long SplitKCalls { get; private set; }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        _splitScratch?.Dispose();
+        _splitScratch = null;
+        foreach (var b in _retiredSplitScratch) { try { b.Dispose(); } catch { } }
+        _retiredSplitScratch.Clear();
+    }
+
+    private bool TryForwardSplitK(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output, int M, int K, int N, int activationCode)
+    {
+        int S = SplitKCount(M, K, N);
+        if (S < 2) return false;
+        long need = (long)S * M * N;
+        if (need > int.MaxValue) return false;
+        if (_splitScratch == null || _splitScratch.Length < need)
+        {
+            // A device allocation inside a capture window is fatal (cuMemAlloc on CUDA, a hung device on WebGPU). Capture records a WARM
+            // forward, so the scratch is already sized; if it is not, this call takes the unsplit path instead.
+            if (Graph.GraphExecutor.SuppressDrains) return false;
+            if (_splitScratch != null) _retiredSplitScratch.Add(_splitScratch);
+            _splitScratch = _accelerator.Allocate1D<float>(Math.Max(need, 1 << 16));
+        }
+        _splitKPartialKernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int>(SplitKPartialImpl);
+        _splitKReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SplitKReduceImpl);
+        int numTilesM = (M + RbTile - 1) / RbTile;
+        int numTilesN = (N + RbTile - 1) / RbTile;
+        int numKTiles = (K + RbBlock - 1) / RbBlock;
+        int kTilesPerSplit = (numKTiles + S - 1) / S;
+        var partial = _splitScratch.View.SubView(0, need);
+        _splitKPartialKernel(new KernelConfig(new Index1D(numTilesM * numTilesN * S), new Index1D(RbBlock * RbBlock)),
+            input, weights, partial, M, K, N, numTilesN, numTilesM * numTilesN, kTilesPerSplit);
+        _splitKReduceKernel(M * N, partial, bias, output, M * N, N, S, activationCode);
+        SplitKCalls++;
+        return true;
+    }
+
+    // The register-blocked tile of FusedRegBlockedLinearActivation over ONE K range: group g = s * tiles + tile handles K-tiles
+    // [s * kTilesPerSplit, (s + 1) * kTilesPerSplit) and writes its raw partial sums (no bias, no activation) to P[s * M * N + row * N + col].
+    private static void SplitKPartialImpl(
+        ArrayView1D<float, Stride1D.Dense> X,
+        ArrayView1D<float, Stride1D.Dense> W,
+        ArrayView1D<float, Stride1D.Dense> P,
+        int M, int K, int N, int numTilesN, int tiles, int kTilesPerSplit)
+    {
+        const int BLOCK = 16;
+        const int REG = 4;
+        const int TILE = BLOCK * REG; // 64
+        var aTile = SharedMemory.Allocate<float>(TILE * BLOCK);
+        var bTile = SharedMemory.Allocate<float>(BLOCK * TILE);
+
+        int split = Grid.IdxX / tiles;
+        int tileIdx = Grid.IdxX - split * tiles;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / BLOCK;
+        int threadCol = localIdx % BLOCK;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+        float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+        float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + BLOCK - 1) / BLOCK;
+        int tBegin = split * kTilesPerSplit;
+        int tEnd = tBegin + kTilesPerSplit;
+        if (tEnd > numKTiles) tEnd = numKTiles;
+        for (int t = tBegin; t < tEnd; t++)
+        {
+            for (int r = 0; r < REG; r++)
+            {
+                int aRow = tileRow * TILE + threadRow * REG + r;
+                int aCol = t * BLOCK + threadCol;
+                int sIdx = (threadRow * REG + r) * BLOCK + threadCol;
+                aTile[sIdx] = (aRow < M && aCol < K) ? X[aRow * K + aCol] : 0f;
+            }
+            for (int r = 0; r < REG; r++)
+            {
+                int bRow = t * BLOCK + threadRow;
+                int bCol = tileCol * TILE + threadCol * REG + r;
+                int sIdx = threadRow * TILE + threadCol * REG + r;
+                bTile[sIdx] = (bRow < K && bCol < N) ? W[bRow * N + bCol] : 0f;
+            }
+            Group.Barrier();
+
+            for (int k = 0; k < BLOCK; k++)
+            {
+                float a0 = aTile[(threadRow * REG + 0) * BLOCK + k];
+                float a1 = aTile[(threadRow * REG + 1) * BLOCK + k];
+                float a2 = aTile[(threadRow * REG + 2) * BLOCK + k];
+                float a3 = aTile[(threadRow * REG + 3) * BLOCK + k];
+                float b0 = bTile[k * TILE + threadCol * REG + 0];
+                float b1 = bTile[k * TILE + threadCol * REG + 1];
+                float b2 = bTile[k * TILE + threadCol * REG + 2];
+                float b3 = bTile[k * TILE + threadCol * REG + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+            Group.Barrier();
+        }
+
+        int baseRow = tileRow * TILE + threadRow * REG;
+        int baseCol = tileCol * TILE + threadCol * REG;
+        int off = split * M * N;
+        if (baseRow + 0 < M)
+        {
+            if (baseCol + 0 < N) P[off + (baseRow + 0) * N + baseCol + 0] = c00;
+            if (baseCol + 1 < N) P[off + (baseRow + 0) * N + baseCol + 1] = c01;
+            if (baseCol + 2 < N) P[off + (baseRow + 0) * N + baseCol + 2] = c02;
+            if (baseCol + 3 < N) P[off + (baseRow + 0) * N + baseCol + 3] = c03;
+        }
+        if (baseRow + 1 < M)
+        {
+            if (baseCol + 0 < N) P[off + (baseRow + 1) * N + baseCol + 0] = c10;
+            if (baseCol + 1 < N) P[off + (baseRow + 1) * N + baseCol + 1] = c11;
+            if (baseCol + 2 < N) P[off + (baseRow + 1) * N + baseCol + 2] = c12;
+            if (baseCol + 3 < N) P[off + (baseRow + 1) * N + baseCol + 3] = c13;
+        }
+        if (baseRow + 2 < M)
+        {
+            if (baseCol + 0 < N) P[off + (baseRow + 2) * N + baseCol + 0] = c20;
+            if (baseCol + 1 < N) P[off + (baseRow + 2) * N + baseCol + 1] = c21;
+            if (baseCol + 2 < N) P[off + (baseRow + 2) * N + baseCol + 2] = c22;
+            if (baseCol + 3 < N) P[off + (baseRow + 2) * N + baseCol + 3] = c23;
+        }
+        if (baseRow + 3 < M)
+        {
+            if (baseCol + 0 < N) P[off + (baseRow + 3) * N + baseCol + 0] = c30;
+            if (baseCol + 1 < N) P[off + (baseRow + 3) * N + baseCol + 1] = c31;
+            if (baseCol + 2 < N) P[off + (baseRow + 3) * N + baseCol + 2] = c32;
+            if (baseCol + 3 < N) P[off + (baseRow + 3) * N + baseCol + 3] = c33;
+        }
+    }
+
+    // Sum the S partials of one output element in a fixed order, then bias + activation (the write-back of the unsplit kernel).
+    private static void SplitKReduceImpl(Index1D i,
+        ArrayView1D<float, Stride1D.Dense> P,
+        ArrayView1D<float, Stride1D.Dense> Bias,
+        ArrayView1D<float, Stride1D.Dense> Y,
+        int mn, int N, int S, int activation)
+    {
+        float acc = P[i];
+        for (int s = 1; s < S; s++) acc += P[s * mn + i];
+        Y[i] = FusedActivate(acc, Bias[i % N], activation);
+    }
+
+
     /// <summary>
     /// Fused linear: output = activation(input @ weights + bias)
     /// Input: [M, K], Weights: [K, N], Bias: [N], Output: [M, N]
@@ -92,6 +292,7 @@ public class FusedLinearKernel
                 FusedActivation.SiLU => 5,
                 _ => 0,
             };
+            if (TryForwardSplitK(input, weights, bias, output, M, K, N, activationCode)) return;
             _fusedRegBlockedKernel ??= _accelerator.LoadStreamKernel<
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

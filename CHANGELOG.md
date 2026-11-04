@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **`FusedLinear` split-K for GEMMs with few output tiles (speed)**: a register-blocked GEMM with fewer than 64 output tiles of 64x64 and K >= 512 now splits the K reduction across groups (S chosen from the shape only, 2..~11) and sums the partials in a fixed order with the bias and activation in a second pass. Found with the new `Bench_ClapAudioTower_OpProfile`: FusedLinear was 51% of CLAP HTSAT's GPU time and its worst node (M=64, K=3072, N=768: 12 tiles on a 46-SM card) ran at ~0.46 TFLOPS. Interleaved A/B in one process (RTX 4070, median of 6 rounds): WebGPU in Chrome direct forward 42.0 -> 32.0 ms; CUDA FusedLinear GPU time 5.81 -> 4.30 ms (the CUDA direct forward is host-bound: 11.8 -> 11.7 ms); captured WebGPU replay 22-23 -> 20.0 ms. Not bit-identical to the unsplit sum (embedding max |diff| 5e-7). `FusedLinearKernel.SplitK` (default on) is the A/B switch; the scratch is grow-only, never allocated while a capture is recording, and released with the operator. `FusedLinear_SplitK_MatchesCpu` (double reference, seven shapes incl. ragged edges and the no-split cases) 4/4 on CUDA/OpenCL/WebGPU/Wasm; red-check (reduce drops the last partial) fails at 0.8 relative error.
+
 ## 5.8.2-local.7 - 2026-11-04 (local feed) - CLAP audio-tower capture
 
 - **`ClapAudioClassifier` replays its audio tower (speed)**: the tower's input is always [1,1,1001,64], so it is recorded once (`SessionGraphCapture`: a CUDA graph on CUDA, a dispatch plan on WebGPU) and replayed for every later clip. `EnableGraphCapture` (default on) and `AudioCaptureStatus`. `Bench_ClapAudioTower_CaptureVsDirect` (RTX 4070, two runs, steady state): CUDA 16.7-17.0 -> 12.9-13.6 ms per forward (1.23-1.32x), WebGPU in Chrome 40.4 -> 22.3-23.4 ms (1.73-1.81x), one-time setup 0.7 s / 1.6-1.7 s; replayed embeddings bit-identical to the direct forward on two clips; 100 replays: pool allocations +0, live WebGPU buffers +0. All CLAP tests 22/0 on CUDA, OpenCL and WebGPU with it on (OpenCL has no capture and runs direct).
