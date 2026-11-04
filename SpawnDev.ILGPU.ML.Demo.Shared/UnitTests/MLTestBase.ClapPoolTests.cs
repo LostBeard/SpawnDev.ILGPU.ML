@@ -133,6 +133,8 @@ public abstract partial class MLTestBase
         sw.Restart();
         for (int i = 0; i < Steps; i++) await Run(captured, (i & 1) == 0 ? featsA : featsB);
         double replayMs = sw.Elapsed.TotalMilliseconds / Steps;
+        // Where a WebGPU replay's time goes: input copy, the one plan call, the wait for completion (the rest of replayMs is the readback).
+        string split = capture.LastReplaySplit is var (inMs, planMs, syncMs) ? $" [last replay: input copy {inMs:F1} ms, plan call {planMs:F1} ms, sync {syncMs:F1} ms]" : "";
         // Replays must not grow anything per call (Riker's PadKernel climb was invisible to the pool counters): count every live WebGPU buffer.
         bool webgpu = accelerator.AcceleratorType == AcceleratorType.WebGPU;
         int live0 = webgpu ? global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount : 0;
@@ -150,12 +152,63 @@ public abstract partial class MLTestBase
         }
         bool distinct = !directA.SequenceEqual(directB);   // the two clips must give different embeddings, or the replay check proves nothing
         var line = $"{accelerator.AcceleratorType}: direct {directMs:F1} ms/forward, capture setup {setupMs:F0} ms over {setupCalls} call(s) "
-            + $"({capture.CaptureStatus}), replay {replayMs:F1} ms/forward ({directMs / replayMs:F2}x), replay differs from direct in {differ} of 1024 values, "
+            + $"({capture.CaptureStatus}), replay {replayMs:F1} ms/forward ({directMs / replayMs:F2}x){split}, replay differs from direct in {differ} of 1024 values, "
             + $"100 more replays: pool device allocations +{allocsGrew}" + (webgpu ? $", live WebGPU buffers +{liveGrew}" : "");
         Console.WriteLine($"[Benchmark] ClapCapture [{accelerator.AcceleratorType}] {line}");
         if (!distinct) throw new Exception("the two fixture clips gave identical embeddings: the input-change check is vacuous: " + line);
         if (differ != 0) throw new Exception("captured replay is not bit-identical to the direct forward: " + line);
         if (liveGrew > 0 || allocsGrew > 0) throw new Exception("replays grow device memory: " + line);
+        return line;
+    });
+
+    /// <summary>
+    /// DIAGNOSTIC: where the CLAP audio tower's GPU time goes, per op type and per node (GraphExecutor.PerOpSync + CapturedNodeTimingsMs, so each
+    /// node's time includes its own GPU drain). The replay is GPU-bound (WebGPU 2026-11-04: 18 of 23.5 ms is the wait for the plan), so the next
+    /// speedup is a kernel one and this names it. Per-op sync adds a fixed cost per node (a JS round trip on WebGPU), so compare op types against
+    /// each other, not the total against a normal forward. Prints "[ClapProfile] ..."; PMT_CONSOLE_LOG=ClapProfile on the browser lane.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Bench_ClapAudioTower_OpProfile() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("a CUDA / WebGPU profile");
+        var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        using var doc = JsonDocument.Parse(await assets.GetStringAsync("test-audio/clap-fixture.json"));
+        var feats = doc.RootElement.GetProperty("clips")[0].GetProperty("input_features").EnumerateArray().SelectMany(r => r.EnumerateArray().Select(v => v.GetSingle())).ToArray();
+        using var http = CreateHuggingFaceHttpClient();
+        http.Timeout = TimeSpan.FromMinutes(20);
+        var bytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://models.spawndev.com/Xenova/clap-htsat-unfused/resolve/main/onnx/audio_model.onnx");
+        using var session = InferenceSession.CreateFromFile(accelerator, bytes);
+        session.OutputsLiveUntilNextRun = true;
+        using var featBuf = accelerator.Allocate1D(feats);
+        var input = new Dictionary<string, Tensor> { [session.InputNames[0]] = new Tensor(featBuf.View, new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels }) };
+        for (int i = 0; i < 6; i++) { var o = await session.RunAsync(input); await o[session.OutputNames[0]].Data.SubView(0, 16).CopyToHostAsync(); }
+        bool syncSaved = GraphExecutor.PerOpSync;
+        var timings = new Dictionary<string, double>();
+        try
+        {
+            GraphExecutor.PerOpSync = true;
+            const int Runs = 3;
+            for (int r = 0; r < Runs; r++)
+            {
+                GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+                var o = await session.RunAsync(input);
+                await o[session.OutputNames[0]].Data.SubView(0, 16).CopyToHostAsync();
+                foreach (var (k, v) in GraphExecutor.CapturedNodeTimingsMs)
+                    timings[k] = timings.TryGetValue(k, out var t) ? t + v / Runs : v / Runs;
+            }
+        }
+        finally { GraphExecutor.CapturedNodeTimingsMs = null; GraphExecutor.PerOpSync = syncSaved; }
+        static string OpOf(string key) { var parts = key.Split('_', 3); return parts.Length > 1 ? parts[1] : key; }
+        double total = timings.Values.Sum();
+        var byType = timings.GroupBy(kv => OpOf(kv.Key)).Select(g => (Op: g.Key, Ms: g.Sum(kv => kv.Value), N: g.Count(), Min: g.Min(kv => kv.Value)))
+            .OrderByDescending(x => x.Ms).ToList();
+        double floor = timings.Values.Min();   // ~ the per-node sync overhead
+        var line = $"{accelerator.AcceleratorType}: {timings.Count} nodes, {total:F1} ms with per-op sync (cheapest node {floor:F3} ms = the sync floor; "
+            + $"total minus floor x nodes {total - floor * timings.Count:F1} ms) | by type: "
+            + string.Join(", ", byType.Take(14).Select(x => $"{x.Op} {x.Ms:F1} ms/{x.N} ({100 * x.Ms / total:F0}%)"))
+            + " | top nodes: " + string.Join(", ", timings.OrderByDescending(kv => kv.Value).Take(12).Select(kv => $"{kv.Key} {kv.Value:F2}"));
+        Console.WriteLine("[ClapProfile] " + line);
         return line;
     });
 }
