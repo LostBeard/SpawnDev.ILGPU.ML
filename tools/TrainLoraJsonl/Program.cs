@@ -6,7 +6,9 @@
 //
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
-//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl]
+//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only]
+// --eval-only: skip training; evaluate the adapters already in --out. Every run writes <out>/generation_eval.jsonl: per dev line the
+// prompt, the target and the generated ids of the base model and of the adapters (a fixture for SpawnDev.AI's adapter test).
 using System.Diagnostics;
 using System.Text.Json;
 using ILGPU;
@@ -61,6 +63,10 @@ Device device = args.Contains("--opencl") ? context.GetCLDevices()[0]
 using var accelerator = device.CreateAccelerator(context);
 var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = alpha, LearningRate = lr, Seed = seed, CheckpointLayers = args.Contains("--checkpoint") };
 var sw = Stopwatch.StartNew();
+bool evalOnly = args.Contains("--eval-only");
+var log = new List<object>();
+if (!evalOnly)
+{
 using var trainer = await GgufLoraTrainer.CreateFromFileAsync(accelerator, args[0], options);
 Console.WriteLine($"{accelerator.Name} ({accelerator.AcceleratorType}): loaded in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters rank {rank} alpha {alpha} on {string.Join(",", targets)}; lr {lr}, accum {accum}, checkpoint {options.CheckpointLayers}");
 
@@ -72,7 +78,6 @@ async Task<double> DevLossAsync()
     return sum / dev.Count;
 }
 
-var log = new List<object>();
 double best = await DevLossAsync();
 Console.WriteLine($"epoch 0: dev loss {best:F4}");
 log.Add(new { epoch = 0, dev_loss = best });
@@ -99,32 +104,43 @@ for (int ep = 1; ep <= epochs; ep++)
         Console.WriteLine($"  saved adapters (best dev loss so far) to {outDir}");
     }
 }
+}
+
 // ── generation on the dev split, base vs the saved adapters, through the inference engine (GgufGenerator, Auto engine) ──
 // exact match = the greedy continuation's ids equal target_ids and the model then emits the end of turn
 if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors")))
 {
-    var saved = LoraAdapterFile.ReadSafeTensors(File.ReadAllBytes(Path.Combine(outDir, "adapter_model.safetensors")));
-    trainer.Dispose();   // free the training session before loading the generator
     await using var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
     using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + 64, 8192));
-    using var lora = new LoraRuntime(accelerator, saved, rank, alpha);
+    using var lora = LoraRuntime.Load(accelerator, File.ReadAllBytes(Path.Combine(outDir, "adapter_model.safetensors")), File.ReadAllText(Path.Combine(outDir, "adapter_config.json")));
+    var perLine = dev.Select(_ => new Dictionary<string, int[]>()).ToList();
     var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { Strategy = "greedy" };
     foreach (bool withLora in new[] { false, true })
     {
         gen.Lora = withLora ? lora : null;
         int exact = 0;
-        foreach (var (id, ids, labels) in dev)
+        for (int di = 0; di < dev.Count; di++)
         {
+            var (id, ids, labels) = dev[di];
             int p = Array.FindIndex(labels, l => l != -100) + 1;              // prompt length
             var target = ids[p..];
             int eot = labels[^1];
             cfg.MaxNewTokens = target.Length + 4;
             var res = await gen.GenerateAsync(ids[..p], cfg, stopTokenIds: new[] { eot });
+            perLine[di][withLora ? "adapter_ids" : "base_ids"] = res.GeneratedTokenIds;
             if (res.GeneratedTokenIds.SequenceEqual(target) && res.Stop is SpawnDev.ILGPU.ML.Pipelines.StopReason.StopToken or SpawnDev.ILGPU.ML.Pipelines.StopReason.Eos) exact++;
         }
         Console.WriteLine($"generation on dev ({gen.Engine}): {(withLora ? "with adapters" : "base")}: {exact}/{dev.Count} exact (target ids, then end of turn)");
         log.Add(new { generation = withLora ? "adapters" : "base", exact, of = dev.Count });
     }
+    using (var w = new StreamWriter(Path.Combine(outDir, "generation_eval.jsonl")))
+        for (int di = 0; di < dev.Count; di++)
+        {
+            var (id, ids, labels) = dev[di];
+            int p = Array.FindIndex(labels, l => l != -100) + 1;
+            w.WriteLine(JsonSerializer.Serialize(new { id, prompt_ids = ids[..p], target_ids = ids[p..], end_of_turn_id = labels[^1],
+                base_ids = perLine[di]["base_ids"], adapter_ids = perLine[di]["adapter_ids"] }));
+        }
 }
 File.WriteAllText(Path.Combine(outDir, "train_log.json"), JsonSerializer.Serialize(log, new JsonSerializerOptions { WriteIndented = true }));
 return 0;
