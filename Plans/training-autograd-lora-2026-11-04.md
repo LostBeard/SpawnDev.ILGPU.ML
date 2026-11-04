@@ -102,3 +102,14 @@ Backward rules (each a graph rewrite; gradients of a value with several consumer
 
 Each NEW op: CPU-oracle kernel test + finite-difference check, all backends; then the full-model gate against
 tiny-llama-train-ref.json (loss, LoRA grads, one AdamW step).
+
+### M4 gate replaced (2026-11-04, Seven's baseline: ToolChoiceTests 20/20 on llama3.1:8b, one run, temp 0.7)
+
+"Beats the base on ToolChoiceTests" has no room. New gate, in order:
+1. PRIMARY, prompt shrink: adapter + SHORT prompt (no tool definitions) equals base + FULL prompt on ToolChoiceTests with a
+   strict scorer (arguments too), 5 runs per configuration (per-case pass rate), and decodes faster on the 2060. Before
+   training: measure (a) base + full prompt and (b) base + short prompt with the strict scorer; (b)'s gap is the room.
+2. SECOND, honesty: beat the base on Seven's held-out real game-event set scored against `truth`.
+3. Only if both are empty: a harder tool-choice set (instinct hint off, several runs).
+Data: format 2 lines carry the engine's exact rendered_prompt / rendered_target (Data's PassObserver, SpawnDev.AI.Server
+1.4.1-local.1); the target excludes the end-of-turn token, which training appends so the adapter learns to stop.
