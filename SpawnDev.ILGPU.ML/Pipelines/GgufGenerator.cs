@@ -66,6 +66,21 @@ public sealed class GgufGenerator : IDisposable
     /// <summary>The batch decoder when <see cref="Engine"/> is <see cref="GgufEngine.BatchDecoder"/>, else null.</summary>
     public GgufBatchDecoder? BatchDecoder => _batch?.Decoder;
 
+    /// <summary>
+    /// LoRA adapters applied unmerged at every step (<see cref="Training.LoraRuntime"/>, PEFT tensors; null = the base model). The batch decoder
+    /// engine only (<see cref="Engine"/> = BatchDecoder, which Auto picks for llama / qwen on CUDA, OpenCL and WebGPU); setting it on the
+    /// session engine throws. Changing it forgets the reusable prefix. The caller owns the runtime's lifetime.
+    /// </summary>
+    public Training.LoraRuntime? Lora
+    {
+        get => _batch?.Decoder.Lora;
+        set
+        {
+            if (_batch == null) throw new NotSupportedException("LoRA adapters at inference need the batch decoder engine (Engine = BatchDecoder)");
+            _batch.Decoder.Lora = value;
+        }
+    }
+
     /// <summary>The model's parsed GGUF header (the chat template, architecture and tokenizer metadata come from it).</summary>
     public GGUFModel Gguf { get; }
 

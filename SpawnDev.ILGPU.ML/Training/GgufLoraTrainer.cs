@@ -260,9 +260,13 @@ public sealed class GgufLoraTrainer : IDisposable
         return t;
     }
 
+    private bool _disposed;
+
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         foreach (var (_, _, _, m, v) in _params) { m.Dispose(); v.Dispose(); }
         if (_accum != null) foreach (var a in _accum.Values) a.Dispose();
         _kernels.Dispose();

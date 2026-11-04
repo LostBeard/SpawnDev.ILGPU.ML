@@ -529,9 +529,14 @@ public sealed class GgufBatchDecoder : IDisposable
 
     /// <summary>
     /// LoRA adapters applied unmerged after each adapted projection (<see cref="Training.LoraRuntime"/>; PEFT tensors). Null = the base model.
-    /// Set before generating; the prefix cache is the caller's to reset when it changes (cached K/V were computed with the old adapters).
+    /// Changing it forgets the reusable prefix: cached K/V were computed with the old adapters.
     /// </summary>
-    public Training.LoraRuntime? Lora { get; set; }
+    public Training.LoraRuntime? Lora
+    {
+        get => _lora;
+        set { if (!ReferenceEquals(_lora, value)) { _lora = value; _cacheIds = null; } }
+    }
+    private Training.LoraRuntime? _lora;
 
     // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM
     private void Gemm(FV x, string name, FV o, int rows, int K, int N)
