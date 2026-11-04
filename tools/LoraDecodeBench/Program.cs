@@ -3,7 +3,7 @@
 // (Auto engine) base vs adapter; reports prefill (time to first token) and decode tokens/s, median of a few runs.
 //
 // Run: dotnet run --project tools/LoraDecodeBench -c Release -- <model.gguf> [--rank 16] [--targets attn_q,attn_k,attn_v,attn_output]
-//        [--tokens 128] [--prompt 512] [--runs 3] [--ungrouped] [--opencl]
+//        [--tokens 128] [--prompt 512] [--runs 3] [--ungrouped] [--unfused] [--opencl]
 using System.Diagnostics;
 using ILGPU;
 using ILGPU.Runtime;
@@ -19,6 +19,8 @@ string Arg(string name, string def) { int i = Array.IndexOf(args, name); return 
 int rank = int.Parse(Arg("--rank", "16")), tokens = int.Parse(Arg("--tokens", "128")), promptLen = int.Parse(Arg("--prompt", "512")), runs = int.Parse(Arg("--runs", "3"));
 var targets = Arg("--targets", "attn_q,attn_k,attn_v,attn_output").Split(',');
 if (args.Contains("--ungrouped")) LoraRuntime.GroupedDown = false;
+if (args.Contains("--unfused")) LoraRuntime.FuseAdjacent = false;
+if (args.Contains("--no-prefill-gemm")) LoraRuntime.PrefillGemm = false;
 
 using var context = MLContext.Create().ToContext();
 Device device = args.Contains("--opencl") ? context.GetCLDevices()[0]
@@ -62,7 +64,7 @@ foreach (var withLora in new[] { false, true })
         tps.Add((res.GeneratedTokens - 1) / Math.Max(1e-3, (ms - firstMs) / 1000.0));
     }
     double Med(List<double> v) => v.OrderBy(x => x).ElementAt(v.Count / 2);
-    Console.WriteLine($"{accelerator.AcceleratorType} {gen.Engine} {(withLora ? $"LoRA r{rank} on {string.Join(",", targets)} ({tensors.Count / 2} adapters{(LoraRuntime.GroupedDown ? "" : ", ungrouped")})" : "base")}: "
+    Console.WriteLine($"{accelerator.AcceleratorType} {gen.Engine} {(withLora ? $"LoRA r{rank} on {string.Join(",", targets)} ({tensors.Count / 2} adapters{(LoraRuntime.GroupedDown ? "" : ", ungrouped")}{(LoraRuntime.FuseAdjacent ? "" : ", unfused")}{(LoraRuntime.PrefillGemm ? "" : ", no prefill GEMM")})" : "base")}: "
         + $"prompt {promptLen} -> time to first token {Med(ttft):F0} ms; decode ~{Med(tps):F1} tok/s ({tokens} tokens)");
 }
 return 0;

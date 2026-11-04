@@ -537,6 +537,8 @@ public sealed class GgufBatchDecoder : IDisposable
         set { if (!ReferenceEquals(_lora, value)) { _lora = value; _cacheIds = null; } }
     }
     private Training.LoraRuntime? _lora;
+    private static readonly string[] LoraQkv = { "attn_q", "attn_k", "attn_v" }, LoraQk = { "attn_q", "attn_k" }, LoraGateUp = { "ffn_gate", "ffn_up" };
+    private int[]? _loraQkvOff, _loraQkOff, _loraGateUpOff;
 
     // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM
     private void Gemm(FV x, string name, FV o, int rows, int K, int N)
@@ -675,10 +677,9 @@ public sealed class GgufBatchDecoder : IDisposable
                 Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
                 if (Lora != null)
                 {
-                    // LoRA deltas into the fused q|k|v columns, before the bias / rotary / cache-store kernel reads them
-                    Lora.Apply(l, "attn_q", hn, qkv, R, 0, n);
-                    Lora.Apply(l, "attn_k", hn, qkv, R, Q, n);
-                    if (all) Lora.Apply(l, "attn_v", hn, qkv, R, Q + kvC, n);
+                    // LoRA deltas into the fused q|k|v columns, before the bias / rotary / cache-store kernel reads them (one packed launch)
+                    if (all) Lora.ApplyAdjacent(l, LoraQkv, _loraQkvOff ??= new[] { 0, Q, Q + kvC }, hn, qkv, R, n);
+                    else Lora.ApplyAdjacent(l, LoraQk, _loraQkOff ??= new[] { 0, Q }, hn, qkv, R, n);
                 }
                 var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
                 if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
@@ -755,7 +756,7 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 var gu = Buf(ref _gateUp, (long)R * 2 * FfnDim);
                 Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim); Prof("gate-up");
-                if (Lora != null) { Lora.Apply(l, "ffn_gate", hn, gu, R, 0, 2 * FfnDim); Lora.Apply(l, "ffn_up", hn, gu, R, FfnDim, 2 * FfnDim); }
+                Lora?.ApplyAdjacent(l, LoraGateUp, _loraGateUpOff ??= new[] { 0, FfnDim }, hn, gu, R, 2 * FfnDim);
                 _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu");
             }
             else

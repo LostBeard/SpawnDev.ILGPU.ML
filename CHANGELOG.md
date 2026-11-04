@@ -2,6 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (5.8.2-local.11 candidate) - faster LoRA at inference
+
+- **LoRA q|k|v and gate|up in one launch** (`LoraRuntime.FuseAdjacent`, default on; `ApplyAdjacent`): the batch decoder's fused q|k|v and
+  gate|up outputs take their adapters as ONE packed down + up launch instead of one pair per projection. Bit-identical to per-projection
+  (`Training_DecoderLora_MatchesTrainingForward` compares both; red-check: a wrong part offset differs by 4.05). Parts without an adapter
+  fall back to per-projection. SmolLM2-360M, r16 on all 7 projections, RTX 4070 shared with a training run: decode 45.0 / 41.0 tok/s fused
+  vs 37.8 unfused (base 52).
+- **LoRA prefill as a GEMM** (`LoraRuntime.PrefillGemm`, from `PrefillGemmRows` = 16 rows): x A^T runs on the tiled `MatMulKernel` instead
+  of one reduction group per value. Same setup, 512-token prompt: first token +107 / +51 ms over base, vs +153 ms without (noisy: shared GPU).
+- `tools/LoraDecodeBench`: `--unfused`, `--no-prefill-gemm`.
+
 ## 5.8.2-local.10 - 2026-11-04 (local feed) - training at real lengths; LoRA at inference on both engines; two leaks and a Wasm race fixed
 
 - **GraphExecutor leak (fix)**: outputs an operator produces but the NODE does not name (an optional output the graph did not ask for;

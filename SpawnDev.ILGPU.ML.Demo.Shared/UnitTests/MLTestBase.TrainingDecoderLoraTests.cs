@@ -41,6 +41,18 @@ public abstract partial class MLTestBase
         dec.Lora = lora;
         await dec.PrefillAsync(ids);
         var got = await dec.ReadLogitsAsync();
+        // the packed q|k|v / gate|up launch (FuseAdjacent) sums each column's own rank terms in the same order: bit-identical to per-projection
+        bool savedFuse = LoraRuntime.FuseAdjacent;
+        float[] unfused;
+        try
+        {
+            LoraRuntime.FuseAdjacent = !savedFuse;
+            await dec.PrefillAsync(ids);
+            unfused = await dec.ReadLogitsAsync();
+        }
+        finally { LoraRuntime.FuseAdjacent = savedFuse; }
+        if (!unfused.SequenceEqual(got))
+            throw new Exception($"FuseAdjacent {savedFuse} vs {!savedFuse} differ: max |diff| {got.Zip(unfused, (a, b) => Math.Abs(a - b)).Max():E2}");
         double diff = 0, moved = 0, scale = want.Max(Math.Abs);
         for (int i = 0; i < want.Length; i++) { diff = Math.Max(diff, Math.Abs(got[i] - want[i])); moved = Math.Max(moved, Math.Abs(baseLogits[i] - want[i])); }
         var line = $"{accelerator.AcceleratorType}: decoder + LoRA vs training forward max |diff| {diff:E2} (max |logit| {scale:F2}); base decoder differs by {moved:E2}; "
