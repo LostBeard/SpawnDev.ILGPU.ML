@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **`ClapAudioClassifier` replays its audio tower (speed)**: the tower's input is always [1,1,1001,64], so it is recorded once (`SessionGraphCapture`: a CUDA graph on CUDA, a dispatch plan on WebGPU) and replayed for every later clip. `EnableGraphCapture` (default on) and `AudioCaptureStatus`. `Bench_ClapAudioTower_CaptureVsDirect` (RTX 4070, two runs, steady state): CUDA 16.7-17.0 -> 12.9-13.6 ms per forward (1.23-1.32x), WebGPU in Chrome 40.4 -> 22.3-23.4 ms (1.73-1.81x), one-time setup 0.7 s / 1.6-1.7 s; replayed embeddings bit-identical to the direct forward on two clips; 100 replays: pool allocations +0, live WebGPU buffers +0. All CLAP tests 22/0 on CUDA, OpenCL and WebGPU with it on (OpenCL has no capture and runs direct).
+
 ## 5.8.2-local.6 - 2026-11-04 (local feed) - PadKernel params-buffer leak
 
 - **`PadKernel` leaked a parameters buffer per call (memory)**: every Pad allocated a fresh params buffer and kept it until the kernel was disposed (to dodge a params race under async Wasm dispatch). Found by Riker in AssistZ with `WebGPUBufferAccounting.TopCreationSites`: 12 x 88-byte buffers per CLAP forward, +3,600 live buffers over 300 audio events, Chrome's dedicated GPU memory +0.95 MB per event (on local.3 too: not new). The buffers are now cached by CONTENT, as `TransposeKernel` already did: each is written once and never overwritten, so the race stays impossible, and a fixed-shape workload allocates each distinct pad once. `Bench_ClapAudioTower_PoolPeak` now also gates every live WebGPU buffer (`WebGPUBufferAccounting.LiveBufferCount`), not only the pool's: +0 over 200 forwards; red with the old PadKernel (+2,400). Pad tests 135/0 on all six lanes.

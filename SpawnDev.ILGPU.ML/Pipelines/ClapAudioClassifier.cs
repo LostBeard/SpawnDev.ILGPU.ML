@@ -83,6 +83,23 @@ public sealed class ClapAudioClassifier : IDisposable
     /// <summary>Audio-tower runs so far (one per <see cref="EmbedAudioAsync"/> / classify call). Diagnostic.</summary>
     public long AudioTowerRuns { get; private set; }
 
+    private Graph.SessionGraphCapture? _audioCapture;
+
+    /// <summary>
+    /// Record the audio tower once and replay it (a CUDA graph on CUDA, a dispatch plan on WebGPU; other backends run it directly). Default on.
+    /// </summary>
+    /// <remarks>
+    /// The tower's input is always [1,1,1001,64], so the recording is made once per classifier and never invalidated by a shape change.
+    /// MEASURED 2026-11-04 (RTX 4070, Bench_ClapAudioTower_CaptureVsDirect, two runs, steady state past the planned-reuse warm-up): CUDA
+    /// 16.7-17.0 -> 12.9-13.6 ms per forward (1.23-1.32x), WebGPU in Chrome 40.4 -> 22.3-23.4 ms (1.73-1.81x); one-time setup 0.7 s / 1.6-1.7 s
+    /// on the first call; the replayed embeddings bit-identical to the direct forward on two different clips; 100 replays allocate nothing.
+    /// Set before the first audio call; turning it off later runs the direct forward.
+    /// </remarks>
+    public bool EnableGraphCapture { get; set; } = true;
+
+    /// <summary>Why the audio tower is or is not replaying (<see cref="Graph.SessionGraphCapture.CaptureStatus"/>).</summary>
+    public string AudioCaptureStatus => _audioCapture?.CaptureStatus ?? "not attempted";
+
     /// <summary>Scale applied to the cosine similarities to form logits (and so the softmax temperature): the checkpoint's own.</summary>
     public float LogitScale { get; set; }
 
@@ -171,7 +188,9 @@ public sealed class ClapAudioClassifier : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         _features.Extract(pcm, length, _featureBuf.View);
         var shape = new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels };
-        var outs = await _audio.RunAsync(new Dictionary<string, Tensor> { [_audio.InputNames[0]] = new Tensor(_featureBuf.View, shape) })
+        _audioCapture ??= new Graph.SessionGraphCapture(_audio, _accelerator);
+        _audioCapture.Enabled = EnableGraphCapture;
+        var outs = await _audioCapture.RunAsync(new Dictionary<string, Tensor> { [_audio.InputNames[0]] = new Tensor(_featureBuf.View, shape) })
             .ConfigureAwait(false);
         AudioTowerRuns++;
         return Normalize(await outs[_audio.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false));
@@ -249,6 +268,7 @@ public sealed class ClapAudioClassifier : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _audioCapture?.Dispose();
         _audio.Dispose();
         _text.Dispose();
         _features.Dispose();
