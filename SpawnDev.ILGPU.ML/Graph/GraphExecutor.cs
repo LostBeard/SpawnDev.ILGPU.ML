@@ -379,6 +379,13 @@ public class GraphExecutor : IDisposable
                     && !_weights.ContainsKey(outName))
                     dead.Add(outName);
         _deadOutputs = dead;
+        if (TraceRefsMatch != null)
+            foreach (var node in _graph.Nodes)
+                foreach (var outName in node.OutputNames)
+                    if (!string.IsNullOrEmpty(outName) && outName.Contains(TraceRefsMatch, StringComparison.Ordinal))
+                        Console.WriteLine($"[REF] template: '{outName}' produced by {node.OpType}: refcount {(rc.TryGetValue(outName, out var r0) ? (r0 == int.MaxValue ? "PINNED" : r0.ToString()) : "none")}"
+                            + $"{(dead.Contains(outName) ? ", DEAD (no consumer)" : "")}; consumers: "
+                            + string.Join(", ", _graph.Nodes.Where(nn => nn.RefInputNames.Contains(outName)).Select(nn => nn.OpType)));
         if (VerboseLogging && dead.Count > 0)
             Console.WriteLine($"[GraphExecutor] {dead.Count} produced-but-unread output(s) will be "
                 + $"released immediately: {string.Join(", ", dead.Take(6))}");
@@ -1074,6 +1081,10 @@ public class GraphExecutor : IDisposable
     /// speaks 8.82 s of confident nonsense that Whisper reads back as "[MUSIC PLAYING]".
     /// </para>
     /// </remarks>
+    /// <summary>DIAGNOSTIC (<c>ML_TRACE_REFS=substring</c>): every refcount decrement of a matching tensor name (value, PINNED or ABSENT,
+    /// and the buffer), to find a tensor that is never released within a forward.</summary>
+    public static string? TraceRefsMatch = Environment.GetEnvironmentVariable("ML_TRACE_REFS") is { Length: > 0 } trm ? trm : null;
+
     /// <summary>DIAGNOSTIC (<c>ML_TRACE_SHAPES=substring</c>): every node whose first output name contains it - input shapes (and small host values), output shape.</summary>
     public static string? TraceShapesPrefix = Environment.GetEnvironmentVariable("ML_TRACE_SHAPES") is { Length: > 0 } tsp ? tsp : null;
 
@@ -2404,6 +2415,7 @@ public class GraphExecutor : IDisposable
                 InputNames = node.InputNames,
                 OutputNames = node.OutputNames,
                 ConstantValues = runtimeConstants,
+                IsInputTainted = IsInputTainted,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
                 IntegerTensorNames = _integerTensorNames,
@@ -3507,6 +3519,10 @@ public class GraphExecutor : IDisposable
             foreach (var inputName in n.RefInputNames)
             {
                 if (string.IsNullOrEmpty(inputName)) continue;
+                if (TraceRefsMatch != null && inputName.Contains(TraceRefsMatch, StringComparison.Ordinal))
+                    Console.WriteLine($"[REF] node {CurrentRunNodeIndex} {n.OpType} consumes '{inputName}': refcount "
+                        + (refCounts.TryGetValue(inputName, out var trc) ? (trc == int.MaxValue ? "PINNED" : $"{trc} -> {trc - 1}") : "ABSENT")
+                        + (tensors.TryGetValue(inputName, out var ttr) ? $" tensor #{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(ttr):x}" : " (no tensor)"));
                 if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
                 {
                     refCounts[inputName] = rc - 1;
@@ -3567,6 +3583,8 @@ public class GraphExecutor : IDisposable
             foreach (var outName in n.OutputNames)
             {
                 if (string.IsNullOrEmpty(outName) || !_deadOutputs.Contains(outName)) continue;
+                if (TraceRefsMatch != null && outName.Contains(TraceRefsMatch, StringComparison.Ordinal))
+                    Console.WriteLine($"[REF] node {CurrentRunNodeIndex} {n.OpType}: dead output '{outName}' released");
                 if (halfTensors.TryGetValue(outName, out var hdead))
                 {
                     halfTensors.Remove(outName);
@@ -3716,6 +3734,7 @@ public class GraphExecutor : IDisposable
                 Format = Format,
                 InputNames = n.InputNames,
                 ConstantValues = runtimeConstants,
+                IsInputTainted = IsInputTainted,
                 IntegerTensorNames = _integerTensorNames,
                 Registry = _registry,
             };
@@ -3806,8 +3825,10 @@ public class GraphExecutor : IDisposable
             // dispatch — leaves this node as the file's last line. See CaptureTraceFile doc.
             if (CaptureTraceFile != null)
             {
+                // In a capture pass, the capture status BEFORE this node: the first node to see Invalidated follows the illegal operation.
+                string capStatus = SuppressDrains && _accelerator.DefaultStream is global::ILGPU.Runtime.Cuda.CudaStream cs ? $"  [capture {cs.CaptureStatus}]" : "";
                 try { System.IO.File.AppendAllText(CaptureTraceFile,
-                    $"{nodeIdx} {node.OpType} {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "")}\n"); } catch { }
+                    $"{nodeIdx} {node.OpType} {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "")}{capStatus}\n"); } catch { }
             }
             if (VerboseLogging)
             {
@@ -5007,6 +5028,7 @@ public class GraphExecutor : IDisposable
                 InputNames = node.InputNames,
                 OutputNames = node.OutputNames,
                 ConstantValues = runtimeConstants,
+                IsInputTainted = IsInputTainted,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
                 IntegerTensorNames = _integerTensorNames,
@@ -5061,6 +5083,8 @@ public class GraphExecutor : IDisposable
                 {
                     if (DiagBindingLog != null) LogBindings(nodeIdx, node, nodeInputs, nodeOutputs);
                     await node.Operator.ExecuteAsync(ctx);
+                    if (CaptureTraceFile != null && SuppressDrains && _accelerator.DefaultStream is global::ILGPU.Runtime.Cuda.CudaStream cs2)
+                        try { System.IO.File.AppendAllText(CaptureTraceFile, $"   -> executed [capture {cs2.CaptureStatus}]\n"); } catch { }
                 }
                 if (opProf != null) PhaseMark(4);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
@@ -5217,7 +5241,10 @@ public class GraphExecutor : IDisposable
             }
 
             // DIAGNOSTIC probe: first-divergent-node hunt. See NodeProbeFirst64.
-            if (NodeProbeFirst64 != null && nodeIdx >= NodeProbeFromIndex
+            // 🔴 Never inside a CUDA graph capture (SuppressDrains): its synchronize + readback is illegal mid-capture and INVALIDATES it, and the
+            // catch below swallowed the error - Pipeline_ZipVoice_CaptureReplayFidelity's own probe killed the capture it was there to check
+            // ("operation failed due to a previous error during capture" at the next node; found 2026-11-04 by tracing the stream's capture status).
+            if (NodeProbeFirst64 != null && !SuppressDrains && nodeIdx >= NodeProbeFromIndex
                 && nodeOutputs.Length > 0 && nodeOutputs[0] != null
                 && node.OutputNames.Length > 0 && !string.IsNullOrEmpty(node.OutputNames[0]))
             {
@@ -5382,8 +5409,8 @@ public class GraphExecutor : IDisposable
                 }
             }
 
-            // Capture intermediate values for debugging (when enabled)
-            if (!shapeCacheHit && CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
+            // Capture intermediate values for debugging (when enabled). Not inside a CUDA graph capture: see the NodeProbeFirst64 note above.
+            if (!shapeCacheHit && !SuppressDrains && CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
             {
                 var captureOutput = nodeOutputs[0];
                 bool nameFiltered = CaptureOutputNames != null;

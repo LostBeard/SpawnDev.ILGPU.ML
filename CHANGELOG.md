@@ -2,8 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.2-local.4 - 2026-11-04 (local feed) - planned reuse on by default, ZipVoice CUDA capture + If leak fix
 
+- **Test fix: `DA3Small_Pipeline_5D_ElideDispatch`** turns input-independent folding off for both runs: folding (on by default, newer than the test) binds the shape ops once and skips them before the elide decision, so the elide-on run elided nothing ("elided=0"). Not a library bug.
+- **ZipVoice CUDA graph capture works, and an If leak is fixed (memory + speed)**: four bugs, each hidden behind the previous one (found by the HeavyModel desktop sweep; Plans/heavy-test-failures-2026-11-04.md):
+  1. `If` with a one-Constant branch (`TryWriteConstantBranch`) replaced the output the executor had pre-rented without returning it: one orphaned pooled buffer per such If per forward, in every run (ZipVoice's fm_decoder: 5 x 512 KB per forward). It now returns it as `SubgraphOutputCopy.CopyOrAdopt` does. This leak is also why capture always refused ZipVoice ("accelerator child objects still growing").
+  2. The `NodeProbeFirst64` / `CapturedOutputs` diagnostics synchronized and read back inside a CUDA capture (invalidating it, with the error swallowed); they now skip capture passes like the per-node readbacks do.
+  3. The constant branch uploaded with `CopyFromCPU` inside the capture window (an access violation); it now uses `CaptureParamArena.CaptureConstWrite` like every other constant write.
+  4. `If` read its condition back from the device inside the capture (an access violation): in a capture's warm pass an input-data-INDEPENDENT condition is now published into the capture seed (`OnnxOpContext.IsInputTainted`, new), and `OperatorInputReader` refuses a device readback inside a CUDA capture with a clear exception instead of crashing.
+  Result: `Pipeline_ZipVoice_CaptureReplayFidelity` - capture live, replay 0 of 16,800 values different at the captured inputs and at a changed timestep; `_SpeaksInTheBrowser` / `_CaptureEligibilityProbe` (CUDA) no longer crash. New diagnostics: `ML_TRACE_REFS=<substring>` (refcount decrements and pool returns of matching tensors), and the capture trace (`ML_CAPTURE_TRACE` in the ZipVoice tests) now logs the CUDA stream's capture status before and after every node.
 - **Planned buffer reuse is ON by default** on CUDA / OpenCL / CPU / Velocity (with ImmediateRelease; never WebGPU / WebGL / Wasm, never in a capture regime); `ML_PLANNED_REUSE=0` turns it off. Gate: the default desktop sweep with it on by default, 4,176 passed / 0 failed (37.5 min). ReDimNet2-B6 steady-state pool 682 -> 372 MiB on CUDA. A HeavyModel desktop sweep found no failure caused by it; the pre-existing heavy failures it surfaced (ZipVoice capture leak on CUDA, DA3 elide, Trellis2 flow crash) fail identically with it off: Plans/heavy-test-failures-2026-11-04.md.
 
 ## 5.8.2-local.3 - 2026-11-04 (local feed) - CLAP probe, planned buffer reuse (opt-in)

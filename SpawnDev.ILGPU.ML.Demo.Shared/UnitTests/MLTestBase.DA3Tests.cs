@@ -518,6 +518,11 @@ public abstract partial class MLTestBase
 
         Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
         Graph.GraphExecutor.ShapeInterpValidate = false;
+        // Input-independent folding (on by default since this test was written) binds the shape ops once and skips them on later runs, before
+        // the elide decision is ever reached: with it on, the elide-on run elides nothing and the test fails with "elided=0" (2026-11-04,
+        // pre-existing). Off for both runs here, so the dispatch-elide path is what gets measured.
+        bool foldSaved = Graph.GraphExecutor.FoldInputIndependentNodes;
+        Graph.GraphExecutor.FoldInputIndependentNodes = false;
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
@@ -591,6 +596,7 @@ public abstract partial class MLTestBase
         {
             Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
             Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+            Graph.GraphExecutor.FoldInputIndependentNodes = foldSaved;
         }
     });
 

@@ -39,6 +39,7 @@ internal static class OperatorInputReader
         var tensor = ctx.Inputs[index];
         int count = tensor.ElementCount;
         if (count <= 0) return null;
+        ThrowIfCapturing(reg, ctx, index);
         try
         {
             using var staging = reg.Accelerator.Allocate1D<float>(count);
@@ -65,9 +66,24 @@ internal static class OperatorInputReader
         var tensor = ctx.Inputs[index];
         int count = tensor.ElementCount;
         if (count <= 0) return null;
+        ThrowIfCapturing(reg, ctx, index);
         using var staging = reg.Accelerator.Allocate1D<float>(count);
         staging.View.SubView(0, count).CopyFrom(tensor.Data.SubView(0, count));
         return await staging.CopyToHostAsync<float>(0, count);
+    }
+
+    /// <summary>
+    /// A device readback (an allocation, a copy and a synchronize) inside a CUDA graph capture window (GraphExecutor.SuppressDrains) is illegal:
+    /// it invalidates the capture or takes the process down (an access violation at ZipVoice's encoder_pos If, 2026-11-04). The value must be
+    /// known on the host by then (the warm passes seed every runtime value the capture pass reads); if it is not, refuse the capture cleanly.
+    /// </summary>
+    private static void ThrowIfCapturing(OperatorRegistry reg, OnnxOpContext ctx, int index)
+    {
+        // CUDA only: a WebGPU capture records dispatches and keeps its drains (GraphExecutor.KeepDrainsDuringCapture); a readback is legal there.
+        if (!Graph.GraphExecutor.SuppressDrains || reg.Accelerator.AcceleratorType != global::ILGPU.Runtime.AcceleratorType.Cuda) return;
+        var name = index < ctx.InputNames.Length ? ctx.InputNames[index] : $"input {index}";
+        throw new InvalidOperationException($"'{name}' has no host value inside a CUDA graph capture pass and reading it back from the device "
+            + "is illegal there; the warm passes did not seed it, so this graph cannot be captured as is.");
     }
 
     /// <summary>

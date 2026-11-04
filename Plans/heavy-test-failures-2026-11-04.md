@@ -16,3 +16,9 @@ eligibility-probe access violation (likely the same capture path), DA3 elide (te
 Also from that sweep, CPU / Velocity lanes: 18 heavy LLM / SD tests hit the 600 s console cap. Those tests never run on CPU lanes in a default
 sweep, and Data's release gates overlapped that stretch (CPU contention), so they say nothing yet; SD-Turbo on CUDA (600 s cap) and
 Embeddings_RealTokenizer on CUDA (300 s) are being A/B'd for planned reuse.
+
+## 2026-11-04 status
+- ZipVoice capture (both CUDA tests): FIXED - four chained bugs (If constant-branch output leak in every run, diagnostic probes syncing mid-capture,
+  constant-branch CopyFromCPU mid-capture, If condition device readback mid-capture). Capture live and faithful; see CHANGELOG Unreleased.
+  Found with ML_TRACE_REFS + the per-node capture-status trace.
+- DA3Small_Pipeline_5D_ElideDispatch (OpenCL) and Trellis2_Flow20kTokens_OpTimes (CPU/Velocity crash): still open, next.

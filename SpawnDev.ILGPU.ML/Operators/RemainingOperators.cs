@@ -1952,7 +1952,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
     /// <see cref="SubgraphOutputCopy"/>'s adoption path must handle it. Declining is always safe.
     /// </para>
     /// </remarks>
-    private static bool TryWriteConstantBranch(OnnxOpContext ctx, Onnx.OnnxGraphProto sub)
+    private static bool TryWriteConstantBranch(Accelerator accelerator, OnnxOpContext ctx, Onnx.OnnxGraphProto sub)
     {
         if (sub.Nodes.Count != 1 || sub.Outputs.Count != 1 || ctx.Outputs.Length < 1) return false;
         var only = sub.Nodes[0];
@@ -1994,7 +1994,20 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         // Uploaded on every real execution rather than once. A queue write is cheap, a stale table is not,
         // and "write once" would need to prove the pool never rebound the name - which this does not need
         // to know. Replays skip this entirely and read the value the last real execution left.
-        stable.Data.SubView(0, values.Length).CopyFromCPU(values);
+        // Under CUDA graph capture: the arena stable slot + a captured device copy (CaptureParamArena.CaptureConstWrite), as every other constant
+        // write does. A CopyFromCPU inside the capture window is illegal and took the process down (access violation at this node in
+        // Pipeline_ZipVoice_CaptureReplayFidelity / _SpeaksInTheBrowser, 2026-11-04 - reachable once the leak below stopped refusing capture).
+        if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+            Kernels.CaptureParamArena.CaptureConstWrite(accelerator, stable.Data.SubView(0, values.Length), values);
+        else
+            stable.Data.SubView(0, values.Length).CopyFromCPU(values);
+        // 🔴 Hand back the output the executor pre-rented for this node before replacing it, as SubgraphOutputCopy.CopyOrAdopt does. Dropping
+        // it orphaned one pooled buffer per If per forward: ZipVoice's fm_decoder (five encoder_pos Ifs taking this path) gained 5 buffers every
+        // forward, so CUDA graph capture refused it forever ("accelerator child objects still growing", Pipeline_ZipVoice_CaptureReplayFidelity;
+        // found 2026-11-04 with ML_TRACE_REFS). Nothing has read or written the pre-rented buffer, so returning it now is safe.
+        var preRented = ctx.Outputs[0];
+        if (preRented != null && !ReferenceEquals(preRented, stable) && ctx.OutputNames.Length > 0 && preRented.Name == ctx.OutputNames[0])
+            ctx.Pool.ReturnIfOwned(preRented);
         ctx.Outputs[0] = stable;   // aliases the executor's nodeOutputs, exactly as SubgraphOutputCopy does
         return true;
     }
@@ -2172,6 +2185,20 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
 
     private static bool TryDeclaredOutputShapes(Onnx.OnnxGraphProto sub, out int[][] shapes)
         => SubgraphShapes.TryDeclaredOutputShapes(sub, out shapes);
+    /// <summary>
+    /// In a CUDA graph capture's warm pass, publish a condition read back from the device into the run's runtime values, so the capture pass is
+    /// seeded with it (GraphExecutor's _captureRuntimeSeed) and never reads it back mid-capture (illegal: an access violation at ZipVoice's
+    /// encoder_pos If, 2026-11-04). Only a condition NOT derived from input data: a captured plan replays the branch it recorded, so a data-dependent
+    /// condition must keep refusing capture (OperatorInputReader throws in the capture pass).
+    /// </summary>
+    private static void PublishConditionForCapture(OnnxOpContext ctx, float[] condVals)
+    {
+        if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots || SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains) return;
+        if (ctx.ConstantValues == null || ctx.InputNames.Length == 0 || string.IsNullOrEmpty(ctx.InputNames[0])) return;
+        if (ctx.TryGetInputValues(0) != null || ctx.IsInputTainted?.Invoke(ctx.InputNames[0]) != false) return;
+        ctx.ConstantValues[ctx.InputNames[0]] = condVals;
+    }
+
     public void Execute(OnnxOpContext ctx)
     {
         // If: evaluate condition scalar, execute then_branch or else_branch subgraph
@@ -2181,7 +2208,10 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         bool condition = false;
         var condVals = OperatorInputReader.Read(reg, ctx, 0);
         if (condVals != null && condVals.Length > 0)
+        {
             condition = condVals[0] != 0f;
+            PublishConditionForCapture(ctx, condVals);
+        }
         else if (ctx.TryGetInputValues(0) == null)
             throw new NotSupportedException(
                 "If could not read its condition. On a browser backend this operator needs the async path "
@@ -2195,7 +2225,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
             // allocates inside a capture window. See TryWriteConstantBranch.
-            if (TryWriteConstantBranch(ctx, subgraph)) return;
+            if (TryWriteConstantBranch(reg.Accelerator, ctx, subgraph)) return;
             if (TryRunViewBranch(reg, ctx, subgraph)) return;
             // Subgraph inputs reference outer graph tensors — pass all available tensors
             var subInputs = new Dictionary<string, Tensor>();
@@ -2242,6 +2272,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             throw new NotSupportedException(
                 "If could not read its condition. Defaulting to a branch would silently pick the wrong one.");
         bool condition = condVals[0] != 0f;
+        PublishConditionForCapture(ctx, condVals);
 
         CountBranch(condition);
         if (BypassSubgraphForCaptureProbe) return;   // DIAGNOSTIC: leaves the output unwritten
@@ -2250,7 +2281,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
             // allocates inside a capture window. See TryWriteConstantBranch.
-            if (TryWriteConstantBranch(ctx, subgraph)) return;
+            if (TryWriteConstantBranch(reg.Accelerator, ctx, subgraph)) return;
             if (TryRunViewBranch(reg, ctx, subgraph)) return;
             var subInputs = new Dictionary<string, Tensor>();
             OuterScope.Add(ctx, subgraph, subInputs);

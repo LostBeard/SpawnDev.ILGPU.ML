@@ -906,6 +906,10 @@ public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
     {
         var name = tensor.Name;
         var own = BufferOf(tensor.Data);
+        if (Graph.GraphExecutor.TraceRefsMatch is { } trm && name != null && name.Contains(trm, StringComparison.Ordinal))
+            Console.WriteLine($"[REF] Return '{name}' node {Graph.GraphExecutor.CurrentRunNodeIndex}: own {Bid(own)} (live {(own != null && _live.ContainsKey(own))}, "
+                + $"live name '{(own != null && _live.TryGetValue(own, out var tl) ? tl.Name : "-")}', rentable {(own != null && _rentable.Contains(own))}); "
+                + $"name records {(_namedBuffers.TryGetValue(name, out var tnb) ? Bid(tnb.Buffer) : "none")}");
         // STALE RETURN: this tensor's own buffer is still live but its name has been re-Rented since (the GGUF decode
         // loop's 'logits', Whisper's per-step 'present.*'). Free exactly this buffer; the name's current one is live.
         if (own != null && _live.TryGetValue(own, out var mine) && mine.Name == null)

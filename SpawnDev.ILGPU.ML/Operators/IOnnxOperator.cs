@@ -62,6 +62,12 @@ public class OnnxOpContext
     public Dictionary<string, float[]>? ConstantValues { get; init; }
 
     /// <summary>
+    /// Is this value derived from the graph's input DATA (not only its shapes)? Set by the executor. A CUDA graph capture bakes host values into
+    /// the replayed plan, so only an untainted value may be published for the capture pass (see IfOperator's condition).
+    /// </summary>
+    public Func<string, bool>? IsInputTainted { get; init; }
+
+    /// <summary>
     /// Host-side ONNX values (Sequence / Optional / String / Bytes) keyed by tensor name.
     /// Shared with the executor for the life of a Run — float GPU tensors stay in <see cref="Inputs"/>/
     /// <see cref="Outputs"/>; non-float types never go through <c>ArrayView1D&lt;float&gt;</c>.
