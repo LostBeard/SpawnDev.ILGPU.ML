@@ -49,7 +49,7 @@ no checkpointing, no LoRA for language models (`StableDiffusion/SdLora.cs` is lo
   - [x] M1.2 autograd core: `Training/GraphAutograd.cs` (AddLora + AddBackward graph rewrite), `CreateFromGGUF(..., graphTransform)` hook.
   - [x] M1.3 rules + gradient kernels (75cdc277), CE loss op on device per ONNX.
   - [x] M1.4 LoRA rewrite + AdamW (`Training/GgufLoraTrainer.cs`) + PEFT files (`Training/LoraAdapterFile.cs`, `SaveAdaptersAsync`): reload exact; Python safetensors reads them (tools/TrainTinyLora + check_tiny_lora_peft_files.py, 6e-8 vs torch).
-- [ ] **M2** train a small real llama GGUF (SmolLM2-135M class) on a toy task; loss curve within tolerance of a PEFT run
+- [x] **M2** (2026-11-04: smollm2:360m F16 GGUF, 12 AdamW steps, per-step loss vs float64 torch <= 1.3e-5 rel on CUDA and OpenCL, loss 14.37 -> 4.10; tools/TrainLoraCurve + tools/gen_lora_curve_reference.py) train a small real llama GGUF (SmolLM2-135M class) on a toy task; loss curve within tolerance of a PEFT run
       with the same data, seed and hyperparameters.
 - [ ] **M3** llama3.1:8b on the 2060: Q4_K / Q6_K transposed-dequant kernels, checkpointing, measured VRAM and tokens/s;
       fused unmerged LoRA at decode with a decode-speed gate.
