@@ -45,7 +45,7 @@ no checkpointing, no LoRA for language models (`StableDiffusion/SdLora.cs` is lo
 - [ ] **M1** autograd + LoRA on a tiny llama GGUF (synthetic f32 weights, `BuildTinyLfm2GGUF`'s pattern, plus a quantized
       variant). Gate: every gradient rule against finite differences and against PyTorch; full-model loss, input and
       adapter gradients against torch + PEFT on the same weights; one AdamW step equal. CUDA / OpenCL / WebGPU.
-  - [ ] M1.1 oracle: `tools/` script that builds the tiny llama in torch, writes the GGUF + reference loss / grads.
+  - [x] M1.1 oracle: `tools/gen_tiny_llama_train_reference.py` (f32 tiny llama, GQA 4:2, LoRA q/v rank 4) -> `wwwroot/test-train/`; `Training_TinyLlama_ForwardMatchesTorch` 7/7 lanes, logits max |diff| ~3e-6 (2026-11-04).
   - [ ] M1.2 autograd core: `GradientRule` per op type, backward-graph builder, trainable-parameter set, loss node.
   - [ ] M1.3 rules: Add, Mul, Reshape, Transpose, Gather, MatMul (f32), RMSNorm, SwiGLU, FusedAttention+RoPE, CE loss.
   - [ ] M1.4 LoRA rewrite + AdamW + PEFT-compatible safetensors save / load.
