@@ -37,6 +37,19 @@ output buffer being returned, read-before-write at node inputs/outputs. Remainin
 under colliding names (201 ALIEN-RETURNs per capture: `_mmi_a/_mmi_b`, DynamicQuantize temps), BufferPool's
 name-ownership leak. CLAP replays bit-identically with KeepDrains, so the hazard is per graph.
 
+## Ruled out from the code (2026-11-04, Tuvok, no run)
+
+- GPU->GPU copies inside a capture are ordered: `WebGPUAccelerator.RecordCopyBuffer` writes the copy into the stream's
+  encoder (batching is inactive while a plan records) AND into the plan (`_activeDispatchPlan.RecordCopy`), so a replay
+  re-runs it. MatMulInteger's `_mmi_a/_mmi_b` input copies are therefore not out of order.
+- Host uploads during a capture: `TryBatchUpload` refuses while a plan records, and `WebGPUMemoryBuffer` then calls
+  `FlushPendingCommands()` before `queue.writeBuffer`, so the CAPTURE pass is ordered; a replay would skip such a
+  write, but the census found none beyond the scalar uploads.
+- Next suspect stays the pool's name ownership: an operator that returns an internal temp while a LATER node (or a
+  later op inside the same node) rents the same name gets the same buffer back. That is fine in order, so the
+  question is which ALIEN-RETURN hands a buffer to a node whose recorded dispatch is still pending. Next run (needs
+  the GPU; ZipVoice fm_decoder on WebGPU): log rent / return per name inside the window with the dispatch index.
+
 ## Plan
 
 - [ ] Find the ZipVoice capture-pass divergence under reuse (the colliding-name internal rents first): a fix there is
