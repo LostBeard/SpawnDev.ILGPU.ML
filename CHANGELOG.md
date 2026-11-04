@@ -2,7 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (5.8.2-local.10 candidate) - training at real lengths; LoRA at inference on both engines
+## 5.8.2-local.10 - 2026-11-04 (local feed) - training at real lengths; LoRA at inference on both engines; two leaks and a Wasm race fixed
+
+- **GraphExecutor leak (fix)**: outputs an operator produces but the NODE does not name (an optional output the graph did not ask for;
+  ONNX "" outputs) were rented every run and never returned, all under the shared pool name "_anon_{i}". MEASURED on the training graph
+  (SoftmaxCrossEntropyLoss's optional log_prob): +1 device allocation and +32 MiB per step, without end; any ONNX model with an unused
+  optional output leaked the same way per forward. Now a node-unique pool name and the dead-output release.
+  `Training_StepsDoNotGrowThePool` (+0 over 5 steps; red +5).
+- **GatherND on Wasm (fix)**: the operator disposed the previous call's params buffer per call, so a GatherND still queued on the Wasm
+  worker pool read freed memory ("[GE node-192 sync] Arg_NullReferenceException" on MoveNet once the stable node order put two GatherNDs
+  together; per-op sync passed). Now content-addressed, write-once params (Kernels.ContentParamBuffers). The recurrent operator's scratch
+  grow retires the old buffer instead of disposing it (same hazard). `Diagnostic_MoveNet_StableVsFifoOrder`: all four combinations pass.
+- **`GenerationResult.StopTokenId`** (both engines): the id that ended a generation (EOS / stop token; null for length, stop string,
+  cancel), so a training pair appends the end-of-turn id the model actually emitted. Asked by Data / Seven.
+- **Training speed**: register-blocked transposed-quant matmul (64 x 64 tiles, 4 x 4 per thread) and blocked attention backward
+  (8 rows / keys per iteration): a llama3.1:8b training step at 1,600 tokens ~66 s -> 21.7 s on an RTX 4070 (profiled with
+  `tools/TrainLoraProbe --profile`).
+- Full default sweep 7495/0.
 
 - **`GraphCompiler`'s topological sort is STABLE**: among ready nodes, the one earliest in the given list runs first, so a list that is already a
   valid order (ONNX files, GGUFGraphBuilder) is kept exactly. FIFO scheduled every node as soon as its inputs existed, which pulled the training
