@@ -11,6 +11,12 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// <param name="Probability">Softmax of the logits over the labels of the call.</param>
 public readonly record struct ClapScore(string Label, float Logit, float Probability);
 
+/// <summary>Zero-shot scores and the audio embedding of one clip, from ONE audio-tower run
+/// (<see cref="ClapAudioClassifier.ClassifyWithEmbeddingAsync(ArrayView1D{float, Stride1D.Dense}, int, IReadOnlyList{string})"/>).</summary>
+/// <param name="Scores">Per label, in label order.</param>
+/// <param name="Embedding">The L2-normalized audio embedding (feed it to a <see cref="ClapProbe"/>).</param>
+public readonly record struct ClapResult(ClapScore[] Scores, float[] Embedding);
+
 /// <summary>
 /// Zero-shot audio classification with CLAP (LAION <c>clap-htsat-unfused</c>: an HTSAT audio tower and a RoBERTa text tower trained
 /// contrastively): score a 48 kHz mono clip against any text labels ("a gunshot", "footsteps on gravel", ...) with no training.
@@ -73,6 +79,9 @@ public sealed class ClapAudioClassifier : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _featureBuf;
     private readonly Dictionary<string, float[]> _textCache = new();
     private bool _disposed;
+
+    /// <summary>Audio-tower runs so far (one per <see cref="EmbedAudioAsync"/> / classify call). Diagnostic.</summary>
+    public long AudioTowerRuns { get; private set; }
 
     /// <summary>Scale applied to the cosine similarities to form logits (and so the softmax temperature): the checkpoint's own.</summary>
     public float LogitScale { get; set; }
@@ -164,18 +173,35 @@ public sealed class ClapAudioClassifier : IDisposable
         var shape = new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels };
         var outs = await _audio.RunAsync(new Dictionary<string, Tensor> { [_audio.InputNames[0]] = new Tensor(_featureBuf.View, shape) })
             .ConfigureAwait(false);
+        AudioTowerRuns++;
         return Normalize(await outs[_audio.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false));
     }
 
     /// <summary>Score a 48 kHz mono clip on the accelerator against <paramref name="labels"/>; the scores are in label order.</summary>
     public async Task<ClapScore[]> ClassifyAsync(ArrayView1D<float, Stride1D.Dense> pcm, int length, IReadOnlyList<string> labels)
+        => (await ClassifyWithEmbeddingAsync(pcm, length, labels).ConfigureAwait(false)).Scores;
+
+    /// <summary>
+    /// Zero-shot scores AND the audio embedding of a 48 kHz mono clip on the accelerator, from one audio-tower run: for callers that also feed the
+    /// embedding to a <see cref="ClapProbe"/> (calling <see cref="ClassifyAsync(ArrayView1D{float, Stride1D.Dense}, int, IReadOnlyList{string})"/> and
+    /// <see cref="EmbedAudioAsync"/> separately would run the tower twice).
+    /// </summary>
+    public async Task<ClapResult> ClassifyWithEmbeddingAsync(ArrayView1D<float, Stride1D.Dense> pcm, int length, IReadOnlyList<string> labels)
     {
         ArgumentNullException.ThrowIfNull(labels);
         if (labels.Count == 0) throw new ArgumentException("at least one label is required", nameof(labels));
         var audio = await EmbedAudioAsync(pcm, length).ConfigureAwait(false);
         var texts = new float[labels.Count][];
         for (int i = 0; i < labels.Count; i++) texts[i] = await EmbedTextAsync(labels[i]).ConfigureAwait(false);
-        return Score(audio, texts, labels, LogitScale);
+        return new ClapResult(Score(audio, texts, labels, LogitScale), audio);
+    }
+
+    /// <summary>Zero-shot scores and the embedding of a 48 kHz mono clip held on the host (uploaded once), from one audio-tower run.</summary>
+    public async Task<ClapResult> ClassifyWithEmbeddingAsync(float[] pcm, IReadOnlyList<string> labels)
+    {
+        ArgumentNullException.ThrowIfNull(pcm);
+        using var buf = _accelerator.Allocate1D(pcm);
+        return await ClassifyWithEmbeddingAsync(buf.View, pcm.Length, labels).ConfigureAwait(false);
     }
 
     /// <summary>Score a 48 kHz mono clip held on the host (uploaded once) against <paramref name="labels"/>.</summary>

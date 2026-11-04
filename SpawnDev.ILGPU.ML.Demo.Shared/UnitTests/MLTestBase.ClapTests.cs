@@ -199,6 +199,18 @@ public abstract partial class MLTestBase
         if (top.Label != wantTop || worstReal > 0.03)
             throw new Exception($"LibriSpeech: best '{top.Label}' ({top.Probability:F3}) vs transformers' '{wantTop}', probabilities off by {worstReal:F4}");
         notes.Add($"LibriSpeech -> '{top.Label}' {top.Probability:F3} (|dp| {worstReal:F4}, warm {realMs:F0} ms)");
+        // ClassifyWithEmbeddingAsync: the same scores and embedding as the two separate calls, from ONE audio-tower run (AssistZ feeds both a probe
+        // and the prompts per event)
+        long runs0 = clap.AudioTowerRuns;
+        var both = await clap.ClassifyWithEmbeddingAsync(speech, labels);
+        if (clap.AudioTowerRuns - runs0 != 1) throw new Exception($"ClassifyWithEmbeddingAsync ran the audio tower {clap.AudioTowerRuns - runs0} times");
+        var alone = await clap.ClassifyAsync(speech, labels);
+        using (var speechBuf = accelerator.Allocate1D(speech))
+        {
+            var emb = await clap.EmbedAudioAsync(speechBuf.View, speech.Length);
+            if (!both.Embedding.SequenceEqual(emb)) throw new Exception("ClassifyWithEmbeddingAsync's embedding differs from EmbedAudioAsync's");
+        }
+        if (!both.Scores.Select(x => x.Probability).SequenceEqual(alone.Select(x => x.Probability))) throw new Exception("ClassifyWithEmbeddingAsync's scores differ from ClassifyAsync's");
         var line = $"{accelerator.AcceleratorType} {repo}: " + string.Join("; ", notes);
         Console.WriteLine($"[Clap] {line}");
         return line;

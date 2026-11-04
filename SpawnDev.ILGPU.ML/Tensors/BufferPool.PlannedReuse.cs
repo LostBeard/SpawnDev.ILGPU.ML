@@ -66,6 +66,12 @@ public partial class BufferPool
     // (ControlFlow_IfSqueeze_NoLeakAcrossForwards). By the next run they are back in the buckets.
     private readonly Dictionary<object, List<(int Bucket, int RentAt, int ReturnAt, MemoryBuffer1D<float, Stride1D.Dense> Buffer)>> _readyToPlan = new(ReferenceEqualityComparer.Instance);
 
+    /// <summary>
+    /// Directory to write each recording a plan is built from (<c>plan-NNN.csv</c>: seq, bucket elements, rent clock, return clock or -1), for offline
+    /// study of packing strategies. Env <c>ML_PLANNED_REUSE_DUMP</c>. Diagnostic.
+    /// </summary>
+    public static string? PlannedReuseDumpDir = Environment.GetEnvironmentVariable("ML_PLANNED_REUSE_DUMP") is { Length: > 0 } dd ? dd : null;
+
     /// <summary>Log a planned run's first deviation (rent index, recorded vs requested bucket) to the console. Diagnostic.</summary>
     public static bool TracePlannedReuse = Environment.GetEnvironmentVariable("ML_TRACE_PLANNED_REUSE") is "1" or "true";
     private readonly Dictionary<MemoryBuffer, SlotEntry> _slotOf = new(ReferenceEqualityComparer.Instance);
@@ -212,28 +218,47 @@ public partial class BufferPool
 
     private void BuildPlanLocked(object owner, List<(int Bucket, int RentAt, int ReturnAt, MemoryBuffer1D<float, Stride1D.Dense> Buffer)> rec)
     {
+        if (PlannedReuseDumpDir != null)
+        {
+            try
+            {
+                Directory.CreateDirectory(PlannedReuseDumpDir);
+                var sb = new System.Text.StringBuilder("seq,bucket,rent,ret").AppendLine();
+                for (int i = 0; i < rec.Count; i++) sb.Append(i).Append(',').Append(rec[i].Bucket).Append(',').Append(rec[i].RentAt).Append(',').Append(rec[i].ReturnAt).AppendLine();
+                File.WriteAllText(Path.Combine(PlannedReuseDumpDir, $"plan-{PlannedReusePlans:D3}.csv"), sb.ToString());
+            }
+            catch { /* diagnostic only */ }
+        }
         var planned = new List<int>();
         for (int i = 0; i < rec.Count; i++) if (rec[i].ReturnAt >= 0) planned.Add(i);
-        if (planned.Count == 0) return;
+        if (planned.Count == 0) { _neverPlan.Add(owner); return; }   // nothing to plan: stop recording this executor
         planned.Sort((a, b) => rec[a].Bucket != rec[b].Bucket ? rec[b].Bucket.CompareTo(rec[a].Bucket) : rec[a].RentAt.CompareTo(rec[b].RentAt));
 
         // Greedy by size: largest rent first, into the first slot whose intervals it does not overlap; a slot's size is its first (largest) rent's.
+        // A slot's intervals never overlap, so kept sorted by start they are sorted by end too: one binary search and the two neighbours decide an
+        // overlap (O(log k) instead of a scan of every interval: a big graph records tens of thousands of rents).
         var slotOf = new int[rec.Count];
         Array.Fill(slotOf, -1);
         var slotFirst = new List<int>();
-        var slotIntervals = new List<List<(int A, int B)>>();
+        var slotStarts = new List<List<int>>();
+        var slotEnds = new List<List<int>>();
         foreach (int i in planned)
         {
             int a = rec[i].RentAt, b = rec[i].ReturnAt;
-            int chosen = -1;
-            for (int k = 0; k < slotIntervals.Count && chosen < 0; k++)
+            int chosen = -1, at = -1;
+            for (int k = 0; k < slotStarts.Count && chosen < 0; k++)
             {
-                bool overlap = false;
-                foreach (var (sa, sb) in slotIntervals[k]) if (a < sb && sa < b) { overlap = true; break; }
-                if (!overlap) chosen = k;
+                var starts = slotStarts[k];
+                int pos = starts.BinarySearch(a);
+                if (pos >= 0) continue;                                   // another rent starts at the same tick: overlap
+                pos = ~pos;                                               // first interval starting after a
+                if (pos > 0 && slotEnds[k][pos - 1] > a) continue;        // the one before still live at a
+                if (pos < starts.Count && starts[pos] < b) continue;      // the one after starts before b
+                chosen = k; at = pos;
             }
-            if (chosen < 0) { chosen = slotIntervals.Count; slotIntervals.Add(new()); slotFirst.Add(i); }
-            slotIntervals[chosen].Add((a, b));
+            if (chosen < 0) { chosen = slotStarts.Count; slotStarts.Add(new()); slotEnds.Add(new()); slotFirst.Add(i); at = 0; }
+            slotStarts[chosen].Insert(at, a);
+            slotEnds[chosen].Insert(at, b);
             slotOf[i] = chosen;
         }
 
