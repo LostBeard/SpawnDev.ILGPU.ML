@@ -26,5 +26,8 @@ defect were read site by site. Verdicts:
   `Pipelines/IlgpuZipVoiceGraphs.cs` 259: workspace buffers / kernels assigned by `??=`, an Ensure* call or `Load()` right before use.
 
 ## Open
-- [ ] CS9113 (54), CS0419 (56), CS1734 (38), CS1572 / CS1735 / CS1587: unread parameters and doc-reference noise - read in a second pass.
+- [x] CS9113 read 2026-11-04: 27 unique (54 counting both target builds), every one the `OperatorRegistry reg` primary-constructor parameter of a
+  host-only / shape operator (ShapeOperators, RemainingOperators, ElementWiseOperators, SignalOperators). The registry constructs every operator
+  the same way, so the parameter is a convention, not an ignored setting: no defect. CS0419 / CS1734 / CS1572 / CS1735 / CS1587 are doc-comment
+  references (ambiguous cref, missing paramref target): documentation noise, folded into the documentation-debt item below.
 - [ ] Documentation debt (CS1591 x ~2800 unique): not defects; document the public API surface over time.
