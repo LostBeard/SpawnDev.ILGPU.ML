@@ -6,7 +6,7 @@
 //
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
-//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only]
+//        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch]
 // --eval-only: skip training; evaluate the adapters already in --out. Every run writes <out>/generation_eval.jsonl: per dev line the
 // prompt, the target and the generated ids of the base model and of the adapters (a fixture for SpawnDev.AI's adapter test).
 using System.Diagnostics;
@@ -110,14 +110,21 @@ for (int ep = 1; ep <= epochs; ep++)
 // exact match = the greedy continuation's ids equal target_ids and the model then emits the end of turn
 if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors")))
 {
-    await using var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
-    using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + 64, 8192));
-    using var lora = LoraRuntime.Load(accelerator, File.ReadAllBytes(Path.Combine(outDir, "adapter_model.safetensors")), File.ReadAllText(Path.Combine(outDir, "adapter_config.json")));
+    var set = LoraAdapterSet.Load(File.ReadAllBytes(Path.Combine(outDir, "adapter_model.safetensors")), File.ReadAllText(Path.Combine(outDir, "adapter_config.json")));
+    var engine = Arg("--engine", "auto") switch
+    {
+        "generator" => SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Generator,
+        "batch" => SpawnDev.ILGPU.ML.Pipelines.GgufEngine.BatchDecoder,
+        _ => SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Auto,
+    };
     var perLine = dev.Select(_ => new Dictionary<string, int[]>()).ToList();
     var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { Strategy = "greedy" };
     foreach (bool withLora in new[] { false, true })
     {
-        gen.Lora = withLora ? lora : null;
+        // a generator per pass, the adapters given at load (GgufGenerator.CreateAsync(lora:)): the path that works on either engine
+        await using var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + 64, 8192), engine: engine,
+            lora: withLora ? set : null);
         int exact = 0;
         for (int di = 0; di < dev.Count; di++)
         {
@@ -133,7 +140,7 @@ if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors
         Console.WriteLine($"generation on dev ({gen.Engine}): {(withLora ? "with adapters" : "base")}: {exact}/{dev.Count} exact (target ids, then end of turn)");
         log.Add(new { generation = withLora ? "adapters" : "base", exact, of = dev.Count });
     }
-    using (var w = new StreamWriter(Path.Combine(outDir, "generation_eval.jsonl")))
+    using (var w = new StreamWriter(Path.Combine(outDir, engine == SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Auto ? "generation_eval.jsonl" : $"generation_eval.{Arg("--engine", "auto")}.jsonl")))
         for (int di = 0; di < dev.Count; di++)
         {
             var (id, ids, labels) = dev[di];
