@@ -22,9 +22,10 @@ namespace SpawnDev.ILGPU.ML.Tensors;
 public partial class BufferPool
 {
     /// <summary>
-    /// Plan each executor's activation buffers from its first run (see the notes in BufferPool.PlannedReuse.cs). Env <c>ML_PLANNED_REUSE</c> (1 = on).
+    /// Plan each executor's activation buffers from its recorded runs (see the notes in BufferPool.PlannedReuse.cs). On by default on the eligible backends (CUDA,
+    /// OpenCL, CPU, Velocity with ImmediateRelease); env <c>ML_PLANNED_REUSE=0</c> turns it off.
     /// </summary>
-    public static bool PlannedReuse = Environment.GetEnvironmentVariable("ML_PLANNED_REUSE") is "1" or "true";
+    public static bool PlannedReuse = Environment.GetEnvironmentVariable("ML_PLANNED_REUSE") is not ("0" or "false");
 
     /// <summary>Rents served from a plan's slots (cumulative, diagnostic).</summary>
     public static long PlannedReuseRents;

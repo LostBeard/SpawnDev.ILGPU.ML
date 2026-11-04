@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **Planned buffer reuse is ON by default** on CUDA / OpenCL / CPU / Velocity (with ImmediateRelease; never WebGPU / WebGL / Wasm, never in a capture regime); `ML_PLANNED_REUSE=0` turns it off. Gate: the default desktop sweep with it on by default, 4,176 passed / 0 failed (37.5 min). ReDimNet2-B6 steady-state pool 682 -> 372 MiB on CUDA. A HeavyModel desktop sweep found no failure caused by it; the pre-existing heavy failures it surfaced (ZipVoice capture leak on CUDA, DA3 elide, Trellis2 flow crash) fail identically with it off: Plans/heavy-test-failures-2026-11-04.md.
+
 ## 5.8.2-local.3 - 2026-11-04 (local feed) - CLAP probe, planned buffer reuse (opt-in)
 
 - **CLAP probe on audio embeddings (AssistZ)**: `ClapProbe` - class-balanced logistic regression on `ClapAudioClassifier` embeddings, fitted on LABELLED AUDIO instead of text prompts (two classes = AssistZ's Lab/probe_eval.py fit_logistic exactly; more = the multinomial form); `Predict`, `PredictLabel`, `ToJson` / `FromJson` (source-generated, trim safe). `ClassifyWithEmbeddingAsync` returns the zero-shot scores AND the embedding from one audio-tower run (`AudioTowerRuns` counts them). On AssistZ's labelled DayZ set (903 clips, truth from the game logs), reproduced on our CUDA and OpenCL: leave-one-run-out gunfire 618/619 (prompts 616/619), no-shot called gunfire 1/169 (33/169); held out: a 150 m automatic burst 30/30 (20/30), real footsteps 0/55; a 600 s recording with no shots 0/100 (11/100). `tools/clap-probe-eval`. Gate `ClapProbe_FitMatchesNumpyReference` (red without class balancing: 0.605 off). Also measured in transformers: the prompts' gunfire/footsteps call tracks clip LEVEL (a 150 m burst peak-normalized to -24 / -18 / -12 / -6 dBFS: 9 / 18 / 29 / 30 of 30) - the checkpoint's dB features carry no per-clip normalization; the probe does not depend on it.
