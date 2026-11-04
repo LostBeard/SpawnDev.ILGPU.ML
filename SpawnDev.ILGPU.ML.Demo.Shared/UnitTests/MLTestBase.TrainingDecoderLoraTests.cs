@@ -54,4 +54,46 @@ public abstract partial class MLTestBase
         if (!back.SequenceEqual(baseLogits)) throw new Exception("removing the adapters did not restore the base logits");
         return line;
     });
+
+    /// <summary>
+    /// GgufGenerator.CreateAsync(lora:) on BOTH engines: the session engine (adapters inserted into its graph at load) and the batch decoder
+    /// (a LoraRuntime) generate the same greedy tokens with the same adapter set, and both differ from the base model. Added 2026-11-04.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_GeneratorLora_BothEnginesAgree() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("the batch decoder's backends (CUDA, OpenCL, WebGPU), to compare the two engines");
+        var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var gguf = await assets.GetByteArrayAsync("test-train/tiny-llama-f16.gguf");
+        const int rank = 4; const float alpha = 8f;
+        Dictionary<string, float[]> adapters;
+        int vocab;
+        using (var trainer = GgufLoraTrainer.Create(accelerator, gguf, new LoraOptions { Targets = new[] { "attn_q", "attn_v", "ffn_up", "ffn_down" }, Rank = rank, Alpha = alpha, Seed = 9 }))
+        {
+            var rng0 = new Random(13);
+            adapters = await trainer.GetAdaptersAsync();
+            foreach (var k in adapters.Keys.Where(k => k.EndsWith("lora_B.weight")).ToList())
+                adapters[k] = adapters[k].Select(_ => (float)((rng0.NextDouble() * 2 - 1) * 0.3)).ToArray();
+            vocab = trainer.VocabSize;
+        }
+        var set = new LoraAdapterSet(adapters, rank, alpha);
+        var rng = new Random(17);
+        var prompt = Enumerable.Range(0, 12).Select(_ => rng.Next(0, vocab)).ToArray();
+        var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { Strategy = "greedy", MaxNewTokens = 8 };
+        async Task<int[]> Gen(GgufEngine engine, LoraAdapterSet? lora)
+        {
+            using var gen = await GgufGenerator.CreateAsync(accelerator, new MemoryStream(gguf), 64, engine: engine, lora: lora);
+            if (gen.Engine != engine) throw new Exception($"asked for {engine}, got {gen.Engine}");
+            return (await gen.GenerateAsync(prompt, cfg)).GeneratedTokenIds;
+        }
+        var sessionLora = await Gen(GgufEngine.Generator, set);
+        var batchLora = await Gen(GgufEngine.BatchDecoder, set);
+        var sessionBase = await Gen(GgufEngine.Generator, null);
+        var line = $"{accelerator.AcceleratorType}: session+LoRA [{string.Join(",", sessionLora)}], batch+LoRA [{string.Join(",", batchLora)}], base [{string.Join(",", sessionBase)}]";
+        Console.WriteLine("[Training] " + line);
+        if (!sessionLora.SequenceEqual(batchLora)) throw new Exception("the two engines generate differently with the same adapters: " + line);
+        if (sessionLora.SequenceEqual(sessionBase)) throw new Exception("the adapters do not change the generation: " + line);
+        return line;
+    });
 }

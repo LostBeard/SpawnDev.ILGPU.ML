@@ -50,6 +50,7 @@ public sealed class GgufGenerator : IDisposable
     // the batch decoder's engine (CreateAsync chose it): every public member routes to it; the session-path fields are then unset
     private readonly GgufBatchTextEngine? _batch;
     private InferenceSession? _ownedSession;   // CreateAsync's session (the generator engine), disposed with this generator
+    private Training.LoraRuntime? _ownedLora;   // CreateAsync's adapters on the batch decoder, disposed with this generator
     private Stream? _ownedStream;
 
     /// <summary>The underlying decode-enabled <see cref="InferenceSession"/> (owned by the pipeline/creator). The generator engine only: a generator on the batch
@@ -94,8 +95,12 @@ public sealed class GgufGenerator : IDisposable
     /// engine disposes it with itself. <paramref name="ownsStream"/>: dispose it with this generator on either engine.
     /// </summary>
     /// <remarks>Seeded sampling is reproducible on each engine, not across them (the batch decoder's device draws take their uniform from seed, sequence and position).</remarks>
+    /// <param name="lora">A LoRA adapter to apply at every step (<see cref="Training.LoraAdapterSet.Load"/>), on either engine: the batch decoder gets
+    /// a <see cref="Training.LoraRuntime"/> this generator owns; the session engine gets the adapters inserted into its graph at load
+    /// (<see cref="Training.GraphAutograd.AddLora"/>), the same unmerged math. Null = the base model.</param>
     public static async Task<GgufGenerator> CreateAsync(Accelerator accelerator, Stream gguf, int maxSeqLen = 4096, GGUFModel? model = null,
-        Action<string, int>? onProgress = null, GgufEngine engine = GgufEngine.Auto, bool ownsStream = false, CancellationToken ct = default)
+        Action<string, int>? onProgress = null, GgufEngine engine = GgufEngine.Auto, bool ownsStream = false, CancellationToken ct = default,
+        Training.LoraAdapterSet? lora = null)
     {
         if (!gguf.CanSeek) throw new ArgumentException("GgufGenerator.CreateAsync requires a seekable stream.", nameof(gguf));
         if (model == null)
@@ -112,12 +117,16 @@ public sealed class GgufGenerator : IDisposable
             if (chosen == GgufEngine.BatchDecoder)
             {
                 var dec = await GgufBatchDecoder.CreateAsync(accelerator, gguf, model, maxSeqLen, 1, onProgress, ct).ConfigureAwait(false);
-                return new GgufGenerator(dec, accelerator, model);
+                var g = new GgufGenerator(dec, accelerator, model);
+                if (lora != null) { g._ownedLora = Training.LoraRuntime.Load(accelerator, lora); dec.Lora = g._ownedLora; }
+                return g;
             }
             if (engine == GgufEngine.BatchDecoder) throw new NotSupportedException("GgufEngine.BatchDecoder: " + reason);
         }
         gguf.Seek(0, SeekOrigin.Begin);
-        var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, gguf, onProgress, ct, parsedHeader: model).ConfigureAwait(false);
+        var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, gguf, onProgress, ct, parsedHeader: model,
+            graphTransform: lora == null ? null : (graph, weights) => Training.GraphAutograd.AddLora(graph, weights, lora.GgufTargets, lora.Rank, lora.Alpha, lora.Tensors))
+            .ConfigureAwait(false);
         return new GgufGenerator(session, accelerator, model, maxSeqLen) { _ownedSession = session, _ownedStream = ownsStream ? gguf : null, EngineReason = reason };
     }
 
@@ -672,7 +681,7 @@ public sealed class GgufGenerator : IDisposable
     /// batch decoder. Never a session passed to the constructor, nor the accelerator (caller-owned).</summary>
     public void Dispose()
     {
-        if (_batch != null) { _batch.Dispose(); _ownedStream?.Dispose(); return; }
+        if (_batch != null) { _batch.Dispose(); _ownedLora?.Dispose(); _ownedLora = null; _ownedStream?.Dispose(); return; }
         _decodeCapture?.Dispose(); _decodeCapture = null;
         _inputIdsBuf?.Dispose(); _inputIdsBuf = null;
         _logitsReadBuf?.Dispose(); _logitsReadBuf = null;
