@@ -24,6 +24,46 @@ public class RMSNormGradOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+/// <summary>
+/// MatMulGradInput(dy [..., N], W [K, N]) -> dx [..., K] = dy W^T: the input gradient of <c>MatMul(x, W)</c> through a FROZEN weight in
+/// whatever form the loader kept it - GGUF-quantized bytes (decoded in-register, never expanded), native low precision (F16/BF16/FP8), or f32.
+/// </summary>
+public class MatMulGradInputOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "MatMulGradInput";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var dy = inputs[0]; var w = inputs[1];
+        var o = (int[])dy.Clone();
+        o[^1] = w[0];
+        return new[] { o };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var dy = ctx.Inputs[0]; var w = ctx.Inputs[1];
+        int K = w.Shape[0], N = w.Shape[1];
+        int M = dy.ElementCount / N;
+        var dx = ctx.Outputs[0].Data.SubView(0, M * K);
+        if (w.Name != null && ctx.QuantizedWeights != null && ctx.QuantizedWeights.TryGetValue(w.Name, out var q))
+        {
+            if (reg.QuantizedWeightTypes == null || !reg.QuantizedWeightTypes.TryGetValue(w.Name, out var type))
+                throw new InvalidOperationException($"MatMulGradInput: quantized weight '{w.Name}' has no GGML type registered");
+            reg.Backward.MatMulTransposedQuant(dy.Data.SubView(0, M * N), q, dx, M, K, N, type);
+            return;
+        }
+        // The forward's B is [K, N]; dx = dy [M, N] x B^T [N, K] is the "transB" product of B stored [K, N] viewed as [N', K'] = [K, N].
+        if (LowPWeightDispatch.IsLowP(w))
+        {
+            LowPWeightDispatch.MatMulTransB(reg.MatMul, dy.Data, w, dx, M, N, K);
+            return;
+        }
+        var wT = ctx.Pool.Rent(new[] { N, K }, "_matmul_grad_wT");
+        reg.Transpose.Transpose(w.Data, wT.Data, new[] { K, N }, new[] { 1, 0 });
+        reg.MatMul.MatMul(dy.Data, wT.Data, dx, M, N, K);
+        ctx.Pool.Return(wT);
+    }
+}
+
 /// <summary>SwiGLUGrad(g, u, dy) -> (dg, du) for SwiGLU(g, u) = silu(g) * u.</summary>
 public class SwiGLUGradOperator(OperatorRegistry reg) : IOnnxOperator
 {

@@ -242,6 +242,35 @@ public sealed class BackwardKernels : IDisposable
         dlogits[i] = label == ignoreIndex ? 0f : (MathF.Exp(logits[i] - stats[1 + r]) - (c == label ? 1f : 0f)) * invN;
     }
 
+    // ── Input gradient through a frozen GGUF-quantized weight (FusedDequantMatMul's layout: [N rows][K], value k of row n) ──
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int>? _matmulQuantT;
+
+    /// <summary>
+    /// dx[m, k] = sum_n dy[m, n] * W[k, n] for the forward <c>y = x W</c> with W [K, N] held as raw GGUF blocks (<paramref name="weightQuant"/>,
+    /// any type <c>FusedDequantMatMul.DecodeOf</c> decodes, padded to a 4-byte multiple as the loader uploads it). One thread per dx element,
+    /// decoding W in-register: the base weights stay compressed. Correct first; a tiled kernel replaces it when it is the bottleneck.
+    /// </summary>
+    public void MatMulTransposedQuant(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
+        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, GGUF.GGMLType type)
+    {
+        _matmulQuantT ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MatMulTransposedQuantImpl);
+        int code = Kernels.FusedDequantMatMul.TypeCode(type);
+        _matmulQuantT(M * K, dy, weightQuant.Cast<byte, int>(), dx, K, N, code, Kernels.FusedDequantMatMul.RowBytesOf(code, K));
+    }
+
+    private static void MatMulTransposedQuantImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> dx, int K, int N, int code, int rowBytes)
+    {
+        int m = i / K, k = i - m * K;
+        int dyBase = m * N;
+        float acc = 0f;
+        for (int n = 0; n < N; n++)
+            acc += dy[dyBase + n] * Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k);
+        dx[i] = acc;
+    }
+
     // ── AdamW (torch.optim.AdamW, decoupled weight decay) ──
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, AdamWStep>? _adamw;

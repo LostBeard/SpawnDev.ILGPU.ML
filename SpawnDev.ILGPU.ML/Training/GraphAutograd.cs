@@ -149,14 +149,15 @@ public static class GraphAutograd
                     if (!graph.Initializers.TryGetValue(w, out var ws) || ws.Length != 2)
                         throw new NotSupportedException($"autograd: MatMul whose second input is not a 2-D initializer ({n.Outputs[0]})");
                     int K = ws[0], N = ws[1];
-                    var dy2 = b.Emit("Reshape", new[] { dy }, dy + ".2d", ("shape", new long[] { -1, N }));
                     if (Need(1))
                     {
+                        var dy2 = b.Emit("Reshape", new[] { dy }, dy + ".2d", ("shape", new long[] { -1, N }));
                         var x2 = b.Emit("Reshape", new[] { x }, x + ".2d_for_" + w, ("shape", new long[] { -1, K }));
                         b.Contribute(w, b.Emit("Gemm", new[] { x2, dy2 }, "grad_part." + w + "." + n.Outputs[0], ("transA", 1L)));
                     }
+                    // dx = dy W^T through the weight in whatever form it was loaded (GGUF-quantized, low precision, f32).
                     if (Need(0))
-                        b.Contribute(x, b.ReshapeLike(b.Emit("Gemm", new[] { dy2, w }, n.Outputs[0] + ".grad_x2d", ("transB", 1L)), x));
+                        b.Contribute(x, b.Emit("MatMulGradInput", new[] { dy, w }, n.Outputs[0] + ".grad_x"));
                     break;
                 }
                 case "Reshape":

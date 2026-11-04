@@ -1,4 +1,5 @@
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.GGUF;
 using SpawnDev.ILGPU.ML.Operators;
 using SpawnDev.ILGPU.ML.Training;
 using SpawnDev.UnitTesting;
@@ -187,6 +188,39 @@ public abstract partial class MLTestBase
             notes.Add(tag);
         }
         return "attention dq, dk, dv match finite differences: " + string.Join("; ", notes);
+    });
+
+    /// <summary>
+    /// The input gradient through a frozen GGUF-quantized weight (BackwardKernels.MatMulTransposedQuant, used by MatMulGradInput for
+    /// llama3.1:8b's Q4_K / Q6_K): dx = dy W^T against the ggml-verified CPU dequantization, per type.
+    /// </summary>
+    [TestMethod]
+    public async Task Backward_MatMulTransposedQuant_MatchesDequantReference() => await RunTest(async accelerator =>
+    {
+        int M = 3, K = 256, N = 40;
+        var notes = new List<string>();
+        foreach (var type in new[] { GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.Q8_0 })
+        {
+            var rng = new Random(560 + (int)type);
+            int rb = RowBytes(type, K);
+            var bytes = new byte[(N * rb + 3) & ~3];
+            var W = new float[N * K];
+            for (int n = 0; n < N; n++)
+            {
+                var row = MakeBlocks(type, K, rng);
+                Buffer.BlockCopy(row, 0, bytes, n * rb, rb);
+                Array.Copy(ReferenceDequant(type, row, K), 0, W, n * K, K);
+            }
+            var dy = RandomFloats(M * N, seed: 561);
+            var want = new double[M * K];
+            for (int m = 0; m < M; m++) for (int k = 0; k < K; k++) { double s = 0; for (int n = 0; n < N; n++) s += (double)dy[m * N + n] * W[n * K + k]; want[m * K + k] = s; }
+            using var reg = new OperatorRegistry(accelerator);
+            using var qb = accelerator.Allocate1D(bytes); using var db = accelerator.Allocate1D(dy); using var dx = accelerator.Allocate1D<float>(M * K);
+            reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
+            AssertGrad($"dy W^T {type}", await dx.View.CopyToHostAsync(), want, 1e-5);
+            notes.Add(type.ToString());
+        }
+        return "dx = dy W^T through quantized W matches the CPU dequant reference: " + string.Join(", ", notes);
     });
 
     /// <summary>
