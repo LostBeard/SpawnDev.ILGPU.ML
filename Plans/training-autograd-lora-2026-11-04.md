@@ -61,3 +61,15 @@ no checkpointing, no LoRA for language models (`StableDiffusion/SdLora.cs` is lo
 JSONL, one example per line: `id`, `split` (train | heldout, by game session), `messages` (exactly what Vertex sends),
 `tools`, `target_turn`, `truth`, `source`, plus `rendered_prompt` / `rendered_target` from SpawnDev.AI's llama3.1 chat
 template at inference, checked line by line against our renderer.
+
+### Seven's update (2026-11-04, later)
+
+- `ToolChoiceTests` has 20 cases now (the 16-17/18 figure was October); no baseline pinned until Seven's fresh run on
+  llama3.1:8b (per-case results + exact command).
+- Data: `turns-YYYY-MM-DD.jsonl` under Vertex's data folder. `rendered_prompt` / `rendered_target` are null until Data
+  adds a hook in SpawnDev.AI's AiChatEngine (tool rounds run inside it); tool calls arrive as a `tool_runs` string list.
+  Split: one session in five held out (hash of the session id). Lines without `rendered_target` are not trainable.
+- PRIVACY: only game-event turns are logged; nothing a person said, nor facts about a person (Vertex's privacy page
+  promises chat is not logged, and an adapter would carry it). Real tool-choice requests from people are excluded until
+  TJ decides. Proposed: synthetic tool-choice requests, disjoint from the 20 test cases (checked automatically); the
+  test cases stay held out as the gate and are never trained on.
