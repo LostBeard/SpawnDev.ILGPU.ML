@@ -73,3 +73,32 @@ template at inference, checked line by line against our renderer.
   promises chat is not logged, and an adapter would carry it). Real tool-choice requests from people are excluded until
   TJ decides. Proposed: synthetic tool-choice requests, disjoint from the 20 test cases (checked automatically); the
   test cases stay held out as the gate and are never trained on.
+
+## M1.2 / M1.3 design (2026-11-04, from the tiny llama's actual graph)
+
+The llama graph GGUFGraphBuilder emits (dumped from tiny-llama-train.gguf): `Gather(token_embd, input_ids)`,
+`RMSNormalization(x, w)`, `MatMul(x, W[K,N])` (weights transposed to [in, out] on upload), `Reshape`, `RoPE`,
+`FusedAttention(q, k, v)` (causal, GQA inside), `AddRMSNorm(a, b, w) -> (res, norm)`, `SwiGLU(g, u)`, `Add`, final
+`RMSNormalization` + `MatMul(.., output.weight) -> logits`.
+
+Hook: `CreateFromGGUF` gets a graph transform (graph + cpu weights) applied after BuildGraph and before compile; the
+LoRA rewrite adds f32 initializers, the autograd appends backward nodes and graph outputs (loss, parameter grads) and
+inputs (targets, loss mask). Trainable parameters are the session's own weight tensors, updated in place by AdamW
+after each RunAsync. Shape-recompile keeps working because the transformed graph is the one it re-compiles.
+
+Backward rules (each a graph rewrite; gradients of a value with several consumers are summed with Add):
+| forward | backward | op used |
+|---|---|---|
+| Add(a, b) | da = db = dy (same shapes in llama) | - |
+| MatMul(x, W) | dx = dy W^T; dW = x^T dy (trainable W only) | `Gemm` transB / transA (+ Reshape(Shape(x))) |
+| Reshape(x) | dx = Reshape(dy, Shape(x)) | `Shape` + `Reshape` |
+| RMSNormalization(x, w) | dx = rstd * (w dy - xhat * mean(xhat w dy)) | NEW `RMSNormGrad` |
+| AddRMSNorm(a, b, w) | dres = dres_out + RMSNormGrad(res, w, dnorm); da = db = dres | NEW `RMSNormGrad` + Add |
+| SwiGLU(g, u) | dg = dy u silu'(g); du = dy silu(g) | NEW `SwiGLUGrad` (2 outputs) |
+| RoPE(x) | rotate dy by -theta | NEW `RoPE` inverse (attribute) |
+| FusedAttention(q, k, v) | dq, dk, dv (causal, GQA: sum dk/dv over the head group) | NEW `FusedAttentionGrad` (naive first, flash at M3) |
+| Gather(table, ids) | stop (table frozen) | - |
+| loss | masked mean softmax-CE over target positions, emits dlogits | NEW `SoftmaxCrossEntropyLoss` (2 outputs) |
+
+Each NEW op: CPU-oracle kernel test + finite-difference check, all backends; then the full-model gate against
+tiny-llama-train-ref.json (loss, LoRA grads, one AdamW step).
