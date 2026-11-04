@@ -2,6 +2,31 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.8.2-local.9 - 2026-11-04 (local feed) - real training: graph autograd + LoRA; GeneratedTokenIds
+
+TJ (via Seven): "Training is something we have promised in SpawnDev.ILGPU.ML since day 1 and it is currently VERY limited in that area, and I would
+like to change that." Plan and measurements: `Plans/training-autograd-lora-2026-11-04.md`.
+
+- **Graph autograd** (`Training/GraphAutograd.cs`): reverse-mode differentiation as a graph rewrite. The backward pass is appended to the forward
+  graph as ordinary nodes and runs on the same executor and kernels, on every backend. Rules for the llama-family op set (Add, Mul, MatMul,
+  Reshape, RMSNormalization, AddRMSNorm, SwiGLU, RoPE incl. rope_freqs, FusedAttention with GQA / causal / window / kv offset, Gather); an op on
+  the gradient path without a rule throws. `CreateFromGGUF` / `CreateFromGGUFStreamAsync` / `CreateFromGGUFFileAsync` gain a `graphTransform` hook.
+- **Gradient ops** (`Operators/TrainingOperators.cs`, `Training/BackwardKernels.cs`): RMSNormGrad, SwiGLUGrad, RoPEGrad, FusedAttentionGrad
+  (blocked shared-memory kernels for long prompts), SoftmaxCrossEntropyLossGrad, MatMulGradInput (dx through a FROZEN weight in any loaded form:
+  GGUF-quantized blocks decoded in-register by a tiled kernel, low precision, f32). Each checked against central finite differences of a float64
+  CPU forward on all 7 lanes.
+- **LoRA** (`GgufLoraTrainer`, `LoraAdapterFile`, `LoraRuntime`): PEFT semantics and files (adapter_model.safetensors + adapter_config.json; Python's
+  safetensors reads them), AdamW in torch.optim.AdamW's order, `CreateFromFileAsync` for models past 2 GB. `GgufBatchDecoder.Lora` applies adapters
+  UNMERGED at inference (merging a rank-r delta into Q4_K blocks would requantize it away).
+- **Parity**: one step on a tiny llama equals float64 torch on all 7 backends (loss, every adapter gradient ~1.5e-6 relative, AdamW 1.2e-7);
+  12 AdamW steps on smollm2:360m match float64 torch at every step within 1.3e-5 (CUDA, OpenCL); llama3.1:8b Q4_K_M on an RTX 4070: directional
+  derivative 2.4e-4, loss 12.66 -> 11.48 in 3 steps at seq 128, 6.5 s per step, +5.8 GB VRAM; the decoder with the trained adapters reproduces the
+  training forward (max |diff| 9.3e-3 on logits up to 8.5).
+- **`SoftmaxCrossEntropyLoss` op (fix)**: now on the device and per the ONNX spec: `ignore_index` honoured and the mean taken over the rows NOT
+  ignored (it read the logits back to the host and divided by every row).
+- **`GenerationResult.GeneratedTokenIds`** (both engines): the ids the model generated, the terminating stop / EOS token excluded. Asked by Data
+  for exact training pairs (re-encoding generated text does not reproduce non-canonical tokenizations).
+
 ## 5.8.2-local.8 - 2026-11-04 (local feed) - FusedLinear split-K; CLAP capture opt-in
 
 - **`ClapAudioClassifier.EnableGraphCapture` is now OFF by default (memory; reverses local.7)**: Riker measured local.7 on an RX 590 in Chrome: bit-identical, but no speedup (median 74.4 -> 73.9 ms per event; the card is GPU-bound and a replay only removes host encoding work) and +700 MB of Chrome GPU memory, one-time and flat. Reproduced on the RTX 4070 by the reworked `Bench_ClapAudioTower_CaptureVsDirect`, which now reports the capture's ONE-TIME cost (it only gated growth after capture before): +323 MiB storage / +4,937 buffers / +2,727 pool allocations recorded without drains (WebGPUGraphCapture pins every intermediate of the recorded pass, and capture runs drop planned reuse so the warm passes fill size buckets). New `SessionGraphCapture.KeepDrains` (per instance) records with the forward's drains: +132 MiB / +2,876 / +666, still bit-identical; the classifier uses it when capture is opted into. With split-K, capture gains nothing on CUDA (11.3 vs 11.5 ms) and 32.7 -> 23.7 ms on WebGPU (4070). Open: record under the planned-reuse slots so a capture costs what a direct forward does.
