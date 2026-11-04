@@ -151,3 +151,14 @@ the strict scorer passes; honesty targets are the corrected sentence, not the li
 - [ ] 8B probe at 1024 / 2048 tokens, checkpointed (quiet card), then a full default sweep (the compiler change) and local.10.
 - [ ] M4 run on Seven's data once target_ids flow (AI 1.4.1-local.2 has them): ToolChoiceTests strict on the short prompt
       >= 93/100 with TTFT down, honesty above the base; on the 2060 (GATEGAMER) for the production-card timing.
+
+## M4 runbook (the 2060 on GATEGAMER, Vertex stopped)
+
+1. Data: Seven's format-3 lines with `prompt_ids` + `target_ids` (AI 1.4.1-local.2 passes GeneratedTokenIds; end-of-turn id from
+   `end_of_turn_ids`), synthetic tool-choice (short prompt, distilled from base + full prompt) and real honesty turns.
+2. Train: `dotnet run --project tools/TrainLoraJsonl -c Release -- <llama3.1:8b blob> <train.jsonl,...> --out <dir> --checkpoint
+   --rank 16 --targets attn_q,attn_k,attn_v,attn_output --lr 2e-4 --accum 8 --epochs 3 --max-len 2560`; it keeps the best dev loss and
+   reports greedy dev generation through GgufGenerator (base vs adapters).
+3. Gate in Vertex (Seven): load the adapter (`GgufGenerator.CreateAsync(lora: LoraAdapterSet.Load(...))`, AI's SetAdapterAsync), run
+   ToolChoiceTests strict x5 on the names-only prompt (>= 93/100) and measure TTFT / prefill; honesty set vs the base.
+4. Decode speed: adapters cost two small dispatches per adapted projection per step; measure tok/s with and without on the 2060.

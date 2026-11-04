@@ -64,6 +64,23 @@ public class MatMulGradInputOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+/// <summary>
+/// GatherRowsGrad(dy [1, n, C], positions [n], like [1, T, C]) -> dx shaped like <c>like</c>: the gradient of Gather(like, positions, axis=1)
+/// for DISTINCT positions (rows not gathered get zero).
+/// </summary>
+public class GatherRowsGradOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "GatherRowsGrad";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[2] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var dy = ctx.Inputs[0]; var pos = ctx.Inputs[1]; var like = ctx.Inputs[2];
+        int C = like.Shape[^1];
+        int rows = like.ElementCount / C, n = pos.ElementCount;
+        reg.Backward.GatherRowsGrad(dy.Data, pos.Data, ctx.Outputs[0].Data, rows, n, C);
+    }
+}
+
 /// <summary>SwiGLUGrad(g, u, dy) -> (dg, du) for SwiGLU(g, u) = silu(g) * u.</summary>
 public class SwiGLUGradOperator(OperatorRegistry reg) : IOnnxOperator
 {

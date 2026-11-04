@@ -61,7 +61,7 @@ using var context = MLContext.Create().ToContext();
 Device device = args.Contains("--opencl") ? context.GetCLDevices()[0]
     : context.GetCudaDevices().Count > 0 ? context.GetCudaDevices()[0] : context.GetPreferredDevice(false);
 using var accelerator = device.CreateAccelerator(context);
-var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = alpha, LearningRate = lr, Seed = seed, CheckpointLayers = args.Contains("--checkpoint") };
+var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = alpha, LearningRate = lr, Seed = seed, CheckpointLayers = args.Contains("--checkpoint"), LossOnLabeledPositionsOnly = !args.Contains("--full-logits") };
 var sw = Stopwatch.StartNew();
 bool evalOnly = args.Contains("--eval-only");
 var log = new List<object>();

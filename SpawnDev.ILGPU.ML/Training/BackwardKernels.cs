@@ -333,6 +333,35 @@ public sealed class BackwardKernels : IDisposable
         dx[i] = acc;
     }
 
+    // ── Gather of rows along the sequence axis: backward = scatter the selected rows' gradients into zeros ──
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _zero;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _scatterRows;
+
+    /// <summary>
+    /// dx [rows, C] = 0 except dx[positions[j]] = dy[j] for j &lt; n: the gradient of gathering n DISTINCT rows of x (the training loss's
+    /// labelled positions). Two dispatches: zero-fill, then one thread per selected value. A scatter: not on WebGL (one store per thread at its own slot).
+    /// </summary>
+    public void GatherRowsGrad(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<float, Stride1D.Dense> positions, ArrayView1D<float, Stride1D.Dense> dx,
+        int rows, int n, int C)
+    {
+        if (_acc.AcceleratorType == AcceleratorType.WebGL)
+            throw new NotSupportedException("GatherRowsGrad scatters rows, which WebGL's transform feedback cannot (one store per thread at its own slot)");
+        _zero ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(ZeroImpl);
+        _scatterRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int>(ScatterRowsImpl);
+        _zero(rows * C, dx);
+        _scatterRows(n * C, dy, positions, dx, C);
+    }
+
+    private static void ZeroImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> y) => y[i] = 0f;
+
+    private static void ScatterRowsImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<float, Stride1D.Dense> positions,
+        ArrayView1D<float, Stride1D.Dense> dx, int C)
+    {
+        int j = i / C, c = i - j * C;
+        dx[(int)positions[j] * C + c] = dy[i];
+    }
+
     // ── y = a * y + b * x (gradient accumulation) ──
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _axpby;
 

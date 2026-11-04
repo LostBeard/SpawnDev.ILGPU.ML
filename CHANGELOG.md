@@ -2,6 +2,25 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (5.8.2-local.10 candidate) - training at real lengths; LoRA at inference on both engines
+
+- **`GraphCompiler`'s topological sort is STABLE**: among ready nodes, the one earliest in the given list runs first, so a list that is already a
+  valid order (ONNX files, GGUFGraphBuilder) is kept exactly. FIFO scheduled every node as soon as its inputs existed, which pulled the training
+  graph's recompute nodes into the forward pass. Values are unchanged; the schedule follows the producer's order.
+- **Activation checkpointing** (`LoraOptions.CheckpointLayers`, GraphAutograd `checkpointLayers`): each decoder layer's forward is re-emitted
+  before its backward, so only layer inputs persist. smollm2:360m at 512 tokens: same loss and gradients, +2.06 vs +2.97 GB, 3.3 vs 3.75 s/step.
+- **Loss on labelled positions only** (`LoraOptions.LossOnLabeledPositionsOnly`): the LM head runs on the gathered rows that carry a label, never
+  forming full-vocabulary logits for every position (new `GatherRowsGrad` op). Same loss and gradients as the full path vs torch.
+- **Gradient accumulation**: `GgufLoraTrainer.AccumulateAsync` / `ApplyAsync` (one AdamW step on the mean of a batch's gradients).
+- **LoRA at inference on BOTH engines**: `GgufGenerator.CreateAsync(..., lora: LoraAdapterSet.Load(safetensors, adapter_config.json))` - a
+  `LoraRuntime` on the batch decoder, the adapters inserted into the graph on the session engine; `GgufGenerator.Lora` swaps adapters on a
+  resident batch-decoder model (forgets the prefix cache). Both engines generate the same tokens with the same adapter (CUDA/OpenCL/WebGPU);
+  the decoder with adapters reproduces the training forward on every projection type (fused q|k|v and gate|up included).
+- **llama3.1:8b on an RTX 4070** (checkpointed, rank 8 q/v): 512 tokens 14.5 s/step, 1,024 tokens 24 s/step; gradients checked by directional
+  derivative at each length; the decoder with the trained adapters matches the training forward (6.6e-3 on logits up to 8).
+- **Tools**: `tools/TrainLoraJsonl` (format-3 JSONL with prompt_ids/target_ids -> PEFT adapters; dev loss; greedy generation eval through
+  GgufGenerator, per engine), `tools/LoraDecodeBench` (decode tok/s with and without an adapter), `tools/TrainLoraProbe` (`--checkpoint`, `--labeled-only`).
+
 ## 5.8.2-local.9 - 2026-11-04 (local feed) - real training: graph autograd + LoRA; GeneratedTokenIds
 
 TJ (via Seven): "Training is something we have promised in SpawnDev.ILGPU.ML since day 1 and it is currently VERY limited in that area, and I would

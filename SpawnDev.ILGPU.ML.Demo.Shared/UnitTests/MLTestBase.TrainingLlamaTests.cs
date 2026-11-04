@@ -65,8 +65,14 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task Training_TinyLlama_LoraStepMatchesTorch_Checkpointed() => await RunTest(accelerator => TinyLlamaLoraStepCheck(accelerator, checkpoint: true));
 
-    private async Task<string> TinyLlamaLoraStepCheck(Accelerator accelerator, bool checkpoint)
+    /// <summary>The M1 gate with the LM head and loss on the labelled positions only (LoraOptions.LossOnLabeledPositionsOnly) and checkpointing: same loss and gradients.</summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_TinyLlama_LoraStepMatchesTorch_LabeledOnly() => await RunTest(accelerator => TinyLlamaLoraStepCheck(accelerator, checkpoint: true, labeledOnly: true));
+
+    private async Task<string> TinyLlamaLoraStepCheck(Accelerator accelerator, bool checkpoint, bool labeledOnly = false)
     {
+        if (labeledOnly && accelerator.AcceleratorType == AcceleratorType.WebGL)
+            throw new UnsupportedTestException("the labelled-positions loss scatters rows (GatherRowsGrad), which WebGL cannot");
         var (gguf, refDoc) = await LoadTinyLlamaTrainFixture();
         using var _ = refDoc;
         var root = refDoc.RootElement;
@@ -86,6 +92,7 @@ public abstract partial class MLTestBase
             Epsilon = cfg.GetProperty("adam_eps").GetSingle(), WeightDecay = cfg.GetProperty("weight_decay").GetSingle(),
             Initial = initial,
             CheckpointLayers = checkpoint,
+            LossOnLabeledPositionsOnly = labeledOnly,
         };
         using var trainer = SpawnDev.ILGPU.ML.Training.GgufLoraTrainer.Create(accelerator, gguf, options);
         if (trainer.Adapters.Count != lora.Count / 2) throw new Exception($"{trainer.Adapters.Count} adapters, expected {lora.Count / 2}");
@@ -108,7 +115,7 @@ public abstract partial class MLTestBase
         }
         notes.Add($"adapter grads max relative diff {worstGrad:E2} ({atGrad})");
         notes.Add($"after AdamW max |diff| {worstAfter:E2} ({atAfter})");
-        var line = $"{accelerator.AcceleratorType}{(checkpoint ? " checkpointed" : "")}: " + string.Join("; ", notes);
+        var line = $"{accelerator.AcceleratorType}{(checkpoint ? " checkpointed" : "")}{(labeledOnly ? " labeled-only" : "")}: " + string.Join("; ", notes);
         Console.WriteLine("[Training] " + line);
         if (worstGrad > 1e-3) throw new Exception("adapter gradients differ from torch: " + line);
         // One AdamW step moves each element by ~lr (1e-2) in the gradient's sign direction; a sign error or a wrong bias correction is ~1e-2.

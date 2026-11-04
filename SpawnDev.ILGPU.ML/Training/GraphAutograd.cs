@@ -9,8 +9,12 @@ namespace SpawnDev.ILGPU.ML.Training;
 /// <param name="BName">Graph initializer holding B TRANSPOSED: [rank, out] (PEFT stores lora_B as [out, rank]).</param>
 public sealed record LoraAdapter(string PeftName, string AName, string BName, int In, int Out, int Rank);
 
-/// <summary>What <see cref="GraphAutograd.AddBackward"/> added: the loss output, the labels input, and each parameter's gradient output.</summary>
-public sealed record TrainingGraphInfo(string LossOutput, string LabelsInput, IReadOnlyDictionary<string, string> GradientOutputs);
+/// <summary>
+/// What <see cref="GraphAutograd.AddBackward"/> added: the loss output, the labels input, each parameter's gradient output, and - when the loss
+/// is computed on the labelled positions only - the positions input (<see cref="PositionsInput"/>, null otherwise; then the labels input holds
+/// ONLY the labels of those positions).
+/// </summary>
+public sealed record TrainingGraphInfo(string LossOutput, string LabelsInput, IReadOnlyDictionary<string, string> GradientOutputs, string? PositionsInput = null);
 
 /// <summary>
 /// Reverse-mode automatic differentiation as a GRAPH REWRITE (Plans/training-autograd-lora-2026-11-04.md, M1.2): the backward pass is
@@ -100,10 +104,26 @@ public static class GraphAutograd
     /// compute. Layers are the GGUF builder's (<c>blk.L_*</c> / <c>block_L_out</c>); nodes outside a layer (embedding, final norm, LM head) are kept.
     /// Relies on the compiler keeping the given node order (GraphCompiler's stable topological sort).
     /// </param>
+    /// <param name="labeledPositionsOnly">
+    /// Compute the LM head and the loss only at the labelled positions: the head's MatMul over every position is removed from the graph (and the
+    /// <c>logits</c> output with it), the hidden rows at a new <c>label_positions</c> input are gathered, and the head runs on those rows only.
+    /// A chat example labels its answer (tens of tokens) out of thousands; full logits over a 128k vocabulary are 0.5 GB per 1,024 positions, held
+    /// several times over by the loss path (MEASURED: llama3.1:8b at 1,024 tokens, checkpointed, +8.0 GB of which ~2 GB was that).
+    /// </param>
     public static TrainingGraphInfo AddBackward(ModelGraph graph, string logits, int vocab, IReadOnlyCollection<string> parameters, int ignoreIndex = -100,
-        bool checkpointLayers = false)
+        bool checkpointLayers = false, bool labeledPositionsOnly = false)
     {
         var b = new Builder(graph);
+        string? positions = null;
+        GraphNode? head = null;
+        if (labeledPositionsOnly)
+        {
+            head = graph.Nodes.SingleOrDefault(n => n.Outputs.Contains(logits));
+            if (head == null || head.OpType != "MatMul" || !graph.Initializers.ContainsKey(head.Inputs[1]))
+                throw new NotSupportedException($"labeledPositionsOnly needs the logits to come from one MatMul by a head weight (got {head?.OpType ?? "none"})");
+            graph.Nodes.Remove(head);
+            graph.Outputs.RemoveAll(o => o.Name == logits);
+        }
         var forward = graph.Nodes.ToList();
         // layer of each forward node (-1 = outside every layer)
         var layerOf = new Dictionary<GraphNode, int>(ReferenceEqualityComparer.Instance);
@@ -135,15 +155,31 @@ public static class GraphAutograd
         // ── loss ──
         const string labels = "labels";
         graph.Inputs.Add(new GraphValueInfo { Name = labels, Shape = new[] { 1, -1 } });
-        b.Add("Reshape", new[] { logits }, new[] { "train.logits2d" }, ("shape", new long[] { -1, vocab }));
+        if (head != null)
+        {
+            // gather the hidden rows at the labelled positions, run the head on those only; d hidden = scatter of d rows back into zeros
+            positions = "label_positions";
+            graph.Inputs.Add(new GraphValueInfo { Name = positions, Shape = new[] { -1 } });
+            string hidden = head.Inputs[0], w = head.Inputs[1];
+            b.Add("Gather", new[] { hidden, positions }, new[] { "train.h_sel" }, ("axis", 1L));
+            b.Add("MatMul", new[] { "train.h_sel", w }, new[] { "train.logits_sel" });
+            b.Add("Reshape", new[] { "train.logits_sel" }, new[] { "train.logits2d" }, ("shape", new long[] { -1, vocab }));
+        }
+        else b.Add("Reshape", new[] { logits }, new[] { "train.logits2d" }, ("shape", new long[] { -1, vocab }));
         b.Add("Reshape", new[] { labels }, new[] { "train.labels1d" }, ("shape", new long[] { -1 }));
         b.Add("SoftmaxCrossEntropyLoss", new[] { "train.logits2d", "train.labels1d" }, new[] { "loss" },
             ("reduction", "mean"), ("ignore_index", (long)ignoreIndex));
         b.Add("SoftmaxCrossEntropyLossGrad", new[] { "train.logits2d", "train.labels1d" }, new[] { "train.dlogits2d" },
             ("reduction", "mean"), ("ignore_index", (long)ignoreIndex));
         graph.Outputs.Add(new GraphValueInfo { Name = "loss", Shape = new[] { 1 } });
+        if (head != null)
+        {
+            var dsel = b.Emit("MatMulGradInput", new[] { b.ReshapeLike("train.dlogits2d", "train.logits_sel"), head.Inputs[1] }, "train.h_sel.grad");
+            b.Contribute(head.Inputs[0], b.Emit("GatherRowsGrad", new[] { dsel, positions!, head.Inputs[0] }, head.Inputs[0] + ".grad_rows"));
+            logits = head.Inputs[0];   // the sweep starts from the hidden state
+        }
         // d logits = reshape(d logits2d) back to logits' shape
-        b.Contribute(logits, b.ReshapeLike("train.dlogits2d", logits));
+        else b.Contribute(logits, b.ReshapeLike("train.dlogits2d", logits));
 
         // ── which values carry a gradient: everything downstream of a parameter ──
         var requires = new HashSet<string>(parameters);
@@ -265,7 +301,7 @@ public static class GraphAutograd
             graph.Outputs.Add(new GraphValueInfo { Name = name, Shape = graph.Initializers[p] });
             grads[p] = name;
         }
-        return new TrainingGraphInfo("loss", labels, grads);
+        return new TrainingGraphInfo("loss", labels, grads, positions);
     }
 
     private static GraphNode Node(string op, string[] inputs, string[] outputs, Dictionary<string, JsonElement>? attrs = null)

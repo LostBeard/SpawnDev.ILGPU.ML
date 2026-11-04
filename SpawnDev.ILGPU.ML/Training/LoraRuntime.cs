@@ -118,8 +118,42 @@ public sealed class LoraRuntime : IDisposable
             ArrayView1D<float, Stride1D.Dense>, int, int>(DownImpl);
         _up ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float>(UpImpl);
-        _down((int)need, x, ad.AT.View, _t.View, ad.In, Rank);
+        if (GroupedDown && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= DownGroup)
+        {
+            _downGrouped ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int>(DownGroupedImpl);
+            _downGrouped(new KernelConfig((int)need, DownGroup), x, ad.AT.View, _t.View, ad.In, Rank);
+        }
+        else _down((int)need, x, ad.AT.View, _t.View, ad.In, Rank);
         _up(rows * ad.Out, _t.View, ad.BT.View, o, ad.Out, Rank, colOffset, rowStride, Scale);
+    }
+
+    /// <summary>
+    /// x A^T with one 64-thread group per output value (default on; false = one thread per value, the A/B control and WebGL's path). At decode
+    /// there are only rows * rank values (16 at rank 16), so the per-thread kernel had 16 threads each walking all of x serially.
+    /// </summary>
+    public static bool GroupedDown { get; set; } = true;
+    private const int DownGroup = 64;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _downGrouped;
+
+    // group g = output (row, r); its threads stride x's row and reduce in shared memory (fixed order: deterministic)
+    private static void DownGroupedImpl(ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> aT,
+        ArrayView1D<float, Stride1D.Dense> t, int fin, int rank)
+    {
+        var sh = SharedMemory.Allocate<float>(DownGroup);
+        int g = Grid.IdxX, tid = Group.IdxX;
+        int row = g / rank, r = g - row * rank;
+        int xb = row * fin;
+        float s = 0f;
+        for (int i = tid; i < fin; i += DownGroup) s += x[xb + i] * aT[i * rank + r];
+        sh[tid] = s;
+        Group.Barrier();
+        for (int w = DownGroup / 2; w > 0; w >>= 1)
+        {
+            if (tid < w) sh[tid] += sh[tid + w];
+            Group.Barrier();
+        }
+        if (tid == 0) t[g] = sh[0];
     }
 
     // t[row, r] = sum_i x[row, i] * AT[i, r]

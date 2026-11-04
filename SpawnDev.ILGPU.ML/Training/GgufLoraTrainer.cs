@@ -25,6 +25,11 @@ public sealed class LoraOptions
     /// needed for long sequences on large models (llama3.1:8b at 2,048 tokens keeps ~20 GB of activations without it), one extra forward of compute.
     /// </summary>
     public bool CheckpointLayers { get; set; }
+    /// <summary>
+    /// Run the LM head and the loss only at the positions that carry a label (GraphAutograd's labeledPositionsOnly): the full-vocabulary logits
+    /// of every position are never formed. Same loss and gradients; <see cref="GgufLoraTrainer.GetLogitsAsync"/> is then unavailable.
+    /// </summary>
+    public bool LossOnLabeledPositionsOnly { get; set; }
     /// <summary>Starting adapters in PEFT layout (<c>{module}.lora_A.weight</c> [rank, in], <c>{module}.lora_B.weight</c> [out, rank]).</summary>
     public IReadOnlyDictionary<string, float[]>? Initial { get; set; }
 }
@@ -101,7 +106,7 @@ public sealed class GgufLoraTrainer : IDisposable
             var logits = graph.Outputs.FirstOrDefault(o => o.Name == "logits") ?? throw new InvalidOperationException("the graph has no 'logits' output");
             Vocab = logits.Shape[^1];
             Info = GraphAutograd.AddBackward(graph, "logits", Vocab, adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex,
-                options.CheckpointLayers);
+                options.CheckpointLayers, options.LossOnLabeledPositionsOnly);
             Adapters = adapters;
         }
     }
@@ -159,12 +164,25 @@ public sealed class GgufLoraTrainer : IDisposable
         }
         if (!labels.Any(l => l != _opt.IgnoreIndex)) throw new ArgumentException("every label is IgnoreIndex: the loss would be 0/0");
         using var ids = _acc.Allocate1D(inputIds.Select(i => (float)i).ToArray());
-        using var lab = _acc.Allocate1D(labels.Select(i => (float)i).ToArray());
-        var outs = await _session.RunAsync(new Dictionary<string, Tensor>
+        var inputs = new Dictionary<string, Tensor> { ["input_ids"] = new Tensor(ids.View, new[] { 1, inputIds.Length }, "input_ids") };
+        MemoryBuffer1D<float, Stride1D.Dense> lab, pos = null!;
+        if (_info.PositionsInput != null)
         {
-            ["input_ids"] = new Tensor(ids.View, new[] { 1, inputIds.Length }, "input_ids"),
-            [_info.LabelsInput] = new Tensor(lab.View, new[] { 1, labels.Length }, _info.LabelsInput),
-        });
+            // the labelled positions and their labels only
+            var at = Enumerable.Range(0, labels.Length).Where(t => labels[t] != _opt.IgnoreIndex).ToArray();
+            pos = _acc.Allocate1D(at.Select(t => (float)t).ToArray());
+            lab = _acc.Allocate1D(at.Select(t => (float)labels[t]).ToArray());
+            inputs[_info.PositionsInput] = new Tensor(pos.View, new[] { at.Length }, _info.PositionsInput);
+            inputs[_info.LabelsInput] = new Tensor(lab.View, new[] { 1, at.Length }, _info.LabelsInput);
+        }
+        else
+        {
+            lab = _acc.Allocate1D(labels.Select(i => (float)i).ToArray());
+            inputs[_info.LabelsInput] = new Tensor(lab.View, new[] { 1, labels.Length }, _info.LabelsInput);
+        }
+        using var _lab = lab;
+        using var _pos = pos;
+        var outs = await _session.RunAsync(inputs);
         _lastOutputs = outs;
         float loss = (await outs[_info.LossOutput].Data.SubView(0, 1).CopyToHostAsync())[0];
         if (update)
@@ -182,6 +200,7 @@ public sealed class GgufLoraTrainer : IDisposable
     public async Task<float[]> GetLogitsAsync(int position)
     {
         if (_lastOutputs == null) throw new InvalidOperationException("no step has run");
+        if (_info.PositionsInput != null) throw new InvalidOperationException("LossOnLabeledPositionsOnly: the full logits are never formed");
         return await _lastOutputs["logits"].Data.SubView((long)position * VocabSize, VocabSize).CopyToHostAsync();
     }
 

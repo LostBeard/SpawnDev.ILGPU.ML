@@ -38,7 +38,7 @@ long vram0 = VramMiB();
 Console.WriteLine($"accelerator: {accelerator.Name} ({accelerator.AcceleratorType}); VRAM in use before load {vram0} MiB");
 
 var sw = Stopwatch.StartNew();
-var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank, LearningRate = 1e-3f, Seed = 7, CheckpointLayers = args.Contains("--checkpoint") };
+var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank, LearningRate = 1e-3f, Seed = 7, CheckpointLayers = args.Contains("--checkpoint"), LossOnLabeledPositionsOnly = args.Contains("--labeled-only") };
 using var trainer = await GgufLoraTrainer.CreateFromFileAsync(accelerator, args[0], options);
 Console.WriteLine($"loaded + compiled in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters, rank {rank}, checkpoint {options.CheckpointLayers}; VRAM {VramMiB()} MiB");
 
@@ -98,6 +98,7 @@ Console.WriteLine($"{steps} AdamW steps (lr {options.LearningRate}): loss " + st
     + $"; median step {times.OrderBy(t => t).ElementAt(times.Count / 2):F0} ms; VRAM {VramMiB()} MiB");
 
 // ── the adapters at inference: GgufBatchDecoder + LoraRuntime (unmerged) against the training graph's forward, same adapters ──
+if (options.LossOnLabeledPositionsOnly) { Console.WriteLine("decoder check skipped (--labeled-only forms no full logits)"); return 0; }
 float lossNow = await trainer.StepAsync(ids, labels, update: false);
 var trainLogits = await trainer.GetLogitsAsync(seq - 1);
 var adapters = await trainer.GetAdaptersAsync();
