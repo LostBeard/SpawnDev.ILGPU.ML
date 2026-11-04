@@ -52,3 +52,9 @@ Capture-regime runs drop their executor's plan (capture priming unchanged); a re
 Measured: ReDimNet2-B6 steady state 682 -> 372 MiB on CUDA, bit-identical. Remaining gap to live (256) is greedy-by-size's slot rounding.
 Gates: PlannedReuse_RepeatedRuns_BitIdenticalAndPlanned (red with overlapping lifetimes sharing slots unguarded), PlannedReuse_TwoExecutorsOnePool_ShareSlots,
 Bench_SpeakerEmbedding_PoolPeak; desktop sweeps with ML_PLANNED_REUSE=1.
+
+## Packing strategies compared (2026-11-04, ReDimNet2-B6 recording via ML_PLANNED_REUSE_DUMP, tools/planned_reuse_sim.py)
+702 planned rents, live peak 256.0 MiB: greedy by size + first fit (shipped) 372.4 MiB; greedy by size + best fit 384.4 MiB; greedy by breadth
+(TFLite GPU) 420.4 MiB. The shipped strategy is the best of the three. The remaining gap to live is the shared-object model itself (each slot is
+sized to its largest occupant); closing it needs sub-allocation inside one buffer, which the pool's identity-keyed records and WebGPU's
+read_write aliasing rule exclude. Closed: 372 MiB is this design's floor for this model.
