@@ -47,7 +47,7 @@ no checkpointing, no LoRA for language models (`StableDiffusion/SdLora.cs` is lo
       adapter gradients against torch + PEFT on the same weights; one AdamW step equal. CUDA / OpenCL / WebGPU.
   - [x] M1.1 oracle: `tools/gen_tiny_llama_train_reference.py` (f32 tiny llama, GQA 4:2, LoRA q/v rank 4) -> `wwwroot/test-train/`; `Training_TinyLlama_ForwardMatchesTorch` 7/7 lanes, logits max |diff| ~3e-6 (2026-11-04).
   - [ ] M1.2 autograd core: `GradientRule` per op type, backward-graph builder, trainable-parameter set, loss node.
-  - [ ] M1.3 rules: Add, Mul, Reshape, Transpose, Gather, MatMul (f32), RMSNorm, SwiGLU, FusedAttention+RoPE, CE loss.
+  - [~] M1.3 rules: gradient KERNELS + ops done (75cdc277: RMSNormGrad, SwiGLUGrad, RoPEGrad, SoftmaxCrossEntropyLossGrad, FusedAttentionGrad; FD-checked 35/35 all lanes). Remaining: the graph rewrite rules that emit them (with Gemm transA/transB, Shape+Reshape, Add).
   - [ ] M1.4 LoRA rewrite + AdamW + PEFT-compatible safetensors save / load.
 - [ ] **M2** train a small real llama GGUF (SmolLM2-135M class) on a toy task; loss curve within tolerance of a PEFT run
       with the same data, seed and hyperparameters.
