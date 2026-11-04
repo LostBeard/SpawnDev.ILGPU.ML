@@ -54,6 +54,23 @@ public sealed class LoraRuntime : IDisposable
         if (_adapters.Count == 0) throw new ArgumentException("no LoRA adapter tensors found");
     }
 
+    /// <summary>
+    /// Load a PEFT adapter from its two files: <c>adapter_model.safetensors</c> bytes and <c>adapter_config.json</c> text (rank <c>r</c> and
+    /// <c>lora_alpha</c> are read from it). <c>use_rslora</c> / DoRA / bias adapters are refused rather than applied wrongly.
+    /// </summary>
+    public static LoraRuntime Load(Accelerator accelerator, byte[] adapterSafeTensors, string adapterConfigJson)
+    {
+        using var cfg = System.Text.Json.JsonDocument.Parse(adapterConfigJson);
+        var root = cfg.RootElement;
+        if (root.TryGetProperty("peft_type", out var pt) && pt.GetString() != "LORA") throw new NotSupportedException($"peft_type {pt.GetString()} is not LORA");
+        if (root.TryGetProperty("use_rslora", out var rs) && rs.ValueKind == System.Text.Json.JsonValueKind.True) throw new NotSupportedException("rsLoRA scaling (use_rslora) is not supported");
+        if (root.TryGetProperty("use_dora", out var dora) && dora.ValueKind == System.Text.Json.JsonValueKind.True) throw new NotSupportedException("DoRA adapters are not supported");
+        if (root.TryGetProperty("bias", out var bias) && bias.GetString() is { } b && b != "none") throw new NotSupportedException($"LoRA bias '{b}' is not supported");
+        int rank = root.GetProperty("r").GetInt32();
+        float alpha = root.TryGetProperty("lora_alpha", out var a) ? a.GetSingle() : rank;
+        return new LoraRuntime(accelerator, LoraAdapterFile.ReadSafeTensors(adapterSafeTensors), rank, alpha);
+    }
+
     /// <summary>Adapted projections, as (layer, GGUF target name).</summary>
     public IEnumerable<(int Layer, string Target)> Targets => _adapters.Keys;
 
