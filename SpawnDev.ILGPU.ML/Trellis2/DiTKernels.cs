@@ -585,6 +585,15 @@ public sealed class DiTKernels
     /// <summary>scores must hold H*Nq*Nk floats. o is [Nq, H*D].</summary>
     public void ReferenceAttention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
     {
+        // The reference path materializes every score: it needs scores of H * Nq * Nk. A smaller view (callers on a flash-capable backend pass
+        // a placeholder) used to be indexed past its end - an "X index out of bounds" assertion that killed the process on the CPU accelerator
+        // (Trellis2_Flow20kTokens_OpTimes, 2026-11-04), a silent out-of-bounds write on a GPU. Size scores with UsesFlashAttention.
+        long need = (long)H * Nq * Nk;
+        if (scores.Length < need)
+            throw new ArgumentException($"reference attention needs scores of H * Nq * Nk = {need} elements, got {scores.Length}: no flash attention "
+                + $"path on {_acc.AcceleratorType} for head width {D} (see UsesFlashAttention)", nameof(scores));
+        if (need > int.MaxValue)
+            throw new ArgumentException($"reference attention over H * Nq * Nk = {need} scores exceeds the kernel's int index range", nameof(scores));
         _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
         _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);

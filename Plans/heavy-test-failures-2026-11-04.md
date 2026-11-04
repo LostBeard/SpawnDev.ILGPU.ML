@@ -21,4 +21,8 @@ Embeddings_RealTokenizer on CUDA (300 s) are being A/B'd for planned reuse.
 - ZipVoice capture (both CUDA tests): FIXED - four chained bugs (If constant-branch output leak in every run, diagnostic probes syncing mid-capture,
   constant-branch CopyFromCPU mid-capture, If condition device readback mid-capture). Capture live and faithful; see CHANGELOG Unreleased.
   Found with ML_TRACE_REFS + the per-node capture-status trace.
-- DA3Small_Pipeline_5D_ElideDispatch (OpenCL) and Trellis2_Flow20kTokens_OpTimes (CPU/Velocity crash): still open, next.
+- DA3Small_Pipeline_5D_ElideDispatch: STALE TEST - input-independent folding (default on, newer than the test) skips the shape ops before
+  elision; the test now turns folding off for both runs. Passes on CUDA and OpenCL.
+- Trellis2_Flow20kTokens_OpTimes (CPU / Velocity): the test passed no scores buffer and those backends have no flash path, so the reference
+  attention indexed past an empty view. ReferenceAttention now validates scores (clear ArgumentException); the benchmark skips without a flash path.
+All four resolved (ML 5.8.2-local.4 + the Unreleased ReferenceAttention guard).

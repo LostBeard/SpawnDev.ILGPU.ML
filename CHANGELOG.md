@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **`DiTKernels.ReferenceAttention` validates its scores buffer (correctness)**: the reference path materializes H x Nq x Nk scores; a smaller view (the placeholder a caller passes where a flash path is expected) was indexed past its end - an "X index out of bounds" assertion that killed the process on the CPU accelerator and an access violation on Velocity (`Trellis2_Flow20kTokens_OpTimes`), a silent out-of-bounds write on a GPU. It now throws an `ArgumentException` naming the size and `UsesFlashAttention`, and refuses a score count past the int index range. The 20k-token flow benchmark skips where no flash path exists (CPU, Velocity). Production callers (FlowDiT, DinoV3Extractor) already size scores by `UsesFlashAttention`.
+
 ## 5.8.2-local.4 - 2026-11-04 (local feed) - planned reuse on by default, ZipVoice CUDA capture + If leak fix
 
 - **Test fix: `DA3Small_Pipeline_5D_ElideDispatch`** turns input-independent folding off for both runs: folding (on by default, newer than the test) binds the shape ops once and skips them before the elide decision, so the elide-on run elided nothing ("elided=0"). Not a library bug.

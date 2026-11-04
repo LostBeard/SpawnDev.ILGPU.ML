@@ -527,6 +527,10 @@ public abstract partial class MLTestBase
         RequireTrellisBackend(accelerator);
         const int T = 19786, C = 1536, H = 12, D = 128, Mlp = 6144;
         var dk = new DiTKernels(accelerator);
+        // A 20k-token attention benchmark only means something with a flash path: the reference path would materialize 12 x 19786 x 19786 scores
+        // (and this test passes no scores buffer). The CPU accelerator has no flash path (no 256-thread groups / 4-lane shuffles).
+        if (!dk.UsesFlashAttention(D))
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: no flash attention path for head width {D}; a 20k-token attention benchmark needs one");
         using var x = accelerator.Allocate1D(Enumerable.Range(0, T * C).Select(i => (float)Math.Sin(i * 0.37) * 0.5f).ToArray());
         using var w = accelerator.Allocate1D(Enumerable.Range(0, Mlp * C).Select(i => BFloat16.FromRawBits((ushort)(0x3C00 + (i % 255)))).ToArray());
         using var qkv = accelerator.Allocate1D(Enumerable.Range(0, T * 3 * C).Select(i => (float)Math.Cos(i * 0.11) * 0.5f).ToArray());
