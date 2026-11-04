@@ -87,12 +87,16 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// frozen at its capture-time value forever. That failure produces confident, plausible audio, so it
     /// cannot be caught by listening; only rendering with and without capture and comparing SAMPLES finds it.
     /// <para>
-    /// 🔴 THIS DEFECT IS REAL AND CURRENTLY OPEN. An older note here read "Done: bit-identical", which was
-    /// never true of this graph - capture on this decoder was refused for control flow and so had never
-    /// actually run. The first time it did run, MEASURED 2026-09-03:
-    /// <b>all 73,216 samples differed, worst 0.502935</b> - a completely different utterance, still fluent
-    /// enough to pass every amplitude, RMS and duration check in the gate. Replaying this plan is NOT
-    /// faithful yet, which is why <see cref="AllowControlFlowCapture"/> defaults OFF.
+    /// The first time this decoder's capture ran, MEASURED 2026-09-03: <b>all 73,216 samples differed, worst
+    /// 0.502935</b> - a different utterance, still fluent enough to pass every amplitude, RMS and duration check.
+    /// <b>FAITHFUL SINCE 2026-11-04</b> (CUDA, RTX 4070, fp32, tools/zipvoice-harness with ZIPVOICE_CF_CAPTURE=1 and
+    /// ZIPVOICE_REPEAT): the captured render equals the direct one in <b>0 of 73,216 samples</b>, on the first
+    /// utterance and on every replayed one, after four fixes to the If / capture path (CHANGELOG 5.8.2-local.4).
+    /// Steady state for a repeated utterance length: decoder 204 ms vs 380-426 ms direct (4 steps), utterance
+    /// 230-320 ms vs 406-511 ms. But a capture is per input SHAPE, and each new utterance length pays observe +
+    /// warm + record again (decoder 1,252 ms vs 672 ms direct on that utterance) - so with varied sentence lengths
+    /// capture loses on CUDA, which is why <see cref="AllowControlFlowCapture"/> still defaults OFF. Turn it on for
+    /// workloads that repeat lengths. WebGPU, where per-node orchestration costs far more, is not measured yet.
     /// </para>
     /// </para>
     /// <para>
@@ -217,7 +221,11 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
         // downstream is shaped by it.
         int numFrames = condition.Shape[^2];
         int featDim = condition.Shape[^1];
-        return new ZipVoiceEncoding(await ReadAsync(condition), numFrames, featDim);
+        var encoding = new ZipVoiceEncoding(await ReadAsync(condition), numFrames, featDim);
+        // Read back: give the outputs to the pool. Unreturned, every utterance left them behind (with the vocoder's three, +4 device allocations
+        // per utterance, capture or not; the pool's REBIND-LIVE trace named 'text_condition', 'mag', 'x', 'y' - 2026-11-04, ZIPVOICE_REPEAT).
+        _encoder.ReturnOutputs(outputs);
+        return encoding;
     }
 
     public async Task<float[]> RunDecoderAsync(
@@ -292,8 +300,10 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
         int bins = magnitude.Shape[^2];
         int outFrames = magnitude.Shape[^1];
 
-        return new ZipVoiceSpectrum(
+        var spectrum = new ZipVoiceSpectrum(
             await ReadAsync(magnitude), await ReadAsync(cos), await ReadAsync(sin), bins, outFrames);
+        _vocoder.ReturnOutputs(outputs);   // read back: see RunEncoderAsync
+        return spectrum;
     }
 
     /// <summary>

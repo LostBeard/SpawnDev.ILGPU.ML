@@ -215,6 +215,9 @@ int Synth(string fixturePath, string? outPath)
         if (Environment.GetEnvironmentVariable("ZIPVOICE_CF_CAPTURE") == "1")
         {
             SpawnDev.ILGPU.ML.Graph.SessionGraphCapture.RefuseControlFlow = false;
+            // The PER-INSTANCE switch: IlgpuZipVoiceGraphs sets SessionGraphCapture.AllowControlFlow from it, and a non-null per-instance value
+            // wins over the static one, so lifting only the static refusal changed nothing (2026-11-04: "LIFTED" printed, capture still refused).
+            ((IlgpuZipVoiceGraphs)graphs).AllowControlFlowCapture = true;
             if (Environment.GetEnvironmentVariable("ZIPVOICE_CF_NODRAIN") == "1")
             {
                 typeof(SpawnDev.ILGPU.ML.CudaGraphCapture)
@@ -279,6 +282,18 @@ int Synth(string fixturePath, string? outPath)
     }
 
     var result = pipeline.SynthesizeAsync(fixture.Tokens, fixture.PromptTokens, reference, referenceRate).GetAwaiter().GetResult();
+    // ZIPVOICE_REPEAT=N: synthesize the same utterance N more times in this process and print each one's stage times. Same text = same shapes,
+    // so with capture on, every decoder step after the first utterance is a REPLAY: this is the steady-state cost, which a single run (whose
+    // 4 decoder steps include the observe / warm / capture passes) cannot show. The last repeat's audio is the one written and compared.
+    if (int.TryParse(Environment.GetEnvironmentVariable("ZIPVOICE_REPEAT"), out int repeats) && repeats > 0)
+    {
+        Console.WriteLine($"repeat 0 : encoder {result.EncoderMs:F0}ms, decoder {result.DecoderMs:F0}ms, vocoder {result.VocoderMs:F0}ms, total {result.TotalMs:F0}ms");
+        for (int rep = 1; rep <= repeats; rep++)
+        {
+            result = pipeline.SynthesizeAsync(fixture.Tokens, fixture.PromptTokens, reference, referenceRate).GetAwaiter().GetResult();
+            Console.WriteLine($"repeat {rep} : encoder {result.EncoderMs:F0}ms, decoder {result.DecoderMs:F0}ms, vocoder {result.VocoderMs:F0}ms, total {result.TotalMs:F0}ms; device allocations so far {SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations}");
+        }
+    }
 
     if (nodeTiming)
     {
