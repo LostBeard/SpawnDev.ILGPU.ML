@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.2-local.5 - 2026-11-04 (local feed) - planned reuse on WebGPU, ZipVoice leak fix, ReferenceAttention guard
 
 - **Planned buffer reuse on WebGPU too (memory, browser)**: `GraphExecutor.PlannedReuseOnWebGPU` (static, default on; environment variables do not reach Blazor WASM). Both WebGPU captures set `UseCaptureParamSlots` for their whole window, so a capturing executor's plan is dropped as on CUDA; outside captures a plan gives rent k the same slot buffer every run (more stable buffer identity than the buckets, for the bind-group cache). ReDimNet2-B6 in Chrome WebGPU: steady-state pool 682 -> 372 MiB, embeddings bit-identical (`Bench_SpeakerEmbedding_PoolPeak` now runs on WebGPU). Gate: the WebGPU lane, 1,076 passed / 0 failed. WebGL / Wasm stay on the buckets.
 
