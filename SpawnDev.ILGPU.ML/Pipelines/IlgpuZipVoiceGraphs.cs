@@ -96,7 +96,9 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// 230-320 ms vs 406-511 ms. But a capture is per input SHAPE, and each new utterance length pays observe +
     /// warm + record again (decoder 1,252 ms vs 672 ms direct on that utterance) - so with varied sentence lengths
     /// capture loses on CUDA, which is why <see cref="AllowControlFlowCapture"/> still defaults OFF. Turn it on for
-    /// workloads that repeat lengths. WebGPU, where per-node orchestration costs far more, is not measured yet.
+    /// workloads that repeat lengths. Per decoder STEP (int8 graphs, Bench_ZipVoice_DecoderCaptureVsDirect, 2026-11-04, RTX 4070, bit-identical):
+    /// CUDA 126.5 -> 50.2 ms (2.52x, setup 1.2 s); WebGPU in Chrome 336 -> 74.5 ms (4.52x, setup 2.7 s) - on WebGPU the setup is repaid after about
+    /// two utterances of one length.
     /// </para>
     /// </para>
     /// <para>
