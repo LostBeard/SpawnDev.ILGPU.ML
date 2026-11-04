@@ -188,4 +188,33 @@ public abstract partial class MLTestBase
         }
         return "attention dq, dk, dv match finite differences: " + string.Join("; ", notes);
     });
+
+    /// <summary>
+    /// The ONNX SoftmaxCrossEntropyLoss op (rewritten onto the device 2026-11-04): mean over the rows NOT ignored, sum, none, and the
+    /// log_prob output, against a float64 CPU reference. The old body divided by every row even when rows were masked.
+    /// </summary>
+    [TestMethod]
+    public async Task SoftmaxCrossEntropyLoss_Op_MatchesReference() => await RunTest(async accelerator =>
+    {
+        int rows = 6, C = 9, ignore = -100;
+        var logits = RandomFloats(rows * C, seed: 551, scale: 3f);
+        var labels = new float[] { 4, ignore, 0, 8, ignore, 2 };
+        double Lse(int r) { double m = double.NegativeInfinity; for (int c = 0; c < C; c++) m = Math.Max(m, logits[r * C + c]); double z = 0; for (int c = 0; c < C; c++) z += Math.Exp(logits[r * C + c] - m); return m + Math.Log(z); }
+        var perRow = Enumerable.Range(0, rows).Select(r => (int)labels[r] == ignore ? 0.0 : Lse(r) - logits[r * C + (int)labels[r]]).ToArray();
+        int kept = labels.Count(l => (int)l != ignore);
+        using var reg = new OperatorRegistry(accelerator);
+        using var lb = accelerator.Allocate1D(logits); using var yb = accelerator.Allocate1D(labels);
+        using var loss = accelerator.Allocate1D<float>(rows); using var lp = accelerator.Allocate1D<float>(rows * C); using var scratch = accelerator.Allocate1D<float>(1 + rows);
+        var notes = new List<string>();
+        foreach (var (red, name, want) in new[] { (1, "mean", new[] { perRow.Sum() / kept }), (2, "sum", new[] { perRow.Sum() }), (0, "none", perRow) })
+        {
+            reg.Backward.SoftmaxCrossEntropyLoss(lb.View, yb.View, loss.View, lp.View, scratch.View, rows, C, ignore, red);
+            var got = await loss.View.SubView(0, want.Length).CopyToHostAsync();
+            AssertGrad($"CE loss reduction={name}", got, want, 1e-5);
+            notes.Add($"{name} {got[0]:F5}");
+        }
+        var gotLp = await lp.View.CopyToHostAsync();
+        AssertGrad("CE log_prob", gotLp, Enumerable.Range(0, rows * C).Select(i => logits[i] - Lse(i / C)).ToArray(), 1e-5);
+        return "SoftmaxCrossEntropyLoss: " + string.Join(", ", notes) + ", log_prob OK";
+    });
 }

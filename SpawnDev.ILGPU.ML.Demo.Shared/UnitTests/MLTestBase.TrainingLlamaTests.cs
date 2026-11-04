@@ -52,4 +52,60 @@ public abstract partial class MLTestBase
         if (worst > 2e-4 * Math.Max(1, scale)) throw new Exception("forward does not match the torch reference: " + line);
         return line;
     });
+
+    /// <summary>
+    /// THE M1 gate: a LoRA training step through the graph autograd (GraphAutograd + GgufLoraTrainer) on the tiny llama equals float64
+    /// torch with the same adapters (rank 4 on q and v, PEFT semantics): the masked next-token loss, every adapter gradient, and the
+    /// adapters after one AdamW step. Added 2026-11-04.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_TinyLlama_LoraStepMatchesTorch() => await RunTest(async accelerator =>
+    {
+        var (gguf, refDoc) = await LoadTinyLlamaTrainFixture();
+        using var _ = refDoc;
+        var root = refDoc.RootElement;
+        var cfg = root.GetProperty("config");
+        var tokens = root.GetProperty("tokens").EnumerateArray().Select(t => t.GetInt32()).ToArray();
+        int lossFrom = root.GetProperty("loss_from").GetInt32();
+        var labels = new int[tokens.Length];
+        for (int t = 0; t < tokens.Length; t++) labels[t] = t >= lossFrom && t < tokens.Length - 1 ? tokens[t + 1] : -100;
+        var lora = root.GetProperty("lora").EnumerateObject().ToDictionary(p => p.Name, p => p.Value);
+        float[] Arr(JsonElement e, string key) => e.GetProperty(key).EnumerateArray().Select(v => v.GetSingle()).ToArray();
+        var initial = lora.ToDictionary(kv => kv.Key, kv => Arr(kv.Value, "value"));
+        var options = new SpawnDev.ILGPU.ML.Training.LoraOptions
+        {
+            Targets = new[] { "attn_q", "attn_v" },
+            Rank = cfg.GetProperty("rank").GetInt32(), Alpha = cfg.GetProperty("alpha").GetSingle(),
+            LearningRate = cfg.GetProperty("lr").GetSingle(), Beta1 = cfg.GetProperty("beta1").GetSingle(), Beta2 = cfg.GetProperty("beta2").GetSingle(),
+            Epsilon = cfg.GetProperty("adam_eps").GetSingle(), WeightDecay = cfg.GetProperty("weight_decay").GetSingle(),
+            Initial = initial,
+        };
+        using var trainer = SpawnDev.ILGPU.ML.Training.GgufLoraTrainer.Create(accelerator, gguf, options);
+        if (trainer.Adapters.Count != lora.Count / 2) throw new Exception($"{trainer.Adapters.Count} adapters, expected {lora.Count / 2}");
+
+        float loss = await trainer.StepAsync(tokens, labels, update: true);
+        double wantLoss = root.GetProperty("loss").GetDouble();
+        var notes = new List<string> { $"loss {loss:F6} (torch {wantLoss:F6})" };
+        if (Math.Abs(loss - wantLoss) > 1e-4 * Math.Max(1, Math.Abs(wantLoss))) throw new Exception("loss differs from torch: " + notes[0]);
+
+        var grads = await trainer.GetGradientsAsync();
+        var after = await trainer.GetAdaptersAsync();
+        double worstGrad = 0, worstAfter = 0; string atGrad = "", atAfter = "";
+        foreach (var (name, e) in lora)
+        {
+            var wantG = Arr(e, "grad"); var g = grads[name];
+            double scale = Math.Max(1e-3, wantG.Max(Math.Abs));
+            for (int i = 0; i < wantG.Length; i++) { double d = Math.Abs(g[i] - wantG[i]) / scale; if (d > worstGrad) { worstGrad = d; atGrad = $"{name}[{i}] {g[i]:G6} vs {wantG[i]:G6}"; } }
+            var wantA = Arr(e, "after_adamw"); var a = after[name];
+            for (int i = 0; i < wantA.Length; i++) { double d = Math.Abs(a[i] - wantA[i]); if (d > worstAfter) { worstAfter = d; atAfter = $"{name}[{i}] {a[i]:G6} vs {wantA[i]:G6}"; } }
+        }
+        notes.Add($"adapter grads max relative diff {worstGrad:E2} ({atGrad})");
+        notes.Add($"after AdamW max |diff| {worstAfter:E2} ({atAfter})");
+        var line = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        Console.WriteLine("[Training] " + line);
+        if (worstGrad > 1e-3) throw new Exception("adapter gradients differ from torch: " + line);
+        // One AdamW step moves each element by ~lr (1e-2) in the gradient's sign direction; a sign error or a wrong bias correction is ~1e-2.
+        if (worstAfter > 1e-4) throw new Exception("AdamW step differs from torch: " + line);
+        return line;
+    });
 }

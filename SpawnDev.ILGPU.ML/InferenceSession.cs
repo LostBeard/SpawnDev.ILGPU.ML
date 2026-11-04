@@ -2050,6 +2050,18 @@ public class InferenceSession : IDisposable
     public static InferenceSession CreateFromGGUF(
         Accelerator accelerator, byte[] ggufBytes,
         Action<string, int>? onProgress = null, bool acceptInputsEmbeds = false)
+        => CreateFromGGUF(accelerator, ggufBytes, onProgress, acceptInputsEmbeds, graphTransform: null);
+
+    /// <summary>
+    /// <see cref="CreateFromGGUF(Accelerator, byte[], Action{string, int}?, bool)"/> with <paramref name="graphTransform"/> applied to the
+    /// built graph and its f32 weights BEFORE compile and upload: initializers it adds to both are uploaded like any other weight (and
+    /// reachable with <see cref="TryGetWeight"/>), nodes and inputs/outputs it adds are compiled, and shape recompiles reuse the
+    /// transformed graph. The training path (<see cref="Training.GraphAutograd"/>) adds LoRA adapters and the backward pass here.
+    /// </summary>
+    public static InferenceSession CreateFromGGUF(
+        Accelerator accelerator, byte[] ggufBytes,
+        Action<string, int>? onProgress, bool acceptInputsEmbeds,
+        Action<ModelGraph, Dictionary<string, float[]>>? graphTransform)
     {
         // Parse GGUF
         onProgress?.Invoke("parse", 0);
@@ -2059,6 +2071,7 @@ public class InferenceSession : IDisposable
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
         var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload, lowPWeightsTyped) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
+        graphTransform?.Invoke(graph, cpuWeightsAll);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values

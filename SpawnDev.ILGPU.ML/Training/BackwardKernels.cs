@@ -20,6 +20,11 @@ public sealed class BackwardKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _rmsNorm;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _ceLse;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int>? _ceRowLoss;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _ceReduce;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _ceLogProb;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _swiglu;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, float, int, int, int, int>? _rope;
@@ -160,6 +165,57 @@ public sealed class BackwardKernels : IDisposable
         _ceGrad(rows * C, logits, labels, scratch, dlogits, C, ignoreIndex);
     }
 
+    /// <summary>
+    /// The FORWARD loss of ONNX SoftmaxCrossEntropyLoss on [rows, C] scores, on the device: per-row log-sum-exp into
+    /// <paramref name="scratch"/> (1 + rows floats, same layout as <see cref="SoftmaxCrossEntropy"/>), then
+    /// <paramref name="loss"/>: reduction 0 = none (one value per row, 0 for ignored rows), 1 = mean over the rows not ignored,
+    /// 2 = sum. Optional <paramref name="logProb"/> [rows, C] = logits - lse. Pass <c>int.MinValue</c> to ignore nothing.
+    /// </summary>
+    public void SoftmaxCrossEntropyLoss(ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> labels,
+        ArrayView1D<float, Stride1D.Dense> loss, ArrayView1D<float, Stride1D.Dense>? logProb, ArrayView1D<float, Stride1D.Dense> scratch,
+        int rows, int C, int ignoreIndex, int reduction)
+    {
+        _ceCount ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CECountImpl);
+        _ceLse ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(CELseImpl);
+        _ceRowLoss ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CERowLossImpl);
+        _ceReduce ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(CEReduceImpl);
+        _ceLogProb ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int>(CELogProbImpl);
+        _ceCount(1, labels, scratch, rows, ignoreIndex);
+        _ceLse(rows, logits, scratch, C);
+        if (reduction == 0) _ceRowLoss(rows, logits, labels, scratch, loss, C, ignoreIndex);
+        else _ceReduce(1, logits, labels, scratch, loss, rows, C, ignoreIndex, reduction);
+        if (logProb is { } lp) _ceLogProb(rows * C, logits, scratch, lp, C);
+    }
+
+    private static void CERowLossImpl(Index1D r, ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> labels,
+        ArrayView1D<float, Stride1D.Dense> stats, ArrayView1D<float, Stride1D.Dense> loss, int C, int ignoreIndex)
+    {
+        int label = (int)labels[r];
+        loss[r] = label == ignoreIndex ? 0f : stats[1 + r] - logits[r * C + label];
+    }
+
+    // Single thread, fixed order: deterministic, and the rows of one training example are few (the targets of one sequence).
+    private static void CEReduceImpl(Index1D t, ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> labels,
+        ArrayView1D<float, Stride1D.Dense> stats, ArrayView1D<float, Stride1D.Dense> loss, int rows, int C, int ignoreIndex, int reduction)
+    {
+        float s = 0f;
+        for (int r = 0; r < rows; r++)
+        {
+            int label = (int)labels[r];
+            if (label != ignoreIndex) s += stats[1 + r] - logits[r * C + label];
+        }
+        loss[0] = reduction == 1 ? s / stats[0] : s;
+    }
+
+    private static void CELogProbImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> stats,
+        ArrayView1D<float, Stride1D.Dense> logProb, int C)
+    {
+        logProb[i] = logits[i] - stats[1 + i / C];
+    }
+
     private static void CECountImpl(Index1D t, ArrayView1D<float, Stride1D.Dense> labels, ArrayView1D<float, Stride1D.Dense> count, int rows, int ignoreIndex)
     {
         float n = 0f;
@@ -184,6 +240,45 @@ public sealed class BackwardKernels : IDisposable
         int label = (int)labels[r];
         float invN = 1f / stats[0];
         dlogits[i] = label == ignoreIndex ? 0f : (MathF.Exp(logits[i] - stats[1 + r]) - (c == label ? 1f : 0f)) * invN;
+    }
+
+    // ── AdamW (torch.optim.AdamW, decoupled weight decay) ──
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, AdamWStep>? _adamw;
+
+    /// <summary>One AdamW step's scalars; the bias corrections are computed on the host from the step number.</summary>
+    public struct AdamWStep
+    {
+        public float Lr, Beta1, Beta2, Eps, WeightDecay, BiasCorrection1, SqrtBiasCorrection2;
+    }
+
+    /// <summary>
+    /// In place, element-wise, exactly torch.optim.AdamW's order of operations: p *= 1 - lr*wd; m = b1 m + (1-b1) g;
+    /// v = b2 v + (1-b2) g^2; p -= (lr / bc1) * m / (sqrt(v) / sqrt(bc2) + eps), with bc_k = 1 - beta_k^step.
+    /// </summary>
+    public void AdamW(ArrayView1D<float, Stride1D.Dense> p, ArrayView1D<float, Stride1D.Dense> g, ArrayView1D<float, Stride1D.Dense> m,
+        ArrayView1D<float, Stride1D.Dense> v, int n, float lr, float beta1, float beta2, float eps, float weightDecay, int step)
+    {
+        _adamw ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, AdamWStep>(AdamWImpl);
+        var s = new AdamWStep
+        {
+            Lr = lr, Beta1 = beta1, Beta2 = beta2, Eps = eps, WeightDecay = weightDecay,
+            BiasCorrection1 = (float)(1 - Math.Pow(beta1, step)), SqrtBiasCorrection2 = (float)Math.Sqrt(1 - Math.Pow(beta2, step)),
+        };
+        _adamw(n, p, g, m, v, s);
+    }
+
+    private static void AdamWImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> p, ArrayView1D<float, Stride1D.Dense> g,
+        ArrayView1D<float, Stride1D.Dense> m, ArrayView1D<float, Stride1D.Dense> v, AdamWStep s)
+    {
+        float gi = g[i];
+        float pi = p[i] * (1f - s.Lr * s.WeightDecay);
+        float mi = s.Beta1 * m[i] + (1f - s.Beta1) * gi;
+        float vi = s.Beta2 * v[i] + (1f - s.Beta2) * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        p[i] = pi - (s.Lr / s.BiasCorrection1) * mi / (MathF.Sqrt(vi) / s.SqrtBiasCorrection2 + s.Eps);
     }
 
     // ── Attention (FusedAttentionKernel, seq-major q/k/v/out [seq, heads, hd], causal, GQA, window, kv_offset) ──

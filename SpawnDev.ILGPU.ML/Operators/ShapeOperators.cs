@@ -1447,37 +1447,30 @@ public class SoftmaxCrossEntropyLossOperator(OperatorRegistry reg) : IOnnxOperat
         if (reduction == "none") return new[] { new[] { inputs[0][0] }, inputs[0] };
         return new[] { new[] { 1 }, inputs[0] };
     }
+    /// <remarks>
+    /// On the device (2026-11-04, training M1). The previous body read the logits back to the host, ignored the
+    /// <c>ignore_index</c> attribute, skipped out-of-range targets but still divided by every row - a mean that disagreed with
+    /// the ONNX spec (mean over the rows NOT ignored) whenever a row was masked, which is how a language-model loss masks the
+    /// prompt. Rank-2 scores [N, C] (a class axis of 1 with no trailing dims); class weights are not supported.
+    /// </remarks>
     public void Execute(OnnxOpContext ctx)
     {
-        // SoftmaxCE: softmax(logits) → -log(p[target]) → reduce
-        // Input[0] = logits [N, C], Input[1] = target [N]
-        var logits = OperatorInputReader.Require(reg, ctx, 0, OpType, "logits");
-        var targets = OperatorInputReader.Require(reg, ctx, 1, OpType, "target");
-        var shape = ctx.Inputs[0].Shape;
-        int N = shape[0], C = shape.Length > 1 ? shape[1] : 1;
-        var logProbs = new float[N * C];
-        float totalLoss = 0f;
-
-        for (int n = 0; n < N; n++)
+        var scores = ctx.Inputs[0];
+        if (scores.Shape.Length != 2)
+            throw new NotSupportedException($"SoftmaxCrossEntropyLoss: scores must be [N, C]; got [{string.Join(",", scores.Shape)}] (reshape first)");
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null && ctx.Inputs[2].ElementCount > 0)
+            throw new NotSupportedException("SoftmaxCrossEntropyLoss: class weights are not supported");
+        int N = scores.Shape[0], C = scores.Shape[1];
+        int reduction = ctx.GetString("reduction", "mean") switch
         {
-            // Softmax
-            float maxVal = float.NegativeInfinity;
-            for (int c = 0; c < C; c++) maxVal = Math.Max(maxVal, logits[n * C + c]);
-            float sumExp = 0f;
-            for (int c = 0; c < C; c++) { logProbs[n * C + c] = MathF.Exp(logits[n * C + c] - maxVal); sumExp += logProbs[n * C + c]; }
-            for (int c = 0; c < C; c++) logProbs[n * C + c] = MathF.Log(logProbs[n * C + c] / sumExp);
-            // Loss
-            int target = (int)targets[n];
-            if (target >= 0 && target < C) totalLoss -= logProbs[n * C + target];
-        }
-        string reduction = ctx.GetString("reduction", "mean");
-        if (reduction == "mean" && N > 0) totalLoss /= N;
-        ctx.Outputs[0].Data.SubView(0, 1).CopyFromCPU(new[] { totalLoss });
-        // Output[1] = log probabilities
-        if (ctx.Outputs.Length > 1)
-        {
-            int lpCount = Math.Min(logProbs.Length, ctx.Outputs[1].ElementCount);
-            ctx.Outputs[1].Data.SubView(0, lpCount).CopyFromCPU(logProbs.AsSpan(0, lpCount).ToArray());
-        }
+            "none" => 0, "mean" => 1, "sum" => 2,
+            var r => throw new NotSupportedException($"SoftmaxCrossEntropyLoss: reduction '{r}'"),
+        };
+        // ONNX: no ignore_index attribute = nothing is ignored.
+        int ignore = ctx.Attributes.ContainsKey("ignore_index") ? ctx.GetInt("ignore_index", int.MinValue) : int.MinValue;
+        var scratch = ctx.Pool.Rent(new[] { 1 + N }, "_ce_loss_stats");
+        reg.Backward.SoftmaxCrossEntropyLoss(scores.Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
+            ctx.Outputs.Length > 1 ? ctx.Outputs[1].Data : null, scratch.Data, N, C, ignore, reduction);
+        ctx.Pool.Return(scratch);
     }
 }

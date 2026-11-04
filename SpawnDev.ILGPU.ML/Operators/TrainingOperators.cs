@@ -75,7 +75,8 @@ public class SoftmaxCrossEntropyLossGradOperator(OperatorRegistry reg) : IOnnxOp
         int C = scores.Shape[^1];
         int rows = scores.ElementCount / C;
         var scratch = ctx.Pool.Rent(new[] { 1 + rows }, "_ce_grad_stats");
-        reg.Backward.SoftmaxCrossEntropy(scores.Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, scratch.Data, rows, C, ctx.GetInt("ignore_index", -100));
+        int ignore = ctx.Attributes.ContainsKey("ignore_index") ? ctx.GetInt("ignore_index", int.MinValue) : int.MinValue;   // ONNX: absent = none
+        reg.Backward.SoftmaxCrossEntropy(scores.Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, scratch.Data, rows, C, ignore);
         ctx.Pool.Return(scratch);
     }
 }
