@@ -1446,6 +1446,9 @@ public class GraphCompiler
       }
     }
 
+    /// <summary>Keep the given node order where it is valid (default). False = the old FIFO Kahn order (A/B diagnostic).</summary>
+    public static bool StableTopologicalOrder { get; set; } = true;
+
     /// <summary>Topological sort using Kahn's algorithm.</summary>
     private static List<GraphNode> TopologicalSort(List<GraphNode> nodes)
     {
@@ -1479,7 +1482,7 @@ public class GraphCompiler
         // which is what a producer's order exists to prevent: the training graph's per-layer RECOMPUTE nodes (GraphAutograd checkpointing) depend
         // only on the layer's input, so FIFO ran them in the forward pass and every recomputed activation stayed alive until the backward.
         var position = new Dictionary<GraphNode, int>(ReferenceEqualityComparer.Instance);
-        for (int i = 0; i < nodes.Count; i++) position[nodes[i]] = i;
+        for (int i = 0; i < nodes.Count; i++) position[nodes[i]] = StableTopologicalOrder ? i : 0;   // all 0 = FIFO among equals (the old order)
         var queue = new PriorityQueue<GraphNode, int>();
         foreach (var n in nodes) if (inDegree[n] == 0) queue.Enqueue(n, position[n]);
         var sorted = new List<GraphNode>();

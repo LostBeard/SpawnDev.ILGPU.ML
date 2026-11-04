@@ -93,6 +93,14 @@ for (int s = 0; s < steps; s++)
     sw.Restart();
     losses.Add(await trainer.StepAsync(ids, labels));
     times.Add(sw.Elapsed.TotalMilliseconds);
+    // where the device memory sits: the pool's idle buffers (reusable by the next step, unavailable to anything else) vs the process total
+    Console.WriteLine($"  step {s + 1}: {times[^1]:F0} ms; pool idle {trainer.PooledFreeBytes / 1048576.0:F0} MiB; pool device allocations {SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations} (planned-reuse {SpawnDev.ILGPU.ML.Tensors.BufferPool.PlannedReuseAllocations}, plans {SpawnDev.ILGPU.ML.Tensors.BufferPool.PlannedReusePlans}, deviations {SpawnDev.ILGPU.ML.Tensors.BufferPool.PlannedReuseDeviations}); card {VramMiB()} MiB");
+    if (args.Contains("--live"))
+    {
+        var live = trainer.Session.Executor.Pool.LiveNamedBuffers();
+        Console.WriteLine($"    live rents {live.Count}, {live.Sum(x => x.Bytes) / 1048576.0:F0} MiB; largest: " + string.Join(", ", live.Take(6).Select(x => $"{x.Name} {x.Bytes / 1048576.0:F1}")));
+    }
+    if (args.Contains("--release")) Console.WriteLine($"    released {trainer.ReleaseWorkingMemory() / 1048576.0:F0} MiB; card {VramMiB()} MiB");
 }
 Console.WriteLine($"{steps} AdamW steps (lr {options.LearningRate}): loss " + string.Join(" -> ", losses.Select(l => l.ToString("F4")))
     + $"; median step {times.OrderBy(t => t).ElementAt(times.Count / 2):F0} ms; VRAM {VramMiB()} MiB");

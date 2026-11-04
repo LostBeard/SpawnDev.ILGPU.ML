@@ -52,13 +52,14 @@ foreach (var withLora in new[] { false, true })
     var ttft = new List<double>(); var tps = new List<double>();
     for (int r = 0; r <= runs; r++)
     {
-        var (ids, firstMs) = await gen.GenerateFirstTokenIdsAsync(prompt);   // warm-up on r = 0
+        // time to first token = the first streamed delta (either engine); decode rate = the remaining tokens over the remaining time
         var sw = Stopwatch.StartNew();
-        var res = await gen.GenerateAsync(prompt, cfg);
+        double firstMs = -1;
+        var res = await gen.GenerateAsync(prompt, cfg, onDelta: _ => { if (firstMs < 0) firstMs = sw.Elapsed.TotalMilliseconds; return Task.CompletedTask; });
         double ms = sw.Elapsed.TotalMilliseconds;
-        if (r == 0) continue;
+        if (r == 0 || firstMs < 0 || res.GeneratedTokens < 2) continue;   // r = 0 warms up
         ttft.Add(firstMs);
-        tps.Add(res.GeneratedTokens / Math.Max(1e-3, (ms - firstMs) / 1000.0));
+        tps.Add((res.GeneratedTokens - 1) / Math.Max(1e-3, (ms - firstMs) / 1000.0));
     }
     double Med(List<double> v) => v.OrderBy(x => x).ElementAt(v.Count / 2);
     Console.WriteLine($"{accelerator.AcceleratorType} {gen.Engine} {(withLora ? $"LoRA r{rank} on {string.Join(",", targets)} ({tensors.Count / 2} adapters{(LoraRuntime.GroupedDown ? "" : ", ungrouped")})" : "base")}: "

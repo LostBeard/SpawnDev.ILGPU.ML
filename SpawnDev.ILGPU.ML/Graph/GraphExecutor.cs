@@ -550,6 +550,17 @@ public class GraphExecutor : IDisposable
     /// <see cref="ImmediateRelease"/> on, and no capture regime (a capture-flagged run drops the executor's plan for good, so capture priming is unchanged).
     /// WebGPU: see <see cref="PlannedReuseOnWebGPU"/>. Never WebGL / Wasm (their release paths differ).
     /// </summary>
+    /// <summary>
+    /// Null when output <paramref name="i"/> of <paramref name="node"/> is a named graph value; otherwise (the operator produced more outputs than the
+    /// node names, or the node's name for it is "") a pool name unique to this node, so two unbound outputs never share a pool record.
+    /// </summary>
+    private static string? UnboundOutputName(CompiledNode node, int i)
+    {
+        if (i < node.OutputNames.Length && !string.IsNullOrEmpty(node.OutputNames[i])) return null;
+        string owner = node.OutputNames.FirstOrDefault(n => !string.IsNullOrEmpty(n)) ?? node.OpType;
+        return $"{owner}#unbound{i}";
+    }
+
     private bool PlannedReuseEligible => ImmediateReleaseActive && !UseCaptureParamSlots
         && (_accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU or AcceleratorType.Velocity
             || (PlannedReuseOnWebGPU && _accelerator.AcceleratorType == AcceleratorType.WebGPU));
@@ -2409,7 +2420,7 @@ public class GraphExecutor : IDisposable
                 bool resolvedAtRuntime = !ReferenceEquals(runtimeOutputShapes, node.OutputShapes);
                 for (int d = 0; d < shape.Length; d++)
                     if (shape[d] < 0 || (shape[d] == 0 && !resolvedAtRuntime)) shape[d] = 1;
-                var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
+                var name = UnboundOutputName(node, i) ?? node.OutputNames[i];
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
 
@@ -4962,7 +4973,7 @@ public class GraphExecutor : IDisposable
                 bool resolvedAtRuntime = !ReferenceEquals(runtimeOutputShapes, node.OutputShapes);
                 for (int d = 0; d < shape.Length; d++)
                     if (shape[d] < 0 || (shape[d] == 0 && !resolvedAtRuntime)) shape[d] = 1;
-                var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
+                var name = UnboundOutputName(node, i) ?? node.OutputNames[i];
                 // Shape-cache hit: bind the retained buffer instead of renting a fresh one.
                 nodeOutputs[i] = shapeCacheHit && i == 0 ? cachedShapeBuf! : _pool.Rent(shape, name);
             }
@@ -5139,7 +5150,7 @@ public class GraphExecutor : IDisposable
             }
 
             for (int i = 0; i < node.OutputNames.Length; i++)
-                tensors[node.OutputNames[i]] = nodeOutputs[i];
+                if (UnboundOutputName(node, i) == null) tensors[node.OutputNames[i]] = nodeOutputs[i];
 
             if (_dumpMatch != null) await DumpNodeOutputsAsync(nodeIdx, node, nodeOutputs);
 
@@ -5494,6 +5505,18 @@ public class GraphExecutor : IDisposable
             if (opProf != null) PhaseMark(8);
             ReleaseConsumedInputs(node);
             ReleaseDeadOutputs(node);
+            // 🔴 Outputs the operator produced but the NODE does not name (an optional output the graph did not ask for: the
+            // operator's InferOutputShapes reported more than the node declares, or the ONNX name is ""). Nothing can read them,
+            // and they were never registered, so no lifetime path ever returned them: one leaked buffer per such node per run.
+            // MEASURED 2026-11-04 (training graph, SoftmaxCrossEntropyLoss declares only `loss`; its optional log_prob [N, C] was
+            // rented as "_anon_1" every run): +1 device allocation and +32 MiB per training step, without end. They also all shared
+            // the name "_anon_{i}", so the pool's name table re-bound a live buffer (ML_TRACE_POOL: REBIND-LIVE '_anon_1').
+            for (int oi = 0; oi < nodeOutputs.Length; oi++)
+            {
+                if (UnboundOutputName(node, oi) == null || nodeOutputs[oi] is not { } unbound) continue;
+                if (ImmediateReleaseActive) _pool.Return(unbound);
+                else { pendingReleases.Add(unbound); pendingReleaseBytes += (long)unbound.ElementCount * sizeof(float); }
+            }
 
             if (opProf != null) PhaseMark(9);
             nodeIdx++;

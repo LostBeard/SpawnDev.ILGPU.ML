@@ -81,6 +81,12 @@ public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
     /// </summary>
     public int LiveNamedCount => _namedBuffers.Count;
 
+    /// <summary>The rented (not yet Returned) fp32 buffers by name and size, largest first. Diagnostic: diff it across runs to name a rent that never comes back.</summary>
+    public List<(string Name, long Bytes)> LiveNamedBuffers()
+    {
+        lock (_sync) return _namedBuffers.Select(kv => (kv.Key, kv.Value.LengthInBytes)).OrderByDescending(x => x.Item2).ToList();
+    }
+
     /// <summary>
     /// Compact "bucketSize:freeCount" profile of the FREE buckets, largest counts first. Answers the
     /// question a miss count alone cannot: whether the capture pass started against an EMPTY pool or a

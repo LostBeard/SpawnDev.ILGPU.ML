@@ -56,6 +56,32 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Training steps must not grow device memory: after two warm steps (planned reuse records, then plans), five more steps allocate nothing.
+    /// MEASURED 2026-11-04 before the fix: +1 pool device allocation and +32 MiB per step - the graph executor rented outputs an operator
+    /// produces but the node does not name (SoftmaxCrossEntropyLoss's optional log_prob) and never returned them. Added 2026-11-04.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_StepsDoNotGrowThePool() => await RunTest(async accelerator =>
+    {
+        var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var gguf = await assets.GetByteArrayAsync("test-train/tiny-llama-train.gguf");
+        using var trainer = GgufLoraTrainer.Create(accelerator, gguf, new LoraOptions { Targets = new[] { "attn_q", "attn_v" }, Rank = 4, Alpha = 8, Seed = 2 });
+        var rng = new Random(3);
+        var ids = Enumerable.Range(0, 12).Select(_ => rng.Next(0, trainer.VocabSize)).ToArray();
+        var labels = ids.Select((_, t) => t >= 6 && t < ids.Length - 1 ? ids[t + 1] : -100).ToArray();
+        await trainer.StepAsync(ids, labels);
+        await trainer.StepAsync(ids, labels);
+        long allocs0 = SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations;
+        int live0 = trainer.Session.Executor.Pool.LiveNamedCount;
+        for (int i = 0; i < 5; i++) await trainer.StepAsync(ids, labels);
+        long grew = SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations - allocs0;
+        int liveGrew = trainer.Session.Executor.Pool.LiveNamedCount - live0;
+        var line = $"{accelerator.AcceleratorType}: 5 steps after warm-up: pool device allocations +{grew}, live rents {liveGrew:+0;-0;+0}";
+        if (grew > 0 || liveGrew > 0) throw new Exception("training steps grow device memory: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// GgufGenerator.CreateAsync(lora:) on BOTH engines: the session engine (adapters inserted into its graph at load) and the batch decoder
     /// (a LoraRuntime) generate the same greedy tokens with the same adapter set, and both differ from the base model. Added 2026-11-04.
     /// </summary>

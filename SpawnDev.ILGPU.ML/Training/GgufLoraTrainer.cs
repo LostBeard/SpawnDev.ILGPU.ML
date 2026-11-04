@@ -114,6 +114,18 @@ public sealed class GgufLoraTrainer : IDisposable
     private Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>>? _accum;
     private int _accumCount;
 
+    /// <summary>The training session (diagnostics: its executor's pool, weights).</summary>
+    public InferenceSession Session => _session;
+
+    /// <summary>Bytes the training session's pools hold in free (idle) buffers: device memory the next step may reuse but nothing else can have.</summary>
+    public long PooledFreeBytes => _session.PooledFreeBytes;
+
+    /// <summary>
+    /// Free the session's idle pool buffers (<see cref="InferenceSession.ReleaseWorkingMemory"/>); the next step re-allocates what it needs. For a
+    /// device shared with other work, or before loading something else (an inference model) next to the trainer.
+    /// </summary>
+    public long ReleaseWorkingMemory() => _session.ReleaseWorkingMemory();
+
     /// <summary>Sequences accumulated since the last <see cref="ApplyAsync"/>.</summary>
     public int AccumulatedSequences => _accumCount;
 
