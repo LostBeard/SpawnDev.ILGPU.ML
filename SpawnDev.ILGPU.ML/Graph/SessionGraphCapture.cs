@@ -64,6 +64,18 @@ public sealed class SessionGraphCapture : IDisposable
     /// </remarks>
     public bool? AllowControlFlow { get; set; }
 
+    /// <summary>
+    /// WebGPU: keep the forward's periodic drains in the recorded pass, so buffers released during it are recycled on a plain forward's
+    /// schedule instead of every intermediate being pinned for the plan's lifetime. Null follows
+    /// <see cref="WebGPUGraphCapture.KeepDrainsDuringCapture"/> (off). Ignored on CUDA (its capture already recycles).
+    /// </summary>
+    /// <remarks>
+    /// Per instance for the same reason as <see cref="AllowControlFlow"/>: whether a graph replays right with drains is a property of that
+    /// graph (ZipVoice's decoder does not), so it is verified and opted into per pipeline. MEASURED 2026-11-04 (Riker, AssistZ, RX 590):
+    /// CLAP's audio tower captured without drains held +337 MB of storage and +4,437 buffers for the plan's lifetime.
+    /// </remarks>
+    public bool? KeepDrains { get; set; }
+
     public SessionGraphCapture(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
@@ -265,7 +277,7 @@ public sealed class SessionGraphCapture : IDisposable
                     _cuda = await CudaGraphCapture.TryCaptureAsync(_session, stable, !refuseControlFlow)
                         .ConfigureAwait(false);
                 else
-                    _webGpu = await WebGPUGraphCapture.TryCaptureAsync(_session, stable).ConfigureAwait(false);
+                    _webGpu = await WebGPUGraphCapture.TryCaptureAsync(_session, stable, KeepDrains).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

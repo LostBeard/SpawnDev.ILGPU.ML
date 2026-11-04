@@ -100,65 +100,83 @@ public abstract partial class MLTestBase
         using var http = CreateHuggingFaceHttpClient();
         http.Timeout = TimeSpan.FromMinutes(20);
         var bytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://models.spawndev.com/Xenova/clap-htsat-unfused/resolve/main/onnx/audio_model.onnx");
-        using var session = InferenceSession.CreateFromFile(accelerator, bytes);
-        session.OutputsLiveUntilNextRun = true;
-        using var featBuf = accelerator.Allocate1D<float>(featsA.Length);
-        var shape = new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels };
-        string name = session.InputNames[0], outName = session.OutputNames[0];
-        async Task<float[]> Run(Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>> run, float[] feats)
-        {
-            featBuf.CopyFromCPU(feats);
-            var outs = await run(new Dictionary<string, Tensor> { [name] = new Tensor(featBuf.View, shape) });
-            return await outs[outName].Data.SubView(0, 512).CopyToHostAsync();
-        }
-        const int Steps = 30;
-        var direct = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)session.RunAsync;
-        // compile + warm, and past planned reuse's record/plan runs: timed earlier, the direct side carried the plan build (64 ms on WebGPU
-        // in the first measurement against 32 ms steady state)
-        for (int i = 0; i < 8; i++) await Run(direct, (i & 1) == 0 ? featsA : featsB);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < Steps; i++) await Run(direct, (i & 1) == 0 ? featsA : featsB);
-        double directMs = sw.Elapsed.TotalMilliseconds / Steps;
-        var directA = await Run(direct, featsA);
-        var directB = await Run(direct, featsB);
-
-        using var capture = new SessionGraphCapture(session, accelerator);
-        var captured = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)capture.RunAsync;
-        sw.Restart();
-        int setupCalls = 0;
-        while (!capture.IsCaptured && setupCalls < 4) { await Run(captured, featsA); setupCalls++; }
-        double setupMs = sw.Elapsed.TotalMilliseconds;
-        if (!capture.IsCaptured) throw new Exception($"capture never went live after {setupCalls} calls: {capture.CaptureStatus}");
-        await Run(captured, featsB);                                              // first replay
-        sw.Restart();
-        for (int i = 0; i < Steps; i++) await Run(captured, (i & 1) == 0 ? featsA : featsB);
-        double replayMs = sw.Elapsed.TotalMilliseconds / Steps;
-        // Where a WebGPU replay's time goes: input copy, the one plan call, the wait for completion (the rest of replayMs is the readback).
-        string split = capture.LastReplaySplit is var (inMs, planMs, syncMs) ? $" [last replay: input copy {inMs:F1} ms, plan call {planMs:F1} ms, sync {syncMs:F1} ms]" : "";
-        // Replays must not grow anything per call (Riker's PadKernel climb was invisible to the pool counters): count every live WebGPU buffer.
         bool webgpu = accelerator.AcceleratorType == AcceleratorType.WebGPU;
-        int live0 = webgpu ? global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount : 0;
-        long allocs0 = BufferPool.TotalDeviceAllocations;
-        for (int i = 0; i < 100; i++) await Run(captured, (i & 1) == 0 ? featsA : featsB);
-        int liveGrew = webgpu ? global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount - live0 : 0;
-        long allocsGrew = BufferPool.TotalDeviceAllocations - allocs0;
-        var replayA = await Run(captured, featsA);
-        var replayB = await Run(captured, featsB);
-        int differ = 0;
-        for (int i = 0; i < 512; i++)
+        const double MiB = 1048576.0;
+        static long Storage() => global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveStorageBytes;
+        static int Buffers() => global::SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveBufferCount;
+        // WebGPU: the recorded pass with and without drains (KeepDrains), each in a FRESH session so neither inherits the other's pool.
+        // MEASURED 2026-11-04 by Riker on an RX 590: the default (no drains) held +337 MB storage / +4,437 buffers for the plan's life, which
+        // this bench never looked at - it only gated growth AFTER the capture.
+        var variants = webgpu ? new bool?[] { null, true } : new bool?[] { null };
+        var lines = new List<string>();
+        foreach (var keepDrains in variants)
         {
-            if (BitConverter.SingleToInt32Bits(replayA[i]) != BitConverter.SingleToInt32Bits(directA[i])) differ++;
-            if (BitConverter.SingleToInt32Bits(replayB[i]) != BitConverter.SingleToInt32Bits(directB[i])) differ++;
+            using var session = InferenceSession.CreateFromFile(accelerator, bytes);
+            session.OutputsLiveUntilNextRun = true;
+            using var featBuf = accelerator.Allocate1D<float>(featsA.Length);
+            var shape = new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels };
+            string name = session.InputNames[0], outName = session.OutputNames[0];
+            async Task<float[]> Run(Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>> run, float[] feats)
+            {
+                featBuf.CopyFromCPU(feats);
+                var outs = await run(new Dictionary<string, Tensor> { [name] = new Tensor(featBuf.View, shape) });
+                return await outs[outName].Data.SubView(0, 512).CopyToHostAsync();
+            }
+            const int Steps = 30;
+            var direct = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)session.RunAsync;
+            // compile + warm, and past planned reuse's record/plan runs: timed earlier, the direct side carried the plan build (64 ms on WebGPU
+            // in the first measurement against 32 ms steady state)
+            for (int i = 0; i < 8; i++) await Run(direct, (i & 1) == 0 ? featsA : featsB);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Steps; i++) await Run(direct, (i & 1) == 0 ? featsA : featsB);
+            double directMs = sw.Elapsed.TotalMilliseconds / Steps;
+            var directA = await Run(direct, featsA);
+            var directB = await Run(direct, featsB);
+
+            // The capture's ONE-TIME cost: everything it allocates and keeps (warm passes, pinned intermediates, per-dispatch params).
+            long storage0 = webgpu ? Storage() : 0, devAllocs0 = BufferPool.TotalDeviceAllocations;
+            int buffers0 = webgpu ? Buffers() : 0;
+            using var capture = new SessionGraphCapture(session, accelerator) { KeepDrains = keepDrains };
+            var captured = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)capture.RunAsync;
+            sw.Restart();
+            int setupCalls = 0;
+            while (!capture.IsCaptured && setupCalls < 4) { await Run(captured, featsA); setupCalls++; }
+            double setupMs = sw.Elapsed.TotalMilliseconds;
+            if (!capture.IsCaptured) throw new Exception($"capture never went live after {setupCalls} calls: {capture.CaptureStatus}");
+            await Run(captured, featsB);                                              // first replay
+            string cost = $"capture cost: pool device allocations +{BufferPool.TotalDeviceAllocations - devAllocs0}"
+                + (webgpu ? $", live WebGPU storage +{(Storage() - storage0) / MiB:F0} MiB, buffers +{Buffers() - buffers0}" : "");
+            sw.Restart();
+            for (int i = 0; i < Steps; i++) await Run(captured, (i & 1) == 0 ? featsA : featsB);
+            double replayMs = sw.Elapsed.TotalMilliseconds / Steps;
+            // Where a WebGPU replay's time goes: input copy, the one plan call, the wait for completion (the rest of replayMs is the readback).
+            string split = capture.LastReplaySplit is var (inMs, planMs, syncMs) ? $" [last replay: input copy {inMs:F1} ms, plan call {planMs:F1} ms, sync {syncMs:F1} ms]" : "";
+            // Replays must not grow anything per call (Riker's PadKernel climb was invisible to the pool counters): count every live WebGPU buffer.
+            int live0 = webgpu ? Buffers() : 0;
+            long allocs0 = BufferPool.TotalDeviceAllocations;
+            for (int i = 0; i < 100; i++) await Run(captured, (i & 1) == 0 ? featsA : featsB);
+            int liveGrew = webgpu ? Buffers() - live0 : 0;
+            long allocsGrew = BufferPool.TotalDeviceAllocations - allocs0;
+            var replayA = await Run(captured, featsA);
+            var replayB = await Run(captured, featsB);
+            int differ = 0;
+            for (int i = 0; i < 512; i++)
+            {
+                if (BitConverter.SingleToInt32Bits(replayA[i]) != BitConverter.SingleToInt32Bits(directA[i])) differ++;
+                if (BitConverter.SingleToInt32Bits(replayB[i]) != BitConverter.SingleToInt32Bits(directB[i])) differ++;
+            }
+            bool distinct = !directA.SequenceEqual(directB);   // the two clips must give different embeddings, or the replay check proves nothing
+            var line = $"{accelerator.AcceleratorType} keepDrains={(keepDrains?.ToString() ?? "default")}: direct {directMs:F1} ms/forward, "
+                + $"capture setup {setupMs:F0} ms over {setupCalls} call(s) ({capture.CaptureStatus}), {cost}, "
+                + $"replay {replayMs:F1} ms/forward ({directMs / replayMs:F2}x){split}, replay differs from direct in {differ} of 1024 values, "
+                + $"100 more replays: pool device allocations +{allocsGrew}" + (webgpu ? $", live WebGPU buffers +{liveGrew}" : "");
+            Console.WriteLine($"[Benchmark] ClapCapture [{accelerator.AcceleratorType}] {line}");
+            if (!distinct) throw new Exception("the two fixture clips gave identical embeddings: the input-change check is vacuous: " + line);
+            if (differ != 0) throw new Exception("captured replay is not bit-identical to the direct forward: " + line);
+            if (liveGrew > 0 || allocsGrew > 0) throw new Exception("replays grow device memory: " + line);
+            lines.Add(line);
         }
-        bool distinct = !directA.SequenceEqual(directB);   // the two clips must give different embeddings, or the replay check proves nothing
-        var line = $"{accelerator.AcceleratorType}: direct {directMs:F1} ms/forward, capture setup {setupMs:F0} ms over {setupCalls} call(s) "
-            + $"({capture.CaptureStatus}), replay {replayMs:F1} ms/forward ({directMs / replayMs:F2}x){split}, replay differs from direct in {differ} of 1024 values, "
-            + $"100 more replays: pool device allocations +{allocsGrew}" + (webgpu ? $", live WebGPU buffers +{liveGrew}" : "");
-        Console.WriteLine($"[Benchmark] ClapCapture [{accelerator.AcceleratorType}] {line}");
-        if (!distinct) throw new Exception("the two fixture clips gave identical embeddings: the input-change check is vacuous: " + line);
-        if (differ != 0) throw new Exception("captured replay is not bit-identical to the direct forward: " + line);
-        if (liveGrew > 0 || allocsGrew > 0) throw new Exception("replays grow device memory: " + line);
-        return line;
+        return string.Join(" || ", lines);
     });
 
     /// <summary>
@@ -183,7 +201,38 @@ public abstract partial class MLTestBase
         using var featBuf = accelerator.Allocate1D(feats);
         var input = new Dictionary<string, Tensor> { [session.InputNames[0]] = new Tensor(featBuf.View, new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels }) };
         for (int i = 0; i < 6; i++) { var o = await session.RunAsync(input); await o[session.OutputNames[0]].Data.SubView(0, 16).CopyToHostAsync(); }
-        bool syncSaved = GraphExecutor.PerOpSync;
+        static string OpOf(string key) { var parts = key.Split('_', 3); return parts.Length > 1 ? parts[1] : key; }
+        // A/B of FusedLinearKernel.SplitK in ONE process, interleaved (off, on, off, on ...) so clock drift hits both sides alike: plain
+        // forward ms (no per-op sync) and FusedLinear's per-op-sync total. A profile taken in a separate run read every op type ~2x slower.
+        bool splitSaved = Kernels.FusedLinearKernel.SplitK, syncSaved = GraphExecutor.PerOpSync;
+        var fwd = new Dictionary<bool, List<double>> { [false] = new(), [true] = new() };
+        var linMs = new Dictionary<bool, List<double>> { [false] = new(), [true] = new() };
+        var emb = new Dictionary<bool, float[]>();
+        try
+        {
+            for (int round = 0; round < 6; round++)
+                foreach (bool split in new[] { false, true })
+                {
+                    Kernels.FusedLinearKernel.SplitK = split;
+                    { var o = await session.RunAsync(input); emb[split] = await o[session.OutputNames[0]].Data.SubView(0, 512).CopyToHostAsync(); }
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < 5; i++) { var o = await session.RunAsync(input); await o[session.OutputNames[0]].Data.SubView(0, 16).CopyToHostAsync(); }
+                    fwd[split].Add(sw.Elapsed.TotalMilliseconds / 5);
+                    GraphExecutor.PerOpSync = true;
+                    GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+                    { var o = await session.RunAsync(input); await o[session.OutputNames[0]].Data.SubView(0, 16).CopyToHostAsync(); }
+                    linMs[split].Add(GraphExecutor.CapturedNodeTimingsMs.Where(kv => OpOf(kv.Key) == "FusedLinear").Sum(kv => kv.Value));
+                    GraphExecutor.CapturedNodeTimingsMs = null;
+                    GraphExecutor.PerOpSync = false;
+                }
+        }
+        finally { Kernels.FusedLinearKernel.SplitK = splitSaved; GraphExecutor.CapturedNodeTimingsMs = null; GraphExecutor.PerOpSync = syncSaved; }
+        static double Med(List<double> v) { var a = v.OrderBy(x => x).ToArray(); return a[a.Length / 2]; }
+        double drift = emb[false].Zip(emb[true], (a, b) => Math.Abs(a - b)).Max();
+        var ab = $"split-K A/B (median of 6 interleaved rounds): forward off {Med(fwd[false]):F1} / on {Med(fwd[true]):F1} ms, "
+            + $"FusedLinear (per-op sync) off {Med(linMs[false]):F2} / on {Med(linMs[true]):F2} ms, embedding max |diff| {drift:E1}";
+        Console.WriteLine("[ClapProfile] " + ab);
+
         var timings = new Dictionary<string, double>();
         try
         {
@@ -199,12 +248,11 @@ public abstract partial class MLTestBase
             }
         }
         finally { GraphExecutor.CapturedNodeTimingsMs = null; GraphExecutor.PerOpSync = syncSaved; }
-        static string OpOf(string key) { var parts = key.Split('_', 3); return parts.Length > 1 ? parts[1] : key; }
         double total = timings.Values.Sum();
         var byType = timings.GroupBy(kv => OpOf(kv.Key)).Select(g => (Op: g.Key, Ms: g.Sum(kv => kv.Value), N: g.Count(), Min: g.Min(kv => kv.Value)))
             .OrderByDescending(x => x.Ms).ToList();
         double floor = timings.Values.Min();   // ~ the per-node sync overhead
-        var line = $"{accelerator.AcceleratorType}: {timings.Count} nodes, {total:F1} ms with per-op sync (cheapest node {floor:F3} ms = the sync floor; "
+        var line = $"{accelerator.AcceleratorType}: {ab} | {timings.Count} nodes, {total:F1} ms with per-op sync (cheapest node {floor:F3} ms = the sync floor; "
             + $"total minus floor x nodes {total - floor * timings.Count:F1} ms) | by type: "
             + string.Join(", ", byType.Take(14).Select(x => $"{x.Op} {x.Ms:F1} ms/{x.N} ({100 * x.Ms / total:F0}%)"))
             + " | top nodes: " + string.Join(", ", timings.OrderByDescending(kv => kv.Value).Take(12).Select(kv => $"{kv.Key} {kv.Value:F2}"));

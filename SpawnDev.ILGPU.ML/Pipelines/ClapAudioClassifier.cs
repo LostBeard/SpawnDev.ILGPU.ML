@@ -86,16 +86,22 @@ public sealed class ClapAudioClassifier : IDisposable
     private Graph.SessionGraphCapture? _audioCapture;
 
     /// <summary>
-    /// Record the audio tower once and replay it (a CUDA graph on CUDA, a dispatch plan on WebGPU; other backends run it directly). Default on.
+    /// Record the audio tower once and replay it (a CUDA graph on CUDA, a dispatch plan on WebGPU; other backends run it directly).
+    /// Default OFF: it trades a one-time memory cost for host time only, so it pays only where the host, not the GPU, is the bottleneck.
     /// </summary>
     /// <remarks>
-    /// The tower's input is always [1,1,1001,64], so the recording is made once per classifier and never invalidated by a shape change.
-    /// MEASURED 2026-11-04 (RTX 4070, Bench_ClapAudioTower_CaptureVsDirect, two runs, steady state past the planned-reuse warm-up): CUDA
-    /// 16.7-17.0 -> 12.9-13.6 ms per forward (1.23-1.32x), WebGPU in Chrome 40.4 -> 22.3-23.4 ms (1.73-1.81x); one-time setup 0.7 s / 1.6-1.7 s
-    /// on the first call; the replayed embeddings bit-identical to the direct forward on two different clips; 100 replays allocate nothing.
-    /// Set before the first audio call; turning it off later runs the direct forward.
+    /// The tower's input is always [1,1,1001,64], so the recording is made once per classifier and never invalidated by a shape change, and the
+    /// replay is bit-identical to the direct forward. A replay removes the HOST work of encoding ~3,000 dispatches, not GPU work.
+    /// <para>
+    /// MEASURED 2026-11-04 (Bench_ClapAudioTower_CaptureVsDirect, FusedLinear split-K on, fresh session per variant), RTX 4070:
+    /// WebGPU in Chrome 32.7 -> 23.7 ms per forward for a one-time +132 MiB storage / +2,876 buffers (recorded with drains, as this class
+    /// does; without them +323 MiB / +4,937); CUDA 11.3 -> 11.5 ms (no gain). Riker, AssistZ, RX 590 in Chrome (5.8.2-local.7, which had this
+    /// ON by default and recorded without drains): per-event median 74.4 -> 73.9 ms - the card is GPU-bound, so the host work a replay saves
+    /// was already overlapped - and Chrome's GPU memory +700 MB. Hence opt-in. Set before the first audio call; turning it off after a
+    /// recording runs the direct forward but keeps the recording's memory until the classifier is disposed.
+    /// </para>
     /// </remarks>
-    public bool EnableGraphCapture { get; set; } = true;
+    public bool EnableGraphCapture { get; set; }
 
     /// <summary>Why the audio tower is or is not replaying (<see cref="Graph.SessionGraphCapture.CaptureStatus"/>).</summary>
     public string AudioCaptureStatus => _audioCapture?.CaptureStatus ?? "not attempted";
@@ -188,7 +194,9 @@ public sealed class ClapAudioClassifier : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         _features.Extract(pcm, length, _featureBuf.View);
         var shape = new[] { 1, 1, ClapFeatureExtractor.Frames, ClapFeatureExtractor.Mels };
-        _audioCapture ??= new Graph.SessionGraphCapture(_audio, _accelerator);
+        // KeepDrains: buffers released during the recorded pass are recycled on a plain forward's schedule instead of all being pinned
+        // (+132 vs +323 MiB on the 4070; replay still bit-identical, Bench_ClapAudioTower_CaptureVsDirect).
+        _audioCapture ??= new Graph.SessionGraphCapture(_audio, _accelerator) { KeepDrains = true };
         _audioCapture.Enabled = EnableGraphCapture;
         var outs = await _audioCapture.RunAsync(new Dictionary<string, Tensor> { [_audio.InputNames[0]] = new Tensor(_featureBuf.View, shape) })
             .ConfigureAwait(false);

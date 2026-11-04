@@ -211,6 +211,19 @@ public abstract partial class MLTestBase
             if (!both.Embedding.SequenceEqual(emb)) throw new Exception("ClassifyWithEmbeddingAsync's embedding differs from EmbedAudioAsync's");
         }
         if (!both.Scores.Select(x => x.Probability).SequenceEqual(alone.Select(x => x.Probability))) throw new Exception("ClassifyWithEmbeddingAsync's scores differ from ClassifyAsync's");
+        // Opt-in graph capture (off by default since local.8): turned on mid-run it records on the next call and must replay bit-identically -
+        // the same scores and embedding as the direct forward above - on the backends that capture (CUDA, WebGPU); elsewhere it runs direct.
+        if (clap.EnableGraphCapture) throw new Exception("EnableGraphCapture must default to off");
+        clap.EnableGraphCapture = true;
+        for (int i = 0; i < 3; i++)
+        {
+            var cap = await clap.ClassifyWithEmbeddingAsync(speech, labels);
+            if (!cap.Embedding.SequenceEqual(both.Embedding) || !cap.Scores.Select(x => x.Probability).SequenceEqual(both.Scores.Select(x => x.Probability)))
+                throw new Exception($"captured call {i + 1} differs from the direct forward ({clap.AudioCaptureStatus})");
+        }
+        bool capturable = accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.WebGPU;
+        if (capturable && !clap.AudioCaptureStatus.StartsWith("live")) throw new Exception("audio capture did not go live: " + clap.AudioCaptureStatus);
+        notes.Add($"capture opt-in: {clap.AudioCaptureStatus}, bit-identical");
         var line = $"{accelerator.AcceleratorType} {repo}: " + string.Join("; ", notes);
         Console.WriteLine($"[Clap] {line}");
         return line;
