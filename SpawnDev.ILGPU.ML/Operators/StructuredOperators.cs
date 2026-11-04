@@ -777,7 +777,7 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
     public string OpType => "GatherND";
     /// <summary>Releases the last params buffer (the registry disposes operators that implement this).</summary>
-    public void Dispose() { _lastParamsBuf?.Dispose(); _lastParamsBuf = null; }
+    public void Dispose() { _params?.Dispose(); _params = null; }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         // ONNX GatherND output shape per spec:
@@ -812,7 +812,11 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
 
     // GPU GatherND kernel: each thread copies one element of the output.
     // params: [lastIdxDim, sliceSize, dataTotal, strides[0], strides[1], ...]
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
+    // Content-addressed, write-once params (Kernels/ContentParamBuffers): a dispatch still queued on the Wasm worker pool or in a WebGPU
+    // encoder keeps reading exactly its params. This used to dispose the PREVIOUS call's buffer and allocate a new one per call: a
+    // queued GatherND then read a freed buffer. MEASURED 2026-11-04: MoveNet on Wasm, "[GE node-192 sync] Arg_NullReferenceException"
+    // once the compiler's stable node order put two GatherNDs close enough together (per-op sync passed, which is the race's signature).
+    private Kernels.ContentParamBuffers<int>? _params;
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // data
         ArrayView1D<float, Stride1D.Dense>,  // indices
@@ -904,13 +908,13 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator, IDisposable
             paramsArr[1] = sliceSize;
             paramsArr[2] = dataTotal;
             for (int i = 0; i < strides.Length; i++) paramsArr[3 + i] = strides[i];
-            _lastParamsBuf?.Dispose();
-            _lastParamsBuf = reg.Accelerator.Allocate1D(paramsArr);
+            _params ??= new Kernels.ContentParamBuffers<int>(reg.Accelerator);
+            var paramsView = _params.Get(paramsArr);
 
             _gatherNDKernel ??= reg.Accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherNDImpl);
-            _gatherNDKernel(outputSize, data.Data, indices.Data, ctx.Outputs[0].Data, _lastParamsBuf.View);
+            _gatherNDKernel(outputSize, data.Data, indices.Data, ctx.Outputs[0].Data, paramsView);
         }
     }
 }

@@ -289,11 +289,13 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator, IDisposable
     {
         if (buf == null || buf.Length < elements)
         {
-            buf?.Dispose();
+            // Retired, not disposed: a dispatch still queued (Wasm worker pool, WebGPU encoder) may reference the smaller buffer.
+            if (buf != null) _retiredScratch.Add(buf);
             buf = reg.Accelerator.Allocate1D<float>(elements);
         }
         return buf.View;
     }
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _retiredScratch = new();
 
     /// <summary>
     /// Runs the recurrence entirely on the accelerator, or returns false to leave it to the host path.
@@ -420,6 +422,8 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator, IDisposable
         _cA?.Dispose(); _cA = null;
         _cB?.Dispose(); _cB = null;
         _unused?.Dispose(); _unused = null;
+        foreach (var r in _retiredScratch) r.Dispose();
+        _retiredScratch.Clear();
     }
 
     private void ExecuteCore(OnnxOpContext ctx, Dictionary<int, float[]>? pre)
