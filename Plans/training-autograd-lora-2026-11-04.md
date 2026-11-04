@@ -140,3 +140,14 @@ the strict scorer passes; honesty targets are the corrected sentence, not the li
   GgufBatchDecoder + LoraRuntime vs the training forward with the same adapters: max |diff| 9.3e-3 (max |logit| 8.5),
   same argmax; the base decoder differs by 14.6 (the adapters' effect). Blocked (shared-memory) attention backward added
   for long prompts (the per-element one is O(seq^2 hd) per output value); FD-checked across block boundaries, 7/7 lanes.
+- 2026-11-04 11:41-11:49, checkpointed (LoraOptions.CheckpointLayers) seq 512: directional derivative 4e-4, loss 12.69 -> 12.29,
+  14.5 s/step; decoder + LoraRuntime vs training forward 6.8e-3. GraphCompiler's topological sort is now stable (it
+  ran recompute nodes in the forward under FIFO). Long-sequence VRAM (1024 / 2048) pending a quiet card (Geordi).
+- tools/TrainLoraJsonl: format-3 JSONL -> PEFT adapters with dev loss and a generation eval through GgufGenerator +
+  gen.Lora. Synthetic smollm2 check: dev loss 13.87 -> 0.29, dev generation base 0/24 -> adapters 13/24 exact.
+- Inference API for AI (Data): LoraRuntime.Load(accelerator, safetensors, adapter_config.json); generator.Lora = it.
+
+### Next
+- [ ] 8B probe at 1024 / 2048 tokens, checkpointed (quiet card), then a full default sweep (the compiler change) and local.10.
+- [ ] M4 run on Seven's data once target_ids flow (AI 1.4.1-local.2 has them): ToolChoiceTests strict on the short prompt
+      >= 93/100 with TTFT down, honesty above the base; on the 2060 (GATEGAMER) for the production-card timing.
