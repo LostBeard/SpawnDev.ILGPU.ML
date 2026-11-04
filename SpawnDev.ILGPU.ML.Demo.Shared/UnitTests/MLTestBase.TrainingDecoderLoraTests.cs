@@ -120,6 +120,17 @@ public abstract partial class MLTestBase
         Console.WriteLine("[Training] " + line);
         if (!sessionLora.SequenceEqual(batchLora)) throw new Exception("the two engines generate differently with the same adapters: " + line);
         if (sessionLora.SequenceEqual(sessionBase)) throw new Exception("the adapters do not change the generation: " + line);
-        return line;
+
+        // GenerationResult.StopTokenId: make the 4th greedy token a stop id; both engines must stop there, report THAT id, and not include it.
+        int stopId = sessionBase[3];
+        foreach (var engine in new[] { GgufEngine.Generator, GgufEngine.BatchDecoder })
+        {
+            using var gen = await GgufGenerator.CreateAsync(accelerator, new MemoryStream(gguf), 64, engine: engine);
+            var res = await gen.GenerateAsync(prompt, cfg, stopTokenIds: new[] { stopId });
+            int firstStop = Array.IndexOf(sessionBase, stopId);
+            if (res.StopTokenId != stopId || res.Stop != StopReason.StopToken || !res.GeneratedTokenIds.SequenceEqual(sessionBase.Take(firstStop)))
+                throw new Exception($"{engine}: StopTokenId {res.StopTokenId?.ToString() ?? "null"} (want {stopId}), Stop {res.Stop}, ids [{string.Join(",", res.GeneratedTokenIds)}] (want [{string.Join(",", sessionBase.Take(firstStop))}])");
+        }
+        return line + $"; StopTokenId {stopId} reported by both engines";
     });
 }

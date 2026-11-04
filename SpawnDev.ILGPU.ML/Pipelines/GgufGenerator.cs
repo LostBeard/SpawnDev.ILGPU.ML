@@ -33,6 +33,13 @@ public sealed record GenerationResult(string Text, int PromptTokens, int Generat
     /// (Plans/training-autograd-lora-2026-11-04.md).
     /// </summary>
     public int[] GeneratedTokenIds { get; init; } = Array.Empty<int>();
+
+    /// <summary>
+    /// The token id that ended the generation when <see cref="Stop"/> is <see cref="StopReason.Eos"/> or <see cref="StopReason.StopToken"/>
+    /// (not in <see cref="GeneratedTokenIds"/>); null for a length limit, a stop string or a cancel. llama 3.1 ends a turn with &lt;|eot_id|&gt; or a
+    /// tool call with &lt;|eom_id|&gt;: a training pair appends THIS id, not a guess.
+    /// </summary>
+    public int? StopTokenId { get; init; }
 }
 
 /// <summary>
@@ -353,6 +360,7 @@ public sealed class GgufGenerator : IDisposable
         ForgetCachedRowsFrom(P);
         int written = P;   // K/V rows that hold real data: the reused prefix, plus each step once it has RUN
         StopReason stop = StopReason.Length;
+        int? stopTokenId = null;
 
         for (int step = 0; step < maxNew; step++)
         {
@@ -505,8 +513,8 @@ public sealed class GgufGenerator : IDisposable
             }   // end !fastToken (logits path)
 
             // Stop tokens (EOS + caller list) end the turn WITHOUT contributing text.
-            if (next == _eosId) { stop = StopReason.Eos; break; }
-            if (stopTokenIds != null && stopTokenIds.Contains(next)) { stop = StopReason.StopToken; break; }
+            if (next == _eosId) { stop = StopReason.Eos; stopTokenId = next; break; }
+            if (stopTokenIds != null && stopTokenIds.Contains(next)) { stop = StopReason.StopToken; stopTokenId = next; break; }
 
             generated.Add(next);
             // the text: a stop string cuts it at its first match and ends the turn; what cannot still start one is streamed
@@ -524,7 +532,7 @@ public sealed class GgufGenerator : IDisposable
         // reuse this turn's prompt+response as its prefix.
         RecordResident(promptIds, generated, written);
 
-        return new GenerationResult(text.Text, promptIds.Length, generated.Count, stop) { GeneratedTokenIds = generated.ToArray() };
+        return new GenerationResult(text.Text, promptIds.Length, generated.Count, stop) { GeneratedTokenIds = generated.ToArray(), StopTokenId = stopTokenId };
     }
 
     /// <summary>

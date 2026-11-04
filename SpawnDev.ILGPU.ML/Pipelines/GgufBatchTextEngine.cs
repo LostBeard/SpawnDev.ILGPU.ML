@@ -58,11 +58,13 @@ internal sealed class GgufBatchTextEngine : IDisposable
         int produced = 0;
         var ids = new List<int>();
         StopReason stop;
+        int? stopTokenId = null;
         try
         {
             await _dec.GenerateAsync(promptIds, 1, maxNew, T, topP, seed, stops, ct: ct, repetitionPenalty: penalty, repeatLastN: window,
                 reusePrefix: EnablePrefixCache && !truncated, shouldContinue: (_, token) => { produced++; ids.Add(token); return text.PushAsync(token); }, topK: topK).ConfigureAwait(false);
             int stopToken = _dec.LastStopTokens.Length > 0 ? _dec.LastStopTokens[0] : -1;
+            if (stopToken >= 0 && !text.StoppedOnString) stopTokenId = stopToken;
             stop = text.StoppedOnString ? StopReason.StopString
                 : stopToken >= 0 ? (stopToken == _eosId ? StopReason.Eos : StopReason.StopToken)
                 : StopReason.Length;
@@ -73,7 +75,7 @@ internal sealed class GgufBatchTextEngine : IDisposable
             stop = StopReason.Cancelled;
         }
         await text.FinishAsync().ConfigureAwait(false);
-        return new GenerationResult(text.Text, promptIds.Length, produced, stop) { GeneratedTokenIds = ids.ToArray() };
+        return new GenerationResult(text.Text, promptIds.Length, produced, stop) { GeneratedTokenIds = ids.ToArray(), StopTokenId = stopTokenId };
     }
 
     public void Dispose() => _dec.Dispose();

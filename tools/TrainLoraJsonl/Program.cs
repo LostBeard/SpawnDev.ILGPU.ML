@@ -32,6 +32,9 @@ Directory.CreateDirectory(outDir);
 var train = new List<(string Id, int[] Ids, int[] Labels)>();
 var dev = new List<(string Id, int[] Ids, int[] Labels)>();
 int skippedNoIds = 0, skippedLong = 0, lines = 0;
+// Vertex lines carry `expected_tool` (null = the answer calls no tool): scored as tool choice besides exact ids
+var expectedTool = new Dictionary<string, string?>();
+bool hasToolField = false;
 foreach (var path in args[1].Split(','))
     foreach (var line in File.ReadLines(path))
     {
@@ -51,6 +54,7 @@ foreach (var path in args[1].Split(','))
         for (int i = 0; i < ids.Length; i++) labels[i] = i < p.Length - 1 ? -100 : i < ids.Length - 1 ? ids[i + 1] : eot;
         string split = r.TryGetProperty("split", out var s) ? s.GetString() ?? "train" : "train";
         string id = r.TryGetProperty("id", out var ide) ? ide.ToString() : lines.ToString();
+        if (r.TryGetProperty("expected_tool", out var et)) { hasToolField = true; expectedTool[id] = et.ValueKind == JsonValueKind.String ? et.GetString() : null; }
         (split == "train" ? train : dev).Add((id, ids, labels));
     }
 Console.WriteLine($"{lines} lines: {train.Count} train, {dev.Count} dev; skipped {skippedNoIds} without ids, {skippedLong} longer than {maxLen}");
@@ -125,7 +129,7 @@ if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors
         await using var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
         using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + 64, 8192), engine: engine,
             lora: withLora ? set : null);
-        int exact = 0;
+        int exact = 0, toolOk = 0;
         for (int di = 0; di < dev.Count; di++)
         {
             var (id, ids, labels) = dev[di];
@@ -135,10 +139,13 @@ if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors
             cfg.MaxNewTokens = target.Length + 4;
             var res = await gen.GenerateAsync(ids[..p], cfg, stopTokenIds: new[] { eot });
             perLine[di][withLora ? "adapter_ids" : "base_ids"] = res.GeneratedTokenIds;
+            if (hasToolField && expectedTool.TryGetValue(id, out var want))
+                toolOk += want != null ? (res.Text.Contains($"\"name\": \"{want}\"") ? 1 : 0) : (res.Text.Contains("<tool_call>") ? 0 : 1);
             if (res.GeneratedTokenIds.SequenceEqual(target) && res.Stop is SpawnDev.ILGPU.ML.Pipelines.StopReason.StopToken or SpawnDev.ILGPU.ML.Pipelines.StopReason.Eos) exact++;
         }
-        Console.WriteLine($"generation on dev ({gen.Engine}): {(withLora ? "with adapters" : "base")}: {exact}/{dev.Count} exact (target ids, then end of turn)");
-        log.Add(new { generation = withLora ? "adapters" : "base", exact, of = dev.Count });
+        Console.WriteLine($"generation on dev ({gen.Engine}): {(withLora ? "with adapters" : "base")}: {exact}/{dev.Count} exact (target ids, then end of turn)"
+            + (hasToolField ? $"; tool choice {toolOk}/{dev.Count} (the expected tool named, or no tool call when none is expected)" : ""));
+        log.Add(new { generation = withLora ? "adapters" : "base", exact, tool_choice = toolOk, of = dev.Count });
     }
     using (var w = new StreamWriter(Path.Combine(outDir, engine == SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Auto ? "generation_eval.jsonl" : $"generation_eval.{Arg("--engine", "auto")}.jsonl")))
         for (int di = 0; di < dev.Count; di++)
