@@ -40,7 +40,7 @@ You hand it a model file. It detects the format, builds a graph, optimizes it an
 - **200+ ONNX operators**, a graph optimizer (constant folding, fusion, strength reduction, dead-node elimination) and fused kernels for linear layers, attention, quantized matmul and more.
 - **Generative models, ported and checked.** FLUX 3 Image Klein, FLUX.2 klein, Stable Diffusion 1.x / 2.x / SDXL (LoRA, ControlNet, ComfyUI's UNet patches, ToMe and ToDo), SD-Turbo, LTX-Video and Wan 2.2 (text, picture, keyframes and story to video), TRELLIS.2 (text and image to textured 3D), SkinTokens and UniRig (auto-rigging), Kimodo (character animation). Stages are gated against the reference implementations.
 - **Language and speech.** Quantized GGUF LLMs with KV-cache decode and TurboQuant cache compression, Whisper speech-to-text, Kokoro and ZipVoice text-to-speech with voice cloning.
-- **Training, not only inference.** Backpropagation, SGD and Adam as GPU kernels, so a small network can be trained in a browser tab.
+- **Training, not only inference.** LoRA fine-tuning of GGUF language models on the device (llama3.1:8b on a 12 GB card), with adapters in PEFT's format and a step checked against PyTorch ([training.md](Docs/training.md)); backpropagation, SGD and Adam as GPU kernels for small networks, trainable in a browser tab.
 - **Zero-copy by design.** Pixels, activations and weights stay on the GPU. In the browser, bulk data streams from `fetch` and OPFS straight into GPU buffers without touching the .NET heap.
 - **Trim and AOT safe.** The trim analyzer runs on every build of the library.
 
@@ -169,7 +169,7 @@ More: [Docs/assetgen.md](Docs/assetgen.md), [Docs/scenes.md](Docs/scenes.md) (a 
 | **Rigging and animation** | `SkinTokensRigger` (learned skeleton and skin weights), `UniRigRigger`, `HumanoidRetargeter` and `AnimatedGlb` (Kimodo clips on any rigged humanoid) |
 | **Language** | GGUF LLM inference (Llama, Qwen, Gemma, Mistral, Phi, LFM2, gpt-oss and more) with KV-cache decode and TurboQuant cache compression, sentiment (DistilBERT), embeddings (MiniLM), text generation, multimodal Gemma 4 |
 | **Speech** | Whisper and Parakeet speech-to-text, Silero voice-activity detection, smart-turn detection, Kokoro and ZipVoice text-to-speech with voice cloning |
-| **Training** | `TrainableModel` with softmax cross-entropy, Conv2D, ReLU, max-pool and linear backward passes, SGD and Adam; `SystemOneDecisionHead` for small typed decision models |
+| **Training** | `GgufLoraTrainer`: LoRA fine-tuning of GGUF language models (graph autograd, AdamW, checkpointing, PEFT adapter files), adapters at inference on both text engines ([training.md](Docs/training.md)); `TrainableModel` with softmax cross-entropy, Conv2D, ReLU, max-pool and linear backward passes, SGD and Adam; `SystemOneDecisionHead` for small typed decision models |
 | **Tooling** | Model inspector (header-only streaming), op-compatibility reports, per-node timing, an Ollama-compatible GGUF server (Example 06) |
 
 Pipelines, models and their verification status are tracked in [Docs/DEMO_AND_MODEL_STATUS.md](Docs/DEMO_AND_MODEL_STATUS.md). "The loader reads format X" and "model Y runs end to end" are different claims, and that file keeps them apart.
@@ -293,6 +293,7 @@ Self-contained projects under [`Examples/`](Examples/README.md), each runnable w
 | [Operators](Docs/operators.md) | ONNX operator support and implementation tiers |
 | [TRELLIS.2](Docs/trellis2.md) | Text and image to 3D: pipeline, API, browser design, numbers |
 | [FLUX 3 Image Klein](Docs/flux3.md) / [FLUX.2 klein](Docs/flux2.md) | Image generation and reference editing |
+| [Training](Docs/training.md) | LoRA fine-tuning of GGUF language models, adapters at inference, the gates |
 | [Stable Diffusion](Docs/stable-diffusion.md) | SD 1.x / 2.x / SDXL checkpoints, LoRA, ControlNet, ComfyUI's patches, token merging |
 | [Video generation](Docs/video.md) | LTX-Video and Wan 2.2: the /video studio, story writer and narration, MagCache, parity and numbers |
 | [Rigging and animation](Docs/rigging.md) | SkinTokens, UniRig, Kimodo retargeting |
