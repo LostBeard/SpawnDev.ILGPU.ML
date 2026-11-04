@@ -7,6 +7,7 @@
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
 //        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch] [--no-dev-loss]
+//        [--progress 10] (a progress line every N AdamW steps)
 // --eval-only: skip training; evaluate the adapters already in --out. Every run writes <out>/generation_eval.jsonl: per dev line the
 // prompt, the target and the generated ids of the base model and of the adapters (a fixture for SpawnDev.AI's adapter test).
 using System.Diagnostics;
@@ -88,6 +89,7 @@ async Task<double> DevLossAsync()
 double best = await DevLossAsync();
 Console.WriteLine($"epoch 0: dev loss {best:F4}");
 log.Add(new { epoch = 0, dev_loss = best });
+int progressEvery = Math.Max(1, int.Parse(Arg("--progress", "10")));
 var rng = new Random(seed);
 for (int ep = 1; ep <= epochs; ep++)
 {
@@ -97,7 +99,16 @@ for (int ep = 1; ep <= epochs; ep++)
     for (int i = 0; i < order.Count; i++)
     {
         trainSum += await trainer.AccumulateAsync(order[i].Ids, order[i].Labels);
-        if (trainer.AccumulatedSequences == accum || i == order.Count - 1) await trainer.ApplyAsync();
+        if (trainer.AccumulatedSequences == accum || i == order.Count - 1)
+        {
+            await trainer.ApplyAsync();
+            // progress per --progress AdamW steps (default 10): long runs otherwise print nothing until the epoch ends
+            if (trainer.Step % progressEvery == 0 || i == order.Count - 1)
+            {
+                double el = sw.Elapsed.TotalSeconds, eta = el / (i + 1) * (order.Count - i - 1);
+                Console.WriteLine($"  epoch {ep}: {i + 1}/{order.Count} sequences, step {trainer.Step}, mean train loss {trainSum / (i + 1):F4}, {el:F0} s, ~{eta / 60:F0} min left in the epoch");
+            }
+        }
     }
     double devLoss = await DevLossAsync();
     Console.WriteLine($"epoch {ep}: train loss {trainSum / order.Count:F4}, dev loss {devLoss:F4}, {trainer.Step} AdamW steps, {sw.Elapsed.TotalSeconds:F0} s");
