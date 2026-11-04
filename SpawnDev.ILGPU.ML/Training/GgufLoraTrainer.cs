@@ -20,6 +20,11 @@ public sealed class LoraOptions
     public int IgnoreIndex { get; set; } = -100;
     /// <summary>Seed for PEFT-default initialisation (A Kaiming-uniform, B zero) when <see cref="Initial"/> lacks an adapter.</summary>
     public int Seed { get; set; }
+    /// <summary>
+    /// Recompute each decoder layer's activations in the backward instead of keeping them from the forward (GraphAutograd's checkpointLayers):
+    /// needed for long sequences on large models (llama3.1:8b at 2,048 tokens keeps ~20 GB of activations without it), one extra forward of compute.
+    /// </summary>
+    public bool CheckpointLayers { get; set; }
     /// <summary>Starting adapters in PEFT layout (<c>{module}.lora_A.weight</c> [rank, in], <c>{module}.lora_B.weight</c> [out, rank]).</summary>
     public IReadOnlyDictionary<string, float[]>? Initial { get; set; }
 }
@@ -95,9 +100,47 @@ public sealed class GgufLoraTrainer : IDisposable
             var adapters = GraphAutograd.AddLora(graph, weights, options.Targets, options.Rank, options.Alpha, options.Initial, options.Seed);
             var logits = graph.Outputs.FirstOrDefault(o => o.Name == "logits") ?? throw new InvalidOperationException("the graph has no 'logits' output");
             Vocab = logits.Shape[^1];
-            Info = GraphAutograd.AddBackward(graph, "logits", Vocab, adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex);
+            Info = GraphAutograd.AddBackward(graph, "logits", Vocab, adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex,
+                options.CheckpointLayers);
             Adapters = adapters;
         }
+    }
+
+    private Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>>? _accum;
+    private int _accumCount;
+
+    /// <summary>Sequences accumulated since the last <see cref="ApplyAsync"/>.</summary>
+    public int AccumulatedSequences => _accumCount;
+
+    /// <summary>
+    /// Forward + loss + backward on one sequence and ADD its gradients to the running sum (gradient accumulation: a batch of sequences of any
+    /// lengths, one at a time). <see cref="ApplyAsync"/> then takes one AdamW step on their mean. Returns this sequence's loss.
+    /// </summary>
+    public async Task<float> AccumulateAsync(int[] inputIds, int[] labels)
+    {
+        float loss = await StepAsync(inputIds, labels, update: false).ConfigureAwait(false);
+        _accum ??= _params.ToDictionary(p => p.Param, p => _acc.Allocate1D<float>(p.Weight.ElementCount));
+        foreach (var (_, p, w, _, _) in _params)
+            _kernels.Axpby(_accum[p].View, _lastOutputs![_info.GradientOutputs[p]].Data, w.ElementCount, _accumCount == 0 ? 0f : 1f, 1f);
+        _accumCount++;
+        await _acc.SynchronizeAsync().ConfigureAwait(false);
+        return loss;
+    }
+
+    /// <summary>One AdamW step on the MEAN of the gradients accumulated by <see cref="AccumulateAsync"/>, then reset the sum.</summary>
+    public async Task ApplyAsync()
+    {
+        if (_accumCount == 0 || _accum == null) throw new InvalidOperationException("nothing accumulated");
+        _step++;
+        float inv = 1f / _accumCount;
+        foreach (var (_, p, w, m, v) in _params)
+        {
+            var g = _accum[p].View;
+            if (_accumCount > 1) _kernels.Scale(g, w.ElementCount, inv);   // in place (one binding: WebGPU rejects a buffer bound twice)
+            _kernels.AdamW(w.Data, g, m.View, v.View, w.ElementCount, _opt.LearningRate, _opt.Beta1, _opt.Beta2, _opt.Epsilon, _opt.WeightDecay, _step);
+        }
+        _accumCount = 0;
+        await _acc.SynchronizeAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -221,6 +264,7 @@ public sealed class GgufLoraTrainer : IDisposable
     public void Dispose()
     {
         foreach (var (_, _, _, m, v) in _params) { m.Dispose(); v.Dispose(); }
+        if (_accum != null) foreach (var a in _accum.Values) a.Dispose();
         _kernels.Dispose();
         _session.Dispose();
     }

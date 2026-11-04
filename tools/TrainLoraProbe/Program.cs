@@ -38,9 +38,9 @@ long vram0 = VramMiB();
 Console.WriteLine($"accelerator: {accelerator.Name} ({accelerator.AcceleratorType}); VRAM in use before load {vram0} MiB");
 
 var sw = Stopwatch.StartNew();
-var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank, LearningRate = 1e-3f, Seed = 7 };
+var options = new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank, LearningRate = 1e-3f, Seed = 7, CheckpointLayers = args.Contains("--checkpoint") };
 using var trainer = await GgufLoraTrainer.CreateFromFileAsync(accelerator, args[0], options);
-Console.WriteLine($"loaded + compiled in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters, rank {rank}; VRAM {VramMiB()} MiB");
+Console.WriteLine($"loaded + compiled in {sw.Elapsed.TotalSeconds:F1} s; {trainer.Adapters.Count} adapters, rank {rank}, checkpoint {options.CheckpointLayers}; VRAM {VramMiB()} MiB");
 
 // B nonzero (PEFT starts it at zero, which makes every A gradient exactly zero and the check vacuous for A).
 var rng = new Random(11);

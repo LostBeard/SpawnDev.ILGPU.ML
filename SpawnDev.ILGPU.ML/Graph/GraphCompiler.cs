@@ -1474,7 +1474,14 @@ public class GraphCompiler
             foreach (var dep in deps[node])
                 consumers[dep].Add(node);
 
-        var queue = new Queue<GraphNode>(nodes.Where(n => inDegree[n] == 0));
+        // STABLE: among the nodes that are ready, the one EARLIEST in the given list runs first, so a list that is already a valid order
+        // is kept exactly (ONNX files and GGUFGraphBuilder emit one). A FIFO queue scheduled every node as soon as its inputs existed instead -
+        // which is what a producer's order exists to prevent: the training graph's per-layer RECOMPUTE nodes (GraphAutograd checkpointing) depend
+        // only on the layer's input, so FIFO ran them in the forward pass and every recomputed activation stayed alive until the backward.
+        var position = new Dictionary<GraphNode, int>(ReferenceEqualityComparer.Instance);
+        for (int i = 0; i < nodes.Count; i++) position[nodes[i]] = i;
+        var queue = new PriorityQueue<GraphNode, int>();
+        foreach (var n in nodes) if (inDegree[n] == 0) queue.Enqueue(n, position[n]);
         var sorted = new List<GraphNode>();
         while (queue.Count > 0)
         {
@@ -1485,7 +1492,7 @@ public class GraphCompiler
             {
                 inDegree[consumer]--;
                 if (inDegree[consumer] == 0)
-                    queue.Enqueue(consumer);
+                    queue.Enqueue(consumer, position[consumer]);
             }
         }
 

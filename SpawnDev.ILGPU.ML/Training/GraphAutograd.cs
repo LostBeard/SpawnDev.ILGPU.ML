@@ -93,10 +93,44 @@ public static class GraphAutograd
     /// is not <paramref name="ignoreIndex"/> (labels are a new graph input <c>labels</c> [1, seq], already shifted by the caller so label t
     /// is the token that follows position t), and one gradient output per name in <paramref name="parameters"/> (graph initializers).
     /// </summary>
-    public static TrainingGraphInfo AddBackward(ModelGraph graph, string logits, int vocab, IReadOnlyCollection<string> parameters, int ignoreIndex = -100)
+    /// <param name="checkpointLayers">
+    /// Activation checkpointing per decoder layer: only each layer's INPUT is kept from the forward; just before a layer's backward its forward
+    /// is re-emitted (outputs renamed <c>.rc</c>) and the layer's rules read those. Memory is then ~one layer's activations plus the layer inputs
+    /// instead of every activation of every layer (llama3.1:8b at 2,048 tokens: ~20 GB -> ~1 GB of saved tensors) for one extra forward of
+    /// compute. Layers are the GGUF builder's (<c>blk.L_*</c> / <c>block_L_out</c>); nodes outside a layer (embedding, final norm, LM head) are kept.
+    /// Relies on the compiler keeping the given node order (GraphCompiler's stable topological sort).
+    /// </param>
+    public static TrainingGraphInfo AddBackward(ModelGraph graph, string logits, int vocab, IReadOnlyCollection<string> parameters, int ignoreIndex = -100,
+        bool checkpointLayers = false)
     {
         var b = new Builder(graph);
         var forward = graph.Nodes.ToList();
+        // layer of each forward node (-1 = outside every layer)
+        var layerOf = new Dictionary<GraphNode, int>(ReferenceEqualityComparer.Instance);
+        var layerRx = new System.Text.RegularExpressions.Regex(@"^(?:blk\.(\d+)_|block_(\d+)_out$)");
+        foreach (var n in forward)
+        {
+            int L = -1;
+            foreach (var o in n.Outputs)
+            {
+                var m = layerRx.Match(o);
+                if (m.Success) { L = int.Parse(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value); break; }
+            }
+            layerOf[n] = L;
+        }
+        int recomputed = -1;
+        void Recompute(int L)
+        {
+            // re-emit layer L's forward, outputs renamed; inputs produced inside the layer read the renamed copies
+            var inLayer = forward.Where(n => layerOf[n] == L).ToList();
+            var outs = new HashSet<string>(inLayer.SelectMany(n => n.Outputs));
+            string R(string v) => outs.Contains(v) ? v + ".rc" : v;
+            foreach (var n in inLayer)
+                graph.Nodes.Add(new GraphNode { OpType = n.OpType, Inputs = n.Inputs.Select(R).ToList(), Outputs = n.Outputs.Select(o => o + ".rc").ToList(),
+                    Attributes = n.Attributes, RawAttributes = n.RawAttributes });
+            b.Saved = R;
+            recomputed = L;
+        }
 
         // ── loss ──
         const string labels = "labels";
@@ -124,6 +158,13 @@ public static class GraphAutograd
             if (!n.Outputs.Any(o => b.HasGradient(o))) continue;
             bool Need(int k) => k < n.Inputs.Count && requires.Contains(n.Inputs[k]);
             if (!Enumerable.Range(0, n.Inputs.Count).Any(Need)) continue;
+            if (checkpointLayers)
+            {
+                int L = layerOf[n];
+                if (L < 0) b.Saved = v => v;
+                else if (L != recomputed) Recompute(L);
+            }
+            var S = b.Saved;   // a forward activation as the backward reads it (the recomputed copy inside a checkpointed layer)
             switch (n.OpType)
             {
                 case "Add":
@@ -152,7 +193,7 @@ public static class GraphAutograd
                     if (Need(1))
                     {
                         var dy2 = b.Emit("Reshape", new[] { dy }, dy + ".2d", ("shape", new long[] { -1, N }));
-                        var x2 = b.Emit("Reshape", new[] { x }, x + ".2d_for_" + w, ("shape", new long[] { -1, K }));
+                        var x2 = b.Emit("Reshape", new[] { S(x) }, x + ".2d_for_" + w, ("shape", new long[] { -1, K }));
                         b.Contribute(w, b.Emit("Gemm", new[] { x2, dy2 }, "grad_part." + w + "." + n.Outputs[0], ("transA", 1L)));
                     }
                     // dx = dy W^T through the weight in whatever form it was loaded (GGUF-quantized, low precision, f32).
@@ -161,11 +202,11 @@ public static class GraphAutograd
                     break;
                 }
                 case "Reshape":
-                    b.Contribute(n.Inputs[0], b.ReshapeLike(b.Gradient(n.Outputs[0]), n.Inputs[0]));
+                    b.Contribute(n.Inputs[0], b.ReshapeLike(b.Gradient(n.Outputs[0]), S(n.Inputs[0])));
                     break;
                 case "RMSNormalization":
                     if (Need(1)) throw new NotSupportedException("autograd: a trainable RMSNorm weight is not supported yet");
-                    b.Contribute(n.Inputs[0], b.Emit("RMSNormGrad", new[] { n.Inputs[0], n.Inputs[1], b.Gradient(n.Outputs[0]) },
+                    b.Contribute(n.Inputs[0], b.Emit("RMSNormGrad", new[] { S(n.Inputs[0]), n.Inputs[1], b.Gradient(n.Outputs[0]) },
                         n.Outputs[0] + ".grad_x", n.Attributes));
                     break;
                 case "AddRMSNorm":
@@ -176,7 +217,7 @@ public static class GraphAutograd
                     var parts = new List<string>();
                     if (b.HasGradient(res)) parts.Add(b.Gradient(res));
                     if (b.HasGradient(norm))
-                        parts.Add(b.Emit("RMSNormGrad", new[] { res, n.Inputs[2], b.Gradient(norm) }, norm + ".grad_res", n.Attributes));
+                        parts.Add(b.Emit("RMSNormGrad", new[] { S(res), n.Inputs[2], b.Gradient(norm) }, norm + ".grad_res", n.Attributes));
                     var dres = b.Sum(parts, res + ".grad_total");
                     if (Need(0)) b.Contribute(n.Inputs[0], dres);
                     if (Need(1)) b.Contribute(n.Inputs[1], dres);
@@ -184,7 +225,7 @@ public static class GraphAutograd
                 }
                 case "SwiGLU":
                 {
-                    var outs = b.EmitMulti("SwiGLUGrad", new[] { n.Inputs[0], n.Inputs[1], b.Gradient(n.Outputs[0]) },
+                    var outs = b.EmitMulti("SwiGLUGrad", new[] { S(n.Inputs[0]), S(n.Inputs[1]), b.Gradient(n.Outputs[0]) },
                         new[] { n.Outputs[0] + ".grad_g", n.Outputs[0] + ".grad_u" }, null);
                     if (Need(0)) b.Contribute(n.Inputs[0], outs[0]);
                     if (Need(1)) b.Contribute(n.Inputs[1], outs[1]);
@@ -201,7 +242,7 @@ public static class GraphAutograd
                 {
                     if (n.Inputs.Count > 3 && !string.IsNullOrEmpty(n.Inputs[3])) throw new NotSupportedException("autograd: attention sinks");
                     var outs = b.EmitMulti("FusedAttentionGrad",
-                        new[] { n.Inputs[0], n.Inputs[1], n.Inputs[2], n.Outputs[0], b.Gradient(n.Outputs[0]) },
+                        new[] { S(n.Inputs[0]), S(n.Inputs[1]), S(n.Inputs[2]), S(n.Outputs[0]), b.Gradient(n.Outputs[0]) },
                         new[] { n.Outputs[0] + ".grad_q", n.Outputs[0] + ".grad_k", n.Outputs[0] + ".grad_v" }, n.Attributes);
                     for (int k = 0; k < 3; k++) if (Need(k)) b.Contribute(n.Inputs[k], outs[k]);
                     break;
@@ -237,6 +278,9 @@ public static class GraphAutograd
         private readonly Dictionary<string, string> _summed = new();
         private readonly Dictionary<string, string> _shapes = new();
         private int _n;
+
+        /// <summary>Maps a forward activation to the name the backward reads (identity, or the recomputed copy in a checkpointed layer).</summary>
+        public Func<string, string> Saved { get; set; } = v => v;
 
         public bool HasGradient(string v) => _parts.ContainsKey(v);
 

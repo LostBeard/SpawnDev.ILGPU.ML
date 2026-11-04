@@ -59,7 +59,13 @@ public abstract partial class MLTestBase
     /// adapters after one AdamW step. Added 2026-11-04.
     /// </summary>
     [TestMethod(Timeout = 300000)]
-    public async Task Training_TinyLlama_LoraStepMatchesTorch() => await RunTest(async accelerator =>
+    public async Task Training_TinyLlama_LoraStepMatchesTorch() => await RunTest(accelerator => TinyLlamaLoraStepCheck(accelerator, checkpoint: false));
+
+    /// <summary>The M1 gate with per-layer activation checkpointing (LoraOptions.CheckpointLayers): the recomputed backward must equal torch exactly as the kept one does.</summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_TinyLlama_LoraStepMatchesTorch_Checkpointed() => await RunTest(accelerator => TinyLlamaLoraStepCheck(accelerator, checkpoint: true));
+
+    private async Task<string> TinyLlamaLoraStepCheck(Accelerator accelerator, bool checkpoint)
     {
         var (gguf, refDoc) = await LoadTinyLlamaTrainFixture();
         using var _ = refDoc;
@@ -79,6 +85,7 @@ public abstract partial class MLTestBase
             LearningRate = cfg.GetProperty("lr").GetSingle(), Beta1 = cfg.GetProperty("beta1").GetSingle(), Beta2 = cfg.GetProperty("beta2").GetSingle(),
             Epsilon = cfg.GetProperty("adam_eps").GetSingle(), WeightDecay = cfg.GetProperty("weight_decay").GetSingle(),
             Initial = initial,
+            CheckpointLayers = checkpoint,
         };
         using var trainer = SpawnDev.ILGPU.ML.Training.GgufLoraTrainer.Create(accelerator, gguf, options);
         if (trainer.Adapters.Count != lora.Count / 2) throw new Exception($"{trainer.Adapters.Count} adapters, expected {lora.Count / 2}");
@@ -101,7 +108,7 @@ public abstract partial class MLTestBase
         }
         notes.Add($"adapter grads max relative diff {worstGrad:E2} ({atGrad})");
         notes.Add($"after AdamW max |diff| {worstAfter:E2} ({atAfter})");
-        var line = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+        var line = $"{accelerator.AcceleratorType}{(checkpoint ? " checkpointed" : "")}: " + string.Join("; ", notes);
         Console.WriteLine("[Training] " + line);
         if (worstGrad > 1e-3) throw new Exception("adapter gradients differ from torch: " + line);
         // One AdamW step moves each element by ~lr (1e-2) in the gradient's sign direction; a sign error or a wrong bias correction is ~1e-2.
@@ -124,6 +131,50 @@ public abstract partial class MLTestBase
             if (lossReloaded != lossTrained) throw new Exception($"reloaded adapters give loss {lossReloaded}, the trained ones {lossTrained}");
             line += $"; saved {st.Length} B PEFT safetensors, reloaded loss {lossReloaded:F6} == trained";
         }
+        return line;
+    }
+
+    /// <summary>
+    /// Gradient accumulation (GgufLoraTrainer.AccumulateAsync / ApplyAsync): accumulating the same sequence twice and applying is one AdamW step on
+    /// the mean of two identical gradients, which is the gradient itself exactly (2g * 0.5 = g in float), so the adapters after it must equal
+    /// torch's single step, as StepAsync's do. Added 2026-11-04.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_TinyLlama_AccumulateTwiceEqualsOneStep() => await RunTest(async accelerator =>
+    {
+        var (gguf, refDoc) = await LoadTinyLlamaTrainFixture();
+        using var _ = refDoc;
+        var root = refDoc.RootElement;
+        var cfg = root.GetProperty("config");
+        var tokens = root.GetProperty("tokens").EnumerateArray().Select(t => t.GetInt32()).ToArray();
+        int lossFrom = root.GetProperty("loss_from").GetInt32();
+        var labels = tokens.Select((_, t) => t >= lossFrom && t < tokens.Length - 1 ? tokens[t + 1] : -100).ToArray();
+        var lora = root.GetProperty("lora").EnumerateObject().ToDictionary(p => p.Name, p => p.Value);
+        float[] Arr(JsonElement e, string key) => e.GetProperty(key).EnumerateArray().Select(v => v.GetSingle()).ToArray();
+        var options = new SpawnDev.ILGPU.ML.Training.LoraOptions
+        {
+            Targets = new[] { "attn_q", "attn_v" },
+            Rank = cfg.GetProperty("rank").GetInt32(), Alpha = cfg.GetProperty("alpha").GetSingle(),
+            LearningRate = cfg.GetProperty("lr").GetSingle(), Beta1 = cfg.GetProperty("beta1").GetSingle(), Beta2 = cfg.GetProperty("beta2").GetSingle(),
+            Epsilon = cfg.GetProperty("adam_eps").GetSingle(), WeightDecay = cfg.GetProperty("weight_decay").GetSingle(),
+            Initial = lora.ToDictionary(kv => kv.Key, kv => Arr(kv.Value, "value")),
+        };
+        using var trainer = SpawnDev.ILGPU.ML.Training.GgufLoraTrainer.Create(accelerator, gguf, options);
+        float l1 = await trainer.AccumulateAsync(tokens, labels);
+        float l2 = await trainer.AccumulateAsync(tokens, labels);
+        if (l1 != l2) throw new Exception($"the same sequence gave two losses before any update: {l1} vs {l2}");
+        if (trainer.AccumulatedSequences != 2) throw new Exception($"AccumulatedSequences {trainer.AccumulatedSequences}");
+        await trainer.ApplyAsync();
+        var after = await trainer.GetAdaptersAsync();
+        double worst = 0;
+        foreach (var (name, e) in lora)
+        {
+            var want = Arr(e, "after_adamw"); var got = after[name];
+            for (int i = 0; i < want.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - want[i]));
+        }
+        var line = $"{accelerator.AcceleratorType}: loss {l1:F6} x2, after accumulate+apply max |diff| vs torch's step {worst:E2}";
+        if (worst > 1e-4) throw new Exception("accumulated step differs from torch's single step: " + line);
+        if (trainer.Step != 1 || trainer.AccumulatedSequences != 0) throw new Exception($"Step {trainer.Step}, AccumulatedSequences {trainer.AccumulatedSequences} after ApplyAsync");
         return line;
     });
 }

@@ -333,6 +333,30 @@ public sealed class BackwardKernels : IDisposable
         dx[i] = acc;
     }
 
+    // ── y = a * y + b * x (gradient accumulation) ──
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _axpby;
+
+    /// <summary>y[i] = a * y[i] + b * x[i] for i &lt; n (a = 0 overwrites y).</summary>
+    public void Axpby(ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> x, int n, float a, float b)
+    {
+        _axpby ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(AxpbyImpl);
+        _axpby(n, y, x, a, b);
+    }
+
+    private static void AxpbyImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> x, float a, float b)
+        => y[i] = (a == 0f ? 0f : a * y[i]) + b * x[i];
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scale;
+
+    /// <summary>y[i] *= a for i &lt; n, in place.</summary>
+    public void Scale(ArrayView1D<float, Stride1D.Dense> y, int n, float a)
+    {
+        _scale ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float>(ScaleImpl);
+        _scale(n, y, a);
+    }
+
+    private static void ScaleImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> y, float a) => y[i] = y[i] * a;
+
     // ── AdamW (torch.optim.AdamW, decoupled weight decay) ──
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, AdamWStep>? _adamw;
