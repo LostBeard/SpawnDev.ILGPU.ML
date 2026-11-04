@@ -162,3 +162,13 @@ the strict scorer passes; honesty targets are the corrected sentence, not the li
 3. Gate in Vertex (Seven): load the adapter (`GgufGenerator.CreateAsync(lora: LoraAdapterSet.Load(...))`, AI's SetAdapterAsync), run
    ToolChoiceTests strict x5 on the names-only prompt (>= 93/100) and measure TTFT / prefill; honesty set vs the base.
 4. Decode speed: adapters cost two small dispatches per adapted projection per step; measure tok/s with and without on the 2060.
+
+## Open: Wasm MoveNet regression from the stable topological order (2026-11-04 sweep, 7481/2)
+
+`CreateFromFile_MoveNet_Inference` and `Pipeline_MoveNet_DetectsKeypoints` fail on the Wasm lane only:
+`[GE node-192 sync] Arg_NullReferenceException` - an error from a QUEUED Wasm kernel surfacing at the drain after the
+zero-copy Unsqueeze view at node 192. tools/DumpCompiledOrder: under the stable order `Cast(concat) -> GatherNd_3__439`
+(190) is followed directly by its consumer `GatherND(Transpose__510, GatherNd_3__439)` (191) and the view chain; under FIFO
+several nodes (and view drains) sat between them. GatherND reads its indices on the device (no host read). Next: the Wasm
+lane with GraphExecutor.PerOpSync and GraphCompiler.StableTopologicalOrder = false/true A/B, to name the kernel that faults.
+Held until Geordi's AubsCraft suite ends (a Wasm lane slowed his Paper servers 418 s before). Blocks local.10.
