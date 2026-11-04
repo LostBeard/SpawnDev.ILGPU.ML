@@ -46,9 +46,12 @@ public sealed class GgufLoraTrainer : IDisposable
     /// <summary>AdamW steps taken.</summary>
     public int Step => _step;
 
-    private GgufLoraTrainer(Accelerator acc, InferenceSession session, LoraOptions opt, List<LoraAdapter> adapters, TrainingGraphInfo info)
+    /// <summary>The model's vocabulary size (the logits' last dimension): token ids and labels must lie in [0, VocabSize).</summary>
+    public int VocabSize { get; }
+
+    private GgufLoraTrainer(Accelerator acc, InferenceSession session, LoraOptions opt, List<LoraAdapter> adapters, TrainingGraphInfo info, int vocab)
     {
-        _acc = acc; _session = session; _opt = opt; _info = info; Adapters = adapters;
+        _acc = acc; _session = session; _opt = opt; _info = info; Adapters = adapters; VocabSize = vocab;
         _kernels = new BackwardKernels(acc);
         _session.OutputsLiveUntilNextRun = true;   // the gradient outputs are read by AdamW after RunAsync returns
         foreach (var a in adapters)
@@ -67,13 +70,15 @@ public sealed class GgufLoraTrainer : IDisposable
     {
         List<LoraAdapter>? adapters = null;
         TrainingGraphInfo? info = null;
+        int vocab = 0;
         var session = InferenceSession.CreateFromGGUF(accelerator, gguf, null, false, (graph, weights) =>
         {
             adapters = GraphAutograd.AddLora(graph, weights, options.Targets, options.Rank, options.Alpha, options.Initial, options.Seed);
             var logits = graph.Outputs.FirstOrDefault(o => o.Name == "logits") ?? throw new InvalidOperationException("the graph has no 'logits' output");
+            vocab = logits.Shape[^1];
             info = GraphAutograd.AddBackward(graph, "logits", logits.Shape[^1], adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex);
         });
-        return new GgufLoraTrainer(accelerator, session, options, adapters!, info!);
+        return new GgufLoraTrainer(accelerator, session, options, adapters!, info!, vocab);
     }
 
     /// <summary>
@@ -83,6 +88,14 @@ public sealed class GgufLoraTrainer : IDisposable
     public async Task<float> StepAsync(int[] inputIds, int[] labels, bool update = true)
     {
         if (inputIds.Length != labels.Length) throw new ArgumentException("one label per input position");
+        // Out-of-range ids read past the embedding table and out-of-range labels past a logits row: the GPU would return garbage, not fail.
+        for (int t = 0; t < inputIds.Length; t++)
+        {
+            if ((uint)inputIds[t] >= (uint)VocabSize) throw new ArgumentOutOfRangeException(nameof(inputIds), $"token {inputIds[t]} at position {t} is outside the vocabulary [0, {VocabSize})");
+            if (labels[t] != _opt.IgnoreIndex && (uint)labels[t] >= (uint)VocabSize)
+                throw new ArgumentOutOfRangeException(nameof(labels), $"label {labels[t]} at position {t} is outside the vocabulary [0, {VocabSize}) and is not IgnoreIndex");
+        }
+        if (!labels.Any(l => l != _opt.IgnoreIndex)) throw new ArgumentException("every label is IgnoreIndex: the loss would be 0/0");
         using var ids = _acc.Allocate1D(inputIds.Select(i => (float)i).ToArray());
         using var lab = _acc.Allocate1D(labels.Select(i => (float)i).ToArray());
         var outs = await _session.RunAsync(new Dictionary<string, Tensor>
@@ -130,6 +143,28 @@ public sealed class GgufLoraTrainer : IDisposable
             r[$"{a.PeftName}.lora_B.weight"] = Transpose(bT, a.Rank, a.Out);
         }
         return r;
+    }
+
+    /// <summary>
+    /// Overwrite the adapters with <paramref name="adapters"/> (PEFT layout and names, as <see cref="GetAdaptersAsync"/> returns them); names not
+    /// given keep their values. The AdamW moments are not reset.
+    /// </summary>
+    public async Task SetAdaptersAsync(IReadOnlyDictionary<string, float[]> adapters)
+    {
+        foreach (var a in Adapters)
+        {
+            if (adapters.TryGetValue($"{a.PeftName}.lora_A.weight", out var A))
+            {
+                if (A.Length != a.Rank * a.In) throw new ArgumentException($"{a.PeftName}.lora_A.weight: {A.Length} values, expected {a.Rank * a.In}");
+                _session.TryGetWeight(a.AName)!.Data.SubView(0, A.Length).CopyFromCPU(Transpose(A, a.Rank, a.In));
+            }
+            if (adapters.TryGetValue($"{a.PeftName}.lora_B.weight", out var B))
+            {
+                if (B.Length != a.Out * a.Rank) throw new ArgumentException($"{a.PeftName}.lora_B.weight: {B.Length} values, expected {a.Out * a.Rank}");
+                _session.TryGetWeight(a.BName)!.Data.SubView(0, B.Length).CopyFromCPU(Transpose(B, a.Out, a.Rank));
+            }
+        }
+        await _acc.SynchronizeAsync();
     }
 
     /// <summary>

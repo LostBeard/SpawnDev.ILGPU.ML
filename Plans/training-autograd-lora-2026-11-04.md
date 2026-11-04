@@ -113,3 +113,14 @@ tiny-llama-train-ref.json (loss, LoRA grads, one AdamW step).
 3. Only if both are empty: a harder tool-choice set (instinct hint off, several runs).
 Data: format 2 lines carry the engine's exact rendered_prompt / rendered_target (Data's PassObserver, SpawnDev.AI.Server
 1.4.1-local.1); the target excludes the end-of-turn token, which training appends so the adapter learns to stop.
+
+### Gate settled (2026-11-04)
+
+TJ (via Seven): "Family chat out of training for now. Both in one adapter." Seven's reference measurements on the 2060
+(`_DevComms/2026-11-04-1059-Seven-TO-Tuvok-reference-measurements.md`, scorer Vertex 630672c `Vertex.Tests/ToolChoiceScoring.cs`):
+strict tool choice, 5 runs: full prompt 93/100, names-only prompt (descriptions + schemas emptied) 59/100. Decode barely
+moves (24.4 -> 26.7 tok/s), but turn time-to-first-token 1,175 -> 682 ms median (-42%) and cold prefill 4,238 -> 2,055 ms
+(-52%). So the M4 gate: ONE adapter (synthetic tool-choice + real honesty turns) that (1) scores >= 93/100 strict on the
+names-only prompt with TTFT/prefill down, and (2) beats the base on the held-out honesty set. Data (Seven): ~30 synthetic
+requests per tool + ~15% no-tool lines, 20% synthetic dev split, targets DISTILLED from base + full prompt and kept only when
+the strict scorer passes; honesty targets are the corrected sentence, not the live one.
