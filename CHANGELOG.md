@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.79 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.78 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -45,10 +45,15 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
   - **SwiGLU in the gate | up GEMM** (GateUpSwiGLUDown, `GraphAutograd.FuseSwiGLUDown`, `FusedDequantMatMul.ForwardGateUpSwiGLUDown`):
     in the checkpointed forward, where nothing else reads gate / up / SwiGLU, gate and up are dequantized row-interleaved so the GEMM epilogue
     (`MmaGemm.KernelF16PackedV6SwiGLU`) writes silu(g) u as the down GEMM's packed f16 input. Bit-identical (tested bitwise; red-checked).
-  - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, off until measured on a Turing card; `GGUF_GEMM_SM75_V5=1`): 64 x 64 warp
+  - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, default on; `GGUF_GEMM_SM75_V5=0` = PackedV2): 64 x 64 warp
     tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2; with it on, Turing also runs the sibling-projection
     groups and the gate | up SwiGLU epilogue (`KernelF16Sm75PackedV5Split` / `SwiGLU`). Through the Turing path on an RTX 4070: training
-    step 2.18 -> 2.02 s, identical loss trajectory.
+    step 2.18 -> 2.02 s, identical loss trajectory. RTX 2060 (Seven): 5,804 -> 5,564 ms per 1,600-token step, identical loss and
+    gradients (10.45 s at 39d5fc8b).
+  - **Scratch memory**: buffers a growth replaces are freed after every training step (`InferenceSession.ReleaseRetiredScratch`; they were
+    held until the session was disposed), and the training scratch grows to the need plus an eighth instead of the next power of two.
+  - `TrainLoraProbe --labeled N` (only the last N positions labelled, like a chat answer) and A/B switches `--no-group --no-fused-lora
+    --no-sums --no-scratch`. 2,560 tokens with a 200-token answer: 2.65 s per step on an RTX 4070.
   - **Scratch-operand K-quant GEMM** (`FusedDequantMatMul.EnableMmaScratch`, M >= 512, f16 weight <= 256 MiB): the weight is dequantized once
     to f16 with the GEMM's own decode helpers (bit-identical words), then the 16-bit V4 GEMM.
   - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing

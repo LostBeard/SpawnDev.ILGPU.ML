@@ -2959,11 +2959,18 @@ public class InferenceSession : IDisposable
 
     public long ReleaseWorkingMemory()
     {
-        long freed = _executor.ReleaseWorkingMemory();
+        long freed = ReleaseRetiredScratch();
+        freed += _executor.ReleaseWorkingMemory();
         foreach (var exec in _shapeExecutors.Values) freed += exec.ReleaseWorkingMemory();
         freed += _pool.ReleaseFreeBuffers();
         return freed;
     }
+
+    /// <summary>
+    /// Free the kernels' replaced scratch buffers (FusedDequantMatMul, BackwardKernels): kept alive after a growth in case a queued launch still
+    /// read them. Call only when every launch issued so far has finished (after a synchronizing readback). Returns the bytes freed.
+    /// </summary>
+    public long ReleaseRetiredScratch() => _registry.FusedDequant.ReleaseRetired() + _registry.Backward.ReleaseRetired();
 
     /// <summary>Bytes every executor's pool currently holds in its free buckets; what
     /// <see cref="ReleaseWorkingMemory"/> would free.</summary>

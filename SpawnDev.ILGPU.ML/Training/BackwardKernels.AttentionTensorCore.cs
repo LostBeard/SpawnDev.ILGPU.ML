@@ -53,9 +53,7 @@ public sealed partial class BackwardKernels
         if (b == null || b.Length < n)
         {
             if (b != null) retired.Add(b);
-            long cap = 1;
-            while (cap < n) cap <<= 1;
-            b = acc.Allocate1D<ushort>(cap);
+            b = acc.Allocate1D<ushort>(GrowCapacity(n));
         }
         return b;
     }

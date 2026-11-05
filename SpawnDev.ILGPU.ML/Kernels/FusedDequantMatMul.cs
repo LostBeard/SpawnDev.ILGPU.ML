@@ -167,17 +167,19 @@ public class FusedDequantMatMul : IDisposable
     public static bool EnableMmaV5 = Environment.GetEnvironmentVariable("GGUF_GEMM_V5") != "0";
 
     /// <summary>
-    /// Turing (sm_75): the 16-bit GEMMs run MmaGemm.KernelF16Sm75PackedV5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering) instead
-    /// of PackedV2. Bit-identical (same m16n8k8 MMAs per output, same K order). Off until measured on a Turing card (on an RTX 4070 through the
-    /// Turing path: 41.7 -> 43.0, 47.9 -> 47.6, 39.1 -> 42.5 TFLOPS). GGUF_GEMM_SM75_V5=1 turns it on.
-    /// </summary>
-    /// <summary>
     /// sm_80+ with <see cref="EnableMmaV5"/>: the V6 kernels (V5 with three cp.async stages and XOR-swizzled 64-byte rows, 48 KB shared).
-    /// Bit-identical. MEASURED 2026-11-05 (RTX 4070): +1.5 - 4%% over V5 (f16 q / o 45.2 -> 46.9, down 52.3 -> 53.9 TFLOPS). GGUF_GEMM_V6=0 = V5.
+    /// Bit-identical. MEASURED 2026-11-05 (RTX 4070): +1.5 - 4% over V5 (f16 q / o 45.2 -> 46.9, down 52.3 -> 53.9 TFLOPS). GGUF_GEMM_V6=0 = V5.
     /// </summary>
     public static bool EnableMmaV6 = Environment.GetEnvironmentVariable("GGUF_GEMM_V6") != "0";
 
-    public static bool EnableMmaSm75V5 = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V5") == "1";
+    /// <summary>
+    /// Turing (sm_75): the 16-bit GEMMs run MmaGemm.KernelF16Sm75PackedV5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering) instead
+    /// of PackedV2, and with it the Turing sibling groups and SwiGLU epilogue. Bit-identical (same m16n8k8 MMAs per output, same K order).
+    /// MEASURED 2026-11-05 on an RTX 2060 (Seven, llama3.1:8b LoRA step at 1,600 tokens): 5,804 -> 5,564 ms, identical loss and gradients.
+    /// GGUF_GEMM_SM75_V5=0 = PackedV2.
+    /// </summary>
+    public static bool EnableMmaSm75V5 = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V5") != "0";
+
     /// <summary>The row count from which <see cref="EnableMmaScratch"/> applies.</summary>
     public static int MmaScratchMinRows = 512;
     /// <summary>
@@ -3013,10 +3015,27 @@ public class FusedDequantMatMul : IDisposable
         return sign == 1 ? -result : result;
     }
 
+    /// <summary>
+    /// Free the scratch buffers a growth replaced (kept until now because a queued launch could still read them). Call only when the device
+    /// has finished every launch issued so far (after a synchronizing readback). Returns the bytes freed.
+    /// </summary>
+    public long ReleaseRetired()
+    {
+        long bytes = 0;
+        foreach (var r in _scratchRetired)
+        {
+            if (r is MemoryBuffer mb) bytes += mb.LengthInBytes;
+            r.Dispose();
+        }
+        _scratchRetired.Clear();
+        return bytes;
+    }
+
     public void Dispose()
     {
         _scratchA16?.Dispose(); _scratchA16 = null;
         _scratchW16?.Dispose(); _scratchW16 = null;
+        _scratchS16?.Dispose(); _scratchS16 = null;
         _scratchOnes?.Dispose(); _scratchOnes = null;
         foreach (var r in _scratchRetired) r.Dispose();
         _scratchRetired.Clear();

@@ -472,6 +472,23 @@ public sealed partial class BackwardKernels
         outp[i] = s * scale;
     }
 
+    /// <summary>
+    /// Free the scratch buffers a growth replaced (the attention, LoRA and transposed-weight scratch), kept until now because a queued launch could
+    /// still read them. Call only when the device has finished every launch issued so far. Returns the bytes freed. Added 2026-11-05: they were
+    /// freed only at Dispose, so every growth during a session left its predecessor allocated.
+    /// </summary>
+    public long ReleaseRetired()
+    {
+        long bytes = 0;
+        foreach (var b in _gRetired) { bytes += b.LengthInBytes; b.Dispose(); }
+        _gRetired.Clear();
+        foreach (var b in _tRetired16) { bytes += b.LengthInBytes; b.Dispose(); }
+        _tRetired16.Clear();
+        foreach (var b in _retiredWt) { bytes += b.LengthInBytes; b.Dispose(); }
+        _retiredWt.Clear();
+        return bytes;
+    }
+
     private void DisposeLora()
     {
         _lrPart?.Dispose(); _lrDxa?.Dispose(); _lrNone?.Dispose(); _lrAR?.Dispose();

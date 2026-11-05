@@ -22,6 +22,10 @@ if (args.Contains("--no-tc")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseTens
 if (args.Contains("--no-gemm-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseGemmAttentionBackward = false;   // the blocked attention backward (A/B)
 if (args.Contains("--no-tc-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseTensorCoreAttentionBackward = false;   // the fp32 GEMM attention backward (A/B)
 if (args.Contains("--no-flash-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseFlashAttentionBackward = false;   // the materialised tensor-core attention backward (A/B)
+if (args.Contains("--no-group")) SpawnDev.ILGPU.ML.Training.GraphAutograd.GroupSiblingProjections = false;   // separate q / k / v, gate / up MatMuls (A/B)
+if (args.Contains("--no-fused-lora")) SpawnDev.ILGPU.ML.Training.GraphAutograd.FusedLora = false;   // the four-op LoRA form (A/B)
+if (args.Contains("--no-sums")) SpawnDev.ILGPU.ML.Training.GraphAutograd.FuseGradientSums = false;   // Add nodes for gradient sums (A/B)
+if (args.Contains("--no-scratch")) SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableMmaScratch = false;   // the in-kernel-dequant K-quant GEMMs (A/B)
 
 static long VramMiB()
 {
@@ -54,7 +58,9 @@ foreach (var k in start.Keys.Where(k => k.EndsWith("lora_B.weight")).ToList())
 await trainer.SetAdaptersAsync(start);
 
 var ids = Enumerable.Range(0, seq).Select(_ => rng.Next(100, trainer.VocabSize - 100)).ToArray();
-var labels = ids.Select((_, t) => t >= seq / 2 && t < seq - 1 ? ids[t + 1] : -100).ToArray();
+// --labeled N: only the last N positions carry labels (a chat line's answer); default the second half of the sequence
+int labeledN = int.Parse(Arg("--labeled", (seq / 2).ToString()));
+var labels = ids.Select((_, t) => t >= seq - 1 - labeledN && t < seq - 1 ? ids[t + 1] : -100).ToArray();
 
 if (args.Contains("--profile"))
 {

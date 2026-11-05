@@ -206,6 +206,8 @@ public sealed class GgufLoraTrainer : IDisposable
         var outs = await _session.RunAsync(inputs);
         _lastOutputs = outs;
         float loss = (await outs[_info.LossOutput].Data.SubView(0, 1).CopyToHostAsync())[0];
+        // the loss readback waited for the whole pass: scratch the kernels replaced while growing (first steps, longer sequences) can go now
+        _session.ReleaseRetiredScratch();
         if (update)
         {
             _step++;

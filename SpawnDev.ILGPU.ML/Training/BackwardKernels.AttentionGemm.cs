@@ -49,16 +49,18 @@ public sealed partial class BackwardKernels
         public int Hc;
     }
 
+    // n plus an eighth, in 4 KiB steps: sequences of varying length re-grow a buffer a few times, not once per new maximum. MEASURED 2026-11-05:
+    // the earlier next-power-of-two allocated up to twice the need (the 2,560-token gate / up dy pack: 134 MB for 73), and on a 12 GB card a
+    // 2,560-token llama3.1:8b step ran out of memory headroom. The trainer frees replaced buffers after every step (ReleaseRetired).
+    internal static long GrowCapacity(long n) => (n + n / 8 + 1023) / 1024 * 1024;
+
     private static MemoryBuffer1D<float, Stride1D.Dense> Grow(Accelerator acc, ref MemoryBuffer1D<float, Stride1D.Dense>? b, long n,
         List<MemoryBuffer1D<float, Stride1D.Dense>> retired)
     {
         if (b == null || b.Length < n)
         {
             if (b != null) retired.Add(b);   // a queued launch may still read it
-            // the next power of two: sequences of varying length re-grow a buffer a few times, not once per new maximum
-            long cap = 1;
-            while (cap < n) cap <<= 1;
-            b = acc.Allocate1D<float>(cap);
+            b = acc.Allocate1D<float>(GrowCapacity(n));
         }
         return b;
     }
