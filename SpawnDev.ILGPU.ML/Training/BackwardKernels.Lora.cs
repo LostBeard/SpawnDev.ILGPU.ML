@@ -20,8 +20,8 @@ public sealed partial class BackwardKernels
 
     private MemoryBuffer1D<float, Stride1D.Dense>? _lrPart, _lrDxa, _lrNone, _lrAR;
     private Action<Index1D, FV, FV, int, int>? _lrTrans;
-    private Action<KernelConfig, F4V, F4V, FV, int, int, int, int>? _lrRowDot;
-    private Action<KernelConfig, FV, FV, FV, int, int, int, int>? _lrColDot;
+    private Action<KernelConfig, F4V, F4V, FV, int, int, int, int>? _lrRowDot, _lrRowDot16;
+    private Action<KernelConfig, FV, FV, FV, int, int, int, int>? _lrColDot, _lrColDot16;
     private Action<Index1D, F4V, F4V, F4V, F4V, int, int, int, int, float>? _lrCombine;
     private Action<Index1D, FV, FV, int, int, float, int, int, int>? _lrReduce;
     private Action<Index1D, FV, FV, FV, int, int, int, float>? _lrRowDotNaive;
@@ -40,6 +40,8 @@ public sealed partial class BackwardKernels
         if (LoraShared)
         {
             _lrRowDot ??= _acc.LoadStreamKernel<F4V, F4V, FV, int, int, int, int>(LoraRowDotImpl);
+            _lrRowDot16 ??= _acc.LoadStreamKernel<F4V, F4V, FV, int, int, int, int>(LoraRowDot16Impl);
+            _lrColDot16 ??= _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int>(LoraColDot16Impl);
             _lrColDot ??= _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int>(LoraColDotImpl);
             _lrReduce ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float, int, int, int>(LoraReduceImpl);
         }
@@ -74,7 +76,7 @@ public sealed partial class BackwardKernels
         if (!LoraShared || K % 4 != 0) { _lrRowDotNaive!(M * R, P, Q, outp, K, R, 1, scale); return; }
         int slices = (K + LrSlice - 1) / LrSlice;
         var part = Grow(_acc, ref _lrPart, (long)slices * M * R, _gRetired);
-        _lrRowDot!(new KernelConfig(((M + LrRows - 1) / LrRows) * slices, 256), Vec4(P, (long)M * K), Vec4(Q, (long)R * K), part.View, M, K, R, slices);
+        (R % 16 == 0 ? _lrRowDot16! : _lrRowDot!)(new KernelConfig(((M + LrRows - 1) / LrRows) * slices, 256), Vec4(P, (long)M * K), Vec4(Q, (long)R * K), part.View, M, K, R, slices);
         _lrReduce!(M * R, part.View, outp, M * R, slices, scale, 0, R, 1);
     }
 
@@ -98,7 +100,7 @@ public sealed partial class BackwardKernels
         if (!LoraShared) { _lrColDotNaive!(R * N, P, Q, outp, M, N, R, transpose, scale); return; }
         int slices = (M + LcSlice - 1) / LcSlice;
         var part = Grow(_acc, ref _lrPart, (long)slices * R * N, _gRetired);
-        _lrColDot!(new KernelConfig(((N + LcCols - 1) / LcCols) * slices, LcCols), P, Q, part.View, M, N, R, slices);
+        (R % 16 == 0 ? _lrColDot16! : _lrColDot!)(new KernelConfig(((N + LcCols - 1) / LcCols) * slices, LcCols), P, Q, part.View, M, N, R, slices);
         _lrReduce!(R * N, part.View, outp, R * N, slices, scale, transpose, R, N);
     }
 
@@ -214,6 +216,109 @@ public sealed partial class BackwardKernels
                 long o = ((long)sl * R + rc) * N + n;
                 part[o] = a0; part[o + N] = a1; part[o + 2 * (long)N] = a2; part[o + 3 * (long)N] = a3;
                 part[o + 4 * (long)N] = a4; part[o + 5 * (long)N] = a5; part[o + 6 * (long)N] = a6; part[o + 7 * (long)N] = a7;
+            }
+            Group.Barrier();
+        }
+    }
+
+    // LoraRowDotImpl with 16 rank columns per pass (R % 16 == 0): the row's P values are read once for rank 16 instead of twice. Each
+    // accumulator sums the same products in the same order as the 8-column form: bit-identical. The k-lane reduction runs in two halves
+    // through the same 8 KB of shared memory.
+    private static void LoraRowDot16Impl(F4V P, F4V Q, FV part, int M, int K, int R, int slices)
+    {
+        var sh = SharedMemory.Allocate<float>(LrRows * 64);
+        int gi = Grid.IdxX, rb = gi / slices, sl = gi - rb * slices;
+        int tid = Group.IdxX, row = tid >> 3, kl = tid & 7;
+        int m = rb * LrRows + row;
+        int K4 = K >> 2;
+        int k0 = sl * (LrSlice / 4), k1 = Math.Min(K4, k0 + LrSlice / 4);
+        long pb = (long)m * K4;
+        for (int rc = 0; rc < R; rc += 16)
+        {
+            float a0 = 0f; float a1 = 0f; float a2 = 0f; float a3 = 0f; float a4 = 0f; float a5 = 0f; float a6 = 0f; float a7 = 0f; float a8 = 0f; float a9 = 0f; float a10 = 0f; float a11 = 0f; float a12 = 0f; float a13 = 0f; float a14 = 0f; float a15 = 0f;
+            if (m < M)
+            {
+                long q0 = (long)rc * K4;
+                for (int k = k0 + kl; k < k1; k += 8)
+                {
+                    var p = P[pb + k];
+                    long qb = q0 + k;
+                    var q = Q[qb]; a0 += p.X * q.X; a0 += p.Y * q.Y; a0 += p.Z * q.Z; a0 += p.W * q.W;
+                    q = Q[qb + K4]; a1 += p.X * q.X; a1 += p.Y * q.Y; a1 += p.Z * q.Z; a1 += p.W * q.W;
+                    q = Q[qb + 2 * (long)K4]; a2 += p.X * q.X; a2 += p.Y * q.Y; a2 += p.Z * q.Z; a2 += p.W * q.W;
+                    q = Q[qb + 3 * (long)K4]; a3 += p.X * q.X; a3 += p.Y * q.Y; a3 += p.Z * q.Z; a3 += p.W * q.W;
+                    q = Q[qb + 4 * (long)K4]; a4 += p.X * q.X; a4 += p.Y * q.Y; a4 += p.Z * q.Z; a4 += p.W * q.W;
+                    q = Q[qb + 5 * (long)K4]; a5 += p.X * q.X; a5 += p.Y * q.Y; a5 += p.Z * q.Z; a5 += p.W * q.W;
+                    q = Q[qb + 6 * (long)K4]; a6 += p.X * q.X; a6 += p.Y * q.Y; a6 += p.Z * q.Z; a6 += p.W * q.W;
+                    q = Q[qb + 7 * (long)K4]; a7 += p.X * q.X; a7 += p.Y * q.Y; a7 += p.Z * q.Z; a7 += p.W * q.W;
+                    q = Q[qb + 8 * (long)K4]; a8 += p.X * q.X; a8 += p.Y * q.Y; a8 += p.Z * q.Z; a8 += p.W * q.W;
+                    q = Q[qb + 9 * (long)K4]; a9 += p.X * q.X; a9 += p.Y * q.Y; a9 += p.Z * q.Z; a9 += p.W * q.W;
+                    q = Q[qb + 10 * (long)K4]; a10 += p.X * q.X; a10 += p.Y * q.Y; a10 += p.Z * q.Z; a10 += p.W * q.W;
+                    q = Q[qb + 11 * (long)K4]; a11 += p.X * q.X; a11 += p.Y * q.Y; a11 += p.Z * q.Z; a11 += p.W * q.W;
+                    q = Q[qb + 12 * (long)K4]; a12 += p.X * q.X; a12 += p.Y * q.Y; a12 += p.Z * q.Z; a12 += p.W * q.W;
+                    q = Q[qb + 13 * (long)K4]; a13 += p.X * q.X; a13 += p.Y * q.Y; a13 += p.Z * q.Z; a13 += p.W * q.W;
+                    q = Q[qb + 14 * (long)K4]; a14 += p.X * q.X; a14 += p.Y * q.Y; a14 += p.Z * q.Z; a14 += p.W * q.W;
+                    q = Q[qb + 15 * (long)K4]; a15 += p.X * q.X; a15 += p.Y * q.Y; a15 += p.Z * q.Z; a15 += p.W * q.W;
+                }
+            }
+            {
+                int b = row * 64 + kl;
+                sh[b + 0] = a0; sh[b + 8] = a1; sh[b + 16] = a2; sh[b + 24] = a3; sh[b + 32] = a4; sh[b + 40] = a5; sh[b + 48] = a6; sh[b + 56] = a7;
+                Group.Barrier();
+                int rb8 = row * 64 + kl * 8;
+                float s = sh[rb8] + sh[rb8 + 1] + sh[rb8 + 2] + sh[rb8 + 3] + sh[rb8 + 4] + sh[rb8 + 5] + sh[rb8 + 6] + sh[rb8 + 7];
+                if (m < M) part[((long)sl * M + m) * R + rc + 0 + kl] = s;
+                Group.Barrier();
+            }
+            {
+                int b = row * 64 + kl;
+                sh[b + 0] = a8; sh[b + 8] = a9; sh[b + 16] = a10; sh[b + 24] = a11; sh[b + 32] = a12; sh[b + 40] = a13; sh[b + 48] = a14; sh[b + 56] = a15;
+                Group.Barrier();
+                int rb8 = row * 64 + kl * 8;
+                float s = sh[rb8] + sh[rb8 + 1] + sh[rb8 + 2] + sh[rb8 + 3] + sh[rb8 + 4] + sh[rb8 + 5] + sh[rb8 + 6] + sh[rb8 + 7];
+                if (m < M) part[((long)sl * M + m) * R + rc + 8 + kl] = s;
+                Group.Barrier();
+            }
+        }
+    }
+
+    // LoraColDotImpl with 16 rank columns per pass (R % 16 == 0): the column's Q values are read once for rank 16. Bit-identical.
+    private static void LoraColDot16Impl(FV P, FV Q, FV part, int M, int N, int R, int slices)
+    {
+        var ps = SharedMemory.Allocate<float>(LcSlice * 16);
+        int gi = Grid.IdxX, cb = gi / slices, sl = gi - cb * slices;
+        int tid = Group.IdxX, n = cb * LcCols + tid;
+        int m0 = sl * LcSlice, rows = Math.Min(M, m0 + LcSlice) - m0;
+        for (int rc = 0; rc < R; rc += 16)
+        {
+            for (int e = tid; e < LcSlice * 16; e += LcCols)
+            {
+                int mm = e >> 4, j = e & 15;
+                ps[e] = mm < rows ? P[(long)(m0 + mm) * R + rc + j] : 0f;
+            }
+            Group.Barrier();
+            float a0 = 0f; float a1 = 0f; float a2 = 0f; float a3 = 0f; float a4 = 0f; float a5 = 0f; float a6 = 0f; float a7 = 0f; float a8 = 0f; float a9 = 0f; float a10 = 0f; float a11 = 0f; float a12 = 0f; float a13 = 0f; float a14 = 0f; float a15 = 0f;
+            if (n < N)
+            {
+                int mm = 0;
+                long qr = (long)m0 * N + n;
+                for (; mm + 4 <= rows; mm += 4, qr += 4 * (long)N)
+                {
+                    float qa = Q[qr], qb = Q[qr + N], qc = Q[qr + 2 * (long)N], qd = Q[qr + 3 * (long)N];
+                    int pb = mm * 16;
+                    a0 += ps[pb + 0] * qa; a1 += ps[pb + 1] * qa; a2 += ps[pb + 2] * qa; a3 += ps[pb + 3] * qa; a4 += ps[pb + 4] * qa; a5 += ps[pb + 5] * qa; a6 += ps[pb + 6] * qa; a7 += ps[pb + 7] * qa; a8 += ps[pb + 8] * qa; a9 += ps[pb + 9] * qa; a10 += ps[pb + 10] * qa; a11 += ps[pb + 11] * qa; a12 += ps[pb + 12] * qa; a13 += ps[pb + 13] * qa; a14 += ps[pb + 14] * qa; a15 += ps[pb + 15] * qa;
+                    a0 += ps[pb + 16] * qb; a1 += ps[pb + 17] * qb; a2 += ps[pb + 18] * qb; a3 += ps[pb + 19] * qb; a4 += ps[pb + 20] * qb; a5 += ps[pb + 21] * qb; a6 += ps[pb + 22] * qb; a7 += ps[pb + 23] * qb; a8 += ps[pb + 24] * qb; a9 += ps[pb + 25] * qb; a10 += ps[pb + 26] * qb; a11 += ps[pb + 27] * qb; a12 += ps[pb + 28] * qb; a13 += ps[pb + 29] * qb; a14 += ps[pb + 30] * qb; a15 += ps[pb + 31] * qb;
+                    a0 += ps[pb + 32] * qc; a1 += ps[pb + 33] * qc; a2 += ps[pb + 34] * qc; a3 += ps[pb + 35] * qc; a4 += ps[pb + 36] * qc; a5 += ps[pb + 37] * qc; a6 += ps[pb + 38] * qc; a7 += ps[pb + 39] * qc; a8 += ps[pb + 40] * qc; a9 += ps[pb + 41] * qc; a10 += ps[pb + 42] * qc; a11 += ps[pb + 43] * qc; a12 += ps[pb + 44] * qc; a13 += ps[pb + 45] * qc; a14 += ps[pb + 46] * qc; a15 += ps[pb + 47] * qc;
+                    a0 += ps[pb + 48] * qd; a1 += ps[pb + 49] * qd; a2 += ps[pb + 50] * qd; a3 += ps[pb + 51] * qd; a4 += ps[pb + 52] * qd; a5 += ps[pb + 53] * qd; a6 += ps[pb + 54] * qd; a7 += ps[pb + 55] * qd; a8 += ps[pb + 56] * qd; a9 += ps[pb + 57] * qd; a10 += ps[pb + 58] * qd; a11 += ps[pb + 59] * qd; a12 += ps[pb + 60] * qd; a13 += ps[pb + 61] * qd; a14 += ps[pb + 62] * qd; a15 += ps[pb + 63] * qd;
+                }
+                for (; mm < rows; mm++, qr += N)
+                {
+                    float q = Q[qr];
+                    int pb = mm * 16;
+                    a0 += ps[pb + 0] * q; a1 += ps[pb + 1] * q; a2 += ps[pb + 2] * q; a3 += ps[pb + 3] * q; a4 += ps[pb + 4] * q; a5 += ps[pb + 5] * q; a6 += ps[pb + 6] * q; a7 += ps[pb + 7] * q; a8 += ps[pb + 8] * q; a9 += ps[pb + 9] * q; a10 += ps[pb + 10] * q; a11 += ps[pb + 11] * q; a12 += ps[pb + 12] * q; a13 += ps[pb + 13] * q; a14 += ps[pb + 14] * q; a15 += ps[pb + 15] * q;
+                }
+                long o = ((long)sl * R + rc) * N + n;
+                part[o + 0 * (long)N] = a0; part[o + 1 * (long)N] = a1; part[o + 2 * (long)N] = a2; part[o + 3 * (long)N] = a3; part[o + 4 * (long)N] = a4; part[o + 5 * (long)N] = a5; part[o + 6 * (long)N] = a6; part[o + 7 * (long)N] = a7; part[o + 8 * (long)N] = a8; part[o + 9 * (long)N] = a9; part[o + 10 * (long)N] = a10; part[o + 11 * (long)N] = a11; part[o + 12 * (long)N] = a12; part[o + 13 * (long)N] = a13; part[o + 14 * (long)N] = a14; part[o + 15 * (long)N] = a15;
             }
             Group.Barrier();
         }
