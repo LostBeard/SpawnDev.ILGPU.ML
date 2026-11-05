@@ -391,7 +391,8 @@ public sealed partial class BackwardKernels : IDisposable
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBias;
     private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;
     private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>? _dequantTBf16;
-    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>? _dequantT64;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<Kernels.FusedDequantMatMul.W16, Stride1D.Dense>,
+        ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>? _dequantT64;
     private MemoryBuffer1D<int, Stride1D.Dense>? _absMax;
     private MemoryBuffer1D<float, Stride1D.Dense>? _qtScale;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>>? _zeroInt;
@@ -416,9 +417,11 @@ public sealed partial class BackwardKernels : IDisposable
         _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>(DequantTransposeBf16Impl);
         if (UseDequantTranspose64 && (code == 4 || code == 5) && K % 64 == 0 && N % 2 == 0)
         {
-            _dequantT64 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>(DequantTranspose64Impl);
+            _dequantT64 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<Kernels.FusedDequantMatMul.W16, Stride1D.Dense>,
+                ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>(DequantTranspose64Impl);
             int tiles64 = K / 64;
-            _dequantT64(new KernelConfig(((N + 63) / 64) * tiles64, 256), weightQuant.Cast<byte, int>(), _wtBf16.View.SubView(0, need).Cast<ushort, uint>(),
+            var wq16 = weightQuant.SubView(0, weightQuant.Length & ~15L).Cast<byte, Kernels.FusedDequantMatMul.W16>();   // Q4_K rows are 16-byte multiples
+            _dequantT64(new KernelConfig(((N + 63) / 64) * tiles64, 256), weightQuant.Cast<byte, int>(), wq16, _wtBf16.View.SubView(0, need).Cast<ushort, uint>(),
                 K, N, code, rowBytes, tiles64, turing ? 1 : 0);
         }
         else
@@ -561,27 +564,103 @@ public sealed partial class BackwardKernels : IDisposable
         sc[1] = Interop.IntAsFloat((uint)((127 - e) << 23));    // 2^-e
     }
 
+    // 16 bytes from a 2-byte aligned offset of an int view, as four little-endian words
+    private static void Read16(ArrayView1D<int, Stride1D.Dense> w, int off, out uint a, out uint b, out uint c, out uint d)
+    {
+        int wi = off >> 2;
+        uint w0 = (uint)w[wi], w1 = (uint)w[wi + 1], w2 = (uint)w[wi + 2], w3 = (uint)w[wi + 3];
+        if ((off & 3) == 0) { a = w0; b = w1; c = w2; d = w3; }
+        else
+        {
+            uint w4 = (uint)w[wi + 4];
+            a = (w0 >> 16) | (w1 << 16); b = (w1 >> 16) | (w2 << 16); c = (w2 >> 16) | (w3 << 16); d = (w3 >> 16) | (w4 << 16);
+        }
+    }
+
     // Q4_K / Q6_K, 64 (rows n) x 64 (values k) tiles: thread (nn = tid / 4, q = tid % 4) decodes 16 consecutive values of row n0 + nn (four Run4
     // decodes, bit-identical to the per-element decode), stages them in shared memory, then each thread writes 8 words of two 16-bit values
     // (columns n, n + 1 of an output row k): a warp stores 128 contiguous bytes. MEASURED 2026-11-05 (RTX 4070): the 32 x 32 kernel with 2-byte
     // stores ran at ~230 GB/s (666 us for a 4096 x 14336 weight). grid = ceil(N / 64) * (K / 64); N even, K % 64 == 0.
-    private static void DequantTranspose64Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<uint, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK, int half)
+    private static void DequantTranspose64Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<Kernels.FusedDequantMatMul.W16, Stride1D.Dense> w16,
+        ArrayView1D<uint, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK, int half)
     {
         var sh = SharedMemory.Allocate<float>(64 * 65);
         int t = Grid.IdxX, tid = Group.IdxX;
         int n0 = (t / tilesK) * 64, k0 = (t % tilesK) * 64;
         int nn = tid >> 2, kq = (tid & 3) * 16, n = n0 + nn;
-        for (int r = 0; r < 4; r++)
+        if (code == 4)
         {
-            float d0 = 0f, d1 = 0f, d2 = 0f, d3 = 0f;
-            int k = k0 + kq + 4 * r;
+            // Q4_K: the thread's 16 values are one half of a 32-value sub-block: the header and the sub-block's scale / min once, the 16 nibble
+            // bytes as one 16-byte load (rows and blocks are 16-byte multiples). Same arithmetic as DecodeQ4KRun4: v = (d sc) q - dmin m.
+            // MEASURED 2026-11-05: four Run4 decodes per thread re-read the header and scales each time (~32 loads per thread), ~230 GB/s.
+            int col = k0 + kq;
+            int b = nn * 65 + kq;
             if (n < N)
             {
-                if (code == 4) Kernels.FusedDequantMatMul.DecodeQ4KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
-                else Kernels.FusedDequantMatMul.DecodeQ6KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
+                int sbOff = n * rowBytes + (col >> 8) * 144;
+                int rr = col & 255;
+                int tt = rr >> 6, c = rr & 63, l = c & 31, hi = (c >> 5) & 1;
+                int hdr = w[sbOff >> 2];
+                float d = Kernels.FusedDequantMatMul.HalfToFloatFinite(hdr & 0xFFFF);
+                float dmin = Kernels.FusedDequantMatMul.HalfToFloatFinite((hdr >> 16) & 0xFFFF);
+                int scOff = sbOff + 4;
+                int j = 2 * tt + hi;
+                int lowBit = ((j - 4) >> 31) & 1;
+                int hiBit = 1 - lowBit;
+                int bj = Kernels.FusedDequantMatMul.ReadByte(w, scOff + j);
+                int bj4 = Kernels.FusedDequantMatMul.ReadByte(w, scOff + j + 4);
+                int bjAlt = Kernels.FusedDequantMatMul.ReadByte(w, scOff + j - 4 * hiBit);
+                int sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+                int mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+                float ds = d * sc, dm = dmin * mn;
+                var q = w16[(sbOff + 16 + 32 * tt + l) >> 4];
+                int s4 = 4 * hi;
+                sh[b] = ds * ((q.a >> s4) & 0xF) - dm; sh[b + 1] = ds * ((q.a >> (8 + s4)) & 0xF) - dm;
+                sh[b + 2] = ds * ((q.a >> (16 + s4)) & 0xF) - dm; sh[b + 3] = ds * ((q.a >> (24 + s4)) & 0xF) - dm;
+                sh[b + 4] = ds * ((q.b >> s4) & 0xF) - dm; sh[b + 5] = ds * ((q.b >> (8 + s4)) & 0xF) - dm;
+                sh[b + 6] = ds * ((q.b >> (16 + s4)) & 0xF) - dm; sh[b + 7] = ds * ((q.b >> (24 + s4)) & 0xF) - dm;
+                sh[b + 8] = ds * ((q.c >> s4) & 0xF) - dm; sh[b + 9] = ds * ((q.c >> (8 + s4)) & 0xF) - dm;
+                sh[b + 10] = ds * ((q.c >> (16 + s4)) & 0xF) - dm; sh[b + 11] = ds * ((q.c >> (24 + s4)) & 0xF) - dm;
+                sh[b + 12] = ds * ((q.d >> s4) & 0xF) - dm; sh[b + 13] = ds * ((q.d >> (8 + s4)) & 0xF) - dm;
+                sh[b + 14] = ds * ((q.d >> (16 + s4)) & 0xF) - dm; sh[b + 15] = ds * ((q.d >> (24 + s4)) & 0xF) - dm;
             }
-            int b = nn * 65 + kq + 4 * r;
-            sh[b] = d0; sh[b + 1] = d1; sh[b + 2] = d2; sh[b + 3] = d3;
+            else for (int i = 0; i < 16; i++) sh[b + i] = 0f;
+        }
+        else
+        {
+            // Q6_K: the thread's 16 values share one scale; their 16 ql and 16 qh bytes are read as two 16-byte runs (blocks are 210 bytes, so a run
+            // starts on a 2-byte boundary: four or five 32-bit loads, funnel-shifted). Same arithmetic as DecodeQ6KRun4: ds ((ql | qh << 4) - 32).
+            int col = k0 + kq;
+            int b = nn * 65 + kq;
+            if (n < N)
+            {
+                int sbOff = n * rowBytes + (col >> 8) * 210;
+                int rr = col & 255;
+                int hf = rr >> 7, rh = rr & 127, variant = rh >> 5, l = rh & 31;
+                int isHigh = variant >> 1, qsh = 2 * variant;
+                int sc = Kernels.FusedDequantMatMul.SignExtend8(Kernels.FusedDequantMatMul.ReadByte(w, sbOff + 192 + 8 * hf + (l >> 4) + 2 * variant));
+                float d = Kernels.FusedDequantMatMul.HalfToFloatFinite(Kernels.FusedDequantMatMul.ReadByte(w, sbOff + 208) | (Kernels.FusedDequantMatMul.ReadByte(w, sbOff + 209) << 8));
+                float ds = d * sc;
+                Read16(w, sbOff + 64 * hf + l + (variant & 1) * 32, out uint qa, out uint qb, out uint qc, out uint qd);
+                Read16(w, sbOff + 128 + 32 * hf + l, out uint ha, out uint hb, out uint hc, out uint hd);
+                { int ql = (int)((qa >> 0) & 0xFFu), qh = (int)((ha >> 0) & 0xFFu); sh[b + 0] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qa >> 8) & 0xFFu), qh = (int)((ha >> 8) & 0xFFu); sh[b + 1] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qa >> 16) & 0xFFu), qh = (int)((ha >> 16) & 0xFFu); sh[b + 2] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qa >> 24) & 0xFFu), qh = (int)((ha >> 24) & 0xFFu); sh[b + 3] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qb >> 0) & 0xFFu), qh = (int)((hb >> 0) & 0xFFu); sh[b + 4] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qb >> 8) & 0xFFu), qh = (int)((hb >> 8) & 0xFFu); sh[b + 5] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qb >> 16) & 0xFFu), qh = (int)((hb >> 16) & 0xFFu); sh[b + 6] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qb >> 24) & 0xFFu), qh = (int)((hb >> 24) & 0xFFu); sh[b + 7] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qc >> 0) & 0xFFu), qh = (int)((hc >> 0) & 0xFFu); sh[b + 8] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qc >> 8) & 0xFFu), qh = (int)((hc >> 8) & 0xFFu); sh[b + 9] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qc >> 16) & 0xFFu), qh = (int)((hc >> 16) & 0xFFu); sh[b + 10] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qc >> 24) & 0xFFu), qh = (int)((hc >> 24) & 0xFFu); sh[b + 11] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qd >> 0) & 0xFFu), qh = (int)((hd >> 0) & 0xFFu); sh[b + 12] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qd >> 8) & 0xFFu), qh = (int)((hd >> 8) & 0xFFu); sh[b + 13] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qd >> 16) & 0xFFu), qh = (int)((hd >> 16) & 0xFFu); sh[b + 14] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+                { int ql = (int)((qd >> 24) & 0xFFu), qh = (int)((hd >> 24) & 0xFFu); sh[b + 15] = ds * (((isHigh == 1 ? ql >> 4 : ql & 0xF) | (((qh >> qsh) & 3) << 4)) - 32); }
+            }
+            else for (int i = 0; i < 16; i++) sh[b + i] = 0f;
         }
         Group.Barrier();
         int cp = tid & 31;
