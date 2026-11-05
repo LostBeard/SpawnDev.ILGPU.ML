@@ -134,8 +134,8 @@ public class FusedDequantMatMul : IDisposable
     public static bool EnableMmaGemm = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA") != "0";
     /// <summary>The kernel family <see cref="Forward"/> last took for M &gt; 1 ("mma-q4k", "mma-q4k-sm75", "mma-q6k", "mma-q6k-sm75" or "simt"): tests check the route they mean to cover.</summary>
     public string LastGemmKernel { get; private set; } = "";
-    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ4K, _mmaQ4KSm75, _mmaQ4KV2, _mmaQ4KSm75V2;
-    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ6K, _mmaQ6KSm75, _mmaQ6KV2, _mmaQ6KSm75V2;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ4K, _mmaQ4KSm75, _mmaQ4KV2, _mmaQ4KSm75V2, _mmaQ4KV3, _mmaQ4KSm75V3;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaQ6K, _mmaQ6KSm75, _mmaQ6KV2, _mmaQ6KSm75V2, _mmaQ6KV3, _mmaQ6KSm75V3;
     /// <summary>Tests: the Turing (sm_75, m16n8k8) variant of the tensor-core GEMM on an sm_80+ card too (its instructions run there), so it is gated where no Turing card is.</summary>
     public static bool ForceSm75Mma = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_SM75") == "1";
     /// <summary>
@@ -143,6 +143,13 @@ public class FusedDequantMatMul : IDisposable
     /// runs the V1 kernels (the A/B). Same arithmetic: the operands are rounded and accumulated identically, only the staging differs.
     /// </summary>
     public static bool EnableMmaV2 = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_V2") != "0";
+    /// <summary>
+    /// The V3 tensor-core K-quant GEMMs (MmaKQuantGemm.*V3: 256 x 128 tiles, so each weight tile is decoded once per 256 rows; V2's 64-bit
+    /// fragment loads, single-buffered). Taken over V2 when on and M is large enough to fill 256-row tiles. GGUF_GEMM_MMA_V3=0 = V2.
+    /// </summary>
+    public static bool EnableMmaV3 = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_V3") != "0";
+    /// <summary>The row count from which <see cref="EnableMmaV3"/> applies.</summary>
+    public static int MmaV3MinRows = 512;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _fastQ4_K;
     private const int FgBm = 128, FgBn = 128, FgBk = 32, FgThreads = 256, FgPer = 8;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
@@ -372,11 +379,15 @@ public class FusedDequantMatMul : IDisposable
             && ((type == GGMLType.Q4_K && (wByte & 15) == 0) || (type == GGMLType.Q6_K && (wByte & 1) == 0)))
         {
             bool turing = !sm80 || ForceSm75Mma;
-            var cfg = new KernelConfig(((M + MmaKQuantGemm.BM - 1) / MmaKQuantGemm.BM) * ((N + MmaKQuantGemm.BN - 1) / MmaKQuantGemm.BN), MmaKQuantGemm.Threads);
+            bool v3 = EnableMmaV3 && M >= MmaV3MinRows;
+            var cfg = new KernelConfig(((M + (v3 ? 256 : MmaKQuantGemm.BM) - 1) / (v3 ? 256 : MmaKQuantGemm.BM)) * ((N + MmaKQuantGemm.BN - 1) / MmaKQuantGemm.BN), MmaKQuantGemm.Threads);
             var a4 = input.SubView(0, (long)M * K).BaseView.Cast<Vec4LoadMatMul.F4>();
             if (type == GGMLType.Q4_K)
             {
-                var kernel = (turing, EnableMmaV2) switch
+                var kernel = v3
+                    ? (turing ? _mmaQ4KSm75V3 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q4KSm75V3)
+                              : _mmaQ4KV3 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q4KV3))
+                    : (turing, EnableMmaV2) switch
                 {
                     (true, false) => _mmaQ4KSm75 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q4KSm75),
                     (false, false) => _mmaQ4K ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q4K),
@@ -384,11 +395,14 @@ public class FusedDequantMatMul : IDisposable
                     _ => _mmaQ4KV2 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q4KV2),
                 };
                 kernel(cfg, a4, weightQuant.BaseView.Cast<W16>(), output, M, K, N);
-                LastGemmKernel = (turing ? "mma-q4k-sm75" : "mma-q4k") + (EnableMmaV2 ? "-v2" : "");
+                LastGemmKernel = (turing ? "mma-q4k-sm75" : "mma-q4k") + (v3 ? "-v3" : EnableMmaV2 ? "-v2" : "");
             }
             else
             {
-                var kernel = (turing, EnableMmaV2) switch
+                var kernel = v3
+                    ? (turing ? _mmaQ6KSm75V3 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q6KSm75V3)
+                              : _mmaQ6KV3 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q6KV3))
+                    : (turing, EnableMmaV2) switch
                 {
                     (true, false) => _mmaQ6KSm75 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q6KSm75),
                     (false, false) => _mmaQ6K ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q6K),
@@ -396,7 +410,7 @@ public class FusedDequantMatMul : IDisposable
                     _ => _mmaQ6KV2 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaKQuantGemm.Q6KV2),
                 };
                 kernel(cfg, a4, weightQuant.BaseView.Cast<ushort>(), output, M, K, N);
-                LastGemmKernel = (turing ? "mma-q6k-sm75" : "mma-q6k") + (EnableMmaV2 ? "-v2" : "");
+                LastGemmKernel = (turing ? "mma-q6k-sm75" : "mma-q6k") + (v3 ? "-v3" : EnableMmaV2 ? "-v2" : "");
             }
             return;
         }

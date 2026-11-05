@@ -21,7 +21,9 @@ public abstract partial class MLTestBase
     {
         if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core GEMMs run on CUDA sm_75+");
         var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
-        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2;
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2, v3Saved = FusedDequantMatMul.EnableMmaV3;
+        int v3MinSaved = FusedDequantMatMul.MmaV3MinRows;
+        FusedDequantMatMul.MmaV3MinRows = 1;   // every shape on V3 too
         using var fused = new FusedDequantMatMul(accelerator);
         var notes = new List<string>();
         try
@@ -72,22 +74,25 @@ public abstract partial class MLTestBase
             using var weightBuf = AllocatePadded(accelerator, weightBytes);
             using var inputBuf = accelerator.Allocate1D(input);
             using var outBuf = accelerator.Allocate1D<float>((long)M * N);
-            // aligned: the tensor-core kernel, V1 then V2 (double-buffered, 64-bit fragment loads: the same rounding and MMA order, so bit-identical)
+            // aligned: the tensor-core kernel, V1, V2 (double-buffered, 64-bit fragment loads) and V3 (256-row tiles): the same rounding and MMA
+            // order per output, so V2 and V3 must be bit-identical to V1
             float[] got = Array.Empty<float>(); string route = "";
-            foreach (bool v2 in new[] { false, true })
+            foreach (var (v2, v3, sfx) in new[] { (false, false, ""), (true, false, "-v2"), (true, true, "-v3") })
             {
                 FusedDequantMatMul.EnableMmaV2 = v2;
+                FusedDequantMatMul.EnableMmaV3 = v3;
                 fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
                 string r = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
                 var g = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
-                if (r != want + (v2 ? "-v2" : "")) throw new Exception($"{type} M={M} K={K} N={N}: an aligned GEMM ran on '{r}', not {want}{(v2 ? "-v2" : "")}");
-                if (v2)
+                if (r != want + sfx) throw new Exception($"{type} M={M} K={K} N={N}: an aligned GEMM ran on '{r}', not {want}{sfx}");
+                if (sfx != "")
                 {
                     int diff = 0; for (int i = 0; i < g.Length; i++) if (BitConverter.SingleToInt32Bits(g[i]) != BitConverter.SingleToInt32Bits(got[i])) diff++;
-                    if (diff > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: V2 differs from V1 in {diff} of {g.Length} outputs");
+                    if (diff > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}{sfx}: differs from V1 in {diff} of {g.Length} outputs");
                 }
-                got = g; route = r;
+                else got = g;
+                route = r;
             }
             int bad = Bad(got, Oracle(0), out float worst);
             if (bad > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: {bad} of {got.Length} outputs past 2e-3 x sum|a w| (worst {worst:F2}x the bound)");
@@ -102,7 +107,11 @@ public abstract partial class MLTestBase
             notes.Add($"{type} M={M} K={K} N={N}: {route} worst {worst:F3}x the bound, {route2} {worst2:F3}x");
         }
         }
-        finally { FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; }
+        finally
+        {
+            FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved;
+            FusedDequantMatMul.MmaV3MinRows = v3MinSaved;
+        }
         return string.Join("; ", notes);
     });
 }
