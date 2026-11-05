@@ -2,6 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- `Dinov2EmbeddingPipeline.Dim` is set at load from the compiled output shape (it read 0 until the first embed; Riker). The gate asserts it.
+
 ## 5.8.2-local.11 - 2026-11-04 (local feed) - DINOv2 image embeddings; ONNX Resize scales fix; faster LoRA at inference
 
 - **LoRA q|k|v and gate|up in one launch** (`LoraRuntime.FuseAdjacent`, default on; `ApplyAdjacent`): the batch decoder's fused q|k|v and

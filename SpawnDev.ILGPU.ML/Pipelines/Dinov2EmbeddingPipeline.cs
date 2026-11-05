@@ -57,7 +57,7 @@ public sealed class Dinov2EmbeddingPipeline : IDisposable
 
     /// <summary>Model input side (224 by default).</summary>
     public int InputSize { get; }
-    /// <summary>Hidden width of the loaded checkpoint (read from its output on the first embed; 0 before).</summary>
+    /// <summary>Hidden width of the loaded checkpoint (384 small, 768 base), from the compiled graph's output shape; the pooled descriptor has 2 x Dim values.</summary>
     public int Dim { get; private set; }
 
     /// <summary>Wrap a session already loaded with input shape [1, 3, <paramref name="inputSize"/>, <paramref name="inputSize"/>].</summary>
@@ -67,6 +67,8 @@ public sealed class Dinov2EmbeddingPipeline : IDisposable
         _acc = accelerator; _session = session; _ownsSession = ownsSession; InputSize = inputSize;
         _pixels = accelerator.Allocate1D<float>(3L * inputSize * inputSize);
         _pooled = accelerator.Allocate1D<float>(2 * 1536);   // up to ViT-L width x 2
+        // known at load (Riker 2026-11-04: Dim read 0 until the first embed)
+        if (session.OutputShapes.TryGetValue(session.OutputNames[0], out var os) && os.Length > 0 && os[^1] > 0) Dim = os[^1];
     }
 
     /// <summary>Load <see cref="ModelFile"/> of <paramref name="repoId"/> from a model source (the models host / OPFS in the browser).</summary>

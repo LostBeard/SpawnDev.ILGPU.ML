@@ -29,6 +29,8 @@ public abstract partial class MLTestBase
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using var dino = await Dinov2EmbeddingPipeline.CreateFromHubAsync(accelerator, new SpawnDev.ILGPU.ML.Hub.HttpClientModelSource(modelHttp), repo);
         var notes = new List<string> { $"{accelerator.AcceleratorType} dinov2-{tag}: load {sw.Elapsed.TotalSeconds:F1} s" };
+        int wantDim = tag == "small" ? 384 : 768;
+        if (dino.Dim != wantDim) throw new Exception($"Dim after load is {dino.Dim}, expected {wantDim} (it must be known before the first embed)");
 
         static float[] Floats(byte[] b) { var f = new float[b.Length / 4]; Buffer.BlockCopy(b, 0, f, 0, b.Length); return f; }
         static double Cos(float[] a, float[] b) { double s = 0; for (int i = 0; i < a.Length; i++) s += (double)a[i] * b[i]; return s; }
