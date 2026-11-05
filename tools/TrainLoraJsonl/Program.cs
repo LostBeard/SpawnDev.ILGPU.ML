@@ -7,7 +7,11 @@
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
 //        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch] [--no-dev-loss]
-//        [--progress 10] (a progress line every N AdamW steps)
+//        [--progress 10] (a progress line every N AdamW steps) [--exclude-source synthetic-v2-hinted[,more]] [--eval-max-new 160]
+// --dry-run: print the data summary and exit (no model load).
+// --exclude-source: TRAIN lines whose `source` matches are left out (the A/B for teacher-hinted lines; dev lines are never dropped).
+// Dev lines without target ids but with `expected_tool` (Seven's v2 `target_usable: false`) are kept for tool choice only; they take
+// no part in exact match or dev loss and generate up to --eval-max-new tokens. Scores are reported per data file and per expected tool.
 // --eval-only: skip training; evaluate the adapters already in --out. Every run writes <out>/generation_eval.jsonl: per dev line the
 // prompt, the target and the generated ids of the base model and of the adapters (a fixture for SpawnDev.AI's adapter test).
 using System.Diagnostics;
@@ -30,12 +34,12 @@ var targets = Arg("--targets", "attn_q,attn_k,attn_v,attn_output").Split(',');
 Directory.CreateDirectory(outDir);
 
 // ── data ──
-var train = new List<(string Id, int[] Ids, int[] Labels)>();
-var dev = new List<(string Id, int[] Ids, int[] Labels)>();
-int skippedNoIds = 0, skippedLong = 0, lines = 0;
-// Vertex lines carry `expected_tool` (null = the answer calls no tool): scored as tool choice besides exact ids
-var expectedTool = new Dictionary<string, string?>();
-bool hasToolField = false;
+var train = new List<Line>();
+var dev = new List<Line>();
+int skippedNoIds = 0, skippedLong = 0, skippedSource = 0, lines = 0;
+var excludeSources = new HashSet<string>(Arg("--exclude-source", "").Split(',', StringSplitOptions.RemoveEmptyEntries));
+int evalMaxNew = int.Parse(Arg("--eval-max-new", "160"));
+var trainSources = new Dictionary<string, int>();
 foreach (var path in args[1].Split(','))
     foreach (var line in File.ReadLines(path))
     {
@@ -44,22 +48,35 @@ foreach (var path in args[1].Split(','))
         using var doc = JsonDocument.Parse(line);
         var r = doc.RootElement;
         int[]? Ids(string key) => r.TryGetProperty(key, out var e) && e.ValueKind == JsonValueKind.Array ? e.EnumerateArray().Select(v => v.GetInt32()).ToArray() : null;
+        string? Str(string key) => r.TryGetProperty(key, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
         var p = Ids("prompt_ids"); var t = Ids("target_ids");
-        if (p == null || t == null || p.Length == 0 || t.Length == 0) { skippedNoIds++; continue; }
+        string split = Str("split") ?? "train";
+        string id = r.TryGetProperty("id", out var ide) ? ide.ToString() : lines.ToString();
+        // Vertex lines carry `expected_tool` (null = the answer calls no tool): scored as tool choice besides exact ids
+        bool hasTool = r.TryGetProperty("expected_tool", out var et);
+        string? tool = hasTool && et.ValueKind == JsonValueKind.String ? et.GetString() : null;
+        string source = Str("source") ?? "";
+        string group = Path.GetFileNameWithoutExtension(path);
+        bool hasTarget = t is { Length: > 0 };
+        // a dev line without a target still scores tool choice when it says which tool is expected
+        if (p == null || p.Length == 0 || (!hasTarget && !(split != "train" && hasTool))) { skippedNoIds++; continue; }
         int eot = eotArg >= 0 ? eotArg : (Ids("end_of_turn_ids") is { Length: > 0 } e0 ? e0[0] : throw new InvalidOperationException("no --eot and the line has no end_of_turn_ids"));
+        if (split == "train" && excludeSources.Contains(source)) { skippedSource++; continue; }
         // input = prompt + target; label at position i = the token after it; the prompt predicts nothing (-100) except its last position,
         // which predicts the first target token; the last target position predicts the end of turn.
-        var ids = p.Concat(t).ToArray();
+        var ids = hasTarget ? p.Concat(t!).ToArray() : p;
         if (ids.Length > maxLen) { skippedLong++; continue; }
         var labels = new int[ids.Length];
-        for (int i = 0; i < ids.Length; i++) labels[i] = i < p.Length - 1 ? -100 : i < ids.Length - 1 ? ids[i + 1] : eot;
-        string split = r.TryGetProperty("split", out var s) ? s.GetString() ?? "train" : "train";
-        string id = r.TryGetProperty("id", out var ide) ? ide.ToString() : lines.ToString();
-        if (r.TryGetProperty("expected_tool", out var et)) { hasToolField = true; expectedTool[id] = et.ValueKind == JsonValueKind.String ? et.GetString() : null; }
-        (split == "train" ? train : dev).Add((id, ids, labels));
+        for (int i = 0; i < ids.Length; i++) labels[i] = !hasTarget || i < p.Length - 1 ? -100 : i < ids.Length - 1 ? ids[i + 1] : eot;
+        var item = new Line(id, ids, labels, p.Length, eot, hasTarget, group, source, hasTool, tool);
+        if (split == "train") { train.Add(item); trainSources[group + "/" + source] = trainSources.GetValueOrDefault(group + "/" + source) + 1; }
+        else dev.Add(item);
     }
-Console.WriteLine($"{lines} lines: {train.Count} train, {dev.Count} dev; skipped {skippedNoIds} without ids, {skippedLong} longer than {maxLen}");
+Console.WriteLine($"{lines} lines: {train.Count} train, {dev.Count} dev ({dev.Count(d => !d.HasTarget)} of them tool choice only); skipped {skippedNoIds} without ids, "
+    + $"{skippedLong} longer than {maxLen}, {skippedSource} train lines of an excluded source");
+Console.WriteLine("  train by file/source: " + string.Join(", ", trainSources.OrderBy(k => k.Key).Select(k => $"{k.Key} {k.Value}")));
 if (train.Count == 0) { Console.WriteLine("nothing to train on"); return 1; }
+if (args.Contains("--dry-run")) return 0;   // the data summary only: no model, no GPU
 
 // ── model ──
 using var context = MLContext.Create().ToContext();
@@ -82,8 +99,9 @@ async Task<double> DevLossAsync()
 {
     if (dev.Count == 0 || noDevLoss) return double.NaN;
     double sum = 0;
-    foreach (var (_, ids, labels) in dev) sum += await trainer.StepAsync(ids, labels, update: false);
-    return sum / dev.Count;
+    int n = 0;
+    foreach (var d in dev.Where(d => d.HasTarget)) { sum += await trainer.StepAsync(d.Ids, d.Labels, update: false); n++; }
+    return n == 0 ? double.NaN : sum / n;
 }
 
 double best = await DevLossAsync();
@@ -135,40 +153,66 @@ if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors
         "batch" => SpawnDev.ILGPU.ML.Pipelines.GgufEngine.BatchDecoder,
         _ => SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Auto,
     };
-    var perLine = dev.Select(_ => new Dictionary<string, int[]>()).ToList();
+    var perLine = dev.Select(_ => new Dictionary<string, object>()).ToList();
     var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { Strategy = "greedy" };
     foreach (bool withLora in new[] { false, true })
     {
         // a generator per pass, the adapters given at load (GgufGenerator.CreateAsync(lora:)): the path that works on either engine
         await using var fs = new FileStream(args[0], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
-        using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + 64, 8192), engine: engine,
+        using var gen = await SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.CreateAsync(accelerator, fs, Math.Min(maxLen + evalMaxNew + 64, 8192), engine: engine,
             lora: withLora ? set : null);
-        int exact = 0, toolOk = 0;
+        string tag = withLora ? "adapter" : "base";
+        // per group (data file): exact over lines with a target, tool choice over lines with expected_tool; per expected tool likewise
+        var byGroup = new SortedDictionary<string, int[]>();   // exact, of, toolOk, toolOf
+        var byTool = new SortedDictionary<string, int[]>();    // toolOk, toolOf
         for (int di = 0; di < dev.Count; di++)
         {
-            var (id, ids, labels) = dev[di];
-            int p = Array.FindIndex(labels, l => l != -100) + 1;              // prompt length
-            var target = ids[p..];
-            int eot = labels[^1];
-            cfg.MaxNewTokens = target.Length + 4;
-            var res = await gen.GenerateAsync(ids[..p], cfg, stopTokenIds: new[] { eot });
-            perLine[di][withLora ? "adapter_ids" : "base_ids"] = res.GeneratedTokenIds;
-            if (hasToolField && expectedTool.TryGetValue(id, out var want))
-                toolOk += want != null ? (res.Text.Contains($"\"name\": \"{want}\"") ? 1 : 0) : (res.Text.Contains("<tool_call>") ? 0 : 1);
-            if (res.GeneratedTokenIds.SequenceEqual(target) && res.Stop is SpawnDev.ILGPU.ML.Pipelines.StopReason.StopToken or SpawnDev.ILGPU.ML.Pipelines.StopReason.Eos) exact++;
+            var d = dev[di];
+            var target = d.Ids[d.PromptLen..];
+            cfg.MaxNewTokens = d.HasTarget ? target.Length + 4 : evalMaxNew;
+            var res = await gen.GenerateAsync(d.Ids[..d.PromptLen], cfg, stopTokenIds: new[] { d.Eot });
+            var g = byGroup.TryGetValue(d.Group, out var gv) ? gv : byGroup[d.Group] = new int[4];
+            bool isExact = d.HasTarget && res.GeneratedTokenIds.SequenceEqual(target)
+                && res.Stop is SpawnDev.ILGPU.ML.Pipelines.StopReason.StopToken or SpawnDev.ILGPU.ML.Pipelines.StopReason.Eos;
+            if (d.HasTarget) { g[1]++; if (isExact) g[0]++; }
+            bool? toolOk = null;
+            if (d.HasTool)
+            {
+                toolOk = d.Tool != null ? res.Text.Contains($"\"name\": \"{d.Tool}\"") : !res.Text.Contains("<tool_call>");
+                g[3]++; if (toolOk == true) g[2]++;
+                var tk = d.Tool ?? "(no tool)";
+                var tv = byTool.TryGetValue(tk, out var x) ? x : byTool[tk] = new int[2];
+                tv[1]++; if (toolOk == true) tv[0]++;
+            }
+            perLine[di][tag + "_ids"] = res.GeneratedTokenIds;
+            perLine[di][tag + "_text"] = res.Text;
+            perLine[di][tag + "_exact"] = isExact;
+            if (toolOk != null) perLine[di][tag + "_tool_ok"] = toolOk.Value;
         }
-        Console.WriteLine($"generation on dev ({gen.Engine}): {(withLora ? "with adapters" : "base")}: {exact}/{dev.Count} exact (target ids, then end of turn)"
-            + (hasToolField ? $"; tool choice {toolOk}/{dev.Count} (the expected tool named, or no tool call when none is expected)" : ""));
-        log.Add(new { generation = withLora ? "adapters" : "base", exact, tool_choice = toolOk, of = dev.Count });
+        foreach (var (grp, v) in byGroup)
+        {
+            Console.WriteLine($"generation on dev ({gen.Engine}) {grp}: {tag}: exact {v[0]}/{v[1]} (target ids, then end of turn)"
+                + (v[3] > 0 ? $"; tool choice {v[2]}/{v[3]} (the expected tool named, or no tool call when none is expected)" : ""));
+            log.Add(new { generation = tag, group = grp, exact = v[0], exact_of = v[1], tool_choice = v[2], tool_of = v[3] });
+        }
+        if (byTool.Count > 0)
+        {
+            Console.WriteLine($"  {tag} tool choice per expected tool: " + string.Join(", ", byTool.Select(k => $"{k.Key} {k.Value[0]}/{k.Value[1]}")));
+            log.Add(new { generation = tag, per_tool = byTool.ToDictionary(k => k.Key, k => new { ok = k.Value[0], of = k.Value[1] }) });
+        }
     }
     using (var w = new StreamWriter(Path.Combine(outDir, engine == SpawnDev.ILGPU.ML.Pipelines.GgufEngine.Auto ? "generation_eval.jsonl" : $"generation_eval.{Arg("--engine", "auto")}.jsonl")))
         for (int di = 0; di < dev.Count; di++)
         {
-            var (id, ids, labels) = dev[di];
-            int p = Array.FindIndex(labels, l => l != -100) + 1;
-            w.WriteLine(JsonSerializer.Serialize(new { id, prompt_ids = ids[..p], target_ids = ids[p..], end_of_turn_id = labels[^1],
-                base_ids = perLine[di]["base_ids"], adapter_ids = perLine[di]["adapter_ids"] }));
+            var d = dev[di];
+            var row = new Dictionary<string, object?> { ["id"] = d.Id, ["group"] = d.Group, ["expected_tool"] = d.Tool, ["prompt_ids"] = d.Ids[..d.PromptLen],
+                ["target_ids"] = d.HasTarget ? d.Ids[d.PromptLen..] : null, ["end_of_turn_id"] = d.Eot };
+            foreach (var (k, v) in perLine[di]) row[k] = v;
+            w.WriteLine(JsonSerializer.Serialize(row));
         }
 }
 File.WriteAllText(Path.Combine(outDir, "train_log.json"), JsonSerializer.Serialize(log, new JsonSerializerOptions { WriteIndented = true }));
 return 0;
+
+// one data line: Ids = prompt (+ target), Labels per position, PromptLen, the end-of-turn id, and what it is scored on
+record Line(string Id, int[] Ids, int[] Labels, int PromptLen, int Eot, bool HasTarget, string Group, string Source, bool HasTool, string? Tool);
