@@ -16,7 +16,7 @@ public sealed partial class BackwardKernels
     /// </summary>
     public static bool UseGemmAttentionBackward { get; set; } = true;
     /// <summary>Bytes the three [heads, SeqQ, SeqKV] score buffers may take together; the heads are processed in chunks that fit.</summary>
-    public static long GemmAttentionScoreBudgetBytes { get; set; } = 640L << 20;
+    public static long GemmAttentionScoreBudgetBytes { get; set; } = 384L << 20;
 
     private MatMulKernel? _attnMm;
     private MemoryBuffer1D<float, Stride1D.Dense>? _gQh, _gdOh, _gdQh, _gKh, _gKhT, _gVhT, _gdKh, _gdVh, _gS, _gdP, _gT;
@@ -55,7 +55,10 @@ public sealed partial class BackwardKernels
         if (b == null || b.Length < n)
         {
             if (b != null) retired.Add(b);   // a queued launch may still read it
-            b = acc.Allocate1D<float>(n);
+            // the next power of two: sequences of varying length re-grow a buffer a few times, not once per new maximum
+            long cap = 1;
+            while (cap < n) cap <<= 1;
+            b = acc.Allocate1D<float>(cap);
         }
         return b;
     }
@@ -72,7 +75,9 @@ public sealed partial class BackwardKernels
         var Qh = Grow(_acc, ref _gQh, qn, _gRetired); var dOh = Grow(_acc, ref _gdOh, qn, _gRetired); var dQh = Grow(_acc, ref _gdQh, qn, _gRetired);
         var Kh = Grow(_acc, ref _gKh, kn, _gRetired); var KhT = Grow(_acc, ref _gKhT, kn, _gRetired); var VhT = Grow(_acc, ref _gVhT, kn, _gRetired);
         var dKh = Grow(_acc, ref _gdKh, kn, _gRetired); var dVh = Grow(_acc, ref _gdVh, kn, _gRetired);
-        var S = Grow(_acc, ref _gS, sn, _gRetired); var dP = Grow(_acc, ref _gdP, sn, _gRetired); var T = Grow(_acc, ref _gT, sn, _gRetired);
+        // the score buffers are sized by the budget once (hc is chosen to fit it), so they never re-grow
+        long scoreCap = Math.Max(sn, GemmAttentionScoreBudgetBytes / 3 / sizeof(float));
+        var S = Grow(_acc, ref _gS, scoreCap, _gRetired); var dP = Grow(_acc, ref _gdP, scoreCap, _gRetired); var T = Grow(_acc, ref _gT, scoreCap, _gRetired);
         _attnMm ??= new MatMulKernel(_acc);
         _gPack ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, PackDims>(PackImpl);
         _gStats ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, AttnDims, int>(GemmStatsImpl);

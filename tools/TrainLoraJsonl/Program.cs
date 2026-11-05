@@ -7,6 +7,7 @@
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
 //        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch] [--no-dev-loss]
+//        [--gpu-share 1] (fraction of GPU time to use; 0.5 = idle as long as each step runs; <out>/gpu-share.txt overrides it live)
 //        [--progress 10] (a progress line every N AdamW steps) [--save-every 25] (save the adapters every N AdamW steps; 0 = per epoch) [--exclude-source synthetic-v2-hinted[,more]] [--eval-max-new 160]
 // --dry-run: print the data summary and exit (no model load).
 // --exclude-source: TRAIN lines whose `source` matches are left out (the A/B for teacher-hinted lines; dev lines are never dropped).
@@ -108,7 +109,16 @@ double best = await DevLossAsync();
 Console.WriteLine($"epoch 0: dev loss {best:F4}");
 log.Add(new { epoch = 0, dev_loss = best });
 int progressEvery = Math.Max(1, int.Parse(Arg("--progress", "10")));
-int saveEvery = int.Parse(Arg("--save-every", "25"));   // AdamW steps between checkpoint saves; 0 = only at the end of an epoch
+int saveEvery = int.Parse(Arg("--save-every", "25"));
+double shareArg = double.Parse(Arg("--gpu-share", "1"), System.Globalization.CultureInfo.InvariantCulture);
+string shareFile = Path.Combine(outDir, "gpu-share.txt");
+double GpuShare()
+{
+    double v = shareArg;
+    try { if (File.Exists(shareFile) && double.TryParse(File.ReadAllText(shareFile).Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var f)) v = f; }
+    catch (IOException) { }
+    return Math.Clamp(v, 0.05, 1.0);
+}   // AdamW steps between checkpoint saves; 0 = only at the end of an epoch
 var rng = new Random(seed);
 for (int ep = 1; ep <= epochs; ep++)
 {
@@ -117,7 +127,12 @@ for (int ep = 1; ep <= epochs; ep++)
     sw.Restart();
     for (int i = 0; i < order.Count; i++)
     {
-        trainSum += await trainer.AccumulateAsync(order[i].Ids, order[i].Labels);
+        var stepSw = Stopwatch.StartNew();
+        trainSum += await trainer.AccumulateAsync(order[i].Ids, order[i].Labels);   // returns the loss: the readback waits for the GPU
+        // --gpu-share: leave the GPU idle for the rest of each period so the PC stays usable (TJ 2026-11-05). Re-read every sequence from
+        // <out>/gpu-share.txt when it exists, so a running job can be slowed down or sped up without a restart.
+        double share = GpuShare();
+        if (share < 1.0) await Task.Delay(TimeSpan.FromMilliseconds(stepSw.Elapsed.TotalMilliseconds * (1.0 / share - 1.0)));
         if (trainer.AccumulatedSequences == accum || i == order.Count - 1)
         {
             await trainer.ApplyAsync();
@@ -125,7 +140,7 @@ for (int ep = 1; ep <= epochs; ep++)
             if (trainer.Step % progressEvery == 0 || i == order.Count - 1)
             {
                 double el = sw.Elapsed.TotalSeconds, eta = el / (i + 1) * (order.Count - i - 1);
-                Console.WriteLine($"  epoch {ep}: {i + 1}/{order.Count} sequences, step {trainer.Step}, mean train loss {trainSum / (i + 1):F4}, {el:F0} s, ~{eta / 60:F0} min left in the epoch");
+                Console.WriteLine($"  epoch {ep}: {i + 1}/{order.Count} sequences, step {trainer.Step}, mean train loss {trainSum / (i + 1):F4}, {el:F0} s, ~{eta / 60:F0} min left in the epoch, GPU share {GpuShare():0.##}");
             }
             // --save-every: a long run leaves usable adapters behind as it goes (a killed run otherwise saves nothing)
             if (saveEvery > 0 && trainer.Step % saveEvery == 0 && i < order.Count - 1)
