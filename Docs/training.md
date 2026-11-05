@@ -82,7 +82,7 @@ forgets the cached prefix. On the session engine the adapters are inserted into 
 
 ## Speed
 
-llama3.1:8b Q4_K_M, RTX 4070, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed: **2.01 s per step** (forward, recompute,
+llama3.1:8b Q4_K_M, RTX 4070, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed: **1.94 s per step** (forward, recompute,
 backward; 21.7 s before the attention backward moved to a fused tensor-core kernel, the quantized input gradient and the forward GEMMs to
 tensor cores, and the training forward attention to the tensor-core flash kernel). Turing (RTX 2060) runs f16 variants of the same kernels.
 Profile with `tools/TrainLoraProbe --profile`: the forward matmuls (run twice with checkpointing) are about half of a step, then the

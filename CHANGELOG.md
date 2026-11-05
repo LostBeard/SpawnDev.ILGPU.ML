@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.01 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.94 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -29,6 +29,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
   - **Tensor-core GEMMs rebuilt**: packed 16-bit operands, double-buffered tiles, 64-bit fragment loads, then `cp.async` + `ldmatrix` (V4) and
     column-major block order (the large operand is read from DRAM about once); K-quant prefill GEMMs V2 / V3 (256-row tiles); nibbles to
     float without I2F; Q4_K / Q6_K transpose-dequant decoding 4 values per scale read. All bit-identical to the kernels they replace.
+  - **V5 tensor-core GEMM** (`FusedDequantMatMul.EnableMmaV5`, sm_80+, `GGUF_GEMM_V5=0` = V4): 4 warps of 64 x 64 per 128 x 128 block instead
+    of 8 warps of 64 x 32 (a third less shared-memory traffic per FLOP); bit-identical (same MMAs per output, same K order). llama3.1:8b
+    shapes: 43.7 -> 46.0 (q / o), 49.4 -> 52.0 (down), 45.4 -> 48.4 (gate / up) TFLOPS. Step 2.01 -> 1.94 s.
   - **Scratch-operand K-quant GEMM** (`FusedDequantMatMul.EnableMmaScratch`, M >= 512, f16 weight <= 256 MiB): the weight is dequantized once
     to f16 with the GEMM's own decode helpers (bit-identical words), then the 16-bit V4 GEMM.
   - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing

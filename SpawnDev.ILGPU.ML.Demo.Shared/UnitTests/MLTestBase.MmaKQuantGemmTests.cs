@@ -21,7 +21,7 @@ public abstract partial class MLTestBase
     {
         if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core GEMMs run on CUDA sm_75+");
         var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
-        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2, v3Saved = FusedDequantMatMul.EnableMmaV3;
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2, v3Saved = FusedDequantMatMul.EnableMmaV3; bool v5Saved = FusedDequantMatMul.EnableMmaV5;
         bool scrSaved = FusedDequantMatMul.EnableMmaScratch;
         int v3MinSaved = FusedDequantMatMul.MmaV3MinRows, scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
         FusedDequantMatMul.MmaV3MinRows = 1;   // every shape on V3 too
@@ -79,11 +79,15 @@ public abstract partial class MLTestBase
             // aligned: the tensor-core kernel, V1, V2 (double-buffered, 64-bit fragment loads) and V3 (256-row tiles): the same rounding and MMA
             // order per output, so V2 and V3 must be bit-identical to V1
             float[] got = Array.Empty<float>(); string route = "";
-            foreach (var (v2, v3, scr, sfx) in new[] { (false, false, false, ""), (true, false, false, "-v2"), (true, true, false, "-v3"), (true, true, true, "-scratch") })
+            foreach (var (v2, v3, scr, v5, sfx0) in new[] { (false, false, false, false, ""), (true, false, false, false, "-v2"), (true, true, false, false, "-v3"),
+                (true, true, true, false, "-scratch"), (true, true, true, true, "-scratch-v5") })
             {
+                // V5 (64 x 64 warp tiles) is sm_80+: the Turing scratch path keeps its V2 GEMM
+                string sfx = v5 && want.Contains("sm75") ? "-scratch" : sfx0;
                 FusedDequantMatMul.EnableMmaV2 = v2;
                 FusedDequantMatMul.EnableMmaV3 = v3;
                 FusedDequantMatMul.EnableMmaScratch = scr;
+                FusedDequantMatMul.EnableMmaV5 = v5;
                 fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
                 string r = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
@@ -115,6 +119,7 @@ public abstract partial class MLTestBase
         {
             FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved;
             FusedDequantMatMul.MmaV3MinRows = v3MinSaved; FusedDequantMatMul.EnableMmaScratch = scrSaved; FusedDequantMatMul.MmaScratchMinRows = scrMinSaved;
+            FusedDequantMatMul.EnableMmaV5 = v5Saved;
         }
         return string.Join("; ", notes);
     });

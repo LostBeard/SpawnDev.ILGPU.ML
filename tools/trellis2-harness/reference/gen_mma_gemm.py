@@ -47,7 +47,7 @@ w("public struct U4 { public uint X, Y, Z, W; }")
 w("")
 w("internal static class MmaGemm")
 w("{")
-w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, RowWords = 20;")
+w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, V5Threads = 128, RowWords = 20;")
 w("")
 w("    private static float Activate(float v, int act)")
 w("    {")
@@ -616,6 +616,112 @@ kernel_packed_v4("Bf16", False)
 kernel_packed_v4("F16", True)
 kernel_packed_v4("F16", False)
 kernel_packed_v4("Bf16", False, acc=True)
+
+
+def kernel_packed_v5(dtype, sm75, acc=False):
+    """Kernel{Bf16|F16}PackedV5 (2026-11-05): the V4 pipeline (cp.async double buffering, ldmatrix fragments, column-major block order) with
+    4 warps of 64 x 64 (MT 4 x NT 8) per 128 x 128 block instead of 8 warps of 64 x 32: per k16 step a warp issues 4 A + 4 B ldmatrix.x4 for 32
+    MMAs (V4: 4 + 2 for 16), so shared-memory traffic per FLOP drops by a third. 128 threads, 40 KB shared (two stages of 20-word rows)."""
+    t_ = "bf16" if dtype == "Bf16" else "f16"
+    mma16 = f"mma.sync.aligned.m16n8k16.row.col.f32.{t_}.{t_}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%10, %11, %12, %13}};"
+    mma8 = "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+    ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+    cpa = "cp.async.cg.shared.global [%0], [%1], 16, %2;"
+    RW = 20
+    MT5, NT5 = 4, 8
+    name = f"Kernel{dtype}{'Sm75' if sm75 else ''}PackedV5{'Acc' if acc else ''}"
+    w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V4's pipeline with 64 x 64 warp tiles. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+ (cp.async).</summary>")
+    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    w("    {")
+    w("        int numTilesM = (M + BM - 1) / BM;")
+    w("        int tileRow = Grid.IdxX % numTilesM;")
+    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 1, wn = warp & 1;")
+    w("        float inv = sc[1];")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * BM * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<uint>(2 * BN * {RW});")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        // copy assignment: a tile is 128 rows x 4 chunks of 16 bytes; thread tid copies chunk (tid & 3) of rows (tid >> 2) + 32 i, i < 4")
+    w("        int cr = tid >> 2, cc = tid & 3;")
+    for i in range(4):
+        w(f"        int aR{i} = tileRow * BM + cr + {32 * i}, bR{i} = tileCol * BN + cr + {32 * i};")
+        w(f"        int aSz{i} = aR{i} < M ? 16 : 0, bSz{i} = bR{i} < N ? 16 : 0;")
+        w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 3) + cc, bG{i} = (long)(bSz{i} != 0 ? bR{i} : 0) * (K >> 3) + cc;")
+        w(f"        int sOff{i} = (cr + {32 * i}) * {RW} + cc * 4;")
+    w(f"        int aLd = (wm * 64 + (lane & 15)) * {RW} + (lane >> 4) * 4;")
+    w(f"        int bLd = (wn * 64 + (lane & 7) + ((lane >> 4) << 3)) * {RW} + ((lane >> 3) & 1) * 4;")
+
+    def issue(kt_expr, buf_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int kq = ({kt_expr}) >> 3;")
+        w(f"{ind}    int sb = ({buf_expr}) * BM * {RW};")
+        for (arr, src, gp, zp) in (("aS", "Au", "aG", "aSz"), ("bS", "Wu", "bG", "bSz")):
+            for i in range(4):
+                w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref {arr}[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref {src}[{gp}{i} + kq]), {zp}{i});")
+        w(f"{ind}    CudaAsm.Emit(\"cp.async.commit_group;\");")
+        w(f"{ind}}}")
+
+    issue("0", "0", "        ")
+    w("        int cur = 0;")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    w("            if (kt + BK < K)")
+    w("            {")
+    issue("kt + BK", "1 - cur", "                ")
+    w('                CudaAsm.Emit("cp.async.wait_group 1;");')
+    w("            }")
+    w('            else CudaAsm.Emit("cp.async.wait_group 0;");')
+    w("            Group.Barrier();")
+    w(f"            int so = cur * BM * {RW};")
+    w("            for (int ks = 0; ks < 2; ks++)")
+    w("            {")
+    for mt in range(MT5):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd + {mt * 16 * RW} + ks * 8]));')
+    for np_ in range(NT5 // 2):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[so + bLd + {np_ * 16 * RW} + ks * 8]));')
+    for mt in range(MT5):
+        for nt in range(NT5):
+            if not sm75:
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma16}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+            else:
+                for (x0, x1, bb) in ((0, 1, 0), (2, 3, 1)):
+                    w("                {")
+                    w(f'                CudaAsm.Emit("{mma8}",')
+                    w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}{x0}, a{mt}{x1}, b{nt}{bb}, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                    w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                    w("                }")
+    w("            }")
+    w("            Group.Barrier();")
+    w("            cur = 1 - cur;")
+    w("        }")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            if acc:
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+
+kernel_packed_v5("Bf16", False)
+kernel_packed_v5("F16", False)
+kernel_packed_v5("Bf16", False, acc=True)
 w("}")
 
 path = sys.argv[1]
