@@ -155,8 +155,42 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             return;
         }
 
+        // a training graph's attention (GraphAutograd marks it train_tc) on the tensor-core flash kernel the batch decoder's prefill uses:
+        // K / V rounded to f16 into scratch, Q and P to f16 inside the kernel, fp32 accumulate. MEASURED 2026-11-05 (llama3.1:8b, 1,600 tokens):
+        // the generic kernel took 1.5 s of a 5.9 s training step (forward + checkpoint recompute).
+        float defScale = 1f / MathF.Sqrt(headDim);
+        if (ctx.GetInt("train_tc", 0) == 1 && seqMajor && seqMajorQ && seqMajorKV && headDim == Kernels.MmaFlashPrefill.HeadDim && causal
+            && effWindow == int.MaxValue && sinkCount == 0 && nHeads % kvHeads == 0 && kvOffset == seqKV - seqQ && seqQ >= 16
+            && (scale == 0f || MathF.Abs(scale - defScale) <= 1e-6f * defScale) && Kernels.CudaCaps.TensorCores(reg.Accelerator))
+        {
+            var acc = reg.Accelerator;
+            int kvWords = seqKV * kvHeads * headDim / 2;
+            var kc = ctx.Pool.Rent(new[] { kvWords }, "_fa_tc_k");
+            var vc = ctx.Pool.Rent(new[] { kvWords }, "_fa_tc_v");
+            _toF16 ??= acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>>(ToF16WordsImpl);
+            _toF16(kvWords, k.Data, kc.Data.Cast<float, uint>());
+            _toF16(kvWords, v.Data, vc.Data.Cast<float, uint>());
+            _flashTc ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
+                Kernels.MmaFlashPrefill.Kernel);
+            _flashTc(new KernelConfig(((seqQ + Kernels.MmaFlashPrefill.QTile - 1) / Kernels.MmaFlashPrefill.QTile) * nHeads, Kernels.MmaFlashPrefill.Threads),
+                q.Data, kc.Data.Cast<float, uint>().BaseView, vc.Data.Cast<float, uint>().BaseView, ctx.Outputs[0].Data, seqQ, nHeads, kvHeads, kvOffset);
+            ctx.Pool.Return(kc);
+            ctx.Pool.Return(vc);
+            return;
+        }
+
         reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
             nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
             sinks: sinksView, sinkCount: sinkCount, seqMajorOut: seqMajor, seqMajorQ: seqMajorQ, seqMajorKV: seqMajorKV);
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>>? _toF16;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _flashTc;
+
+    // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even (CUDA sm_80+: the caller checks)
+    private static void ToF16WordsImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<uint, Stride1D.Dense> o)
+    {
+        global::ILGPU.Runtime.Cuda.CudaAsm.Emit("cvt.rn.f16x2.f32 %0, %2, %1;", out uint packed, x[2 * i], x[2 * i + 1]);
+        o[i] = packed;
     }
 }

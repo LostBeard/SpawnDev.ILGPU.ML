@@ -144,6 +144,73 @@ public abstract partial class MLTestBase
         await FusedAttnOpOracle(accelerator, nHeads: 4, kvHeads: 1, seqQ: 1, seqKV: 12,
             headDim: 32, causal: true, window: 0, scale: 0f, kvOffset: 11));
 
+    /// <summary>
+    /// A training graph's attention (GraphAutograd marks it train_tc = 1) on the tensor-core flash kernel: seq-major q / k / v / out, head dim 128,
+    /// causal GQA, 150 rows (crossing the kernel's 128-row tile), against the float64 CPU oracle; and the same node unmarked (the generic
+    /// kernel) as the control. CUDA sm_80+. Added 2026-11-05.
+    /// </summary>
+    [TestMethod]
+    public async Task AttnOp_FusedAttention_TrainTensorCore_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_80+ tensor cores");
+        const int nHeads = 4, kvHeads = 2, seq = 150, hd = 128;
+        var rng = new Random(905);
+        float[] R(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
+        var q = R(seq * nHeads * hd); var k = R(seq * kvHeads * hd); var v = R(seq * kvHeads * hd);
+        double sc = 1 / Math.Sqrt(hd);
+        var expected = new float[q.Length];
+        for (int h = 0; h < nHeads; h++)
+        {
+            int kvh = h / (nHeads / kvHeads);
+            for (int i = 0; i < seq; i++)
+            {
+                var s = new double[i + 1]; double m = double.NegativeInfinity;
+                for (int j = 0; j <= i; j++)
+                {
+                    double dot = 0; for (int e = 0; e < hd; e++) dot += q[(i * nHeads + h) * hd + e] * k[(j * kvHeads + kvh) * hd + e];
+                    s[j] = dot * sc; m = Math.Max(m, s[j]);
+                }
+                double z = 0; for (int j = 0; j <= i; j++) z += Math.Exp(s[j] - m);
+                for (int e = 0; e < hd; e++)
+                {
+                    double a = 0; for (int j = 0; j <= i; j++) a += Math.Exp(s[j] - m) / z * v[(j * kvHeads + kvh) * hd + e];
+                    expected[(i * nHeads + h) * hd + e] = (float)a;
+                }
+            }
+        }
+        using var qBuf = accelerator.Allocate1D(q); using var kBuf = accelerator.Allocate1D(k); using var vBuf = accelerator.Allocate1D(v);
+        using var outBuf = accelerator.Allocate1D<float>(expected.Length);
+        using var registry = new OperatorRegistry(accelerator);
+        var op = registry.Resolve("FusedAttention");
+        var pool = new BufferPool(accelerator);
+        var notes = new List<string>();
+        foreach (int tc in new[] { 1, 0 })
+        {
+            op.Execute(new OnnxOpContext
+            {
+                Inputs = new[] { new Tensor(qBuf.View, new[] { 1, seq, nHeads, hd }), new Tensor(kBuf.View, new[] { 1, seq, kvHeads, hd }), new Tensor(vBuf.View, new[] { 1, seq, kvHeads, hd }) },
+                Outputs = new[] { new Tensor(outBuf.View, new[] { 1, seq, nHeads, hd }) },
+                Attributes = new Dictionary<string, object>
+                {
+                    ["n_heads"] = nHeads, ["n_kv_heads"] = kvHeads, ["head_dim"] = hd, ["causal"] = 1, ["window"] = 0, ["scale"] = 0f, ["kv_offset"] = 0,
+                    ["seq_major_out"] = 1, ["seq_major_q"] = 1, ["seq_major_kv"] = 1, ["train_tc"] = tc,
+                },
+                Pool = pool,
+                InputNames = new[] { "q", "k", "v" },
+            });
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.CopyToHostAsync<float>(0, expected.Length);
+            double worst = 0; for (int i = 0; i < got.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - expected[i]));
+            notes.Add($"train_tc={tc}: max |diff| {worst:E2}");
+            // f16 Q, K, V and P with fp32 accumulation (the batch decoder's prefill kernel); the generic kernel is fp32
+            // MEASURED 2026-11-05 CUDA: train_tc 2.8e-4, generic 1.2e-7
+            if (worst > (tc == 1 ? 2e-3 : 2e-4)) throw new Exception($"FusedAttention train_tc={tc} differs from the CPU oracle: " + string.Join("; ", notes));
+        }
+        var line = "FusedAttention seq-major hd 128, 150 rows: " + string.Join("; ", notes);
+        Console.WriteLine("[AttnOp] " + line);
+        return line;
+    });
+
     private static async Task FusedAttnOpOracle(Accelerator accelerator,
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, float scale, int kvOffset)

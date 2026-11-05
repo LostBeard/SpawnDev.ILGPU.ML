@@ -110,10 +110,24 @@ public static class GraphAutograd
     /// A chat example labels its answer (tens of tokens) out of thousands; full logits over a 128k vocabulary are 0.5 GB per 1,024 positions, held
     /// several times over by the loss path (MEASURED: llama3.1:8b at 1,024 tokens, checkpointed, +8.0 GB of which ~2 GB was that).
     /// </param>
+    /// <summary>
+    /// Mark a training graph's FusedAttention nodes for the tensor-core flash kernel (CUDA sm_80+, head dim 128, causal, no window or sinks;
+    /// otherwise the node runs as before). Default on; false = the generic kernel (the A/B control). Inference graphs are never marked.
+    /// </summary>
+    public static bool TensorCoreForwardAttention { get; set; } = true;
+
     public static TrainingGraphInfo AddBackward(ModelGraph graph, string logits, int vocab, IReadOnlyCollection<string> parameters, int ignoreIndex = -100,
         bool checkpointLayers = false, bool labeledPositionsOnly = false)
     {
         var b = new Builder(graph);
+        // the forward attention of a training graph may run on the tensor-core flash kernel (FusedAttentionOperator, train_tc): marked
+        // here, before the checkpoint copies are made, so the recompute pass takes the same kernel as the forward
+        if (TensorCoreForwardAttention)
+            foreach (var n in graph.Nodes.Where(n => n.OpType == "FusedAttention"))
+            {
+                n.Attributes = n.Attributes == null ? new Dictionary<string, System.Text.Json.JsonElement>() : new Dictionary<string, System.Text.Json.JsonElement>(n.Attributes);
+                { using var one = System.Text.Json.JsonDocument.Parse("1"); n.Attributes["train_tc"] = one.RootElement.Clone(); }
+            }
         string? positions = null;
         GraphNode? head = null;
         if (labeledPositionsOnly)

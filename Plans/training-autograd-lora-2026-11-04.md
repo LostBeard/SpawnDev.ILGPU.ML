@@ -193,6 +193,11 @@ step is ~4 forwards of work: target 4-5 s per step (a 7 h run in ~1.5 h).
       the scale, dq off by 0.57); TinyLlama LoRA step vs torch green on CUDA + OpenCL. Qwen2.5-0.5B 512 tokens: FusedAttentionGrad
       954 -> 68 ms (14x, shared GPU). 8B measurement pending.
 - [ ] Attention backward on tensor cores (FlashAttention-2 style) only if the GEMM path is still a large share after the 8B profile.
-- [ ] The training forward / recompute through the tensor-core prefill kernels (MmaKQuantGemm, MmaFlashPrefill) instead of the
-      generic graph kernels.
+- [x] 8B step at 1,600 tokens: 21.7 -> 5.9 s with the two items above (profiled: attention backward 9.26 -> 0.94 s, quantized input
+      gradient 8.48 -> 1.13 s; gradient check 2.5e-3 / 5.3e-4). Remaining: forward MatMul 1.6 s (already MmaKQuantGemm: it is two forwards
+      with the checkpoint recompute), forward FusedAttention 1.5 s.
+- [x] Training forward attention on MmaFlashPrefill (2026-11-05): GraphAutograd marks a training graph's FusedAttention nodes `train_tc`
+      (`GraphAutograd.TensorCoreForwardAttention`, default on); the operator converts K / V to f16 and runs the batch decoder's prefill kernel
+      (CUDA sm_80+, hd 128, causal, no window / sinks). Inference graphs are never marked. `AttnOp_FusedAttention_TrainTensorCore_MatchesCPU`:
+      2.8e-4 vs float64 (generic 1.2e-7). PENDING: the 8B gradient check + step time with it (after v2.1).
 - [ ] Then: packing several short sequences per step; skipping work that has no gradient.
