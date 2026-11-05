@@ -458,7 +458,8 @@ public sealed partial class BackwardKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, ArrayView1D<float, Stride1D.Dense>>? _pack16Flat;
 
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Acc, _packedBf16Acc, _packedBf16V5Acc;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5, _packedF16Sm75V5;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5, _packedBf16V6, _packedF16Sm75V5;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V6Acc;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Sm75V5Acc;
 
     private void MmaPacked(bool turing, ArrayView1D<ushort, Stride1D.Dense> A, ArrayView1D<ushort, Stride1D.Dense> W, ArrayView1D<float, Stride1D.Dense> C,
@@ -483,6 +484,15 @@ public sealed partial class BackwardKernels : IDisposable
             var a4 = A.SubView(0, (long)M * K).Cast<ushort, Trellis2.U4>();
             var w4 = W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>();
             var cfg = new KernelConfig(tiles, Trellis2.MmaGemm.V5Threads);
+            if (Kernels.FusedDequantMatMul.EnableMmaV6)
+            {
+                // V6: three cp.async stages, swizzled rows (bit-identical to V5)
+                if (accumulate.IsValid)
+                    (_packedBf16V6Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV6Acc))(cfg, a4, w4, sc, C, accumulate, M, K, N);
+                else
+                    (_packedBf16V6 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV6))(cfg, a4, w4, sc, C, M, K, N);
+                return;
+            }
             if (accumulate.IsValid)
                 (_packedBf16V5Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV5Acc))(cfg, a4, w4, sc, C, accumulate, M, K, N);
             else

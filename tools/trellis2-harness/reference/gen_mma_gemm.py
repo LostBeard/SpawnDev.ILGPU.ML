@@ -823,6 +823,108 @@ def kernel_packed_v5r(acc=False):
 
 kernel_packed_v5r()
 kernel_packed_v5r(acc=True)
+
+
+def kernel_packed_v6(dtype, acc=False):
+    """Kernel{Bf16|F16}PackedV6{Acc} (2026-11-05): V5 (4 warps of 64 x 64, cp.async, ldmatrix, column-major block order) with THREE stages:
+    two K tiles in flight while one computes. Rows are 64 bytes with no padding and the 16-byte chunks XOR-swizzled (chunk c of row r at
+    c ^ ((r >> 1) & 3)), so the 8 row addresses of every ldmatrix 8 x 8 read land in 8 distinct bank groups and 3 stages fit the 48 KB of
+    static shared memory exactly. Same MMAs per output in the same K order as V4 / V5: bit-identical. sm_80+."""
+    t_ = "bf16" if dtype == "Bf16" else "f16"
+    mma16 = f"mma.sync.aligned.m16n8k16.row.col.f32.{t_}.{t_}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%10, %11, %12, %13}};"
+    ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+    cpa = "cp.async.cg.shared.global [%0], [%1], 16, %2;"
+    RW = 16          # words per row: 32 halves, no padding
+    ST = 3
+    MT5, NT5 = 4, 8
+    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}"
+    w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
+    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    w("    {")
+    w("        int numTilesM = (M + BM - 1) / BM;")
+    w("        int tileRow = Grid.IdxX % numTilesM;")
+    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 1, wn = warp & 1;")
+    w("        float inv = sc[1];")
+    w(f"        var aS = SharedMemory.Allocate<uint>({ST} * BM * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<uint>({ST} * BN * {RW});")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int cr = tid >> 2, cc = tid & 3;")
+    for i in range(4):
+        w(f"        int aR{i} = tileRow * BM + cr + {32 * i}, bR{i} = tileCol * BN + cr + {32 * i};")
+        w(f"        int aSz{i} = aR{i} < M ? 16 : 0, bSz{i} = bR{i} < N ? 16 : 0;")
+        w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 3) + cc, bG{i} = (long)(bSz{i} != 0 ? bR{i} : 0) * (K >> 3) + cc;")
+        w(f"        int sOff{i} = (cr + {32 * i}) * {RW} + ((cc ^ (((cr + {32 * i}) >> 1) & 3)) << 2);")
+    w("        // ldmatrix lane rows and their swizzled chunk offsets per k16 step (adding 16-row tile offsets keeps (row >> 1) & 3)")
+    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 64 + (lane & 7) + ((lane >> 4) << 3);")
+    w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;")
+    w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
+    w(f"        int bLd0 = rowB * {RW} + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * {RW} + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);")
+    w("        int nk = (K + BK - 1) / BK;")
+
+    def issue(kt_expr, st_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int kq = ({kt_expr}) >> 3;")
+        w(f"{ind}    int sb = ({st_expr}) * BM * {RW};")
+        for (arr, src, gp, zp) in (("aS", "Au", "aG", "aSz"), ("bS", "Wu", "bG", "bSz")):
+            for i in range(4):
+                w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref {arr}[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref {src}[{gp}{i} + kq]), {zp}{i});")
+        w(f"{ind}}}")
+
+    w("        // prologue: tiles 0 and 1 in flight (one commit group each; an empty group when there is no tile keeps the count uniform)")
+    issue("0", "0", "        ")
+    w('        CudaAsm.Emit("cp.async.commit_group;");')
+    w("        if (nk > 1)")
+    issue("BK", "1", "        ")
+    w('        CudaAsm.Emit("cp.async.commit_group;");')
+    w("        for (int it = 0; it < nk; it++)")
+    w("        {")
+    w('            CudaAsm.Emit("cp.async.wait_group 1;");   // tile it has landed (at most the newest group pending)')
+    w("            Group.Barrier();")
+    w("            if (it + 2 < nk)")
+    issue("(it + 2) * BK", "(it + 2) % 3", "            ")
+    w('            CudaAsm.Emit("cp.async.commit_group;");')
+    w(f"            int so = (it % 3) * BM * {RW};")
+    for ks in range(2):
+        w("            {")
+        for mt in range(MT5):
+            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd{ks} + {mt * 16 * RW}]));')
+        for np_ in range(NT5 // 2):
+            w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[so + bLd{ks} + {np_ * 16 * RW}]));')
+        for mt in range(MT5):
+            for nt in range(NT5):
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma16}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+        w("            }")
+    w("        }")
+    w('        CudaAsm.Emit("cp.async.wait_group 0;");')
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            if acc:
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+
+kernel_packed_v6("Bf16")
+kernel_packed_v6("F16")
+kernel_packed_v6("Bf16", acc=True)
 w("}")
 
 path = sys.argv[1]
