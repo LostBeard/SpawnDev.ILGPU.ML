@@ -1047,9 +1047,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q4_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 16-byte aligned. sm_80+: m16n8k16.</summary>
     public static void Q4KV2(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BM - 1) / BM;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -1340,9 +1341,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q4_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 16-byte aligned. Turing (sm_75): two m16n8k8 per 16 k.</summary>
     public static void Q4KSm75V2(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BM - 1) / BM;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -1713,9 +1715,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q4_K, 256 x 128 tiles: grid = ceil(M/256) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned. sm_80+.</summary>
     public static void Q4KV3(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order: each W tile is decoded and read from DRAM about once per 256-row band sweep
+        int numTilesM = (M + 255) / 256;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -2192,9 +2195,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q4_K, 256 x 128 tiles: grid = ceil(M/256) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned. Turing (sm_75).</summary>
     public static void Q4KSm75V3(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order: each W tile is decoded and read from DRAM about once per 256-row band sweep
+        int numTilesM = (M + 255) / 256;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -3825,9 +3829,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q6_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 2-byte aligned. sm_80+: m16n8k16.</summary>
     public static void Q6KV2(ArrayView<F4> A, ArrayView<ushort> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BM - 1) / BM;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -4134,9 +4139,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q6_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 2-byte aligned. Turing (sm_75): two m16n8k8 per 16 k.</summary>
     public static void Q6KSm75V2(ArrayView<F4> A, ArrayView<ushort> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BM - 1) / BM;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -4523,9 +4529,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q6_K, 256 x 128 tiles: grid = ceil(M/256) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned. sm_80+.</summary>
     public static void Q6KV3(ArrayView<F4> A, ArrayView<ushort> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order: each W tile is decoded and read from DRAM about once per 256-row band sweep
+        int numTilesM = (M + 255) / 256;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -5013,9 +5020,10 @@ internal static class MmaKQuantGemm
     /// <summary>Q6_K, 256 x 128 tiles: grid = ceil(M/256) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned. Turing (sm_75).</summary>
     public static void Q6KSm75V3(ArrayView<F4> A, ArrayView<ushort> Wq, FV C, int M, int K, int N)
     {
-        int numTilesN = (N + BN - 1) / BN;
-        int tileRow = Grid.IdxX / numTilesN;
-        int tileCol = Grid.IdxX % numTilesN;
+        // column-major block order: each W tile is decoded and read from DRAM about once per 256-row band sweep
+        int numTilesM = (M + 255) / 256;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;

@@ -436,7 +436,7 @@ public sealed partial class BackwardKernels : IDisposable
             ? _packedF16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
             : _packedBf16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV2);
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV4);   // sm_80+: cp.async + ldmatrix
         k(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), A.SubView(0, (long)M * K).Cast<ushort, Trellis2.U4>(), W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>(),
             sc, C, M, K, N);
     }

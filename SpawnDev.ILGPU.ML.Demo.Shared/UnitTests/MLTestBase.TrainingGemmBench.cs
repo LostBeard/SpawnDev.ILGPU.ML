@@ -39,10 +39,15 @@ public abstract partial class MLTestBase
                 using var ab = accelerator.Allocate1D(a); using var wb = accelerator.Allocate1D(w);
                 using var cb = accelerator.Allocate1D<float>(M * N); using var sc = accelerator.Allocate1D(new[] { 1f, 1f });
                 int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
-                foreach (var v2 in new[] { false, true })
+                foreach (var ver in new[] { 1, 2, 4 })
                 {
+                    if (ver == 4 && !SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) continue;   // cp.async is sm_80+
+                    bool v2 = ver == 2;
                     Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                        ArrayView1D<float, Stride1D.Dense>, int, int, int> kern = (bf16, v2) switch
+                        ArrayView1D<float, Stride1D.Dense>, int, int, int> kern = ver == 4
+                        ? (bf16 ? accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV4)
+                                : accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV4))
+                        : (bf16, v2) switch
                     {
                         (true, false) => accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16Packed),
                         (true, true) => accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV2),
@@ -54,7 +59,7 @@ public abstract partial class MLTestBase
                     var got = await cb.View.CopyToHostAsync();
                     double scale = want.Max(Math.Abs), worst = 0;
                     for (int i = 0; i < want.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - want[i]));
-                    string tag = $"{(bf16 ? "bf16" : "f16 sm75")}{(v2 ? " V2" : "")} {M}x{K}x{N}";
+                    string tag = $"{(bf16 ? "bf16" : "f16 sm75")} V{ver} {M}x{K}x{N}";
                     notes.Add($"{tag}: {worst / scale:E1}");
                     // same 16-bit operands on both sides: only fp32-vs-float64 accumulation differs
                     if (worst > 1e-5 * scale) throw new Exception($"{tag}: max |diff| {worst:E2} (max {scale:F2}): " + string.Join("; ", notes));
@@ -123,6 +128,15 @@ public abstract partial class MLTestBase
             var kv275 = accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2);
             variants.Add(("sm75 f16 packed-A V2", () => kv275(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), a16v, w4, sc.View, cb.View, M, K, N)));
+            if (SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator))
+            {
+                var kv4 = accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV4);
+                variants.Add(("bf16 packed-A V4", () => kv4(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), a16v, w4, sc.View, cb.View, M, K, N)));
+                var kv475 = accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV4);
+                variants.Add(("sm75 f16 packed-A V4", () => kv475(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), a16v, w4, sc.View, cb.View, M, K, N)));
+            }
             foreach (var (tag, run) in variants)
             {
                 run();
