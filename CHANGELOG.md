@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (5.8.2-local.11 candidate) - faster LoRA at inference
+## 5.8.2-local.11 - 2026-11-04 (local feed) - DINOv2 image embeddings; ONNX Resize scales fix; faster LoRA at inference
 
 - **LoRA q|k|v and gate|up in one launch** (`LoraRuntime.FuseAdjacent`, default on; `ApplyAdjacent`): the batch decoder's fused q|k|v and
   gate|up outputs take their adapters as ONE packed down + up launch instead of one pair per projection. Bit-identical to per-projection
