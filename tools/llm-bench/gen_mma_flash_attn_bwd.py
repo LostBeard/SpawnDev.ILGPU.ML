@@ -171,19 +171,43 @@ def kernel_q():
     w(f"{ind}if (d.Window > 0) kBeg = Math.Max(0, qLo + d.KvOffset - d.Window + 1) / {KTQ} * {KTQ};")
     w("")
 
+    NW = KTQ * WR // 128   # words per thread per tile
+
+    def decl_kv(do_v, ind2):
+        w(f"{ind2}uint " + ", ".join(f"kr{i} = 0u" for i in range(NW)) + ";")
+        if do_v:
+            w(f"{ind2}uint " + ", ".join(f"vr{i} = 0u" for i in range(NW)) + ";")
+
+    def load_kv(do_v, kb_expr, ind2):
+        # the tile's words into registers (issued before the previous tile's MMAs: the loads overlap them)
+        for i in range(NW):
+            w(f"{ind2}{{ int idx = {i * 128} + tid; int gk = {kb_expr} + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * {WR} + (idx & 63);")
+            w(f"{ind2}  kr{i} = gk < d.SeqKV ? K16[src] : 0u;" + (f" vr{i} = gk < d.SeqKV ? V16[src] : 0u; }}" if do_v else " }"))
+
+    def store_kv(do_v, ind2):
+        for i in range(NW):
+            w(f"{ind2}{{ int idx = {i * 128} + tid; int sidx = (idx >> 6) * {RS} + (idx & 63); ks[sidx] = kr{i};" + (f" vs[sidx] = vr{i}; }}" if do_v else " }"))
+
     def stage_kv(do_v, ind2):
-        for i in range(KTQ * WR // 128):
-            w(f"{ind2}{{ int idx = {i * 128} + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * {WR} + c;")
-            w(f"{ind2}  ks[r * {RS} + c] = gk < d.SeqKV ? K16[src] : 0u;" + (f" vs[r * {RS} + c] = gk < d.SeqKV ? V16[src] : 0u; }}" if do_v else " }"))
+        store_kv(do_v, ind2)
 
     NJ = KTQ // 8
     # pass 1: lse
     w(f"{ind}float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;")
-    w(f"{ind}for (int kb = kBeg; kb < kEnd; kb += {KTQ})")
-    w(f"{ind}{{")
     i2 = ind + "    "
+    w(f"{ind}{{")
+    decl_kv(False, i2)
+    load_kv(False, "kBeg", i2)
+    w(f"{i2}for (int kb = kBeg; kb < kEnd; kb += {KTQ})")
+    w(f"{i2}{{")
+    i2o = i2
+    i2 = i2 + "    "
     stage_kv(False, i2)
     w(f"{i2}Group.Barrier();")
+    w(f"{i2}if (kb + {KTQ} < kEnd)")
+    w(f"{i2}{{")
+    load_kv(False, f"kb + {KTQ}", i2 + "    ")
+    w(f"{i2}}}")
     scores("s", "qa", "ks", f"0", NJ, i2)
     for j in range(NJ):
         w(f"{i2}int kk{j} = kb + {8 * j} + 2 * t;")
@@ -198,7 +222,9 @@ def kernel_q():
     w(f"{i2}l1 = l1 * MathF.Exp(m1 - mn1) + {e1};")
     w(f"{i2}m0 = mn0; m1 = mn1;")
     w(f"{i2}Group.Barrier();")
+    w(f"{i2o}}}")
     w(f"{ind}}}")
+    i2 = ind + "    "
     w(f"{ind}float M0 = MathF.Max(m0, Warp.ShuffleXor(m0, 1)); M0 = MathF.Max(M0, Warp.ShuffleXor(M0, 2));")
     w(f"{ind}float M1 = MathF.Max(m1, Warp.ShuffleXor(m1, 1)); M1 = MathF.Max(M1, Warp.ShuffleXor(M1, 2));")
     w(f"{ind}float L0 = l0 * MathF.Exp(m0 - M0); L0 += Warp.ShuffleXor(L0, 1); L0 += Warp.ShuffleXor(L0, 2);")
@@ -220,10 +246,18 @@ def kernel_q():
 
     def pass2(mode):
         # mode "max": Turing row max |dS|; "dq": dQ += dS K
-        w(f"{ind}for (int kb = kBeg; kb < kEnd; kb += {KTQ})")
         w(f"{ind}{{")
-        stage_kv(True, i2)
-        w(f"{i2}Group.Barrier();")
+        decl_kv(True, i2)
+        load_kv(True, "kBeg", i2)
+        w(f"{i2}for (int kb = kBeg; kb < kEnd; kb += {KTQ})")
+        w(f"{i2}{{")
+        i3 = i2 + "    "
+        stage_kv(True, i3)
+        w(f"{i3}Group.Barrier();")
+        w(f"{i3}if (kb + {KTQ} < kEnd)")
+        w(f"{i3}{{")
+        load_kv(True, f"kb + {KTQ}", i3 + "    ")
+        w(f"{i3}}}")
         scores("s", "qa", "ks", "0", NJ, i2)
         scores("p", "oa", "vs", "0", NJ, i2)
         for j in range(NJ):
@@ -252,6 +286,7 @@ def kernel_q():
                     w(f"{i2}    }}")
                 w(f"{i2}}}")
         w(f"{i2}Group.Barrier();")
+        w(f"{i2}}}")
         w(f"{ind}}}")
 
     if SM75:

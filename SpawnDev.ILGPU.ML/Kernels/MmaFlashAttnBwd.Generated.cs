@@ -104,254 +104,308 @@ internal static class MmaFlashAttnBwd
         if (d.Window > 0) kBeg = Math.Max(0, qLo + d.KvOffset - d.Window + 1) / 32 * 32;
 
         float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;
-        for (int kb = kBeg; kb < kEnd; kb += 32)
         {
-            { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            Group.Barrier();
-            float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
-            float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
-            float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
-            float s30 = 0f, s31 = 0f, s32 = 0f, s33 = 0f;
+            uint kr0 = 0u, kr1 = 0u, kr2 = 0u, kr3 = 0u, kr4 = 0u, kr5 = 0u, kr6 = 0u, kr7 = 0u, kr8 = 0u, kr9 = 0u, kr10 = 0u, kr11 = 0u, kr12 = 0u, kr13 = 0u, kr14 = 0u, kr15 = 0u;
+            { int idx = 0 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr0 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 128 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr1 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 256 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr2 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 384 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr3 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 512 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr4 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 640 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr5 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 768 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr6 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 896 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr7 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1024 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr8 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1152 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr9 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1280 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr10 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1408 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr11 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1536 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr12 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1664 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr13 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1792 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr14 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1920 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr15 = gk < d.SeqKV ? K16[src] : 0u; }
+            for (int kb = kBeg; kb < kEnd; kb += 32)
             {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 0]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 0]));
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr15; }
+                Group.Barrier();
+                if (kb + 32 < kEnd)
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    { int idx = 0 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr0 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 128 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr1 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 256 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr2 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 384 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr3 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 512 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr4 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 640 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr5 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 768 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr6 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 896 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr7 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1024 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr8 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1152 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr9 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1280 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr10 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1408 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr11 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1536 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr12 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1664 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr13 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1792 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr14 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1920 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr15 = gk < d.SeqKV ? K16[src] : 0u; }
+                }
+                float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
+                float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
+                float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
+                float s30 = 0f, s31 = 0f, s32 = 0f, s33 = 0f;
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 0]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 0]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 8]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 8]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 16]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 16]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, qa02, qa03, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 24]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 24]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 32]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 32]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                }
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 40]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 40]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                }
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 48]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 48]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                }
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 56]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 56]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b00, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b10, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b20, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b30, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                }
+                int kk0 = kb + 0 + 2 * t;
+                float x00 = Ok(row0, kk0, d) ? s00 * d.Scale : -1e30f, x01 = Ok(row0, kk0 + 1, d) ? s01 * d.Scale : -1e30f;
+                float x02 = Ok(row1, kk0, d) ? s02 * d.Scale : -1e30f, x03 = Ok(row1, kk0 + 1, d) ? s03 * d.Scale : -1e30f;
+                int kk1 = kb + 8 + 2 * t;
+                float x10 = Ok(row0, kk1, d) ? s10 * d.Scale : -1e30f, x11 = Ok(row0, kk1 + 1, d) ? s11 * d.Scale : -1e30f;
+                float x12 = Ok(row1, kk1, d) ? s12 * d.Scale : -1e30f, x13 = Ok(row1, kk1 + 1, d) ? s13 * d.Scale : -1e30f;
+                int kk2 = kb + 16 + 2 * t;
+                float x20 = Ok(row0, kk2, d) ? s20 * d.Scale : -1e30f, x21 = Ok(row0, kk2 + 1, d) ? s21 * d.Scale : -1e30f;
+                float x22 = Ok(row1, kk2, d) ? s22 * d.Scale : -1e30f, x23 = Ok(row1, kk2 + 1, d) ? s23 * d.Scale : -1e30f;
+                int kk3 = kb + 24 + 2 * t;
+                float x30 = Ok(row0, kk3, d) ? s30 * d.Scale : -1e30f, x31 = Ok(row0, kk3 + 1, d) ? s31 * d.Scale : -1e30f;
+                float x32 = Ok(row1, kk3, d) ? s32 * d.Scale : -1e30f, x33 = Ok(row1, kk3 + 1, d) ? s33 * d.Scale : -1e30f;
+                float mn0 = MathF.Max(m0, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x00, x01), x10), x11), x20), x21), x30), x31)), mn1 = MathF.Max(m1, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x02, x03), x12), x13), x22), x23), x32), x33));
+                l0 = l0 * MathF.Exp(m0 - mn0) + (x00 <= -1e29f ? 0f : MathF.Exp(x00 - mn0)) + (x01 <= -1e29f ? 0f : MathF.Exp(x01 - mn0)) + (x10 <= -1e29f ? 0f : MathF.Exp(x10 - mn0)) + (x11 <= -1e29f ? 0f : MathF.Exp(x11 - mn0)) + (x20 <= -1e29f ? 0f : MathF.Exp(x20 - mn0)) + (x21 <= -1e29f ? 0f : MathF.Exp(x21 - mn0)) + (x30 <= -1e29f ? 0f : MathF.Exp(x30 - mn0)) + (x31 <= -1e29f ? 0f : MathF.Exp(x31 - mn0));
+                l1 = l1 * MathF.Exp(m1 - mn1) + (x02 <= -1e29f ? 0f : MathF.Exp(x02 - mn1)) + (x03 <= -1e29f ? 0f : MathF.Exp(x03 - mn1)) + (x12 <= -1e29f ? 0f : MathF.Exp(x12 - mn1)) + (x13 <= -1e29f ? 0f : MathF.Exp(x13 - mn1)) + (x22 <= -1e29f ? 0f : MathF.Exp(x22 - mn1)) + (x23 <= -1e29f ? 0f : MathF.Exp(x23 - mn1)) + (x32 <= -1e29f ? 0f : MathF.Exp(x32 - mn1)) + (x33 <= -1e29f ? 0f : MathF.Exp(x33 - mn1));
+                m0 = mn0; m1 = mn1;
+                Group.Barrier();
             }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 8]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 8]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, qa12, qa13, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 16]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 16]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, qa22, qa23, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 24]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 24]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, qa32, qa33, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 32]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 32]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, qa42, qa43, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 40]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 40]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, qa52, qa53, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 48]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 48]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, qa62, qa63, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 56]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 56]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b00, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b10, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b20, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, qa72, qa73, b30, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            int kk0 = kb + 0 + 2 * t;
-            float x00 = Ok(row0, kk0, d) ? s00 * d.Scale : -1e30f, x01 = Ok(row0, kk0 + 1, d) ? s01 * d.Scale : -1e30f;
-            float x02 = Ok(row1, kk0, d) ? s02 * d.Scale : -1e30f, x03 = Ok(row1, kk0 + 1, d) ? s03 * d.Scale : -1e30f;
-            int kk1 = kb + 8 + 2 * t;
-            float x10 = Ok(row0, kk1, d) ? s10 * d.Scale : -1e30f, x11 = Ok(row0, kk1 + 1, d) ? s11 * d.Scale : -1e30f;
-            float x12 = Ok(row1, kk1, d) ? s12 * d.Scale : -1e30f, x13 = Ok(row1, kk1 + 1, d) ? s13 * d.Scale : -1e30f;
-            int kk2 = kb + 16 + 2 * t;
-            float x20 = Ok(row0, kk2, d) ? s20 * d.Scale : -1e30f, x21 = Ok(row0, kk2 + 1, d) ? s21 * d.Scale : -1e30f;
-            float x22 = Ok(row1, kk2, d) ? s22 * d.Scale : -1e30f, x23 = Ok(row1, kk2 + 1, d) ? s23 * d.Scale : -1e30f;
-            int kk3 = kb + 24 + 2 * t;
-            float x30 = Ok(row0, kk3, d) ? s30 * d.Scale : -1e30f, x31 = Ok(row0, kk3 + 1, d) ? s31 * d.Scale : -1e30f;
-            float x32 = Ok(row1, kk3, d) ? s32 * d.Scale : -1e30f, x33 = Ok(row1, kk3 + 1, d) ? s33 * d.Scale : -1e30f;
-            float mn0 = MathF.Max(m0, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x00, x01), x10), x11), x20), x21), x30), x31)), mn1 = MathF.Max(m1, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x02, x03), x12), x13), x22), x23), x32), x33));
-            l0 = l0 * MathF.Exp(m0 - mn0) + (x00 <= -1e29f ? 0f : MathF.Exp(x00 - mn0)) + (x01 <= -1e29f ? 0f : MathF.Exp(x01 - mn0)) + (x10 <= -1e29f ? 0f : MathF.Exp(x10 - mn0)) + (x11 <= -1e29f ? 0f : MathF.Exp(x11 - mn0)) + (x20 <= -1e29f ? 0f : MathF.Exp(x20 - mn0)) + (x21 <= -1e29f ? 0f : MathF.Exp(x21 - mn0)) + (x30 <= -1e29f ? 0f : MathF.Exp(x30 - mn0)) + (x31 <= -1e29f ? 0f : MathF.Exp(x31 - mn0));
-            l1 = l1 * MathF.Exp(m1 - mn1) + (x02 <= -1e29f ? 0f : MathF.Exp(x02 - mn1)) + (x03 <= -1e29f ? 0f : MathF.Exp(x03 - mn1)) + (x12 <= -1e29f ? 0f : MathF.Exp(x12 - mn1)) + (x13 <= -1e29f ? 0f : MathF.Exp(x13 - mn1)) + (x22 <= -1e29f ? 0f : MathF.Exp(x22 - mn1)) + (x23 <= -1e29f ? 0f : MathF.Exp(x23 - mn1)) + (x32 <= -1e29f ? 0f : MathF.Exp(x32 - mn1)) + (x33 <= -1e29f ? 0f : MathF.Exp(x33 - mn1));
-            m0 = mn0; m1 = mn1;
-            Group.Barrier();
         }
         float M0 = MathF.Max(m0, Warp.ShuffleXor(m0, 1)); M0 = MathF.Max(M0, Warp.ShuffleXor(M0, 2));
         float M1 = MathF.Max(m1, Warp.ShuffleXor(m1, 1)); M1 = MathF.Max(M1, Warp.ShuffleXor(M1, 2));
@@ -387,41 +441,95 @@ internal static class MmaFlashAttnBwd
         float dq130 = 0f, dq131 = 0f, dq132 = 0f, dq133 = 0f;
         float dq140 = 0f, dq141 = 0f, dq142 = 0f, dq143 = 0f;
         float dq150 = 0f, dq151 = 0f, dq152 = 0f, dq153 = 0f;
-        for (int kb = kBeg; kb < kEnd; kb += 32)
         {
-            { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            Group.Barrier();
+            uint kr0 = 0u, kr1 = 0u, kr2 = 0u, kr3 = 0u, kr4 = 0u, kr5 = 0u, kr6 = 0u, kr7 = 0u, kr8 = 0u, kr9 = 0u, kr10 = 0u, kr11 = 0u, kr12 = 0u, kr13 = 0u, kr14 = 0u, kr15 = 0u;
+            uint vr0 = 0u, vr1 = 0u, vr2 = 0u, vr3 = 0u, vr4 = 0u, vr5 = 0u, vr6 = 0u, vr7 = 0u, vr8 = 0u, vr9 = 0u, vr10 = 0u, vr11 = 0u, vr12 = 0u, vr13 = 0u, vr14 = 0u, vr15 = 0u;
+            { int idx = 0 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 128 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 256 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 384 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 512 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 640 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 768 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 896 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1024 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1152 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1280 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1408 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1536 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1664 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1792 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1920 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+            for (int kb = kBeg; kb < kEnd; kb += 32)
+            {
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr0; vs[sidx] = vr0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr1; vs[sidx] = vr1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr2; vs[sidx] = vr2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr3; vs[sidx] = vr3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr4; vs[sidx] = vr4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr5; vs[sidx] = vr5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr6; vs[sidx] = vr6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr7; vs[sidx] = vr7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr8; vs[sidx] = vr8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr9; vs[sidx] = vr9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr10; vs[sidx] = vr10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr11; vs[sidx] = vr11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr12; vs[sidx] = vr12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr13; vs[sidx] = vr13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr14; vs[sidx] = vr14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr15; vs[sidx] = vr15; }
+                Group.Barrier();
+                if (kb + 32 < kEnd)
+                {
+                    { int idx = 0 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 128 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 256 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 384 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 512 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 640 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 768 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 896 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1024 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1152 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1280 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1408 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1536 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1664 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1792 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1920 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+                }
             float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
             float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
             float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
@@ -1049,6 +1157,7 @@ internal static class MmaFlashAttnBwd
                 }
             }
             Group.Barrier();
+            }
         }
         if (r0ok) { dq[f0 + 0 + 2 * t] = dq00; dq[f0 + 0 + 2 * t + 1] = dq01; }
         if (r1ok) { dq[f1 + 0 + 2 * t] = dq02; dq[f1 + 0 + 2 * t + 1] = dq03; }
@@ -2145,414 +2254,468 @@ internal static class MmaFlashAttnBwd
         if (d.Window > 0) kBeg = Math.Max(0, qLo + d.KvOffset - d.Window + 1) / 32 * 32;
 
         float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;
-        for (int kb = kBeg; kb < kEnd; kb += 32)
         {
-            { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; }
-            Group.Barrier();
-            float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
-            float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
-            float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
-            float s30 = 0f, s31 = 0f, s32 = 0f, s33 = 0f;
+            uint kr0 = 0u, kr1 = 0u, kr2 = 0u, kr3 = 0u, kr4 = 0u, kr5 = 0u, kr6 = 0u, kr7 = 0u, kr8 = 0u, kr9 = 0u, kr10 = 0u, kr11 = 0u, kr12 = 0u, kr13 = 0u, kr14 = 0u, kr15 = 0u;
+            { int idx = 0 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr0 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 128 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr1 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 256 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr2 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 384 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr3 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 512 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr4 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 640 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr5 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 768 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr6 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 896 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr7 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1024 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr8 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1152 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr9 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1280 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr10 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1408 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr11 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1536 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr12 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1664 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr13 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1792 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr14 = gk < d.SeqKV ? K16[src] : 0u; }
+            { int idx = 1920 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr15 = gk < d.SeqKV ? K16[src] : 0u; }
+            for (int kb = kBeg; kb < kEnd; kb += 32)
             {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 0]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 0]));
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr15; }
+                Group.Barrier();
+                if (kb + 32 < kEnd)
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    { int idx = 0 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr0 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 128 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr1 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 256 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr2 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 384 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr3 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 512 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr4 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 640 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr5 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 768 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr6 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 896 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr7 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1024 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr8 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1152 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr9 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1280 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr10 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1408 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr11 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1536 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr12 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1664 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr13 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1792 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr14 = gk < d.SeqKV ? K16[src] : 0u; }
+                    { int idx = 1920 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr15 = gk < d.SeqKV ? K16[src] : 0u; }
+                }
+                float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
+                float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
+                float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
+                float s30 = 0f, s31 = 0f, s32 = 0f, s33 = 0f;
+                {
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 0]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 0]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa02, qa03, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa02, qa03, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa02, qa03, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa00, qa01, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa02, qa03, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa02, qa03, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 8]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 8]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa12, qa13, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa12, qa13, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa12, qa13, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa10, qa11, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa12, qa13, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 16]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 16]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa22, qa23, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa22, qa23, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa22, qa23, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa20, qa21, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa22, qa23, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa02, qa03, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 24]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 24]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa32, qa33, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa32, qa33, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa32, qa33, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa30, qa31, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa32, qa33, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 32]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 32]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa42, qa43, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa42, qa43, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa42, qa43, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa40, qa41, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa42, qa43, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa02, qa03, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 40]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 40]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa52, qa53, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa52, qa53, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa52, qa53, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa50, qa51, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa52, qa53, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa00, qa01, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 48]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 48]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa62, qa63, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa62, qa63, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa62, qa63, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa60, qa61, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa62, qa63, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
                 {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa02, qa03, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 56]));
+                    CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 56]));
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, b00, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa72, qa73, b01, s00, s01, s02, s03);
+                    s00 = d0; s01 = d1; s02 = d2; s03 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, b10, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa72, qa73, b11, s10, s11, s12, s13);
+                    s10 = d0; s11 = d1; s12 = d2; s13 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, b20, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa72, qa73, b21, s20, s21, s22, s23);
+                    s20 = d0; s21 = d1; s22 = d2; s23 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa70, qa71, b30, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
+                    {
+                    CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
+                        out float d0, out float d1, out float d2, out float d3, qa72, qa73, b31, s30, s31, s32, s33);
+                    s30 = d0; s31 = d1; s32 = d2; s33 = d3;
+                    }
                 }
+                int kk0 = kb + 0 + 2 * t;
+                float x00 = Ok(row0, kk0, d) ? s00 * d.Scale : -1e30f, x01 = Ok(row0, kk0 + 1, d) ? s01 * d.Scale : -1e30f;
+                float x02 = Ok(row1, kk0, d) ? s02 * d.Scale : -1e30f, x03 = Ok(row1, kk0 + 1, d) ? s03 * d.Scale : -1e30f;
+                int kk1 = kb + 8 + 2 * t;
+                float x10 = Ok(row0, kk1, d) ? s10 * d.Scale : -1e30f, x11 = Ok(row0, kk1 + 1, d) ? s11 * d.Scale : -1e30f;
+                float x12 = Ok(row1, kk1, d) ? s12 * d.Scale : -1e30f, x13 = Ok(row1, kk1 + 1, d) ? s13 * d.Scale : -1e30f;
+                int kk2 = kb + 16 + 2 * t;
+                float x20 = Ok(row0, kk2, d) ? s20 * d.Scale : -1e30f, x21 = Ok(row0, kk2 + 1, d) ? s21 * d.Scale : -1e30f;
+                float x22 = Ok(row1, kk2, d) ? s22 * d.Scale : -1e30f, x23 = Ok(row1, kk2 + 1, d) ? s23 * d.Scale : -1e30f;
+                int kk3 = kb + 24 + 2 * t;
+                float x30 = Ok(row0, kk3, d) ? s30 * d.Scale : -1e30f, x31 = Ok(row0, kk3 + 1, d) ? s31 * d.Scale : -1e30f;
+                float x32 = Ok(row1, kk3, d) ? s32 * d.Scale : -1e30f, x33 = Ok(row1, kk3 + 1, d) ? s33 * d.Scale : -1e30f;
+                float mn0 = MathF.Max(m0, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x00, x01), x10), x11), x20), x21), x30), x31)), mn1 = MathF.Max(m1, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x02, x03), x12), x13), x22), x23), x32), x33));
+                l0 = l0 * MathF.Exp(m0 - mn0) + (x00 <= -1e29f ? 0f : MathF.Exp(x00 - mn0)) + (x01 <= -1e29f ? 0f : MathF.Exp(x01 - mn0)) + (x10 <= -1e29f ? 0f : MathF.Exp(x10 - mn0)) + (x11 <= -1e29f ? 0f : MathF.Exp(x11 - mn0)) + (x20 <= -1e29f ? 0f : MathF.Exp(x20 - mn0)) + (x21 <= -1e29f ? 0f : MathF.Exp(x21 - mn0)) + (x30 <= -1e29f ? 0f : MathF.Exp(x30 - mn0)) + (x31 <= -1e29f ? 0f : MathF.Exp(x31 - mn0));
+                l1 = l1 * MathF.Exp(m1 - mn1) + (x02 <= -1e29f ? 0f : MathF.Exp(x02 - mn1)) + (x03 <= -1e29f ? 0f : MathF.Exp(x03 - mn1)) + (x12 <= -1e29f ? 0f : MathF.Exp(x12 - mn1)) + (x13 <= -1e29f ? 0f : MathF.Exp(x13 - mn1)) + (x22 <= -1e29f ? 0f : MathF.Exp(x22 - mn1)) + (x23 <= -1e29f ? 0f : MathF.Exp(x23 - mn1)) + (x32 <= -1e29f ? 0f : MathF.Exp(x32 - mn1)) + (x33 <= -1e29f ? 0f : MathF.Exp(x33 - mn1));
+                m0 = mn0; m1 = mn1;
+                Group.Barrier();
             }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 8]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 8]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa12, qa13, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa12, qa13, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa12, qa13, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa10, qa11, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa12, qa13, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 16]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 16]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa22, qa23, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa22, qa23, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa22, qa23, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa20, qa21, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa22, qa23, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 24]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 24]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa32, qa33, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa32, qa33, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa32, qa33, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa30, qa31, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa32, qa33, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 32]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 32]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa42, qa43, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa42, qa43, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa42, qa43, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa40, qa41, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa42, qa43, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 40]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 40]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa52, qa53, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa52, qa53, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa52, qa53, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa50, qa51, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa52, qa53, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 48]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 48]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa62, qa63, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa62, qa63, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa62, qa63, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa60, qa61, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa62, qa63, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            {
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref ks[(0 + 0) * 68 + lB + 56]));
-                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b20, out uint b21, out uint b30, out uint b31, (ulong)Unsafe.AsPointer(ref ks[(0 + 16) * 68 + lB + 56]));
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, b00, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa72, qa73, b01, s00, s01, s02, s03);
-                s00 = d0; s01 = d1; s02 = d2; s03 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, b10, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa72, qa73, b11, s10, s11, s12, s13);
-                s10 = d0; s11 = d1; s12 = d2; s13 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, b20, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa72, qa73, b21, s20, s21, s22, s23);
-                s20 = d0; s21 = d1; s22 = d2; s23 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa70, qa71, b30, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-                {
-                CudaAsm.Emit("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};",
-                    out float d0, out float d1, out float d2, out float d3, qa72, qa73, b31, s30, s31, s32, s33);
-                s30 = d0; s31 = d1; s32 = d2; s33 = d3;
-                }
-            }
-            int kk0 = kb + 0 + 2 * t;
-            float x00 = Ok(row0, kk0, d) ? s00 * d.Scale : -1e30f, x01 = Ok(row0, kk0 + 1, d) ? s01 * d.Scale : -1e30f;
-            float x02 = Ok(row1, kk0, d) ? s02 * d.Scale : -1e30f, x03 = Ok(row1, kk0 + 1, d) ? s03 * d.Scale : -1e30f;
-            int kk1 = kb + 8 + 2 * t;
-            float x10 = Ok(row0, kk1, d) ? s10 * d.Scale : -1e30f, x11 = Ok(row0, kk1 + 1, d) ? s11 * d.Scale : -1e30f;
-            float x12 = Ok(row1, kk1, d) ? s12 * d.Scale : -1e30f, x13 = Ok(row1, kk1 + 1, d) ? s13 * d.Scale : -1e30f;
-            int kk2 = kb + 16 + 2 * t;
-            float x20 = Ok(row0, kk2, d) ? s20 * d.Scale : -1e30f, x21 = Ok(row0, kk2 + 1, d) ? s21 * d.Scale : -1e30f;
-            float x22 = Ok(row1, kk2, d) ? s22 * d.Scale : -1e30f, x23 = Ok(row1, kk2 + 1, d) ? s23 * d.Scale : -1e30f;
-            int kk3 = kb + 24 + 2 * t;
-            float x30 = Ok(row0, kk3, d) ? s30 * d.Scale : -1e30f, x31 = Ok(row0, kk3 + 1, d) ? s31 * d.Scale : -1e30f;
-            float x32 = Ok(row1, kk3, d) ? s32 * d.Scale : -1e30f, x33 = Ok(row1, kk3 + 1, d) ? s33 * d.Scale : -1e30f;
-            float mn0 = MathF.Max(m0, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x00, x01), x10), x11), x20), x21), x30), x31)), mn1 = MathF.Max(m1, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(x02, x03), x12), x13), x22), x23), x32), x33));
-            l0 = l0 * MathF.Exp(m0 - mn0) + (x00 <= -1e29f ? 0f : MathF.Exp(x00 - mn0)) + (x01 <= -1e29f ? 0f : MathF.Exp(x01 - mn0)) + (x10 <= -1e29f ? 0f : MathF.Exp(x10 - mn0)) + (x11 <= -1e29f ? 0f : MathF.Exp(x11 - mn0)) + (x20 <= -1e29f ? 0f : MathF.Exp(x20 - mn0)) + (x21 <= -1e29f ? 0f : MathF.Exp(x21 - mn0)) + (x30 <= -1e29f ? 0f : MathF.Exp(x30 - mn0)) + (x31 <= -1e29f ? 0f : MathF.Exp(x31 - mn0));
-            l1 = l1 * MathF.Exp(m1 - mn1) + (x02 <= -1e29f ? 0f : MathF.Exp(x02 - mn1)) + (x03 <= -1e29f ? 0f : MathF.Exp(x03 - mn1)) + (x12 <= -1e29f ? 0f : MathF.Exp(x12 - mn1)) + (x13 <= -1e29f ? 0f : MathF.Exp(x13 - mn1)) + (x22 <= -1e29f ? 0f : MathF.Exp(x22 - mn1)) + (x23 <= -1e29f ? 0f : MathF.Exp(x23 - mn1)) + (x32 <= -1e29f ? 0f : MathF.Exp(x32 - mn1)) + (x33 <= -1e29f ? 0f : MathF.Exp(x33 - mn1));
-            m0 = mn0; m1 = mn1;
-            Group.Barrier();
         }
         float M0 = MathF.Max(m0, Warp.ShuffleXor(m0, 1)); M0 = MathF.Max(M0, Warp.ShuffleXor(M0, 2));
         float M1 = MathF.Max(m1, Warp.ShuffleXor(m1, 1)); M1 = MathF.Max(M1, Warp.ShuffleXor(M1, 2));
@@ -2574,41 +2737,95 @@ internal static class MmaFlashAttnBwd
 
         // Turing: the row max of |dS| first (f16 needs a scale; a power of two per row, exact to undo)
         float rm0 = 0f, rm1 = 0f;
-        for (int kb = kBeg; kb < kEnd; kb += 32)
         {
-            { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            Group.Barrier();
+            uint kr0 = 0u, kr1 = 0u, kr2 = 0u, kr3 = 0u, kr4 = 0u, kr5 = 0u, kr6 = 0u, kr7 = 0u, kr8 = 0u, kr9 = 0u, kr10 = 0u, kr11 = 0u, kr12 = 0u, kr13 = 0u, kr14 = 0u, kr15 = 0u;
+            uint vr0 = 0u, vr1 = 0u, vr2 = 0u, vr3 = 0u, vr4 = 0u, vr5 = 0u, vr6 = 0u, vr7 = 0u, vr8 = 0u, vr9 = 0u, vr10 = 0u, vr11 = 0u, vr12 = 0u, vr13 = 0u, vr14 = 0u, vr15 = 0u;
+            { int idx = 0 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 128 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 256 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 384 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 512 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 640 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 768 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 896 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1024 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1152 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1280 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1408 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1536 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1664 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1792 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1920 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+            for (int kb = kBeg; kb < kEnd; kb += 32)
+            {
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr0; vs[sidx] = vr0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr1; vs[sidx] = vr1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr2; vs[sidx] = vr2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr3; vs[sidx] = vr3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr4; vs[sidx] = vr4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr5; vs[sidx] = vr5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr6; vs[sidx] = vr6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr7; vs[sidx] = vr7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr8; vs[sidx] = vr8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr9; vs[sidx] = vr9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr10; vs[sidx] = vr10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr11; vs[sidx] = vr11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr12; vs[sidx] = vr12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr13; vs[sidx] = vr13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr14; vs[sidx] = vr14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr15; vs[sidx] = vr15; }
+                Group.Barrier();
+                if (kb + 32 < kEnd)
+                {
+                    { int idx = 0 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 128 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 256 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 384 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 512 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 640 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 768 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 896 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1024 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1152 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1280 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1408 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1536 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1664 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1792 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1920 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+                }
             float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
             float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
             float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
@@ -3344,6 +3561,7 @@ internal static class MmaFlashAttnBwd
             rm0 = MathF.Max(rm0, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Abs(g00), MathF.Abs(g01)), MathF.Abs(g10)), MathF.Abs(g11)), MathF.Abs(g20)), MathF.Abs(g21)), MathF.Abs(g30)), MathF.Abs(g31)));
             rm1 = MathF.Max(rm1, MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Max(MathF.Abs(g02), MathF.Abs(g03)), MathF.Abs(g12)), MathF.Abs(g13)), MathF.Abs(g22)), MathF.Abs(g23)), MathF.Abs(g32)), MathF.Abs(g33)));
             Group.Barrier();
+            }
         }
         rm0 = MathF.Max(rm0, Warp.ShuffleXor(rm0, 1)); rm0 = MathF.Max(rm0, Warp.ShuffleXor(rm0, 2));
         rm1 = MathF.Max(rm1, Warp.ShuffleXor(rm1, 1)); rm1 = MathF.Max(rm1, Warp.ShuffleXor(rm1, 2));
@@ -3366,41 +3584,95 @@ internal static class MmaFlashAttnBwd
         float dq130 = 0f, dq131 = 0f, dq132 = 0f, dq133 = 0f;
         float dq140 = 0f, dq141 = 0f, dq142 = 0f, dq143 = 0f;
         float dq150 = 0f, dq151 = 0f, dq152 = 0f, dq153 = 0f;
-        for (int kb = kBeg; kb < kEnd; kb += 32)
         {
-            { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gk = kb + r; long src = ((long)gk * d.KvHeads + hk) * 64 + c;
-              ks[r * 68 + c] = gk < d.SeqKV ? K16[src] : 0u; vs[r * 68 + c] = gk < d.SeqKV ? V16[src] : 0u; }
-            Group.Barrier();
+            uint kr0 = 0u, kr1 = 0u, kr2 = 0u, kr3 = 0u, kr4 = 0u, kr5 = 0u, kr6 = 0u, kr7 = 0u, kr8 = 0u, kr9 = 0u, kr10 = 0u, kr11 = 0u, kr12 = 0u, kr13 = 0u, kr14 = 0u, kr15 = 0u;
+            uint vr0 = 0u, vr1 = 0u, vr2 = 0u, vr3 = 0u, vr4 = 0u, vr5 = 0u, vr6 = 0u, vr7 = 0u, vr8 = 0u, vr9 = 0u, vr10 = 0u, vr11 = 0u, vr12 = 0u, vr13 = 0u, vr14 = 0u, vr15 = 0u;
+            { int idx = 0 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 128 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 256 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 384 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 512 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 640 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 768 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 896 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1024 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1152 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1280 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1408 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1536 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1664 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1792 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+            { int idx = 1920 + tid; int gk = kBeg + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+              kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+            for (int kb = kBeg; kb < kEnd; kb += 32)
+            {
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr0; vs[sidx] = vr0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr1; vs[sidx] = vr1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr2; vs[sidx] = vr2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr3; vs[sidx] = vr3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr4; vs[sidx] = vr4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr5; vs[sidx] = vr5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr6; vs[sidx] = vr6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr7; vs[sidx] = vr7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr8; vs[sidx] = vr8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr9; vs[sidx] = vr9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr10; vs[sidx] = vr10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr11; vs[sidx] = vr11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr12; vs[sidx] = vr12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr13; vs[sidx] = vr13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr14; vs[sidx] = vr14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); ks[sidx] = kr15; vs[sidx] = vr15; }
+                Group.Barrier();
+                if (kb + 32 < kEnd)
+                {
+                    { int idx = 0 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr0 = gk < d.SeqKV ? K16[src] : 0u; vr0 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 128 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr1 = gk < d.SeqKV ? K16[src] : 0u; vr1 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 256 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr2 = gk < d.SeqKV ? K16[src] : 0u; vr2 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 384 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr3 = gk < d.SeqKV ? K16[src] : 0u; vr3 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 512 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr4 = gk < d.SeqKV ? K16[src] : 0u; vr4 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 640 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr5 = gk < d.SeqKV ? K16[src] : 0u; vr5 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 768 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr6 = gk < d.SeqKV ? K16[src] : 0u; vr6 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 896 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr7 = gk < d.SeqKV ? K16[src] : 0u; vr7 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1024 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr8 = gk < d.SeqKV ? K16[src] : 0u; vr8 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1152 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr9 = gk < d.SeqKV ? K16[src] : 0u; vr9 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1280 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr10 = gk < d.SeqKV ? K16[src] : 0u; vr10 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1408 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr11 = gk < d.SeqKV ? K16[src] : 0u; vr11 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1536 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr12 = gk < d.SeqKV ? K16[src] : 0u; vr12 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1664 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr13 = gk < d.SeqKV ? K16[src] : 0u; vr13 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1792 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr14 = gk < d.SeqKV ? K16[src] : 0u; vr14 = gk < d.SeqKV ? V16[src] : 0u; }
+                    { int idx = 1920 + tid; int gk = kb + 32 + (idx >> 6); long src = ((long)gk * d.KvHeads + hk) * 64 + (idx & 63);
+                      kr15 = gk < d.SeqKV ? K16[src] : 0u; vr15 = gk < d.SeqKV ? V16[src] : 0u; }
+                }
             float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
             float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
             float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
@@ -4508,6 +4780,7 @@ internal static class MmaFlashAttnBwd
                 }
             }
             Group.Barrier();
+            }
         }
         if (r0ok) { dq[f0 + 0 + 2 * t] = dq00 * irs0; dq[f0 + 0 + 2 * t + 1] = dq01 * irs0; }
         if (r1ok) { dq[f1 + 0 + 2 * t] = dq02 * irs1; dq[f1 + 0 + 2 * t + 1] = dq03 * irs1; }
