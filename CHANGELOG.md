@@ -2,9 +2,10 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (master) - LoRA training another 1.9x faster; Turing tensor cores; fused attention backward
+## 5.8.3 - 2026-11-05 (nuget.org) - LoRA training 2.5x faster again (12x since this morning's 5.8.2 baseline); Turing; faster prefill
 
-Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
+Stable. Full sweep 7513 passed, 0 failed. On SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory
+addresses for `ldmatrix` / `cp.async`) and SpawnDev.SpawnJS 3.0.8.
 
 - **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.78 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
