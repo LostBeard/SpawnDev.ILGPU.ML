@@ -37,7 +37,7 @@ public sealed partial class BackwardKernels
     private MemoryBuffer1D<float, Stride1D.Dense>? _tS, _tdP, _tT, _tScOne, _tScDo, _tScDs, _tScDv;
     private MemoryBuffer1D<int, Stride1D.Dense>? _tMaxDo, _tMaxDs;
     private Action<Index1D, FV, HV16, Pack16Dims, FV>? _pack16;
-    private Action<Index1D, FV, FV, FV, FV, AttnDims, int, int>? _tStats;
+    private Action<KernelConfig, FV, FV, FV, FV, AttnDims, int, int>? _tStats;
     private Action<Index1D, FV, FV, AttnDims, int, int>? _tP;
     private Action<Index1D, FV, FV, FV, AttnDims, int, int>? _tDs;
     private Action<KernelConfig, FV, FV, int, int, int, int>? _tTranspose;
@@ -121,7 +121,7 @@ public sealed partial class BackwardKernels
         _tMaxDo ??= _acc.Allocate1D<int>(1); _tMaxDs ??= _acc.Allocate1D<int>(1);
         _gPack ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, PackDims>(PackImpl);
         _pack16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV16, Pack16Dims, FV>(Pack16Impl);
-        _tStats ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, AttnDims, int, int>(TcStatsImpl);
+        _tStats ??= _acc.LoadStreamKernel<FV, FV, FV, FV, AttnDims, int, int>(TcStatsImpl);
         _tP ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, AttnDims, int, int>(TcPImpl);
         _tDs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, AttnDims, int, int>(TcDsImpl);
         _tTranspose ??= _acc.LoadStreamKernel<FV, FV, int, int, int, int>(TransposePadImpl);
@@ -148,7 +148,7 @@ public sealed partial class BackwardKernels
             _pack16((int)((long)hc * Sqp * hd), dout, dOTb.View, p16q, _tScDo.View);
             for (int c = 0; c < hc; c++)                                               // S = Q K^T  [Sq, Skvp]
                 Mma(turing, At(Qh.View, (long)c * Sq * hd), At(Kb.View, (long)c * Skvp * hd), At(S.View, (long)c * Sq * Skvp), _tScOne.View, Sq, hd, Skvp);
-            _tStats(hc * Sq, S.View, dout, outp, stats, d, h0, Skvp);                 // lse and D per row
+            _tStats(new KernelConfig(hc * Sq, StatsThreads), S.View, dout, outp, stats, d, h0, Skvp);   // lse and D per row
             _tP((int)sn, S.View, stats, d, h0, Skvp);                                   // S -> P (masked, padding 0)
             for (int c = 0; c < hc; c++)                                               // dP = dO V^T  [Sq, Skvp]
                 Mma(turing, At(dOh.View, (long)c * Sq * hd), At(Vb.View, (long)c * Skvp * hd), At(dP.View, (long)c * Sq * Skvp), _tScDo.View, Sq, hd, Skvp);
@@ -195,21 +195,55 @@ public sealed partial class BackwardKernels
     // out = { 1, sc[1] }: A unscaled, output multiplied by sc's inverse (dV = P^T (dO s)^T / s)
     private static void InvOnlyScaleImpl(Index1D i, FV sc, FV o) { o[0] = 1f; o[1] = sc[1]; }
 
-    // one thread per (chunk head c, query row i); S rows have stride Skvp; keys j >= SeqKV are padding
-    private static void TcStatsImpl(Index1D r, FV s, FV dout, FV outp, FV stats, AttnDims d, int h0, int stride)
+    private const int StatsThreads = 128;
+
+    // one group per (chunk head c, query row i): the row's max and sum of exp over the allowed keys (coalesced strided loops, shared-memory
+    // trees in a fixed order: deterministic), and D = dO . O. MEASURED 2026-11-05: a thread per row walking its own 1,600-wide row twice was
+    // most of FusedAttentionGrad's time once the GEMMs moved to tensor cores. S rows have stride Skvp; keys j >= SeqKV are padding.
+    private static void TcStatsImpl(FV s, FV dout, FV outp, FV stats, AttnDims d, int h0, int stride)
     {
+        var sh = SharedMemory.Allocate<float>(StatsThreads);
+        int r = Grid.IdxX, tid = Group.IdxX;
         int c = r / d.SeqQ, i = r - c * d.SeqQ, h = h0 + c;
-        long rowBase = (long)(int)r * stride;
+        long rowBase = (long)r * stride;
         float m = float.NegativeInfinity;
-        for (int j = 0; j < d.SeqKV; j++) if (Allowed(i, j, d)) m = MathF.Max(m, s[rowBase + j] * d.Scale);
+        for (int j = tid; j < d.SeqKV; j += StatsThreads) if (Allowed(i, j, d)) m = MathF.Max(m, s[rowBase + j] * d.Scale);
+        sh[tid] = m;
+        Group.Barrier();
+        for (int w = StatsThreads / 2; w > 0; w >>= 1)
+        {
+            if (tid < w) sh[tid] = MathF.Max(sh[tid], sh[tid + w]);
+            Group.Barrier();
+        }
+        float rowMax = sh[0];
+        Group.Barrier();
         float sum = 0f;
-        if (m != float.NegativeInfinity)
-            for (int j = 0; j < d.SeqKV; j++) if (Allowed(i, j, d)) sum += MathF.Exp(s[rowBase + j] * d.Scale - m);
-        stats[h * d.SeqQ + i] = m == float.NegativeInfinity ? 0f : m + MathF.Log(sum);
-        float dd = 0f;
+        if (rowMax != float.NegativeInfinity)
+            for (int j = tid; j < d.SeqKV; j += StatsThreads) if (Allowed(i, j, d)) sum += MathF.Exp(s[rowBase + j] * d.Scale - rowMax);
+        sh[tid] = sum;
+        Group.Barrier();
+        for (int w = StatsThreads / 2; w > 0; w >>= 1)
+        {
+            if (tid < w) sh[tid] += sh[tid + w];
+            Group.Barrier();
+        }
+        float rowSum = sh[0];
+        Group.Barrier();
         long ob = ((long)i * d.Heads + h) * d.HeadDim;
-        for (int e = 0; e < d.HeadDim; e++) dd += dout[ob + e] * outp[ob + e];
-        stats[d.Heads * d.SeqQ + h * d.SeqQ + i] = dd;
+        float dd = 0f;
+        for (int e = tid; e < d.HeadDim; e += StatsThreads) dd += dout[ob + e] * outp[ob + e];
+        sh[tid] = dd;
+        Group.Barrier();
+        for (int w = StatsThreads / 2; w > 0; w >>= 1)
+        {
+            if (tid < w) sh[tid] += sh[tid + w];
+            Group.Barrier();
+        }
+        if (tid == 0)
+        {
+            stats[h * d.SeqQ + i] = rowMax == float.NegativeInfinity ? 0f : rowMax + MathF.Log(rowSum);
+            stats[d.Heads * d.SeqQ + h * d.SeqQ + i] = sh[0];
+        }
     }
 
     private static void TcPImpl(Index1D idx, FV s, FV stats, AttnDims d, int h0, int stride)
