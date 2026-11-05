@@ -1880,6 +1880,30 @@ public class FusedDequantMatMul : IDisposable
     /// layout (210B/256: [ql:128][qh:64][scales:16×int8][d:fp16@208], two 128-elem halves). Used by the
     /// M==1 GEMV. PURE INTEGER ARITHMETIC + the branchless HalfToFloatFinite (no branches/selects), same
     /// WebGL-emitter discipline as DecodeQ4KElement.</summary>
+    /// <summary>
+    /// Four consecutive Q6_K values (col a multiple of 4: one variant, one scale): d and the scale are read once. Each value is
+    /// <c>(d * sc) * q</c>, the same expression and order as <see cref="DecodeQ6KElement"/>: bit-identical. Super-blocks are 210 bytes (2-byte
+    /// aligned), so the quant bytes are read one by one.
+    /// </summary>
+    internal static void DecodeQ6KRun4(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col, out float v0, out float v1, out float v2, out float v3)
+    {
+        int sbOff = rowByteBase + (col >> 8) * 210;
+        int r = col & 255;
+        int half = r >> 7, rh = r & 127, variant = rh >> 5, l = rh & 31;
+        int qlB = sbOff + 64 * half + l + (variant & 1) * 32;
+        int qhB = sbOff + 128 + 32 * half + l;
+        int isHigh = variant >> 1, qsh = 2 * variant;
+        int sc = SignExtend8(ReadByte(w, sbOff + 192 + 8 * half + (l >> 4) + 2 * variant));
+        float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+        float ds = d * sc;
+        int b0 = ReadByte(w, qlB), b1 = ReadByte(w, qlB + 1), b2 = ReadByte(w, qlB + 2), b3 = ReadByte(w, qlB + 3);
+        int h0 = ReadByte(w, qhB), h1 = ReadByte(w, qhB + 1), h2 = ReadByte(w, qhB + 2), h3 = ReadByte(w, qhB + 3);
+        v0 = ds * (((isHigh == 1 ? b0 >> 4 : b0 & 0xF) | (((h0 >> qsh) & 3) << 4)) - 32);
+        v1 = ds * (((isHigh == 1 ? b1 >> 4 : b1 & 0xF) | (((h1 >> qsh) & 3) << 4)) - 32);
+        v2 = ds * (((isHigh == 1 ? b2 >> 4 : b2 & 0xF) | (((h2 >> qsh) & 3) << 4)) - 32);
+        v3 = ds * (((isHigh == 1 ? b3 >> 4 : b3 & 0xF) | (((h3 >> qsh) & 3) << 4)) - 32);
+    }
+
     internal static float DecodeQ6KElement(
         ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
     {
@@ -2545,6 +2569,35 @@ public class FusedDequantMatMul : IDisposable
     /// zero branches AND zero selects: a single ternary in a dynamic-loop body multiplies
     /// the WebGL GLSL emitter's block duplication (5 selects here = 4.7MB of GLSL;
     /// this form ≈ 60KB; measured 2026-06-11 - see the kernel SHAPE WARNING above).</summary>
+    /// <summary>
+    /// Four consecutive Q4_K values (col a multiple of 4: one sub-block, one nibble word): the header and the sub-block scale / min are read
+    /// once. Each value is <c>(d * sc) * q - dmin * m</c>, the same expression and order as <see cref="DecodeQ4KElement"/>: bit-identical.
+    /// </summary>
+    internal static void DecodeQ4KRun4(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col, out float v0, out float v1, out float v2, out float v3)
+    {
+        int sbOff = rowByteBase + (col >> 8) * 144;
+        int r = col & 255;
+        int t = r >> 6, c = r & 63, l = c & 31, hi = (c >> 5) & 1;
+        float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+        float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+        int scOff = sbOff + 4;
+        int j = 2 * t + hi;
+        int lowBit = ((j - 4) >> 31) & 1;
+        int hiBit = 1 - lowBit;
+        int bj = ReadByte(w, scOff + j);
+        int bj4 = ReadByte(w, scOff + j + 4);
+        int bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+        int sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+        int mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+        float ds = d * sc, dm = dmin * mn;
+        int word = w[(sbOff + 16 + 32 * t + l) >> 2];   // 4 bytes, 4-aligned: l is a multiple of 4, rows are 16-byte multiples
+        int sh = 4 * hi;
+        v0 = ds * ((word >> sh) & 0xF) - dm;
+        v1 = ds * ((word >> (8 + sh)) & 0xF) - dm;
+        v2 = ds * ((word >> (16 + sh)) & 0xF) - dm;
+        v3 = ds * ((word >> (24 + sh)) & 0xF) - dm;
+    }
+
     internal static float DecodeQ4KElement(
         ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
     {

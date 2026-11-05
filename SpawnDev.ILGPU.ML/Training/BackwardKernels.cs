@@ -529,10 +529,26 @@ public sealed partial class BackwardKernels : IDisposable
         int t = Grid.IdxX;
         int n0 = (t / tilesK) * 32, k0 = (t % tilesK) * 32;
         int tx = Group.IdxX & 31, ty = Group.IdxX >> 5;
-        for (int r = 0; r < 4; r++)
+        if (code == 4 || code == 5)
         {
-            int nn = ty + 8 * r, n = n0 + nn, k = k0 + tx;
-            sh[nn * 33 + tx] = n < N && k < K ? Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k) : 0f;
+            // Q4_K / Q6_K: each thread decodes 4 consecutive values of one row with the scale read once (DecodeQ4KRun4 / Q6KRun4, bit-identical to
+            // the per-element decode). MEASURED 2026-11-05: the per-element decode made this pass 273 ms of an 8B training step.
+            int nn = Group.IdxX >> 3, kk = (Group.IdxX & 7) * 4, n = n0 + nn, k = k0 + kk;
+            float d0 = 0f, d1 = 0f, d2 = 0f, d3 = 0f;
+            if (n < N && k + 3 < K)
+            {
+                if (code == 4) Kernels.FusedDequantMatMul.DecodeQ4KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
+                else Kernels.FusedDequantMatMul.DecodeQ6KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
+            }
+            sh[nn * 33 + kk] = d0; sh[nn * 33 + kk + 1] = d1; sh[nn * 33 + kk + 2] = d2; sh[nn * 33 + kk + 3] = d3;
+        }
+        else
+        {
+            for (int r = 0; r < 4; r++)
+            {
+                int nn = ty + 8 * r, n = n0 + nn, k = k0 + tx;
+                sh[nn * 33 + tx] = n < N && k < K ? Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k) : 0f;
+            }
         }
         Group.Barrier();
         for (int r = 0; r < 4; r++)
