@@ -59,9 +59,53 @@ public sealed partial class BackwardKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(RMSNormImpl);
         // ONE binding for both statistics (stats[row] = rstd, stats[rows + row] = the mean term): WebGPU forbids two views of
         // one buffer in a dispatch (MEASURED: "Storage buffer aliasing detected"), and sub-view offsets need 256-byte alignment.
-        _rmsRstd(rows, x, scratch, C, eps);
-        _rmsMean(rows, x, w, dy, scratch, C, rows);
+        if (UseGroupRowStats && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= RowStatsThreads)
+        {
+            _rmsStatsGroup ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, float>(RMSStatsGroupImpl);
+            _rmsStatsGroup(new KernelConfig(rows, RowStatsThreads), x, w, dy, scratch, C, rows, eps);
+        }
+        else
+        {
+            _rmsRstd(rows, x, scratch, C, eps);
+            _rmsMean(rows, x, w, dy, scratch, C, rows);
+        }
         _rmsNorm(rows * C, x, w, dy, scratch, dx, C, rows);
+    }
+
+    /// <summary>
+    /// RMSNorm backward statistics with one group per row (default on, not WebGL; false = a thread per row, the A/B control and WebGL's path).
+    /// MEASURED 2026-11-05 (llama3.1:8b, 1,600 tokens): the thread-per-row passes walked 4,096 values each with only 1,600 threads and took
+    /// 247 ms per step for ~0.4 G values.
+    /// </summary>
+    public static bool UseGroupRowStats { get; set; } = true;
+    private const int RowStatsThreads = 256;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, float>? _rmsStatsGroup;
+
+    // stats[row] = rstd, stats[rows + row] = mean(xhat * w * dy): the group strides the row (coalesced) and reduces in shared memory (fixed order)
+    private static void RMSStatsGroupImpl(ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> dy,
+        ArrayView1D<float, Stride1D.Dense> stats, int C, int rows, float eps)
+    {
+        var sh = SharedMemory.Allocate<float>(RowStatsThreads);
+        var sh2 = SharedMemory.Allocate<float>(RowStatsThreads);
+        int row = Grid.IdxX, tid = Group.IdxX;
+        long b = (long)row * C;
+        float ss = 0f, dot = 0f;
+        for (int c = tid; c < C; c += RowStatsThreads) { float v = x[b + c]; ss += v * v; dot += v * w[c] * dy[b + c]; }
+        sh[tid] = ss; sh2[tid] = dot;
+        Group.Barrier();
+        for (int s = RowStatsThreads / 2; s > 0; s >>= 1)
+        {
+            if (tid < s) { sh[tid] += sh[tid + s]; sh2[tid] += sh2[tid + s]; }
+            Group.Barrier();
+        }
+        if (tid == 0)
+        {
+            float r = 1f / MathF.Sqrt(sh[0] / C + eps);
+            stats[row] = r;
+            stats[rows + row] = sh2[0] * r / C;   // sum(x * r * w * dy) / C
+        }
     }
 
     private static void RMSRstdImpl(Index1D row, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> rstd, int C, float eps)
