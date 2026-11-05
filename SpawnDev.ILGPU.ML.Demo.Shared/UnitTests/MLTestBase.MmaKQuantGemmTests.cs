@@ -30,12 +30,16 @@ public abstract partial class MLTestBase
         var act = new ActivationKernels(accelerator);
         var notes = new List<string>();
         int scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, t75Saved = FusedDequantMatMul.EnableMmaSm75V5;
         FusedDequantMatMul.MmaScratchMinRows = 1;
+        FusedDequantMatMul.EnableMmaSm75V5 = true;   // the Turing form exists on the Turing V5 kernels
         try
         {
+            foreach (bool turing in new[] { false, true })
             foreach (var (M, K, Nff, Nout, tg, tu, td) in new[] { (300, 512, 768, 264, GGMLType.Q4_K, GGMLType.Q4_K, GGMLType.Q6_K),
                 (77, 256, 512, 512, GGMLType.Q6_K, GGMLType.Q4_K, GGMLType.Q4_K) })
             {
+                FusedDequantMatMul.ForceSm75Mma = turing;
                 var rng = new Random(301 + M + K);
                 var input = new float[M * K];
                 // small inputs: the random blocks' scales are large, and SwiGLU of O(100) values overflows f16 (the comparison must see finite values)
@@ -58,7 +62,7 @@ public abstract partial class MLTestBase
                     throw new Exception("the grouped GEMM was not taken");
                 act.SwiGLU(g.View, u.View, sv.View, M * Nff);
                 fused.Forward(sv.View, dw.View, want.View, M, Nff, Nout, td);
-                if (!fused.ForwardGateUpSwiGLUDown(inBuf.View, gw.View, tg, uw.View, tu, dw.View, td, got.View, M, K, Nff, Nout) || fused.LastGemmKernel != "mma-scratch-swiglu")
+                if (!fused.ForwardGateUpSwiGLUDown(inBuf.View, gw.View, tg, uw.View, tu, dw.View, td, got.View, M, K, Nff, Nout) || fused.LastGemmKernel != "mma-scratch-swiglu" + (turing ? "-sm75" : ""))
                     throw new Exception($"M={M} K={K} Nff={Nff}: the fused FFN GEMM was not taken ('{fused.LastGemmKernel}')");
                 await accelerator.SynchronizeAsync();
                 var a = await want.CopyToHostAsync<float>(0, (long)M * Nout);
@@ -68,10 +72,10 @@ public abstract partial class MLTestBase
                         throw new Exception($"M={M} K={K} Nff={Nff} Nout={Nout}: output {e} = {b2[e]:R}, separate {a[e]:R}");
                 int finite = a.Count(v => float.IsFinite(v) && v != 0f);
                 if (finite < a.Length * 9 / 10) throw new Exception($"only {finite} of {a.Length} outputs finite and nonzero: the comparison proves little");
-                notes.Add($"M={M} K={K} Nff={Nff} Nout={Nout} {tg}/{tu}/{td}: bitwise ({finite} finite nonzero, max |y| {a.Max(Math.Abs):G3})");
+                notes.Add($"{(turing ? "sm75 " : "")}M={M} K={K} Nff={Nff} Nout={Nout} {tg}/{tu}/{td}: bitwise ({finite} finite nonzero, max |y| {a.Max(Math.Abs):G3})");
             }
         }
-        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaSm75V5 = t75Saved; }
         return "ForwardGateUpSwiGLUDown vs group + SwiGLU + down: " + string.Join("; ", notes);
     });
 
@@ -87,12 +91,16 @@ public abstract partial class MLTestBase
         using var fused = new FusedDequantMatMul(accelerator);
         var notes = new List<string>();
         int scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, t75Saved = FusedDequantMatMul.EnableMmaSm75V5;
         FusedDequantMatMul.MmaScratchMinRows = 1;
+        FusedDequantMatMul.EnableMmaSm75V5 = true;
         try
         {
+            foreach (bool turing in new[] { false, true })
             foreach (var (M, K, parts) in new[] { (600, 1024, new[] { (GGMLType.Q4_K, 256), (GGMLType.Q6_K, 128), (GGMLType.Q4_K, 136) }),
                 (130, 512, new[] { (GGMLType.Q4_K, 264), (GGMLType.Q4_K, 264) }) })
             {
+                FusedDequantMatMul.ForceSm75Mma = turing;
                 var rng = new Random(91 + M + K);
                 var input = new float[M * K];
                 for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
@@ -118,7 +126,7 @@ public abstract partial class MLTestBase
                     }
                     bool taken = fused.ForwardGroup(inBuf.View, bufs.Select(b => b.View).ToList(), parts.Select(x => x.Item1).ToList(), parts.Select(x => x.Item2).ToList(),
                         outs.Select(o => o.View).ToList(), M, K);
-                    if (!taken || fused.LastGemmKernel != "mma-scratch-group" + parts.Length)
+                    if (!taken || fused.LastGemmKernel != "mma-scratch-group" + parts.Length + (turing ? "-sm75" : ""))
                         throw new Exception($"M={M} K={K}: the grouped GEMM was not taken (returned {taken}, ran '{fused.LastGemmKernel}')");
                     await accelerator.SynchronizeAsync();
                     for (int i = 0; i < parts.Length; i++)
@@ -128,12 +136,12 @@ public abstract partial class MLTestBase
                             if (BitConverter.SingleToInt32Bits(got[e]) != BitConverter.SingleToInt32Bits(sep[i][e]))
                                 throw new Exception($"M={M} K={K} part {i} ({parts[i].Item1}, N={parts[i].Item2}): output {e} = {got[e]:R}, separate {sep[i][e]:R}");
                     }
-                    notes.Add($"M={M} K={K} [{string.Join(", ", parts.Select(x => $"{x.Item1} {x.Item2}"))}]: bitwise");
+                    notes.Add($"{(turing ? "sm75 " : "")}M={M} K={K} [{string.Join(", ", parts.Select(x => $"{x.Item1} {x.Item2}"))}]: bitwise");
                 }
                 finally { foreach (var b in bufs) b.Dispose(); foreach (var o in outs) o.Dispose(); }
             }
         }
-        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaSm75V5 = t75Saved; }
         return "ForwardGroup vs separate scratch GEMMs: " + string.Join("; ", notes);
     });
 

@@ -559,6 +559,7 @@ for qt_ in ("q4k", "q6k"):
     dequant_f16(False, qt_)
     dequant_f16(True, qt_)
     dequant_f16(False, qt_, rows=True)
+    dequant_f16(True, qt_, rows=True)
 w("}")
 
 path = sys.argv[1]

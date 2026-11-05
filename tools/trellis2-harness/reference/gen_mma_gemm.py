@@ -724,7 +724,7 @@ kernel_packed_v5("F16", False)
 kernel_packed_v5("Bf16", False, acc=True)
 
 
-def kernel_packed_v5r(acc=False):
+def kernel_packed_v5r(acc=False, split=False, swiglu=False):
     """KernelF16Sm75PackedV5{Acc} (2026-11-05): the Turing (sm_75) form of V5: 4 warps of 64 x 64, ldmatrix fragments (sm_75 has ldmatrix),
     m16n8k8 MMAs, and register-staged double buffering instead of cp.async (sm_80+): the next tile's 16-byte chunks are loaded into registers
     before the current tile's MMAs and stored to the other shared buffer after them (one barrier per K tile)."""
@@ -732,9 +732,18 @@ def kernel_packed_v5r(acc=False):
     ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
     RW = 20
     MT5, NT5 = 4, 8
-    name = f"KernelF16Sm75PackedV5{'Acc' if acc else ''}"
+    name = f"KernelF16Sm75PackedV5{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}"
     w(f"    /// <summary>16-bit A and W (f16): C = A W^T * sc[1]{' + D' if acc else ''}; Turing V5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering). grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_75+.</summary>")
-    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    if swiglu:
+        w("    /// <summary>The gate | up GEMM with SwiGLU in the epilogue: W rows are gate and up interleaved in 8-row blocks (n-tile 2j = gate, 2j + 1 = up of")
+        w("    /// the same 8 columns), N = 2 Nff; writes f16 words S [M, Nff / 2] = cvt.rn(silu(g) u), the expression ActivationKernels.SwiGLUImpl computes")
+        w("    /// and the rounding FusedDequantMatMul.PackA16Impl applies: the down projection's packed input, bit-identical to the separate passes.</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, ArrayView<uint> S, int M, int K, int N)")
+    elif split:
+        w("    /// <summary>The same with the output columns split over three tensors: [0, N0) -> C [M, N0], [N0, N0 + N1) -> C1 [M, N1], the rest -> C2 [M, N - N0 - N1] (sibling projections of one input as one GEMM; N0, N1 multiples of 8).</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, FV C1, FV C2, int M, int K, int N, int N0, int N1)")
+    else:
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
     w("    {")
     w("        int numTilesM = (M + BM - 1) / BM;")
     w("        int tileRow = Grid.IdxX % numTilesM;")
@@ -805,12 +814,37 @@ def kernel_packed_v5r(acc=False):
     w("            Group.Barrier();")
     w("            cur = 1 - cur;")
     w("        }")
+    if swiglu:
+        w("        int Nff = N >> 1;")
+        for mt in range(MT5):
+            for j in range(NT5 // 2):
+                w("        {")
+                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int oc = ((tileCol * BN + wn * 64) >> 1) + {8 * j} + 2 * t;")
+                w("            if (oc < Nff)")
+                w("            {")
+                w(f"                if (m0 < M) S[((long)m0 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}0 * inv, c{mt}{2 * j + 1}0 * inv, c{mt}{2 * j}1 * inv, c{mt}{2 * j + 1}1 * inv);")
+                w(f"                if (m1 < M) S[((long)m1 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}2 * inv, c{mt}{2 * j + 1}2 * inv, c{mt}{2 * j}3 * inv, c{mt}{2 * j + 1}3 * inv);")
+                w("            }")
+                w("        }")
+        w("    }")
+        w("")
+        return
     for mt in range(MT5):
         for nt in range(NT5):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            if acc:
+            if split:
+                w("            if (n0 < N)")
+                w("            {")
+                w("                int seg = n0 < N0 ? 0 : (n0 < N0 + N1 ? 1 : 2);")
+                w("                int ns = seg == 0 ? N0 : (seg == 1 ? N1 : N - N0 - N1), nc = seg == 0 ? n0 : (seg == 1 ? n0 - N0 : n0 - N0 - N1);")
+                w("                var T = seg == 0 ? C : (seg == 1 ? C1 : C2);")
+                w(f"                if (m0 < M) {{ T[(long)m0 * ns + nc] = c{mt}{nt}0 * inv; if (n1 < N) T[(long)m0 * ns + nc + 1] = c{mt}{nt}1 * inv; }}")
+                w(f"                if (m1 < M) {{ T[(long)m1 * ns + nc] = c{mt}{nt}2 * inv; if (n1 < N) T[(long)m1 * ns + nc + 1] = c{mt}{nt}3 * inv; }}")
+                w("            }")
+            elif acc:
                 w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
                 w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
             else:
@@ -821,8 +855,11 @@ def kernel_packed_v5r(acc=False):
     w("")
 
 
+
 kernel_packed_v5r()
 kernel_packed_v5r(acc=True)
+kernel_packed_v5r(split=True)
+kernel_packed_v5r(swiglu=True)
 
 
 def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False):

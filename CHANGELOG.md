@@ -46,8 +46,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
     in the checkpointed forward, where nothing else reads gate / up / SwiGLU, gate and up are dequantized row-interleaved so the GEMM epilogue
     (`MmaGemm.KernelF16PackedV6SwiGLU`) writes silu(g) u as the down GEMM's packed f16 input. Bit-identical (tested bitwise; red-checked).
   - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, off until measured on a Turing card; `GGUF_GEMM_SM75_V5=1`): 64 x 64 warp
-    tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2. Through the Turing path on an RTX 4070: training
-    step 2.18 -> 2.09 s, identical loss trajectory.
+    tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2; with it on, Turing also runs the sibling-projection
+    groups and the gate | up SwiGLU epilogue (`KernelF16Sm75PackedV5Split` / `SwiGLU`). Through the Turing path on an RTX 4070: training
+    step 2.18 -> 2.02 s, identical loss trajectory.
   - **Scratch-operand K-quant GEMM** (`FusedDequantMatMul.EnableMmaScratch`, M >= 512, f16 weight <= 256 MiB): the weight is dequantized once
     to f16 with the GEMM's own decode helpers (bit-identical words), then the 16-bit V4 GEMM.
   - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing
