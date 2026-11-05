@@ -44,6 +44,49 @@ public static class GraphAutograd
     public static bool FuseGradientSums { get; set; } = true;
 
     /// <summary>
+    /// Join MatMul nodes that read the same input through 2-D initializer weights picked by <paramref name="candidate"/> (sibling projections:
+    /// q | k | v, gate | up, in the forward and in the checkpoint recompute) into MatMulGroup nodes of 2 or 3, at the first member's place. The
+    /// group runs as one GEMM where it can (MatMulGroupOperator) and as the separate MatMuls otherwise. Run after <see cref="AddBackward"/> (the
+    /// backward rules read the MatMul nodes). Returns the number of groups. Added 2026-11-05.
+    /// </summary>
+    /// <summary>GgufLoraTrainer joins sibling projections (<see cref="GroupSiblingMatMuls"/>; default on; false = separate MatMuls, the A/B control).</summary>
+    public static bool GroupSiblingProjections { get; set; } = true;
+
+    public static int GroupSiblingMatMuls(ModelGraph graph, Func<string, bool> candidate)
+    {
+        var byInput = new Dictionary<string, List<GraphNode>>();
+        foreach (var n in graph.Nodes)
+        {
+            if (n.OpType != "MatMul" || n.Inputs.Count != 2 || n.Outputs.Count != 1) continue;
+            string w = n.Inputs[1];
+            if (!candidate(w) || !graph.Initializers.TryGetValue(w, out var ws) || ws.Length != 2) continue;
+            if (!byInput.TryGetValue(n.Inputs[0], out var l)) byInput[n.Inputs[0]] = l = new List<GraphNode>();
+            l.Add(n);
+        }
+        int groups = 0;
+        foreach (var members in byInput.Values)
+        {
+            // same K only (the weights' first dim), in graph order, chunks of at most 3
+            foreach (var sameK in members.GroupBy(m => graph.Initializers[m.Inputs[1]][0]))
+            {
+                var list = sameK.ToList();
+                for (int c = 0; c + 1 < list.Count; c += 3)
+                {
+                    var chunk = list.Skip(c).Take(3).ToList();
+                    if (chunk.Count < 2) break;
+                    int at = graph.Nodes.IndexOf(chunk[0]);
+                    var group = Node("MatMulGroup", new[] { chunk[0].Inputs[0] }.Concat(chunk.Select(m => m.Inputs[1])).ToArray(),
+                        chunk.Select(m => m.Outputs[0]).ToArray());
+                    foreach (var m in chunk) graph.Nodes.Remove(m);
+                    graph.Nodes.Insert(Math.Min(at, graph.Nodes.Count), group);
+                    groups++;
+                }
+            }
+        }
+        return groups;
+    }
+
+    /// <summary>
     /// Add LoRA adapters beside the MatMuls whose weight is <c>blk.{L}.{target}.weight</c> for each target in <paramref name="targets"/>
     /// (GGUF names: attn_q, attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down): <c>y = x W + (alpha / rank) * (x A^T) B^T</c>, PEFT's
     /// semantics. A^T / B^T become f32 initializers in <paramref name="weights"/>: from <paramref name="initial"/> when it holds the PEFT tensors

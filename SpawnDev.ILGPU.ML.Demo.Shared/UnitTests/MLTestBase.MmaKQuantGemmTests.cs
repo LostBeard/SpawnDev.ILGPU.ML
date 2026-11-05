@@ -1,3 +1,4 @@
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.GGUF;
 using SpawnDev.ILGPU.ML.Kernels;
@@ -16,6 +17,68 @@ public abstract partial class MLTestBase
     /// 16 k, scalar f16 packs) on any sm_75+ card (<see cref="FusedDequantMatMul.ForceSm75Mma"/> runs them on a newer one). Added 2026-11-02 (Q4_K), Q6_K the
     /// same day.
     /// </summary>
+    /// <summary>
+    /// FusedDequantMatMul.ForwardGroup (MatMulGroup: sibling projections of one input as one scratch GEMM with the output columns split per
+    /// tensor) against separate <see cref="FusedDequantMatMul.Forward"/> calls: bitwise, for a q | k | v-like triple (Q4_K, Q6_K, Q4_K with
+    /// different widths) and a gate | up-like pair; and it must be taken (LastGemmKernel). CUDA sm_80+ (the V6 split kernel). Added 2026-11-05.
+    /// </summary>
+    [TestMethod]
+    public async Task Gemm_MmaKQuant_GroupMatchesSeparate() => await RunTest(async accelerator =>
+    {
+        if (!CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("the grouped scratch GEMM runs on CUDA sm_80+");
+        using var fused = new FusedDequantMatMul(accelerator);
+        var notes = new List<string>();
+        int scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        FusedDequantMatMul.MmaScratchMinRows = 1;
+        try
+        {
+            foreach (var (M, K, parts) in new[] { (600, 1024, new[] { (GGMLType.Q4_K, 256), (GGMLType.Q6_K, 128), (GGMLType.Q4_K, 136) }),
+                (130, 512, new[] { (GGMLType.Q4_K, 264), (GGMLType.Q4_K, 264) }) })
+            {
+                var rng = new Random(91 + M + K);
+                var input = new float[M * K];
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                using var inBuf = accelerator.Allocate1D(input);
+                var bufs = new List<MemoryBuffer1D<byte, Stride1D.Dense>>();
+                var outs = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+                var sep = new List<float[]>();
+                try
+                {
+                    foreach (var (type, N) in parts)
+                    {
+                        int rb = RowBytes(type, K);
+                        var bytes = new byte[N * rb];
+                        for (int n = 0; n < N; n++) Buffer.BlockCopy(MakeBlocks(type, K, rng), 0, bytes, n * rb, rb);
+                        var wb = AllocatePadded(accelerator, bytes);
+                        bufs.Add(wb);
+                        var ob = accelerator.Allocate1D<float>((long)M * N);
+                        outs.Add(ob);
+                        fused.Forward(inBuf.View, wb.View, ob.View, M, K, N, type);
+                        await accelerator.SynchronizeAsync();
+                        sep.Add(await ob.CopyToHostAsync<float>(0, (long)M * N));
+                        ob.MemSetToZero();
+                    }
+                    bool taken = fused.ForwardGroup(inBuf.View, bufs.Select(b => b.View).ToList(), parts.Select(x => x.Item1).ToList(), parts.Select(x => x.Item2).ToList(),
+                        outs.Select(o => o.View).ToList(), M, K);
+                    if (!taken || fused.LastGemmKernel != "mma-scratch-group" + parts.Length)
+                        throw new Exception($"M={M} K={K}: the grouped GEMM was not taken (returned {taken}, ran '{fused.LastGemmKernel}')");
+                    await accelerator.SynchronizeAsync();
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        var got = await outs[i].CopyToHostAsync<float>(0, (long)M * parts[i].Item2);
+                        for (int e = 0; e < got.Length; e++)
+                            if (BitConverter.SingleToInt32Bits(got[e]) != BitConverter.SingleToInt32Bits(sep[i][e]))
+                                throw new Exception($"M={M} K={K} part {i} ({parts[i].Item1}, N={parts[i].Item2}): output {e} = {got[e]:R}, separate {sep[i][e]:R}");
+                    }
+                    notes.Add($"M={M} K={K} [{string.Join(", ", parts.Select(x => $"{x.Item1} {x.Item2}"))}]: bitwise");
+                }
+                finally { foreach (var b in bufs) b.Dispose(); foreach (var o in outs) o.Dispose(); }
+            }
+        }
+        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        return "ForwardGroup vs separate scratch GEMMs: " + string.Join("; ", notes);
+    });
+
     [TestMethod]
     public async Task Gemm_MmaKQuant_MatchesOracle_AndIsTaken() => await RunTest(async accelerator =>
     {

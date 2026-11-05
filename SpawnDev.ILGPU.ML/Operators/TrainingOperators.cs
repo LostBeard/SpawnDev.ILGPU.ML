@@ -110,6 +110,68 @@ public class LoraLinearGradOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
+/// MatMulGroup(x, W_1, ..., W_n) -> (x W_1, ..., x W_n), n = 2 or 3: sibling projections of one input (q | k | v, gate | up) that
+/// GraphAutograd.GroupSiblingMatMuls joined. Q4_K / Q6_K weights on CUDA sm_80+ run as ONE scratch GEMM (FusedDequantMatMul.ForwardGroup:
+/// the input packed once, the weights dequantized side by side, each output's columns written to its own tensor; bit-identical to separate
+/// MatMuls); anything else runs the MatMul operator once per weight, exactly as the separate nodes did.
+/// </summary>
+public class MatMulGroupOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "MatMulGroup";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var outs = new int[inputs.Length - 1][];
+        for (int i = 1; i < inputs.Length; i++)
+        {
+            var o = (int[])inputs[0].Clone();
+            o[^1] = inputs[i][^1];
+            outs[i - 1] = o;
+        }
+        return outs;
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0];
+        int n = ctx.Inputs.Length - 1;
+        int K = ctx.Inputs[1].Shape[0];
+        int M = x.ElementCount / K;
+        if (ctx.QuantizedWeights != null && reg.QuantizedWeightTypes != null && ctx.InputNames.Length == n + 1)
+        {
+            var ws = new List<global::ILGPU.Runtime.ArrayView1D<byte, global::ILGPU.Stride1D.Dense>>();
+            var types = new List<GGUF.GGMLType>();
+            var ns = new List<int>();
+            var outs = new List<global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>>();
+            for (int i = 0; i < n; i++)
+            {
+                string w = ctx.InputNames[1 + i];
+                if (!ctx.QuantizedWeights.TryGetValue(w, out var q) || !reg.QuantizedWeightTypes.TryGetValue(w, out var t) || ctx.Inputs[1 + i].Shape[0] != K) break;
+                ws.Add(q); types.Add(t); ns.Add(ctx.Inputs[1 + i].Shape[1]); outs.Add(ctx.Outputs[i].Data);
+            }
+            if (ws.Count == n && reg.FusedDequant.ForwardGroup(x.Data, ws, types, ns, outs, M, K)) return;
+        }
+        var mm = reg.Resolve("MatMul");
+        for (int i = 0; i < n; i++)
+            mm.Execute(new OnnxOpContext
+            {
+                Inputs = new[] { x, ctx.Inputs[1 + i] },
+                Outputs = new[] { ctx.Outputs[i] },
+                Attributes = new Dictionary<string, object>(),
+                Pool = ctx.Pool,
+                Format = ctx.Format,
+                InputNames = ctx.InputNames.Length == n + 1 ? new[] { ctx.InputNames[0], ctx.InputNames[1 + i] } : Array.Empty<string>(),
+                ConstantValues = ctx.ConstantValues,
+                IsInputTainted = ctx.IsInputTainted,
+                HostValues = ctx.HostValues,
+                OutputNames = ctx.OutputNames.Length == n ? new[] { ctx.OutputNames[i] } : Array.Empty<string>(),
+                QuantizedWeights = ctx.QuantizedWeights,
+                Registry = ctx.Registry,
+                ScopeTensors = ctx.ScopeTensors,
+                IntegerTensorNames = ctx.IntegerTensorNames,
+            });
+    }
+}
+
+/// <summary>
 /// GatherRowsGrad(dy [1, n, C], positions [n], like [1, T, C]) -> dx shaped like <c>like</c>: the gradient of Gather(like, positions, axis=1)
 /// for DISTINCT positions (rows not gathered get zero).
 /// </summary>

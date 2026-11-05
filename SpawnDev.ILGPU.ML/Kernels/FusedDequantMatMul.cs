@@ -246,6 +246,65 @@ public class FusedDequantMatMul : IDisposable
     /// MatMul with a GGUF-quantized weight matrix.
     /// input [M, K] (float) × weight (raw GGUF blocks, [N rows][K contiguous]) → output [M, N].
     /// </summary>
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _f16V6Split;
+
+    /// <summary>
+    /// Sibling projections of ONE input as one GEMM (2026-11-05; MatMulGroup, see GraphAutograd.GroupSiblingMatMuls): 2 or 3 Q4_K / Q6_K weights
+    /// [N_i, K] are dequantized into one f16 scratch [sum N_i, K], the input is packed once, and MmaGemm.KernelF16PackedV6Split writes each output's
+    /// column range straight into its own tensor. Every output element accumulates the same MMAs in the same order as its own scratch GEMM:
+    /// bit-identical to separate <see cref="Forward"/> calls. Returns false (nothing launched) where it does not apply (not sm_80+, M below the
+    /// scratch threshold, a type other than Q4_K / Q6_K, alignment, the weights over <see cref="MmaScratchMaxWeightBytes"/>); the caller then
+    /// runs the projections one by one. MEASURED (RTX 4070, llama3.1:8b, 1,600 rows): k and v alone (N = 1024) filled 104 blocks, ~1.1 waves, at 31
+    /// TFLOPS; as part of q|k|v (N = 6144) they run at the big-shape rate, and q, k, v (gate, up) share one packed input.
+    /// </summary>
+    public bool ForwardGroup(ArrayView1D<float, Stride1D.Dense> input, IReadOnlyList<ArrayView1D<byte, Stride1D.Dense>> weights, IReadOnlyList<GGMLType> types,
+        IReadOnlyList<int> ns, IReadOnlyList<ArrayView1D<float, Stride1D.Dense>> outputs, int M, int K)
+    {
+        int count = weights.Count;
+        if (count < 2 || count > 3 || types.Count != count || ns.Count != count || outputs.Count != count) return false;
+        if (!EnableMmaGemm || !EnableMmaScratch || !EnableMmaV5 || !EnableMmaV6 || ForceSm75Mma || !CudaCaps.TensorCores(_accelerator)) return false;
+        if (M < MmaScratchMinRows || K % 256 != 0) return false;
+        long inByte = ((IContiguousArrayView)input.BaseView).IndexInBytes;
+        if ((inByte & 15) != 0) return false;
+        long nTot = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (ns[i] % 8 != 0) return false;
+            long wByte = ((IContiguousArrayView)weights[i].BaseView).IndexInBytes;
+            if (!((types[i] == GGMLType.Q4_K && (wByte & 15) == 0) || (types[i] == GGMLType.Q6_K && (wByte & 1) == 0))) return false;
+            nTot += ns[i];
+        }
+        if (nTot * K * 2 > MmaScratchMaxWeightBytes) return false;
+        long aWords = (long)M * K / 2, wWords = nTot * K / 2;
+        var a16 = GrowScratch(ref _scratchA16, aWords);
+        var w16 = GrowScratch(ref _scratchW16, wWords);
+        _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
+        _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
+        _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+        long rowOff = 0;
+        for (int i = 0; i < count; i++)
+        {
+            // weight i fills rows [rowOff, rowOff + N_i) of the scratch (K % 256 == 0 keeps every block 16-byte aligned)
+            var dst = w16.View.SubView(rowOff * K / 2, (long)ns[i] * K / 2).BaseView.Cast<W16>();
+            int deqCount = ns[i] * (K >> 5) * 2;
+            if (types[i] == GGMLType.Q4_K)
+                (_deqQ4K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16))(
+                    deqCount, weights[i].BaseView.Cast<W16>(), dst, ns[i], K);
+            else
+                (_deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
+                    deqCount, weights[i].BaseView.Cast<ushort>(), dst, ns[i], K);
+            rowOff += ns[i];
+        }
+        _f16V6Split ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6Split);
+        int N = (int)nTot;
+        int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        var o2 = count == 3 ? outputs[2] : outputs[1];   // the third tensor is never written with two outputs (N0 + N1 = N)
+        _f16V6Split(new KernelConfig(tiles, Trellis2.MmaGemm.V5Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, wWords).Cast<uint, Trellis2.U4>(),
+            _scratchOnes.View, outputs[0].SubView(0, (long)M * ns[0]), outputs[1].SubView(0, (long)M * ns[1]), o2, M, K, N, ns[0], count == 3 ? ns[1] : N - ns[0]);
+        LastGemmKernel = "mma-scratch-group" + count;
+        return true;
+    }
+
     public void Forward(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<byte, Stride1D.Dense> weightQuant,

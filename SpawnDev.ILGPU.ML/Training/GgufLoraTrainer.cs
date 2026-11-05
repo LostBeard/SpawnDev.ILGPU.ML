@@ -107,6 +107,10 @@ public sealed class GgufLoraTrainer : IDisposable
             Vocab = logits.Shape[^1];
             Info = GraphAutograd.AddBackward(graph, "logits", Vocab, adapters.SelectMany(a => new[] { a.AName, a.BName }).ToList(), options.IgnoreIndex,
                 options.CheckpointLayers, options.LossOnLabeledPositionsOnly);
+            // sibling projections of one input (q | k | v, gate | up) as one GEMM: the base weights the loader keeps out of the f32 dictionary
+            // (GGUF-quantized or low precision); MatMulGroup falls back to the separate MatMuls wherever one GEMM does not apply
+            // (the loader keeps those as empty placeholders: GGUFGraphBuilder's presence marker for a ShapeOnly tensor)
+            if (GraphAutograd.GroupSiblingProjections) GraphAutograd.GroupSiblingMatMuls(graph, w => !weights.TryGetValue(w, out var f) || f.Length == 0);
             Adapters = adapters;
         }
     }

@@ -825,7 +825,7 @@ kernel_packed_v5r()
 kernel_packed_v5r(acc=True)
 
 
-def kernel_packed_v6(dtype, acc=False):
+def kernel_packed_v6(dtype, acc=False, split=False):
     """Kernel{Bf16|F16}PackedV6{Acc} (2026-11-05): V5 (4 warps of 64 x 64, cp.async, ldmatrix, column-major block order) with THREE stages:
     two K tiles in flight while one computes. Rows are 64 bytes with no padding and the 16-byte chunks XOR-swizzled (chunk c of row r at
     c ^ ((r >> 1) & 3)), so the 8 row addresses of every ldmatrix 8 x 8 read land in 8 distinct bank groups and 3 stages fit the 48 KB of
@@ -837,9 +837,13 @@ def kernel_packed_v6(dtype, acc=False):
     RW = 16          # words per row: 32 halves, no padding
     ST = 3
     MT5, NT5 = 4, 8
-    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}"
+    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}{'Split' if split else ''}"
     w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
-    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    if split:
+        w("    /// <summary>The same with the output columns split over three tensors: [0, N0) -> C [M, N0], [N0, N0 + N1) -> C1 [M, N1], the rest -> C2 [M, N - N0 - N1] (sibling projections of one input as one GEMM; N0, N1 multiples of 8).</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, FV C1, FV C2, int M, int K, int N, int N0, int N1)")
+    else:
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
     w("    {")
     w("        int numTilesM = (M + BM - 1) / BM;")
     w("        int tileRow = Grid.IdxX % numTilesM;")
@@ -911,7 +915,16 @@ def kernel_packed_v6(dtype, acc=False):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            if acc:
+            if split:
+                w("            if (n0 < N)")
+                w("            {")
+                w("                int seg = n0 < N0 ? 0 : (n0 < N0 + N1 ? 1 : 2);")
+                w("                int ns = seg == 0 ? N0 : (seg == 1 ? N1 : N - N0 - N1), nc = seg == 0 ? n0 : (seg == 1 ? n0 - N0 : n0 - N0 - N1);")
+                w("                var T = seg == 0 ? C : (seg == 1 ? C1 : C2);")
+                w(f"                if (m0 < M) {{ T[(long)m0 * ns + nc] = c{mt}{nt}0 * inv; if (n1 < N) T[(long)m0 * ns + nc + 1] = c{mt}{nt}1 * inv; }}")
+                w(f"                if (m1 < M) {{ T[(long)m1 * ns + nc] = c{mt}{nt}2 * inv; if (n1 < N) T[(long)m1 * ns + nc + 1] = c{mt}{nt}3 * inv; }}")
+                w("            }")
+            elif acc:
                 w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
                 w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
             else:
@@ -925,6 +938,7 @@ def kernel_packed_v6(dtype, acc=False):
 kernel_packed_v6("Bf16")
 kernel_packed_v6("F16")
 kernel_packed_v6("Bf16", acc=True)
+kernel_packed_v6("F16", split=True)
 w("}")
 
 path = sys.argv[1]
