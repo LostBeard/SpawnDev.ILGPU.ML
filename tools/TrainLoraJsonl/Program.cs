@@ -221,7 +221,7 @@ if (dev.Count > 0 && File.Exists(Path.Combine(outDir, "adapter_model.safetensors
             w.WriteLine(JsonSerializer.Serialize(row));
         }
 }
-File.WriteAllText(Path.Combine(outDir, "train_log.json"), JsonSerializer.Serialize(log, new JsonSerializerOptions { WriteIndented = true }));
+File.WriteAllText(Path.Combine(outDir, "train_log.json"), JsonSerializer.Serialize(log, new JsonSerializerOptions { WriteIndented = true, NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals }));
 return 0;
 
 // one data line: Ids = prompt (+ target), Labels per position, PromptLen, the end-of-turn id, and what it is scored on
