@@ -21,7 +21,7 @@ public abstract partial class MLTestBase
     {
         if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core GEMMs run on CUDA sm_75+");
         var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
-        bool forceSaved = FusedDequantMatMul.ForceSm75Mma;
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2;
         using var fused = new FusedDequantMatMul(accelerator);
         var notes = new List<string>();
         try
@@ -72,12 +72,23 @@ public abstract partial class MLTestBase
             using var weightBuf = AllocatePadded(accelerator, weightBytes);
             using var inputBuf = accelerator.Allocate1D(input);
             using var outBuf = accelerator.Allocate1D<float>((long)M * N);
-            // aligned: the tensor-core kernel
-            fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
-            string route = fused.LastGemmKernel;
-            await accelerator.SynchronizeAsync();
-            var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
-            if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: an aligned GEMM ran on '{route}', not {want}");
+            // aligned: the tensor-core kernel, V1 then V2 (double-buffered, 64-bit fragment loads: the same rounding and MMA order, so bit-identical)
+            float[] got = Array.Empty<float>(); string route = "";
+            foreach (bool v2 in new[] { false, true })
+            {
+                FusedDequantMatMul.EnableMmaV2 = v2;
+                fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
+                string r = fused.LastGemmKernel;
+                await accelerator.SynchronizeAsync();
+                var g = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
+                if (r != want + (v2 ? "-v2" : "")) throw new Exception($"{type} M={M} K={K} N={N}: an aligned GEMM ran on '{r}', not {want}{(v2 ? "-v2" : "")}");
+                if (v2)
+                {
+                    int diff = 0; for (int i = 0; i < g.Length; i++) if (BitConverter.SingleToInt32Bits(g[i]) != BitConverter.SingleToInt32Bits(got[i])) diff++;
+                    if (diff > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: V2 differs from V1 in {diff} of {g.Length} outputs");
+                }
+                got = g; route = r;
+            }
             int bad = Bad(got, Oracle(0), out float worst);
             if (bad > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: {bad} of {got.Length} outputs past 2e-3 x sum|a w| (worst {worst:F2}x the bound)");
             // misaligned by one float: the SIMT kernels, the same answer
@@ -91,7 +102,7 @@ public abstract partial class MLTestBase
             notes.Add($"{type} M={M} K={K} N={N}: {route} worst {worst:F3}x the bound, {route2} {worst2:F3}x");
         }
         }
-        finally { FusedDequantMatMul.ForceSm75Mma = forceSaved; }
+        finally { FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; }
         return string.Join("; ", notes);
     });
 }

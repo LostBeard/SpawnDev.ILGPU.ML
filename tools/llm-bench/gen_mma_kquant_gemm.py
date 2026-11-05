@@ -226,10 +226,149 @@ def kernel(sm75, qt):
     w("    }")
 
 mma = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+
+
+def kernel_v2(sm75, qt):
+    """{Q4K|Q6K}{Sm75}V2 (2026-11-05): the same GEMM with (1) double-buffered shared tiles (one barrier per K tile; the next tile's global
+    loads and weight decode overlap the current tile's MMAs) and (2) 64-bit fragment loads. Each thread stages ONE row's k16 block: A as four
+    adjacent float4 (16 values), the weights as the half-sub-block it already decodes, and writes the 8 words as the pairs (w, w+4), so a0/a2,
+    a1/a3 and b0/b1 are each one ld.shared.u64. Shared rows are 10 ulongs (8 data + 2 pad). MEASURED gains: see the benchmark notes."""
+    sfx = "Sm75" if sm75 else ""
+    q6 = qt == "q6k"
+    kname = ("Q6K" if q6 else "Q4K") + sfx + "V2"
+    wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
+    RW = 10
+    w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'}, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W {'2' if q6 else '16'}-byte aligned. {'Turing (sm_75): two m16n8k8 per 16 k.' if sm75 else 'sm_80+: m16n8k16.'}</summary>")
+    w(f"    public static void {kname}(ArrayView<F4> A, {wtype} Wq, FV C, int M, int K, int N)")
+    w("    {")
+    w("        int numTilesN = (N + BN - 1) / BN;")
+    w("        int tileRow = Grid.IdxX / numTilesN;")
+    w("        int tileCol = Grid.IdxX % numTilesN;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 2, wn = warp & 3;")
+    w(f"        var aS = SharedMemory.Allocate<ulong>(2 * BM * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<ulong>(2 * BN * {RW});")
+    for mt in range(MT):
+        for nt in range(NT):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        // staging: thread = (row sr = tid >> 1, k16 block kb = tid & 1) for A; (weight row brow = tid >> 1, half bh = tid & 1) for W")
+    w("        int sr = tid >> 1, kb = tid & 1;")
+    w("        int aRg = tileRow * BM + sr; int aOk = aRg < M ? 1 : 0;")
+    w("        long aBase = (long)aRg * (K >> 2) + kb * 4;")
+    w("        int brow = tid >> 1, bh = tid & 1;")
+    w("        int bRg = tileCol * BN + brow; int bOk = bRg < N ? 1 : 0;")
+    if q6:
+        w("        long bRow = (long)bRg * ((K >> 8) * 105);                          // a super-block is 210 bytes = 105 ushorts")
+    else:
+        w("        long bRow = (long)bRg * ((K >> 8) * 9);                            // a super-block is 144 bytes = 9 W16")
+    w("        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;")
+    if q6:
+        w("        int l0 = 0, l1 = 0, l2 = 0, l3 = 0, l4 = 0, l5 = 0, l6 = 0, l7 = 0, h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0, scw = 0, dw = 0;")
+    else:
+        w("        W16 ph = default, pq = default;")
+
+    def load(kt_expr, ind):
+        w(f"{ind}if (aOk != 0) {{ long ab = aBase + (({kt_expr}) >> 2); pa0 = A.AsAligned16()[ab]; pa1 = A.AsAligned16()[ab + 1]; pa2 = A.AsAligned16()[ab + 2]; pa3 = A.AsAligned16()[ab + 3]; }}")
+        w(f"{ind}else {{ pa0 = default; pa1 = default; pa2 = default; pa3 = default; }}")
+        if q6:
+            w(f"{ind}if (bOk != 0) {{ int ktL = {kt_expr}; long sbL = bRow + (ktL >> 8) * 105; int oL = ktL & 255, nL = oL >> 7, qqL = (oL >> 5) & 3;")
+            w(f"{ind}  long qlL = sbL + 32 * nL + 16 * (qqL & 1) + 8 * bh, qhL = sbL + 64 + 16 * nL + 8 * bh;")
+            w(f"{ind}  " + " ".join(f"l{i} = Wq[qlL + {i}];" for i in range(8)))
+            w(f"{ind}  " + " ".join(f"h{i} = Wq[qhL + {i}];" for i in range(8)))
+            w(f"{ind}  scw = Wq[sbL + 96 + 4 * nL + qqL]; dw = Wq[sbL + 104]; }}")
+        else:
+            w(f"{ind}{{ int ktL = {kt_expr}; long sbL = bRow + (ktL >> 8) * 9; int jL = (ktL >> 5) & 7;")
+            w(f"{ind}  ph = bOk != 0 ? Wq.AsAligned16()[sbL] : default(W16); pq = bOk != 0 ? Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh] : default(W16); }}")
+
+    def store(kt_expr, buf_expr, ind):
+        # A: 16 floats -> 8 packed words -> pairs (w, w+4)
+        w(f"{ind}{{")
+        w(f"{ind}    uint x0 = PackF16{sfx}(pa0.A, pa0.B), x1 = PackF16{sfx}(pa0.C, pa0.D), x2 = PackF16{sfx}(pa1.A, pa1.B), x3 = PackF16{sfx}(pa1.C, pa1.D);")
+        w(f"{ind}    uint x4 = PackF16{sfx}(pa2.A, pa2.B), x5 = PackF16{sfx}(pa2.C, pa2.D), x6 = PackF16{sfx}(pa3.A, pa3.B), x7 = PackF16{sfx}(pa3.C, pa3.D);")
+        w(f"{ind}    int o = {buf_expr} * BM * {RW} + sr * {RW} + kb * 4;")
+        w(f"{ind}    aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32);")
+        w(f"{ind}}}")
+        # W: this thread's 8 decoded words of row brow, half bh (= k16 block bh of the 32-value sub-block)
+        w(f"{ind}{{")
+        if q6:
+            w(f"{ind}    int qq = (({kt_expr}) >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;")
+            w(f"{ind}    int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);")
+            w(f"{ind}    float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);   // the scale is an int8")
+            for i in range(8):
+                w(f"{ind}    uint y{i} = Q6Pair{sfx}(l{i}, h{i}, lsh, hsh, ds);")
+        else:
+            w(f"{ind}    int j = (({kt_expr}) >> 5) & 7, sh = (j & 1) * 4;")
+            w(f"{ind}    ScaleMin s = SubBlockScale(ph, j);")
+            for wi, f in enumerate("abcd"):
+                w(f"{ind}    uint y{2 * wi} = Pair{sfx}(pq.{f}, 0, sh, s), y{2 * wi + 1} = Pair{sfx}(pq.{f}, 1, sh, s);")
+        w(f"{ind}    int o = {buf_expr} * BN * {RW} + brow * {RW} + bh * 4;")
+        w(f"{ind}    bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);")
+        w(f"{ind}}}")
+
+    load("0", "        ")
+    store("0", "0", "        ")
+    w("        Group.Barrier();")
+    w("        int cur = 0;")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    w("            bool more = kt + BK < K;")
+    w("            if (more)")
+    w("            {")
+    load("kt + BK", "                ")
+    w("            }")
+    w(f"            int aOff = cur * BM * {RW}, bOff = cur * BN * {RW};")
+    w("            for (int ks = 0; ks < 2; ks++)")
+    w("            {")
+    for mt in range(MT):
+        w(f"                ulong la{mt} = aS[aOff + (wm * 64 + {mt * 16} + g) * {RW} + ks * 4 + t];")
+        w(f"                ulong lb{mt} = aS[aOff + (wm * 64 + {mt * 16} + g + 8) * {RW} + ks * 4 + t];")
+        w(f"                uint a{mt}0 = (uint)la{mt}, a{mt}2 = (uint)(la{mt} >> 32), a{mt}1 = (uint)lb{mt}, a{mt}3 = (uint)(lb{mt} >> 32);")
+    for nt in range(NT):
+        w(f"                ulong lw{nt} = bS[bOff + (wn * 32 + {nt * 8} + g) * {RW} + ks * 4 + t];")
+        w(f"                uint b{nt}0 = (uint)lw{nt}, b{nt}1 = (uint)(lw{nt} >> 32);")
+    for mt in range(MT):
+        for nt in range(NT):
+            if not sm75:
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+            else:
+                for (x0, x1, bb) in ((0, 1, 0), (2, 3, 1)):
+                    w("                {")
+                    w(f'                CudaAsm.Emit("{mma8}",')
+                    w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}{x0}, a{mt}{x1}, b{nt}{bb}, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                    w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                    w("                }")
+    w("            }")
+    w("            if (more)")
+    w("            {")
+    store("kt + BK", "(1 - cur)", "                ")
+    w("            }")
+    w("            Group.Barrier();")
+    w("            cur = 1 - cur;")
+    w("        }")
+    for mt in range(MT):
+        for nt in range(NT):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
+            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
+            w("        }")
+    w("    }")
+
 for qt_ in ("q4k", "q6k"):
     kernel(False, qt_)
     w("")
     kernel(True, qt_)
+    w("")
+    kernel_v2(False, qt_)
+    w("")
+    kernel_v2(True, qt_)
     w("")
 w("}")
 
