@@ -68,6 +68,69 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The fused LoraLinear / LoraLinearGrad ops (GraphAutograd.FusedLora, ranks that are a multiple of 8) against the four-op form (MatMul, MatMul,
+    /// Mul, Add and its autograd): the same loss, logits and every adapter gradient, at ranks 8 and 16 on all seven projection types, with and
+    /// without layer checkpointing. Both are fp32; only the summation order differs. Tiny F16 llama. Added 2026-11-05.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_FusedLora_MatchesFourOpForm() => await RunTest(async accelerator =>
+    {
+        var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var gguf = await assets.GetByteArrayAsync("test-train/tiny-llama-f16.gguf");
+        var targets = new[] { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" };
+        var notes = new List<string>();
+        bool saved = GraphAutograd.FusedLora, savedTcFwd = GraphAutograd.TensorCoreForwardAttention, savedTcBwd = BackwardKernels.UseTensorCoreAttentionBackward;
+        try
+        {
+            // fp32 attention on every backend: the bf16 tensor-core attention backward rounds dO, and a 1e-7 difference upstream (summation order)
+            // flips some of those roundings, which reads as ~1e-3 in dV: the comparison would measure that, not the LoRA math
+            GraphAutograd.TensorCoreForwardAttention = false;
+            BackwardKernels.UseTensorCoreAttentionBackward = false;
+            foreach (var (rank, checkpoint) in new[] { (8, false), (16, true) })
+            {
+                var rng = new Random(11 + rank);
+                Dictionary<string, float[]>? adapters = null;
+                int[] ids = Array.Empty<int>(), labels = Array.Empty<int>();
+                async Task<(float Loss, float[] Logits, Dictionary<string, float[]> Grads)> Run(bool fused)
+                {
+                    GraphAutograd.FusedLora = fused;
+                    using var trainer = GgufLoraTrainer.Create(accelerator, gguf, new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank + 3, Seed = 4, CheckpointLayers = checkpoint });
+                    if (adapters == null)
+                    {
+                        // B nonzero (PEFT starts it at zero: the adapters would be a no-op and dA zero)
+                        adapters = await trainer.GetAdaptersAsync();
+                        foreach (var k in adapters.Keys.Where(k => k.EndsWith("lora_B.weight")).ToList())
+                            adapters[k] = adapters[k].Select(_ => (float)((rng.NextDouble() * 2 - 1) * 0.3)).ToArray();
+                        ids = Enumerable.Range(0, 37).Select(_ => rng.Next(0, trainer.VocabSize)).ToArray();
+                        labels = ids.Select((_, t) => t < ids.Length - 1 ? ids[t + 1] : -100).ToArray();
+                    }
+                    await trainer.SetAdaptersAsync(adapters);
+                    float loss = await trainer.StepAsync(ids, labels, update: false);
+                    return (loss, await trainer.GetLogitsAsync(ids.Length - 1), await trainer.GetGradientsAsync());
+                }
+                var want = await Run(false);
+                var got = await Run(true);
+                double Rel(float[] a, float[] b) { double m = b.Max(x => Math.Abs((double)x)), d = 0; for (int i = 0; i < a.Length; i++) d = Math.Max(d, Math.Abs(a[i] - b[i])); return d / Math.Max(m, 1e-30); }
+                double lossRel = Math.Abs(got.Loss - want.Loss) / Math.Abs(want.Loss), logitRel = Rel(got.Logits, want.Logits);
+                double worst = 0; string worstKey = "";
+                foreach (var (k, g) in want.Grads)
+                {
+                    if (!got.Grads.TryGetValue(k, out var gg)) throw new Exception($"rank {rank}: fused graph has no gradient for {k}");
+                    if (g.All(v => v == 0f)) throw new Exception($"rank {rank}: the four-op gradient of {k} is all zero: the comparison proves nothing");
+                    double r = Rel(gg, g);
+                    if (!(r <= worst)) { worst = r; worstKey = k; }
+                }
+                notes.Add($"rank {rank}{(checkpoint ? " checkpointed" : "")}: loss {want.Loss:F5} (rel {lossRel:E1}), logits {logitRel:E1}, {want.Grads.Count} gradients worst {worst:E1} ({worstKey})");
+                if (!(lossRel <= 1e-5 && logitRel <= 1e-5 && worst <= 1e-4)) throw new Exception("fused LoRA differs from the four-op form: " + string.Join("; ", notes));
+            }
+        }
+        finally { GraphAutograd.FusedLora = saved; GraphAutograd.TensorCoreForwardAttention = savedTcFwd; BackwardKernels.UseTensorCoreAttentionBackward = savedTcBwd; }
+        var line = $"{accelerator.AcceleratorType}: fused LoraLinear vs four-op form: " + string.Join("; ", notes);
+        Console.WriteLine("[Training] " + line);
+        return line;
+    });
+
+    /// <summary>
     /// Training steps must not grow device memory: after two warm steps (planned reuse records, then plans), five more steps allocate nothing.
     /// MEASURED 2026-11-04 before the fix: +1 pool device allocation and +32 MiB per step - the graph executor rented outputs an operator
     /// produces but the node does not name (SoftmaxCrossEntropyLoss's optional log_prob) and never returned them. Added 2026-11-04.

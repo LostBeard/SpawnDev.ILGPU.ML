@@ -65,6 +65,46 @@ public class MatMulGradInputOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
+/// LoraLinear(x [..., F], A_T [F, R], B_T [R, N], yBase [..., N]) -> (y = yBase + scale (x A_T) B_T, xa = x A_T [..., R]): a LoRA adapter on a
+/// projection whose base output is yBase (<see cref="GraphAutograd.AddLora"/>). Attribute <c>scale</c> (alpha / rank). xa is kept for the backward.
+/// </summary>
+public class LoraLinearOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "LoraLinear";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var xa = (int[])inputs[0].Clone();
+        xa[^1] = inputs[1][1];
+        return new[] { inputs[3], xa };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0]; var aT = ctx.Inputs[1]; var bT = ctx.Inputs[2]; var yBase = ctx.Inputs[3];
+        int F = aT.Shape[0], R = aT.Shape[1], N = bT.Shape[1];
+        int M = x.ElementCount / F;
+        reg.Backward.LoraForward(x.Data, aT.Data, bT.Data, yBase.Data, ctx.Outputs[0].Data, ctx.Outputs[1].Data, M, F, N, R, ctx.GetFloat("scale", 1f));
+    }
+}
+
+/// <summary>
+/// LoraLinearGrad(x, A_T, B_T, dy, xa) -> (dx, dA_T, dB_T) for <see cref="LoraLinearOperator"/> (dy is the gradient of y; yBase's gradient is dy
+/// itself). Attributes <c>scale</c>, <c>need_dx</c> (0: dx is not computed - the adapter's input carries no gradient).
+/// </summary>
+public class LoraLinearGradOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "LoraLinearGrad";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0], inputs[1], inputs[2] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0]; var aT = ctx.Inputs[1]; var bT = ctx.Inputs[2]; var dy = ctx.Inputs[3]; var xa = ctx.Inputs[4];
+        int F = aT.Shape[0], R = aT.Shape[1], N = bT.Shape[1];
+        int M = x.ElementCount / F;
+        reg.Backward.LoraBackward(x.Data, aT.Data, bT.Data, dy.Data, xa.Data, ctx.Outputs[0].Data, ctx.Outputs[1].Data, ctx.Outputs[2].Data,
+            M, F, N, R, ctx.GetFloat("scale", 1f), ctx.GetInt("need_dx", 1) == 1);
+    }
+}
+
+/// <summary>
 /// GatherRowsGrad(dy [1, n, C], positions [n], like [1, T, C]) -> dx shaped like <c>like</c>: the gradient of Gather(like, positions, axis=1)
 /// for DISTINCT positions (rows not gathered get zero).
 /// </summary>

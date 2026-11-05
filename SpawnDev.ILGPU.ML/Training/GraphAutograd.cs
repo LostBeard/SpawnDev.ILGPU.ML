@@ -32,6 +32,12 @@ public static class GraphAutograd
     };
 
     /// <summary>
+    /// <see cref="AddLora"/> emits one fused LoraLinear node per adapter (default on, ranks that are a multiple of 8; false = the four-op form
+    /// MatMul, MatMul, Mul, Add, the A/B control). Same values in fp32; the backward is LoraLinearGrad (split-K dots, no transposes). Added 2026-11-05.
+    /// </summary>
+    public static bool FusedLora { get; set; } = true;
+
+    /// <summary>
     /// Add LoRA adapters beside the MatMuls whose weight is <c>blk.{L}.{target}.weight</c> for each target in <paramref name="targets"/>
     /// (GGUF names: attn_q, attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down): <c>y = x W + (alpha / rank) * (x A^T) B^T</c>, PEFT's
     /// semantics. A^T / B^T become f32 initializers in <paramref name="weights"/>: from <paramref name="initial"/> when it holds the PEFT tensors
@@ -73,19 +79,24 @@ public static class GraphAutograd
             }
             weights[aName] = aT; graph.Initializers[aName] = new[] { fin, rank };
             weights[bName] = bT; graph.Initializers[bName] = new[] { rank, fout };
-            if (!weights.ContainsKey(scaleName)) { weights[scaleName] = new[] { scale }; graph.Initializers[scaleName] = new[] { 1 }; }
+            bool fused = FusedLora && BackwardKernels.LoraRankSupported(rank);
+            if (!fused && !weights.ContainsKey(scaleName)) { weights[scaleName] = new[] { scale }; graph.Initializers[scaleName] = new[] { 1 }; }
 
             string y = node.Outputs[0];
             string yBase = y + ".lora_base";
             node.Outputs[0] = yBase;
             int at = graph.Nodes.IndexOf(node) + 1;
-            graph.Nodes.InsertRange(at, new[]
-            {
-                Node("MatMul", new[] { node.Inputs[0], aName }, new[] { y + ".lora_xa" }),
-                Node("MatMul", new[] { y + ".lora_xa", bName }, new[] { y + ".lora_xab" }),
-                Node("Mul", new[] { y + ".lora_xab", scaleName }, new[] { y + ".lora_delta" }),
-                Node("Add", new[] { yBase, y + ".lora_delta" }, new[] { y }),
-            });
+            if (fused)
+                graph.Nodes.Insert(at, Node("LoraLinear", new[] { node.Inputs[0], aName, bName, yBase }, new[] { y, y + ".lora_xa" },
+                    new Dictionary<string, JsonElement> { ["scale"] = MLJson.ToElement(scale) }));
+            else
+                graph.Nodes.InsertRange(at, new[]
+                {
+                    Node("MatMul", new[] { node.Inputs[0], aName }, new[] { y + ".lora_xa" }),
+                    Node("MatMul", new[] { y + ".lora_xa", bName }, new[] { y + ".lora_xab" }),
+                    Node("Mul", new[] { y + ".lora_xab", scaleName }, new[] { y + ".lora_delta" }),
+                    Node("Add", new[] { yBase, y + ".lora_delta" }, new[] { y }),
+                });
             adapters.Add(new LoraAdapter(peft, aName, bName, fin, fout, rank));
         }
         if (adapters.Count == 0) throw new ArgumentException($"no MatMul matched the LoRA targets [{string.Join(", ", targets)}]");
@@ -249,6 +260,22 @@ public static class GraphAutograd
                     // dx = dy W^T through the weight in whatever form it was loaded (GGUF-quantized, low precision, f32).
                     if (Need(0))
                         b.Contribute(x, b.Emit("MatMulGradInput", new[] { dy, w }, n.Outputs[0] + ".grad_x"));
+                    break;
+                }
+                case "LoraLinear":
+                {
+                    // y = yBase + scale (x A_T) B_T: yBase's gradient is dy; one LoraLinearGrad node gives dx, dA_T, dB_T (xa from the forward)
+                    var dy = b.Gradient(n.Outputs[0]);
+                    if (Need(3)) b.Contribute(n.Inputs[3], dy);
+                    if (Need(0) || Need(1) || Need(2))
+                    {
+                        var attrs = new Dictionary<string, JsonElement>(n.Attributes ?? new()) { ["need_dx"] = MLJson.ToElement(Need(0) ? 1L : 0L) };
+                        var outs = b.EmitMulti("LoraLinearGrad", new[] { S(n.Inputs[0]), n.Inputs[1], n.Inputs[2], dy, S(n.Outputs[1]) },
+                            new[] { n.Outputs[0] + ".grad_x", "grad_part." + n.Inputs[1] + "." + n.Outputs[0], "grad_part." + n.Inputs[2] + "." + n.Outputs[0] }, attrs);
+                        if (Need(0)) b.Contribute(n.Inputs[0], outs[0]);
+                        if (Need(1)) b.Contribute(n.Inputs[1], outs[1]);
+                        if (Need(2)) b.Contribute(n.Inputs[2], outs[2]);
+                    }
                     break;
                 }
                 case "Reshape":

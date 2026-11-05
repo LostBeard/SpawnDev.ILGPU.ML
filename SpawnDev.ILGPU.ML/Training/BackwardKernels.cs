@@ -1137,5 +1137,6 @@ public sealed partial class BackwardKernels : IDisposable
         _qtScale?.Dispose(); _qtScale = null;
         DisposeAttentionGemm();
         DisposeAttentionTensorCore();
+        DisposeLora();
     }
 }

@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.29 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.09 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -14,6 +14,12 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
     Turing with a power-of-two scale (per query row for dQ, per tensor for dK). FusedAttentionGrad 548 -> 94 ms per step; the 384 MiB score
     buffers are gone. Gate `Backward_Attention_Flash_MatchFp32` (causal, kv offset, dout x 1e-6, sliding window, non-causal, G 2 and 4; bf16
     <= 4.5e-3, f16 <= 5.0e-4 vs fp32; red-checked).
+  - **Fused LoRA projection** (`GraphAutograd.FusedLora`, default on, ranks that are a multiple of 8): `AddLora` emits one LoraLinear node
+    (y = yBase + scale (x A_T) B_T, keeping xa) instead of MatMul, MatMul, Mul, Add; its autograd is one LoraLinearGrad (dx, dA_T, dB_T) instead of
+    Mul, two Gemm transA (one through a materialised 1600 x 4096 transpose), MatMulGradInput through a transposed B and a scale pass. Split-K
+    dots with an ordered reduction (deterministic), 16-byte loads, four rows per thread in the combine. LoRA kernels ~290 -> ~79 ms per step;
+    step 2.29 -> 2.09 s. Gate `Training_FusedLora_MatchesFourOpForm` (loss, logits and all 28 gradients vs the four-op form at ranks 8 / 16,
+    with and without checkpointing; all six backends; red-checked).
   - **Attention backward GEMMs on tensor cores** (`BackwardKernels.UseTensorCoreAttentionBackward`; the materialised path, now the fallback for
     head dims other than 128).
   - **Tensor-core GEMMs rebuilt**: packed 16-bit operands, double-buffered tiles, 64-bit fragment loads, then `cp.async` + `ldmatrix` (V4) and

@@ -51,7 +51,7 @@ public class OperatorRegistry : IDisposable
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
         "RoPE", "ShortConv", "GatedDeltaNet",
         // gradient ops emitted by the training autograd (Training/BackwardKernels.cs)
-        "RMSNormGrad", "SwiGLUGrad", "RoPEGrad", "SoftmaxCrossEntropyLossGrad", "FusedAttentionGrad", "MatMulGradInput", "GatherRowsGrad",
+        "RMSNormGrad", "SwiGLUGrad", "RoPEGrad", "SoftmaxCrossEntropyLossGrad", "FusedAttentionGrad", "MatMulGradInput", "GatherRowsGrad", "LoraLinear", "LoraLinearGrad",
         "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
         "RMSNormalization",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
@@ -419,6 +419,8 @@ public class OperatorRegistry : IDisposable
         Register(new SoftmaxCrossEntropyLossGradOperator(this));
         Register(new FusedAttentionGradOperator(this));
         Register(new MatMulGradInputOperator(this));
+        Register(new LoraLinearOperator(this));
+        Register(new LoraLinearGradOperator(this));
         Register(new GatherRowsGradOperator(this));
         // ORT contrib alias of RMSNorm (Florence / Phi vision encoders, etc.).
         Register(new SimplifiedLayerNormalizationOperator(this));
