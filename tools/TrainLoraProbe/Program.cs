@@ -5,7 +5,7 @@
 //   2. that training moves the loss (a few AdamW steps on one sequence);
 //   3. step time and the VRAM the process takes (nvidia-smi before / after).
 //
-// Run: dotnet run --project tools/TrainLoraProbe -c Release -- <model.gguf> [--seq 128] [--steps 5] [--rank 8] [--targets attn_q,attn_v] [--no-tc] [--opencl]
+// Run: dotnet run --project tools/TrainLoraProbe -c Release -- <model.gguf> [--seq 128] [--steps 5] [--rank 8] [--targets attn_q,attn_v] [--no-tc] [--no-gemm-attn] [--opencl]
 using System.Diagnostics;
 using ILGPU;
 using ILGPU.Runtime;
@@ -19,6 +19,7 @@ string Arg(string name, string def) { int i = Array.IndexOf(args, name); return 
 int seq = int.Parse(Arg("--seq", "128")), steps = int.Parse(Arg("--steps", "5")), rank = int.Parse(Arg("--rank", "8"));
 var targets = Arg("--targets", "attn_q,attn_v").Split(',');
 if (args.Contains("--no-tc")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseTensorCoreQuantT = false;   // the SIMT transposed-quant kernel (A/B)
+if (args.Contains("--no-gemm-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseGemmAttentionBackward = false;   // the blocked attention backward (A/B)
 
 static long VramMiB()
 {

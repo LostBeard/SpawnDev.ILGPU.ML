@@ -186,7 +186,13 @@ step is ~4 forwards of work: target 4-5 s per step (a 7 h run in ~1.5 h).
       `Backward_MatMulTransposedQuant_TensorCores_MatchReference`: 2.5e-3 relative vs float64 (same with dy x 1e-7), red 1.29.
       Qwen2.5-0.5B Q4_K_M probe: directional derivative 7.4e-4 / 2.9e-4 (SIMT 1.2e-3 / 1.9e-3), same loss curve, step 1,253 vs 1,520 ms
       (shared GPU). 8B measurement pending (after the v2 run).
-- [ ] Attention backward on tensor cores (the MmaFlashPrefill pattern: S = QK^T, dP = dO V^T, dS, dQ, dK, dV as mma tiles).
+- [x] Attention backward as batched GEMMs (2026-11-05, `BackwardKernels.UseGemmAttentionBackward`, default on, not WebGL): the blocked
+      kernels ran ~42 GFLOP at ~4.5 GFLOPS. Per chunk of query heads (score buffers within `GemmAttentionScoreBudgetBytes`, 640 MiB):
+      S = Q K^T, lse and D from S, P, dP = dO V^T, dS, dQ = dS K, dK = dS^T Q, dV = P^T dO on the register-blocked batched matmul, fp32;
+      GQA heads summed into their kv head. `Backward_Attention_MatchesFiniteDifference` covers GEMM / blocked / per-element (red: dS without
+      the scale, dq off by 0.57); TinyLlama LoRA step vs torch green on CUDA + OpenCL. Qwen2.5-0.5B 512 tokens: FusedAttentionGrad
+      954 -> 68 ms (14x, shared GPU). 8B measurement pending.
+- [ ] Attention backward on tensor cores (FlashAttention-2 style) only if the GEMM path is still a large share after the 8B profile.
 - [ ] The training forward / recompute through the tensor-core prefill kernels (MmaKQuantGemm, MmaFlashPrefill) instead of the
       generic graph kernels.
 - [ ] Then: packing several short sequences per step; skipping work that has no gradient.

@@ -9,7 +9,7 @@ namespace SpawnDev.ILGPU.ML.Training;
 /// backward is the naive O(seq^2 * head_dim) recompute, one thread per output element, and is replaced by a flash-style
 /// kernel at M3 (llama3.1:8b). Every method only DISPATCHES; scratch comes from the caller.
 /// </summary>
-public sealed class BackwardKernels : IDisposable
+public sealed partial class BackwardKernels : IDisposable
 {
     private readonly Accelerator _acc;
 
@@ -534,6 +534,11 @@ public sealed class BackwardKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, AttnDims>(AttnDkDvImpl);
         int rowsQ = d.Heads * d.SeqQ;
+        if (UseGemmAttentionBackward && d.Heads % d.KvHeads == 0 && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= 256)
+        {
+            AttentionGemm(q, k, v, outp, dout, dq, dk, dv, stats, d);
+            return;
+        }
         _attnStats(rowsQ, q, k, outp, dout, stats, d);
         if (UseBlockedAttentionBackward && d.HeadDim <= FaMaxHd && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= FaThreads)
         {
@@ -843,5 +848,6 @@ public sealed class BackwardKernels : IDisposable
         _retiredWt.Clear();
         _noBias?.Dispose(); _noBias = null;
         _noNbr?.Dispose(); _noNbr = null;
+        DisposeAttentionGemm();
     }
 }

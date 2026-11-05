@@ -182,21 +182,23 @@ public abstract partial class MLTestBase
             var fdq = Fd(D(q), qv => Dot(Fwd(qv, D(k), D(v))));
             var fdk = Fd(D(k), kv => Dot(Fwd(D(q), kv, D(v))));
             var fdv = Fd(D(v), vv => Dot(Fwd(D(q), D(k), vv)));
-            bool savedBlocked = BackwardKernels.UseBlockedAttentionBackward;
+            bool savedBlocked = BackwardKernels.UseBlockedAttentionBackward, savedGemm = BackwardKernels.UseGemmAttentionBackward;
             try
             {
-                foreach (bool blocked in new[] { true, false })
+                // the GEMM path (default), the blocked kernels, the per-element kernels: all three against the same finite differences
+                foreach (var (gemm, blocked) in new[] { (true, true), (false, true), (false, false) })
                 {
+                    BackwardKernels.UseGemmAttentionBackward = gemm;
                     BackwardKernels.UseBlockedAttentionBackward = blocked;
                     reg.Backward.Attention(qb.View, kb.View, vb.View, ob.View, dob.View, dq.View, dk.View, dv.View, stats.View,
                         new BackwardKernels.AttnDims { Heads = heads, KvHeads = kvHeads, SeqQ = seq, SeqKV = seqKV, HeadDim = hd, Causal = 1, Window = window, KvOffset = kvOffset, Scale = (float)scale });
-                    string tag = $"seq={seq} kvOffset={kvOffset} window={window} seqKV={seqKV} blocked={blocked}";
+                    string tag = $"seq={seq} kvOffset={kvOffset} window={window} seqKV={seqKV} gemm={gemm} blocked={blocked}";
                     AssertGrad($"attention dq ({tag})", await dq.View.CopyToHostAsync(), fdq);
                     AssertGrad($"attention dk ({tag})", await dk.View.CopyToHostAsync(), fdk);
                     AssertGrad($"attention dv ({tag})", await dv.View.CopyToHostAsync(), fdv);
                 }
             }
-            finally { BackwardKernels.UseBlockedAttentionBackward = savedBlocked; }
+            finally { BackwardKernels.UseBlockedAttentionBackward = savedBlocked; BackwardKernels.UseGemmAttentionBackward = savedGemm; }
             notes.Add($"seq={seq} kvOffset={kvOffset} window={window} seqKV={seqKV}");
         }
         return "attention dq, dk, dv match finite differences: " + string.Join("; ", notes);
