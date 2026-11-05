@@ -625,7 +625,8 @@ public sealed partial class BackwardKernels : IDisposable
         int rowsQ = d.Heads * d.SeqQ;
         if (UseGemmAttentionBackward && d.Heads % d.KvHeads == 0 && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= 256)
         {
-            AttentionGemm(q, k, v, outp, dout, dq, dk, dv, stats, d);
+            if (TensorCoreAttentionEligible(d)) AttentionTensorCore(q, k, v, outp, dout, dq, dk, dv, stats, d);
+            else AttentionGemm(q, k, v, outp, dout, dq, dk, dv, stats, d);
             return;
         }
         _attnStats(rowsQ, q, k, outp, dout, stats, d);
@@ -940,5 +941,6 @@ public sealed partial class BackwardKernels : IDisposable
         _absMax?.Dispose(); _absMax = null;
         _qtScale?.Dispose(); _qtScale = null;
         DisposeAttentionGemm();
+        DisposeAttentionTensorCore();
     }
 }

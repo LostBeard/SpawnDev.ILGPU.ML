@@ -207,3 +207,10 @@ step is ~4 forwards of work: target 4-5 s per step (a 7 h run in ~1.5 h).
       and training attention on `MmaFlashPrefill.KernelSm75`. Gates: the tensor-core test runs both paths (Turing f16 ~3e-4 vs float64,
       also at dy x 1e-7; red: scale off -> 0.30), the attention op test runs both kernels (2.8e-4). 8B on the 4070 with
       GGUF_GEMM_MMA_SM75=1: 4.5 s per step, directional derivative 4.4e-4 / 3.1e-4. 2060 timing: Seven.
+- [x] Attention backward GEMMs on tensor cores (2026-11-05, `BackwardKernels.UseTensorCoreAttentionBackward`, CUDA sm_75+, hd % 32 == 0):
+      S = Q K^T and dP = dO V^T with K / V as the 16-bit MmaGemm operand; dQ / dK / dV with K^T / Q^T / dO^T; sequence axes zero-padded to
+      32; bf16 on sm_80, f16 + device power-of-two scales (dO, dS) on sm_75. `Backward_Attention_TensorCores_MatchFp32`: bf16 <= 4.6e-3,
+      f16 <= 5.2e-4 vs the fp32 path, also at dout x 1e-6 (red: dV not unscaled -> fails). 8B on the 4070: 4.5 -> 4.18 s per step
+      (FusedAttentionGrad 937 -> 681 ms), grads 2.1e-3 / 7.4e-4 (forced sm_75 1.1e-3 / 1.9e-4); VRAM unchanged vs the fp32 path.
+      The rest of FusedAttentionGrad is now the row stats (a serial loop per row), P / dS, two transposes and the packs: next.
+

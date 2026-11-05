@@ -20,6 +20,7 @@ int seq = int.Parse(Arg("--seq", "128")), steps = int.Parse(Arg("--steps", "5"))
 var targets = Arg("--targets", "attn_q,attn_v").Split(',');
 if (args.Contains("--no-tc")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseTensorCoreQuantT = false;   // the SIMT transposed-quant kernel (A/B)
 if (args.Contains("--no-gemm-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseGemmAttentionBackward = false;   // the blocked attention backward (A/B)
+if (args.Contains("--no-tc-attn")) SpawnDev.ILGPU.ML.Training.BackwardKernels.UseTensorCoreAttentionBackward = false;   // the fp32 GEMM attention backward (A/B)
 
 static long VramMiB()
 {
