@@ -49,6 +49,37 @@ public static class GraphAutograd
     /// group runs as one GEMM where it can (MatMulGroupOperator) and as the separate MatMuls otherwise. Run after <see cref="AddBackward"/> (the
     /// backward rules read the MatMul nodes). Returns the number of groups. Added 2026-11-05.
     /// </summary>
+    /// <summary>
+    /// Replace MatMulGroup(x; W_gate, W_up) -> SwiGLU -> MatMul(W_down) by one GateUpSwiGLUDown node where the gate, up and SwiGLU outputs have no
+    /// other reader (a checkpointed forward: the backward reads the recompute's copies), so the gate | up GEMM can apply SwiGLU in its epilogue.
+    /// Run after <see cref="GroupSiblingMatMuls"/>. Returns the number replaced. Added 2026-11-05.
+    /// </summary>
+    public static int FuseSwiGLUDown(ModelGraph graph)
+    {
+        var readers = new Dictionary<string, int>();
+        foreach (var n in graph.Nodes) foreach (var i in n.Inputs) readers[i] = readers.TryGetValue(i, out var c) ? c + 1 : 1;
+        foreach (var o in graph.Outputs) readers[o.Name] = readers.TryGetValue(o.Name, out var c) ? c + 1 : 1;
+        int Readers(string v) => readers.TryGetValue(v, out var c) ? c : 0;
+        var producer = new Dictionary<string, GraphNode>();
+        foreach (var n in graph.Nodes) foreach (var o in n.Outputs) producer[o] = n;
+        int fused = 0;
+        foreach (var sw in graph.Nodes.Where(n => n.OpType == "SwiGLU" && n.Inputs.Count == 2 && n.Outputs.Count == 1).ToList())
+        {
+            string gOut = sw.Inputs[0], uOut = sw.Inputs[1], sOut = sw.Outputs[0];
+            if (!producer.TryGetValue(gOut, out var grp) || grp.OpType != "MatMulGroup" || grp.Outputs.Count != 2 || !grp.Outputs.Contains(uOut)) continue;
+            if (Readers(gOut) != 1 || Readers(uOut) != 1 || Readers(sOut) != 1) continue;
+            var down = graph.Nodes.FirstOrDefault(n => n.OpType == "MatMul" && n.Inputs.Count == 2 && n.Inputs[0] == sOut);
+            if (down == null || !graph.Initializers.TryGetValue(down.Inputs[1], out var ds) || ds.Length != 2) continue;
+            string wGate = grp.Inputs[1 + grp.Outputs.IndexOf(gOut)], wUp = grp.Inputs[1 + grp.Outputs.IndexOf(uOut)];
+            int at = graph.Nodes.IndexOf(grp);
+            var node = Node("GateUpSwiGLUDown", new[] { grp.Inputs[0], wGate, wUp, down.Inputs[1] }, new[] { down.Outputs[0] });
+            graph.Nodes.Remove(grp); graph.Nodes.Remove(sw); graph.Nodes.Remove(down);
+            graph.Nodes.Insert(Math.Min(at, graph.Nodes.Count), node);
+            fused++;
+        }
+        return fused;
+    }
+
     /// <summary>GgufLoraTrainer joins sibling projections (<see cref="GroupSiblingMatMuls"/>; default on; false = separate MatMuls, the A/B control).</summary>
     public static bool GroupSiblingProjections { get; set; } = true;
 

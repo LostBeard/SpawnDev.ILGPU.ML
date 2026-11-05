@@ -257,6 +257,67 @@ public class FusedDequantMatMul : IDisposable
     /// runs the projections one by one. MEASURED (RTX 4070, llama3.1:8b, 1,600 rows): k and v alone (N = 1024) filled 104 blocks, ~1.1 waves, at 31
     /// TFLOPS; as part of q|k|v (N = 6144) they run at the big-shape rate, and q, k, v (gate, up) share one packed input.
     /// </summary>
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>? _f16V6SwiGLU;
+    private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int, int, int>? _deqQ4KRows;
+    private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int, int, int>? _deqQ6KRows;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchS16;
+
+    private void DequantRows(ArrayView1D<byte, Stride1D.Dense> w, GGMLType type, ArrayView<W16> dst, int N, int K, int dstBlock, int dstOff)
+    {
+        int count = N * (K >> 5) * 2;
+        if (type == GGMLType.Q4_K)
+            (_deqQ4KRows ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int, int, int>(MmaKQuantGemm.DequantQ4KF16Rows))(
+                count, w.BaseView.Cast<W16>(), dst, N, K, dstBlock, dstOff);
+        else
+            (_deqQ6KRows ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int, int, int>(MmaKQuantGemm.DequantQ6KF16Rows))(
+                count, w.BaseView.Cast<ushort>(), dst, N, K, dstBlock, dstOff);
+    }
+
+    /// <summary>
+    /// A transformer FFN's forward as two GEMMs (2026-11-05; GateUpSwiGLUDown, see GraphAutograd.FuseSwiGLUDown): y = SwiGLU(x Wg, x Wu) Wd with
+    /// gate and up dequantized row-interleaved in 8-row blocks into one f16 scratch, so the gate | up GEMM's epilogue
+    /// (MmaGemm.KernelF16PackedV6SwiGLU) holds g and u of the same columns and writes silu(g) u straight to the down GEMM's packed f16 input:
+    /// g, u and the SwiGLU output never reach memory. Same expression and rounding as the separate SwiGLU and A-pack passes, same MMAs:
+    /// bit-identical. Returns false (nothing launched) where it does not apply (as <see cref="ForwardGroup"/>; Nff a multiple of 256).
+    /// x [M, K]; gate / up rows [Nff, K]; down rows [Nout, Nff]; y [M, Nout].
+    /// </summary>
+    public bool ForwardGateUpSwiGLUDown(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> wGate, GGMLType tGate,
+        ArrayView1D<byte, Stride1D.Dense> wUp, GGMLType tUp, ArrayView1D<byte, Stride1D.Dense> wDown, GGMLType tDown,
+        ArrayView1D<float, Stride1D.Dense> output, int M, int K, int Nff, int Nout)
+    {
+        if (!EnableMmaGemm || !EnableMmaScratch || !EnableMmaV5 || !EnableMmaV6 || ForceSm75Mma || !CudaCaps.TensorCores(_accelerator)) return false;
+        if (M < MmaScratchMinRows || K % 256 != 0 || Nff % 256 != 0 || Nout % 8 != 0) return false;
+        if (((IContiguousArrayView)input.BaseView).IndexInBytes % 16 != 0) return false;
+        foreach (var (w, t) in new[] { (wGate, tGate), (wUp, tUp), (wDown, tDown) })
+        {
+            long wb = ((IContiguousArrayView)w.BaseView).IndexInBytes;
+            if (!((t == GGMLType.Q4_K && (wb & 15) == 0) || (t == GGMLType.Q6_K && (wb & 1) == 0))) return false;
+        }
+        if (2L * Nff * K * 2 > MmaScratchMaxWeightBytes || (long)Nout * Nff * 2 > MmaScratchMaxWeightBytes) return false;
+        long aWords = (long)M * K / 2, guWords = (long)Nff * K, sWords = (long)M * Nff / 2, dWords = (long)Nout * Nff / 2;
+        var a16 = GrowScratch(ref _scratchA16, aWords);
+        var w16 = GrowScratch(ref _scratchW16, Math.Max(guWords, dWords));
+        var s16 = GrowScratch(ref _scratchS16, sWords);
+        _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
+        _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
+        _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+        var wDst = w16.View.SubView(0, guWords).BaseView.Cast<W16>();
+        DequantRows(wGate, tGate, wDst, Nff, K, 16, 0);
+        DequantRows(wUp, tUp, wDst, Nff, K, 16, 8);
+        _f16V6SwiGLU ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6SwiGLU);
+        int tilesGu = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((2 * Nff + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        _f16V6SwiGLU(new KernelConfig(tilesGu, Trellis2.MmaGemm.V5Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(),
+            w16.View.SubView(0, guWords).Cast<uint, Trellis2.U4>(), _scratchOnes.View, s16.View.SubView(0, sWords).BaseView, M, K, 2 * Nff);
+        // down: the same scratch (stream order: the gate | up GEMM has read it), rows as stored
+        DequantRows(wDown, tDown, w16.View.SubView(0, dWords).BaseView.Cast<W16>(), Nout, Nff, 8, 0);
+        _f16V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6);
+        int tilesD = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((Nout + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        _f16V6(new KernelConfig(tilesD, Trellis2.MmaGemm.V5Threads), s16.View.SubView(0, sWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, dWords).Cast<uint, Trellis2.U4>(),
+            _scratchOnes.View, output.SubView(0, (long)M * Nout), M, Nff, Nout);
+        LastGemmKernel = "mma-scratch-swiglu";
+        return true;
+    }
+
     public bool ForwardGroup(ArrayView1D<float, Stride1D.Dense> input, IReadOnlyList<ArrayView1D<byte, Stride1D.Dense>> weights, IReadOnlyList<GGMLType> types,
         IReadOnlyList<int> ns, IReadOnlyList<ArrayView1D<float, Stride1D.Dense>> outputs, int M, int K)
     {

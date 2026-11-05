@@ -825,7 +825,7 @@ kernel_packed_v5r()
 kernel_packed_v5r(acc=True)
 
 
-def kernel_packed_v6(dtype, acc=False, split=False):
+def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False):
     """Kernel{Bf16|F16}PackedV6{Acc} (2026-11-05): V5 (4 warps of 64 x 64, cp.async, ldmatrix, column-major block order) with THREE stages:
     two K tiles in flight while one computes. Rows are 64 bytes with no padding and the 16-byte chunks XOR-swizzled (chunk c of row r at
     c ^ ((r >> 1) & 3)), so the 8 row addresses of every ldmatrix 8 x 8 read land in 8 distinct bank groups and 3 stages fit the 48 KB of
@@ -837,9 +837,14 @@ def kernel_packed_v6(dtype, acc=False, split=False):
     RW = 16          # words per row: 32 halves, no padding
     ST = 3
     MT5, NT5 = 4, 8
-    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}{'Split' if split else ''}"
+    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}"
     w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
-    if split:
+    if swiglu:
+        w("    /// <summary>The gate | up GEMM with SwiGLU in the epilogue: W rows are gate and up interleaved in 8-row blocks (n-tile 2j = gate, 2j + 1 = up of")
+        w("    /// the same 8 columns), N = 2 Nff; writes f16 words S [M, Nff / 2] = cvt.rn(silu(g) u), the expression ActivationKernels.SwiGLUImpl computes")
+        w("    /// and the rounding FusedDequantMatMul.PackA16Impl applies: the down projection's packed input, bit-identical to the separate passes.</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, ArrayView<uint> S, int M, int K, int N)")
+    elif split:
         w("    /// <summary>The same with the output columns split over three tensors: [0, N0) -> C [M, N0], [N0, N0 + N1) -> C1 [M, N1], the rest -> C2 [M, N - N0 - N1] (sibling projections of one input as one GEMM; N0, N1 multiples of 8).</summary>")
         w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, FV C1, FV C2, int M, int K, int N, int N0, int N1)")
     else:
@@ -910,6 +915,22 @@ def kernel_packed_v6(dtype, acc=False, split=False):
         w("            }")
     w("        }")
     w('        CudaAsm.Emit("cp.async.wait_group 0;");')
+    if swiglu:
+        w("        int Nff = N >> 1;")
+        for mt in range(MT5):
+            for j in range(NT5 // 2):
+                w("        {")
+                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int oc = ((tileCol * BN + wn * 64) >> 1) + {8 * j} + 2 * t;")
+                w("            if (oc < Nff)")
+                w("            {")
+                w(f"                if (m0 < M) S[((long)m0 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}0 * inv, c{mt}{2 * j + 1}0 * inv, c{mt}{2 * j}1 * inv, c{mt}{2 * j + 1}1 * inv);")
+                w(f"                if (m1 < M) S[((long)m1 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}2 * inv, c{mt}{2 * j + 1}2 * inv, c{mt}{2 * j}3 * inv, c{mt}{2 * j + 1}3 * inv);")
+                w("            }")
+                w("        }")
+        w("    }")
+        w("")
+        return
     for mt in range(MT5):
         for nt in range(NT5):
             w("        {")
@@ -939,6 +960,16 @@ kernel_packed_v6("Bf16")
 kernel_packed_v6("F16")
 kernel_packed_v6("Bf16", acc=True)
 kernel_packed_v6("F16", split=True)
+kernel_packed_v6("F16", swiglu=True)
+w("    // silu(g) u for two columns, rounded to f16 and packed (low half = the first): ActivationKernels.SwiGLUImpl's expression, PackA16Impl's rounding")
+w("    private static uint SwiPack(float g0, float u0, float g1, float u1)")
+w("    {")
+w("        float sig0 = g0 > 80f ? 1f : (g0 < -80f ? 0f : 1f / (1f + MathF.Exp(-g0)));")
+w("        float sig1 = g1 > 80f ? 1f : (g1 < -80f ? 0f : 1f / (1f + MathF.Exp(-g1)));")
+w("        float s0 = (g0 * sig0) * u0, s1 = (g1 * sig1) * u1;")
+w('        CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, s0, s1);')
+w("        return packed;")
+w("    }")
 w("}")
 
 path = sys.argv[1]

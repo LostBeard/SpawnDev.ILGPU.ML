@@ -495,17 +495,22 @@ def kernel_v3(sm75, qt):
     w("    }")
 
 
-def dequant_f16(sm75, qt):
+def dequant_f16(sm75, qt, rows=False):
     """Dequant{Q4K|Q6K}F16{Sm75} (2026-11-05): the raw GGUF rows -> f16 words [N][K / 2] (two values per word, the lower k in the low half),
     built from the SAME Pair / Q6Pair helpers and the same 16-value staging unit the tensor-core GEMMs decode in shared memory, so the words
     are bit-identical to what those kernels feed their MMAs. For the scratch-operand GEMM (FusedDequantMatMul: dequantize once, then the
     16-bit V4 / V2 GEMM). One thread per (row, 32-value block, half): idx = (n * (K / 32) + k32) * 2 + bh."""
     sfx = "Sm75" if sm75 else ""
     q6 = qt == "q6k"
-    kname = ("DequantQ6KF16" if q6 else "DequantQ4KF16") + sfx
+    kname = ("DequantQ6KF16" if q6 else "DequantQ4KF16") + sfx + ("Rows" if rows else "")
     wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
     w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>")
-    w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<W16> O, int N, int K)")
+    if rows:
+        w("    /// <summary>The same with row n written at destination row (n / 8) * dstBlock + dstOff + n % 8 (two weights' rows interleaved in 8-row")
+        w("    /// blocks: FusedDequantMatMul's gate | up SwiGLU GEMM, whose n-tile pairs then hold g and u of the same columns).</summary>")
+        w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<W16> O, int N, int K, int dstBlock, int dstOff)")
+    else:
+        w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<W16> O, int N, int K)")
     w("    {")
     w("        int bh = idx & 1, rest = idx >> 1;")
     w("        int k32n = K >> 5;")
@@ -521,7 +526,7 @@ def dequant_f16(sm75, qt):
         w("        int qq = (kt >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;")
         w("        int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);")
         w("        float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);")
-        w("        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
+        w(f"        long o = ((long){'((n >> 3) * dstBlock + dstOff + (n & 7))' if rows else 'n'} * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
         for half in range(2):
             fl = ", ".join(f"{f} = (int)Q6Pair{sfx}(l{4 * half + i}, h{4 * half + i}, lsh, hsh, ds)" for i, f in enumerate("abcd"))
             w(f"        O.AsAligned16()[o + {half}] = new W16 {{ {fl} }};")
@@ -531,7 +536,7 @@ def dequant_f16(sm75, qt):
         w("        W16 ph = Wq.AsAligned16()[sbL], pq = Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh];")
         w("        int j = (kt >> 5) & 7, sh = (j & 1) * 4;")
         w("        ScaleMin s = SubBlockScale(ph, j);")
-        w("        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
+        w(f"        long o = ((long){'((n >> 3) * dstBlock + dstOff + (n & 7))' if rows else 'n'} * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
         w(f"        O.AsAligned16()[o] = new W16 {{ a = (int)Pair{sfx}(pq.a, 0, sh, s), b = (int)Pair{sfx}(pq.a, 1, sh, s), c = (int)Pair{sfx}(pq.b, 0, sh, s), d = (int)Pair{sfx}(pq.b, 1, sh, s) }};")
         w(f"        O.AsAligned16()[o + 1] = new W16 {{ a = (int)Pair{sfx}(pq.c, 0, sh, s), b = (int)Pair{sfx}(pq.c, 1, sh, s), c = (int)Pair{sfx}(pq.d, 0, sh, s), d = (int)Pair{sfx}(pq.d, 1, sh, s) }};")
     w("    }")
@@ -553,6 +558,7 @@ for qt_ in ("q4k", "q6k"):
     w("")
     dequant_f16(False, qt_)
     dequant_f16(True, qt_)
+    dequant_f16(False, qt_, rows=True)
 w("}")
 
 path = sys.argv[1]

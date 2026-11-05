@@ -172,6 +172,52 @@ public class MatMulGroupOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
+/// GateUpSwiGLUDown(x, W_gate, W_up, W_down) -> y = SwiGLU(x W_gate, x W_up) W_down: a transformer FFN forward whose gate / up / SwiGLU outputs
+/// nothing else reads (GraphAutograd.FuseSwiGLUDown). Q4_K / Q6_K on CUDA sm_80+: FusedDequantMatMul.ForwardGateUpSwiGLUDown (SwiGLU in the
+/// gate | up GEMM's epilogue, bit-identical); otherwise MatMulGroup, SwiGLU and MatMul run as the separate nodes did.
+/// </summary>
+public class GateUpSwiGLUDownOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "GateUpSwiGLUDown";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var o = (int[])inputs[0].Clone();
+        o[^1] = inputs[3][^1];
+        return new[] { o };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0];
+        int K = ctx.Inputs[1].Shape[0], Nff = ctx.Inputs[1].Shape[1], Nout = ctx.Inputs[3].Shape[1];
+        int M = x.ElementCount / K;
+        if (ctx.QuantizedWeights != null && reg.QuantizedWeightTypes != null && ctx.InputNames.Length == 4
+            && ctx.QuantizedWeights.TryGetValue(ctx.InputNames[1], out var qg) && reg.QuantizedWeightTypes.TryGetValue(ctx.InputNames[1], out var tg)
+            && ctx.QuantizedWeights.TryGetValue(ctx.InputNames[2], out var qu) && reg.QuantizedWeightTypes.TryGetValue(ctx.InputNames[2], out var tu)
+            && ctx.QuantizedWeights.TryGetValue(ctx.InputNames[3], out var qd) && reg.QuantizedWeightTypes.TryGetValue(ctx.InputNames[3], out var td)
+            && ctx.Inputs[2].Shape[0] == K && ctx.Inputs[2].Shape[1] == Nff && ctx.Inputs[3].Shape[0] == Nff
+            && reg.FusedDequant.ForwardGateUpSwiGLUDown(x.Data, qg, tg, qu, tu, qd, td, ctx.Outputs[0].Data, M, K, Nff, Nout))
+            return;
+        // the separate nodes' path: gate | up, SwiGLU, down
+        var shapeFf = (int[])x.Shape.Clone(); shapeFf[^1] = Nff;
+        var g = ctx.Pool.Rent(shapeFf, "_gusd_g"); var u = ctx.Pool.Rent(shapeFf, "_gusd_u"); var s = ctx.Pool.Rent(shapeFf, "_gusd_s");
+        try
+        {
+            OnnxOpContext Sub(SpawnDev.ILGPU.ML.Tensors.Tensor[] ins, string[] inNames, SpawnDev.ILGPU.ML.Tensors.Tensor[] outs) => new OnnxOpContext
+            {
+                Inputs = ins, Outputs = outs, Attributes = new Dictionary<string, object>(), Pool = ctx.Pool, Format = ctx.Format, InputNames = inNames,
+                ConstantValues = ctx.ConstantValues, IsInputTainted = ctx.IsInputTainted, HostValues = ctx.HostValues, QuantizedWeights = ctx.QuantizedWeights,
+                Registry = ctx.Registry, ScopeTensors = ctx.ScopeTensors, IntegerTensorNames = ctx.IntegerTensorNames,
+            };
+            string N(int i) => ctx.InputNames.Length == 4 ? ctx.InputNames[i] : "";
+            reg.Resolve("MatMulGroup").Execute(Sub(new[] { x, ctx.Inputs[1], ctx.Inputs[2] }, new[] { N(0), N(1), N(2) }, new[] { g, u }));
+            reg.Resolve("SwiGLU").Execute(Sub(new[] { g, u }, new[] { "", "" }, new[] { s }));
+            reg.Resolve("MatMul").Execute(Sub(new[] { s, ctx.Inputs[3] }, new[] { "", N(3) }, new[] { ctx.Outputs[0] }));
+        }
+        finally { ctx.Pool.Return(g); ctx.Pool.Return(u); ctx.Pool.Return(s); }
+    }
+}
+
+/// <summary>
 /// GatherRowsGrad(dy [1, n, C], positions [n], like [1, T, C]) -> dx shaped like <c>like</c>: the gradient of Gather(like, positions, axis=1)
 /// for DISTINCT positions (rows not gathered get zero).
 /// </summary>

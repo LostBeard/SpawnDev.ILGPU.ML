@@ -18,6 +18,64 @@ public abstract partial class MLTestBase
     /// same day.
     /// </summary>
     /// <summary>
+    /// FusedDequantMatMul.ForwardGateUpSwiGLUDown (GateUpSwiGLUDown: SwiGLU in the gate | up GEMM's epilogue, its f16 output straight into the
+    /// down GEMM) against the separate path (ForwardGroup gate | up, ActivationKernels.SwiGLU, Forward down): bitwise, Q4_K and Q6_K mixes, a
+    /// partial row tile. CUDA sm_80+. Added 2026-11-05.
+    /// </summary>
+    [TestMethod]
+    public async Task Gemm_MmaKQuant_SwiGLUDownMatchesSeparate() => await RunTest(async accelerator =>
+    {
+        if (!CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("the fused FFN GEMM runs on CUDA sm_80+");
+        using var fused = new FusedDequantMatMul(accelerator);
+        var act = new ActivationKernels(accelerator);
+        var notes = new List<string>();
+        int scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        FusedDequantMatMul.MmaScratchMinRows = 1;
+        try
+        {
+            foreach (var (M, K, Nff, Nout, tg, tu, td) in new[] { (300, 512, 768, 264, GGMLType.Q4_K, GGMLType.Q4_K, GGMLType.Q6_K),
+                (77, 256, 512, 512, GGMLType.Q6_K, GGMLType.Q4_K, GGMLType.Q4_K) })
+            {
+                var rng = new Random(301 + M + K);
+                var input = new float[M * K];
+                // small inputs: the random blocks' scales are large, and SwiGLU of O(100) values overflows f16 (the comparison must see finite values)
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1) * 0.01f;
+                byte[] Weight(GGMLType t, int rows, int cols)
+                {
+                    int rb = RowBytes(t, cols);
+                    var b = new byte[rows * rb];
+                    for (int n = 0; n < rows; n++) Buffer.BlockCopy(MakeBlocks(t, cols, rng), 0, b, n * rb, rb);
+                    return b;
+                }
+                using var inBuf = accelerator.Allocate1D(input);
+                using var gw = AllocatePadded(accelerator, Weight(tg, Nff, K));
+                using var uw = AllocatePadded(accelerator, Weight(tu, Nff, K));
+                using var dw = AllocatePadded(accelerator, Weight(td, Nout, Nff));
+                using var g = accelerator.Allocate1D<float>((long)M * Nff); using var u = accelerator.Allocate1D<float>((long)M * Nff);
+                using var sv = accelerator.Allocate1D<float>((long)M * Nff);
+                using var want = accelerator.Allocate1D<float>((long)M * Nout); using var got = accelerator.Allocate1D<float>((long)M * Nout);
+                if (!fused.ForwardGroup(inBuf.View, new[] { gw.View, uw.View }, new[] { tg, tu }, new[] { Nff, Nff }, new[] { g.View, u.View }, M, K))
+                    throw new Exception("the grouped GEMM was not taken");
+                act.SwiGLU(g.View, u.View, sv.View, M * Nff);
+                fused.Forward(sv.View, dw.View, want.View, M, Nff, Nout, td);
+                if (!fused.ForwardGateUpSwiGLUDown(inBuf.View, gw.View, tg, uw.View, tu, dw.View, td, got.View, M, K, Nff, Nout) || fused.LastGemmKernel != "mma-scratch-swiglu")
+                    throw new Exception($"M={M} K={K} Nff={Nff}: the fused FFN GEMM was not taken ('{fused.LastGemmKernel}')");
+                await accelerator.SynchronizeAsync();
+                var a = await want.CopyToHostAsync<float>(0, (long)M * Nout);
+                var b2 = await got.CopyToHostAsync<float>(0, (long)M * Nout);
+                for (int e = 0; e < a.Length; e++)
+                    if (BitConverter.SingleToInt32Bits(a[e]) != BitConverter.SingleToInt32Bits(b2[e]))
+                        throw new Exception($"M={M} K={K} Nff={Nff} Nout={Nout}: output {e} = {b2[e]:R}, separate {a[e]:R}");
+                int finite = a.Count(v => float.IsFinite(v) && v != 0f);
+                if (finite < a.Length * 9 / 10) throw new Exception($"only {finite} of {a.Length} outputs finite and nonzero: the comparison proves little");
+                notes.Add($"M={M} K={K} Nff={Nff} Nout={Nout} {tg}/{tu}/{td}: bitwise ({finite} finite nonzero, max |y| {a.Max(Math.Abs):G3})");
+            }
+        }
+        finally { FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        return "ForwardGateUpSwiGLUDown vs group + SwiGLU + down: " + string.Join("; ", notes);
+    });
+
+    /// <summary>
     /// FusedDequantMatMul.ForwardGroup (MatMulGroup: sibling projections of one input as one scratch GEMM with the output columns split per
     /// tensor) against separate <see cref="FusedDequantMatMul.Forward"/> calls: bitwise, for a q | k | v-like triple (Q4_K, Q6_K, Q4_K with
     /// different widths) and a gate | up-like pair; and it must be taken (LastGemmKernel). CUDA sm_80+ (the V6 split kernel). Added 2026-11-05.

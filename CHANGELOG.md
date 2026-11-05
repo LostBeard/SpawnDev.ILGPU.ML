@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.81 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.79 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -42,6 +42,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
     whose epilogue writes each output's columns into its own tensor (`MmaGemm.KernelF16PackedV6Split`). k and v alone (N = 1024) filled
     ~1.1 waves at 31 TFLOPS. Bit-identical to separate MatMuls (tested bitwise; red-checked); anything else falls back to the MatMul op.
     Step 1.863 -> 1.81 s.
+  - **SwiGLU in the gate | up GEMM** (GateUpSwiGLUDown, `GraphAutograd.FuseSwiGLUDown`, `FusedDequantMatMul.ForwardGateUpSwiGLUDown`):
+    in the checkpointed forward, where nothing else reads gate / up / SwiGLU, gate and up are dequantized row-interleaved so the GEMM epilogue
+    (`MmaGemm.KernelF16PackedV6SwiGLU`) writes silu(g) u as the down GEMM's packed f16 input. Bit-identical (tested bitwise; red-checked).
   - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, off until measured on a Turing card; `GGUF_GEMM_SM75_V5=1`): 64 x 64 warp
     tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2. Through the Turing path on an RTX 4070: training
     step 2.18 -> 2.09 s, identical loss trajectory.
