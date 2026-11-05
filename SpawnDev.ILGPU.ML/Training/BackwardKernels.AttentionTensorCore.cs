@@ -32,7 +32,7 @@ public sealed partial class BackwardKernels
         public int UseScale;
     }
 
-    private MemoryBuffer1D<ushort, Stride1D.Dense>? _tKb, _tVb, _tKTb, _tQTb, _tdOTb;
+    private MemoryBuffer1D<ushort, Stride1D.Dense>? _tKb, _tVb, _tKTb, _tQTb, _tdOTb, _tQh16, _tdOh16, _tdS16, _tT16;
     private readonly List<MemoryBuffer1D<ushort, Stride1D.Dense>> _tRetired16 = new();
     private MemoryBuffer1D<float, Stride1D.Dense>? _tS, _tdP, _tT, _tScOne, _tScDo, _tScDs, _tScDv;
     private MemoryBuffer1D<int, Stride1D.Dense>? _tMaxDo, _tMaxDs;
@@ -41,6 +41,7 @@ public sealed partial class BackwardKernels
     private Action<Index1D, FV, FV, AttnDims, int, int>? _tP;
     private Action<Index1D, FV, FV, FV, AttnDims, int, int>? _tDs;
     private Action<KernelConfig, FV, FV, int, int, int, int>? _tTranspose;
+    private Action<KernelConfig, FV, HV16, int, int, int, int, int, int, FV>? _tTranspose16;
     private Action<Index1D, FV, FV>? _tScaleSet;
     private Action<KernelConfig, ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
         FV, FV, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>? _tBf16;
@@ -110,9 +111,11 @@ public sealed partial class BackwardKernels
         long qn = (long)hc * Sq * hd, kn = (long)hc * Skv * hd;
         long sn = (long)hc * Sq * Skvp, tn = (long)hc * Skvp * Sqp;
         long scoreCap = Math.Max(Math.Max(sn, tn), GemmAttentionScoreBudgetBytes / 3 / sizeof(float));
-        var Qh = Grow(_acc, ref _gQh, qn, _gRetired); var dOh = Grow(_acc, ref _gdOh, qn, _gRetired); var dQh = Grow(_acc, ref _gdQh, qn, _gRetired);
+        var dQh = Grow(_acc, ref _gdQh, qn, _gRetired);
         var dKh = Grow(_acc, ref _gdKh, kn, _gRetired); var dVh = Grow(_acc, ref _gdVh, kn, _gRetired);
-        var S = Grow(_acc, ref _tS, scoreCap, _gRetired); var dP = Grow(_acc, ref _tdP, scoreCap, _gRetired); var T = Grow(_acc, ref _tT, scoreCap, _gRetired);
+        var S = Grow(_acc, ref _tS, scoreCap, _gRetired); var dP = Grow(_acc, ref _tdP, scoreCap, _gRetired);
+        var Qh16 = Grow16(_acc, ref _tQh16, qn, _tRetired16); var dOh16 = Grow16(_acc, ref _tdOh16, qn, _tRetired16);
+        var dS16 = Grow16(_acc, ref _tdS16, scoreCap, _tRetired16); var T16 = Grow16(_acc, ref _tT16, scoreCap, _tRetired16);
         var Kb = Grow16(_acc, ref _tKb, (long)hc * Skvp * hd, _tRetired16); var Vb = Grow16(_acc, ref _tVb, (long)hc * Skvp * hd, _tRetired16);
         var KTb = Grow16(_acc, ref _tKTb, (long)hc * hd * Skvp, _tRetired16);
         var QTb = Grow16(_acc, ref _tQTb, (long)hc * hd * Sqp, _tRetired16); var dOTb = Grow16(_acc, ref _tdOTb, (long)hc * hd * Sqp, _tRetired16);
@@ -124,7 +127,7 @@ public sealed partial class BackwardKernels
         _tStats ??= _acc.LoadStreamKernel<FV, FV, FV, FV, AttnDims, int, int>(TcStatsImpl);
         _tP ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, AttnDims, int, int>(TcPImpl);
         _tDs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, AttnDims, int, int>(TcDsImpl);
-        _tTranspose ??= _acc.LoadStreamKernel<FV, FV, int, int, int, int>(TransposePadImpl);
+        _tTranspose16 ??= _acc.LoadStreamKernel<FV, HV16, int, int, int, int, int, int, FV>(TransposePad16Impl);
         _tScaleSet ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(InvOnlyScaleImpl);
         _gScatterQ ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, PackDims>(ScatterQImpl);
         _gScatterKv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, PackDims>(ScatterKvImpl);
@@ -133,10 +136,14 @@ public sealed partial class BackwardKernels
         {
             var pq = new PackDims { S = Sq, Hs = H, Hd = hd, H0 = h0, G = 1, Hc = hc };
             var pk = new PackDims { S = Skv, Hs = d.KvHeads, Hd = hd, H0 = h0, G = g, Hc = hc };
-            _gPack((int)qn, q, Qh.View, pq);
-            _gPack((int)qn, dout, dOh.View, pq);
-            // dO's scale (Turing): dP's A operand and dV's W operand
-            if (turing) { DeviceScale(dOh.View, qn, _tMaxDo, _tScDo.View); _tScaleSet(1, _tScDo.View, _tScDv.View); }
+            if (h0 == 0 && turing) { DeviceScale(dout, (long)Sq * H * hd, _tMaxDo, _tScDo.View); _tScaleSet(1, _tScDo.View, _tScDv.View); }
+            var scDo = turing ? _tScDo.View : _tScOne.View;
+            var scDv = turing ? _tScDv.View : _tScOne.View;
+            // 16-bit A operands: Q and dO [c, Sq, hd] (dO times its scale on Turing)
+            var p16a = new Pack16Dims { S = Sq, Sp = Sq, Hs = H, Hd = hd, H0 = h0, G = 1, Half = half };
+            _pack16((int)qn, q, Qh16.View, p16a, _tScOne.View);
+            p16a.UseScale = turing ? 1 : 0;
+            _pack16((int)qn, dout, dOh16.View, p16a, scDo);
             var p16k = new Pack16Dims { S = Skv, Sp = Skvp, Hs = d.KvHeads, Hd = hd, H0 = h0, G = g, Half = half };
             _pack16((int)((long)hc * Skvp * hd), k, Kb.View, p16k, _tScOne.View);
             _pack16((int)((long)hc * Skvp * hd), v, Vb.View, p16k, _tScOne.View);
@@ -145,24 +152,26 @@ public sealed partial class BackwardKernels
             var p16q = new Pack16Dims { S = Sq, Sp = Sqp, Hs = H, Hd = hd, H0 = h0, G = 1, Half = half, Transpose = 1 };
             _pack16((int)((long)hc * Sqp * hd), q, QTb.View, p16q, _tScOne.View);
             p16q.UseScale = turing ? 1 : 0;
-            _pack16((int)((long)hc * Sqp * hd), dout, dOTb.View, p16q, _tScDo.View);
+            _pack16((int)((long)hc * Sqp * hd), dout, dOTb.View, p16q, scDo);
             for (int c = 0; c < hc; c++)                                               // S = Q K^T  [Sq, Skvp]
-                Mma(turing, At(Qh.View, (long)c * Sq * hd), At(Kb.View, (long)c * Skvp * hd), At(S.View, (long)c * Sq * Skvp), _tScOne.View, Sq, hd, Skvp);
+                MmaPacked(turing, At(Qh16.View, (long)c * Sq * hd), At(Kb.View, (long)c * Skvp * hd), At(S.View, (long)c * Sq * Skvp), _tScOne.View, Sq, hd, Skvp);
             _tStats(new KernelConfig(hc * Sq, StatsThreads), S.View, dout, outp, stats, d, h0, Skvp);   // lse and D per row
             _tP((int)sn, S.View, stats, d, h0, Skvp);                                   // S -> P (masked, padding 0)
             for (int c = 0; c < hc; c++)                                               // dP = dO V^T  [Sq, Skvp]
-                Mma(turing, At(dOh.View, (long)c * Sq * hd), At(Vb.View, (long)c * Skvp * hd), At(dP.View, (long)c * Sq * Skvp), _tScDo.View, Sq, hd, Skvp);
+                MmaPacked(turing, At(dOh16.View, (long)c * Sq * hd), At(Vb.View, (long)c * Skvp * hd), At(dP.View, (long)c * Sq * Skvp), scDo, Sq, hd, Skvp);
             _tDs((int)sn, dP.View, S.View, stats, d, h0, Skvp);                         // dP -> dS = P (dP - D) * scale
             if (turing) DeviceScale(dP.View, sn, _tMaxDs, _tScDs.View);
+            var scDs = turing ? _tScDs.View : _tScOne.View;
+            Pack16Flat(dP.View, dS16.View, sn, turing, turing ? scDs : default);
             for (int c = 0; c < hc; c++)                                               // dQ = dS K = dS (K^T)^T  [Sq, hd]
-                Mma(turing, At(dP.View, (long)c * Sq * Skvp), At(KTb.View, (long)c * hd * Skvp), At(dQh.View, (long)c * Sq * hd), _tScDs.View, Sq, Skvp, hd);
+                MmaPacked(turing, At(dS16.View, (long)c * Sq * Skvp), At(KTb.View, (long)c * hd * Skvp), At(dQh.View, (long)c * Sq * hd), scDs, Sq, Skvp, hd);
             int tilesR = Sqp / 32, tilesC = Skvp / 32;
-            _tTranspose(new KernelConfig(hc * tilesR * tilesC, 256), dP.View, T.View, Sq, Skvp, Sqp, tilesC);   // T = dS^T [Skvp, Sqp]
+            _tTranspose16(new KernelConfig(hc * tilesR * tilesC, 256), dP.View, T16.View, Sq, Skvp, Sqp, tilesC, half, turing ? 1 : 0, scDs);  // T = dS^T
             for (int c = 0; c < hc; c++)                                               // dK = dS^T Q = T (Q^T)^T  [Skv, hd]
-                Mma(turing, At(T.View, (long)c * Skvp * Sqp), At(QTb.View, (long)c * hd * Sqp), At(dKh.View, (long)c * Skv * hd), _tScDs.View, Skv, Sqp, hd);
-            _tTranspose(new KernelConfig(hc * tilesR * tilesC, 256), S.View, T.View, Sq, Skvp, Sqp, tilesC);    // T = P^T
+                MmaPacked(turing, At(T16.View, (long)c * Skvp * Sqp), At(QTb.View, (long)c * hd * Sqp), At(dKh.View, (long)c * Skv * hd), scDs, Skv, Sqp, hd);
+            _tTranspose16(new KernelConfig(hc * tilesR * tilesC, 256), S.View, T16.View, Sq, Skvp, Sqp, tilesC, half, 0, _tScOne.View);         // T = P^T
             for (int c = 0; c < hc; c++)                                               // dV = P^T dO = T (dO^T)^T  [Skv, hd]
-                Mma(turing, At(T.View, (long)c * Skvp * Sqp), At(dOTb.View, (long)c * hd * Sqp), At(dVh.View, (long)c * Skv * hd), _tScDv.View, Skv, Sqp, hd);
+                MmaPacked(turing, At(T16.View, (long)c * Skvp * Sqp), At(dOTb.View, (long)c * hd * Sqp), At(dVh.View, (long)c * Skv * hd), scDv, Skv, Sqp, hd);
             _gScatterQ((int)qn, dQh.View, dq, pq);
             _gScatterKv((int)(kn / g), dKh.View, dk, pk);
             _gScatterKv((int)(kn / g), dVh.View, dv, pk);
@@ -282,10 +291,37 @@ public sealed partial class BackwardKernels
         }
     }
 
+    // [batch, R, C] fp32 -> [batch, C, Rp] 16-bit (f16 when half, else bf16; times sc[0] when scaled); columns r in [R, Rp) are zero
+    private static void TransposePad16Impl(FV src, HV16 dst, int R, int C, int Rp, int tilesC, int half, int useScale, FV sc)
+    {
+        var sh = SharedMemory.Allocate<float>(32 * 33);
+        int tilesR = Rp / 32, perBatch = tilesR * tilesC;
+        int b = Grid.IdxX / perBatch, t = Grid.IdxX - b * perBatch;
+        int r0 = (t / tilesC) * 32, c0 = (t % tilesC) * 32;
+        int tx = Group.IdxX & 31, ty = Group.IdxX >> 5;
+        long sb = (long)b * R * C, db = (long)b * C * Rp;
+        float s = useScale != 0 ? sc[0] : 1f;
+        for (int k = 0; k < 4; k++)
+        {
+            int rr = ty + 8 * k, r = r0 + rr, cc = c0 + tx;
+            sh[rr * 33 + tx] = r < R && cc < C ? src[sb + (long)r * C + cc] * s : 0f;
+        }
+        Group.Barrier();
+        for (int k = 0; k < 4; k++)
+        {
+            int cc = ty + 8 * k, col = c0 + cc, r = r0 + tx;
+            if (col < C && r < Rp)
+            {
+                float v = sh[tx * 33 + cc];
+                dst[db + (long)col * Rp + r] = half != 0 ? F32ToF16Bits(v) : Bf16Bits(v);
+            }
+        }
+    }
+
     private void DisposeAttentionTensorCore()
     {
-        foreach (var b in new[] { _tKb, _tVb, _tKTb, _tQTb, _tdOTb }) b?.Dispose();
-        _tKb = _tVb = _tKTb = _tQTb = _tdOTb = null;
+        foreach (var b in new[] { _tKb, _tVb, _tKTb, _tQTb, _tdOTb, _tQh16, _tdOh16, _tdS16, _tT16 }) b?.Dispose();
+        _tKb = _tVb = _tKTb = _tQTb = _tdOTb = _tQh16 = _tdOh16 = _tdS16 = _tT16 = null;
         foreach (var b in _tRetired16) b.Dispose();
         _tRetired16.Clear();
         foreach (var b in new[] { _tS, _tdP, _tT, _tScOne, _tScDo, _tScDs, _tScDv }) b?.Dispose();

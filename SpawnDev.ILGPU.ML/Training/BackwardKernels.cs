@@ -400,31 +400,69 @@ public sealed partial class BackwardKernels : IDisposable
         _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>(DequantTransposeBf16Impl);
         int tilesK = (K + 31) / 32;
         _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK, turing ? 1 : 0);
-        int tilesT = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((K + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        // dy -> 16-bit once (Turing: times a power-of-two scale from max|dy|, found on the device), then the packed GEMM:
+        // C[M, Nm] = A[M, Km] * W[Nm, Km]^T with A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K]
+        var dy16 = Grow16(_acc, ref _dy16, (long)M * N, _tRetired16);
+        _scOnes ??= _acc.Allocate1D(new[] { 1f, 1f });
+        var sc = _scOnes.View;
         if (turing)
         {
-            // the scale: a power of two that puts max|dy| near 2^14 (f16 tops out at 65504), found on the device (no readback)
             _absMax ??= _acc.Allocate1D<int>(1);
             _qtScale ??= _acc.Allocate1D<float>(2);
-            _zeroInt ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>>(ZeroIntImpl);
-            _absMaxK ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>(AbsMaxImpl);
-            _scaleK ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ScaleFromMaxImpl);
-            int count = M * N;
-            _zeroInt(1, _absMax.View);
-            _absMaxK(new KernelConfig(Math.Max(1, Math.Min(1024, (count + 255) / 256)), 256), dy, _absMax.View, count);
-            _scaleK(1, _absMax.View, _qtScale.View);
-            _mmaF16Sm75 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75Scaled);
-            _mmaF16Sm75(new KernelConfig(tilesT, Trellis2.MmaGemm.Threads), dy.SubView(0, (long)M * N).Cast<float, Trellis2.F4>(),
-                _wtBf16.View.SubView(0, need).Cast<ushort, Trellis2.U4>(), _qtScale.View, dx, M, N, K);
-            return;
+            DeviceScale(dy, (long)M * N, _absMax, _qtScale.View);
+            sc = _qtScale.View;
         }
-        _mmaBf16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>(Trellis2.MmaGemm.KernelBf16Dense);
-        // MmaGemm: C[M, Nm] = A[M, Km] * W[Nm, Km]^T. Here A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K].
-        int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((K + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
-        _mmaBf16(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), dy.SubView(0, (long)M * N).Cast<float, Trellis2.F4>(),
-            _wtBf16.View.SubView(0, need).Cast<ushort, Trellis2.U4>(), _noBias.View, dx, dx, _noNbr.View, M, N, K, 0, 0, 0, 0);
+        Pack16Flat(dy, dy16.View, (long)M * N, turing, turing ? sc : default);
+        MmaPacked(turing, dy16.View, _wtBf16.View.SubView(0, need), dx, sc, M, N, K);
+    }
+
+    /// <summary>
+    /// The packed tensor-core GEMM (Trellis2.MmaGemm.Kernel{Bf16,F16Sm75}PackedV2: double-buffered shared tiles, 64-bit fragment loads) for 16-bit
+    /// operands already in place: C[M, N] = A[M, K] W[N, K]^T * sc[1]. MEASURED 2026-11-05 on an RTX 4070 at the training dX shapes: 40.2 / 34.5 /
+    /// 26.4 TFLOPS (q-o / gate-up / down) where the fp32-A kernels ran 29.9 / 29.9 / 23.9. The A/B controls are UseTensorCoreQuantT and
+    /// UseTensorCoreAttentionBackward (false = the SIMT / fp32 paths).
+    /// </summary>
+    private MemoryBuffer1D<ushort, Stride1D.Dense>? _dy16;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _scOnes;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16, _packedF16;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, ArrayView1D<float, Stride1D.Dense>>? _pack16Flat;
+
+    private void MmaPacked(bool turing, ArrayView1D<ushort, Stride1D.Dense> A, ArrayView1D<ushort, Stride1D.Dense> W, ArrayView1D<float, Stride1D.Dense> C,
+        ArrayView1D<float, Stride1D.Dense> sc, int M, int K, int N)
+    {
+        int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        var k = turing
+            ? _packedF16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
+            : _packedBf16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV2);
+        k(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), A.SubView(0, (long)M * K).Cast<ushort, Trellis2.U4>(), W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>(),
+            sc, C, M, K, N);
+    }
+
+    // dst[i] = 16-bit(src[i] (* sc[0] when scaled)): f16 when half, else bf16 (round to nearest even)
+    private void Pack16Flat(ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<ushort, Stride1D.Dense> dst, long count, bool half, ArrayView1D<float, Stride1D.Dense> sc)
+    {
+        _scOnes ??= _acc.Allocate1D(new[] { 1f, 1f });
+        _pack16Flat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int,
+            ArrayView1D<float, Stride1D.Dense>>(Pack16FlatImpl);
+        _pack16Flat((int)count, src, dst, half ? 1 : 0, sc.IsValid ? 1 : 0, sc.IsValid ? sc : _scOnes.View);
+    }
+
+    private static void Pack16FlatImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<ushort, Stride1D.Dense> dst, int half, int useScale,
+        ArrayView1D<float, Stride1D.Dense> sc)
+    {
+        float v = src[i];
+        if (useScale != 0) v *= sc[0];
+        dst[i] = half != 0 ? F32ToF16Bits(v) : Bf16Bits(v);
+    }
+
+    private static ushort Bf16Bits(float v)
+    {
+        uint b = (uint)Interop.FloatAsInt(v);
+        b += 0x7FFFu + ((b >> 16) & 1u);
+        return (ushort)(b >> 16);
     }
 
     // One group = a 32 (stored rows n) x 32 (values k) tile of the GGUF weight: 256 threads decode it with consecutive threads on consecutive k
@@ -1024,6 +1062,8 @@ public sealed partial class BackwardKernels : IDisposable
         _noBias?.Dispose(); _noBias = null;
         _noNbr?.Dispose(); _noNbr = null;
         _absMax?.Dispose(); _absMax = null;
+        _dy16?.Dispose(); _dy16 = null;
+        _scOnes?.Dispose(); _scOnes = null;
         _qtScale?.Dispose(); _qtScale = null;
         DisposeAttentionGemm();
         DisposeAttentionTensorCore();
