@@ -2,7 +2,9 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (5.8.2-local.12 candidate) - LoRA training 4.8x faster
+## 5.8.2 - 2026-11-05 (nuget.org) - LoRA training on GGUF models (4.8x faster), DINOv2 image embeddings, ONNX Resize fix
+
+Stable release of everything since 5.8.1: this section plus 5.8.2-local.11 and 5.8.2-local.10 below. Full sweep 7500 passed, 0 failed.
 
 - **Training speed**: a llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 21.7 s -> 4.5 s; the Vertex v2.1
   run (1,225 lines) trained in 2.06 h where v1 (755 lines) took 9 h. Gradients unchanged (directional derivative 1.3e-3 - 1.9e-3).
