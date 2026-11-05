@@ -246,6 +246,57 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The tensor-core path of <see cref="BackwardKernels.MatMulTransposedQuant"/> (CUDA sm_80+: W decoded and transposed to bf16, then the bf16
+    /// MMA GEMM): against the float64 CPU reference within bf16 rounding (relative to the largest |dx|), and with dy scaled by 1e-7 (a
+    /// gradient far below f16's range) to the same relative error: bf16 keeps fp32's exponent. Shapes cross the 128-row and 128-column tiles.
+    /// Added 2026-11-05.
+    /// </summary>
+    [TestMethod]
+    public async Task Backward_MatMulTransposedQuant_TensorCores_MatchReference() => await RunTest(async accelerator =>
+    {
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_80+ tensor cores");
+        var notes = new List<string>();
+        foreach (var (type, M, K, N) in new[] { (GGMLType.Q4_K, 200, 512, 96), (GGMLType.Q6_K, 70, 256, 64), (GGMLType.Q8_0, 130, 288, 160) })
+        {
+            var rng = new Random(570 + (int)type);
+            int rb = RowBytes(type, K);
+            var bytes = new byte[(N * rb + 3) & ~3];
+            var W = new float[N * K];
+            for (int n = 0; n < N; n++)
+            {
+                var row = MakeBlocks(type, K, rng);
+                Buffer.BlockCopy(row, 0, bytes, n * rb, rb);
+                Array.Copy(ReferenceDequant(type, row, K), 0, W, n * K, K);
+            }
+            foreach (float dyScale in new[] { 1f, 1e-7f })
+            {
+                var dy = RandomFloats(M * N, seed: 571).Select(v => v * dyScale).ToArray();
+                var want = new double[M * K];
+                for (int m = 0; m < M; m++) for (int k = 0; k < K; k++) { double s = 0; for (int n = 0; n < N; n++) s += (double)dy[m * N + n] * W[n * K + k]; want[m * K + k] = s; }
+                using var reg = new OperatorRegistry(accelerator);
+                using var qb = accelerator.Allocate1D(bytes); using var db = accelerator.Allocate1D(dy); using var dx = accelerator.Allocate1D<float>(M * K);
+                bool saved = BackwardKernels.UseTensorCoreQuantT;
+                double worstRel = 0;
+                try
+                {
+                    BackwardKernels.UseTensorCoreQuantT = true;
+                    reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
+                    var got = await dx.View.CopyToHostAsync();
+                    double scale = want.Max(Math.Abs);
+                    for (int i = 0; i < want.Length; i++) worstRel = Math.Max(worstRel, Math.Abs(got[i] - want[i]) / scale);
+                }
+                finally { BackwardKernels.UseTensorCoreQuantT = saved; }
+                // bf16 keeps 8 mantissa bits (2^-9 = 2e-3 relative per operand); N products of rounded operands accumulate in fp32
+                if (worstRel > 1e-2) throw new Exception($"{type} M={M} K={K} N={N} dy x {dyScale}: tensor-core dx max |diff| / max |dx| = {worstRel:E2}");
+                notes.Add($"{type} {M}x{K}x{N} dy x {dyScale:G2}: {worstRel:E2}");
+            }
+        }
+        var line = "tensor-core dy W^T (bf16) vs float64, max |diff| / max |dx|: " + string.Join("; ", notes);
+        Console.WriteLine("[Backward] " + line);
+        return line;
+    });
+
+    /// <summary>
     /// The ONNX SoftmaxCrossEntropyLoss op (rewritten onto the device 2026-11-04): mean over the rows NOT ignored, sum, none, and the
     /// log_prob output, against a float64 CPU reference. The old body divided by every row even when rows were masked.
     /// </summary>

@@ -258,6 +258,11 @@ public sealed class BackwardKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MatMulTransposedQuantImpl);
         int code = Kernels.FusedDequantMatMul.TypeCode(type);
         int rowBytes = Kernels.FusedDequantMatMul.RowBytesOf(code, K);
+        if (UseTensorCoreQuantT && M >= 16 && N % Trellis2.MmaGemm.BK == 0 && K % 8 == 0 && K >= 64 && Kernels.CudaCaps.TensorCores(_acc))
+        {
+            MatMulTransposedQuantTensorCore(dy, weightQuant, dx, M, K, N, code, rowBytes);
+            return;
+        }
         if (UseTiledQuantT && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= TqThreads)
         {
             _matmulQuantTTiled ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
@@ -271,6 +276,69 @@ public sealed class BackwardKernels : IDisposable
 
     /// <summary>The shared-memory tiled kernel for <see cref="MatMulTransposedQuant"/> (default on; false = the per-element kernel, the A/B control).</summary>
     public static bool UseTiledQuantT { get; set; } = true;
+
+    /// <summary>
+    /// CUDA sm_80+: <see cref="MatMulTransposedQuant"/> on the tensor cores (default on; false = the SIMT tiled kernel, the A/B control). W is decoded
+    /// and transposed ONCE per call into a bf16 scratch [K, N], then <c>Trellis2.MmaGemm.KernelBf16Dense</c> computes dx = dy W^T with dy rounded
+    /// to bf16 and fp32 accumulation. bf16, not f16: gradients can sit far below f16's normal range (6e-5); bf16 keeps fp32's exponent.
+    /// </summary>
+    public static bool UseTensorCoreQuantT { get; set; } = true;
+    private MemoryBuffer1D<ushort, Stride1D.Dense>? _wtBf16;
+    private readonly List<MemoryBuffer1D<ushort, Stride1D.Dense>> _retiredWt = new();
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBias;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int>? _dequantTBf16;
+    private Action<KernelConfig, ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>? _mmaBf16;
+
+    private void MatMulTransposedQuantTensorCore(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
+        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes)
+    {
+        long need = (long)K * N;
+        if (_wtBf16 == null || _wtBf16.Length < need)
+        {
+            if (_wtBf16 != null) _retiredWt.Add(_wtBf16);   // a queued launch may still read it
+            _wtBf16 = _acc.Allocate1D<ushort>(need);
+        }
+        _noBias ??= _acc.Allocate1D<BFloat16>(8);
+        _noNbr ??= _acc.Allocate1D<int>(1);
+        _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int>(DequantTransposeBf16Impl);
+        int tilesK = (K + 31) / 32;
+        _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK);
+        _mmaBf16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>(Trellis2.MmaGemm.KernelBf16Dense);
+        // MmaGemm: C[M, Nm] = A[M, Km] * W[Nm, Km]^T. Here A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K].
+        int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((K + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        _mmaBf16(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), dy.SubView(0, (long)M * N).Cast<float, Trellis2.F4>(),
+            _wtBf16.View.SubView(0, need).Cast<ushort, Trellis2.U4>(), _noBias.View, dx, dx, _noNbr.View, M, N, K, 0, 0, 0, 0);
+    }
+
+    // One group = a 32 (stored rows n) x 32 (values k) tile of the GGUF weight: 256 threads decode it with consecutive threads on consecutive k
+    // (one row's bytes), stage it in shared memory (33-float rows: no bank conflicts on the transposed read), then write out[k, n] with
+    // consecutive threads on consecutive n. bf16 by round to nearest even.
+    private static void DequantTransposeBf16Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<ushort, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK)
+    {
+        var sh = SharedMemory.Allocate<float>(32 * 33);
+        int t = Grid.IdxX;
+        int n0 = (t / tilesK) * 32, k0 = (t % tilesK) * 32;
+        int tx = Group.IdxX & 31, ty = Group.IdxX >> 5;
+        for (int r = 0; r < 4; r++)
+        {
+            int nn = ty + 8 * r, n = n0 + nn, k = k0 + tx;
+            sh[nn * 33 + tx] = n < N && k < K ? Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k) : 0f;
+        }
+        Group.Barrier();
+        for (int r = 0; r < 4; r++)
+        {
+            int kk = ty + 8 * r, k = k0 + kk, n = n0 + tx;
+            if (k < K && n < N)
+            {
+                uint b = (uint)Interop.FloatAsInt(sh[tx * 33 + kk]);
+                b += 0x7FFFu + ((b >> 16) & 1u);
+                o[(long)k * N + n] = (ushort)(b >> 16);
+            }
+        }
+    }
     // MEASURED 2026-11-04 (llama3.1:8b training step, 1,600 tokens, per-op sync): with TqM = 16 the transposed matmul was 60% of the step
     // (25.5 s, 16x the forward GEMMs): each decoded weight served only 16 rows, and every one of the 100 row tiles decoded the same weight
     // tile again - decode-bound. TqM = 64 with a 4 x 4 register block per thread: each decode serves 64 rows.
@@ -767,5 +835,13 @@ public sealed class BackwardKernels : IDisposable
     }
 
     /// <inheritdoc/>
-    public void Dispose() { _ones?.Dispose(); _ones = null; }
+    public void Dispose()
+    {
+        _ones?.Dispose(); _ones = null;
+        _wtBf16?.Dispose(); _wtBf16 = null;
+        foreach (var b in _retiredWt) b.Dispose();
+        _retiredWt.Clear();
+        _noBias?.Dispose(); _noBias = null;
+        _noNbr?.Dispose(); _noNbr = null;
+    }
 }

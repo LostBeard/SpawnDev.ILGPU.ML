@@ -172,3 +172,21 @@ zero-copy Unsqueeze view at node 192. tools/DumpCompiledOrder: under the stable 
 several nodes (and view drains) sat between them. GatherND reads its indices on the device (no host read). Next: the Wasm
 lane with GraphExecutor.PerOpSync and GraphCompiler.StableTopologicalOrder = false/true A/B, to name the kernel that faults.
 Held until Geordi's AubsCraft suite ends (a Wasm lane slowed his Paper servers 418 s before). Blocks local.10.
+
+## Training speed (TJ 2026-11-05: "training takes a LONG time ... plans to improve?")
+
+Measured baseline (llama3.1:8b Q4_K_M, RTX 4070, 1,600 tokens, rank 16 q/k/v/o, checkpointed, labeled-only): 21.7 s per step on an idle
+GPU (re-measured 2026-11-05 in the real loop: 21 s per line); the v1 run averaged 42.8 s per line on a shared GPU. Per-op profile
+(`TrainLoraProbe --profile`): MatMulGradInput (dx through the frozen quantized weights) 8.45 s, FusedAttentionGrad 9.24 s, the rest
+(forward + checkpoint recompute + small ops) ~4 s. The inference engine runs the same forward at ~1,640 tok/s with tensor cores, so a
+step is ~4 forwards of work: target 4-5 s per step (a 7 h run in ~1.5 h).
+
+- [x] MatMulGradInput on tensor cores (2026-11-05): W decoded + transposed once per call to bf16 scratch, then Trellis2.MmaGemm bf16
+      (`BackwardKernels.UseTensorCoreQuantT`, default on, CUDA sm_80+). bf16 because gradients sit below f16's range. Gate
+      `Backward_MatMulTransposedQuant_TensorCores_MatchReference`: 2.5e-3 relative vs float64 (same with dy x 1e-7), red 1.29.
+      Qwen2.5-0.5B Q4_K_M probe: directional derivative 7.4e-4 / 2.9e-4 (SIMT 1.2e-3 / 1.9e-3), same loss curve, step 1,253 vs 1,520 ms
+      (shared GPU). 8B measurement pending (after the v2 run).
+- [ ] Attention backward on tensor cores (the MmaFlashPrefill pattern: S = QK^T, dP = dO V^T, dS, dQ, dK, dV as mma tiles).
+- [ ] The training forward / recompute through the tensor-core prefill kernels (MmaKQuantGemm, MmaFlashPrefill) instead of the
+      generic graph kernels.
+- [ ] Then: packing several short sequences per step; skipping work that has no gradient.
