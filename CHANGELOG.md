@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 5.8.3 - 2026-11-05 (nuget.org) - LoRA training 2.5x faster again (12x since this morning's 5.8.2 baseline); Turing; faster prefill
+## 5.8.3 - 2026-11-05 (nuget.org) - LoRA training 2.5x faster again (4.5 -> 1.78 s per step); Turing; faster prefill
 
 Stable. Full sweep 7513 passed, 0 failed. On SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory
 addresses for `ldmatrix` / `cp.async`) and SpawnDev.SpawnJS 3.0.8.
