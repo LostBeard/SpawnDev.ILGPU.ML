@@ -32,6 +32,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
   - **V5 tensor-core GEMM** (`FusedDequantMatMul.EnableMmaV5`, sm_80+, `GGUF_GEMM_V5=0` = V4): 4 warps of 64 x 64 per 128 x 128 block instead
     of 8 warps of 64 x 32 (a third less shared-memory traffic per FLOP); bit-identical (same MMAs per output, same K order). llama3.1:8b
     shapes: 43.7 -> 46.0 (q / o), 49.4 -> 52.0 (down), 45.4 -> 48.4 (gate / up) TFLOPS. Step 2.01 -> 1.94 s.
+  - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, off until measured on a Turing card; `GGUF_GEMM_SM75_V5=1`): 64 x 64 warp
+    tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2. Through the Turing path on an RTX 4070: training
+    step 2.18 -> 2.09 s, identical loss trajectory.
   - **Scratch-operand K-quant GEMM** (`FusedDequantMatMul.EnableMmaScratch`, M >= 512, f16 weight <= 256 MiB): the weight is dequantized once
     to f16 with the GEMM's own decode helpers (bit-identical words), then the 16-bit V4 GEMM.
   - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing

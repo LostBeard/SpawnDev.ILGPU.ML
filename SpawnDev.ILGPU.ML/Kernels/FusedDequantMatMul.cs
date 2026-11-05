@@ -165,6 +165,13 @@ public class FusedDequantMatMul : IDisposable
     /// GGUF_GEMM_V5=0 = V4.
     /// </summary>
     public static bool EnableMmaV5 = Environment.GetEnvironmentVariable("GGUF_GEMM_V5") != "0";
+
+    /// <summary>
+    /// Turing (sm_75): the 16-bit GEMMs run MmaGemm.KernelF16Sm75PackedV5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering) instead
+    /// of PackedV2. Bit-identical (same m16n8k8 MMAs per output, same K order). Off until measured on a Turing card (on an RTX 4070 through the
+    /// Turing path: 41.7 -> 43.0, 47.9 -> 47.6, 39.1 -> 42.5 TFLOPS). GGUF_GEMM_SM75_V5=1 turns it on.
+    /// </summary>
+    public static bool EnableMmaSm75V5 = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V5") == "1";
     /// <summary>The row count from which <see cref="EnableMmaScratch"/> applies.</summary>
     public static int MmaScratchMinRows = 512;
     /// <summary>
@@ -180,7 +187,7 @@ public class FusedDequantMatMul : IDisposable
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>? _deqQ4K, _deqQ4KSm75;
     private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>? _deqQ6K, _deqQ6KSm75;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16V5, _f16Sm75V2;
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16V5, _f16Sm75V2, _f16Sm75V5;
 
     // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even (two cvt.rn.f16.f32: sm_75 and later, the same bits as cvt.rn.f16x2.f32)
     private static void PackA16Impl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView<uint> o)
@@ -445,8 +452,10 @@ public class FusedDequantMatMul : IDisposable
                     (turing ? _deqQ6KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16Sm75)
                             : _deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
                         deqCount, weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView.Cast<W16>(), N, K);
-                bool v5 = !turing && EnableMmaV5;
-                var gemm = turing
+                bool v5 = turing ? EnableMmaSm75V5 : EnableMmaV5;
+                var gemm = turing && v5
+                    ? _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5)
+                    : turing
                     ? _f16Sm75V2 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
                     : v5 ? _f16V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV5)

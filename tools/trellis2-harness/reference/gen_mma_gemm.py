@@ -722,6 +722,107 @@ def kernel_packed_v5(dtype, sm75, acc=False):
 kernel_packed_v5("Bf16", False)
 kernel_packed_v5("F16", False)
 kernel_packed_v5("Bf16", False, acc=True)
+
+
+def kernel_packed_v5r(acc=False):
+    """KernelF16Sm75PackedV5{Acc} (2026-11-05): the Turing (sm_75) form of V5: 4 warps of 64 x 64, ldmatrix fragments (sm_75 has ldmatrix),
+    m16n8k8 MMAs, and register-staged double buffering instead of cp.async (sm_80+): the next tile's 16-byte chunks are loaded into registers
+    before the current tile's MMAs and stored to the other shared buffer after them (one barrier per K tile)."""
+    mma8 = "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+    ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+    RW = 20
+    MT5, NT5 = 4, 8
+    name = f"KernelF16Sm75PackedV5{'Acc' if acc else ''}"
+    w(f"    /// <summary>16-bit A and W (f16): C = A W^T * sc[1]{' + D' if acc else ''}; Turing V5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering). grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_75+.</summary>")
+    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    w("    {")
+    w("        int numTilesM = (M + BM - 1) / BM;")
+    w("        int tileRow = Grid.IdxX % numTilesM;")
+    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 1, wn = warp & 1;")
+    w("        float inv = sc[1];")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * BM * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<uint>(2 * BN * {RW});")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int cr = tid >> 2, cc = tid & 3;")
+    for i in range(4):
+        w(f"        int aR{i} = tileRow * BM + cr + {32 * i}, bR{i} = tileCol * BN + cr + {32 * i};")
+        w(f"        bool aOk{i} = aR{i} < M, bOk{i} = bR{i} < N;")
+        w(f"        long aG{i} = (long)(aOk{i} ? aR{i} : 0) * (K >> 3) + cc, bG{i} = (long)(bOk{i} ? bR{i} : 0) * (K >> 3) + cc;")
+        w(f"        int sOff{i} = (cr + {32 * i}) * {RW} + cc * 4;")
+    w(f"        int aLd = (wm * 64 + (lane & 15)) * {RW} + (lane >> 4) * 4;")
+    w(f"        int bLd = (wn * 64 + (lane & 7) + ((lane >> 4) << 3)) * {RW} + ((lane >> 3) & 1) * 4;")
+    w("        U4 zero = default;")
+
+    def load(kt_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int kq = ({kt_expr}) >> 3;")
+        for i in range(4):
+            w(f"{ind}    ra{i} = aOk{i} ? Au[aG{i} + kq] : zero; rb{i} = bOk{i} ? Wu[bG{i} + kq] : zero;")
+        w(f"{ind}}}")
+
+    def store(buf_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int sb = ({buf_expr}) * BM * {RW};")
+        for (arr, r) in (("aS", "ra"), ("bS", "rb")):
+            for i in range(4):
+                w(f"{ind}    {arr}[sb + sOff{i}] = {r}{i}.X; {arr}[sb + sOff{i} + 1] = {r}{i}.Y; {arr}[sb + sOff{i} + 2] = {r}{i}.Z; {arr}[sb + sOff{i} + 3] = {r}{i}.W;")
+        w(f"{ind}}}")
+
+    w("        U4 " + ", ".join(f"ra{i}, rb{i}" for i in range(4)) + ";")
+    load("0", "        ")
+    store("0", "        ")
+    w("        Group.Barrier();")
+    w("        int cur = 0;")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    w("            bool more = kt + BK < K;")
+    w("            if (more)")
+    load("kt + BK", "            ")
+    w(f"            int so = cur * BM * {RW};")
+    w("            for (int ks = 0; ks < 2; ks++)")
+    w("            {")
+    for mt in range(MT5):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd + {mt * 16 * RW} + ks * 8]));')
+    for np_ in range(NT5 // 2):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[so + bLd + {np_ * 16 * RW} + ks * 8]));')
+    for mt in range(MT5):
+        for nt in range(NT5):
+            for (x0, x1, bb) in ((0, 1, 0), (2, 3, 1)):
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma8}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}{x0}, a{mt}{x1}, b{nt}{bb}, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+    w("            }")
+    w("            if (more)")
+    store("1 - cur", "            ")
+    w("            Group.Barrier();")
+    w("            cur = 1 - cur;")
+    w("        }")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            if acc:
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+
+kernel_packed_v5r()
+kernel_packed_v5r(acc=True)
 w("}")
 
 path = sys.argv[1]

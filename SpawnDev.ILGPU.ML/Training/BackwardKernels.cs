@@ -458,12 +458,25 @@ public sealed partial class BackwardKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, ArrayView1D<float, Stride1D.Dense>>? _pack16Flat;
 
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Acc, _packedBf16Acc, _packedBf16V5Acc;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5, _packedF16Sm75V5;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Sm75V5Acc;
 
     private void MmaPacked(bool turing, ArrayView1D<ushort, Stride1D.Dense> A, ArrayView1D<ushort, Stride1D.Dense> W, ArrayView1D<float, Stride1D.Dense> C,
         ArrayView1D<float, Stride1D.Dense> sc, int M, int K, int N, ArrayView1D<float, Stride1D.Dense> accumulate = default)
     {
         int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        if (turing && Kernels.FusedDequantMatMul.EnableMmaSm75V5)
+        {
+            // Turing V5 (64 x 64 warp tiles, ldmatrix, register staging; bit-identical to PackedV2)
+            var a4t = A.SubView(0, (long)M * K).Cast<ushort, Trellis2.U4>();
+            var w4t = W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>();
+            var cfgt = new KernelConfig(tiles, Trellis2.MmaGemm.V5Threads);
+            if (accumulate.IsValid)
+                (_packedF16Sm75V5Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5Acc))(cfgt, a4t, w4t, sc, C, accumulate, M, K, N);
+            else
+                (_packedF16Sm75V5 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5))(cfgt, a4t, w4t, sc, C, M, K, N);
+            return;
+        }
         if (!turing && Kernels.FusedDequantMatMul.EnableMmaV5)
         {
             // sm_80+: V5 (64 x 64 warp tiles; bit-identical to V4, see FusedDequantMatMul.EnableMmaV5)
