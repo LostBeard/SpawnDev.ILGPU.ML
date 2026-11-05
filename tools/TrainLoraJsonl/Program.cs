@@ -7,7 +7,7 @@
 // Run: dotnet run --project tools/TrainLoraJsonl -c Release -- <model.gguf> <data.jsonl>[,more.jsonl] --out <dir>
 //        [--eot 128009] [--epochs 3] [--rank 16] [--alpha 32] [--lr 2e-4] [--accum 8] [--targets attn_q,attn_k,attn_v,attn_output]
 //        [--max-len 4096] [--checkpoint] [--seed 1] [--opencl] [--eval-only] [--engine auto|generator|batch] [--no-dev-loss]
-//        [--progress 10] (a progress line every N AdamW steps) [--exclude-source synthetic-v2-hinted[,more]] [--eval-max-new 160]
+//        [--progress 10] (a progress line every N AdamW steps) [--save-every 25] (save the adapters every N AdamW steps; 0 = per epoch) [--exclude-source synthetic-v2-hinted[,more]] [--eval-max-new 160]
 // --dry-run: print the data summary and exit (no model load).
 // --exclude-source: TRAIN lines whose `source` matches are left out (the A/B for teacher-hinted lines; dev lines are never dropped).
 // Dev lines without target ids but with `expected_tool` (Seven's v2 `target_usable: false`) are kept for tool choice only; they take
@@ -108,6 +108,7 @@ double best = await DevLossAsync();
 Console.WriteLine($"epoch 0: dev loss {best:F4}");
 log.Add(new { epoch = 0, dev_loss = best });
 int progressEvery = Math.Max(1, int.Parse(Arg("--progress", "10")));
+int saveEvery = int.Parse(Arg("--save-every", "25"));   // AdamW steps between checkpoint saves; 0 = only at the end of an epoch
 var rng = new Random(seed);
 for (int ep = 1; ep <= epochs; ep++)
 {
@@ -125,6 +126,15 @@ for (int ep = 1; ep <= epochs; ep++)
             {
                 double el = sw.Elapsed.TotalSeconds, eta = el / (i + 1) * (order.Count - i - 1);
                 Console.WriteLine($"  epoch {ep}: {i + 1}/{order.Count} sequences, step {trainer.Step}, mean train loss {trainSum / (i + 1):F4}, {el:F0} s, ~{eta / 60:F0} min left in the epoch");
+            }
+            // --save-every: a long run leaves usable adapters behind as it goes (a killed run otherwise saves nothing)
+            if (saveEvery > 0 && trainer.Step % saveEvery == 0 && i < order.Count - 1)
+            {
+                var (cst, ccfg) = await trainer.SaveAdaptersAsync(Path.GetFileName(args[0]));
+                File.WriteAllBytes(Path.Combine(outDir, "adapter_model.safetensors"), cst);
+                File.WriteAllText(Path.Combine(outDir, "adapter_config.json"), ccfg);
+                File.WriteAllText(Path.Combine(outDir, "checkpoint.json"), JsonSerializer.Serialize(new { epoch = ep, sequences = i + 1, of = order.Count, step = trainer.Step, mean_train_loss = trainSum / (i + 1) }));
+                Console.WriteLine($"  checkpoint: adapters at step {trainer.Step} saved to {outDir}");
             }
         }
     }
