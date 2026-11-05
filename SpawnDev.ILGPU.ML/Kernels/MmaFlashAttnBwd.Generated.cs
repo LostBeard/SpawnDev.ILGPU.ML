@@ -1259,77 +1259,120 @@ internal static class MmaFlashAttnBwd
         if (d.Causal == 1) qBeg = Math.Max(0, kLo - d.KvOffset) / 64 * 64;
         int qEnd = d.SeqQ;
         if (d.Window > 0) qEnd = Math.Min(qEnd, kHi - d.KvOffset + d.Window);
-        for (int hh = 0; hh < G; hh++)
+        int nQ = qEnd > qBeg ? (qEnd - qBeg + 63) / 64 : 0, total = G * nQ;
+        uint qr0 = 0u, or0 = 0u, qr1 = 0u, or1 = 0u, qr2 = 0u, or2 = 0u, qr3 = 0u, or3 = 0u, qr4 = 0u, or4 = 0u, qr5 = 0u, or5 = 0u, qr6 = 0u, or6 = 0u, qr7 = 0u, or7 = 0u, qr8 = 0u, or8 = 0u, qr9 = 0u, or9 = 0u, qr10 = 0u, or10 = 0u, qr11 = 0u, or11 = 0u, qr12 = 0u, or12 = 0u, qr13 = 0u, or13 = 0u, qr14 = 0u, or14 = 0u, qr15 = 0u, or15 = 0u, qr16 = 0u, or16 = 0u, qr17 = 0u, or17 = 0u, qr18 = 0u, or18 = 0u, qr19 = 0u, or19 = 0u, qr20 = 0u, or20 = 0u, qr21 = 0u, or21 = 0u, qr22 = 0u, or22 = 0u, qr23 = 0u, or23 = 0u, qr24 = 0u, or24 = 0u, qr25 = 0u, or25 = 0u, qr26 = 0u, or26 = 0u, qr27 = 0u, or27 = 0u, qr28 = 0u, or28 = 0u, qr29 = 0u, or29 = 0u, qr30 = 0u, or30 = 0u, qr31 = 0u, or31 = 0u;
+        float lr = 0f, dr = 0f;
+        if (total > 0)
         {
-            int h = hk * G + hh;
-            for (int qb = qBeg; qb < qEnd; qb += 64)
-            {
-                { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2048 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2176 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2304 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2432 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2560 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2688 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2816 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 2944 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3072 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3200 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3328 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3456 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3584 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3712 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3840 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 3968 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                if (tid < 64) { int gq = qb + tid; lseS[tid] = gq < d.SeqQ ? stats[h * d.SeqQ + gq] : 0f; ddS[tid] = gq < d.SeqQ ? stats[(H + h) * d.SeqQ + gq] : 0f; }
+            int hh2 = (0) / nQ, qb2 = qBeg + ((0) - hh2 * nQ) * 64, h2 = hk * G + hh2;
+            { int idx = 0 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr0 = gq < d.SeqQ ? Q16[src] : 0u; or0 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 128 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr1 = gq < d.SeqQ ? Q16[src] : 0u; or1 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 256 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr2 = gq < d.SeqQ ? Q16[src] : 0u; or2 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 384 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr3 = gq < d.SeqQ ? Q16[src] : 0u; or3 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 512 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr4 = gq < d.SeqQ ? Q16[src] : 0u; or4 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 640 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr5 = gq < d.SeqQ ? Q16[src] : 0u; or5 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 768 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr6 = gq < d.SeqQ ? Q16[src] : 0u; or6 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 896 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr7 = gq < d.SeqQ ? Q16[src] : 0u; or7 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1024 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr8 = gq < d.SeqQ ? Q16[src] : 0u; or8 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1152 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr9 = gq < d.SeqQ ? Q16[src] : 0u; or9 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1280 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr10 = gq < d.SeqQ ? Q16[src] : 0u; or10 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1408 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr11 = gq < d.SeqQ ? Q16[src] : 0u; or11 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1536 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr12 = gq < d.SeqQ ? Q16[src] : 0u; or12 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1664 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr13 = gq < d.SeqQ ? Q16[src] : 0u; or13 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1792 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr14 = gq < d.SeqQ ? Q16[src] : 0u; or14 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1920 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr15 = gq < d.SeqQ ? Q16[src] : 0u; or15 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2048 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr16 = gq < d.SeqQ ? Q16[src] : 0u; or16 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2176 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr17 = gq < d.SeqQ ? Q16[src] : 0u; or17 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2304 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr18 = gq < d.SeqQ ? Q16[src] : 0u; or18 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2432 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr19 = gq < d.SeqQ ? Q16[src] : 0u; or19 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2560 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr20 = gq < d.SeqQ ? Q16[src] : 0u; or20 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2688 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr21 = gq < d.SeqQ ? Q16[src] : 0u; or21 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2816 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr22 = gq < d.SeqQ ? Q16[src] : 0u; or22 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 2944 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr23 = gq < d.SeqQ ? Q16[src] : 0u; or23 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3072 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr24 = gq < d.SeqQ ? Q16[src] : 0u; or24 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3200 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr25 = gq < d.SeqQ ? Q16[src] : 0u; or25 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3328 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr26 = gq < d.SeqQ ? Q16[src] : 0u; or26 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3456 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr27 = gq < d.SeqQ ? Q16[src] : 0u; or27 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3584 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr28 = gq < d.SeqQ ? Q16[src] : 0u; or28 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3712 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr29 = gq < d.SeqQ ? Q16[src] : 0u; or29 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3840 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr30 = gq < d.SeqQ ? Q16[src] : 0u; or30 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 3968 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr31 = gq < d.SeqQ ? Q16[src] : 0u; or31 = gq < d.SeqQ ? O16[src] : 0u; }
+            if (tid < 64) { int gq = qb2 + tid; lr = gq < d.SeqQ ? stats[h2 * d.SeqQ + gq] : 0f; dr = gq < d.SeqQ ? stats[(H + h2) * d.SeqQ + gq] : 0f; }
+        }
+        for (int it = 0; it < total; it++)
+        {
+                int hh = it / nQ, qb = qBeg + (it - hh * nQ) * 64, h = hk * G + hh;
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr0; os[sidx] = or0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr1; os[sidx] = or1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr2; os[sidx] = or2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr3; os[sidx] = or3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr4; os[sidx] = or4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr5; os[sidx] = or5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr6; os[sidx] = or6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr7; os[sidx] = or7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr8; os[sidx] = or8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr9; os[sidx] = or9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr10; os[sidx] = or10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr11; os[sidx] = or11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr12; os[sidx] = or12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr13; os[sidx] = or13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr14; os[sidx] = or14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr15; os[sidx] = or15; }
+                { int idx = 2048 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr16; os[sidx] = or16; }
+                { int idx = 2176 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr17; os[sidx] = or17; }
+                { int idx = 2304 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr18; os[sidx] = or18; }
+                { int idx = 2432 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr19; os[sidx] = or19; }
+                { int idx = 2560 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr20; os[sidx] = or20; }
+                { int idx = 2688 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr21; os[sidx] = or21; }
+                { int idx = 2816 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr22; os[sidx] = or22; }
+                { int idx = 2944 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr23; os[sidx] = or23; }
+                { int idx = 3072 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr24; os[sidx] = or24; }
+                { int idx = 3200 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr25; os[sidx] = or25; }
+                { int idx = 3328 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr26; os[sidx] = or26; }
+                { int idx = 3456 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr27; os[sidx] = or27; }
+                { int idx = 3584 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr28; os[sidx] = or28; }
+                { int idx = 3712 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr29; os[sidx] = or29; }
+                { int idx = 3840 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr30; os[sidx] = or30; }
+                { int idx = 3968 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr31; os[sidx] = or31; }
+                if (tid < 64) { lseS[tid] = lr; ddS[tid] = dr; }
                 Group.Barrier();
+                if (it + 1 < total)
+                {
+                    int hh2 = (it + 1) / nQ, qb2 = qBeg + ((it + 1) - hh2 * nQ) * 64, h2 = hk * G + hh2;
+                    { int idx = 0 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr0 = gq < d.SeqQ ? Q16[src] : 0u; or0 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 128 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr1 = gq < d.SeqQ ? Q16[src] : 0u; or1 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 256 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr2 = gq < d.SeqQ ? Q16[src] : 0u; or2 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 384 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr3 = gq < d.SeqQ ? Q16[src] : 0u; or3 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 512 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr4 = gq < d.SeqQ ? Q16[src] : 0u; or4 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 640 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr5 = gq < d.SeqQ ? Q16[src] : 0u; or5 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 768 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr6 = gq < d.SeqQ ? Q16[src] : 0u; or6 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 896 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr7 = gq < d.SeqQ ? Q16[src] : 0u; or7 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1024 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr8 = gq < d.SeqQ ? Q16[src] : 0u; or8 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1152 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr9 = gq < d.SeqQ ? Q16[src] : 0u; or9 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1280 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr10 = gq < d.SeqQ ? Q16[src] : 0u; or10 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1408 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr11 = gq < d.SeqQ ? Q16[src] : 0u; or11 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1536 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr12 = gq < d.SeqQ ? Q16[src] : 0u; or12 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1664 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr13 = gq < d.SeqQ ? Q16[src] : 0u; or13 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1792 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr14 = gq < d.SeqQ ? Q16[src] : 0u; or14 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1920 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr15 = gq < d.SeqQ ? Q16[src] : 0u; or15 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2048 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr16 = gq < d.SeqQ ? Q16[src] : 0u; or16 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2176 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr17 = gq < d.SeqQ ? Q16[src] : 0u; or17 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2304 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr18 = gq < d.SeqQ ? Q16[src] : 0u; or18 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2432 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr19 = gq < d.SeqQ ? Q16[src] : 0u; or19 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2560 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr20 = gq < d.SeqQ ? Q16[src] : 0u; or20 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2688 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr21 = gq < d.SeqQ ? Q16[src] : 0u; or21 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2816 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr22 = gq < d.SeqQ ? Q16[src] : 0u; or22 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 2944 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr23 = gq < d.SeqQ ? Q16[src] : 0u; or23 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3072 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr24 = gq < d.SeqQ ? Q16[src] : 0u; or24 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3200 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr25 = gq < d.SeqQ ? Q16[src] : 0u; or25 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3328 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr26 = gq < d.SeqQ ? Q16[src] : 0u; or26 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3456 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr27 = gq < d.SeqQ ? Q16[src] : 0u; or27 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3584 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr28 = gq < d.SeqQ ? Q16[src] : 0u; or28 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3712 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr29 = gq < d.SeqQ ? Q16[src] : 0u; or29 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3840 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr30 = gq < d.SeqQ ? Q16[src] : 0u; or30 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 3968 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr31 = gq < d.SeqQ ? Q16[src] : 0u; or31 = gq < d.SeqQ ? O16[src] : 0u; }
+                    if (tid < 64) { int gq = qb2 + tid; lr = gq < d.SeqQ ? stats[h2 * d.SeqQ + gq] : 0f; dr = gq < d.SeqQ ? stats[(H + h2) * d.SeqQ + gq] : 0f; }
+                }
                 float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
                 float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
                 float s20 = 0f, s21 = 0f, s22 = 0f, s23 = 0f;
@@ -2177,7 +2220,6 @@ internal static class MmaFlashAttnBwd
                     }
                 }
                 Group.Barrier();
-            }
         }
         long o0 = ((long)key0 * KvH + hk) * 128 + hf * 64 + 2 * t, o1 = ((long)key1 * KvH + hk) * 128 + hf * 64 + 2 * t;
         if (k0ok) { dk[o0 + 0] = dk00; dk[o0 + 1] = dk01; dv[o0 + 0] = dv00 * sc1; dv[o0 + 1] = dv01 * sc1; }
@@ -4883,45 +4925,72 @@ internal static class MmaFlashAttnBwd
         if (d.Causal == 1) qBeg = Math.Max(0, kLo - d.KvOffset) / 32 * 32;
         int qEnd = d.SeqQ;
         if (d.Window > 0) qEnd = Math.Min(qEnd, kHi - d.KvOffset + d.Window);
-        for (int hh = 0; hh < G; hh++)
+        int nQ = qEnd > qBeg ? (qEnd - qBeg + 31) / 32 : 0, total = G * nQ;
+        uint qr0 = 0u, or0 = 0u, qr1 = 0u, or1 = 0u, qr2 = 0u, or2 = 0u, qr3 = 0u, or3 = 0u, qr4 = 0u, or4 = 0u, qr5 = 0u, or5 = 0u, qr6 = 0u, or6 = 0u, qr7 = 0u, or7 = 0u, qr8 = 0u, or8 = 0u, qr9 = 0u, or9 = 0u, qr10 = 0u, or10 = 0u, qr11 = 0u, or11 = 0u, qr12 = 0u, or12 = 0u, qr13 = 0u, or13 = 0u, qr14 = 0u, or14 = 0u, qr15 = 0u, or15 = 0u;
+        float lr = 0f, dr = 0f;
+        if (total > 0)
         {
-            int h = hk * G + hh;
-            for (int qb = qBeg; qb < qEnd; qb += 32)
-            {
-                { int idx = 0 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 128 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 256 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 384 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 512 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 640 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 768 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 896 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1024 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1152 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1280 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1408 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1536 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1664 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1792 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                { int idx = 1920 + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * 64 + c;
-                  qs[r * 68 + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * 68 + c] = gq < d.SeqQ ? O16[src] : 0u; }
-                if (tid < 32) { int gq = qb + tid; lseS[tid] = gq < d.SeqQ ? stats[h * d.SeqQ + gq] : 0f; ddS[tid] = gq < d.SeqQ ? stats[(H + h) * d.SeqQ + gq] : 0f; }
+            int hh2 = (0) / nQ, qb2 = qBeg + ((0) - hh2 * nQ) * 32, h2 = hk * G + hh2;
+            { int idx = 0 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr0 = gq < d.SeqQ ? Q16[src] : 0u; or0 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 128 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr1 = gq < d.SeqQ ? Q16[src] : 0u; or1 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 256 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr2 = gq < d.SeqQ ? Q16[src] : 0u; or2 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 384 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr3 = gq < d.SeqQ ? Q16[src] : 0u; or3 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 512 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr4 = gq < d.SeqQ ? Q16[src] : 0u; or4 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 640 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr5 = gq < d.SeqQ ? Q16[src] : 0u; or5 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 768 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr6 = gq < d.SeqQ ? Q16[src] : 0u; or6 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 896 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr7 = gq < d.SeqQ ? Q16[src] : 0u; or7 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1024 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr8 = gq < d.SeqQ ? Q16[src] : 0u; or8 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1152 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr9 = gq < d.SeqQ ? Q16[src] : 0u; or9 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1280 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr10 = gq < d.SeqQ ? Q16[src] : 0u; or10 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1408 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr11 = gq < d.SeqQ ? Q16[src] : 0u; or11 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1536 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr12 = gq < d.SeqQ ? Q16[src] : 0u; or12 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1664 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr13 = gq < d.SeqQ ? Q16[src] : 0u; or13 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1792 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr14 = gq < d.SeqQ ? Q16[src] : 0u; or14 = gq < d.SeqQ ? O16[src] : 0u; }
+            { int idx = 1920 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr15 = gq < d.SeqQ ? Q16[src] : 0u; or15 = gq < d.SeqQ ? O16[src] : 0u; }
+            if (tid < 32) { int gq = qb2 + tid; lr = gq < d.SeqQ ? stats[h2 * d.SeqQ + gq] : 0f; dr = gq < d.SeqQ ? stats[(H + h2) * d.SeqQ + gq] : 0f; }
+        }
+        for (int it = 0; it < total; it++)
+        {
+                int hh = it / nQ, qb = qBeg + (it - hh * nQ) * 32, h = hk * G + hh;
+                { int idx = 0 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr0; os[sidx] = or0; }
+                { int idx = 128 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr1; os[sidx] = or1; }
+                { int idx = 256 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr2; os[sidx] = or2; }
+                { int idx = 384 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr3; os[sidx] = or3; }
+                { int idx = 512 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr4; os[sidx] = or4; }
+                { int idx = 640 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr5; os[sidx] = or5; }
+                { int idx = 768 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr6; os[sidx] = or6; }
+                { int idx = 896 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr7; os[sidx] = or7; }
+                { int idx = 1024 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr8; os[sidx] = or8; }
+                { int idx = 1152 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr9; os[sidx] = or9; }
+                { int idx = 1280 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr10; os[sidx] = or10; }
+                { int idx = 1408 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr11; os[sidx] = or11; }
+                { int idx = 1536 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr12; os[sidx] = or12; }
+                { int idx = 1664 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr13; os[sidx] = or13; }
+                { int idx = 1792 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr14; os[sidx] = or14; }
+                { int idx = 1920 + tid; int sidx = (idx >> 6) * 68 + (idx & 63); qs[sidx] = qr15; os[sidx] = or15; }
+                if (tid < 32) { lseS[tid] = lr; ddS[tid] = dr; }
                 Group.Barrier();
+                if (it + 1 < total)
+                {
+                    int hh2 = (it + 1) / nQ, qb2 = qBeg + ((it + 1) - hh2 * nQ) * 32, h2 = hk * G + hh2;
+                    { int idx = 0 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr0 = gq < d.SeqQ ? Q16[src] : 0u; or0 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 128 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr1 = gq < d.SeqQ ? Q16[src] : 0u; or1 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 256 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr2 = gq < d.SeqQ ? Q16[src] : 0u; or2 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 384 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr3 = gq < d.SeqQ ? Q16[src] : 0u; or3 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 512 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr4 = gq < d.SeqQ ? Q16[src] : 0u; or4 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 640 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr5 = gq < d.SeqQ ? Q16[src] : 0u; or5 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 768 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr6 = gq < d.SeqQ ? Q16[src] : 0u; or6 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 896 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr7 = gq < d.SeqQ ? Q16[src] : 0u; or7 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1024 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr8 = gq < d.SeqQ ? Q16[src] : 0u; or8 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1152 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr9 = gq < d.SeqQ ? Q16[src] : 0u; or9 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1280 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr10 = gq < d.SeqQ ? Q16[src] : 0u; or10 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1408 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr11 = gq < d.SeqQ ? Q16[src] : 0u; or11 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1536 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr12 = gq < d.SeqQ ? Q16[src] : 0u; or12 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1664 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr13 = gq < d.SeqQ ? Q16[src] : 0u; or13 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1792 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr14 = gq < d.SeqQ ? Q16[src] : 0u; or14 = gq < d.SeqQ ? O16[src] : 0u; }
+                    { int idx = 1920 + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * 64 + (idx & 63); qr15 = gq < d.SeqQ ? Q16[src] : 0u; or15 = gq < d.SeqQ ? O16[src] : 0u; }
+                    if (tid < 32) { int gq = qb2 + tid; lr = gq < d.SeqQ ? stats[h2 * d.SeqQ + gq] : 0f; dr = gq < d.SeqQ ? stats[(H + h2) * d.SeqQ + gq] : 0f; }
+                }
                 float s00 = 0f, s01 = 0f, s02 = 0f, s03 = 0f;
                 float s10 = 0f, s11 = 0f, s12 = 0f, s13 = 0f;
                 {
@@ -5683,7 +5752,6 @@ internal static class MmaFlashAttnBwd
                     }
                 }
                 Group.Barrier();
-            }
         }
         long o0 = ((long)key0 * KvH + hk) * 128 + hf * 64 + 2 * t, o1 = ((long)key1 * KvH + hk) * 128 + hf * 64 + 2 * t;
         if (k0ok) { dk[o0 + 0] = dk00 * iDs; dk[o0 + 1] = dk01 * iDs; dv[o0 + 0] = dv00 * sc1; dv[o0 + 1] = dv01 * sc1; }

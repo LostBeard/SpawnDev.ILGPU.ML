@@ -350,16 +350,33 @@ def kernel_kv():
     w(f"{ind}if (d.Causal == 1) qBeg = Math.Max(0, kLo - d.KvOffset) / {QT} * {QT};")
     w(f"{ind}int qEnd = d.SeqQ;")
     w(f"{ind}if (d.Window > 0) qEnd = Math.Min(qEnd, kHi - d.KvOffset + d.Window);")
-    w(f"{ind}for (int hh = 0; hh < G; hh++)")
+    # (query head, query tile) pairs as one sequence; the next pair's Q / dO words and row statistics load into registers before the current
+    # pair's MMAs (register prefetch, as KernelQ) and are stored to shared after the barrier
+    NWQ = QT * WR // 128
+    w(f"{ind}int nQ = qEnd > qBeg ? (qEnd - qBeg + {QT - 1}) / {QT} : 0, total = G * nQ;")
+    w(f"{ind}uint " + ", ".join(f"qr{i} = 0u, or{i} = 0u" for i in range(NWQ)) + ";")
+    w(f"{ind}float lr = 0f, dr = 0f;")
+
+    def load_q(it_expr, ind2):
+        w(f"{ind2}{{")
+        w(f"{ind2}    int hh2 = ({it_expr}) / nQ, qb2 = qBeg + (({it_expr}) - hh2 * nQ) * {QT}, h2 = hk * G + hh2;")
+        for i in range(NWQ):
+            w(f"{ind2}    {{ int idx = {i * 128} + tid; int gq = qb2 + (idx >> 6); long src = ((long)gq * H + h2) * {WR} + (idx & 63); "
+              f"qr{i} = gq < d.SeqQ ? Q16[src] : 0u; or{i} = gq < d.SeqQ ? O16[src] : 0u; }}")
+        w(f"{ind2}    if (tid < {QT}) {{ int gq = qb2 + tid; lr = gq < d.SeqQ ? stats[h2 * d.SeqQ + gq] : 0f; dr = gq < d.SeqQ ? stats[(H + h2) * d.SeqQ + gq] : 0f; }}")
+        w(f"{ind2}}}")
+
+    w(f"{ind}if (total > 0)")
+    load_q("0", ind)
+    w(f"{ind}for (int it = 0; it < total; it++)")
     w(f"{ind}{{")
-    w(f"{i2}int h = hk * G + hh;")
-    w(f"{i2}for (int qb = qBeg; qb < qEnd; qb += {QT})")
-    w(f"{i2}{{")
-    for i in range(QT * WR // 128):
-        w(f"{i3}{{ int idx = {i * 128} + tid; int r = idx >> 6, c = idx & 63; int gq = qb + r; long src = ((long)gq * H + h) * {WR} + c;")
-        w(f"{i3}  qs[r * {RS} + c] = gq < d.SeqQ ? Q16[src] : 0u; os[r * {RS} + c] = gq < d.SeqQ ? O16[src] : 0u; }}")
-    w(f"{i3}if (tid < {QT}) {{ int gq = qb + tid; lseS[tid] = gq < d.SeqQ ? stats[h * d.SeqQ + gq] : 0f; ddS[tid] = gq < d.SeqQ ? stats[(H + h) * d.SeqQ + gq] : 0f; }}")
+    w(f"{i3}int hh = it / nQ, qb = qBeg + (it - hh * nQ) * {QT}, h = hk * G + hh;")
+    for i in range(NWQ):
+        w(f"{i3}{{ int idx = {i * 128} + tid; int sidx = (idx >> 6) * {RS} + (idx & 63); qs[sidx] = qr{i}; os[sidx] = or{i}; }}")
+    w(f"{i3}if (tid < {QT}) {{ lseS[tid] = lr; ddS[tid] = dr; }}")
     w(f"{i3}Group.Barrier();")
+    w(f"{i3}if (it + 1 < total)")
+    load_q("it + 1", i3)
     scores("s", "ka", "qs", f"hf * {QT // 2}", NJ, i3)
     scores("p", "va", "os", f"hf * {QT // 2}", NJ, i3)
     sds = " * sDs" if SM75 else ""
@@ -390,7 +407,6 @@ def kernel_kv():
             w(f"{i4}}}")
         w(f"{i3}}}")
     w(f"{i3}Group.Barrier();")
-    w(f"{i2}}}")
     w(f"{ind}}}")
     w(f"{ind}long o0 = ((long)key0 * KvH + hk) * {D} + hf * 64 + 2 * t, o1 = ((long)key1 * KvH + hk) * {D} + hf * 64 + 2 * t;")
     ik = " * iDs" if SM75 else ""
