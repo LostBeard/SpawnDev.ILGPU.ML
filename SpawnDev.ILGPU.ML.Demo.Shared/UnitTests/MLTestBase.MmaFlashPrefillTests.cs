@@ -24,6 +24,11 @@ public abstract partial class MLTestBase
         if (CudaCaps.TensorCores(accelerator))
             variants.Add(("sm80", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.Kernel)));
         variants.Add(("sm75", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.KernelSm75)));
+        // the ldmatrix forms (2026-11-05): the same fragments read with ldmatrix / ldmatrix.trans, V staged untransposed: bitwise the scalar forms
+        if (CudaCaps.TensorCores(accelerator))
+            variants.Add(("sm80 ldm", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.KernelLdm)));
+        variants.Add(("sm75 ldm", accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaFlashPrefill.KernelLdmSm75)));
+        var reference = new Dictionary<string, float[]>();
         var notes = new List<string>();
         foreach (var (vname, kernel) in variants)
         foreach (var (p, R, H, kvH) in new[] { (77, 200, 8, 2), (0, 37, 4, 4), (300, 129, 4, 2) })
@@ -43,6 +48,12 @@ public abstract partial class MLTestBase
             kernel(new KernelConfig(((R + MmaFlashPrefill.QTile - 1) / MmaFlashPrefill.QTile) * H, MmaFlashPrefill.Threads), qBuf.View, kBuf.View.BaseView, vBuf.View.BaseView, oBuf.View, R, H, kvH, p);
             await accelerator.SynchronizeAsync();
             var got = await oBuf.CopyToHostAsync<float>(0, q.Length);
+            string twin = vname.Replace(" ldm", "") + $" {p} {R} {H} {kvH}";
+            if (!vname.EndsWith(" ldm")) reference[twin] = got;
+            else if (reference.TryGetValue(twin, out var want))
+                for (int i = 0; i < got.Length; i++)
+                    if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(want[i]))
+                        throw new Exception($"{vname} p={p} R={R} H={H} kvH={kvH}: output {i} = {got[i]:R}, the scalar-fragment kernel {want[i]:R}");
             int bad = 0; double worst = 0;
             Parallel.For(0, R * H, () => (bad: 0, worst: 0.0), (rh, _, acc) =>
             {
@@ -71,6 +82,25 @@ public abstract partial class MLTestBase
             if (bad > 0) throw new Exception($"{vname} p={p} R={R} H={H} kvH={kvH}: {bad} of {got.Length} outputs past the bound (worst {worst:F2}x)");
             notes.Add($"{vname} p={p} R={R} H={H} kvH={kvH}: worst {worst:F3}x the bound");
         }
+        // timing at a training shape (llama3.1:8b, 1,600 rows, 32 heads on 8 kv heads): not a gate
+        {
+            const int Rt = 1600, Ht = 32, kvHt = 8;
+            using var qb = accelerator.Allocate1D<float>((long)Rt * Ht * D);
+            using var kb = accelerator.Allocate1D<uint>((long)Rt * kvHt * D / 2);
+            using var vb = accelerator.Allocate1D<uint>((long)Rt * kvHt * D / 2);
+            using var ob = accelerator.Allocate1D<float>((long)Rt * Ht * D);
+            var cfg = new KernelConfig(((Rt + MmaFlashPrefill.QTile - 1) / MmaFlashPrefill.QTile) * Ht, MmaFlashPrefill.Threads);
+            foreach (var (vname, kernel) in variants)
+            {
+                kernel(cfg, qb.View, kb.View.BaseView, vb.View.BaseView, ob.View, Rt, Ht, kvHt, 0);
+                await accelerator.SynchronizeAsync();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 20; i++) kernel(cfg, qb.View, kb.View.BaseView, vb.View.BaseView, ob.View, Rt, Ht, kvHt, 0);
+                await accelerator.SynchronizeAsync();
+                notes.Add($"{vname} 1600 x 32 heads: {sw.Elapsed.TotalMilliseconds / 20:F3} ms");
+            }
+        }
+        Console.WriteLine("[FlashPrefill] " + string.Join("; ", notes));
         return string.Join("; ", notes);
     });
 }

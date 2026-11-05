@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.875 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 1.87 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -34,6 +34,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
     shapes: 43.7 -> 46.0 (q / o), 49.4 -> 52.0 (down), 45.4 -> 48.4 (gate / up) TFLOPS. Step 2.01 -> 1.94 s.
   - **V6 tensor-core GEMM** (`FusedDequantMatMul.EnableMmaV6`, sm_80+, `GGUF_GEMM_V6=0` = V5): three cp.async stages with XOR-swizzled
     64-byte rows (3 stages fit 48 KB of static shared memory); bit-identical. +1.5 - 4% over V5; step 1.94 -> 1.875 s.
+  - **Flash prefill attention with ldmatrix** (`MmaFlashPrefill.KernelLdm` / `KernelLdmSm75`, now used by the batch decoder's prefill and
+    the training forward): K and V fragments by ldmatrix / ldmatrix.trans instead of scalar shared loads, V staged untransposed. Bitwise
+    the previous kernels (asserted). 1,600 tokens x 32 heads on an RTX 4070: 0.903 -> 0.662 ms (sm_80), 0.815 -> 0.758 ms (Turing form).
   - **Turing V5 GEMM** (`FusedDequantMatMul.EnableMmaSm75V5`, off until measured on a Turing card; `GGUF_GEMM_SM75_V5=1`): 64 x 64 warp
     tiles with ldmatrix and register-staged double buffering, bit-identical to PackedV2. Through the Turing path on an RTX 4070: training
     step 2.18 -> 2.09 s, identical loss trajectory.

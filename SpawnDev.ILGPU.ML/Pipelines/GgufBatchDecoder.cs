@@ -269,8 +269,8 @@ public sealed class GgufBatchDecoder : IDisposable
             // sm_75 (Turing) on the m16n8k8 variant; FusedDequantMatMul.ForceSm75Mma runs it on a newer card (the tests)
             bool turing = !CudaCaps.TensorCores(_a) || FusedDequantMatMul.ForceSm75Mma;
             (turing
-                ? _flashMmaSm75 ??= _a.LoadStreamKernel<FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>(MmaFlashPrefill.KernelSm75)
-                : _flashMma ??= _a.LoadStreamKernel<FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>(MmaFlashPrefill.Kernel))(
+                ? _flashMmaSm75 ??= _a.LoadStreamKernel<FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>(MmaFlashPrefill.KernelLdmSm75)
+                : _flashMma ??= _a.LoadStreamKernel<FV, ArrayView<uint>, ArrayView<uint>, FV, int, int, int, int>(MmaFlashPrefill.KernelLdm))(
                 new KernelConfig(((R + MmaFlashPrefill.QTile - 1) / MmaFlashPrefill.QTile) * H, MmaFlashPrefill.Threads),
                 q, _k[l].View.BaseView.Cast<uint>(), _v[l].View.BaseView.Cast<uint>(), att, R, H, kvH, p);
             return true;

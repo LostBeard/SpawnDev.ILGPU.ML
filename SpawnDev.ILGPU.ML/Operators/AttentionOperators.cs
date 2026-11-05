@@ -174,9 +174,9 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             bool turing = !Kernels.CudaCaps.TensorCores(acc) || Kernels.FusedDequantMatMul.ForceSm75Mma;
             var flash = turing
                 ? _flashTcSm75 ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
-                    Kernels.MmaFlashPrefill.KernelSm75)
+                    Kernels.MmaFlashPrefill.KernelLdmSm75)
                 : _flashTc ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
-                    Kernels.MmaFlashPrefill.Kernel);
+                    Kernels.MmaFlashPrefill.KernelLdm);
             flash(new KernelConfig(((seqQ + Kernels.MmaFlashPrefill.QTile - 1) / Kernels.MmaFlashPrefill.QTile) * nHeads, Kernels.MmaFlashPrefill.Threads),
                 q.Data, kc.Data.Cast<float, uint>().BaseView, vc.Data.Cast<float, uint>().BaseView, ctx.Outputs[0].Data, seqQ, nHeads, kvHeads, kvOffset);
             ctx.Pool.Return(kc);
