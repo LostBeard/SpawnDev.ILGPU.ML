@@ -169,8 +169,8 @@ public class FusedDequantMatMul : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _scratchOnes;
     private readonly List<IDisposable> _scratchRetired = new();
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>? _packA16;
-    private Action<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>? _deqQ4K, _deqQ4KSm75;
-    private Action<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>? _deqQ6K, _deqQ6KSm75;
+    private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>? _deqQ4K, _deqQ4KSm75;
+    private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>? _deqQ6K, _deqQ6KSm75;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16Sm75V2;
 
@@ -430,13 +430,13 @@ public class FusedDequantMatMul : IDisposable
                 _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
                 int deqCount = N * (K >> 5) * 2;
                 if (type == GGMLType.Q4_K)
-                    (turing ? _deqQ4KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ4KF16Sm75)
-                            : _deqQ4K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ4KF16))(
-                        deqCount, weightQuant.BaseView.Cast<W16>(), w16.View.BaseView, N, K);
+                    (turing ? _deqQ4KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16Sm75)
+                            : _deqQ4K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16))(
+                        deqCount, weightQuant.BaseView.Cast<W16>(), w16.View.BaseView.Cast<W16>(), N, K);
                 else
-                    (turing ? _deqQ6KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ6KF16Sm75)
-                            : _deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
-                        deqCount, weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView, N, K);
+                    (turing ? _deqQ6KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16Sm75)
+                            : _deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
+                        deqCount, weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView.Cast<W16>(), N, K);
                 var gemm = turing
                     ? _f16Sm75V2 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)

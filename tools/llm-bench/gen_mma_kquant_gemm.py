@@ -505,7 +505,7 @@ def dequant_f16(sm75, qt):
     kname = ("DequantQ6KF16" if q6 else "DequantQ4KF16") + sfx
     wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
     w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>")
-    w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<uint> O, int N, int K)")
+    w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<W16> O, int N, int K)")
     w("    {")
     w("        int bh = idx & 1, rest = idx >> 1;")
     w("        int k32n = K >> 5;")
@@ -521,18 +521,19 @@ def dequant_f16(sm75, qt):
         w("        int qq = (kt >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;")
         w("        int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);")
         w("        float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);")
-        w("        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;")
-        for i in range(8):
-            w(f"        O[o + {i}] = Q6Pair{sfx}(l{i}, h{i}, lsh, hsh, ds);")
+        w("        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
+        for half in range(2):
+            fl = ", ".join(f"{f} = (int)Q6Pair{sfx}(l{4 * half + i}, h{4 * half + i}, lsh, hsh, ds)" for i, f in enumerate("abcd"))
+            w(f"        O.AsAligned16()[o + {half}] = new W16 {{ {fl} }};")
     else:
         w("        long bRow = (long)n * ((K >> 8) * 9);")
         w("        long sbL = bRow + (kt >> 8) * 9; int jL = (kt >> 5) & 7;")
         w("        W16 ph = Wq.AsAligned16()[sbL], pq = Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh];")
         w("        int j = (kt >> 5) & 7, sh = (j & 1) * 4;")
         w("        ScaleMin s = SubBlockScale(ph, j);")
-        w("        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;")
-        for wi, f in enumerate("abcd"):
-            w(f"        O[o + {2 * wi}] = Pair{sfx}(pq.{f}, 0, sh, s); O[o + {2 * wi + 1}] = Pair{sfx}(pq.{f}, 1, sh, s);")
+        w("        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores")
+        w(f"        O.AsAligned16()[o] = new W16 {{ a = (int)Pair{sfx}(pq.a, 0, sh, s), b = (int)Pair{sfx}(pq.a, 1, sh, s), c = (int)Pair{sfx}(pq.b, 0, sh, s), d = (int)Pair{sfx}(pq.b, 1, sh, s) }};")
+        w(f"        O.AsAligned16()[o + 1] = new W16 {{ a = (int)Pair{sfx}(pq.c, 0, sh, s), b = (int)Pair{sfx}(pq.c, 1, sh, s), c = (int)Pair{sfx}(pq.d, 0, sh, s), d = (int)Pair{sfx}(pq.d, 1, sh, s) }};")
     w("    }")
     w("")
 

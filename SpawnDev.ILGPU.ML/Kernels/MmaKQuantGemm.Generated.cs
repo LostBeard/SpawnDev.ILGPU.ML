@@ -2843,7 +2843,7 @@ internal static class MmaKQuantGemm
     }
 
     /// <summary>Q4_K rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>
-    public static void DequantQ4KF16(Index1D idx, ArrayView<W16> Wq, ArrayView<uint> O, int N, int K)
+    public static void DequantQ4KF16(Index1D idx, ArrayView<W16> Wq, ArrayView<W16> O, int N, int K)
     {
         int bh = idx & 1, rest = idx >> 1;
         int k32n = K >> 5;
@@ -2854,15 +2854,13 @@ internal static class MmaKQuantGemm
         W16 ph = Wq.AsAligned16()[sbL], pq = Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh];
         int j = (kt >> 5) & 7, sh = (j & 1) * 4;
         ScaleMin s = SubBlockScale(ph, j);
-        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;
-        O[o + 0] = Pair(pq.a, 0, sh, s); O[o + 1] = Pair(pq.a, 1, sh, s);
-        O[o + 2] = Pair(pq.b, 0, sh, s); O[o + 3] = Pair(pq.b, 1, sh, s);
-        O[o + 4] = Pair(pq.c, 0, sh, s); O[o + 5] = Pair(pq.c, 1, sh, s);
-        O[o + 6] = Pair(pq.d, 0, sh, s); O[o + 7] = Pair(pq.d, 1, sh, s);
+        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores
+        O.AsAligned16()[o] = new W16 { a = (int)Pair(pq.a, 0, sh, s), b = (int)Pair(pq.a, 1, sh, s), c = (int)Pair(pq.b, 0, sh, s), d = (int)Pair(pq.b, 1, sh, s) };
+        O.AsAligned16()[o + 1] = new W16 { a = (int)Pair(pq.c, 0, sh, s), b = (int)Pair(pq.c, 1, sh, s), c = (int)Pair(pq.d, 0, sh, s), d = (int)Pair(pq.d, 1, sh, s) };
     }
 
     /// <summary>Q4_K rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>
-    public static void DequantQ4KF16Sm75(Index1D idx, ArrayView<W16> Wq, ArrayView<uint> O, int N, int K)
+    public static void DequantQ4KF16Sm75(Index1D idx, ArrayView<W16> Wq, ArrayView<W16> O, int N, int K)
     {
         int bh = idx & 1, rest = idx >> 1;
         int k32n = K >> 5;
@@ -2873,11 +2871,9 @@ internal static class MmaKQuantGemm
         W16 ph = Wq.AsAligned16()[sbL], pq = Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh];
         int j = (kt >> 5) & 7, sh = (j & 1) * 4;
         ScaleMin s = SubBlockScale(ph, j);
-        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;
-        O[o + 0] = PairSm75(pq.a, 0, sh, s); O[o + 1] = PairSm75(pq.a, 1, sh, s);
-        O[o + 2] = PairSm75(pq.b, 0, sh, s); O[o + 3] = PairSm75(pq.b, 1, sh, s);
-        O[o + 4] = PairSm75(pq.c, 0, sh, s); O[o + 5] = PairSm75(pq.c, 1, sh, s);
-        O[o + 6] = PairSm75(pq.d, 0, sh, s); O[o + 7] = PairSm75(pq.d, 1, sh, s);
+        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores
+        O.AsAligned16()[o] = new W16 { a = (int)PairSm75(pq.a, 0, sh, s), b = (int)PairSm75(pq.a, 1, sh, s), c = (int)PairSm75(pq.b, 0, sh, s), d = (int)PairSm75(pq.b, 1, sh, s) };
+        O.AsAligned16()[o + 1] = new W16 { a = (int)PairSm75(pq.c, 0, sh, s), b = (int)PairSm75(pq.c, 1, sh, s), c = (int)PairSm75(pq.d, 0, sh, s), d = (int)PairSm75(pq.d, 1, sh, s) };
     }
 
     /// <summary>Q6_K: one 128 x 128 output tile per group: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 2-byte aligned. sm_80+: m16n8k16.</summary>
@@ -5717,7 +5713,7 @@ internal static class MmaKQuantGemm
     }
 
     /// <summary>Q6_K rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>
-    public static void DequantQ6KF16(Index1D idx, ArrayView<ushort> Wq, ArrayView<uint> O, int N, int K)
+    public static void DequantQ6KF16(Index1D idx, ArrayView<ushort> Wq, ArrayView<W16> O, int N, int K)
     {
         int bh = idx & 1, rest = idx >> 1;
         int k32n = K >> 5;
@@ -5732,19 +5728,13 @@ internal static class MmaKQuantGemm
         int qq = (kt >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;
         int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);
         float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);
-        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;
-        O[o + 0] = Q6Pair(l0, h0, lsh, hsh, ds);
-        O[o + 1] = Q6Pair(l1, h1, lsh, hsh, ds);
-        O[o + 2] = Q6Pair(l2, h2, lsh, hsh, ds);
-        O[o + 3] = Q6Pair(l3, h3, lsh, hsh, ds);
-        O[o + 4] = Q6Pair(l4, h4, lsh, hsh, ds);
-        O[o + 5] = Q6Pair(l5, h5, lsh, hsh, ds);
-        O[o + 6] = Q6Pair(l6, h6, lsh, hsh, ds);
-        O[o + 7] = Q6Pair(l7, h7, lsh, hsh, ds);
+        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores
+        O.AsAligned16()[o + 0] = new W16 { a = (int)Q6Pair(l0, h0, lsh, hsh, ds), b = (int)Q6Pair(l1, h1, lsh, hsh, ds), c = (int)Q6Pair(l2, h2, lsh, hsh, ds), d = (int)Q6Pair(l3, h3, lsh, hsh, ds) };
+        O.AsAligned16()[o + 1] = new W16 { a = (int)Q6Pair(l4, h4, lsh, hsh, ds), b = (int)Q6Pair(l5, h5, lsh, hsh, ds), c = (int)Q6Pair(l6, h6, lsh, hsh, ds), d = (int)Q6Pair(l7, h7, lsh, hsh, ds) };
     }
 
     /// <summary>Q6_K rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>
-    public static void DequantQ6KF16Sm75(Index1D idx, ArrayView<ushort> Wq, ArrayView<uint> O, int N, int K)
+    public static void DequantQ6KF16Sm75(Index1D idx, ArrayView<ushort> Wq, ArrayView<W16> O, int N, int K)
     {
         int bh = idx & 1, rest = idx >> 1;
         int k32n = K >> 5;
@@ -5759,15 +5749,9 @@ internal static class MmaKQuantGemm
         int qq = (kt >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;
         int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);
         float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);
-        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;
-        O[o + 0] = Q6PairSm75(l0, h0, lsh, hsh, ds);
-        O[o + 1] = Q6PairSm75(l1, h1, lsh, hsh, ds);
-        O[o + 2] = Q6PairSm75(l2, h2, lsh, hsh, ds);
-        O[o + 3] = Q6PairSm75(l3, h3, lsh, hsh, ds);
-        O[o + 4] = Q6PairSm75(l4, h4, lsh, hsh, ds);
-        O[o + 5] = Q6PairSm75(l5, h5, lsh, hsh, ds);
-        O[o + 6] = Q6PairSm75(l6, h6, lsh, hsh, ds);
-        O[o + 7] = Q6PairSm75(l7, h7, lsh, hsh, ds);
+        long o = ((long)n * (K >> 1) + (kt >> 1) + bh * 8) >> 2;   // 16-byte units: two vector stores
+        O.AsAligned16()[o + 0] = new W16 { a = (int)Q6PairSm75(l0, h0, lsh, hsh, ds), b = (int)Q6PairSm75(l1, h1, lsh, hsh, ds), c = (int)Q6PairSm75(l2, h2, lsh, hsh, ds), d = (int)Q6PairSm75(l3, h3, lsh, hsh, ds) };
+        O.AsAligned16()[o + 1] = new W16 { a = (int)Q6PairSm75(l4, h4, lsh, hsh, ds), b = (int)Q6PairSm75(l5, h5, lsh, hsh, ds), c = (int)Q6PairSm75(l6, h6, lsh, hsh, ds), d = (int)Q6PairSm75(l7, h7, lsh, hsh, ds) };
     }
 
 }

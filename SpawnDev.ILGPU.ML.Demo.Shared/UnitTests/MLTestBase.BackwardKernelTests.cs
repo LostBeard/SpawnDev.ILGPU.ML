@@ -293,8 +293,18 @@ public abstract partial class MLTestBase
                     var got = await dx.View.CopyToHostAsync();
                     double scale = want.Max(Math.Abs);
                     for (int i = 0; i < want.Length; i++) worstRel = Math.Max(worstRel, Math.Abs(got[i] - want[i]) / scale);
+                    if (type is GGMLType.Q4_K or GGMLType.Q6_K)
+                    {
+                        // the 64 x 64 dequant-transpose writes the same 16-bit words as the 32 x 32 kernel: dx bit-identical
+                        BackwardKernels.UseDequantTranspose64 = false;
+                        reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
+                        var old32 = await dx.View.CopyToHostAsync();
+                        for (int i = 0; i < got.Length; i++)
+                            if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(old32[i]))
+                                throw new Exception($"{type} M={M} K={K} N={N}: 64 x 64 dequant-transpose dx[{i}] = {got[i]:R}, 32 x 32 kernel {old32[i]:R}");
+                    }
                 }
-                finally { BackwardKernels.UseTensorCoreQuantT = saved; }
+                finally { BackwardKernels.UseTensorCoreQuantT = saved; BackwardKernels.UseDequantTranspose64 = true; }
                 // bf16 keeps 8 mantissa bits (2^-9 = 2e-3 relative per operand); N products of rounded operands accumulate in fp32
                 // Turing: f16 operands (11 mantissa bits) after the power-of-two scale on dy
                 if (worstRel > (turing ? 2e-3 : 1e-2)) throw new Exception($"{(turing ? "sm75 f16" : "bf16")} {type} M={M} K={K} N={N} dy x {dyScale}: tensor-core dx max |diff| / max |dx| = {worstRel:E2}");

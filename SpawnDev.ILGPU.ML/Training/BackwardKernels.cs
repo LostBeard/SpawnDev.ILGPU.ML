@@ -371,11 +371,16 @@ public sealed partial class BackwardKernels : IDisposable
     /// to bf16 and fp32 accumulation. bf16, not f16: gradients can sit far below f16's normal range (6e-5); bf16 keeps fp32's exponent.
     /// </summary>
     public static bool UseTensorCoreQuantT { get; set; } = true;
+
+    /// <summary>Q4_K / Q6_K: the 64 x 64 dequant-transpose with packed 32-bit stores (default on; false = the 32 x 32 kernel, the A/B control; the words are
+    /// bit-identical).</summary>
+    public static bool UseDequantTranspose64 { get; set; } = true;
     private MemoryBuffer1D<ushort, Stride1D.Dense>? _wtBf16;
     private readonly List<MemoryBuffer1D<ushort, Stride1D.Dense>> _retiredWt = new();
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBias;
     private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;
     private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>? _dequantTBf16;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>? _dequantT64;
     private MemoryBuffer1D<int, Stride1D.Dense>? _absMax;
     private MemoryBuffer1D<float, Stride1D.Dense>? _qtScale;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>>? _zeroInt;
@@ -398,8 +403,18 @@ public sealed partial class BackwardKernels : IDisposable
         _noBias ??= _acc.Allocate1D<BFloat16>(8);
         _noNbr ??= _acc.Allocate1D<int>(1);
         _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>(DequantTransposeBf16Impl);
-        int tilesK = (K + 31) / 32;
-        _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK, turing ? 1 : 0);
+        if (UseDequantTranspose64 && (code == 4 || code == 5) && K % 64 == 0 && N % 2 == 0)
+        {
+            _dequantT64 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>, int, int, int, int, int, int>(DequantTranspose64Impl);
+            int tiles64 = K / 64;
+            _dequantT64(new KernelConfig(((N + 63) / 64) * tiles64, 256), weightQuant.Cast<byte, int>(), _wtBf16.View.SubView(0, need).Cast<ushort, uint>(),
+                K, N, code, rowBytes, tiles64, turing ? 1 : 0);
+        }
+        else
+        {
+            int tilesK = (K + 31) / 32;
+            _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK, turing ? 1 : 0);
+        }
         // dy -> 16-bit once (Turing: times a power-of-two scale from max|dy|, found on the device), then the packed GEMM:
         // C[M, Nm] = A[M, Km] * W[Nm, Km]^T with A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K]
         var dy16 = Grow16(_acc, ref _dy16, (long)M * N, _tRetired16);
@@ -521,6 +536,44 @@ public sealed partial class BackwardKernels : IDisposable
         if (e < -20) e = -20; if (e > 40) e = 40;
         sc[0] = Interop.IntAsFloat((uint)((e + 127) << 23));    // 2^e, exact
         sc[1] = Interop.IntAsFloat((uint)((127 - e) << 23));    // 2^-e
+    }
+
+    // Q4_K / Q6_K, 64 (rows n) x 64 (values k) tiles: thread (nn = tid / 4, q = tid % 4) decodes 16 consecutive values of row n0 + nn (four Run4
+    // decodes, bit-identical to the per-element decode), stages them in shared memory, then each thread writes 8 words of two 16-bit values
+    // (columns n, n + 1 of an output row k): a warp stores 128 contiguous bytes. MEASURED 2026-11-05 (RTX 4070): the 32 x 32 kernel with 2-byte
+    // stores ran at ~230 GB/s (666 us for a 4096 x 14336 weight). grid = ceil(N / 64) * (K / 64); N even, K % 64 == 0.
+    private static void DequantTranspose64Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<uint, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK, int half)
+    {
+        var sh = SharedMemory.Allocate<float>(64 * 65);
+        int t = Grid.IdxX, tid = Group.IdxX;
+        int n0 = (t / tilesK) * 64, k0 = (t % tilesK) * 64;
+        int nn = tid >> 2, kq = (tid & 3) * 16, n = n0 + nn;
+        for (int r = 0; r < 4; r++)
+        {
+            float d0 = 0f, d1 = 0f, d2 = 0f, d3 = 0f;
+            int k = k0 + kq + 4 * r;
+            if (n < N)
+            {
+                if (code == 4) Kernels.FusedDequantMatMul.DecodeQ4KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
+                else Kernels.FusedDequantMatMul.DecodeQ6KRun4(w, n * rowBytes, k, out d0, out d1, out d2, out d3);
+            }
+            int b = nn * 65 + kq + 4 * r;
+            sh[b] = d0; sh[b + 1] = d1; sh[b + 2] = d2; sh[b + 3] = d3;
+        }
+        Group.Barrier();
+        int cp = tid & 31;
+        for (int r = 0; r < 8; r++)
+        {
+            int kk = (tid >> 5) + 8 * r, col = n0 + 2 * cp;
+            if (col < N)
+            {
+                float lo = sh[(2 * cp) * 65 + kk], hi = sh[(2 * cp + 1) * 65 + kk];
+                uint bl, bh;
+                if (half != 0) { bl = F32ToF16Bits(lo); bh = F32ToF16Bits(hi); }
+                else { bl = Bf16Bits(lo); bh = Bf16Bits(hi); }
+                o[((long)(k0 + kk) * N + col) >> 1] = bl | (bh << 16);
+            }
+        }
     }
 
     private static void DequantTransposeBf16Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<ushort, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK, int half)

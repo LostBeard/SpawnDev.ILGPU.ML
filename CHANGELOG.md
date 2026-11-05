@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.35 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.29 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -24,6 +24,9 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
   - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing
     variants of every kernel above (`FusedDequantMatMul.ForceSm75Mma` runs them on newer cards for tests).
   - Row statistics (attention, RMSNorm backward, cross-entropy) one group per row.
+  - **Dequantize at bandwidth**: the scratch GEMM's Dequant{Q4K,Q6K}F16 store two 16-byte vectors per thread (Q4_K 4096 x 14336: 806 -> 346 us), and
+    the backward's Q4_K / Q6_K dequant-transpose runs 64 x 64 tiles with packed 32-bit stores (`BackwardKernels.UseDequantTranspose64`). Both
+    bit-identical (the training loss trajectory is unchanged to the last digit; the test compares dx bitwise). Step 2.35 -> 2.29 s.
 
 ## 5.8.2 - 2026-11-05 (nuget.org) - LoRA training on GGUF models (4.8x faster), DINOv2 image embeddings, ONNX Resize fix
 
