@@ -47,14 +47,20 @@ internal static class MmaKQuantGemm
     // two values of a nibble word: bytes 2p and 2p + 1 of v, the nibble at shift sh (0 low, 4 high)
     private static uint Pair(int v, int p, int sh, ScaleMin s)
     {
-        float q0 = (v >> (16 * p + sh)) & 15, q1 = (v >> (16 * p + 8 + sh)) & 15;
+        // the nibble as a float without an int-to-float conversion (I2F runs at a fraction of the FMA rate): OR it into the mantissa of 2^23
+        // and subtract 2^23 - exact for any integer below 2^23, so the result is the same float
+        float q0 = Interop.IntAsFloat(0x4B000000u | (uint)((v >> (16 * p + sh)) & 15)) - 8388608f;
+        float q1 = Interop.IntAsFloat(0x4B000000u | (uint)((v >> (16 * p + 8 + sh)) & 15)) - 8388608f;
         return PackF16(s.S * q0 - s.M, s.S * q1 - s.M);
     }
 
     // two values of a nibble word: bytes 2p and 2p + 1 of v, the nibble at shift sh (0 low, 4 high)
     private static uint PairSm75(int v, int p, int sh, ScaleMin s)
     {
-        float q0 = (v >> (16 * p + sh)) & 15, q1 = (v >> (16 * p + 8 + sh)) & 15;
+        // the nibble as a float without an int-to-float conversion (I2F runs at a fraction of the FMA rate): OR it into the mantissa of 2^23
+        // and subtract 2^23 - exact for any integer below 2^23, so the result is the same float
+        float q0 = Interop.IntAsFloat(0x4B000000u | (uint)((v >> (16 * p + sh)) & 15)) - 8388608f;
+        float q1 = Interop.IntAsFloat(0x4B000000u | (uint)((v >> (16 * p + 8 + sh)) & 15)) - 8388608f;
         return PackF16Sm75(s.S * q0 - s.M, s.S * q1 - s.M);
     }
 
@@ -62,14 +68,18 @@ internal static class MmaKQuantGemm
     private static uint Q6Pair(int lw, int hw, int lsh, int hsh, float ds)
     {
         int q0 = ((lw >> lsh) & 15) | (((hw >> hsh) & 3) << 4), q1 = ((lw >> (8 + lsh)) & 15) | (((hw >> (8 + hsh)) & 3) << 4);
-        return PackF16(ds * (q0 - 32), ds * (q1 - 32));
+        // q - 32 as a float without I2F (see Pair): 2^23 + q, minus 2^23 + 32, exact
+        float f0 = Interop.IntAsFloat(0x4B000000u | (uint)q0) - 8388640f, f1 = Interop.IntAsFloat(0x4B000000u | (uint)q1) - 8388640f;
+        return PackF16(ds * f0, ds * f1);
     }
 
     // Q6_K: two values from a ql ushort (nibbles at shift lsh of its two bytes) and a qh ushort (2 bits at shift hsh of its two bytes), times d * sc
     private static uint Q6PairSm75(int lw, int hw, int lsh, int hsh, float ds)
     {
         int q0 = ((lw >> lsh) & 15) | (((hw >> hsh) & 3) << 4), q1 = ((lw >> (8 + lsh)) & 15) | (((hw >> (8 + hsh)) & 3) << 4);
-        return PackF16Sm75(ds * (q0 - 32), ds * (q1 - 32));
+        // q - 32 as a float without I2F (see Pair): 2^23 + q, minus 2^23 + 32, exact
+        float f0 = Interop.IntAsFloat(0x4B000000u | (uint)q0) - 8388640f, f1 = Interop.IntAsFloat(0x4B000000u | (uint)q1) - 8388640f;
+        return PackF16Sm75(ds * f0, ds * f1);
     }
 
     /// <summary>Q4_K: one 128 x 128 output tile per group: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 16-byte aligned. sm_80+: m16n8k16.</summary>
