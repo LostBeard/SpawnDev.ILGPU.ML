@@ -495,6 +495,48 @@ def kernel_v3(sm75, qt):
     w("    }")
 
 
+def dequant_f16(sm75, qt):
+    """Dequant{Q4K|Q6K}F16{Sm75} (2026-11-05): the raw GGUF rows -> f16 words [N][K / 2] (two values per word, the lower k in the low half),
+    built from the SAME Pair / Q6Pair helpers and the same 16-value staging unit the tensor-core GEMMs decode in shared memory, so the words
+    are bit-identical to what those kernels feed their MMAs. For the scratch-operand GEMM (FusedDequantMatMul: dequantize once, then the
+    16-bit V4 / V2 GEMM). One thread per (row, 32-value block, half): idx = (n * (K / 32) + k32) * 2 + bh."""
+    sfx = "Sm75" if sm75 else ""
+    q6 = qt == "q6k"
+    kname = ("DequantQ6KF16" if q6 else "DequantQ4KF16") + sfx
+    wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
+    w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} rows -> f16 words [N][K / 2], bit-identical to the GEMMs' shared-memory decode. idx over N * (K / 32) * 2.</summary>")
+    w(f"    public static void {kname}(Index1D idx, {wtype} Wq, ArrayView<uint> O, int N, int K)")
+    w("    {")
+    w("        int bh = idx & 1, rest = idx >> 1;")
+    w("        int k32n = K >> 5;")
+    w("        int n = rest / k32n, k32 = rest - n * k32n;")
+    w("        int kt = k32 << 5;")
+    if q6:
+        w("        long bRow = (long)n * ((K >> 8) * 105);")
+        w("        long sbL = bRow + (kt >> 8) * 105; int oL = kt & 255, nL = oL >> 7, qqL = (oL >> 5) & 3;")
+        w("        long qlL = sbL + 32 * nL + 16 * (qqL & 1) + 8 * bh, qhL = sbL + 64 + 16 * nL + 8 * bh;")
+        w("        " + " ".join(f"int l{i} = Wq[qlL + {i}];" for i in range(8)))
+        w("        " + " ".join(f"int h{i} = Wq[qhL + {i}];" for i in range(8)))
+        w("        int scw = Wq[sbL + 96 + 4 * nL + qqL], dw = Wq[sbL + 104];")
+        w("        int qq = (kt >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;")
+        w("        int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);")
+        w("        float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);")
+        w("        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;")
+        for i in range(8):
+            w(f"        O[o + {i}] = Q6Pair{sfx}(l{i}, h{i}, lsh, hsh, ds);")
+    else:
+        w("        long bRow = (long)n * ((K >> 8) * 9);")
+        w("        long sbL = bRow + (kt >> 8) * 9; int jL = (kt >> 5) & 7;")
+        w("        W16 ph = Wq.AsAligned16()[sbL], pq = Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh];")
+        w("        int j = (kt >> 5) & 7, sh = (j & 1) * 4;")
+        w("        ScaleMin s = SubBlockScale(ph, j);")
+        w("        long o = (long)n * (K >> 1) + (kt >> 1) + bh * 8;")
+        for wi, f in enumerate("abcd"):
+            w(f"        O[o + {2 * wi}] = Pair{sfx}(pq.{f}, 0, sh, s); O[o + {2 * wi + 1}] = Pair{sfx}(pq.{f}, 1, sh, s);")
+    w("    }")
+    w("")
+
+
 for qt_ in ("q4k", "q6k"):
     kernel(False, qt_)
     w("")
@@ -508,6 +550,8 @@ for qt_ in ("q4k", "q6k"):
     w("")
     kernel_v3(True, qt_)
     w("")
+    dequant_f16(False, qt_)
+    dequant_f16(True, qt_)
 w("}")
 
 path = sys.argv[1]

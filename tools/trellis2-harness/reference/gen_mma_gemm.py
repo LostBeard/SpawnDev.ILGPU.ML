@@ -601,6 +601,7 @@ def kernel_packed_v4(dtype, sm75):
 
 kernel_packed_v4("Bf16", False)
 kernel_packed_v4("F16", True)
+kernel_packed_v4("F16", False)
 w("}")
 
 path = sys.argv[1]

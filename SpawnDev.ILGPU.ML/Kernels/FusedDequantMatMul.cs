@@ -150,6 +150,46 @@ public class FusedDequantMatMul : IDisposable
     public static bool EnableMmaV3 = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_V3") != "0";
     /// <summary>The row count from which <see cref="EnableMmaV3"/> applies.</summary>
     public static int MmaV3MinRows = 512;
+    /// <summary>
+    /// Scratch-operand GEMM for large M (default on): the weight is dequantized ONCE to f16 (MmaKQuantGemm.Dequant*F16: the same decode helpers as
+    /// the in-kernel GEMMs, bit-identical words) and A rounded to f16 (cvt.rn), then the 16-bit tensor-core GEMM runs (sm_80+: MmaGemm.KernelF16PackedV4,
+    /// cp.async + ldmatrix; sm_75: KernelF16Sm75PackedV2). Same operands, same MMA instruction and K order as the V3 kernels: bit-identical output.
+    /// The in-kernel kernels decode each weight once per 256-row band; this decodes it once per call. GGUF_GEMM_MMA_SCRATCH=0 = the V3 / V2 kernels.
+    /// </summary>
+    public static bool EnableMmaScratch = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_SCRATCH") != "0";
+    /// <summary>The row count from which <see cref="EnableMmaScratch"/> applies.</summary>
+    public static int MmaScratchMinRows = 512;
+    /// <summary>
+    /// The largest f16 weight (N x K x 2 bytes) the scratch path dequantizes; larger ones run the in-kernel V3 GEMM. MEASURED 2026-11-05: an 8B
+    /// model's 128,256-word output head took a 1,002 MiB scratch, which pushed a 1,600-token training step onto a near-full 12 GB card and made
+    /// it slower (3.0 -> 3.6 s). The largest layer weight of an 8B model is 112 MiB.
+    /// </summary>
+    public static long MmaScratchMaxWeightBytes = 256L << 20;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchA16, _scratchW16;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _scratchOnes;
+    private readonly List<IDisposable> _scratchRetired = new();
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>? _packA16;
+    private Action<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>? _deqQ4K, _deqQ4KSm75;
+    private Action<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>? _deqQ6K, _deqQ6KSm75;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16Sm75V2;
+
+    // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even (two cvt.rn.f16.f32: sm_75 and later, the same bits as cvt.rn.f16x2.f32)
+    private static void PackA16Impl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView<uint> o)
+    {
+        CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, x[2 * i], x[2 * i + 1]);
+        o[i] = packed;
+    }
+
+    private MemoryBuffer1D<uint, Stride1D.Dense> GrowScratch(ref MemoryBuffer1D<uint, Stride1D.Dense>? b, long words)
+    {
+        if (b == null || b.Length < words)
+        {
+            if (b != null) _scratchRetired.Add(b);   // a queued launch may still read it
+            b = _accelerator.Allocate1D<uint>(words);
+        }
+        return b;
+    }
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _fastQ4_K;
     private const int FgBm = 128, FgBn = 128, FgBk = 32, FgThreads = 256, FgPer = 8;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
@@ -379,6 +419,35 @@ public class FusedDequantMatMul : IDisposable
             && ((type == GGMLType.Q4_K && (wByte & 15) == 0) || (type == GGMLType.Q6_K && (wByte & 1) == 0)))
         {
             bool turing = !sm80 || ForceSm75Mma;
+            if (EnableMmaScratch && M >= MmaScratchMinRows && (long)N * K * 2 <= MmaScratchMaxWeightBytes)
+            {
+                // dequantize once to f16, round A to f16, then the 16-bit GEMM (see EnableMmaScratch)
+                long aWords = (long)M * K / 2, wWords = (long)N * K / 2;
+                var a16 = GrowScratch(ref _scratchA16, aWords);
+                var w16 = GrowScratch(ref _scratchW16, wWords);
+                _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
+                _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
+                _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+                int deqCount = N * (K >> 5) * 2;
+                if (type == GGMLType.Q4_K)
+                    (turing ? _deqQ4KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ4KF16Sm75)
+                            : _deqQ4K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ4KF16))(
+                        deqCount, weightQuant.BaseView.Cast<W16>(), w16.View.BaseView, N, K);
+                else
+                    (turing ? _deqQ6KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ6KF16Sm75)
+                            : _deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<uint>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
+                        deqCount, weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView, N, K);
+                var gemm = turing
+                    ? _f16Sm75V2 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
+                    : _f16V4 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV4);
+                int tilesS = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+                gemm(new KernelConfig(tilesS, Trellis2.MmaGemm.Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, wWords).Cast<uint, Trellis2.U4>(),
+                    _scratchOnes.View, output, M, K, N);
+                LastGemmKernel = (type == GGMLType.Q4_K ? "mma-q4k" : "mma-q6k") + (turing ? "-sm75" : "") + "-scratch";
+                return;
+            }
             bool v3 = EnableMmaV3 && M >= MmaV3MinRows;
             var cfg = new KernelConfig(((M + (v3 ? 256 : MmaKQuantGemm.BM) - 1) / (v3 ? 256 : MmaKQuantGemm.BM)) * ((N + MmaKQuantGemm.BN - 1) / MmaKQuantGemm.BN), MmaKQuantGemm.Threads);
             var a4 = input.SubView(0, (long)M * K).BaseView.Cast<Vec4LoadMatMul.F4>();
@@ -2773,6 +2842,11 @@ public class FusedDequantMatMul : IDisposable
 
     public void Dispose()
     {
+        _scratchA16?.Dispose(); _scratchA16 = null;
+        _scratchW16?.Dispose(); _scratchW16 = null;
+        _scratchOnes?.Dispose(); _scratchOnes = null;
+        foreach (var r in _scratchRetired) r.Dispose();
+        _scratchRetired.Clear();
         foreach (var buf in _paramsBufs.Values) buf.Dispose();
         _paramsBufs.Clear();
         foreach (var buf in _rowsParams.Values) buf.Dispose();

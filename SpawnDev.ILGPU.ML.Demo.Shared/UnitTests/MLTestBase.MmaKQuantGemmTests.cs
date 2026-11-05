@@ -22,8 +22,10 @@ public abstract partial class MLTestBase
         if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core GEMMs run on CUDA sm_75+");
         var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
         bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2, v3Saved = FusedDequantMatMul.EnableMmaV3;
-        int v3MinSaved = FusedDequantMatMul.MmaV3MinRows;
+        bool scrSaved = FusedDequantMatMul.EnableMmaScratch;
+        int v3MinSaved = FusedDequantMatMul.MmaV3MinRows, scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
         FusedDequantMatMul.MmaV3MinRows = 1;   // every shape on V3 too
+        FusedDequantMatMul.MmaScratchMinRows = 1;   // and on the scratch-operand GEMM
         using var fused = new FusedDequantMatMul(accelerator);
         var notes = new List<string>();
         try
@@ -77,10 +79,11 @@ public abstract partial class MLTestBase
             // aligned: the tensor-core kernel, V1, V2 (double-buffered, 64-bit fragment loads) and V3 (256-row tiles): the same rounding and MMA
             // order per output, so V2 and V3 must be bit-identical to V1
             float[] got = Array.Empty<float>(); string route = "";
-            foreach (var (v2, v3, sfx) in new[] { (false, false, ""), (true, false, "-v2"), (true, true, "-v3") })
+            foreach (var (v2, v3, scr, sfx) in new[] { (false, false, false, ""), (true, false, false, "-v2"), (true, true, false, "-v3"), (true, true, true, "-scratch") })
             {
                 FusedDequantMatMul.EnableMmaV2 = v2;
                 FusedDequantMatMul.EnableMmaV3 = v3;
+                FusedDequantMatMul.EnableMmaScratch = scr;
                 fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
                 string r = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
@@ -97,6 +100,7 @@ public abstract partial class MLTestBase
             int bad = Bad(got, Oracle(0), out float worst);
             if (bad > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: {bad} of {got.Length} outputs past 2e-3 x sum|a w| (worst {worst:F2}x the bound)");
             // misaligned by one float: the SIMT kernels, the same answer
+            FusedDequantMatMul.EnableMmaScratch = false;
             fused.Forward(inputBuf.View.SubView(1, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
             string route2 = fused.LastGemmKernel;
             await accelerator.SynchronizeAsync();
@@ -110,7 +114,7 @@ public abstract partial class MLTestBase
         finally
         {
             FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved;
-            FusedDequantMatMul.MmaV3MinRows = v3MinSaved;
+            FusedDequantMatMul.MmaV3MinRows = v3MinSaved; FusedDequantMatMul.EnableMmaScratch = scrSaved; FusedDequantMatMul.MmaScratchMinRows = scrMinSaved;
         }
         return string.Join("; ", notes);
     });
