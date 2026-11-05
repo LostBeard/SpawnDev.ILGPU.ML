@@ -2,8 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## Unreleased (5.8.2-local.12 candidate) - LoRA training 4.8x faster
 
+- **Training speed**: a llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 21.7 s -> 4.5 s; the Vertex v2.1
+  run (1,225 lines) trained in 2.06 h where v1 (755 lines) took 9 h. Gradients unchanged (directional derivative 1.3e-3 - 1.9e-3).
+  - **Attention backward as batched GEMMs** (`BackwardKernels.UseGemmAttentionBackward`, default on, not WebGL): S = Q K^T, the row
+    statistics from S, P, dP, dS and dQ / dK / dV on the register-blocked batched matmul in fp32, per chunk of query heads within
+    `GemmAttentionScoreBudgetBytes` (384 MiB); GQA heads summed into their kv head. 9.26 -> 0.94 s per step.
+  - **Input gradient through quantized weights on tensor cores** (`BackwardKernels.UseTensorCoreQuantT`, CUDA sm_80+): W decoded and
+    transposed once per call to bf16, then the bf16 MMA GEMM (bf16 for its fp32 exponent: gradients sit below f16's range). 8.48 -> 1.13 s.
+  - **Training forward attention on the tensor-core flash kernel** (`GraphAutograd.TensorCoreForwardAttention`): a training graph's
+    FusedAttention nodes are marked `train_tc` and run the batch decoder's MmaFlashPrefill (hd 128, causal). Inference graphs unchanged.
+  - Gates: `Backward_Attention_MatchesFiniteDifference` (GEMM / blocked / per-element), `Backward_MatMulTransposedQuant_TensorCores_MatchReference`
+    (2.5e-3 vs float64, also at dy x 1e-7), `AttnOp_FusedAttention_TrainTensorCore_MatchesCPU` (2.8e-4); each red-checked.
+- **TrainLoraJsonl**: v2 data (tool-choice-only dev lines, `--exclude-source`, per-file and per-tool scores, `--dry-run`), `--progress`,
+  `--save-every` checkpoints, `--gpu-share` (live via `<out>/gpu-share.txt`), NaN-safe train log. `TrainLoraProbe --no-tc --no-gemm-attn`.
 - `Dinov2EmbeddingPipeline.Dim` is set at load from the compiled output shape (it read 0 until the first embed; Riker). The gate asserts it.
 
 ## 5.8.2-local.11 - 2026-11-04 (local feed) - DINOv2 image embeddings; ONNX Resize scales fix; faster LoRA at inference

@@ -82,16 +82,19 @@ forgets the cached prefix. On the session engine the adapters are inserted into 
 
 ## Speed
 
-llama3.1:8b Q4_K_M, RTX 4070, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed: 21.7 s per step (forward, recompute,
-backward). Profile it with `tools/TrainLoraProbe --profile`; the largest costs are the transposed quantized matmul of the backward and the
-attention backward.
+llama3.1:8b Q4_K_M, RTX 4070, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed: **4.5 s per step** (forward, recompute,
+backward; it was 21.7 s before the attention backward became batched GEMMs, the quantized input gradient moved to tensor cores and the
+training forward attention to the tensor-core flash kernel). A 1,225-line run of Vertex data trains in about 2 h. Profile with
+`tools/TrainLoraProbe --profile`; the largest remaining costs are the forward matmuls (run twice with checkpointing), the quantized input
+gradient and the attention backward. Each fast path has a switch for A/B (`BackwardKernels.UseGemmAttentionBackward`,
+`BackwardKernels.UseTensorCoreQuantT`, `GraphAutograd.TensorCoreForwardAttention`).
 
 ## Tools
 
 | Tool | What it does |
 |------|--------------|
-| `tools/TrainLoraJsonl` | Trains on JSONL lines (`prompt_ids`, `target_ids`, `end_of_turn_ids` or `--eot`, `split` train / dev, optional `id` and `expected_tool`), saves the adapter, then generates on the dev split base vs adapter (exact match, and tool choice when lines carry `expected_tool`). `--rank --alpha --lr --accum --epochs --targets --max-len --checkpoint --no-dev-loss --eval-only --engine` |
-| `tools/TrainLoraProbe` | One step at a chosen length: time, memory, gradient check, `--profile` per op |
+| `tools/TrainLoraJsonl` | Trains on JSONL lines (`prompt_ids`, `target_ids`, `end_of_turn_ids` or `--eot`, `split` train / dev, optional `id` and `expected_tool`), saves the adapter, then generates on the dev split base vs adapter (exact match, and tool choice when lines carry `expected_tool`). `--rank --alpha --lr --accum --epochs --targets --max-len --checkpoint --no-dev-loss --eval-only --engine --exclude-source --progress --save-every --gpu-share --dry-run` |
+| `tools/TrainLoraProbe` | One step at a chosen length: time, memory, gradient check, `--profile` per op, `--no-tc` / `--no-gemm-attn` for the A/B |
 | `tools/LoraDecodeBench` | Decode speed and time to first token, base vs adapter (`--unfused`, `--no-prefill-gemm`) |
 | `tools/TrainTinyLora`, `tools/TrainLoraCurve` | The small reference runs behind the gates above |
 
