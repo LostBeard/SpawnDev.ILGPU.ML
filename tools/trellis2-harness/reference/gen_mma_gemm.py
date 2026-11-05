@@ -394,7 +394,7 @@ kernel_packed("Bf16", False)
 kernel_packed("F16", True)
 
 
-def kernel_packed_v2(dtype, sm75):
+def kernel_packed_v2(dtype, sm75, acc=False):
     """Kernel{Bf16|F16Sm75}PackedV2 (2026-11-05): KernelPacked plus (1) double-buffered shared tiles, one barrier per K tile; (2) 64-bit
     fragment loads: each thread stages ONE row's 8 words of a k16 block (two adjacent uint4) and writes them as the pairs (w, w+4), so a0/a2,
     a1/a3 and b0/b1 are each one ld.shared.u64. Shared rows are 10 ulongs (8 data + 2 pad)."""
@@ -402,9 +402,9 @@ def kernel_packed_v2(dtype, sm75):
     mma16 = f"mma.sync.aligned.m16n8k16.row.col.f32.{t}.{t}.f32 {{%0, %1, %2, %3}}, {{%4, %5, %6, %7}}, {{%8, %9}}, {{%10, %11, %12, %13}};"
     mma8 = "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
     RW = 10
-    name = f"Kernel{dtype}{'Sm75' if sm75 else ''}PackedV2"
+    name = f"Kernel{dtype}{'Sm75' if sm75 else ''}PackedV2{'Acc' if acc else ''}"
     w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]; double-buffered, 64-bit fragment loads. grid = ceil(M/128) * ceil(N/128), group = 256.</summary>")
-    w(f"    public static void {name}(U4V Au, U4V Wu, FV sc, FV C, int M, int K, int N)")
+    w(f"    public static void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
     w("    {")
     w("        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile")
     w("        int numTilesM = (M + BM - 1) / BM;")
@@ -487,8 +487,14 @@ def kernel_packed_v2(dtype, sm75):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
-            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            if acc:
+                # + D: the gradient accumulated so far (GraphAutograd folds Add(acc, part) here; inv is a power of two, so c * inv is exact and
+                # the sum rounds once, as the Add did: bit-identical)
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
             w("        }")
     w("    }")
     w("")
@@ -496,9 +502,10 @@ def kernel_packed_v2(dtype, sm75):
 
 kernel_packed_v2("Bf16", False)
 kernel_packed_v2("F16", True)
+kernel_packed_v2("F16", True, acc=True)
 
 
-def kernel_packed_v4(dtype, sm75):
+def kernel_packed_v4(dtype, sm75, acc=False):
     """Kernel{Bf16|F16Sm75}PackedV4 (2026-11-05): the packed GEMM with cp.async and ldmatrix (SpawnDev.ILGPU 5.4.16: Unsafe.AsPointer gives
     inline PTX a shared-memory address). Global -> shared copies are cp.async 16-byte transfers straight into the next stage (no register
     staging; out-of-range rows zero-filled by src-size 0), two stages; fragments are ldmatrix.x4: one per 16 x 16 A tile, one per pair of
@@ -509,9 +516,9 @@ def kernel_packed_v4(dtype, sm75):
     ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
     cpa = "cp.async.cg.shared.global [%0], [%1], 16, %2;"
     RW = 20
-    name = f"Kernel{dtype}{'Sm75' if sm75 else ''}PackedV4"
+    name = f"Kernel{dtype}{'Sm75' if sm75 else ''}PackedV4{'Acc' if acc else ''}"
     w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]; cp.async double-buffered, ldmatrix fragments. grid = ceil(M/128) * ceil(N/128), group = 256. sm_80+ (cp.async){' with sm_75 MMAs: for tests' if sm75 else ''}.</summary>")
-    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, int M, int K, int N)")
+    w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
     w("    {")
     w("        // column-major block order: the resident blocks cover every row tile of a few column tiles, so each W tile (the large operand: 117 MB")
     w("        // for an 8B model's ffn) is read from DRAM about once instead of once per row tile")
@@ -592,8 +599,14 @@ def kernel_packed_v4(dtype, sm75):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
-            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            if acc:
+                # + D: the gradient accumulated so far (GraphAutograd folds Add(acc, part) here; inv is a power of two, so c * inv is exact and
+                # the sum rounds once, as the Add did: bit-identical)
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
             w("        }")
     w("    }")
     w("")
@@ -602,6 +615,7 @@ def kernel_packed_v4(dtype, sm75):
 kernel_packed_v4("Bf16", False)
 kernel_packed_v4("F16", True)
 kernel_packed_v4("F16", False)
+kernel_packed_v4("Bf16", False, acc=True)
 w("}")
 
 path = sys.argv[1]

@@ -337,7 +337,7 @@ public sealed partial class BackwardKernels : IDisposable
     /// decoding W in-register: the base weights stay compressed. Correct first; a tiled kernel replaces it when it is the bottleneck.
     /// </summary>
     public void MatMulTransposedQuant(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
-        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, GGUF.GGMLType type)
+        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, GGUF.GGMLType type, ArrayView1D<float, Stride1D.Dense> accumulate = default)
     {
         _matmulQuantT ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MatMulTransposedQuantImpl);
@@ -348,7 +348,7 @@ public sealed partial class BackwardKernels : IDisposable
         bool sm80 = Kernels.CudaCaps.TensorCores(_acc) && !Kernels.FusedDequantMatMul.ForceSm75Mma, sm75 = Kernels.CudaCaps.TuringTensorCores(_acc);
         if (UseTensorCoreQuantT && M >= 16 && N % Trellis2.MmaGemm.BK == 0 && K % 8 == 0 && K >= 64 && (sm80 || sm75))
         {
-            MatMulTransposedQuantTensorCore(dy, weightQuant, dx, M, K, N, code, rowBytes, turing: !sm80);
+            MatMulTransposedQuantTensorCore(dy, weightQuant, dx, M, K, N, code, rowBytes, turing: !sm80, accumulate);
             return;
         }
         if (UseTiledQuantT && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= TqThreads)
@@ -357,10 +357,21 @@ public sealed partial class BackwardKernels : IDisposable
                 ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int>(MatMulTransposedQuantTiledImpl);
             int tilesK = (K + TqK - 1) / TqK;
             _matmulQuantTTiled(new KernelConfig(((M + TqM - 1) / TqM) * tilesK, TqThreads), dy, weightQuant.Cast<byte, int>(), dx, M, K, N, code, rowBytes, tilesK);
-            return;
         }
-        _matmulQuantT(M * K, dy, weightQuant.Cast<byte, int>(), dx, K, N, code, rowBytes);
+        else _matmulQuantT(M * K, dy, weightQuant.Cast<byte, int>(), dx, K, N, code, rowBytes);
+        if (accumulate.IsValid) AddInto(dx, accumulate, (long)M * K);
     }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInto;
+
+    /// <summary>dst[i] += src[i] (dst = part + accumulated: the same value as the graph's Add(accumulated, part)).</summary>
+    public void AddInto(ArrayView1D<float, Stride1D.Dense> dst, ArrayView1D<float, Stride1D.Dense> src, long count)
+    {
+        _addInto ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddIntoImpl);
+        _addInto((int)count, dst, src);
+    }
+
+    private static void AddIntoImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> dst, ArrayView1D<float, Stride1D.Dense> src) => dst[i] += src[i];
 
     /// <summary>The shared-memory tiled kernel for <see cref="MatMulTransposedQuant"/> (default on; false = the per-element kernel, the A/B control).</summary>
     public static bool UseTiledQuantT { get; set; } = true;
@@ -392,7 +403,7 @@ public sealed partial class BackwardKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>? _mmaBf16;
 
     private void MatMulTransposedQuantTensorCore(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
-        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes, bool turing)
+        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes, bool turing, ArrayView1D<float, Stride1D.Dense> accumulate)
     {
         long need = (long)K * N;
         if (_wtBf16 == null || _wtBf16.Length < need)
@@ -428,7 +439,7 @@ public sealed partial class BackwardKernels : IDisposable
             sc = _qtScale.View;
         }
         Pack16Flat(dy, dy16.View, (long)M * N, turing, turing ? sc : default);
-        MmaPacked(turing, dy16.View, _wtBf16.View.SubView(0, need), dx, sc, M, N, K);
+        MmaPacked(turing, dy16.View, _wtBf16.View.SubView(0, need), dx, sc, M, N, K, accumulate);
     }
 
     /// <summary>
@@ -443,10 +454,22 @@ public sealed partial class BackwardKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16, _packedF16;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, ArrayView1D<float, Stride1D.Dense>>? _pack16Flat;
 
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Acc, _packedBf16Acc;
+
     private void MmaPacked(bool turing, ArrayView1D<ushort, Stride1D.Dense> A, ArrayView1D<ushort, Stride1D.Dense> W, ArrayView1D<float, Stride1D.Dense> C,
-        ArrayView1D<float, Stride1D.Dense> sc, int M, int K, int N)
+        ArrayView1D<float, Stride1D.Dense> sc, int M, int K, int N, ArrayView1D<float, Stride1D.Dense> accumulate = default)
     {
         int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        if (accumulate.IsValid)
+        {
+            // C = A W^T * sc[1] + accumulate (the autograd's running gradient sum, folded into the epilogue: bit-identical to the Add)
+            var ka = turing
+                ? _packedF16Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2Acc)
+                : _packedBf16Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelBf16PackedV4Acc);
+            ka(new KernelConfig(tiles, Trellis2.MmaGemm.Threads), A.SubView(0, (long)M * K).Cast<ushort, Trellis2.U4>(), W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>(),
+                sc, C, accumulate, M, K, N);
+            return;
+        }
         var k = turing
             ? _packedF16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)

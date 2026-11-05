@@ -70,7 +70,8 @@ public abstract partial class MLTestBase
     /// <summary>
     /// The fused LoraLinear / LoraLinearGrad ops (GraphAutograd.FusedLora, ranks that are a multiple of 8) against the four-op form (MatMul, MatMul,
     /// Mul, Add and its autograd): the same loss, logits and every adapter gradient, at ranks 8 and 16 on all seven projection types, with and
-    /// without layer checkpointing. Both are fp32; only the summation order differs. Tiny F16 llama. Added 2026-11-05.
+    /// without layer checkpointing. Both are fp32; only the summation order differs. Also GraphAutograd.FuseGradientSums against the Add
+    /// chain, bitwise. Tiny F16 llama. Added 2026-11-05.
     /// </summary>
     [TestMethod(Timeout = 300000)]
     public async Task Training_FusedLora_MatchesFourOpForm() => await RunTest(async accelerator =>
@@ -79,6 +80,7 @@ public abstract partial class MLTestBase
         var gguf = await assets.GetByteArrayAsync("test-train/tiny-llama-f16.gguf");
         var targets = new[] { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" };
         var notes = new List<string>();
+        bool savedSums = GraphAutograd.FuseGradientSums;
         bool saved = GraphAutograd.FusedLora, savedTcFwd = GraphAutograd.TensorCoreForwardAttention, savedTcBwd = BackwardKernels.UseTensorCoreAttentionBackward;
         try
         {
@@ -91,9 +93,10 @@ public abstract partial class MLTestBase
                 var rng = new Random(11 + rank);
                 Dictionary<string, float[]>? adapters = null;
                 int[] ids = Array.Empty<int>(), labels = Array.Empty<int>();
-                async Task<(float Loss, float[] Logits, Dictionary<string, float[]> Grads)> Run(bool fused)
+                async Task<(float Loss, float[] Logits, Dictionary<string, float[]> Grads)> Run(bool fused, bool fuseSums = true)
                 {
                     GraphAutograd.FusedLora = fused;
+                    GraphAutograd.FuseGradientSums = fuseSums;
                     using var trainer = GgufLoraTrainer.Create(accelerator, gguf, new LoraOptions { Targets = targets, Rank = rank, Alpha = 2 * rank + 3, Seed = 4, CheckpointLayers = checkpoint });
                     if (adapters == null)
                     {
@@ -110,6 +113,14 @@ public abstract partial class MLTestBase
                 }
                 var want = await Run(false);
                 var got = await Run(true);
+                // the gradient sums folded into MatMulGradInput / LoraLinearGrad (FuseGradientSums) write part + sum, the value the Add wrote: bitwise
+                var adds = await Run(true, fuseSums: false);
+                if (BitConverter.SingleToInt32Bits(adds.Loss) != BitConverter.SingleToInt32Bits(got.Loss) || !adds.Logits.SequenceEqual(got.Logits))
+                    throw new Exception($"rank {rank}: FuseGradientSums changed the forward ({got.Loss:R} vs {adds.Loss:R})");
+                foreach (var (k, g) in adds.Grads)
+                    for (int i = 0; i < g.Length; i++)
+                        if (BitConverter.SingleToInt32Bits(g[i]) != BitConverter.SingleToInt32Bits(got.Grads[k][i]))
+                            throw new Exception($"rank {rank}: FuseGradientSums is not bit-identical: {k}[{i}] = {got.Grads[k][i]:R}, with Add nodes {g[i]:R}");
                 double Rel(float[] a, float[] b) { double m = b.Max(x => Math.Abs((double)x)), d = 0; for (int i = 0; i < a.Length; i++) d = Math.Max(d, Math.Abs(a[i] - b[i])); return d / Math.Max(m, 1e-30); }
                 double lossRel = Math.Abs(got.Loss - want.Loss) / Math.Abs(want.Loss), logitRel = Rel(got.Logits, want.Logits);
                 double worst = 0; string worstKey = "";
@@ -124,7 +135,7 @@ public abstract partial class MLTestBase
                 if (!(lossRel <= 1e-5 && logitRel <= 1e-5 && worst <= 1e-4)) throw new Exception("fused LoRA differs from the four-op form: " + string.Join("; ", notes));
             }
         }
-        finally { GraphAutograd.FusedLora = saved; GraphAutograd.TensorCoreForwardAttention = savedTcFwd; BackwardKernels.UseTensorCoreAttentionBackward = savedTcBwd; }
+        finally { GraphAutograd.FusedLora = saved; GraphAutograd.FuseGradientSums = savedSums; GraphAutograd.TensorCoreForwardAttention = savedTcFwd; BackwardKernels.UseTensorCoreAttentionBackward = savedTcBwd; }
         var line = $"{accelerator.AcceleratorType}: fused LoraLinear vs four-op form: " + string.Join("; ", notes);
         Console.WriteLine("[Training] " + line);
         return line;

@@ -293,6 +293,20 @@ public abstract partial class MLTestBase
                     var got = await dx.View.CopyToHostAsync();
                     double scale = want.Max(Math.Abs);
                     for (int i = 0; i < want.Length; i++) worstRel = Math.Max(worstRel, Math.Abs(got[i] - want[i]) / scale);
+                    {
+                        // with an accumulator (GraphAutograd.FuseGradientSums): dx = dy W^T + acc in the GEMM epilogue, bitwise the separate add
+                        var accv = RandomFloats(M * K, seed: 579).Select(v => v * dyScale * 7f).ToArray();
+                        using var ab = accelerator.Allocate1D(accv);
+                        using var dx2 = accelerator.Allocate1D<float>(M * K);
+                        reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx2.View, M, K, N, type, ab.View);
+                        var withAcc = await dx2.View.CopyToHostAsync();
+                        for (int i = 0; i < got.Length; i++)
+                        {
+                            float sum = got[i] + accv[i];
+                            if (BitConverter.SingleToInt32Bits(withAcc[i]) != BitConverter.SingleToInt32Bits(sum))
+                                throw new Exception($"{(turing ? "sm75 f16" : "bf16")} {type} M={M} K={K} N={N}: accumulate dx[{i}] = {withAcc[i]:R}, dx + acc = {sum:R}");
+                        }
+                    }
                     if (type is GGMLType.Q4_K or GGMLType.Q6_K)
                     {
                         // the 64 x 64 dequant-transpose writes the same 16-bit words as the 32 x 32 kernel: dx bit-identical

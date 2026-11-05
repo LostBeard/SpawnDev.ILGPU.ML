@@ -25,7 +25,7 @@ public class RMSNormGradOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
-/// MatMulGradInput(dy [..., N], W [K, N]) -> dx [..., K] = dy W^T: the input gradient of <c>MatMul(x, W)</c> through a FROZEN weight in
+/// MatMulGradInput(dy [..., N], W [K, N] [, accumulate [..., K]]) -> dx [..., K] = dy W^T (+ accumulate: the autograd folds a gradient sum here): the input gradient of <c>MatMul(x, W)</c> through a FROZEN weight in
 /// whatever form the loader kept it - GGUF-quantized bytes (decoded in-register, never expanded), native low precision (F16/BF16/FP8), or f32.
 /// </summary>
 public class MatMulGradInputOperator(OperatorRegistry reg) : IOnnxOperator
@@ -48,20 +48,25 @@ public class MatMulGradInputOperator(OperatorRegistry reg) : IOnnxOperator
         {
             if (reg.QuantizedWeightTypes == null || !reg.QuantizedWeightTypes.TryGetValue(w.Name, out var type))
                 throw new InvalidOperationException($"MatMulGradInput: quantized weight '{w.Name}' has no GGML type registered");
-            reg.Backward.MatMulTransposedQuant(dy.Data.SubView(0, M * N), q, dx, M, K, N, type);
+            reg.Backward.MatMulTransposedQuant(dy.Data.SubView(0, M * N), q, dx, M, K, N, type, Accumulate(ctx, M * K));
             return;
         }
         // The forward's B is [K, N]; dx = dy [M, N] x B^T [N, K] is the "transB" product of B stored [K, N] viewed as [N', K'] = [K, N].
         if (LowPWeightDispatch.IsLowP(w))
         {
             LowPWeightDispatch.MatMulTransB(reg.MatMul, dy.Data, w, dx, M, N, K);
+            if (ctx.Inputs.Length > 2) reg.Backward.AddInto(dx, Accumulate(ctx, M * K), (long)M * K);
             return;
         }
         var wT = ctx.Pool.Rent(new[] { N, K }, "_matmul_grad_wT");
         reg.Transpose.Transpose(w.Data, wT.Data, new[] { K, N }, new[] { 1, 0 });
         reg.MatMul.MatMul(dy.Data, wT.Data, dx, M, N, K);
         ctx.Pool.Return(wT);
+        if (ctx.Inputs.Length > 2) reg.Backward.AddInto(dx, Accumulate(ctx, M * K), (long)M * K);
     }
+
+    private static global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> Accumulate(OnnxOpContext ctx, int count)
+        => ctx.Inputs.Length > 2 ? ctx.Inputs[2].Data.SubView(0, count) : default;
 }
 
 /// <summary>
@@ -87,7 +92,7 @@ public class LoraLinearOperator(OperatorRegistry reg) : IOnnxOperator
 }
 
 /// <summary>
-/// LoraLinearGrad(x, A_T, B_T, dy, xa) -> (dx, dA_T, dB_T) for <see cref="LoraLinearOperator"/> (dy is the gradient of y; yBase's gradient is dy
+/// LoraLinearGrad(x, A_T, B_T, dy, xa [, accumulate]) -> (dx [+ accumulate], dA_T, dB_T) for <see cref="LoraLinearOperator"/> (dy is the gradient of y; yBase's gradient is dy
 /// itself). Attributes <c>scale</c>, <c>need_dx</c> (0: dx is not computed - the adapter's input carries no gradient).
 /// </summary>
 public class LoraLinearGradOperator(OperatorRegistry reg) : IOnnxOperator
@@ -100,7 +105,7 @@ public class LoraLinearGradOperator(OperatorRegistry reg) : IOnnxOperator
         int F = aT.Shape[0], R = aT.Shape[1], N = bT.Shape[1];
         int M = x.ElementCount / F;
         reg.Backward.LoraBackward(x.Data, aT.Data, bT.Data, dy.Data, xa.Data, ctx.Outputs[0].Data, ctx.Outputs[1].Data, ctx.Outputs[2].Data,
-            M, F, N, R, ctx.GetFloat("scale", 1f), ctx.GetInt("need_dx", 1) == 1);
+            M, F, N, R, ctx.GetFloat("scale", 1f), ctx.GetInt("need_dx", 1) == 1, ctx.Inputs.Length > 5 ? ctx.Inputs[5].Data : default);
     }
 }
 

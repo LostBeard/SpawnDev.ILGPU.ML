@@ -38,6 +38,12 @@ public static class GraphAutograd
     public static bool FusedLora { get; set; } = true;
 
     /// <summary>
+    /// A gradient sum whose part comes from MatMulGradInput or LoraLinearGrad is folded into that node (an accumulate input added in its
+    /// epilogue) instead of an Add node (default on; false = the Add chain, the A/B control; bit-identical). Added 2026-11-05.
+    /// </summary>
+    public static bool FuseGradientSums { get; set; } = true;
+
+    /// <summary>
     /// Add LoRA adapters beside the MatMuls whose weight is <c>blk.{L}.{target}.weight</c> for each target in <paramref name="targets"/>
     /// (GGUF names: attn_q, attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down): <c>y = x W + (alpha / rank) * (x A^T) B^T</c>, PEFT's
     /// semantics. A^T / B^T become f32 initializers in <paramref name="weights"/>: from <paramref name="initial"/> when it holds the PEFT tensors
@@ -378,8 +384,25 @@ public static class GraphAutograd
         {
             if (parts.Count == 0) throw new InvalidOperationException($"autograd: no gradient for {name}");
             string acc = parts[0];
-            for (int i = 1; i < parts.Count; i++) acc = Emit("Add", new[] { acc, parts[i] }, name + (i == parts.Count - 1 ? "" : "." + i));
+            for (int i = 1; i < parts.Count; i++)
+            {
+                // a part made by an input-gradient node takes the running sum as its accumulate input: the node writes part + sum (its GEMM or
+                // combine epilogue), the same value as Add(sum, part), without the full-size Add pass (MEASURED 2026-11-05: ~300 such Adds per
+                // llama3.1:8b step at 1,600 tokens, ~54 ms)
+                if (FuseGradientSums && AccumulateInto(parts[i], acc)) { acc = parts[i]; continue; }
+                acc = Emit("Add", new[] { acc, parts[i] }, name + (i == parts.Count - 1 ? "" : "." + i));
+            }
             return acc;
+        }
+
+        private bool AccumulateInto(string part, string acc)
+        {
+            var n = graph.Nodes.LastOrDefault(x => x.Outputs.Count > 0 && x.Outputs[0] == part);
+            if (n == null) return false;
+            int arity = n.OpType switch { "MatMulGradInput" => 2, "LoraLinearGrad" => 5, _ => -1 };
+            if (n.Inputs.Count != arity || graph.Nodes.Any(x => x.Inputs.Contains(part))) return false;
+            n.Inputs.Add(acc);
+            return true;
         }
 
         public string ReshapeLike(string v, string like)

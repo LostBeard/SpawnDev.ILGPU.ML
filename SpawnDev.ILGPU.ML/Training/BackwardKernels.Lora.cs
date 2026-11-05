@@ -116,14 +116,15 @@ public sealed partial class BackwardKernels
     /// LoraLinearGrad: from dy [M, N] and the forward's x [M, F] and xa [M, R]: dB_T = scale xa^T dy [R, N], dxa = scale dy B_T^T [M, R],
     /// dA_T = x^T dxa [F, R], and (when <paramref name="needDx"/>) dx = dxa A_T^T [M, F].
     /// </summary>
-    public void LoraBackward(FV x, FV aT, FV bT, FV dy, FV xa, FV dx, FV daT, FV dbT, int M, int F, int N, int R, float scale, bool needDx)
+    public void LoraBackward(FV x, FV aT, FV bT, FV dy, FV xa, FV dx, FV daT, FV dbT, int M, int F, int N, int R, float scale, bool needDx, FV accumulate = default)
     {
         LoraLoad();
         var dxa = Grow(_acc, ref _lrDxa, (long)M * R, _gRetired);
         LoraColDot(xa, dy, dbT, M, N, R, 0, scale);
         LoraRowDot(dy, bT, dxa.View, M, N, R, scale);
         LoraColDot(dxa.View, x, daT, M, F, R, 1, 1f);
-        if (needDx) LoraCombine(dxa.View, LoraRankMajor(aT, F, R), dxa.View, dx, M, F, R, false, 1f);
+        // dx = accumulate + dxa A (the running gradient sum folded in: the same value as the graph's Add)
+        if (needDx) LoraCombine(dxa.View, LoraRankMajor(aT, F, R), accumulate.IsValid ? accumulate : dxa.View, dx, M, F, R, accumulate.IsValid, 1f);
     }
 
     // One group = 32 rows x one K slice of 256; thread (row = tid / 8, kl = tid % 8) takes 4 consecutive k per step (16-byte loads; a row's 8

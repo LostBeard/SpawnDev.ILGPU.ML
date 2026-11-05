@@ -6,7 +6,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
 
-- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.09 s; RTX 2060 (Turing)
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.05 s; RTX 2060 (Turing)
   31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
   - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
     kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
@@ -20,6 +20,10 @@ Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shar
     dots with an ordered reduction (deterministic), 16-byte loads, four rows per thread in the combine. LoRA kernels ~290 -> ~79 ms per step;
     step 2.29 -> 2.09 s. Gate `Training_FusedLora_MatchesFourOpForm` (loss, logits and all 28 gradients vs the four-op form at ranks 8 / 16,
     with and without checkpointing; all six backends; red-checked).
+  - **Gradient sums folded into the producing node** (`GraphAutograd.FuseGradientSums`, default on): a sum whose part comes from
+    MatMulGradInput or LoraLinearGrad passes the running sum in as an accumulate input, added in the GEMM / combine epilogue
+    (`MmaGemm.Kernel{Bf16PackedV4,F16Sm75PackedV2}Acc`), instead of a full-size Add node. Bit-identical (tested bitwise; the 8B loss trajectory
+    is unchanged to the last digit). Step 2.09 -> 2.05 s, -218 MiB VRAM.
   - **Attention backward GEMMs on tensor cores** (`BackwardKernels.UseTensorCoreAttentionBackward`; the materialised path, now the fallback for
     head dims other than 128).
   - **Tensor-core GEMMs rebuilt**: packed 16-bit operands, double-buffered tiles, 64-bit fragment loads, then `cp.async` + `ldmatrix` (V4) and
