@@ -256,8 +256,14 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Backward_MatMulTransposedQuant_TensorCores_MatchReference() => await RunTest(async accelerator =>
     {
-        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_80+ tensor cores");
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_75+ tensor cores");
         var notes = new List<string>();
+        // sm_80+: the bf16 path, then the Turing f16 + scale path (forced); sm_75: the Turing path only
+        var paths = SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
+        bool savedForce = SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma;
+        try
+        {
+        foreach (bool turing in paths)
         foreach (var (type, M, K, N) in new[] { (GGMLType.Q4_K, 200, 512, 96), (GGMLType.Q6_K, 70, 256, 64), (GGMLType.Q8_0, 130, 288, 160) })
         {
             var rng = new Random(570 + (int)type);
@@ -282,6 +288,7 @@ public abstract partial class MLTestBase
                 try
                 {
                     BackwardKernels.UseTensorCoreQuantT = true;
+                    SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = turing;
                     reg.Backward.MatMulTransposedQuant(db.View, qb.View, dx.View, M, K, N, type);
                     var got = await dx.View.CopyToHostAsync();
                     double scale = want.Max(Math.Abs);
@@ -289,11 +296,14 @@ public abstract partial class MLTestBase
                 }
                 finally { BackwardKernels.UseTensorCoreQuantT = saved; }
                 // bf16 keeps 8 mantissa bits (2^-9 = 2e-3 relative per operand); N products of rounded operands accumulate in fp32
-                if (worstRel > 1e-2) throw new Exception($"{type} M={M} K={K} N={N} dy x {dyScale}: tensor-core dx max |diff| / max |dx| = {worstRel:E2}");
-                notes.Add($"{type} {M}x{K}x{N} dy x {dyScale:G2}: {worstRel:E2}");
+                // Turing: f16 operands (11 mantissa bits) after the power-of-two scale on dy
+                if (worstRel > (turing ? 2e-3 : 1e-2)) throw new Exception($"{(turing ? "sm75 f16" : "bf16")} {type} M={M} K={K} N={N} dy x {dyScale}: tensor-core dx max |diff| / max |dx| = {worstRel:E2}");
+                notes.Add($"{(turing ? "sm75 f16" : "bf16")} {type} {M}x{K}x{N} dy x {dyScale:G2}: {worstRel:E2}");
             }
         }
-        var line = "tensor-core dy W^T (bf16) vs float64, max |diff| / max |dx|: " + string.Join("; ", notes);
+        }
+        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = savedForce; }
+        var line = "tensor-core dy W^T vs float64, max |diff| / max |dx|: " + string.Join("; ", notes);
         Console.WriteLine("[Backward] " + line);
         return line;
     });

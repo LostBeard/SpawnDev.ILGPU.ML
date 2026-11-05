@@ -152,7 +152,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task AttnOp_FusedAttention_TrainTensorCore_MatchesCPU() => await RunTest(async accelerator =>
     {
-        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_80+ tensor cores");
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_75+ tensor cores");
         const int nHeads = 4, kvHeads = 2, seq = 150, hd = 128;
         var rng = new Random(905);
         float[] R(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
@@ -184,8 +184,13 @@ public abstract partial class MLTestBase
         var op = registry.Resolve("FusedAttention");
         var pool = new BufferPool(accelerator);
         var notes = new List<string>();
-        foreach (int tc in new[] { 1, 0 })
+        bool savedForce = SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma;
+        try
         {
+        // (train_tc, force the Turing kernel): the sm_80 kernel, the sm_75 kernel, then the generic kernel as the control
+        foreach (var (tc, forceSm75) in new[] { (1, false), (1, true), (0, false) })
+        {
+            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = forceSm75;
             op.Execute(new OnnxOpContext
             {
                 Inputs = new[] { new Tensor(qBuf.View, new[] { 1, seq, nHeads, hd }), new Tensor(kBuf.View, new[] { 1, seq, kvHeads, hd }), new Tensor(vBuf.View, new[] { 1, seq, kvHeads, hd }) },
@@ -201,11 +206,13 @@ public abstract partial class MLTestBase
             await accelerator.SynchronizeAsync();
             var got = await outBuf.CopyToHostAsync<float>(0, expected.Length);
             double worst = 0; for (int i = 0; i < got.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - expected[i]));
-            notes.Add($"train_tc={tc}: max |diff| {worst:E2}");
+            notes.Add($"train_tc={tc}{(forceSm75 ? " sm75" : "")}: max |diff| {worst:E2}");
             // f16 Q, K, V and P with fp32 accumulation (the batch decoder's prefill kernel); the generic kernel is fp32
             // MEASURED 2026-11-05 CUDA: train_tc 2.8e-4, generic 1.2e-7
             if (worst > (tc == 1 ? 2e-3 : 2e-4)) throw new Exception($"FusedAttention train_tc={tc} differs from the CPU oracle: " + string.Join("; ", notes));
         }
+        }
+        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = savedForce; }
         var line = "FusedAttention seq-major hd 128, 150 rows: " + string.Join("; ", notes);
         Console.WriteLine("[AttnOp] " + line);
         return line;

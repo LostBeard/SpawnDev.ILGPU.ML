@@ -161,7 +161,7 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
         float defScale = 1f / MathF.Sqrt(headDim);
         if (ctx.GetInt("train_tc", 0) == 1 && seqMajor && seqMajorQ && seqMajorKV && headDim == Kernels.MmaFlashPrefill.HeadDim && causal
             && effWindow == int.MaxValue && sinkCount == 0 && nHeads % kvHeads == 0 && kvOffset == seqKV - seqQ && seqQ >= 16
-            && (scale == 0f || MathF.Abs(scale - defScale) <= 1e-6f * defScale) && Kernels.CudaCaps.TensorCores(reg.Accelerator))
+            && (scale == 0f || MathF.Abs(scale - defScale) <= 1e-6f * defScale) && Kernels.CudaCaps.TuringTensorCores(reg.Accelerator))
         {
             var acc = reg.Accelerator;
             int kvWords = seqKV * kvHeads * headDim / 2;
@@ -170,9 +170,14 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             _toF16 ??= acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>>(ToF16WordsImpl);
             _toF16(kvWords, k.Data, kc.Data.Cast<float, uint>());
             _toF16(kvWords, v.Data, vc.Data.Cast<float, uint>());
-            _flashTc ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
-                Kernels.MmaFlashPrefill.Kernel);
-            _flashTc(new KernelConfig(((seqQ + Kernels.MmaFlashPrefill.QTile - 1) / Kernels.MmaFlashPrefill.QTile) * nHeads, Kernels.MmaFlashPrefill.Threads),
+            // sm_75 (Turing, the RTX 2060) on the m16n8k8 variant; FusedDequantMatMul.ForceSm75Mma runs it on a newer card (the tests)
+            bool turing = !Kernels.CudaCaps.TensorCores(acc) || Kernels.FusedDequantMatMul.ForceSm75Mma;
+            var flash = turing
+                ? _flashTcSm75 ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
+                    Kernels.MmaFlashPrefill.KernelSm75)
+                : _flashTc ??= acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(
+                    Kernels.MmaFlashPrefill.Kernel);
+            flash(new KernelConfig(((seqQ + Kernels.MmaFlashPrefill.QTile - 1) / Kernels.MmaFlashPrefill.QTile) * nHeads, Kernels.MmaFlashPrefill.Threads),
                 q.Data, kc.Data.Cast<float, uint>().BaseView, vc.Data.Cast<float, uint>().BaseView, ctx.Outputs[0].Data, seqQ, nHeads, kvHeads, kvOffset);
             ctx.Pool.Return(kc);
             ctx.Pool.Return(vc);
@@ -185,12 +190,14 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
     }
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>>? _toF16;
-    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _flashTc;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, ArrayView<uint>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _flashTc, _flashTcSm75;
 
-    // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even (CUDA sm_80+: the caller checks)
+    // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even. Two cvt.rn.f16.f32 + mov.b32: valid on sm_75 (Turing) and later
+    // (cvt.rn.f16x2.f32 is sm_80+). CUDA only: the caller checks.
     private static void ToF16WordsImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<uint, Stride1D.Dense> o)
     {
-        global::ILGPU.Runtime.Cuda.CudaAsm.Emit("cvt.rn.f16x2.f32 %0, %2, %1;", out uint packed, x[2 * i], x[2 * i + 1]);
+        global::ILGPU.Runtime.Cuda.CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }",
+            out uint packed, x[2 * i], x[2 * i + 1]);
         o[i] = packed;
     }
 }

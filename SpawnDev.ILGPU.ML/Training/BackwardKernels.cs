@@ -258,9 +258,12 @@ public sealed partial class BackwardKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MatMulTransposedQuantImpl);
         int code = Kernels.FusedDequantMatMul.TypeCode(type);
         int rowBytes = Kernels.FusedDequantMatMul.RowBytesOf(code, K);
-        if (UseTensorCoreQuantT && M >= 16 && N % Trellis2.MmaGemm.BK == 0 && K % 8 == 0 && K >= 64 && Kernels.CudaCaps.TensorCores(_acc))
+        // sm_80+: bf16 operands; sm_75 (Turing, the RTX 2060): f16 with a power-of-two scale on dy (no bf16 there).
+        // FusedDequantMatMul.ForceSm75Mma runs the Turing path on a newer card (the tests).
+        bool sm80 = Kernels.CudaCaps.TensorCores(_acc) && !Kernels.FusedDequantMatMul.ForceSm75Mma, sm75 = Kernels.CudaCaps.TuringTensorCores(_acc);
+        if (UseTensorCoreQuantT && M >= 16 && N % Trellis2.MmaGemm.BK == 0 && K % 8 == 0 && K >= 64 && (sm80 || sm75))
         {
-            MatMulTransposedQuantTensorCore(dy, weightQuant, dx, M, K, N, code, rowBytes);
+            MatMulTransposedQuantTensorCore(dy, weightQuant, dx, M, K, N, code, rowBytes, turing: !sm80);
             return;
         }
         if (UseTiledQuantT && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= TqThreads)
@@ -287,12 +290,19 @@ public sealed partial class BackwardKernels : IDisposable
     private readonly List<MemoryBuffer1D<ushort, Stride1D.Dense>> _retiredWt = new();
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBias;
     private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;
-    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int>? _dequantTBf16;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>? _dequantTBf16;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _absMax;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _qtScale;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>>? _zeroInt;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>? _absMaxK;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _scaleK;
+    private Action<KernelConfig, ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _mmaF16Sm75;
     private Action<KernelConfig, ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>? _mmaBf16;
 
     private void MatMulTransposedQuantTensorCore(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
-        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes)
+        ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes, bool turing)
     {
         long need = (long)K * N;
         if (_wtBf16 == null || _wtBf16.Length < need)
@@ -302,9 +312,28 @@ public sealed partial class BackwardKernels : IDisposable
         }
         _noBias ??= _acc.Allocate1D<BFloat16>(8);
         _noNbr ??= _acc.Allocate1D<int>(1);
-        _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int>(DequantTransposeBf16Impl);
+        _dequantTBf16 ??= _acc.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, int, int, int, int>(DequantTransposeBf16Impl);
         int tilesK = (K + 31) / 32;
-        _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK);
+        _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK, turing ? 1 : 0);
+        int tilesT = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((K + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+        if (turing)
+        {
+            // the scale: a power of two that puts max|dy| near 2^14 (f16 tops out at 65504), found on the device (no readback)
+            _absMax ??= _acc.Allocate1D<int>(1);
+            _qtScale ??= _acc.Allocate1D<float>(2);
+            _zeroInt ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>>(ZeroIntImpl);
+            _absMaxK ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>(AbsMaxImpl);
+            _scaleK ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ScaleFromMaxImpl);
+            int count = M * N;
+            _zeroInt(1, _absMax.View);
+            _absMaxK(new KernelConfig(Math.Max(1, Math.Min(1024, (count + 255) / 256)), 256), dy, _absMax.View, count);
+            _scaleK(1, _absMax.View, _qtScale.View);
+            _mmaF16Sm75 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75Scaled);
+            _mmaF16Sm75(new KernelConfig(tilesT, Trellis2.MmaGemm.Threads), dy.SubView(0, (long)M * N).Cast<float, Trellis2.F4>(),
+                _wtBf16.View.SubView(0, need).Cast<ushort, Trellis2.U4>(), _qtScale.View, dx, M, N, K);
+            return;
+        }
         _mmaBf16 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.F4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int, int>(Trellis2.MmaGemm.KernelBf16Dense);
         // MmaGemm: C[M, Nm] = A[M, Km] * W[Nm, Km]^T. Here A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K].
@@ -316,7 +345,62 @@ public sealed partial class BackwardKernels : IDisposable
     // One group = a 32 (stored rows n) x 32 (values k) tile of the GGUF weight: 256 threads decode it with consecutive threads on consecutive k
     // (one row's bytes), stage it in shared memory (33-float rows: no bank conflicts on the transposed read), then write out[k, n] with
     // consecutive threads on consecutive n. bf16 by round to nearest even.
-    private static void DequantTransposeBf16Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<ushort, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK)
+    // f16 (half = 1, the Turing path): round to nearest even, subnormals kept, overflow to infinity (dequantized weights never overflow)
+    private static ushort F32ToF16Bits(float f)
+    {
+        uint x = (uint)Interop.FloatAsInt(f);
+        uint sign = (x >> 16) & 0x8000u;
+        int e = (int)((x >> 23) & 0xFF) - 127 + 15;
+        uint m = x & 0x7FFFFFu;
+        if (e >= 31) return (ushort)(sign | 0x7C00u);
+        if (e <= 0)
+        {
+            if (e < -10) return (ushort)sign;
+            m |= 0x800000u;
+            int shift = 14 - e;
+            uint hm = m >> shift, rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1);
+            if (rem > half || (rem == half && (hm & 1u) != 0)) hm++;
+            return (ushort)(sign | hm);
+        }
+        uint h = sign | ((uint)e << 10) | (m >> 13);
+        uint r = m & 0x1FFFu;
+        if (r > 0x1000u || (r == 0x1000u && (h & 1u) != 0)) h++;
+        return (ushort)h;
+    }
+
+    private static void ZeroIntImpl(Index1D i, ArrayView1D<int, Stride1D.Dense> a) => a[i] = 0;
+
+    // max |x| over count values as the bits of a non-negative float (they order like ints): grid-stride, shared-memory tree, one atomic per group
+    private static void AbsMaxImpl(ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<int, Stride1D.Dense> maxBits, int count)
+    {
+        var sh = SharedMemory.Allocate<float>(256);
+        int tid = Group.IdxX;
+        float m = 0f;
+        for (int i = Grid.IdxX * 256 + tid; i < count; i += Grid.DimX * 256) m = MathF.Max(m, MathF.Abs(x[i]));
+        sh[tid] = m;
+        Group.Barrier();
+        for (int s = 128; s > 0; s >>= 1)
+        {
+            if (tid < s) sh[tid] = MathF.Max(sh[tid], sh[tid + s]);
+            Group.Barrier();
+        }
+        if (tid == 0) Atomic.Max(ref maxBits[0], (int)Interop.FloatAsInt(sh[0]));
+    }
+
+    // sc[0] = 2^(14 - ceil(log2 max)) clamped to [2^-20, 2^40] (power of two: scaling and unscaling are exact); sc[1] = 1 / sc[0]
+    private static void ScaleFromMaxImpl(Index1D i, ArrayView1D<int, Stride1D.Dense> maxBits, ArrayView1D<float, Stride1D.Dense> sc)
+    {
+        // ceil(log2 max) from the bits (no Log2 / Pow in PTX): the unbiased exponent, plus one when the mantissa is not zero
+        int bits = maxBits[0];
+        int e = 0;
+        int be = (bits >> 23) & 0xFF;
+        if (bits > 0 && be != 0xFF) e = 14 - ((be - 127) + ((bits & 0x7FFFFF) != 0 ? 1 : 0));
+        if (e < -20) e = -20; if (e > 40) e = 40;
+        sc[0] = Interop.IntAsFloat((uint)((e + 127) << 23));    // 2^e, exact
+        sc[1] = Interop.IntAsFloat((uint)((127 - e) << 23));    // 2^-e
+    }
+
+    private static void DequantTransposeBf16Impl(ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<ushort, Stride1D.Dense> o, int K, int N, int code, int rowBytes, int tilesK, int half)
     {
         var sh = SharedMemory.Allocate<float>(32 * 33);
         int t = Grid.IdxX;
@@ -333,9 +417,14 @@ public sealed partial class BackwardKernels : IDisposable
             int kk = ty + 8 * r, k = k0 + kk, n = n0 + tx;
             if (k < K && n < N)
             {
-                uint b = (uint)Interop.FloatAsInt(sh[tx * 33 + kk]);
-                b += 0x7FFFu + ((b >> 16) & 1u);
-                o[(long)k * N + n] = (ushort)(b >> 16);
+                float v = sh[tx * 33 + kk];
+                if (half != 0) o[(long)k * N + n] = F32ToF16Bits(v);
+                else
+                {
+                    uint b = (uint)Interop.FloatAsInt(v);
+                    b += 0x7FFFu + ((b >> 16) & 1u);
+                    o[(long)k * N + n] = (ushort)(b >> 16);
+                }
             }
         }
     }
@@ -848,6 +937,8 @@ public sealed partial class BackwardKernels : IDisposable
         _retiredWt.Clear();
         _noBias?.Dispose(); _noBias = null;
         _noNbr?.Dispose(); _noNbr = null;
+        _absMax?.Dispose(); _absMax = null;
+        _qtScale?.Dispose(); _qtScale = null;
         DisposeAttentionGemm();
     }
 }

@@ -111,7 +111,7 @@ public static class GraphAutograd
     /// several times over by the loss path (MEASURED: llama3.1:8b at 1,024 tokens, checkpointed, +8.0 GB of which ~2 GB was that).
     /// </param>
     /// <summary>
-    /// Mark a training graph's FusedAttention nodes for the tensor-core flash kernel (CUDA sm_80+, head dim 128, causal, no window or sinks;
+    /// Mark a training graph's FusedAttention nodes for the tensor-core flash kernel (CUDA sm_75+, head dim 128, causal, no window or sinks;
     /// otherwise the node runs as before). Default on; false = the generic kernel (the A/B control). Inference graphs are never marked.
     /// </summary>
     public static bool TensorCoreForwardAttention { get; set; } = true;

@@ -199,6 +199,104 @@ for dtype in ("Bf16", "F16"):
 for dtype in ("Bf16", "F16"):
     for gather in (False, True):
         kernel(dtype, gather)
+
+
+def kernel_sm75_scaled():
+    """KernelF16Sm75Scaled (2026-11-05, training on Turing): C[M,N] = (A[M,K] * s) W[N,K]^T / s with s = sc[0] (a power of two the caller
+    chose from max|A|, so small gradients do not underflow f16 and the scaling is exact). Dense A, no bias / activation / residual.
+    sm_75: each m16n8k16 is two m16n8k8 (the k16 A fragment's a0/a1 and a2/a3 are the two k8 A fragments, B's b0 / b1 the two k8 B
+    fragments) and the f16 pack is two cvt.rn.f16.f32 + mov.b32 (cvt.rn.f16x2.f32 is sm_80+), as in gen_mma_kquant_gemm.py."""
+    mma8 = "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+    w("    /// <summary>Turing (sm_75) f16 GEMM with a device-side power-of-two scale on A: C = (A * sc[0]) W^T * sc[1] (sc[1] = 1 / sc[0]).")
+    w("    /// grid = ceil(M/128) * ceil(N/128), group = 256. For gradients far below f16's normal range (the training backward on a 2060).</summary>")
+    w("    public static void KernelF16Sm75Scaled(F4V A, U4V Wu, FV sc, FV C, int M, int K, int N)")
+    w("    {")
+    w("        int numTilesN = (N + BN - 1) / BN;")
+    w("        int tileRow = Grid.IdxX / numTilesN;")
+    w("        int tileCol = Grid.IdxX % numTilesN;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 2, wn = warp & 3;")
+    w("        float s = sc[0], inv = sc[1];")
+    w("        var aS = SharedMemory.Allocate<uint>(BM * RowWords);")
+    w("        var bS = SharedMemory.Allocate<uint>(BN * RowWords);")
+    for mt in range(MT):
+        for nt in range(NT):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int arow = tid >> 3, a4 = tid & 7;")
+    w("        int brow = tid >> 2, b4 = tid & 3;")
+    for i in range(4):
+        w(f"        int aRg{i} = tileRow * BM + arow + {32 * i}; int aOk{i} = aRg{i} < M ? 1 : 0;")
+        w(f"        long aBase{i} = (long)aRg{i} * (K >> 2) + a4;")
+    for i in range(2):
+        w(f"        int bRg{i} = tileCol * BN + brow + {64 * i}; int bOk{i} = bRg{i} < N ? 1 : 0;")
+        w(f"        long bBase{i} = (long)bRg{i} * (K >> 3) + b4;")
+    w("        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;")
+    w("        U4 pb0 = default, pb1 = default;")
+    def load(kt_expr, ind):
+        for i in range(4):
+            w(f"{ind}pa{i} = aOk{i} != 0 ? A[aBase{i} + (({kt_expr}) >> 2)] : default(F4);")
+        for i in range(2):
+            w(f"{ind}pb{i} = bOk{i} != 0 ? Wu[bBase{i} + (({kt_expr}) >> 3)] : default(U4);")
+    load("0", "        ")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    for i in range(4):
+        w(f"            aS[(arow + {32 * i}) * RowWords + a4 * 2] = PackF16Sm75(pa{i}.X * s, pa{i}.Y * s);")
+        w(f"            aS[(arow + {32 * i}) * RowWords + a4 * 2 + 1] = PackF16Sm75(pa{i}.Z * s, pa{i}.W * s);")
+    for i in range(2):
+        for j, c in enumerate("XYZW"):
+            w(f"            bS[(brow + {64 * i}) * RowWords + b4 * 4 + {j}] = pb{i}.{c};")
+    w("            Group.Barrier();")
+    w("            if (kt + BK < K)")
+    w("            {")
+    load("kt + BK", "                ")
+    w("            }")
+    w("            for (int ks = 0; ks < 2; ks++)")
+    w("            {")
+    w("                int kw = ks * 8;")
+    for mt in range(MT):
+        w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
+        w(f"                uint a{mt}0 = aS[ar{mt}];")
+        w(f"                uint a{mt}1 = aS[ar{mt} + 8 * RowWords];")
+        w(f"                uint a{mt}2 = aS[ar{mt} + 4];")
+        w(f"                uint a{mt}3 = aS[ar{mt} + 8 * RowWords + 4];")
+    for nt in range(NT):
+        w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
+        w(f"                uint b{nt}0 = bS[br{nt}];")
+        w(f"                uint b{nt}1 = bS[br{nt} + 4];")
+    for mt in range(MT):
+        for nt in range(NT):
+            for (x0, x1, bb) in ((0, 1, 0), (2, 3, 1)):
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma8}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}{x0}, a{mt}{x1}, b{nt}{bb}, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+    w("            }")
+    w("            Group.Barrier();")
+    w("        }")
+    for mt in range(MT):
+        for nt in range(NT):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+
+w("    // sm_75: no cvt.rn.f16x2.f32 (sm_80+); two round-to-nearest-even conversions packed low / high")
+w("    private static uint PackF16Sm75(float lo, float hi)")
+w("    {")
+w('        CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, lo, hi);')
+w("        return packed;")
+w("    }")
+w("")
+kernel_sm75_scaled()
 w("}")
 
 path = sys.argv[1]

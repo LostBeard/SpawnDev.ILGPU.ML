@@ -201,3 +201,9 @@ step is ~4 forwards of work: target 4-5 s per step (a 7 h run in ~1.5 h).
       (CUDA sm_80+, hd 128, causal, no window / sinks). Inference graphs are never marked. `AttnOp_FusedAttention_TrainTensorCore_MatchesCPU`:
       2.8e-4 vs float64 (generic 1.2e-7). PENDING: the 8B gradient check + step time with it (after v2.1).
 - [ ] Then: packing several short sequences per step; skipping work that has no gradient.
+- [x] Turing (sm_75, Seven's RTX 2060) paths (2026-11-05). 2060 baseline (Seven, 08b95dd9): 31.5 s per 1,600-token step; MatMulGradInput
+      18.3 s (58%, SIMT there: bf16 needs sm_80), FusedAttention 5.4 s (17%). Now: the quantized input gradient as f16 MMA (m16n8k8 pairs,
+      `Trellis2.MmaGemm.KernelF16Sm75Scaled`, generated) with a device-side power-of-two scale from max|dy| (no readback; exact to undo),
+      and training attention on `MmaFlashPrefill.KernelSm75`. Gates: the tensor-core test runs both paths (Turing f16 ~3e-4 vs float64,
+      also at dy x 1e-7; red: scale off -> 0.30), the attention op test runs both kernels (2.8e-4). 8B on the 4070 with
+      GGUF_GEMM_MMA_SM75=1: 4.5 s per step, directional derivative 4.4e-4 / 3.1e-4. 2060 timing: Seven.
