@@ -63,6 +63,7 @@
 | MoveNet Lightning | ✅ | ✅ | ORT-matched |
 | BlazeFace | ✅ | 🟡 pending live | 5.2.32 weighted NMS + maxFaces=1; PMT Portrait geometry green — re-check /face after deploy |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
+| DINOv2-S / -B (image embeddings, `Dinov2EmbeddingPipeline`) | ✅ | ✅ embeddings | ORT-matched: `Dinov2_Small_MatchesOnnxRuntime`, `Dinov2_Base_MatchesOnnxRuntime` (CUDA, OpenCL, WebGPU) |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
 | DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |
 | all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; **the model `/embeddings` uses** |

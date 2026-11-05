@@ -12,6 +12,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - **LoRA prefill as a GEMM** (`LoraRuntime.PrefillGemm`, from `PrefillGemmRows` = 16 rows): x A^T runs on the tiled `MatMulKernel` instead
   of one reduction group per value. Same setup, 512-token prompt: first token +107 / +51 ms over base, vs +153 ms without (noisy: shared GPU).
 - `tools/LoraDecodeBench`: `--unfused`, `--no-prefill-gemm`.
+- **ONNX Resize, scales form (fix)**: with a constant `scales` input, linear and cubic Resize mapped source coordinates with out / in
+  instead of the GIVEN scale. They differ whenever in x scale is not an integer: DINOv2 interpolates its 37 x 37 position embedding to
+  16 x 16 at scale (16 + 0.1) / 37, and our tokens were 5% off onnxruntime (max 0.93 at |token| 18.7); now 7.9e-5. The linear path also
+  routes `asymmetric` and `pytorch_half_pixel` now (they fell through to half_pixel). The sizes form is unchanged. Resize / depth / CLAP /
+  YOLO / style / CLIP tests on CUDA, OpenCL, WebGPU: 261 passed, 0 failed.
+- **DINOv2 image embeddings** (`Dinov2EmbeddingPipeline`, `SmallRepo` / `BaseRepo` = Xenova/dinov2-small / -base ONNX of facebook/dinov2,
+  Apache-2.0, mirrored on the models host): RGBA in, GPU preprocessing as the checkpoints' processor (antialiased bicubic short edge 256,
+  center crop 224, ImageNet normalisation), out a pooled L2-normalised descriptor (CLS + mean patch token, the DINOv2 paper's feature) and
+  the patch tokens on request. For place retrieval (AssistZ). Gate `Dinov2_Small_MatchesOnnxRuntime` (+ `Dinov2_Base_`, HeavyModel) against
+  onnxruntime (`tools/gen_dinov2_reference.py`): tokens 1e-4 relative, end-to-end descriptor cosine 0.9999 from RGBA, street vs cat 0.002.
+  Warm 970 x 646 frame to descriptor on an RTX 4070 shared with a training run: small 21 ms CUDA / 36 ms WebGPU, base 40 / 42 ms.
 
 ## 5.8.2-local.10 - 2026-11-04 (local feed) - training at real lengths; LoRA at inference on both engines; two leaks and a Wasm race fixed
 

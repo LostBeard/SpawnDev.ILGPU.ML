@@ -1995,6 +1995,34 @@ public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
             return;
         }
         var ctMode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
+        // SCALES form (a constant `scales` input; opset 10: input 1, opset 11+: input 2): ONNX maps coordinates with the GIVEN scale, and
+        // in x scale need not be an integer (DINOv2's position embedding: 37 -> 16 at scale 0.43514, not 16 / 37). Routed to the scaled
+        // kernels; the sizes form below is unchanged.
+        int scalesIdx = ctx.Inputs.Length == 2 ? 1 : 2;
+        var scales = ctx.Inputs.Length > scalesIdx && ctx.Inputs[scalesIdx] != null && ctx.Inputs[scalesIdx].ElementCount >= 2
+            ? ctx.TryGetInputValues(scalesIdx) : null;
+        if (scales != null && scales.Length == rank && (mode == "linear" || mode == "cubic"))
+        {
+            float sh = rank >= 2 ? scales[rank - 2] : 1f, sw = scales[rank - 1];
+            for (int i = 0; i < rank - 2; i++)
+                if (scales[i] != 1f) throw new NotSupportedException($"Resize scales [{string.Join(",", scales)}] resize a non-spatial axis");
+            int ctS = ctMode switch
+            {
+                "half_pixel" => 0,
+                "align_corners" => 1,
+                "asymmetric" => 2,
+                "pytorch_half_pixel" => 3,
+                _ => throw new NotSupportedException($"Resize mode={mode} with coordinate_transformation_mode={ctMode} is not implemented"),
+            };
+            if (ctx.GetInt("antialias", 0) != 0) throw new NotSupportedException("Resize antialias=1 is not implemented");
+            reg.ElementWise.ResizeScaled(ctx.Inputs[0].Data, ctx.Outputs[0].Data, new ElementWiseKernels.ResizeDims
+            {
+                C = C, InH = inH, InW = inW, OutH = outH, OutW = outW, CtMode = ctS,
+                A = ctx.GetFloat("cubic_coeff_a", -0.75f), ExcludeOutside = ctx.GetInt("exclude_outside", 0),
+                ScaleH = sh, ScaleW = sw,
+            }, cubic: mode == "cubic");
+            return;
+        }
         // cubic → true bicubic (Keys, cubic_coeff_a). DAv3's DINOv2 pos-embed interpolation is cubic half_pixel; a bilinear
         // approximation seeded the depth's ~1% divergence. CLAP's HTSAT is cubic ALIGN_CORNERS, which used to fall back to bilinear
         // here: 2.6% off at its Resize, audio_embeds at cosine 0.9996 to onnxruntime (MEASURED 2026-11-03). Every coordinate mode the

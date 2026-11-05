@@ -508,6 +508,93 @@ public class ElementWiseKernels : IDisposable
         return ((float)o + 0.5f) * inLen / outLen - 0.5f;
     }
 
+    /// <summary>
+    /// ONNX Resize scalars for <see cref="ResizeLinearScaledImpl"/> / <see cref="ResizeCubicScaledImpl"/>: shapes, the coordinate mode (0 half_pixel,
+    /// 1 align_corners, 2 asymmetric, 3 pytorch_half_pixel), the cubic coefficient and exclude_outside, and the SCALES the graph gave per axis.
+    /// </summary>
+    public struct ResizeDims
+    {
+        /// <summary>Folded leading axes.</summary>
+        public int C;
+        /// <summary>Input / output spatial sizes.</summary>
+        public int InH, InW, OutH, OutW;
+        /// <summary>coordinate_transformation_mode code.</summary>
+        public int CtMode;
+        /// <summary>cubic_coeff_a.</summary>
+        public float A;
+        /// <summary>exclude_outside (cubic).</summary>
+        public int ExcludeOutside;
+        /// <summary>The scales input for the last two axes (out = floor(in x scale)).</summary>
+        public float ScaleH, ScaleW;
+    }
+
+    // ONNX Resize, scales form: the source coordinate divides by the GIVEN scale, not by out / in. They differ whenever in x scale is not an
+    // integer: DINOv2 interpolates its 37 x 37 position embedding with scale (16 + 0.1) / 37 = 0.43514 to 16 x 16, and out / in = 0.43243
+    // put every sample up to 0.2 px off (tokens 5% off onnxruntime, MEASURED 2026-11-04). align_corners does not use the scale.
+    private static float ResizeSourceCoordScaled(int o, int inLen, int outLen, int ctMode, float scale)
+    {
+        if (ctMode == 1) return outLen > 1 ? (float)o * (inLen - 1) / (outLen - 1) : 0f;
+        if (ctMode == 2) return (float)o / scale;
+        if (ctMode == 3 && outLen <= 1) return 0f;
+        return ((float)o + 0.5f) / scale - 0.5f;
+    }
+
+    private static void ResizeLinearScaledImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, ResizeDims d)
+    {
+        int ox = idx % d.OutW; int rem = idx / d.OutW; int oy = rem % d.OutH; int c = rem / d.OutH;
+        float fy = ResizeSourceCoordScaled(oy, d.InH, d.OutH, d.CtMode, d.ScaleH);
+        float fx = ResizeSourceCoordScaled(ox, d.InW, d.OutW, d.CtMode, d.ScaleW);
+        // onnxruntime clamps the source coordinate into [0, in - 1]
+        if (fy < 0f) fy = 0f; if (fy > d.InH - 1) fy = d.InH - 1;
+        if (fx < 0f) fx = 0f; if (fx > d.InW - 1) fx = d.InW - 1;
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int x0 = (int)floorX;
+        int y1 = y0 + 1 < d.InH ? y0 + 1 : d.InH - 1; int x1 = x0 + 1 < d.InW ? x0 + 1 : d.InW - 1;
+        float ty = fy - floorY; float tx = fx - floorX;
+        int b = c * d.InH * d.InW;
+        float v00 = input[b + y0 * d.InW + x0]; float v01 = input[b + y0 * d.InW + x1];
+        float v10 = input[b + y1 * d.InW + x0]; float v11 = input[b + y1 * d.InW + x1];
+        output[idx] = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx + v10 * ty * (1f - tx) + v11 * ty * tx;
+    }
+
+    private static void ResizeCubicScaledImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, ResizeDims d)
+    {
+        int ox = idx % d.OutW; int rem = idx / d.OutW; int oy = rem % d.OutH; int c = rem / d.OutH;
+        float fy = ResizeSourceCoordScaled(oy, d.InH, d.OutH, d.CtMode, d.ScaleH);
+        float fx = ResizeSourceCoordScaled(ox, d.InW, d.OutW, d.CtMode, d.ScaleW);
+        int iy = (int)MathF.Floor(fy); int ix = (int)MathF.Floor(fx);
+        float dy = fy - iy; float dx = fx - ix;
+        int bC = c * d.InH * d.InW;
+        float acc = 0f, wySum = 0f;
+        for (int m = -1; m <= 2; m++)
+        {
+            int yy = iy + m;
+            float wy = CubicWeight((float)m - dy, d.A);
+            if (yy < 0 || yy >= d.InH)
+            {
+                if (d.ExcludeOutside != 0) continue;
+                yy = yy < 0 ? 0 : d.InH - 1;
+            }
+            float row = 0f, wxSum = 0f;
+            for (int n = -1; n <= 2; n++)
+            {
+                int xx = ix + n;
+                float wx = CubicWeight((float)n - dx, d.A);
+                if (xx < 0 || xx >= d.InW)
+                {
+                    if (d.ExcludeOutside != 0) continue;
+                    xx = xx < 0 ? 0 : d.InW - 1;
+                }
+                row += input[bC + yy * d.InW + xx] * wx;
+                wxSum += wx;
+            }
+            if (d.ExcludeOutside != 0) row /= wxSum;
+            acc += row * wy;
+            wySum += wy;
+        }
+        output[idx] = d.ExcludeOutside != 0 ? acc / wySum : acc;
+    }
+
     private static void BicubicResizeImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
@@ -987,6 +1074,27 @@ public class ElementWiseKernels : IDisposable
         EnsureLoaded();
         _bicubicResizeKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW, ctMode, a, excludeOutside ? 1 : 0);
     }
+
+    /// <summary>
+    /// ONNX Resize mode="linear" or "cubic" in the SCALES form (<see cref="ResizeDims"/>: the coordinate mapping divides by the given scale). The
+    /// sizes form keeps <see cref="BilinearUpsample"/> / <see cref="BicubicResize"/>.
+    /// </summary>
+    public void ResizeScaled(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, ResizeDims d, bool cubic)
+    {
+        if (cubic)
+        {
+            _resizeCubicScaledKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ResizeDims>(ResizeCubicScaledImpl);
+            _resizeCubicScaledKernel(d.C * d.OutH * d.OutW, input, output, d);
+        }
+        else
+        {
+            _resizeLinearScaledKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ResizeDims>(ResizeLinearScaledImpl);
+            _resizeLinearScaledKernel(d.C * d.OutH * d.OutW, input, output, d);
+        }
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ResizeDims>? _resizeLinearScaledKernel, _resizeCubicScaledKernel;
 
     /// <summary>In-place add: data[i] += other[i]. Two separate buffers required.</summary>
     public void AddInPlace(ArrayView1D<float, Stride1D.Dense> data,
