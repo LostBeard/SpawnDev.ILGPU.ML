@@ -200,12 +200,11 @@ public sealed partial class BackwardKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> dlogits, ArrayView1D<float, Stride1D.Dense> scratch, int rows, int C, int ignoreIndex)
     {
         _ceCount ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CECountImpl);
-        _ceLse ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(CELseImpl);
         _ceGrad ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CEGradImpl);
         // ONE binding for the count (stats[0]) and each row's log-sum-exp (stats[1 + r]); see RMSNorm for why.
         _ceCount(1, labels, scratch, rows, ignoreIndex);
-        _ceLse(rows, logits, scratch, C);
+        CeLse(logits, scratch, rows, C);
         _ceGrad(rows * C, logits, labels, scratch, dlogits, C, ignoreIndex);
     }
 
@@ -220,7 +219,6 @@ public sealed partial class BackwardKernels : IDisposable
         int rows, int C, int ignoreIndex, int reduction)
     {
         _ceCount ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CECountImpl);
-        _ceLse ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(CELseImpl);
         _ceRowLoss ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(CERowLossImpl);
         _ceReduce ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -228,7 +226,7 @@ public sealed partial class BackwardKernels : IDisposable
         _ceLogProb ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int>(CELogProbImpl);
         _ceCount(1, labels, scratch, rows, ignoreIndex);
-        _ceLse(rows, logits, scratch, C);
+        CeLse(logits, scratch, rows, C);
         if (reduction == 0) _ceRowLoss(rows, logits, labels, scratch, loss, C, ignoreIndex);
         else _ceReduce(1, logits, labels, scratch, loss, rows, C, ignoreIndex, reduction);
         if (logProb is { } lp) _ceLogProb(rows * C, logits, scratch, lp, C);
@@ -265,6 +263,49 @@ public sealed partial class BackwardKernels : IDisposable
         float n = 0f;
         for (int r = 0; r < rows; r++) if ((int)labels[r] != ignoreIndex) n += 1f;
         count[0] = n;
+    }
+
+    // stats[1 + r] = log-sum-exp of row r: one group per row (not WebGL; UseGroupRowStats) or a thread per row. MEASURED 2026-11-05 (llama3.1:8b,
+    // labelled positions only): a thread per row over the 128,256-word vocabulary took 77 ms each for the loss and its gradient.
+    private void CeLse(ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> stats, int rows, int C)
+    {
+        if (UseGroupRowStats && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= RowStatsThreads)
+        {
+            _ceLseGroup ??= _acc.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(CELseGroupImpl);
+            _ceLseGroup(new KernelConfig(rows, RowStatsThreads), logits, stats, C);
+            return;
+        }
+        _ceLse ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(CELseImpl);
+        _ceLse(rows, logits, stats, C);
+    }
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _ceLseGroup;
+
+    private static void CELseGroupImpl(ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> stats, int C)
+    {
+        var sh = SharedMemory.Allocate<float>(RowStatsThreads);
+        int r = Grid.IdxX, tid = Group.IdxX;
+        long b = (long)r * C;
+        float m = float.NegativeInfinity;
+        for (int c = tid; c < C; c += RowStatsThreads) m = MathF.Max(m, logits[b + c]);
+        sh[tid] = m;
+        Group.Barrier();
+        for (int s = RowStatsThreads / 2; s > 0; s >>= 1)
+        {
+            if (tid < s) sh[tid] = MathF.Max(sh[tid], sh[tid + s]);
+            Group.Barrier();
+        }
+        float mx = sh[0];
+        Group.Barrier();
+        float sum = 0f;
+        for (int c = tid; c < C; c += RowStatsThreads) sum += MathF.Exp(logits[b + c] - mx);
+        sh[tid] = sum;
+        Group.Barrier();
+        for (int s = RowStatsThreads / 2; s > 0; s >>= 1)
+        {
+            if (tid < s) sh[tid] += sh[tid + s];
+            Group.Barrier();
+        }
+        if (tid == 0) stats[1 + r] = mx + MathF.Log(sh[0]);
     }
 
     private static void CELseImpl(Index1D r, ArrayView1D<float, Stride1D.Dense> logits, ArrayView1D<float, Stride1D.Dense> stats, int C)
