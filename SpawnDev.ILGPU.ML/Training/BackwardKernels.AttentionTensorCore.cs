@@ -99,6 +99,65 @@ public sealed partial class BackwardKernels
         _scaleK(1, maxBits.View, sc);
     }
 
+    /// <summary>
+    /// The fused (flash) attention backward (default on; false = the materialised tensor-core path, the A/B control): head dim 128 on CUDA
+    /// sm_75+. Two generated kernels (Kernels/MmaFlashAttnBwd.Generated.cs) keep the scores in registers instead of ten memory passes over
+    /// [heads, Sq, Skv] fp32 matrices, and skip the causal / window blocks no row can see. Same numerics: 16-bit operands (bf16 on sm_80, scaled f16
+    /// on Turing), fp32 accumulate, fp32 softmax and dS. Added 2026-11-05.
+    /// </summary>
+    public static bool UseFlashAttentionBackward { get; set; } = true;
+
+    private MemoryBuffer1D<ushort, Stride1D.Dense>? _fQ16, _fO16, _fK16, _fV16;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _fScDs;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _fMaxDs;
+    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>? _fQ, _fQSm75;
+    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>? _fKv, _fKvSm75;
+
+    private bool FlashAttentionEligible(AttnDims d) => UseFlashAttentionBackward && d.HeadDim == Kernels.MmaFlashAttnBwd.HeadDim;
+
+    private void AttentionFlash(FV q, FV k, FV v, FV outp, FV dout, FV dq, FV dk, FV dv, FV stats, AttnDims d)
+    {
+        bool turing = !Kernels.CudaCaps.TensorCores(_acc) || Kernels.FusedDequantMatMul.ForceSm75Mma;
+        long qn = (long)d.SeqQ * d.Heads * d.HeadDim, kn = (long)d.SeqKV * d.KvHeads * d.HeadDim;
+        var Q16 = Grow16(_acc, ref _fQ16, qn, _tRetired16); var O16 = Grow16(_acc, ref _fO16, qn, _tRetired16);
+        var K16 = Grow16(_acc, ref _fK16, kn, _tRetired16); var V16 = Grow16(_acc, ref _fV16, kn, _tRetired16);
+        _tScOne ??= _acc.Allocate1D(new[] { 1f, 1f });
+        _tScDo ??= _acc.Allocate1D<float>(2); _tMaxDo ??= _acc.Allocate1D<int>(1);
+        _fScDs ??= _acc.Allocate1D(new[] { 1f, 1f }); _fMaxDs ??= _acc.Allocate1D<int>(1);
+        _zeroInt ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>>(ZeroIntImpl);
+        _scaleK ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, FV>(ScaleFromMaxImpl);
+        var scDo = _tScOne.View;
+        if (turing) { DeviceScale(dout, qn, _tMaxDo, _tScDo.View); scDo = _tScDo.View; }
+        Pack16Flat(q, Q16.View, qn, turing, default);
+        Pack16Flat(dout, O16.View, qn, turing, turing ? scDo : default);
+        Pack16Flat(k, K16.View, kn, turing, default);
+        Pack16Flat(v, V16.View, kn, turing, default);
+        static ArrayView<uint> Words(MemoryBuffer1D<ushort, Stride1D.Dense> b, long n) => b.View.SubView(0, n).Cast<ushort, uint>().BaseView;
+        var qw = Words(Q16, qn); var ow = Words(O16, qn); var kw = Words(K16, kn); var vw = Words(V16, kn);
+        var gq = new KernelConfig((d.SeqQ + Kernels.MmaFlashAttnBwd.QRows - 1) / Kernels.MmaFlashAttnBwd.QRows * d.Heads, Kernels.MmaFlashAttnBwd.Threads);
+        var gkv = new KernelConfig((d.SeqKV + Kernels.MmaFlashAttnBwd.KeyRows - 1) / Kernels.MmaFlashAttnBwd.KeyRows * d.KvHeads, Kernels.MmaFlashAttnBwd.Threads);
+        if (turing)
+        {
+            _fQSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>(
+                Kernels.MmaFlashAttnBwd.KernelQSm75);
+            _fKvSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>(
+                Kernels.MmaFlashAttnBwd.KernelKVSm75);
+            _zeroInt(1, _fMaxDs.View);
+            _fQSm75(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, d);
+            _scaleK(1, _fMaxDs.View, _fScDs.View);
+            _fKvSm75(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, d);
+        }
+        else
+        {
+            _fQ ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>(
+                Kernels.MmaFlashAttnBwd.KernelQ);
+            _fKv ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>(
+                Kernels.MmaFlashAttnBwd.KernelKV);
+            _fQ(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, d);
+            _fKv(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, d);
+        }
+    }
+
     private void AttentionTensorCore(FV q, FV k, FV v, FV outp, FV dout, FV dq, FV dk, FV dv, FV stats, AttnDims d)
     {
         bool turing = !Kernels.CudaCaps.TensorCores(_acc) || Kernels.FusedDequantMatMul.ForceSm75Mma;
@@ -327,5 +386,8 @@ public sealed partial class BackwardKernels
         foreach (var b in new[] { _tS, _tdP, _tT, _tScOne, _tScDo, _tScDs, _tScDv }) b?.Dispose();
         _tS = _tdP = _tT = _tScOne = _tScDo = _tScDs = _tScDv = null;
         _tMaxDo?.Dispose(); _tMaxDs?.Dispose(); _tMaxDo = _tMaxDs = null;
+        foreach (var b in new[] { _fQ16, _fO16, _fK16, _fV16 }) b?.Dispose();
+        _fQ16 = _fO16 = _fK16 = _fV16 = null;
+        _fScDs?.Dispose(); _fMaxDs?.Dispose(); _fScDs = null; _fMaxDs = null;
     }
 }

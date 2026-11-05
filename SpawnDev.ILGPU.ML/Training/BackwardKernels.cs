@@ -764,7 +764,8 @@ public sealed partial class BackwardKernels : IDisposable
         int rowsQ = d.Heads * d.SeqQ;
         if (UseGemmAttentionBackward && d.Heads % d.KvHeads == 0 && _acc.AcceleratorType != AcceleratorType.WebGL && _acc.MaxNumThreadsPerGroup >= 256)
         {
-            if (TensorCoreAttentionEligible(d)) AttentionTensorCore(q, k, v, outp, dout, dq, dk, dv, stats, d);
+            if (TensorCoreAttentionEligible(d) && FlashAttentionEligible(d)) AttentionFlash(q, k, v, outp, dout, dq, dk, dv, stats, d);
+            else if (TensorCoreAttentionEligible(d)) AttentionTensorCore(q, k, v, outp, dout, dq, dk, dv, stats, d);
             else AttentionGemm(q, k, v, outp, dout, dq, dk, dv, stats, d);
             return;
         }

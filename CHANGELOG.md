@@ -2,6 +2,29 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (master) - LoRA training another 1.9x faster; Turing tensor cores; fused attention backward
+
+Needs SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory addresses for `ldmatrix` / `cp.async`).
+
+- **Training speed**: the llama3.1:8b LoRA step at 1,600 tokens (rank 16 q/k/v/o, checkpointed, RTX 4070) 4.5 s -> 2.35 s; RTX 2060 (Turing)
+  31.5 s -> 10.45 s by 39d5fc8b (later items not yet measured there). Gradients unchanged (directional derivative 3.8e-4 - 1.1e-3).
+  - **Fused (flash) attention backward** (`BackwardKernels.UseFlashAttentionBackward`, default on, head dim 128, CUDA sm_75+): two generated
+    kernels (`tools/llm-bench/gen_mma_flash_attn_bwd.py`) keep the scores in registers instead of ten memory passes over [heads, Sq, Skv] fp32
+    matrices, and skip the causal / window blocks no row can see. Deterministic (no atomics). Same numerics: bf16 operands on sm_80, f16 on
+    Turing with a power-of-two scale (per query row for dQ, per tensor for dK). FusedAttentionGrad 548 -> 94 ms per step; the 384 MiB score
+    buffers are gone. Gate `Backward_Attention_Flash_MatchFp32` (causal, kv offset, dout x 1e-6, sliding window, non-causal, G 2 and 4; bf16
+    <= 4.5e-3, f16 <= 5.0e-4 vs fp32; red-checked).
+  - **Attention backward GEMMs on tensor cores** (`BackwardKernels.UseTensorCoreAttentionBackward`; the materialised path, now the fallback for
+    head dims other than 128).
+  - **Tensor-core GEMMs rebuilt**: packed 16-bit operands, double-buffered tiles, 64-bit fragment loads, then `cp.async` + `ldmatrix` (V4) and
+    column-major block order (the large operand is read from DRAM about once); K-quant prefill GEMMs V2 / V3 (256-row tiles); nibbles to
+    float without I2F; Q4_K / Q6_K transpose-dequant decoding 4 values per scale read. All bit-identical to the kernels they replace.
+  - **Scratch-operand K-quant GEMM** (`FusedDequantMatMul.EnableMmaScratch`, M >= 512, f16 weight <= 256 MiB): the weight is dequantized once
+    to f16 with the GEMM's own decode helpers (bit-identical words), then the 16-bit V4 GEMM.
+  - **Turing (sm_75)**: f16 tensor-core input gradient with a device power-of-two scale, the Sm75 flash attention forward, and the Turing
+    variants of every kernel above (`FusedDequantMatMul.ForceSm75Mma` runs them on newer cards for tests).
+  - Row statistics (attention, RMSNorm backward, cross-entropy) one group per row.
+
 ## 5.8.2 - 2026-11-05 (nuget.org) - LoRA training on GGUF models (4.8x faster), DINOv2 image embeddings, ONNX Resize fix
 
 Stable release of everything since 5.8.1: this section plus 5.8.2-local.11 and 5.8.2-local.10 below. Full sweep 7500 passed, 0 failed.

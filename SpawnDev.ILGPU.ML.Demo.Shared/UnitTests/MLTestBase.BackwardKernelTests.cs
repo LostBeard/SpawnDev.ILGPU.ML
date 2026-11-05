@@ -365,6 +365,71 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The fused (flash) attention backward (BackwardKernels.UseFlashAttentionBackward, head dim 128, Kernels/MmaFlashAttnBwd.Generated.cs) on both
+    /// tensor-core paths (bf16 on sm_80; scaled f16 on sm_75, forced here through ForceSm75Mma) against the fp32 GEMM path, over the mask shapes it
+    /// skips blocks for: causal, causal at a kv offset (153 keys), dout x 1e-6 (below f16's normal range), a sliding window, and non-causal with more
+    /// keys than queries; four query heads on one kv head (G = 4) and on two (G = 2). Relative to each output's largest value. Added 2026-11-05.
+    /// </summary>
+    [TestMethod]
+    public async Task Backward_Attention_Flash_MatchFp32() => await RunTest(async accelerator =>
+    {
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("CUDA sm_75+ tensor cores");
+        const int heads = 4, hd = 128;
+        var notes = new List<string>();
+        bool savedTc = BackwardKernels.UseTensorCoreAttentionBackward, savedFlash = BackwardKernels.UseFlashAttentionBackward;
+        bool savedForce = SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma;
+        try
+        {
+            foreach (var (seq, kvOffset, seqKV, doutScale, causal, window, kvHeads) in new[] {
+                (150, 0, 150, 1f, 1, 0, 2), (150, 3, 153, 1f, 1, 0, 2), (150, 0, 150, 1e-6f, 1, 0, 1), (150, 0, 150, 1f, 1, 40, 2), (100, 0, 130, 1f, 0, 0, 1) })
+            {
+                var q = RandomFloats(seq * heads * hd, seed: 591); var k = RandomFloats(seqKV * kvHeads * hd, seed: 592);
+                var v = RandomFloats(seqKV * kvHeads * hd, seed: 593);
+                var dout = RandomFloats(seq * heads * hd, seed: 594).Select(x => x * doutScale).ToArray();
+                var outp = RandomFloats(seq * heads * hd, seed: 595);
+                using var reg = new OperatorRegistry(accelerator);
+                using var qb = accelerator.Allocate1D(q); using var kb = accelerator.Allocate1D(k); using var vb = accelerator.Allocate1D(v);
+                using var ob = accelerator.Allocate1D(outp); using var dob = accelerator.Allocate1D(dout);
+                using var dq = accelerator.Allocate1D<float>(q.Length); using var dk = accelerator.Allocate1D<float>(k.Length); using var dv = accelerator.Allocate1D<float>(v.Length);
+                using var stats = accelerator.Allocate1D<float>(2 * heads * seq);
+                var dims = new BackwardKernels.AttnDims { Heads = heads, KvHeads = kvHeads, SeqQ = seq, SeqKV = seqKV, HeadDim = hd, Causal = causal, Window = window, KvOffset = kvOffset, Scale = 1f / MathF.Sqrt(hd) };
+                async Task<(float[] Q, float[] K, float[] V)> Run(bool tc, bool sm75)
+                {
+                    BackwardKernels.UseTensorCoreAttentionBackward = tc;
+                    BackwardKernels.UseFlashAttentionBackward = tc;
+                    SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = sm75;
+                    // poison the outputs with NaN: every element must be written (an unwritten one fails the <= comparison)
+                    dq.CopyFromCPU(Enumerable.Repeat(float.NaN, q.Length).ToArray()); dk.CopyFromCPU(Enumerable.Repeat(float.NaN, k.Length).ToArray());
+                    dv.CopyFromCPU(Enumerable.Repeat(float.NaN, v.Length).ToArray());
+                    reg.Backward.Attention(qb.View, kb.View, vb.View, ob.View, dob.View, dq.View, dk.View, dv.View, stats.View, dims);
+                    return (await dq.View.CopyToHostAsync(), await dk.View.CopyToHostAsync(), await dv.View.CopyToHostAsync());
+                }
+                var want = await Run(false, false);
+                var paths = SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
+                foreach (bool sm75 in paths)
+                {
+                    var got = await Run(true, sm75);
+                    double Rel(float[] a, float[] b) { double m = b.Max(x => Math.Abs((double)x)), w = 0; for (int i = 0; i < a.Length; i++) w = Math.Max(w, Math.Abs(a[i] - b[i])); return w / Math.Max(m, 1e-30); }
+                    double rq = Rel(got.Q, want.Q), rk = Rel(got.K, want.K), rv = Rel(got.V, want.V);
+                    string tag = $"{(sm75 ? "sm75 f16" : "bf16")} seq {seq} kv {seqKV} off {kvOffset} causal {causal} window {window} G {heads / kvHeads} dout x {doutScale:G2}";
+                    notes.Add($"{tag}: dq {rq:E1} dk {rk:E1} dv {rv:E1}");
+                    // the materialised tensor-core path's bounds (Backward_Attention_TensorCores_MatchFp32): bf16 1e-2, f16 2e-3
+                    double tol = sm75 ? 2e-3 : 1e-2;
+                    if (!(rq <= tol && rk <= tol && rv <= tol)) throw new Exception("flash attention backward differs from fp32: " + string.Join("; ", notes));
+                }
+            }
+        }
+        finally
+        {
+            BackwardKernels.UseTensorCoreAttentionBackward = savedTc; BackwardKernels.UseFlashAttentionBackward = savedFlash;
+            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.ForceSm75Mma = savedForce;
+        }
+        var line = "flash attention backward vs fp32, max |diff| / max |grad|: " + string.Join("; ", notes);
+        Console.WriteLine("[Backward] " + line);
+        return line;
+    });
+
+    /// <summary>
     /// The ONNX SoftmaxCrossEntropyLoss op (rewritten onto the device 2026-11-04): mean over the rows NOT ignored, sum, none, and the
     /// log_prob output, against a float64 CPU reference. The old body divided by every row even when rows were masked.
     /// </summary>
