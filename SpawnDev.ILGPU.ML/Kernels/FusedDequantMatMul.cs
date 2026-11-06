@@ -180,6 +180,12 @@ public class FusedDequantMatMul : IDisposable
     /// </summary>
     public static bool EnableMmaSm75V5 = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V5") != "0";
 
+    /// <summary>
+    /// Turing with <see cref="EnableMmaSm75V5"/>: the V6 form (XOR-swizzled 64-byte rows: two stages in 32 KB, so two blocks fit an SM's 64 KB of
+    /// shared memory where V5's 40 KB fit one). Bit-identical. GGUF_GEMM_SM75_V6=0 = V5.
+    /// </summary>
+    public static bool EnableMmaSm75V6 = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V6") != "0";
+
     /// <summary>The row count from which <see cref="EnableMmaScratch"/> applies.</summary>
     public static int MmaScratchMinRows = 512;
     /// <summary>
@@ -195,7 +201,7 @@ public class FusedDequantMatMul : IDisposable
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>? _deqQ4K, _deqQ4KSm75;
     private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>? _deqQ6K, _deqQ6KSm75;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16V5, _f16V6, _f16Sm75V2, _f16Sm75V5;
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _f16V4, _f16V5, _f16V6, _f16Sm75V2, _f16Sm75V5, _f16Sm75V5V6;
 
     // word i = f16(x[2i]) | f16(x[2i + 1]) << 16, round to nearest even (two cvt.rn.f16.f32: sm_75 and later, the same bits as cvt.rn.f16x2.f32)
     private static void PackA16Impl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView<uint> o)
@@ -263,8 +269,8 @@ public class FusedDequantMatMul : IDisposable
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int, int, int>? _deqQ4KRows;
     private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int, int, int>? _deqQ6KRows, _deqQ6KRowsSm75;
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, int, int, int, int>? _deqQ4KRowsSm75;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>? _f16Sm75V5SwiGLU;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _f16Sm75V5Split;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>? _f16Sm75V5SwiGLU, _f16Sm75V5SwiGLUV6;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _f16Sm75V5Split, _f16Sm75V5SplitV6;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchS16;
 
     private void DequantRows(ArrayView1D<byte, Stride1D.Dense> w, GGMLType type, ArrayView<W16> dst, int N, int K, int dstBlock, int dstOff, bool turing = false)
@@ -312,6 +318,7 @@ public class FusedDequantMatMul : IDisposable
             if (!((t == GGMLType.Q4_K && (wb & 15) == 0) || (t == GGMLType.Q6_K && (wb & 1) == 0))) return false;
         }
         if (2L * Nff * K * 2 > MmaScratchMaxWeightBytes || (long)Nout * Nff * 2 > MmaScratchMaxWeightBytes) return false;
+        KernelTimings.Start(_accelerator);
         long aWords = (long)M * K / 2, guWords = (long)Nff * K, sWords = (long)M * Nff / 2, dWords = (long)Nout * Nff / 2;
         var a16 = GrowScratch(ref _scratchA16, aWords);
         var w16 = GrowScratch(ref _scratchW16, Math.Max(guWords, dWords));
@@ -319,23 +326,28 @@ public class FusedDequantMatMul : IDisposable
         _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
         _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
         _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+        KernelTimings.Mark(_accelerator, "ffn.packA");
         var wDst = w16.View.SubView(0, guWords).BaseView.Cast<W16>();
         DequantRows(wGate, tGate, wDst, Nff, K, 16, 0, turing);
         DequantRows(wUp, tUp, wDst, Nff, K, 16, 8, turing);
+        KernelTimings.Mark(_accelerator, "ffn.dequantGateUp");
         var swi = turing
-            ? _f16Sm75V5SwiGLU ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5SwiGLU)
+            ? (EnableMmaSm75V6 ? _f16Sm75V5SwiGLUV6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6SwiGLU) : _f16Sm75V5SwiGLU ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5SwiGLU))
             : _f16V6SwiGLU ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6SwiGLU);
         int tilesGu = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((2 * Nff + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
         swi(new KernelConfig(tilesGu, Trellis2.MmaGemm.V5Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(),
             w16.View.SubView(0, guWords).Cast<uint, Trellis2.U4>(), _scratchOnes.View, s16.View.SubView(0, sWords).BaseView, M, K, 2 * Nff);
+        KernelTimings.Mark(_accelerator, "ffn.gemmGateUpSwiGLU");
         // down: the same scratch (stream order: the gate | up GEMM has read it), rows as stored
         DequantRows(wDown, tDown, w16.View.SubView(0, dWords).BaseView.Cast<W16>(), Nout, Nff, 8, 0, turing);
+        KernelTimings.Mark(_accelerator, "ffn.dequantDown");
         var downGemm = turing
-            ? _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5)
+            ? (EnableMmaSm75V6 ? _f16Sm75V5V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6) : _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5))
             : _f16V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6);
         int tilesD = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((Nout + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
         downGemm(new KernelConfig(tilesD, Trellis2.MmaGemm.V5Threads), s16.View.SubView(0, sWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, dWords).Cast<uint, Trellis2.U4>(),
             _scratchOnes.View, output.SubView(0, (long)M * Nout), M, Nff, Nout);
+        KernelTimings.Mark(_accelerator, "ffn.gemmDown");
         LastGemmKernel = "mma-scratch-swiglu" + (turing ? "-sm75" : "");
         return true;
     }
@@ -361,12 +373,14 @@ public class FusedDequantMatMul : IDisposable
             nTot += ns[i];
         }
         if (nTot * K * 2 > MmaScratchMaxWeightBytes) return false;
+        KernelTimings.Start(_accelerator);
         long aWords = (long)M * K / 2, wWords = nTot * K / 2;
         var a16 = GrowScratch(ref _scratchA16, aWords);
         var w16 = GrowScratch(ref _scratchW16, wWords);
         _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
         _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
         _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+        KernelTimings.Mark(_accelerator, "group.packA");
         long rowOff = 0;
         for (int i = 0; i < count; i++)
         {
@@ -384,13 +398,15 @@ public class FusedDequantMatMul : IDisposable
             rowOff += ns[i];
         }
         var split = turing
-            ? _f16Sm75V5Split ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5Split)
+            ? (EnableMmaSm75V6 ? _f16Sm75V5SplitV6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6Split) : _f16Sm75V5Split ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5Split))
             : _f16V6Split ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6Split);
+        KernelTimings.Mark(_accelerator, "group.dequant");
         int N = (int)nTot;
         int tiles = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
         var o2 = count == 3 ? outputs[2] : outputs[1];   // the third tensor is never written with two outputs (N0 + N1 = N)
         split(new KernelConfig(tiles, Trellis2.MmaGemm.V5Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, wWords).Cast<uint, Trellis2.U4>(),
             _scratchOnes.View, outputs[0].SubView(0, (long)M * ns[0]), outputs[1].SubView(0, (long)M * ns[1]), o2, M, K, N, ns[0], count == 3 ? ns[1] : N - ns[0]);
+        KernelTimings.Mark(_accelerator, "group.gemm");
         LastGemmKernel = "mma-scratch-group" + count + (turing ? "-sm75" : "");
         return true;
     }
@@ -592,12 +608,14 @@ public class FusedDequantMatMul : IDisposable
             if (EnableMmaScratch && M >= MmaScratchMinRows && (long)N * K * 2 <= MmaScratchMaxWeightBytes)
             {
                 // dequantize once to f16, round A to f16, then the 16-bit GEMM (see EnableMmaScratch)
+                KernelTimings.Start(_accelerator);
                 long aWords = (long)M * K / 2, wWords = (long)N * K / 2;
                 var a16 = GrowScratch(ref _scratchA16, aWords);
                 var w16 = GrowScratch(ref _scratchW16, wWords);
                 _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
                 _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
                 _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
+                KernelTimings.Mark(_accelerator, "fwd.packA");
                 int deqCount = N * (K >> 5) * 2;
                 if (type == GGMLType.Q4_K)
                     (turing ? _deqQ4KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16Sm75)
@@ -607,9 +625,10 @@ public class FusedDequantMatMul : IDisposable
                     (turing ? _deqQ6KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16Sm75)
                             : _deqQ6K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ6KF16))(
                         deqCount, weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView.Cast<W16>(), N, K);
+                KernelTimings.Mark(_accelerator, "fwd.dequant");
                 bool v5 = turing ? EnableMmaSm75V5 : EnableMmaV5;
                 var gemm = turing && v5
-                    ? _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5)
+                    ? (EnableMmaSm75V6 ? _f16Sm75V5V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6) : _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5))
                     : turing
                     ? _f16Sm75V2 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
@@ -620,6 +639,7 @@ public class FusedDequantMatMul : IDisposable
                 int tilesS = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
                 gemm(new KernelConfig(tilesS, v5 ? Trellis2.MmaGemm.V5Threads : Trellis2.MmaGemm.Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, wWords).Cast<uint, Trellis2.U4>(),
                     _scratchOnes.View, output, M, K, N);
+                KernelTimings.Mark(_accelerator, "fwd.gemm");
                 LastGemmKernel = (type == GGMLType.Q4_K ? "mma-q4k" : "mma-q6k") + (turing ? "-sm75" : "") + "-scratch" + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
                 return;
             }

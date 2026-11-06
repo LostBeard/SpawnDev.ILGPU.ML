@@ -68,6 +68,7 @@ if (args.Contains("--profile"))
     await trainer.StepAsync(ids, labels, update: false);
     SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true;
     SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+    SpawnDev.ILGPU.ML.Kernels.KernelTimings.Reset();
     var psw = Stopwatch.StartNew();
     await trainer.StepAsync(ids, labels, update: false);
     double total = psw.Elapsed.TotalMilliseconds;
@@ -80,6 +81,13 @@ if (args.Contains("--profile"))
         Console.WriteLine($"  {g.Op,-28} {g.Ms,9:F0} ms  {g.N,5} nodes  {100 * g.Ms / t.Values.Sum(),5:F1}%");
     foreach (var kv in t.OrderByDescending(kv => kv.Value).Take(8))
         Console.WriteLine($"    {kv.Value,8:F1} ms  {kv.Key}");
+    // GGUF_KERNEL_TIMING=1: the pieces inside the GEMM ops (each synchronized)
+    var pieces = SpawnDev.ILGPU.ML.Kernels.KernelTimings.Snapshot();
+    if (pieces.Count > 0)
+    {
+        Console.WriteLine("kernel pieces (GGUF_KERNEL_TIMING=1):");
+        foreach (var (name, ms, n) in pieces) Console.WriteLine($"  {name,-28} {ms,9:F1} ms  {n,5} calls");
+    }
     return 0;
 }
 sw.Restart();

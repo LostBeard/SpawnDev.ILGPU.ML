@@ -406,6 +406,7 @@ public sealed partial class BackwardKernels : IDisposable
     private void MatMulTransposedQuantTensorCore(ArrayView1D<float, Stride1D.Dense> dy, ArrayView1D<byte, Stride1D.Dense> weightQuant,
         ArrayView1D<float, Stride1D.Dense> dx, int M, int K, int N, int code, int rowBytes, bool turing, ArrayView1D<float, Stride1D.Dense> accumulate)
     {
+        Kernels.KernelTimings.Start(_acc);
         long need = (long)K * N;
         if (_wtBf16 == null || _wtBf16.Length < need)
         {
@@ -429,6 +430,7 @@ public sealed partial class BackwardKernels : IDisposable
             int tilesK = (K + 31) / 32;
             _dequantTBf16(new KernelConfig(((N + 31) / 32) * tilesK, 256), weightQuant.Cast<byte, int>(), _wtBf16.View, K, N, code, rowBytes, tilesK, turing ? 1 : 0);
         }
+        Kernels.KernelTimings.Mark(_acc, "gradInput.dequantTranspose");
         // dy -> 16-bit once (Turing: times a power-of-two scale from max|dy|, found on the device), then the packed GEMM:
         // C[M, Nm] = A[M, Km] * W[Nm, Km]^T with A = dy [M, N], W = the transposed weight [K, N], C = dx [M, K]
         var dy16 = Grow16(_acc, ref _dy16, (long)M * N, _tRetired16);
@@ -440,9 +442,12 @@ public sealed partial class BackwardKernels : IDisposable
             _qtScale ??= _acc.Allocate1D<float>(2);
             DeviceScale(dy, (long)M * N, _absMax, _qtScale.View);
             sc = _qtScale.View;
+            Kernels.KernelTimings.Mark(_acc, "gradInput.dyScale");
         }
         Pack16Flat(dy, dy16.View, (long)M * N, turing, turing ? sc : default);
+        Kernels.KernelTimings.Mark(_acc, "gradInput.dyPack");
         MmaPacked(turing, dy16.View, _wtBf16.View.SubView(0, need), dx, sc, M, N, K, accumulate);
+        Kernels.KernelTimings.Mark(_acc, "gradInput.gemm");
     }
 
     /// <summary>
@@ -458,9 +463,9 @@ public sealed partial class BackwardKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<ushort, Stride1D.Dense>, int, int, ArrayView1D<float, Stride1D.Dense>>? _pack16Flat;
 
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Acc, _packedBf16Acc, _packedBf16V5Acc;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5, _packedBf16V6, _packedF16Sm75V5;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V5, _packedBf16V6, _packedF16Sm75V5, _packedF16Sm75V5V6;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedBf16V6Acc;
-    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Sm75V5Acc;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _packedF16Sm75V5Acc, _packedF16Sm75V5AccV6;
 
     private void MmaPacked(bool turing, ArrayView1D<ushort, Stride1D.Dense> A, ArrayView1D<ushort, Stride1D.Dense> W, ArrayView1D<float, Stride1D.Dense> C,
         ArrayView1D<float, Stride1D.Dense> sc, int M, int K, int N, ArrayView1D<float, Stride1D.Dense> accumulate = default)
@@ -473,9 +478,9 @@ public sealed partial class BackwardKernels : IDisposable
             var w4t = W.SubView(0, (long)N * K).Cast<ushort, Trellis2.U4>();
             var cfgt = new KernelConfig(tiles, Trellis2.MmaGemm.V5Threads);
             if (accumulate.IsValid)
-                (_packedF16Sm75V5Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5Acc))(cfgt, a4t, w4t, sc, C, accumulate, M, K, N);
+                ((Kernels.FusedDequantMatMul.EnableMmaSm75V6 ? _packedF16Sm75V5AccV6 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6Acc) : _packedF16Sm75V5Acc ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5Acc)))(cfgt, a4t, w4t, sc, C, accumulate, M, K, N);
             else
-                (_packedF16Sm75V5 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5))(cfgt, a4t, w4t, sc, C, M, K, N);
+                ((Kernels.FusedDequantMatMul.EnableMmaSm75V6 ? _packedF16Sm75V5V6 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6) : _packedF16Sm75V5 ??= _acc.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5)))(cfgt, a4t, w4t, sc, C, M, K, N);
             return;
         }
         if (!turing && Kernels.FusedDequantMatMul.EnableMmaV5)

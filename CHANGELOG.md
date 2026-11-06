@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (master)
+
+- **Turing V6 GEMM** (`FusedDequantMatMul.EnableMmaSm75V6`, default on, `GGUF_GEMM_SM75_V6=0` = V5): the Turing V5 with XOR-swizzled 64-byte
+  rows, so two stages take 32 KB and two blocks fit an SM's 64 KB of shared memory (V5's 40 KB fit one: 4 warps per SM). Bit-identical.
+  MEASURED by Seven with Nsight on the RTX 2060: the V5 GEMMs were 79% of GPU time at ~17 TFLOPS. On the RTX 4070's Turing path: 43.0 -> 44.5
+  (q / o), 48.0 -> 51.4 (down), 42.8 -> 48.6 (gate / up) TFLOPS; training step 2.04 -> 1.95 s, identical loss trajectory.
+- `KernelTimings` (env `GGUF_KERNEL_TIMING=1`, desktop): synchronized per-piece times inside the GEMM ops (dequant, packs, scale, GEMM),
+  printed by `TrainLoraProbe --profile`; for machines without a profiler.
+
 ## 5.8.3 - 2026-11-05 (nuget.org) - LoRA training 2.5x faster again (4.5 -> 1.78 s per step); Turing; faster prefill
 
 Stable. Full sweep 7513 passed, 0 failed. On SpawnDev.ILGPU 5.4.16 (`Unsafe.AsPointer` in kernels gives inline PTX shared-memory
