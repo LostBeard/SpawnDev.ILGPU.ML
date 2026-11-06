@@ -185,6 +185,13 @@ public abstract partial class MLTestBase
         var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
         var notes = new List<string> { $"prompt {ids.Length} tokens" };
         bool ok = true;
+        // f32 GEMMs (the Q8_0 tensor-core prefill off): this compares chunkings, and a chunk below the tensor-core row threshold takes the f32 GEMM while the
+        // one forward takes the f16 one (MEASURED 2026-11-06: last-row logits 0.0316 apart). The Q8_0 tensor-core GEMM is gated on its own
+        // (Gemm_MmaQ8_0_MatchesOracle_AndIsTaken).
+        bool mmaQ8Saved = Kernels.FusedDequantMatMul.EnableMmaQ8;
+        Kernels.FusedDequantMatMul.EnableMmaQ8 = false;
+        try
+        {
         async Task<(int[] Tokens, float[] Logits)> Run(int chunk)
         {
             dec.PrefillChunk = chunk;
@@ -214,6 +221,8 @@ public abstract partial class MLTestBase
         bool turnOk = reused.SequenceEqual(full) && kept > 0 && ids2.Length - kept > 256;
         ok &= turnOk;
         notes.Add($"turn 2: {ids2.Length - kept} new over {kept} reused in chunks of 256: {(turnOk ? "same tokens as one full forward" : "DIFFERS")}");
+        }
+        finally { Kernels.FusedDequantMatMul.EnableMmaQ8 = mmaQ8Saved; }
         var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
         Console.WriteLine("[ChunkedPrefill] " + report);
         if (!ok) throw new Exception(report);
@@ -242,6 +251,10 @@ public abstract partial class MLTestBase
         // logits. The F16 cache is gated on its own (GgufBatchDecoder_HalfKvCache_MatchesF32).
         bool halfSaved = GgufBatchDecoder.HalfKvCache;
         GgufBatchDecoder.HalfKvCache = false;
+        // f32 GEMMs too, for the same reason: with the Q8_0 tensor-core prefill (f16 operands) the two attention kernels' float-order difference crosses f16
+        // rounding boundaries in the next layer's GEMM input (MEASURED 2026-11-06: 0.007-0.022 in the logits). The GEMM is gated on its own.
+        bool mmaQ8Saved = Kernels.FusedDequantMatMul.EnableMmaQ8;
+        Kernels.FusedDequantMatMul.EnableMmaQ8 = false;
         try
         {
         foreach (var (repo, file) in new[] { ("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"), ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf") })
@@ -282,7 +295,7 @@ public abstract partial class MLTestBase
             dec.FlashGqa = true;
         }
         }
-        finally { GgufBatchDecoder.HalfKvCache = halfSaved; }
+        finally { GgufBatchDecoder.HalfKvCache = halfSaved; Kernels.FusedDequantMatMul.EnableMmaQ8 = mmaQ8Saved; }
         var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
         Console.WriteLine("[FlashPrefill] " + report);
         if (!ok) throw new Exception(report);

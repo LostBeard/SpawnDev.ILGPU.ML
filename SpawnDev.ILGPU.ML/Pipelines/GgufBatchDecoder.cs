@@ -109,6 +109,15 @@ public sealed class GgufBatchDecoder : IDisposable
     /// scores hold GqaMaxG x AttChunk).
     /// </summary>
     public int GqaChunk { get => _gqaChunk; set { if (_gqaChunk != value) { _gqaChunk = value; _bufGen++; } } }
+    /// <summary>
+    /// The decode attention on <c>AttnPartialGqaIlpImpl</c> (chunks past the position leave at once; K / V loads issued ahead of their FMAs; bit-identical) instead of
+    /// <c>AttnPartialGqaImpl</c>. Default: on for CUDA and OpenCL, off for WebGPU, per the A/B below (env GGUF_ATTN_ILP=0 / 1 forces it).
+    /// </summary>
+    public bool AttentionIlp { get => _attIlp; set { if (_attIlp != value) { _attIlp = value; _bufGen++; } } }
+    private bool _attIlp;
+    /// <summary>The next decode step records its kernels again (WebGPU plans, CUDA graphs): call after changing a static kernel switch (e.g. FusedDequantMatMul.Q8Vec)
+    /// that a captured step would otherwise keep replaying.</summary>
+    public void InvalidateCapturedSteps() => _bufGen++;
     private int _gqaChunk = int.TryParse(Environment.GetEnvironmentVariable("GGUF_GQA_CHUNK"), out var gc) ? gc : 0;
     private int GqaChunkKeys(int G)
     {
@@ -185,6 +194,9 @@ public sealed class GgufBatchDecoder : IDisposable
         _head = model.Tensors.Any(t => t.Name == "output.weight") ? "output.weight" : "token_embd.weight";
         MaxSeq = maxSeq; MaxBatch = maxBatch;
         CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
+        _attIlp = Environment.GetEnvironmentVariable("GGUF_ATTN_ILP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL };
+        CaptureCuda = accelerator is global::ILGPU.Runtime.Cuda.CudaAccelerator && global::ILGPU.Runtime.Cuda.CudaStream.SupportsGraphCapture
+            && Environment.GetEnvironmentVariable("GGUF_BATCH_CUDA_GRAPH") != "0";
         DeviceSampling = SupportsDeviceDraws(accelerator);
         NoCandidates = accelerator.AcceleratorType == AcceleratorType.WebGL;
         // the fused attention runs a group per head (a power of two up to 256 threads; WebGL has no groups)
@@ -223,7 +235,7 @@ public sealed class GgufBatchDecoder : IDisposable
         /// <summary>The tensor-core flash prefill (<see cref="MmaFlashPrefill"/>; F16 caches only, head dim 128): false when this store cannot take it.</summary>
         public abstract bool FlashMma(int l, FV q, FV att, int R, int H, int kvH, int p);
         public abstract void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
-        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale);
+        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp);
         public abstract void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale);
         public abstract void Pv(int l, int n, FV scores, IV seqs, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode);
         public abstract void Fork(int l, int n, long count, long region);
@@ -239,8 +251,11 @@ public sealed class GgufBatchDecoder : IDisposable
         private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>? _att;
         private readonly Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqa =
             new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
-        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqa<TG>() where TG : struct, IGqaGroup =>
-            _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaImpl<T, TG>);
+        private readonly Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqaIlp =
+            new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
+        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqa<TG>(bool ilp) where TG : struct, IGqaGroup =>
+            ilp ? _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaIlpImpl<T, TG>)
+                : _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaImpl<T, TG>);
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int, int, float>? _scores;
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int>? _pv;
         private Action<Index1D, ArrayView1D<T, Stride1D.Dense>, long, long>? _fork;
@@ -281,10 +296,10 @@ public sealed class GgufBatchDecoder : IDisposable
         public override void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale) =>
             (_att ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, scale);
-        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale) =>
-            (_attGqa[H / kvH] ??= (H / kvH) switch
+        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp) =>
+            ((ilp ? _attGqaIlp : _attGqa)[H / kvH] ??= (H / kvH) switch
             {
-                2 => LoadGqa<Gqa2>(), 3 => LoadGqa<Gqa3>(), 4 => LoadGqa<Gqa4>(), 5 => LoadGqa<Gqa5>(), 6 => LoadGqa<Gqa6>(), 7 => LoadGqa<Gqa7>(), 8 => LoadGqa<Gqa8>(),
+                2 => LoadGqa<Gqa2>(ilp), 3 => LoadGqa<Gqa3>(ilp), 4 => LoadGqa<Gqa4>(ilp), 5 => LoadGqa<Gqa5>(ilp), 6 => LoadGqa<Gqa6>(ilp), 7 => LoadGqa<Gqa7>(ilp), 8 => LoadGqa<Gqa8>(ilp),
                 _ => throw new ArgumentOutOfRangeException(nameof(H), $"grouped-query attention takes 2..{GqaMaxG} query heads a kv head, not {H / kvH}"),
             })(cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, ck, scale);
         public override void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale) =>
@@ -638,6 +653,87 @@ public sealed class GgufBatchDecoder : IDisposable
         return ok ? res : warm;
     }
 
+    /// <summary>
+    /// CUDA: record a decode step's kernels once per (live sequences, temperature) into a CUDA graph and replay it each step after with one
+    /// <c>cuGraphLaunch</c>, instead of launching every kernel from the host (a 28-layer model is ~300 launches a token). The kernels read the position
+    /// from a device buffer and the attention keeps one shape for the whole generation (as for <see cref="CaptureWebGPU"/>), so the graph has nothing to
+    /// patch: a step is the position write and the launch. On by default on CUDA where the driver has the graph API (env GGUF_BATCH_CUDA_GRAPH=0: off).
+    /// Bit-identical: the same kernels with the same arguments in the same order.
+    /// </summary>
+    public bool CaptureCuda { get; set; }
+    private bool CaptureCudaActive => CaptureCuda && FusedAttention && !ProfileKernels && _acc is global::ILGPU.Runtime.Cuda.CudaAccelerator;
+    private bool _cudaCapturing;                                              // EncodeForward is recording: no host writes (illegal mid-capture)
+    private global::ILGPU.Runtime.Cuda.CudaStream? _capStream;
+    private sealed class CudaStepPlan
+    {
+        public global::ILGPU.Runtime.Cuda.CudaGraphExec? Exec;
+        public int Gen;
+        public FV Logits, Cand;
+        public int OutRows;
+        public string? Refusal;
+    }
+    private readonly Dictionary<(int R, float T, bool Dev, bool Pen), CudaStepPlan> _cudaPlans = new();
+    /// <summary>Why the last CUDA step capture was refused (null: none was).</summary>
+    public string? LastCudaCaptureRefusal { get; private set; }
+
+    private (FV Logits, FV Cand, int OutRows) CudaCapturedStep(IV idBuf, int R, float temperature, int p, bool dev)
+    {
+        _fixedChunks = true;
+        var key = (R, temperature, dev, dev && _penOn);
+        var defStream = (global::ILGPU.Runtime.Cuda.CudaStream)_acc.DefaultStream;   // the legacy stream: in order with the position write and the reads
+        if (_cudaPlans.TryGetValue(key, out var cp) && cp.Exec != null && cp.Gen == _bufGen)
+        {
+            _posBuf!.View.SubView(0, 1).CopyFromCPU(new[] { p });
+            cp.Exec.Launch(defStream);
+            CaptureStats = (CaptureStats.Replays + 1, CaptureStats.Captures);
+            return (cp.Logits, cp.Cand, cp.OutRows);
+        }
+        // the real step (it also loads and allocates whatever the shape needs); its results stand. A stream capture RECORDS without running, so the capture
+        // below changes nothing on the device: no tokens to keep aside, no second pass.
+        var res = EncodeForward(idBuf, R, true, temperature, p, dev);
+        if (cp is { Refusal: not null } && cp.Gen == _bufGen) return res;
+        cp?.Exec?.Dispose();
+        // nothing may register with or be freed by the accelerator inside the capture window: settle first
+        _acc.Synchronize();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        int gen = _bufGen;
+        _capStream ??= (global::ILGPU.Runtime.Cuda.CudaStream)_acc.CreateStream();
+        global::ILGPU.Runtime.Cuda.CudaGraph? graph = null;
+        string? why = null;
+        (FV Logits, FV Cand, int OutRows) rec = default;
+        _cudaCapturing = true;
+        try
+        {
+            using (_acc.WithDefaultStream(_capStream))
+            {
+                _capStream.BeginCapture(global::ILGPU.Runtime.Cuda.CudaStreamCaptureMode.ThreadLocal);
+                try { rec = EncodeForward(idBuf, R, true, temperature, p, dev); }
+                catch (Exception ex) { why = ex.GetType().Name + ": " + ex.Message; }
+                try { graph = _capStream.EndCapture(); }
+                catch (Exception ex) { why ??= "EndCapture: " + ex.Message; graph = null; }
+            }
+        }
+        finally { _cudaCapturing = false; }
+        if (why == null && _bufGen != gen) why = "a buffer grew during the capture pass";
+        cp = new CudaStepPlan { Gen = gen, Logits = rec.Logits, Cand = rec.Cand, OutRows = rec.OutRows };
+        if (why == null && graph != null)
+        {
+            try
+            {
+                using (graph) { cp.Exec = graph.Instantiate(); cp.Exec.Upload(defStream); }
+                CaptureStats = (CaptureStats.Replays, CaptureStats.Captures + 1);
+            }
+            catch (Exception ex) { why = "Instantiate: " + ex.Message; cp.Exec = null; }
+        }
+        else graph?.Dispose();
+        cp.Refusal = why;
+        LastCudaCaptureRefusal = why;
+        if (why != null) Console.WriteLine($"[GgufBatchDecoder] CUDA step capture refused, launching kernels one by one: {why}");
+        _cudaPlans[key] = cp;
+        return res;
+    }
+
     // every kernel of one forward (no sync): the embedding gather through the candidate kernels. Decode steps on WebGPU are captured from here and replayed.
     private (FV Logits, FV Cand, int OutRows) EncodeForward(IV idBuf, int R, bool decode, float temperature, int p, bool dev = false)
     {
@@ -648,7 +744,7 @@ public sealed class GgufBatchDecoder : IDisposable
         // pipelined step's kernels read it before the next step's write lands.
         _posBuf ??= Own(_acc.Allocate1D<int>(64));
         var posView = _posBuf.View.SubView(0, 1);
-        posView.CopyFromCPU(new[] { p });
+        if (!_cudaCapturing) posView.CopyFromCPU(new[] { p });              // a CUDA capture records the kernels; the replay writes the position
         // device draws: row r's input is the token its sequence drew last
         if (dev) _gather!(R, _seqIds!.View, seqView, idBuf);
         var hid = Buf(ref _hid, (long)R * C);
@@ -730,12 +826,12 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 // split-K attention: a group per (row, head, chunk of keys) computes the chunk's scores, max, exp-sum and P.V; a second kernel merges the chunks
                 // a captured step keeps one shape for the whole generation: every chunk the cache can hold (the ones past the position mask to nothing)
-                bool gqa = GqaAttention && Heads > KvHeads && Heads / KvHeads <= GqaMaxG && HeadDim <= GqaMaxD;
+                bool gqa = GqaAttention && Heads > KvHeads && Heads / KvHeads <= GqaMaxG && HeadDim <= GqaMaxD && HeadDim % 8 == 0;
                 int ck = gqa ? GqaChunkKeys(Heads / KvHeads) : AttChunk;
                 int ach = _fixedChunks ? (MaxSeq + ck - 1) / ck : (nk + ck - 1) / ck;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
                 if (gqa)
-                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim));
+                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim), AttentionIlp);
                 else
                     _kv.AttPartial(l, new KernelConfig(R * Heads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim));
                 Prof("attn");
@@ -827,6 +923,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (_rep != null && _repCap >= window) return;
         _repCap = Math.Max(window, _repCap);
         _rep = Own(_acc.Allocate1D<int>((long)MaxBatch * (_repCap + 1)));       // the old one stays owned: a queued dispatch may read it
+        _bufGen++;                                                              // captured steps (WebGPU plans, CUDA graphs) bound the old one: capture again
         _rep.MemSetToZero();
         _bufGen++;
     }
@@ -859,6 +956,7 @@ public sealed class GgufBatchDecoder : IDisposable
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         FV logits, cand; int outRows;
         if (decode && CaptureActive) (logits, cand, outRows) = await CapturedStepAsync(idBuf, R, temperature, p, dev).ConfigureAwait(false);
+        else if (decode && CaptureCudaActive) (logits, cand, outRows) = CudaCapturedStep(idBuf, R, temperature, p, dev);
         else (logits, cand, outRows) = EncodeForward(idBuf, R, decode, temperature, p, dev);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         _lastP = p;
@@ -2189,6 +2287,150 @@ public sealed class GgufBatchDecoder : IDisposable
         if (G > 6) part[(pb + 6L * nch) * D + t] = o6;
         if (G > 7) part[(pb + 7L * nch) * D + t] = o7;
     }
+
+    // AttnPartialGqaImpl with (1) a chunk wholly past the position leaving at once (Group.BarrierOr: uniform in WGSL) and (2) the K / V loads issued ahead of
+    // their FMAs (eight K, four V; the same sums in the same order: bit-identical). MEASURED 2026-11-05 on CUDA (RTX 4070): see AttentionIlp.
+    private static void AttnPartialGqaIlpImpl<T, TG>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
+        where T : unmanaged, System.Numerics.INumber<T> where TG : struct, IGqaGroup
+    {
+        int p = posBuf[0];
+        int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
+        int G = default(TG).G;                                      // a compile-time constant: the per-head guards below fold away (H / kvH == G)
+        int ch = g % nch, rest = g / nch, hk = rest % kvH, r = rest / kvH;
+        int seq = mode == 0 ? 0 : seqs[r], pos = mode == 0 ? p + r : p;
+        int kvC = kvH * D, j0 = ch * ck;                             // ck keys a chunk (at most AttChunk: sc holds G x AttChunk scores)
+        var qs = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxD);
+        var sc = SharedMemory.Allocate<float>(GqaMaxG * AttChunk);
+        var mxs = SharedMemory.Allocate<float>(GqaMaxG);              // each head's chunk max (the reductions run in qs, free after the scores)
+        // this sequence's rows of the caches: the offsets below stay 32-bit (a sequence's maxSeq x kvC is far below 2^31), so the inner loops carry no 64-bit
+        // arithmetic (emulated on WebGPU: an i64 add per K element and an i64 multiply per V row before 2026-11-02)
+        // a chunk wholly past the position (a captured step launches every chunk the cache holds): the empty partial it would compute (max -1e30, sum 0: the
+        // merge skips it) and nothing else. Bit-identical to running it. The decision is the group's (j0, pos are), taken through Group.BarrierOr so WGSL sees
+        // a uniform branch around the barriers below.
+        if (Group.BarrierOr(j0 > pos))
+        {
+            if (t < G) { long gq = ((long)r * H + hk * G + t) * nch + ch; ml[2 * gq] = -1e30f; ml[2 * gq + 1] = 0f; }
+            return;
+        }
+        var kq = kc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
+        var vq = vc.SubView((long)seq * maxSeq * kvC, (long)maxSeq * kvC);
+        for (int gi = 0; gi < G; gi++) qs[gi * D + t] = q[((long)r * H + hk * G + gi) * D + t];
+        Group.Barrier();
+        // scores: each key's row once, against the G heads
+        for (int jj = t; jj < ck; jj += D)
+        {
+            int j = j0 + jj;
+            float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f, s4 = 0f, s5 = 0f, s6 = 0f, s7 = 0f;
+            bool live = j <= pos;
+            if (live)
+            {
+                int ko = j * kvC + hk * D;
+                // eight loads in flight before their FMAs (D is a multiple of 8: the route requires it); the sums take the same terms in the same order
+                for (int d = 0; d < D; d += 8)
+                {
+                    float k0 = PrecisionConvert.ConvertToSingle(kq[ko + d + 0]); float k1 = PrecisionConvert.ConvertToSingle(kq[ko + d + 1]); float k2 = PrecisionConvert.ConvertToSingle(kq[ko + d + 2]); float k3 = PrecisionConvert.ConvertToSingle(kq[ko + d + 3]);
+                    float k4 = PrecisionConvert.ConvertToSingle(kq[ko + d + 4]); float k5 = PrecisionConvert.ConvertToSingle(kq[ko + d + 5]); float k6 = PrecisionConvert.ConvertToSingle(kq[ko + d + 6]); float k7 = PrecisionConvert.ConvertToSingle(kq[ko + d + 7]);
+                    s0 += qs[d + 0] * k0; s0 += qs[d + 1] * k1; s0 += qs[d + 2] * k2; s0 += qs[d + 3] * k3; s0 += qs[d + 4] * k4; s0 += qs[d + 5] * k5; s0 += qs[d + 6] * k6; s0 += qs[d + 7] * k7;
+                    if (G > 1) { s1 += qs[D + d + 0] * k0; s1 += qs[D + d + 1] * k1; s1 += qs[D + d + 2] * k2; s1 += qs[D + d + 3] * k3; s1 += qs[D + d + 4] * k4; s1 += qs[D + d + 5] * k5; s1 += qs[D + d + 6] * k6; s1 += qs[D + d + 7] * k7; }
+                    if (G > 2) { s2 += qs[2 * D + d + 0] * k0; s2 += qs[2 * D + d + 1] * k1; s2 += qs[2 * D + d + 2] * k2; s2 += qs[2 * D + d + 3] * k3; s2 += qs[2 * D + d + 4] * k4; s2 += qs[2 * D + d + 5] * k5; s2 += qs[2 * D + d + 6] * k6; s2 += qs[2 * D + d + 7] * k7; }
+                    if (G > 3) { s3 += qs[3 * D + d + 0] * k0; s3 += qs[3 * D + d + 1] * k1; s3 += qs[3 * D + d + 2] * k2; s3 += qs[3 * D + d + 3] * k3; s3 += qs[3 * D + d + 4] * k4; s3 += qs[3 * D + d + 5] * k5; s3 += qs[3 * D + d + 6] * k6; s3 += qs[3 * D + d + 7] * k7; }
+                    if (G > 4) { s4 += qs[4 * D + d + 0] * k0; s4 += qs[4 * D + d + 1] * k1; s4 += qs[4 * D + d + 2] * k2; s4 += qs[4 * D + d + 3] * k3; s4 += qs[4 * D + d + 4] * k4; s4 += qs[4 * D + d + 5] * k5; s4 += qs[4 * D + d + 6] * k6; s4 += qs[4 * D + d + 7] * k7; }
+                    if (G > 5) { s5 += qs[5 * D + d + 0] * k0; s5 += qs[5 * D + d + 1] * k1; s5 += qs[5 * D + d + 2] * k2; s5 += qs[5 * D + d + 3] * k3; s5 += qs[5 * D + d + 4] * k4; s5 += qs[5 * D + d + 5] * k5; s5 += qs[5 * D + d + 6] * k6; s5 += qs[5 * D + d + 7] * k7; }
+                    if (G > 6) { s6 += qs[6 * D + d + 0] * k0; s6 += qs[6 * D + d + 1] * k1; s6 += qs[6 * D + d + 2] * k2; s6 += qs[6 * D + d + 3] * k3; s6 += qs[6 * D + d + 4] * k4; s6 += qs[6 * D + d + 5] * k5; s6 += qs[6 * D + d + 6] * k6; s6 += qs[6 * D + d + 7] * k7; }
+                    if (G > 7) { s7 += qs[7 * D + d + 0] * k0; s7 += qs[7 * D + d + 1] * k1; s7 += qs[7 * D + d + 2] * k2; s7 += qs[7 * D + d + 3] * k3; s7 += qs[7 * D + d + 4] * k4; s7 += qs[7 * D + d + 5] * k5; s7 += qs[7 * D + d + 6] * k6; s7 += qs[7 * D + d + 7] * k7; }
+                }
+            }
+            sc[jj] = live ? s0 * scale : -1e30f;
+            if (G > 1) sc[AttChunk + jj] = live ? s1 * scale : -1e30f;
+            if (G > 2) sc[2 * AttChunk + jj] = live ? s2 * scale : -1e30f;
+            if (G > 3) sc[3 * AttChunk + jj] = live ? s3 * scale : -1e30f;
+            if (G > 4) sc[4 * AttChunk + jj] = live ? s4 * scale : -1e30f;
+            if (G > 5) sc[5 * AttChunk + jj] = live ? s5 * scale : -1e30f;
+            if (G > 6) sc[6 * AttChunk + jj] = live ? s6 * scale : -1e30f;
+            if (G > 7) sc[7 * AttChunk + jj] = live ? s7 * scale : -1e30f;
+        }
+        Group.Barrier();
+        int keys = Math.Min(ck, pos + 1 - j0);
+        int vo = hk * D + t;
+        // every head's chunk max, then exp-sum, in ONE tree reduction each (the probabilities replace the scores in place); the G heads reduce side by side, so
+        // the barriers do not grow with G. MEASURED 2026-11-02 before it (WebGPU, qwen3-0.6b, G = 2, short prompt, captured steps): a reduction pair per head
+        // made this kernel 14% slower per token than the per-head kernel (216 against 251 tok/s): half the groups, each with G times the barrier chain.
+        for (int gi = 0; gi < G; gi++)
+        {
+            float m = -1e30f;
+            for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
+            qs[gi * D + t] = m;
+        }
+        Group.Barrier();
+        for (int w = D / 2; w > 0; w >>= 1)
+        {
+            if (t < w)
+                for (int gi = 0; gi < G; gi++) qs[gi * D + t] = MathF.Max(qs[gi * D + t], qs[gi * D + t + w]);
+            Group.Barrier();
+        }
+        if (t < G) mxs[t] = qs[t * D];
+        Group.Barrier();
+        for (int gi = 0; gi < G; gi++)
+        {
+            float m = mxs[gi], l = 0f;
+            for (int jj = t; jj < ck; jj += D)
+            {
+                int si = gi * AttChunk + jj;
+                float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
+                sc[si] = e; l += e;
+            }
+            qs[gi * D + t] = l;
+        }
+        Group.Barrier();
+        for (int w = D / 2; w > 0; w >>= 1)
+        {
+            if (t < w)
+                for (int gi = 0; gi < G; gi++) qs[gi * D + t] += qs[gi * D + t + w];
+            Group.Barrier();
+        }
+        if (t < G)
+        {
+            long gq = ((long)r * H + hk * G + t) * nch + ch;
+            ml[2 * gq] = mxs[t]; ml[2 * gq + 1] = qs[t * D];
+        }
+        float o0 = 0f, o1 = 0f, o2 = 0f, o3 = 0f, o4 = 0f, o5 = 0f, o6 = 0f, o7 = 0f;
+        // four V rows in flight before their FMAs, the sums in the same key order; then the remainder one key at a time
+        int kj = 0;
+        for (; kj + 4 <= keys; kj += 4)
+        {
+            int vb = vo + (j0 + kj) * kvC;
+            float v0 = PrecisionConvert.ConvertToSingle(vq[vb]), v1 = PrecisionConvert.ConvertToSingle(vq[vb + kvC]), v2 = PrecisionConvert.ConvertToSingle(vq[vb + 2 * kvC]), v3 = PrecisionConvert.ConvertToSingle(vq[vb + 3 * kvC]);
+            o0 += sc[kj + 0] * v0; o0 += sc[kj + 1] * v1; o0 += sc[kj + 2] * v2; o0 += sc[kj + 3] * v3;
+            if (G > 1) { o1 += sc[AttChunk + kj + 0] * v0; o1 += sc[AttChunk + kj + 1] * v1; o1 += sc[AttChunk + kj + 2] * v2; o1 += sc[AttChunk + kj + 3] * v3; }
+            if (G > 2) { o2 += sc[2 * AttChunk + kj + 0] * v0; o2 += sc[2 * AttChunk + kj + 1] * v1; o2 += sc[2 * AttChunk + kj + 2] * v2; o2 += sc[2 * AttChunk + kj + 3] * v3; }
+            if (G > 3) { o3 += sc[3 * AttChunk + kj + 0] * v0; o3 += sc[3 * AttChunk + kj + 1] * v1; o3 += sc[3 * AttChunk + kj + 2] * v2; o3 += sc[3 * AttChunk + kj + 3] * v3; }
+            if (G > 4) { o4 += sc[4 * AttChunk + kj + 0] * v0; o4 += sc[4 * AttChunk + kj + 1] * v1; o4 += sc[4 * AttChunk + kj + 2] * v2; o4 += sc[4 * AttChunk + kj + 3] * v3; }
+            if (G > 5) { o5 += sc[5 * AttChunk + kj + 0] * v0; o5 += sc[5 * AttChunk + kj + 1] * v1; o5 += sc[5 * AttChunk + kj + 2] * v2; o5 += sc[5 * AttChunk + kj + 3] * v3; }
+            if (G > 6) { o6 += sc[6 * AttChunk + kj + 0] * v0; o6 += sc[6 * AttChunk + kj + 1] * v1; o6 += sc[6 * AttChunk + kj + 2] * v2; o6 += sc[6 * AttChunk + kj + 3] * v3; }
+            if (G > 7) { o7 += sc[7 * AttChunk + kj + 0] * v0; o7 += sc[7 * AttChunk + kj + 1] * v1; o7 += sc[7 * AttChunk + kj + 2] * v2; o7 += sc[7 * AttChunk + kj + 3] * v3; }
+        }
+        for (; kj < keys; kj++)
+        {
+            float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + kj) * kvC]);
+            o0 += sc[kj] * v;
+            if (G > 1) o1 += sc[AttChunk + kj] * v;
+            if (G > 2) o2 += sc[2 * AttChunk + kj] * v;
+            if (G > 3) o3 += sc[3 * AttChunk + kj] * v;
+            if (G > 4) o4 += sc[4 * AttChunk + kj] * v;
+            if (G > 5) o5 += sc[5 * AttChunk + kj] * v;
+            if (G > 6) o6 += sc[6 * AttChunk + kj] * v;
+            if (G > 7) o7 += sc[7 * AttChunk + kj] * v;
+        }
+        long pb = ((long)r * H + hk * G) * nch + ch;
+        part[pb * D + t] = o0;
+        if (G > 1) part[(pb + nch) * D + t] = o1;
+        if (G > 2) part[(pb + 2L * nch) * D + t] = o2;
+        if (G > 3) part[(pb + 3L * nch) * D + t] = o3;
+        if (G > 4) part[(pb + 4L * nch) * D + t] = o4;
+        if (G > 5) part[(pb + 5L * nch) * D + t] = o5;
+        if (G > 6) part[(pb + 6L * nch) * D + t] = o6;
+        if (G > 7) part[(pb + 7L * nch) * D + t] = o7;
+    }
     private const int GqaMaxG = 8, GqaMaxD = 128;
     /// <summary>The query heads per kv head of <see cref="AttnPartialGqaImpl"/>, as a type: the kernel is compiled per G, so its G-way guards are constants.</summary>
     internal interface IGqaGroup { int G { get; } }
@@ -2315,6 +2557,10 @@ public sealed class GgufBatchDecoder : IDisposable
         _owned.Clear();
         foreach (var sp in _plans.Values) sp.Plan?.Dispose();
         _plans.Clear();
+        foreach (var cp in _cudaPlans.Values) cp.Exec?.Dispose();
+        _cudaPlans.Clear();
+        _capStream?.Dispose();
+        _capStream = null;
         _mm.Dispose();
         _norm.Dispose();
         _stream.Dispose();

@@ -40,6 +40,11 @@ public static class YoloPostProcessor
         int padY = -1)
     {
         int channels = 4 + numClasses; // 84 for COCO
+        // numDetections follows the input size (8400 at 640: 80^2 + 40^2 + 20^2; 2100 at 320). A wrong count read past the array (8400 at 320, reported
+        // by Riker from AssistZ 2026-11-06) or silently mixed channels: say so instead.
+        if (numDetections < 0 || (long)channels * numDetections > output.Length)
+            throw new ArgumentException($"YOLO output holds {output.Length} values, fewer than {channels} channels x {numDetections} detections: pass numDetections = " +
+                $"output length / {channels} (the head's third dimension; 8400 at 640 input, 2100 at 320).", nameof(numDetections));
 
         // Transpose from [1, 84, 8400] to per-detection access
         // output[c * numDetections + d] gives channel c of detection d

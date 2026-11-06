@@ -438,4 +438,85 @@ public abstract partial class MLTestBase
         }
         if (compared < 3) throw new Exception($"only {compared} faces compared: the portrait cases did not exercise the decode");
     });
+
+    /// <summary>
+    /// YOLOv8's head holds one column per anchor, and the anchor count follows the input size (8400 at 640, 2100 at 320). Riker (AssistZ, 2026-11-06):
+    /// ObjectDetectionPipeline passed no count, so the post-processor read 8400 columns of a 320 output and threw IndexOutOfRangeException. Here: a
+    /// [84, 2100] output with one box in the last column decodes at 2,100 (box and class right), and the default count on it is a clear ArgumentException.
+    /// </summary>
+    [TestMethod]
+    public async Task YoloPostProcessor_DetectionCountFollowsInputSize() => await RunTest(async accelerator =>
+    {
+        await Task.CompletedTask;
+        if (accelerator.AcceleratorType != AcceleratorType.CPU) throw new UnsupportedTestException("host-only post-processing: one lane is enough");
+        const int N = 2100, C = 80, S = 320;
+        var output = new float[(4 + C) * N];
+        int d = N - 1;                                                   // the last column: past it is where the 8400 count read
+        output[0 * N + d] = 160; output[1 * N + d] = 120; output[2 * N + d] = 40; output[3 * N + d] = 60;   // cx, cy, w, h in input pixels
+        output[(4 + 7) * N + d] = 0.9f;                                  // class 7
+        var got = SpawnDev.ILGPU.ML.Preprocessing.YoloPostProcessor.Process(output, numClasses: C, numDetections: N, confThreshold: 0.5f,
+            inputWidth: S, inputHeight: S, originalWidth: S, originalHeight: S, contentW: S, contentH: S, padX: 0, padY: 0);
+        if (got.Count != 1 || got[0].ClassId != 7) throw new Exception($"expected one class-7 box, got {got.Count} ({string.Join(", ", got.Select(g => g.ClassId))})");
+        if (Math.Abs(got[0].X1 - 140) > 1e-3 || Math.Abs(got[0].X2 - 180) > 1e-3) throw new Exception($"box x {got[0].X1}..{got[0].X2}, expected 140..180");
+        try
+        {
+            SpawnDev.ILGPU.ML.Preprocessing.YoloPostProcessor.Process(output, numClasses: C, confThreshold: 0.5f, inputWidth: S, inputHeight: S);
+            throw new Exception("the default count (8400) on a 2,100-column output did not throw");
+        }
+        catch (ArgumentException) { }
+    });
+
+    /// <summary>
+    /// <see cref="ObjectDetectionPipeline.EnableGraphCapture"/> on the street sample: the recorded forward (WebGPU dispatch plan, CUDA graph) must give the
+    /// direct forward's detections (labels, scores to 1e-4, boxes to 0.05 px) on three frames, and must be the path that ran (<c>CaptureStatus</c>). Prints both
+    /// paths' median times. Added 2026-11-06 for Riker (AssistZ: YOLOv8n per-frame cost on the RX 590).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Pipeline_YOLOv8_GraphCapture_MatchesDirect() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("graph capture exists on CUDA and WebGPU");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        byte[] onnxBytes;
+        try { onnxBytes = await http.GetByteArrayAsync("models/yolov8n/model.onnx"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"YOLOv8 model missing: {ex.Message}"); }
+        byte[] bin;
+        try { bin = await http.GetByteArrayAsync("samples/street_rgba.bin"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"street_rgba.bin missing: {ex.Message}"); }
+        int width = BitConverter.ToInt32(bin, 0), height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+
+        async Task<(SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] Objs, double MedianMs, string Status)> Run(bool capture)
+        {
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+            using var pipeline = new ObjectDetectionPipeline(session, accelerator) { EnableGraphCapture = capture };
+            SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[]? first = null;
+            var times = new List<double>();
+            for (int i = 0; i < 6; i++)
+            {
+                var r = await pipeline.DetectAsync(pixels, width, height, confidenceThreshold: 0.25f);
+                if (i >= 3) times.Add(r.InferenceTimeMs);       // the first passes warm (and, captured, record)
+                if (i == 0) first = r.Objects;
+                else if (capture && i >= 3) Same(first!, r.Objects, $"captured frame {i} vs frame 0");
+            }
+            return (first!, times.OrderBy(x => x).ElementAt(times.Count / 2), pipeline.CaptureStatus);
+        }
+        static void Same(SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] a, SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] b, string what)
+        {
+            if (a.Length != b.Length) throw new Exception($"{what}: {a.Length} vs {b.Length} detections");
+            for (int i = 0; i < a.Length; i++)
+                if (a[i].Label != b[i].Label || Math.Abs(a[i].Confidence - b[i].Confidence) > 1e-4f || Math.Abs(a[i].X - b[i].X) > 0.05f || Math.Abs(a[i].Y - b[i].Y) > 0.05f
+                    || Math.Abs(a[i].Width - b[i].Width) > 0.05f || Math.Abs(a[i].Height - b[i].Height) > 0.05f)
+                    throw new Exception($"{what}: detection {i} {a[i].Label} {a[i].Confidence:F4} ({a[i].X:F2},{a[i].Y:F2},{a[i].Width:F2}x{a[i].Height:F2}) vs {b[i].Label} {b[i].Confidence:F4} ({b[i].X:F2},{b[i].Y:F2},{b[i].Width:F2}x{b[i].Height:F2})");
+        }
+        var direct = await Run(false);
+        var captured = await Run(true);
+        Same(direct.Objs, captured.Objs, "captured vs direct");
+        if (!captured.Status.StartsWith("live", StringComparison.Ordinal))
+            throw new Exception($"capture did not take: {captured.Status}");
+        var report = $"{accelerator.AcceleratorType}: {direct.Objs.Length} detections, same on both paths; median direct {direct.MedianMs:F1} ms, captured {captured.MedianMs:F1} ms ({captured.Status})";
+        Console.WriteLine("[YOLOv8 capture] " + report);
+        return report;
+    });
 }

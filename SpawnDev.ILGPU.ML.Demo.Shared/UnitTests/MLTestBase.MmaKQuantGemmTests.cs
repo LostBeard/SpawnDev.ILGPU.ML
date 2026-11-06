@@ -256,4 +256,72 @@ public abstract partial class MLTestBase
         }
         return string.Join("; ", notes);
     });
+
+    /// <summary>
+    /// A prefill's Q8_0 rows on the tensor cores (CUDA sm_75+: rows dequantized to f16, then the 16-bit GEMM) against the CPU dequant oracle, on the sm_80
+    /// kernels and the forced Turing ones; the route must be the Q8_0 scratch GEMM. Each output within 2e-3 of the sum of |x w| (f16 rounding of x and of
+    /// d x q). Added 2026-11-05 with the route (qwen3:1.7b Q8_0 prefill: 1,265 tok/s on the SIMT GEMM, Ollama 16,141).
+    /// </summary>
+    [TestMethod]
+    public async Task Gemm_MmaQ8_0_MatchesOracle_AndIsTaken() => await RunTest(async accelerator =>
+    {
+        if (!CudaCaps.TuringTensorCores(accelerator)) throw new UnsupportedTestException("the tensor-core GEMMs run on CUDA sm_75+");
+        var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
+        bool forceSaved = FusedDequantMatMul.ForceSm75Mma;
+        int scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        FusedDequantMatMul.MmaScratchMinRows = 1;
+        using var fused = new FusedDequantMatMul(accelerator);
+        var notes = new List<string>();
+        var type = GGMLType.Q8_0;
+        try
+        {
+            foreach (bool force in forces)
+            foreach (var (M, K, N) in new[] { (200, 2048, 300), (16, 1024, 130), (1000, 6144, 257) })
+            {
+                FusedDequantMatMul.ForceSm75Mma = force;
+                var rng = new Random(29 + M + K + N);
+                int bytesPerRow = RowBytes(type, K);
+                var weightBytes = new byte[N * bytesPerRow];
+                var wRows = new float[N][];
+                for (int n = 0; n < N; n++)
+                {
+                    var rowBytes = MakeBlocks(type, K, rng);
+                    Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                    wRows[n] = ReferenceDequant(type, rowBytes, K);
+                }
+                var input = new float[M * K];
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                var want = new float[M * N]; var bound = new float[M * N];
+                Parallel.For(0, M, m =>
+                {
+                    for (int n = 0; n < N; n++)
+                    {
+                        double sum = 0, a = 0;
+                        for (int k = 0; k < K; k++) { double p = input[m * K + k] * wRows[n][k]; sum += p; a += Math.Abs(p); }
+                        want[m * N + n] = (float)sum; bound[m * N + n] = (float)(2e-3 * a + 1e-5);
+                    }
+                });
+                using var weightBuf = AllocatePadded(accelerator, weightBytes);
+                using var inputBuf = accelerator.Allocate1D(input);
+                using var outBuf = accelerator.Allocate1D<float>((long)M * N);
+                fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+                string route = fused.LastGemmKernel;
+                await accelerator.SynchronizeAsync();
+                var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
+                string wantRoute = "mma-q8_0" + (force ? "-sm75" : "") + "-scratch";
+                if (!route.StartsWith(wantRoute)) throw new Exception($"M={M} K={K} N={N}: ran on '{route}', not {wantRoute}*");
+                int bad = 0; float worst = 0;
+                for (int i = 0; i < got.Length; i++)
+                {
+                    float e = Math.Abs(got[i] - want[i]);
+                    if (!(e <= bound[i])) bad++;
+                    worst = Math.Max(worst, e / bound[i]);
+                }
+                if (bad > 0) throw new Exception($"{route} M={M} K={K} N={N}: {bad} of {got.Length} outputs outside 2e-3 sum|xw| (worst {worst:F2} of the bound)");
+                notes.Add($"{route} M={M} K={K} N={N}: worst {worst:F3} of the bound");
+            }
+        }
+        finally { FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        return string.Join("; ", notes);
+    });
 }

@@ -14,6 +14,36 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   4,533, V7 everywhere 4,893 (identical losses).
 - `KernelTimings` (env `GGUF_KERNEL_TIMING=1`, desktop): synchronized per-piece times inside the GEMM ops (dequant, packs, scale, GEMM),
   printed by `TrainLoraProbe --profile`; for machines without a profiler.
+- **LLM decode and prefill vs Ollama (qwen3:1.7b, RTX 4070)**. New `tools/OllamaCompareBench`: Ollama 0.34.4 (llama.cpp) and our engine on the SAME
+  GGUF blob, prompt and settings (short and ~1,830-token prompts, greedy and top-p, 256 tokens, median of 3), Ollama unloaded before ours runs; and
+  `Bench_Qwen3_1_7B_VsOllama_Rate` for the browser lanes. Baseline, Q8_0 on CUDA: decode 80.3 tok/s against Ollama's 191.5 (long prompt 70.9 / 176.7),
+  prefill 1,265 against 16,141; WebGPU in Chrome 140.8 (long 127.3). Nsight: the Q8_0 GEMVs ran ~200 GB/s, the decode attention 2 ms a token (a
+  thread per key walking its K row serially), the LM head 1.6 ms. Changes, each A/B'd on CUDA (the others on):
+  - **`GemvQ8_0VecImpl`** (`FusedDequantMatMul.Q8Vec`, GGUF_Q8_VEC=0): one-row Q8_0 GEMV, a lane per block pair (17 aligned word loads), 64 inputs as
+    sixteen float4 loads shared by four outputs a warp. Decode 87.8 -> 148.1 tok/s. Off on WebGPU (`Q8VecWebGPU`): no gain measured there (Dawn's
+    compiler already makes the word-wise kernel fast; WebGPU run-to-run noise is about 5%). Gate `Gemv_Q8Vec_MatchesOracle_AndIsTaken`.
+  - **Decode attention** (`GgufBatchDecoder.AttentionIlp`, GGUF_ATTN_ILP; default CUDA / OpenCL): `AttnPartialGqaIlpImpl`, chunks wholly past the
+    position leave at once (through `Group.BarrierOr`, uniform in WGSL), K / V loads issued ahead of their FMAs. Same sums, same order:
+    bit-identical. Decode 133.9 -> 148.1 (long prompt 107.1 -> 128.1).
+  - **CUDA graphs for decode steps** (`GgufBatchDecoder.CaptureCuda`, GGUF_BATCH_CUDA_GRAPH=0): a step's kernels recorded once per (live sequences,
+    temperature) and replayed with one `cuGraphLaunch`; the capture records without running, so the real step's results stand. 142.6 -> 148.1.
+    `InvalidateCapturedSteps()` for callers that flip a static kernel switch; a grown penalty window now invalidates captured steps too (it did not).
+  - **Q8_0 prefill on the tensor cores** (`FusedDequantMatMul.EnableMmaQ8`, GGUF_GEMM_MMA_Q8=0; CUDA sm_75+): rows dequantized to f16, then the
+    K-quants' scratch GEMMs. 1,830-token prefill 1,265 -> 7,478 tok/s. Gate `Gemm_MmaQ8_0_MatchesOracle_AndIsTaken`.
+  After (CUDA, Q8_0): decode 148.1 (Ollama 191.5), long-prompt decode 128.1 (176.7), prefill 7,478 (16,141). Gates: the batch decoder's model tests
+  (greedy vs generator, GQA vs per-head, F16 cache, prefix reuse, top-k, device draws, route change) on CUDA, OpenCL and WebGPU, 84 passed.
+- **Fix: `ObjectDetectionPipeline` at input sizes other than 640** (reported by Riker from AssistZ): it passed no detection count to
+  `YoloPostProcessor.Process`, whose default is 8400 (the anchors at 640), so a 320 input threw IndexOutOfRangeException. The count now comes from the
+  head's shape ([1, 4 + classes, N]: 2100 at 320), and `Process` rejects a count its output cannot hold with an ArgumentException naming the right one.
+  Gate `YoloPostProcessor_DetectionCountFollowsInputSize`. (The hub's yolov8n export bakes 640 into five head constants: a separate model limit.)
+- **`ObjectDetectionPipeline.EnableGraphCapture`** (opt-in; asked for by Riker, AssistZ): the detector's forward recorded once per input size and replayed
+  per frame (`Graph.SessionGraphCapture`: a WebGPU dispatch plan, a CUDA graph), with `CaptureStatus`. MEASURED (RTX 4070, YOLOv8n, street sample,
+  median of 3 frames after warm-up): WebGPU in Chrome 53.3 -> 23.6 ms (250 dispatches replayed), CUDA 25.2 -> 9.2 ms; the same 14 detections.
+  Opt-in because a GPU-bound card gains nothing and the recording pins memory (CLAP on Riker's RX 590). Gate `Pipeline_YOLOv8_GraphCapture_MatchesDirect`.
+- Two structural gates (`GgufBatchDecoder_ChunkedPrefill_MatchesOneForward`, `GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath`) pin the f32 GEMM: they
+  compare chunkings and attention kernels, and the Q8_0 tensor-core prefill's f16 operands move their logits 0.007-0.03 apart.
+- **Demo: /train verified live** (GitHub Pages, Chrome, WebGPU): 6 drawings per class through the page, trained in 1.2 s, 30 of 30 new drawings right.
+  Its panels now wrap instead of squeezing the results column when the content area is narrow.
 - `TrainableModel.UseAdam(beta1, beta2)`: Adam (bias-corrected, the existing `TrainingKernels.AdamUpdate`) instead of plain SGD; the
   learning rate passed to the train step becomes Adam's step size. Call before `Build`. SGD stays the default.
 - **Demo: Draw to Learn (/train) now learns.** MEASURED by the new gate `Training_DrawToLearn_ClassifiesNewDrawings` (the page's own code

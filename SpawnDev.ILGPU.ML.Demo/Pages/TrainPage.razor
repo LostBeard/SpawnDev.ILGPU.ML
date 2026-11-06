@@ -136,7 +136,11 @@
     .step-badge.done { background: rgba(52,211,153,0.1); color: #34d399; border-color: rgba(52,211,153,0.25); }
     .step-arrow { color: #475569; }
 
-    .train-layout { display: grid; grid-template-columns: 200px 300px 1fr; gap: 1rem; }
+    /* wraps instead of squeezing: the results panel drops below the canvas when the content area is narrow (sidebar open, small window) */
+    .train-layout { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+    .classes-panel { flex: 0 0 200px; }
+    .canvas-panel { flex: 0 0 300px; max-width: 100%; }
+    .results-panel { flex: 1 1 240px; min-width: 240px; }
 
     .panel-title { color: #f1f5f9; font-size: 0.95rem; font-weight: 600; margin-bottom: 0.75rem; }
 
@@ -179,7 +183,7 @@
     .train-note { margin-top: 1.5rem; padding: 0.75rem 1rem; background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.15); border-radius: 8px; color: #7dd3fc; font-size: 0.85rem; line-height: 1.5; }
     .train-note a { color: #93c5fd; }
 
-    @@media (max-width: 768px) { .train-layout { grid-template-columns: 1fr; } }
+    @@media (max-width: 768px) { .classes-panel, .canvas-panel, .results-panel { flex: 1 1 100%; min-width: 0; } }
 </style>
 
 @code {

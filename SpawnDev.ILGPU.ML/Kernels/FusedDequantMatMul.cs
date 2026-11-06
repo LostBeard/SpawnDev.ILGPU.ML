@@ -288,6 +288,35 @@ public class FusedDequantMatMul : IDisposable
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _f16Sm75V7Split;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>, int, int, int>? _f16Sm75V7SwiGLU;
 
+    /// <summary>
+    /// M &gt; 1 of Q8_0 on the tensor cores (CUDA sm_75+): the rows dequantized once to f16 (<see cref="DequantQ8_0F16Impl"/>), then the same 16-bit GEMMs as
+    /// the K-quants' scratch form. MEASURED 2026-11-05 before it (RTX 4070, qwen3:1.7b Q8_0, an 1,830-token prefill): 1,265 tok/s on the SIMT tiled GEMM against
+    /// Ollama's 16,141. Weights rounded to f16 (d x q, round to nearest even), as the K-quants' path rounds d x sc x q. GGUF_GEMM_MMA_Q8=0: the SIMT GEMM.
+    /// </summary>
+    public static bool EnableMmaQ8 = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_Q8") != "0";
+    private Action<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>? _deqQ8;
+
+    // two int8 (the bytes of u, a ushort of a Q8_0 block) times d, rounded to f16 (nearest even), packed low / high
+    private static uint Q8PairF16(int u, float d)
+    {
+        float lo = d * ((u << 24) >> 24), hi = d * ((u << 16) >> 24);
+        CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, lo, hi);
+        return packed;
+    }
+
+    /// <summary>Q8_0 rows -> f16 words [N][K / 2]: a thread per block (34 bytes: fp16 d, 32 int8; read as 17 ushorts), four 16-byte stores. idx over N * K / 32.</summary>
+    private static void DequantQ8_0F16Impl(Index1D idx, ArrayView<ushort> Wq, ArrayView<W16> O, int N, int K)
+    {
+        int nb = K >> 5, n = idx / nb, b = idx - n * nb;
+        long bo = ((long)n * nb + b) * 17;
+        float d = HalfBits(Wq[bo]);
+        long o = ((long)n * (K >> 1) + ((long)b << 4)) >> 2;
+        O.AsAligned16()[o] = new W16 { a = (int)Q8PairF16(Wq[bo + 1], d), b = (int)Q8PairF16(Wq[bo + 2], d), c = (int)Q8PairF16(Wq[bo + 3], d), d = (int)Q8PairF16(Wq[bo + 4], d) };
+        O.AsAligned16()[o + 1] = new W16 { a = (int)Q8PairF16(Wq[bo + 5], d), b = (int)Q8PairF16(Wq[bo + 6], d), c = (int)Q8PairF16(Wq[bo + 7], d), d = (int)Q8PairF16(Wq[bo + 8], d) };
+        O.AsAligned16()[o + 2] = new W16 { a = (int)Q8PairF16(Wq[bo + 9], d), b = (int)Q8PairF16(Wq[bo + 10], d), c = (int)Q8PairF16(Wq[bo + 11], d), d = (int)Q8PairF16(Wq[bo + 12], d) };
+        O.AsAligned16()[o + 3] = new W16 { a = (int)Q8PairF16(Wq[bo + 13], d), b = (int)Q8PairF16(Wq[bo + 14], d), c = (int)Q8PairF16(Wq[bo + 15], d), d = (int)Q8PairF16(Wq[bo + 16], d) };
+    }
+
     private void DequantRows(ArrayView1D<byte, Stride1D.Dense> w, GGMLType type, ArrayView<W16> dst, int N, int K, int dstBlock, int dstOff, bool turing = false)
     {
         int count = N * (K >> 5) * 2;
@@ -631,11 +660,12 @@ public class FusedDequantMatMul : IDisposable
         // sm_75 (Turing) on the same kernels built from m16n8k8 (the Sm75 variants); ForceSm75Mma runs those on a newer card (the tests)
         bool sm80 = CudaCaps.TensorCores(_accelerator), sm75 = CudaCaps.TuringTensorCores(_accelerator);
         long inByte = ((IContiguousArrayView)input.BaseView).IndexInBytes, wByte = ((IContiguousArrayView)weightQuant.BaseView).IndexInBytes;
+        bool q8Scratch = type == GGMLType.Q8_0 && EnableMmaScratch && EnableMmaQ8 && M >= MmaScratchMinRows && (long)N * K * 2 <= MmaScratchMaxWeightBytes && (wByte & 1) == 0;
         if (M > 1 && EnableMmaGemm && K % 256 == 0 && (sm80 || sm75) && (inByte & 15) == 0
-            && ((type == GGMLType.Q4_K && (wByte & 15) == 0) || (type == GGMLType.Q6_K && (wByte & 1) == 0)))
+            && ((type == GGMLType.Q4_K && (wByte & 15) == 0) || (type == GGMLType.Q6_K && (wByte & 1) == 0) || q8Scratch))
         {
             bool turing = !sm80 || ForceSm75Mma;
-            if (EnableMmaScratch && M >= MmaScratchMinRows && (long)N * K * 2 <= MmaScratchMaxWeightBytes)
+            if (q8Scratch || (EnableMmaScratch && M >= MmaScratchMinRows && (long)N * K * 2 <= MmaScratchMaxWeightBytes))
             {
                 // dequantize once to f16, round A to f16, then the 16-bit GEMM (see EnableMmaScratch)
                 KernelTimings.Start(_accelerator);
@@ -647,7 +677,10 @@ public class FusedDequantMatMul : IDisposable
                 _packA16((int)aWords, input.SubView(0, (long)M * K), a16.View.BaseView);
                 KernelTimings.Mark(_accelerator, "fwd.packA");
                 int deqCount = N * (K >> 5) * 2;
-                if (type == GGMLType.Q4_K)
+                if (type == GGMLType.Q8_0)
+                    (_deqQ8 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<ushort>, ArrayView<W16>, int, int>(DequantQ8_0F16Impl))(
+                        N * (K >> 5), weightQuant.BaseView.Cast<ushort>(), w16.View.BaseView.Cast<W16>(), N, K);
+                else if (type == GGMLType.Q4_K)
                     (turing ? _deqQ4KSm75 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16Sm75)
                             : _deqQ4K ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, int, int>(MmaKQuantGemm.DequantQ4KF16))(
                         deqCount, weightQuant.BaseView.Cast<W16>(), w16.View.BaseView.Cast<W16>(), N, K);
@@ -675,7 +708,7 @@ public class FusedDequantMatMul : IDisposable
                 gemm(new KernelConfig(tilesS, v5 ? Trellis2.MmaGemm.V5Threads : Trellis2.MmaGemm.Threads), a16.View.SubView(0, aWords).Cast<uint, Trellis2.U4>(), w16.View.SubView(0, wWords).Cast<uint, Trellis2.U4>(),
                     _scratchOnes.View, output, M, K, N);
                 KernelTimings.Mark(_accelerator, "fwd.gemm");
-                LastGemmKernel = (type == GGMLType.Q4_K ? "mma-q4k" : "mma-q6k") + (turing ? "-sm75" : "") + "-scratch" + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
+                LastGemmKernel = (type == GGMLType.Q4_K ? "mma-q4k" : type == GGMLType.Q8_0 ? "mma-q8_0" : "mma-q6k") + (turing ? "-sm75" : "") + "-scratch" + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
                 return;
             }
             bool v3 = EnableMmaV3 && M >= MmaV3MinRows;
@@ -2258,6 +2291,15 @@ public class FusedDequantMatMul : IDisposable
             GGMLType.Q6_K => _gemvRowsQ6_K ??= LoadRows(GemvRowsQ6_KImpl),
             _ => null,
         };
+        if (M == 1 && type == GGMLType.Q8_0 && !ForceGenericRows && Q8Vec && (_accelerator.AcceleratorType != AcceleratorType.WebGPU || Q8VecWebGPU) && K % 64 == 0
+            && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 3) == 0)
+        {
+            _gemvQ8Vec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ8_0VecImpl);
+            _gemvQ8Vec(new KernelConfig((N + Q8VecCols * Q8VecRows - 1) / (Q8VecCols * Q8VecRows), Q8VecCols * 32),
+                input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.Cast<byte, int>(), output, pb.View);
+            LastRowsKernel = "q8-vec";
+            return;
+        }
         if (M == 1 && type == GGMLType.Q4_K && !ForceGenericRows && Q4KVec && K % 256 == 0
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
         {
@@ -2286,6 +2328,20 @@ public class FusedDequantMatMul : IDisposable
     private const int Q4KVecCols = 2;      // warps a group holds: 32 lanes each
     private const int Q4KVecRows = 4;      // outputs a warp computes: each lane's inputs are read once for all of them
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec;
+    /// <summary>
+    /// One Q8_0 row (M = 1, a decode step) on <see cref="GemvQ8_0VecImpl"/>: a warp per <see cref="Q8VecRows"/> outputs, a lane per pair of blocks (64 values,
+    /// 68 bytes: 17 aligned 32-bit loads, no word read twice), its 64 inputs read once (sixteen float4 loads) for all the warp's outputs. Needs K a multiple of
+    /// 64, a 16-byte-aligned input and a 4-byte-aligned weight view (else the word-wise kernel). Default on; GGUF_Q8_VEC=0 is the A/B.
+    /// </summary>
+    public static bool Q8Vec = Environment.GetEnvironmentVariable("GGUF_Q8_VEC") != "0";
+    /// <summary>
+    /// <see cref="Q8Vec"/> on WebGPU too. Off: MEASURED 2026-11-05 (Chrome, RTX 4070, Qwen3-1.7B Q8_0 decode, captured steps) the word-wise kernel is faster there,
+    /// 128.3 against 116.6 tok/s (Dawn's shader compiler already makes the word-wise kernel fast; on CUDA the vector kernel is the win).
+    /// </summary>
+    public static bool Q8VecWebGPU;
+    private const int Q8VecCols = 2;       // warps a group holds
+    private const int Q8VecRows = 4;       // outputs a warp computes
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ8Vec;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> LoadRows(
         Action<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> impl) =>
         _accelerator.LoadStreamKernel(impl);
@@ -2357,6 +2413,62 @@ public class FusedDequantMatMul : IDisposable
             }
         }
         ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    // 4 int8 values (the bytes of q) against an input quad
+    private static float I8x4(int q, Vec4LoadMatMul.F4 x) => x.A * ((q << 24) >> 24) + x.B * ((q << 16) >> 24) + x.C * ((q << 8) >> 24) + x.D * (q >> 24);
+    // two Q8_0 blocks (68 bytes from int index wi: d_A in bytes 0-1, the first block's 32 quants in 2-33, d_B in 34-35, the second's in 36-67) against 64 inputs.
+    // The first block's quants straddle the words by two bytes: each quad is the high half of one word and the low half of the next; the second's are aligned.
+    private static float Q8Pair(ArrayView1D<int, Stride1D.Dense> w, int wi,
+        Vec4LoadMatMul.F4 x0, Vec4LoadMatMul.F4 x1, Vec4LoadMatMul.F4 x2, Vec4LoadMatMul.F4 x3, Vec4LoadMatMul.F4 x4, Vec4LoadMatMul.F4 x5, Vec4LoadMatMul.F4 x6, Vec4LoadMatMul.F4 x7,
+        Vec4LoadMatMul.F4 x8, Vec4LoadMatMul.F4 x9, Vec4LoadMatMul.F4 x10, Vec4LoadMatMul.F4 x11, Vec4LoadMatMul.F4 x12, Vec4LoadMatMul.F4 x13, Vec4LoadMatMul.F4 x14, Vec4LoadMatMul.F4 x15)
+    {
+        int i0 = w[wi], i1 = w[wi + 1], i2 = w[wi + 2], i3 = w[wi + 3], i4 = w[wi + 4], i5 = w[wi + 5], i6 = w[wi + 6], i7 = w[wi + 7], i8 = w[wi + 8];
+        int i9 = w[wi + 9], i10 = w[wi + 10], i11 = w[wi + 11], i12 = w[wi + 12], i13 = w[wi + 13], i14 = w[wi + 14], i15 = w[wi + 15], i16 = w[wi + 16];
+        float sa = I8x4((int)(((uint)i0 >> 16) | ((uint)i1 << 16)), x0) + I8x4((int)(((uint)i1 >> 16) | ((uint)i2 << 16)), x1)
+                 + I8x4((int)(((uint)i2 >> 16) | ((uint)i3 << 16)), x2) + I8x4((int)(((uint)i3 >> 16) | ((uint)i4 << 16)), x3)
+                 + I8x4((int)(((uint)i4 >> 16) | ((uint)i5 << 16)), x4) + I8x4((int)(((uint)i5 >> 16) | ((uint)i6 << 16)), x5)
+                 + I8x4((int)(((uint)i6 >> 16) | ((uint)i7 << 16)), x6) + I8x4((int)(((uint)i7 >> 16) | ((uint)i8 << 16)), x7);
+        float sb = I8x4(i9, x8) + I8x4(i10, x9) + I8x4(i11, x10) + I8x4(i12, x11) + I8x4(i13, x12) + I8x4(i14, x13) + I8x4(i15, x14) + I8x4(i16, x15);
+        return HalfBits(i0 & 0xFFFF) * sa + HalfBits((i8 >> 16) & 0xFFFF) * sb;
+    }
+
+    // M = 1, Q8_0: a warp per Q8VecRows outputs, a lane per block pair (64 values). The lane reads its 64 inputs once (sixteen float4 loads) and applies them to
+    // each output's pair (17 aligned word loads each: a row is K * 17 / 16 bytes, a multiple of 68 when K is a multiple of 64). Neighbouring lanes take
+    // neighbouring pairs, so a warp's loads cover a contiguous 2,176 bytes of each row.
+    private static void GemvQ8_0VecImpl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, n0 = (Grid.IdxX * Q8VecCols + (tid >> 5)) * Q8VecRows;
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
+        int nU = K >> 6, rowI = nU * 17;                               // block pairs a row, words a row
+        bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
+        if (r0)
+        {
+            for (int u = lane; u < nU; u += 32)
+            {
+                int xb = u << 4, wi = n0 * rowI + u * 17;
+                var x0 = x4.AsAligned16()[xb]; var x1 = x4.AsAligned16()[xb + 1]; var x2 = x4.AsAligned16()[xb + 2]; var x3 = x4.AsAligned16()[xb + 3];
+                var x4_ = x4.AsAligned16()[xb + 4]; var x5 = x4.AsAligned16()[xb + 5]; var x6 = x4.AsAligned16()[xb + 6]; var x7 = x4.AsAligned16()[xb + 7];
+                var x8 = x4.AsAligned16()[xb + 8]; var x9 = x4.AsAligned16()[xb + 9]; var x10 = x4.AsAligned16()[xb + 10]; var x11 = x4.AsAligned16()[xb + 11];
+                var x12 = x4.AsAligned16()[xb + 12]; var x13 = x4.AsAligned16()[xb + 13]; var x14 = x4.AsAligned16()[xb + 14]; var x15 = x4.AsAligned16()[xb + 15];
+                p0 += Q8Pair(w, wi, x0, x1, x2, x3, x4_, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15);
+                if (r1) p1 += Q8Pair(w, wi + rowI, x0, x1, x2, x3, x4_, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15);
+                if (r2) p2 += Q8Pair(w, wi + 2 * rowI, x0, x1, x2, x3, x4_, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15);
+                if (r3) p3 += Q8Pair(w, wi + 3 * rowI, x0, x1, x2, x3, x4_, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15);
+            }
+        }
+        var sh = SharedMemory.Allocate<float>(Q8VecCols * 32 * Q8VecRows);
+        int wb = (tid >> 5) * 32 * Q8VecRows;
+        sh[wb + lane] = p0; sh[wb + 32 + lane] = p1; sh[wb + 64 + lane] = p2; sh[wb + 96 + lane] = p3;
+        Group.Barrier();
+        for (int stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                for (int r = 0; r < Q8VecRows; r++) sh[wb + 32 * r + lane] += sh[wb + 32 * r + lane + stride];
+            Group.Barrier();
+        }
+        if (lane < Q8VecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
     }
 
     // Q4_K (144 B per 256: fp16 d, fp16 dmin, 12 B of 6-bit scales / mins, 128 B of nibbles): a thread per nibble word (8 values: 4 low nibbles of sub-block 2t,

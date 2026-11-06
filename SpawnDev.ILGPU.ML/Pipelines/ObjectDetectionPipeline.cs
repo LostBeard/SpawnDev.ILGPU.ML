@@ -27,6 +27,19 @@ public class ObjectDetectionPipeline : IDisposable
     private readonly Kernels.ImagePreprocessKernel _preprocess;
     private readonly string[] _labels;
     private readonly int _inputSize;
+    private Graph.SessionGraphCapture? _capture;
+
+    /// <summary>
+    /// Record the detector's forward once (fixed input size) and replay it per frame: a dispatch plan on WebGPU, a CUDA graph on CUDA
+    /// (<see cref="Graph.SessionGraphCapture"/>, as <see cref="DepthEstimationPipeline"/> and the CLAP audio tower use). Opt-in, as for the CLAP tower: a replay
+    /// removes the host's per-node dispatch work, which only pays where the host is the bottleneck, and the recording pins its intermediates
+    /// (Riker's RX 590 with CLAP, 2026-11: no gain, GPU-bound, +700 MB of Chrome GPU memory). Asked for by Riker (AssistZ, 2026-11-06: 261-node YOLOv8n,
+    /// RunAsync 106 ms at 640 and 80 at 320 on the RX 590, the fixed part suspected to be host dispatch). Set before the first frame; the recording
+    /// keeps its memory until the pipeline is disposed. <see cref="CaptureStatus"/> says whether it replays.
+    /// </summary>
+    public bool EnableGraphCapture { get; set; }
+    /// <summary>Whether the recorded forward replays, and if not why (<see cref="Graph.SessionGraphCapture.CaptureStatus"/>).</summary>
+    public string CaptureStatus => _capture?.CaptureStatus ?? "not attempted";
 
     public ObjectDetectionPipeline(InferenceSession session, Accelerator accelerator,
         int inputSize = 640, string[]? labels = null)
@@ -107,10 +120,15 @@ public class ObjectDetectionPipeline : IDisposable
 
         // Run inference
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        var feeds = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
+        Dictionary<string, Tensor> outputs;
+        if (EnableGraphCapture)
         {
-            [_session.InputNames[0]] = inputTensor
-        }).ConfigureAwait(false);
+            // KeepDrains: buffers released during the recorded pass are recycled on a plain forward's schedule instead of all being pinned (CLAP: +132 vs +323 MiB)
+            _capture ??= new Graph.SessionGraphCapture(_session, _accelerator) { KeepDrains = true };
+            outputs = await _capture.RunAsync(feeds).ConfigureAwait(false);
+        }
+        else outputs = await _session.RunAsync(feeds).ConfigureAwait(false);
 
         // Read output to CPU
         var output = outputs[_session.OutputNames[0]];
@@ -120,10 +138,18 @@ public class ObjectDetectionPipeline : IDisposable
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
+        // the head's detection count follows the input size ([1, 4 + classes, N]: 8400 at 640, 2100 at 320). It was left at Process's default of 8400,
+        // so any other input size threw (Riker, AssistZ, 2026-11-06).
+        int channels = 4 + _labels.Length;
+        int numDetections = output.Shape is { Length: 3 } sh && sh[1] == channels ? sh[2] : elems / channels;
+        if ((long)numDetections * channels != elems)
+            throw new InvalidOperationException($"YOLO output [{string.Join(", ", output.Shape)}] does not hold 4 + {_labels.Length} channels per detection");
+
         // Postprocess: transpose, filter, NMS — pass the SAME letterbox rect the preprocess used
         var detections = YoloPostProcessor.Process(
             outputData,
             numClasses: _labels.Length,
+            numDetections: numDetections,
             confThreshold: confidenceThreshold,
             iouThreshold: iouThreshold,
             inputWidth: _inputSize,
@@ -157,6 +183,7 @@ public class ObjectDetectionPipeline : IDisposable
 
     public void Dispose()
     {
+        _capture?.Dispose();
         _session?.Dispose();
     }
 }
