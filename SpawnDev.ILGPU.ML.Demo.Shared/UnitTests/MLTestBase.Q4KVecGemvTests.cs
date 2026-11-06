@@ -19,7 +19,7 @@ public abstract partial class MLTestBase
         var type = GGMLType.Q4_K;
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (4096, 203), (1536, 9) })
+        foreach (var (K, N) in new[] { (4096, 203), (1536, 9), (512, 4100), (256, 8200) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
@@ -78,7 +78,7 @@ public abstract partial class MLTestBase
         {
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (2048, 203), (192, 9), (6144, 5) })
+        foreach (var (K, N) in new[] { (2048, 203), (192, 9), (6144, 5), (512, 4100), (256, 8200) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
@@ -134,7 +134,7 @@ public abstract partial class MLTestBase
         var type = GGMLType.F16;
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (2048, 203), (40, 9), (6144, 5) })
+        foreach (var (K, N) in new[] { (2048, 203), (40, 9), (6144, 5), (512, 4100), (256, 8200) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
@@ -192,7 +192,7 @@ public abstract partial class MLTestBase
         {
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (2048, 203), (256, 9), (6144, 5) })
+        foreach (var (K, N) in new[] { (2048, 203), (256, 9), (6144, 5), (512, 4100), (256, 8200) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
