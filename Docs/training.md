@@ -82,13 +82,29 @@ forgets the cached prefix. On the session engine the adapters are inserted into 
 
 ## Speed
 
-llama3.1:8b Q4_K_M, RTX 4070, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed: **1.81 s per step** (forward, recompute,
-backward; 21.7 s before the attention backward moved to a fused tensor-core kernel, the quantized input gradient and the forward GEMMs to
-tensor cores, and the training forward attention to the tensor-core flash kernel). Turing (RTX 2060) runs f16 variants of the same kernels.
-Profile with `tools/TrainLoraProbe --profile`: the forward matmuls (run twice with checkpointing) are about half of a step, then the
-quantized input gradient. Each fast path has a switch for A/B (`BackwardKernels.UseFlashAttentionBackward`,
-`BackwardKernels.UseTensorCoreAttentionBackward`, `BackwardKernels.UseGemmAttentionBackward`, `BackwardKernels.UseTensorCoreQuantT`,
-`GraphAutograd.TensorCoreForwardAttention`, `GraphAutograd.FusedLora`, `GraphAutograd.FuseGradientSums`, `GraphAutograd.GroupSiblingProjections`, `FusedDequantMatMul.EnableMmaScratch`).
+llama3.1:8b Q4_K_M, one sequence of 1,600 tokens, rank 16 on q/k/v/o, checkpointed (forward, recompute, backward):
+
+| GPU | Step | Before (2026-11-05 morning) |
+|---|---|---|
+| RTX 4070 (sm_89, bf16 / f16 tensor cores) | **1.78 s** | 21.7 s |
+| RTX 2060 (sm_75, f16 tensor cores) | **4.53 s** | 31.5 s |
+
+Every speedup is exact: bit-identical to the path it replaced, or gradient-checked (the fused attention backward and LoRA kernels change
+summation order only). 2,560 tokens with a 200-token answer: 2.65 s on the RTX 4070, 8.7 s on the RTX 2060, both within 12 GB. A step's
+memory grows with the number of LABELLED positions (the LM head's logits and their gradient over the vocabulary): label the answer, not the
+prompt (`LossOnLabeledPositionsOnly`).
+
+Where the time goes: the 16-bit tensor-core GEMMs, ~70% of a step on the RTX 4070 (~52 TFLOPS of its ~58 fp32-accumulate peak) and ~80% on
+the RTX 2060, whose GEMMs are DRAM-bound (336 GB/s, 3 MB L2). Profile with `tools/TrainLoraProbe --profile` (per op); add
+`GGUF_KERNEL_TIMING=1` for the pieces inside the GEMM ops (dequantize, pack, scale, GEMM).
+
+Each fast path has a switch for A/B:
+- attention: `BackwardKernels.UseFlashAttentionBackward`, `UseTensorCoreAttentionBackward`, `UseGemmAttentionBackward`,
+  `GraphAutograd.TensorCoreForwardAttention`;
+- graph: `GraphAutograd.FusedLora`, `FuseGradientSums`, `GroupSiblingProjections` (q | k | v and gate | up as one GEMM, SwiGLU in the gate | up
+  epilogue);
+- GEMMs: `FusedDequantMatMul.EnableMmaScratch`, `EnableMmaV5` / `EnableMmaV6` (sm_80+), `EnableMmaSm75V5` / `EnableMmaSm75V6` /
+  `Sm75V7Mode` (Turing; env `GGUF_GEMM_SM75_V5` / `_V6` / `_V7`), `BackwardKernels.UseTensorCoreQuantT`, `UseDequantTranspose64`.
 
 ## Tools
 
