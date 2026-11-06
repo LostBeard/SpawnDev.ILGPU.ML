@@ -8,10 +8,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   rows, so two stages take 32 KB and two blocks fit an SM's 64 KB of shared memory (V5's 40 KB fit one: 4 warps per SM). Bit-identical.
   MEASURED by Seven with Nsight on the RTX 2060: the V5 GEMMs were 79% of GPU time at ~17 TFLOPS. On the RTX 4070's Turing path: 43.0 -> 44.5
   (q / o), 48.0 -> 51.4 (down), 42.8 -> 48.6 (gate / up) TFLOPS; training step 2.04 -> 1.95 s, identical loss trajectory.
-- **Turing V7 GEMM** (`FusedDequantMatMul.Sm75V7Mode`, env `GGUF_GEMM_SM75_V7=1` every GEMM / `long` reductions >= 8,192; off by
-  default until measured on an RTX 2060): 256 x 128 block tiles (85 FLOP per loaded byte vs 64). Seven's 2060 Nsight: its GEMMs are DRAM-bound
-  (a 128 x 128 tile tops out near 21.5 TFLOPS at 336 GB/s; the K = 14,336 GEMMs ran ~14.5). Bit-identical. Slower on an RTX 4070 (not
-  bandwidth-bound).
+- **Turing V7 GEMM** (`FusedDequantMatMul.Sm75V7Mode`, default: reductions >= 8,192; env `GGUF_GEMM_SM75_V7=0` off / `1` every
+  GEMM): 256 x 128 block tiles (85 FLOP per loaded byte vs 64). Seven's 2060 Nsight: its GEMMs are DRAM-bound (a 128 x 128 tile tops out
+  near 21.5 TFLOPS at 336 GB/s; the K = 14,336 GEMMs ran ~14.5). Bit-identical. RTX 2060 step: V6 4,654 ms, V7 on the long reductions
+  4,533, V7 everywhere 4,893 (identical losses).
 - `KernelTimings` (env `GGUF_KERNEL_TIMING=1`, desktop): synchronized per-piece times inside the GEMM ops (dequant, packs, scale, GEMM),
   printed by `TrainLoraProbe --profile`; for machines without a profiler.
 

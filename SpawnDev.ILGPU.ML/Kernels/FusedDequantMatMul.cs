@@ -188,10 +188,11 @@ public class FusedDequantMatMul : IDisposable
 
     /// <summary>
     /// Turing: the V7 kernels (256 x 128 block tiles: 85 FLOP per loaded byte vs 64) for 0 = none, 1 = every GEMM, 2 = reductions of 8,192 or more
-    /// (env GGUF_GEMM_SM75_V7 = 1 / long). Bit-identical. Off by default until measured on an RTX 2060, whose GEMMs are DRAM-bound (Nsight: the
-    /// K = 14,336 GEMMs at ~14.5 TFLOPS where a 128 x 128 tile's ceiling at 336 GB/s is ~21.5). On the RTX 4070 (not bandwidth-bound) V7 is slower.
+    /// (env GGUF_GEMM_SM75_V7 = 0 / 1 / long; default long). Bit-identical. The RTX 2060's GEMMs are DRAM-bound (Nsight: the K = 14,336 GEMMs at
+    /// ~14.5 TFLOPS where a 128 x 128 tile's ceiling at 336 GB/s is ~21.5). MEASURED by Seven on the RTX 2060 (llama3.1:8b LoRA step, 1,600 tokens):
+    /// V6 4,654 ms, V7 on every GEMM 4,893, V7 on the long reductions 4,533 (identical losses). The first pass compiles the bigger kernels (~7 s once).
     /// </summary>
-    public static int Sm75V7Mode = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V7") switch { "1" => 1, "long" => 2, _ => 0 };
+    public static int Sm75V7Mode = Environment.GetEnvironmentVariable("GGUF_GEMM_SM75_V7") switch { "0" => 0, "1" => 1, _ => 2 };
 
     internal static bool UseSm75V7(int K) => Sm75V7Mode == 1 || (Sm75V7Mode == 2 && K >= 8192);
 
