@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.4</Version>
-		<PackageReleaseNotes>v5.8.1 - on SpawnDev.ILGPU 5.4.15: tensor-core GGUF prefill on CUDA sm_75+ (Q4_K / Q6_K GEMMs, causal grouped-query flash attention; llama3.1:8b 4,400-token prefill 18.3 -> 2.7 s on an RTX 4070), F16 KV cache + grouped-query decode attention, a 3x Q4_K decode GEMV, llama 3 rope_freqs and GGUF tokenizer fixes, device top-k, SpectralFrontend (GPU STFT from a ring buffer, mel / log bands, per-band level difference), GraphExecutor.ImmediateRelease (a 2.1 GB -> 0.7 GB working pool on ReDimNet2) and the subgraph refcount fix. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.5-local.1</Version>
+		<PackageReleaseNotes>v5.8.4 - GGUF decode about 2x faster on CUDA for Q8_0 models (qwen3:1.7b on an RTX 4070: 80 -> 165 tok/s; vector Q8_0 / F16 GEMVs, faster decode attention, CUDA-graph decode steps, Q8_0 prefill on tensor cores 1,265 -> 7,478 tok/s); a per-run output leak fixed in 23 pipelines (YOLO grew GPU memory ~4 MB per frame); ObjectDetectionPipeline at any input size and opt-in EnableGraphCapture (RX 590: 129 -> 55 ms a frame); Turing V6 / V7 GEMMs for LoRA training. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -65,4 +65,8 @@
     <!-- FaceDetectionPipeline.DetectBothWaysAsync: GPU decode vs the managed reference, for the parity test only -->
     <InternalsVisibleTo Include="SpawnDev.ILGPU.ML.Demo.Shared" />
   </ItemGroup>
+	<!-- A stable package must carry its own release notes: 5.8.2 - 5.8.4 shipped 5.8.1's (found by Data on nuget.org, 2026-11-06). -local builds are exempt. -->
+	<Target Name="CheckReleaseNotesMatchVersion" BeforeTargets="GenerateNuspec" Condition="!$(Version.Contains('-'))">
+		<Error Condition="!$(PackageReleaseNotes.StartsWith('v$(Version) '))" Text="PackageReleaseNotes must start with 'v$(Version) ' for a stable package; it starts '$(PackageReleaseNotes.Substring(0, 12))'. Update the notes in SpawnDev.ILGPU.ML.csproj." />
+	</Target>
 </Project>

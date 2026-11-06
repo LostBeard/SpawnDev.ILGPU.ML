@@ -546,12 +546,16 @@ public sealed class GgufBatchDecoder : IDisposable
 
     /// <summary>
     /// LoRA adapters applied unmerged after each adapted projection (<see cref="Training.LoraRuntime"/>; PEFT tensors). Null = the base model.
-    /// Changing it forgets the reusable prefix: cached K/V were computed with the old adapters.
+    /// Changing it forgets the reusable prefix: cached K/V were computed with the old adapters. It also drops the recorded decode steps (WebGPU plans,
+    /// CUDA graphs): they replay the kernels and buffers of the adapters they were recorded with. Found by Data (SpawnDev.AI lora-test, 2026-11-06):
+    /// after an in-place change a recorded step kept replaying the old set (1-2 of 24 greedy tokens right); gate
+    /// Training_DecoderLora_SwapInPlace_DecodeMatchesFresh. LoraRuntime's static route switches (FuseAdjacent, GroupedDown) need
+    /// <see cref="InvalidateCapturedSteps"/> the same way.
     /// </summary>
     public Training.LoraRuntime? Lora
     {
         get => _lora;
-        set { if (!ReferenceEquals(_lora, value)) { _lora = value; _cacheIds = null; } }
+        set { if (!ReferenceEquals(_lora, value)) { _lora = value; _cacheIds = null; _bufGen++; } }
     }
     private Training.LoraRuntime? _lora;
     private static readonly string[] LoraQkv = { "attn_q", "attn_k", "attn_v" }, LoraQk = { "attn_q", "attn_k" }, LoraGateUp = { "ffn_gate", "ffn_up" };

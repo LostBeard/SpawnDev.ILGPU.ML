@@ -68,6 +68,63 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Adapters changed IN PLACE on a decoder that has recorded its decode steps (CUDA graphs, WebGPU plans): each phase's greedy tokens must equal a fresh
+    /// decoder's with that adapter set. Found by Data on SpawnDev.AI's lora-test (ML 5.8.4, CUDA): after <c>Lora = null</c> the recorded step kept
+    /// replaying the old adapter kernels, 2 of 24 tokens right. Sequence: A, none, A, B (B: different buffers, so a stale recording cannot pass by luck).
+    /// Tiny F16 llama, random B matrices (PEFT's zero B would make every adapter a no-op).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Training_DecoderLora_SwapInPlace_DecodeMatchesFresh() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("the batch decoder's backends (CUDA, OpenCL, WebGPU)");
+        var assets = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var gguf = await assets.GetByteArrayAsync("test-train/tiny-llama-f16.gguf");
+        var targets = new[] { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" };
+        const int rank = 4; const float alpha = 8f;
+        async Task<Dictionary<string, float[]>> Adapters(int seed)
+        {
+            using var trainer = GgufLoraTrainer.Create(accelerator, gguf, new LoraOptions { Targets = targets, Rank = rank, Alpha = alpha, Seed = seed });
+            var rng = new Random(seed * 7 + 1);
+            var a = await trainer.GetAdaptersAsync();
+            foreach (var k in a.Keys.Where(k => k.EndsWith("lora_B.weight")).ToList())
+                a[k] = a[k].Select(_ => (float)((rng.NextDouble() * 2 - 1) * 0.3)).ToArray();
+            return a;
+        }
+        var adA = await Adapters(3);
+        var adB = await Adapters(11);
+        using var loraA = new LoraRuntime(accelerator, adA, rank, alpha);
+        using var loraB = new LoraRuntime(accelerator, adB, rank, alpha);
+        int vocab;
+        using (var probe = await GgufBatchDecoder.CreateAsync(accelerator, new MemoryStream(gguf), 128, 1, null)) vocab = probe.Vocab;
+        var prompt = Enumerable.Range(0, 12).Select(i => (i * 37 + 5) % vocab).ToArray();
+        var noStops = new HashSet<int>();
+        const int N = 24;
+        async Task<int[]> Fresh(LoraRuntime? l)
+        {
+            using var d = await GgufBatchDecoder.CreateAsync(accelerator, new MemoryStream(gguf), 128, 1, null);
+            d.Lora = l;
+            return (await d.GenerateAsync(prompt, 1, N, 0f, 1f, 1, noStops))[0];
+        }
+        var wantBase = await Fresh(null); var wantA = await Fresh(loraA); var wantB = await Fresh(loraB);
+        if (wantA.SequenceEqual(wantBase) || wantB.SequenceEqual(wantA))
+            throw new Exception("the adapters do not change the greedy tokens: the comparison would prove nothing");
+        using var dec = await GgufBatchDecoder.CreateAsync(accelerator, new MemoryStream(gguf), 128, 1, null);
+        var notes = new List<string>();
+        foreach (var (name, l, want) in new (string, LoraRuntime?, int[])[] { ("A", loraA, wantA), ("none", null, wantBase), ("A again", loraA, wantA), ("B", loraB, wantB) })
+        {
+            dec.Lora = l;
+            var got = (await dec.GenerateAsync(prompt, 1, N, 0f, 1f, 1, noStops))[0];
+            int same = got.Zip(want, (a, b) => a == b ? 1 : 0).Sum();
+            notes.Add($"{name}: {same}/{N}");
+            if (same != N) throw new Exception($"{accelerator.AcceleratorType}: after setting the adapters to {name} in place, {same} of {N} greedy tokens equal a fresh decoder's ({string.Join(", ", notes)}; captures {dec.CaptureStats.Captures}, replays {dec.CaptureStats.Replays})");
+        }
+        var line = $"{accelerator.AcceleratorType}: in-place adapter swaps match fresh decoders ({string.Join(", ", notes)}); captures {dec.CaptureStats.Captures}, replays {dec.CaptureStats.Replays}";
+        Console.WriteLine("[Training] " + line);
+        return line;
+    });
+
+    /// <summary>
     /// The fused LoraLinear / LoraLinearGrad ops (GraphAutograd.FusedLora, ranks that are a multiple of 8) against the four-op form (MatMul, MatMul,
     /// Mul, Add and its autograd): the same loss, logits and every adapter gradient, at ranks 8 and 16 on all seven projection types, with and
     /// without layer checkpointing. Both are fp32; only the summation order differs. Also GraphAutograd.FuseGradientSums against the Add

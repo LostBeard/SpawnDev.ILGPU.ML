@@ -2300,6 +2300,15 @@ public class FusedDequantMatMul : IDisposable
             LastRowsKernel = "f16-vec";
             return;
         }
+        if (M == 1 && type == GGMLType.Q6_K && !ForceGenericRows && Q6Vec && (_accelerator.AcceleratorType != AcceleratorType.WebGPU || Q6VecWebGPU) && K % 256 == 0
+            && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 3) == 0)
+        {
+            _gemvQ6Vec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ6_KVecImpl);
+            _gemvQ6Vec(new KernelConfig((N + Q8VecCols * Q8VecRows - 1) / (Q8VecCols * Q8VecRows), Q8VecCols * 32),
+                input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.Cast<byte, int>(), output, pb.View);
+            LastRowsKernel = "q6k-vec";
+            return;
+        }
         if (M == 1 && type == GGMLType.Q8_0 && !ForceGenericRows && Q8Vec && (_accelerator.AcceleratorType != AcceleratorType.WebGPU || Q8VecWebGPU) && K % 64 == 0
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 3) == 0)
         {
@@ -2354,6 +2363,16 @@ public class FusedDequantMatMul : IDisposable
     /// attn_v is F16): the per-element kernel at ~150 GB/s, 0.78 ms of a 6.5 ms decode token. GGUF_F16_VEC=0 is the A/B.
     /// </summary>
     public static bool F16Vec = Environment.GetEnvironmentVariable("GGUF_F16_VEC") != "0";
+    /// <summary>
+    /// One Q6_K row (M = 1) on <see cref="GemvQ6_KVecImpl"/>: a lane per 16 values of a super-block half (three words: low nibbles of l..l+3 and l+32..l+35,
+    /// high bits of l..l+3), its 16 inputs (four float4 loads) shared by four outputs a warp. Q4_K_M files keep ffn_down and the LM head in Q6_K, and the
+    /// word-wise kernel (a group per output) is the design that held Q8_0 at ~200 GB/s on the RTX 4070. Needs K a multiple of 256, a 16-byte-aligned input
+    /// and a 4-byte-aligned weight view. GGUF_Q6_VEC=0 is the A/B; on WebGPU only with <see cref="Q6VecWebGPU"/> until measured there.
+    /// </summary>
+    public static bool Q6Vec = Environment.GetEnvironmentVariable("GGUF_Q6_VEC") != "0";
+    /// <summary><see cref="Q6Vec"/> on WebGPU too (off until measured there: Q8Vec was slower on WebGPU than the word-wise kernel).</summary>
+    public static bool Q6VecWebGPU;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6Vec;
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvF16Vec;
     private const int Q8VecCols = 2;       // warps a group holds
     private const int Q8VecRows = 4;       // outputs a warp computes
@@ -2429,6 +2448,59 @@ public class FusedDequantMatMul : IDisposable
             }
         }
         ReduceRows(output, M, N, n, tid, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+
+    // q - 32 of four 6-bit values: byte lanes of lo (4 bits at shift ls) and hi (2 bits at shift hs) against an input quad
+    private static float Q6x4(int lo, int ls, int hi, int hs, Vec4LoadMatMul.F4 x) =>
+        x.A * ((((lo >> ls) & 0xF) | (((hi >> hs) & 3) << 4)) - 32) + x.B * ((((lo >> (ls + 8)) & 0xF) | (((hi >> (hs + 8)) & 3) << 4)) - 32)
+      + x.C * ((((lo >> (ls + 16)) & 0xF) | (((hi >> (hs + 16)) & 3) << 4)) - 32) + x.D * ((((lo >> (ls + 24)) & 0xF) | (((hi >> (hs + 24)) & 3) << 4)) - 32);
+
+    // one output's unit of a Q6_K super-block (at byte so: 128 B low nibbles, 64 B high bit pairs, 16 int8 scales, fp16 d) for half h, values l..l+3 of each
+    // of its four 32-value groups: d * (s0 * sum(x (q - 32)) over l.., s2 over l+32.., s4 over l+64.., s6 over l+96..)
+    private static float Q6Unit(ArrayView1D<int, Stride1D.Dense> w, int so, int h, int l,
+        Vec4LoadMatMul.F4 x0, Vec4LoadMatMul.F4 x1, Vec4LoadMatMul.F4 x2, Vec4LoadMatMul.F4 x3)
+    {
+        float d = HalfBits(ReadU16(w, so + 208));
+        int sc = so + 192 + 8 * h + (l >> 4);
+        int qa = ReadWordAt(w, so + 64 * h + l), qb = ReadWordAt(w, so + 64 * h + l + 32), qh = ReadWordAt(w, so + 128 + 32 * h + l);
+        return d * (SignExtend8(ReadByte(w, sc)) * Q6x4(qa, 0, qh, 0, x0) + SignExtend8(ReadByte(w, sc + 2)) * Q6x4(qb, 0, qh, 2, x1)
+                  + SignExtend8(ReadByte(w, sc + 4)) * Q6x4(qa, 4, qh, 4, x2) + SignExtend8(ReadByte(w, sc + 6)) * Q6x4(qb, 4, qh, 6, x3));
+    }
+
+    // M = 1, Q6_K: a warp per Q8VecRows outputs, a lane per 16-value unit (u over 16 units a super-block: half h = (u >> 3) & 1, l = 4 (u & 7)); the
+    // unit's 16 inputs (four float4: values l, l + 32, l + 64, l + 96 of the half) are read once for all the warp's outputs
+    private static void GemvQ6_KVecImpl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, n0 = (Grid.IdxX * Q8VecCols + (tid >> 5)) * Q8VecRows;
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
+        int nsb = K >> 8, rowB = nsb * 210, nU = nsb * 16;
+        bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
+        if (r0)
+        {
+            for (int u = lane; u < nU; u += 32)
+            {
+                int sb = u >> 4, h = (u >> 3) & 1, l = (u & 7) << 2;
+                int xb = ((sb << 8) + (h << 7) + l) >> 2;                  // float4 index of value l of the half; the other three are 8, 16, 24 further
+                var x0 = x4.AsAligned16()[xb]; var x1 = x4.AsAligned16()[xb + 8]; var x2 = x4.AsAligned16()[xb + 16]; var x3 = x4.AsAligned16()[xb + 24];
+                int so = n0 * rowB + sb * 210;
+                p0 += Q6Unit(w, so, h, l, x0, x1, x2, x3);
+                if (r1) p1 += Q6Unit(w, so + rowB, h, l, x0, x1, x2, x3);
+                if (r2) p2 += Q6Unit(w, so + 2 * rowB, h, l, x0, x1, x2, x3);
+                if (r3) p3 += Q6Unit(w, so + 3 * rowB, h, l, x0, x1, x2, x3);
+            }
+        }
+        var sh = SharedMemory.Allocate<float>(Q8VecCols * 32 * Q8VecRows);
+        int wb = (tid >> 5) * 32 * Q8VecRows;
+        sh[wb + lane] = p0; sh[wb + 32 + lane] = p1; sh[wb + 64 + lane] = p2; sh[wb + 96 + lane] = p3;
+        Group.Barrier();
+        for (int stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                for (int r = 0; r < Q8VecRows; r++) sh[wb + 32 * r + lane] += sh[wb + 32 * r + lane + stride];
+            Group.Barrier();
+        }
+        if (lane < Q8VecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
     }
 
     // fp16 bits -> float, every value (subnormals scaled, inf / nan kept): full F16 weights, unlike a block scale, may hold any of them

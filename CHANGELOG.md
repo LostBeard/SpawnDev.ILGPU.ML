@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Fix: in-place LoRA changes on a decoder with recorded decode steps** (found by Data, SpawnDev.AI lora-test on 5.8.4): `GgufBatchDecoder.Lora`
+  reset the prefix cache but not the recorded steps, so a CUDA graph or WebGPU plan kept replaying the previous adapter set's kernels and buffers
+  (Data: 2 of 24 greedy tokens right after `Lora = null`; the WebGPU plans had the same bug since adapters at inference shipped). The setter now drops
+  the recordings. Gate `Training_DecoderLora_SwapInPlace_DecodeMatchesFresh` (A, none, A, B against fresh decoders; red-checked: 1/24 on CUDA and WebGPU).
+- **`GemvQ6_KVecImpl`** (`FusedDequantMatMul.Q6Vec`, GGUF_Q6_VEC=0; WebGPU only with `Q6VecWebGPU` until measured there): one-row Q6_K GEMV, a lane per
+  16 values, four outputs a warp. Q4_K_M files keep ffn_down and the LM head in Q6_K. qwen3:1.7b Q4_K_M on CUDA: decode 180.9 -> 190.5 tok/s, long
+  prompt 153.6 -> 160.5 (139.5 before 5.8.4; Ollama 273.4). Gate `Gemv_Q6KVec_MatchesOracle_AndIsTaken`.
+- Packaging: a stable build fails unless `PackageReleaseNotes` starts with `v$(Version) ` (5.8.2 - 5.8.4 shipped 5.8.1's notes; found by Data).
+
 ## 5.8.4 - 2026-11-06 (nuget.org) - GGUF decode ~2x faster on CUDA (Q8_0), pipeline output leaks fixed, YOLO any size + graph capture
 
 Stable. Full sweep 7,536 passed, 1 failed: `WebGPUTests.Vad_SpeechPad_MovesTheSegmentStartEarlier`, a NullReferenceException inside SpawnDev.ILGPU's
