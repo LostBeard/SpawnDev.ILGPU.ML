@@ -99,6 +99,7 @@ public sealed class YuNetFaceDetector : IDisposable
         var o = new FV[12];
         for (var i = 0; i < 12; i++) o[i] = outs[_session.OutputNames[i]].Data;
         var raw = await _stages.DecodeAsync(o, InputWidth, InputHeight, _found, scale, padX, padY, scoreThreshold).ConfigureAwait(false);
+        _session.ReturnOutputs(outs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         return Suppress(raw, nmsThreshold, maxFaces);
     }
 
@@ -284,7 +285,9 @@ public sealed class SFaceRecognizer : IDisposable
         }).ConfigureAwait(false);
         var t = outs[_session.OutputNames[0]];
         // the read is ordered after the network (no SynchronizeAsync: that would be a second round trip)
-        return await t.Data.SubView(0, EmbeddingSize).CopyToHostAsync<float, Stride1D.Dense>().ConfigureAwait(false);
+        var embedding = await t.Data.SubView(0, EmbeddingSize).CopyToHostAsync<float, Stride1D.Dense>().ConfigureAwait(false);
+        _session.ReturnOutputs(outs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
+        return embedding;
     }
 
     // Least-squares similarity from the five landmarks to the template as one complex number z and the two means: dst = z * (src - srcMean) + dstMean.

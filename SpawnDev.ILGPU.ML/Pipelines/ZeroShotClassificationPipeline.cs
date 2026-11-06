@@ -201,6 +201,7 @@ public class ZeroShotClassificationPipeline : IDisposable
         int elems = Math.Min(output.ElementCount, _embeddingDim);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        _visionSession.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var embedding = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
@@ -234,6 +235,7 @@ public class ZeroShotClassificationPipeline : IDisposable
         int elems = Math.Min(output.ElementCount, _embeddingDim);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        _textSession.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var embedding = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 

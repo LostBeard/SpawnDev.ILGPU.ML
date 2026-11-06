@@ -136,6 +136,7 @@ public class AsyncDepthPipeline : IDisposable
         int outElems = Math.Min(output.ElementCount, (int)fastOutputBuf.Length);
         _ew.Scale(output.Data.SubView(0, outElems), fastOutputBuf.SubView(0, outElems), outElems, 1f);
         await _accelerator.SynchronizeAsync();
+        _fastSession.ReturnOutputs(outputs);   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
     }
 
     /// <summary>

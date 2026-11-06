@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.4 - 2026-11-06 (nuget.org) - GGUF decode ~2x faster on CUDA (Q8_0), pipeline output leaks fixed, YOLO any size + graph capture
+
+Stable. Full sweep 7,536 passed, 1 failed: `WebGPUTests.Vad_SpeechPad_MovesTheSegmentStartEarlier`, a NullReferenceException inside SpawnDev.ILGPU's
+WebGPU shader creation (`WebGPUComputeShader` constructor), which no change here touches; the VAD tests rerun alone passed 11/11 twice (reported to the
+SpawnDev.ILGPU owner). On SpawnDev.ILGPU 5.4.16 and SpawnDev.SpawnJS 3.0.8.
+Headline (RTX 4070, qwen3:1.7b Q8_0 against Ollama 0.34.4 on the same GGUF, `tools/OllamaCompareBench`): CUDA decode 80.3 -> 164.8 tok/s (Ollama 191.5),
+1,830-token prompt decode 70.9 -> 142.5 (176.7), prefill 1,265 -> 7,478 tok/s (16,141). WebGPU in Chrome 128-140 -> 145-147 tok/s.
+
 - **Turing V6 GEMM** (`FusedDequantMatMul.EnableMmaSm75V6`, default on, `GGUF_GEMM_SM75_V6=0` = V5): the Turing V5 with XOR-swizzled 64-byte
   rows, so two stages take 32 KB and two blocks fit an SM's 64 KB of shared memory (V5's 40 KB fit one: 4 warps per SM). Bit-identical.
   MEASURED by Seven with Nsight on the RTX 2060: the V5 GEMMs were 79% of GPU time at ~17 TFLOPS. On the RTX 4070's Turing path: 43.0 -> 44.5
@@ -30,7 +38,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     `InvalidateCapturedSteps()` for callers that flip a static kernel switch; a grown penalty window now invalidates captured steps too (it did not).
   - **Q8_0 prefill on the tensor cores** (`FusedDequantMatMul.EnableMmaQ8`, GGUF_GEMM_MMA_Q8=0; CUDA sm_75+): rows dequantized to f16, then the
     K-quants' scratch GEMMs. 1,830-token prefill 1,265 -> 7,478 tok/s. Gate `Gemm_MmaQ8_0_MatchesOracle_AndIsTaken`.
-  After (CUDA, Q8_0): decode 148.1 (Ollama 191.5), long-prompt decode 128.1 (176.7), prefill 7,478 (16,141). Gates: the batch decoder's model tests
+  After (CUDA, Q8_0): decode 148.1 (Ollama 191.5), long-prompt decode 128.1 (176.7), prefill 7,478 (16,141). Data's consumer check (SpawnDev.AI.Server
+  chat-bench, AiChatEngine, 5.8.4-local.1): 82.5 -> 148.0 tok/s at a 26-token prompt, 71.9 -> 123.5 at 1,602 tokens, greedy text byte-identical to 5.8.3.
+  Second round (Nsight on the new step: 6.5 ms a token, Ollama 5.2):
+  - **`GemvF16VecImpl`** (`FusedDequantMatMul.F16Vec`, GGUF_F16_VEC=0): one-row F16 GEMV, a lane per 8 values. Ollama's qwen3:1.7b Q8_0 file holds an F16
+    attn_v, which ran on the per-element kernel (~150 GB/s, 0.78 ms a token). 157.4 -> 163 tok/s. Gate `Gemv_F16Vec_MatchesOracle_AndIsTaken`.
+  - **RMSNorm reductions** (`RMSNormFused`, `AddRMSNormFused`): the group's partials reduce by a shared-memory tree to 32, then thread 0 adds those in f64;
+    thread 0 used to add all 256 alone (11.3 us of a one-row 2,048-wide norm, two a layer). Float-rounding-level change.
+  - **Attention merge reads live chunks only** (bit-identical) and 64-key chunks by default with `AttentionIlp` (128 / 64 / 32 keys: 163.1 / 164.8 / 166.8
+    tok/s short, 138.1 / 142.5 / 134.6 long). Gates: the batch decoder's model tests
   (greedy vs generator, GQA vs per-head, F16 cache, prefix reuse, top-k, device draws, route change) on CUDA, OpenCL and WebGPU, 84 passed.
 - **Fix: `ObjectDetectionPipeline` at input sizes other than 640** (reported by Riker from AssistZ): it passed no detection count to
   `YoloPostProcessor.Process`, whose default is 8400 (the anchors at 640), so a 320 input threw IndexOutOfRangeException. The count now comes from the
@@ -40,6 +56,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   per frame (`Graph.SessionGraphCapture`: a WebGPU dispatch plan, a CUDA graph), with `CaptureStatus`. MEASURED (RTX 4070, YOLOv8n, street sample,
   median of 3 frames after warm-up): WebGPU in Chrome 53.3 -> 23.6 ms (250 dispatches replayed), CUDA 25.2 -> 9.2 ms; the same 14 detections.
   Opt-in because a GPU-bound card gains nothing and the recording pins memory (CLAP on Riker's RX 590). Gate `Pipeline_YOLOv8_GraphCapture_MatchesDirect`.
+  Riker's RX 590 (AssistZ, Chrome WebGPU, 5.8.4-local.1, 80 frames a setting, off / on / off again): 640 129.5 / 55.0 / 128.8 ms, 320 ~92 / ~36 ms;
+  a frame's four inferences ~520 -> ~230 ms. The capture's GPU memory cost there is still to be measured, so it stays opt-in for now.
+- **Fix: pipelines leaked one output set per run** (found by Riker on AssistZ: YOLOv8n without capture grew Chrome's GPU memory ~4.3 MB per inference,
+  65 -> 1,449 MB over 320, still rising). A session's outputs are pool-rented and, outside the decode loops, returned only by
+  `InferenceSession.ReturnOutputs` or `OutputsLiveUntilNextRun`; 23 pipelines did neither. Reproduced on the RTX 4070 (WebGPU): one 4 MiB rent per
+  frame never returned (+120 MiB over 30 frames); after the fix flat (64.6 MiB, +0 rents). Now returned once read: object detection, classification,
+  pose, background removal, super-resolution, style transfer, zero-shot (CLIP), DINOv2, face detection and recognition, Smart Turn, speaker embedding,
+  Silero VAD, CLAP; `OutputsLiveUntilNextRun` on text classification, text generation, TTS encoder / vocoder, the Whisper encoder, Image3D and the
+  DDPM UNet. `SessionGraphCapture.LastRunReplayed` tells a caller whether it owns the outputs (a replay's belong to the capture). Gate
+  `Pipeline_YOLOv8_DirectFrames_DoNotGrowDeviceMemory` (WebGPU buffer accounting over 40 frames).
 - Two structural gates (`GgufBatchDecoder_ChunkedPrefill_MatchesOneForward`, `GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath`) pin the f32 GEMM: they
   compare chunkings and attention kernels, and the Q8_0 tensor-core prefill's f16 operands move their logits 0.007-0.03 apart.
 - **Demo: /train verified live** (GitHub Pages, Chrome, WebGPU): 6 drawings per class through the page, trained in 1.2 s, 30 of 30 new drawings right.

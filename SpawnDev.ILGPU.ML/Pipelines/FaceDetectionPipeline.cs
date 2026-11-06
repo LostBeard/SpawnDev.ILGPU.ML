@@ -128,6 +128,7 @@ public class FaceDetectionPipeline : IDisposable
         var (regName, clsName) = ResolveOutputNames();
         var faces = await DecodeOnGpuAsync(outputs[regName].Data, outputs[clsName].Data, width, height,
             contentW, contentH, padX, padY, confidenceThreshold, iouThreshold, maxFaces).ConfigureAwait(false);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
 
         sw.Stop();
 
@@ -463,6 +464,7 @@ public class FaceDetectionPipeline : IDisposable
             contentW, contentH, padX, padY, confidenceThreshold, iouThreshold, maxFaces);
         var gpu = await DecodeOnGpuAsync(outputs[regName].Data, outputs[clsName].Data, width, height,
             contentW, contentH, padX, padY, confidenceThreshold, iouThreshold, maxFaces).ConfigureAwait(false);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         return (gpu, reference);
     }
 

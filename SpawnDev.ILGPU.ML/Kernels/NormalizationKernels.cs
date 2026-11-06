@@ -224,10 +224,17 @@ public class NormalizationKernels : IDisposable
         part[tid] = (float)local;
         Group.Barrier();
 
+        // the T partials -> 32 by a shared-memory tree (T a power of two: the host sizes it), then thread 0 adds those 32 in f64. Thread 0 used to add all T
+        // in f64 alone: a 256-long serial chain, MEASURED 2026-11-06 (Nsight, RTX 4070) at 11.3 us of a one-row decode step's 2,048-wide norm.
+        for (int s = T >> 1; s >= 32; s >>= 1)
+        {
+            if (tid < s) part[tid] += part[tid + s];
+            Group.Barrier();
+        }
         if (tid == 0)
         {
             double sumSq = 0.0;
-            for (int t = 0; t < T; t++) sumSq += part[t];
+            for (int t = 0; t < Math.Min(T, 32); t++) sumSq += part[t];
             inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
         }
         Group.Barrier();
@@ -269,10 +276,17 @@ public class NormalizationKernels : IDisposable
         part[tid] = (float)local;
         Group.Barrier();
 
+        // the T partials -> 32 by a shared-memory tree (T a power of two: the host sizes it), then thread 0 adds those 32 in f64. Thread 0 used to add all T
+        // in f64 alone: a 256-long serial chain, MEASURED 2026-11-06 (Nsight, RTX 4070) at 11.3 us of a one-row decode step's 2,048-wide norm.
+        for (int s = T >> 1; s >= 32; s >>= 1)
+        {
+            if (tid < s) part[tid] += part[tid + s];
+            Group.Barrier();
+        }
         if (tid == 0)
         {
             double sumSq = 0.0;
-            for (int t = 0; t < T; t++) sumSq += part[t];
+            for (int t = 0; t < Math.Min(T, 32); t++) sumSq += part[t];
             inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
         }
         Group.Barrier();
@@ -526,7 +540,7 @@ public class NormalizationKernels : IDisposable
     {
         if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
         int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
-            : (_rmsFusedGroup = Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup));
+            : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);   // a power of two: the partials reduce by a tree
         if (T < 32) return false; // group too small to be worth it — keep the two-pass
         _rmsNormFusedKernel ??= _accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -545,7 +559,7 @@ public class NormalizationKernels : IDisposable
         EnsureLoaded();
         if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
         int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
-            : (_rmsFusedGroup = Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup));
+            : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);   // a power of two: the partials reduce by a tree
         if (T < 32) return false;
         if (hasWeight == 0) { _dummyRmsWeight ??= _accelerator.Allocate1D(new float[1]); weight = _dummyRmsWeight.View; }
         _addRmsNormFusedKernel ??= _accelerator.LoadStreamKernel<

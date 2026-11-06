@@ -104,7 +104,7 @@ public sealed class GgufBatchDecoder : IDisposable
     public bool GqaAttention { get => _gqaAttention; set { if (_gqaAttention != value) { _gqaAttention = value; _bufGen++; } } }
     private bool _gqaAttention = Environment.GetEnvironmentVariable("GGUF_BATCH_GQA") != "0";
     /// <summary>
-    /// Keys per chunk of the grouped-query decode attention (0: AttChunk / G rounded up to a power of two, so a step has as many groups as the per-head kernel's and
+    /// Keys per chunk of the grouped-query decode attention (0: with <see cref="AttentionIlp"/> 64 or fewer, else AttChunk / G rounded up to a power of two, so a step has as many groups as the per-head kernel's and
     /// each group the same work). Settable for the A/B (env GGUF_GQA_CHUNK; AttChunk = the chunking before 2026-11-02); clamped to [16, AttChunk] (the shared
     /// scores hold GqaMaxG x AttChunk).
     /// </summary>
@@ -123,7 +123,9 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         int gp = 1; while (gp < G) gp <<= 1;
         int max = AttChunk / gp;
-        return _gqaChunk <= 0 ? max : Math.Clamp(_gqaChunk, 16, AttChunk);
+        // with AttentionIlp (chunks past the position cost nothing, the merge reads only live chunks) 64-key chunks: MEASURED 2026-11-06 (CUDA, RTX 4070,
+        // qwen3:1.7b Q8_0, G = 2): 128 / 64 / 32 keys = 163.1 / 164.8 / 166.8 tok/s at a short prompt, 138.1 / 142.5 / 134.6 at 1,830 tokens
+        return _gqaChunk <= 0 ? (_attIlp ? Math.Min(max, 64) : max) : Math.Clamp(_gqaChunk, 16, AttChunk);
     }
     /// <summary>
     /// Load-time option (static: read when a decoder is created; env GGUF_BATCH_SEPARATE=1 turns it off): join q, k (and v) into one matrix and gate and up into
@@ -835,7 +837,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 else
                     _kv.AttPartial(l, new KernelConfig(R * Heads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim));
                 Prof("attn");
-                _attCombine!((int)((long)R * Q), part, ml, att, HeadDim, ach); Prof("attn-merge");
+                _attCombine!((int)((long)R * Q), part, ml, att, posView, HeadDim, ach, gqa ? ck : AttChunk, Heads, mode); Prof("attn-merge");
             }
             else
             {
@@ -1425,7 +1427,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
-    private Action<Index1D, FV, FV, FV, int, int>? _attCombine;
+    private Action<Index1D, FV, FV, FV, IV, int, int, int, int, int>? _attCombine;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
     private Action<Index1D, FV, FV, IV, int, int, int>? _chunkMax;
     private Action<Index1D, FV, IV, FV, IV, int, int>? _floor;
@@ -1448,7 +1450,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (_qkNorm) _headNorm = _acc.LoadStreamKernel<FV, FV, int, int, int, float>(HeadNormImpl);
         if (FusedAttention)
         {
-            _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnCombineImpl);
+            _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, int, int, int, int, int>(AttnCombineImpl);
         }
         _hasFlash = _acc.AcceleratorType != AcceleratorType.WebGL && HeadDim <= FaMaxD && FaThreads <= _acc.MaxNumThreadsPerGroup;
         // the tensor-core flash prefill: CUDA sm_75+, head dim 128 (the F16-cache check is the store's: FlashMma returns false on F32 caches)
@@ -2443,14 +2445,19 @@ public sealed class GgufBatchDecoder : IDisposable
     internal struct Gqa8 : IGqaGroup { public int G => 8; }
 
     // split-K attention, part 2: out[r, h * D + d] = sum_ch e^(m_ch - M) part[ch, d] / sum_ch e^(m_ch - M) l_ch (chunks without a key skipped)
-    private static void AttnCombineImpl(Index1D i, FV part, FV ml, FV o, int D, int nch)
+    // merges the chunks a row's keys reach: chunk c holds keys [c ck, (c + 1) ck), live when c ck <= the row's position (the rest hold sum 0 and were
+    // skipped by the test below anyway: bounding the loops is bit-identical). A captured step launches every chunk the cache holds (MaxSeq / ck), so an
+    // unbounded loop read all of them for every output.
+    private static void AttnCombineImpl(Index1D i, FV part, FV ml, FV o, IV posBuf, int D, int nch, int ck, int H, int mode)
     {
         int ii = i, d = ii % D, rh = ii / D;
+        int pos = mode == 0 ? posBuf[0] + rh / H : posBuf[0];
+        int live = Math.Min(nch, pos / ck + 1);
         long g0 = (long)rh * nch;
         float M = -1e30f;
-        for (int c = 0; c < nch; c++) if (ml[2 * (g0 + c) + 1] > 0f) M = MathF.Max(M, ml[2 * (g0 + c)]);
+        for (int c = 0; c < live; c++) if (ml[2 * (g0 + c) + 1] > 0f) M = MathF.Max(M, ml[2 * (g0 + c)]);
         float num = 0f, den = 0f;
-        for (int c = 0; c < nch; c++)
+        for (int c = 0; c < live; c++)
         {
             float lc = ml[2 * (g0 + c) + 1];
             if (lc > 0f) { float w = MathF.Exp(ml[2 * (g0 + c)] - M); num += w * part[(g0 + c) * D + d]; den += w * lc; }

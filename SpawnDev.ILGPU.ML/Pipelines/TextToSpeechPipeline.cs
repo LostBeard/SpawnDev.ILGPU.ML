@@ -44,6 +44,7 @@ public class TextToSpeechPipeline : IDisposable
         _encoder = encoder;
         _decoder = decoder;
         _vocoder = vocoder;
+        _encoder.OutputsLiveUntilNextRun = true; _vocoder.OutputsLiveUntilNextRun = true;   // pool-rented outputs go back at the next run (each run's are consumed before it); unflagged, every run leaked one output set (found 2026-11-06 with YOLO's per-frame leak)
         _accelerator = accelerator;
     }
 

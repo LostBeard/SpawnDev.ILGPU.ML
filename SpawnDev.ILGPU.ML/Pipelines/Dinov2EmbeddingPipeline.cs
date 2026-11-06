@@ -146,6 +146,7 @@ public sealed class Dinov2EmbeddingPipeline : IDisposable
         // the readback is the fence: tokens first (same queue), then the pooled parts
         float[]? tokens = includeTokens ? await t.Data.SubView(0, (long)n * dim).CopyToHostAsync().ConfigureAwait(false) : null;
         var raw = await _pooled.View.SubView(0, 2 * dim).CopyToHostAsync().ConfigureAwait(false);
+        _session.ReturnOutputs(outs);   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         return new Dinov2Embedding { Pooled = PoolNormalize(raw, dim), Tokens = tokens, Dim = dim, PatchesPerSide = side };
     }
 

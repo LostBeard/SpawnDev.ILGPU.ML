@@ -36,6 +36,7 @@ public class TextClassificationPipeline : IDisposable
         int maxLength = 128, string[]? labels = null)
     {
         _session = session;
+        _session.OutputsLiveUntilNextRun = true;   // pool-rented outputs go back at the next run (each run's are consumed before it); unflagged, every run leaked one output set (found 2026-11-06 with YOLO's per-frame leak)
         _accelerator = accelerator;
         _maxLength = maxLength;
         _labels = labels ?? new[] { "NEGATIVE", "POSITIVE" };
@@ -462,6 +463,7 @@ public class TextGenerationPipeline : IDisposable
     public TextGenerationPipeline(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
+        _session.OutputsLiveUntilNextRun = true;   // pool-rented outputs go back at the next run (each run's are consumed before it); unflagged, every run leaked one output set (found 2026-11-06 with YOLO's per-frame leak)
         _accelerator = accelerator;
     }
 

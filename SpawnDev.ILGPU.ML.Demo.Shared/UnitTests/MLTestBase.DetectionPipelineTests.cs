@@ -519,4 +519,47 @@ public abstract partial class MLTestBase
         Console.WriteLine("[YOLOv8 capture] " + report);
         return report;
     });
+
+    /// <summary>
+    /// Riker (AssistZ, RX 590, 2026-11-06): with <see cref="ObjectDetectionPipeline.EnableGraphCapture"/> OFF, Chrome's GPU memory grew ~4.3 MB per YOLOv8n
+    /// inference (65 -> 1,449 MB over 320, still rising); ON it stayed flat at ~273 MB. Here: 40 direct frames on the street sample, WebGPU's live storage +
+    /// staging bytes sampled after each (SpawnDev.ILGPU's WebGPUBufferAccounting) and BufferPool's device allocations; after 10 warm frames neither may grow
+    /// by more than one frame's input (4.9 MB) in total. On failure it names the largest creation sites.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Pipeline_YOLOv8_DirectFrames_DoNotGrowDeviceMemory() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("WebGPU's buffer accounting");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        byte[] onnxBytes, bin;
+        try { onnxBytes = await http.GetByteArrayAsync("models/yolov8n/model.onnx"); bin = await http.GetByteArrayAsync("samples/street_rgba.bin"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"YOLOv8 sample missing: {ex.Message}"); }
+        int width = BitConverter.ToInt32(bin, 0), height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+        using var pipeline = new ObjectDetectionPipeline(session, accelerator);
+        bool sitesSaved = SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.CaptureCreationSites;
+        long Live() => SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveStorageBytes + SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.LiveStagingBytes;
+        var samples = new List<(long Bytes, int Allocs)>();
+        try
+        {
+            for (int i = 0; i < 40; i++)
+            {
+                if (i == 10) SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.CaptureCreationSites = true;   // name what is created after warm-up
+                await pipeline.DetectAsync(pixels, width, height, confidenceThreshold: 0.25f);
+                await accelerator.SynchronizeAsync();
+                samples.Add((Live(), SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations));
+            }
+            long grew = samples[^1].Bytes - samples[9].Bytes;
+            int allocs = samples[^1].Allocs - samples[9].Allocs;
+            string trace = string.Join(" ", samples.Where((_, k) => k % 5 == 4).Select(x => $"{x.Bytes / 1048576.0:F1}"));
+            string sites = string.Join("; ", SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.TopCreationSites(5).Select(t => $"{t.Site} x{t.Count} {t.Bytes / 1048576.0:F1} MB"));
+            var report = $"live MiB every 5 frames: {trace}; frames 10-40 grew {grew / 1048576.0:F1} MiB, pool allocations +{allocs}; top sites: {sites}";
+            Console.WriteLine("[YOLOv8 memory] " + report);
+            if (grew > 5L * 1024 * 1024) throw new Exception("direct frames grow device memory: " + report);
+            return report;
+        }
+        finally { SpawnDev.ILGPU.WebGPU.WebGPUBufferAccounting.CaptureCreationSites = sitesSaved; }
+    });
 }

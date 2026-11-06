@@ -180,7 +180,10 @@ public sealed class ClapAudioClassifier : IDisposable
         using var idBuf = _accelerator.Allocate1D(idv);
         var outs = await _text.RunAsync(new Dictionary<string, Tensor> { [_text.InputNames[0]] = new Tensor(idBuf.View, new[] { 1, ids.Length }) })
             .ConfigureAwait(false);
-        var e = Normalize(await outs[_text.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false));
+        // the outputs are pool-rented and nothing else returns them: each uncached label leaked one set before 2026-11-06 (found with YOLO's per-frame leak)
+        float[] e;
+        try { e = Normalize(await outs[_text.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false)); }
+        finally { _text.ReturnOutputs(outs); }
         _textCache[label] = e;
         return e;
     }
@@ -201,7 +204,9 @@ public sealed class ClapAudioClassifier : IDisposable
         var outs = await _audioCapture.RunAsync(new Dictionary<string, Tensor> { [_audio.InputNames[0]] = new Tensor(_featureBuf.View, shape) })
             .ConfigureAwait(false);
         AudioTowerRuns++;
-        return Normalize(await outs[_audio.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false));
+        // a direct forward's outputs are pool-rented: returned once read (before 2026-11-06 every uncaptured event leaked one set); a replay's are the capture's
+        try { return Normalize(await outs[_audio.OutputNames[0]].Data.SubView(0, EmbedDim).CopyToHostAsync().ConfigureAwait(false)); }
+        finally { if (!_audioCapture.LastRunReplayed) _audio.ReturnOutputs(outs); }
     }
 
     /// <summary>Score a 48 kHz mono clip on the accelerator against <paramref name="labels"/>; the scores are in label order.</summary>

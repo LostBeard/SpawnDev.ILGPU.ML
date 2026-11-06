@@ -28,6 +28,7 @@ public class ObjectDetectionPipeline : IDisposable
     private readonly string[] _labels;
     private readonly int _inputSize;
     private Graph.SessionGraphCapture? _capture;
+    private ElementWiseKernels? _ew;
 
     /// <summary>
     /// Record the detector's forward once (fixed input size) and replay it per frame: a dispatch plan on WebGPU, a CUDA graph on CUDA
@@ -130,13 +131,24 @@ public class ObjectDetectionPipeline : IDisposable
         }
         else outputs = await _session.RunAsync(feeds).ConfigureAwait(false);
 
-        // Read output to CPU
+        // Read output to CPU. A direct forward's outputs are pool-rented and nothing else returns them: they go back once read. Before 2026-11-06 they
+        // were never returned, one 4 MiB head output leaked per frame (Riker, AssistZ, RX 590: Chrome's GPU memory 65 -> 1,449 MB over 320
+        // inferences; gate Pipeline_YOLOv8_DirectFrames_DoNotGrowDeviceMemory). A replay's outputs belong to the capture.
+        bool ownOutputs = !EnableGraphCapture || _capture?.LastRunReplayed != true;
         var output = outputs[_session.OutputNames[0]];
         int elems = output.ElementCount;
-        using var readBuf = _accelerator.Allocate1D<float>(elems);
-        new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
-        var outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
+        float[] outputData;
+        try
+        {
+            using var readBuf = _accelerator.Allocate1D<float>(elems);
+            (_ew ??= new ElementWiseKernels(_accelerator)).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+            await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+            outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (ownOutputs) _session.ReturnOutputs(outputs);
+        }
 
         // the head's detection count follows the input size ([1, 4 + classes, N]: 8400 at 640, 2100 at 320). It was left at Process's default of 8400,
         // so any other input size threw (Riker, AssistZ, 2026-11-06).

@@ -160,7 +160,8 @@ public class BackgroundRemovalPipeline : IDisposable
         int maskSize = output.ElementCount;
         int maskH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
         int maskW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
-        return await ApplyMaskAsync(_accelerator, rgbaPixels, output.Data.SubView(0, maskSize), maskW, maskH, width, height).ConfigureAwait(false);
+        try { return await ApplyMaskAsync(_accelerator, rgbaPixels, output.Data.SubView(0, maskSize), maskW, maskH, width, height).ConfigureAwait(false); }
+        finally { _session.ReturnOutputs(outputs); }   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
     }
 
     /// <summary>

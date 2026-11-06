@@ -104,6 +104,7 @@ public class PoseEstimationPipeline : IDisposable
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
 
         // Decode keypoints
         var keypoints = PoseSkeleton.DecodeMoveNetOutput(outputData, width, height);

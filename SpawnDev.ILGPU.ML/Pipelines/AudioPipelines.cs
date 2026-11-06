@@ -187,6 +187,7 @@ public class SpeechRecognitionPipeline : IDisposable
         _accelerator = accelerator;
         // Each decode step's present.* become the next step's past: outputs live until no run uses them.
         _decoderSession.OutputsLiveUntilNextRun = true;
+        _encoderSession.OutputsLiveUntilNextRun = true;   // pool-rented outputs go back at the next run (each run's are consumed before it); unflagged, every run leaked one output set (found 2026-11-06 with YOLO's per-frame leak)
         if (_decoderWithPastSession != null) _decoderWithPastSession.OutputsLiveUntilNextRun = true;
     }
 

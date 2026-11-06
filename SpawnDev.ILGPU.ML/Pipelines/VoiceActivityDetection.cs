@@ -234,6 +234,7 @@ public sealed class SileroVad : IDisposable
         // cost another round trip.
         CopyState(outputs, "new_h", _hBuf);
         CopyState(outputs, "new_c", _cBuf);
+        if (!_capture.LastRunReplayed) _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak); a replay's belong to the capture
 
         return prob[0];
     }

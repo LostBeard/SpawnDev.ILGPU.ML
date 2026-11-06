@@ -54,6 +54,7 @@ public class Image3DPipeline : IDisposable
         _imageTokenizer = imageTokenizer;
         _backbone = backbone;
         _postProcessor = postProcessor;
+        _imageTokenizer.OutputsLiveUntilNextRun = true; _backbone.OutputsLiveUntilNextRun = true; _postProcessor.OutputsLiveUntilNextRun = true;   // pool-rented outputs go back at the next run (each run's are consumed before it); unflagged, every run leaked one output set (found 2026-11-06 with YOLO's per-frame leak)
         _accelerator = accelerator;
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
     }

@@ -104,6 +104,7 @@ public sealed class SpeakerEmbeddingPipeline : IDisposable
         // Terminal sink: EmbeddingSize floats.
         using var host = _accelerator.Allocate1D<float>(EmbeddingSize);
         host.View.CopyFrom(embedding.Data.SubView(0, EmbeddingSize));
+        _session.ReturnOutputs(outs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         return await host.CopyToHostAsync<float>(0, EmbeddingSize).ConfigureAwait(false);
     }

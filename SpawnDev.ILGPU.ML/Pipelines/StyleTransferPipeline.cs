@@ -106,6 +106,7 @@ public class StyleTransferPipeline : IDisposable
         _postprocess ??= new Kernels.ImagePostprocessKernel(_accelerator);
         using var rgbaOutBuf = _accelerator.Allocate1D<int>(outH * outW);
         _postprocess.NCHWToRGBA(output.Data, rgbaOutBuf.View, outH, outW);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
 
         // Resize styled output back to original dimensions if different
         int finalW = width, finalH = height;
@@ -187,6 +188,7 @@ public class StyleTransferPipeline : IDisposable
         {
             using var rgbaOutBuf = _accelerator.Allocate1D<int>(outH * outW);
             _postprocess.NCHWToRGBA(output.Data, rgbaOutBuf.View, outH, outW);
+            _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
             _resize ??= new Kernels.ImageTransformKernel(_accelerator);
             // Allocate 2D output (width = X extent, height = Y extent)
             var result2D = _accelerator.Allocate2DDenseX<int>(new Index2D(finalW, finalH));
@@ -197,6 +199,7 @@ public class StyleTransferPipeline : IDisposable
 
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
         _postprocess.NCHWToRGBA(output.Data, resultBuf.View.BaseView, outH, outW);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         return (resultBuf, outW, outH);
     }

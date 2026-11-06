@@ -80,6 +80,7 @@ public class ClassificationPipeline : IDisposable
         ew.Scale(output.Data.SubView(0, numClasses), readBuf.View, numClasses, 1f);
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         var logits = await readBuf.CopyToHostAsync<float>(0, numClasses).ConfigureAwait(false);
+        _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
 
         float outputSum = logits.Sum();
         bool alreadySoftmaxed = outputSum > 0.9f && outputSum < 1.1f && logits.All(v => v >= 0f);

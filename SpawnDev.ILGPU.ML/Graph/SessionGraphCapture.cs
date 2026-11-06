@@ -98,6 +98,13 @@ public sealed class SessionGraphCapture : IDisposable
     public string CaptureStatus { get; private set; } = "not attempted";
 
     /// <summary>
+    /// True when the last <see cref="RunAsync"/> returned a recorded graph's outputs (stable buffers the capture owns: do not return them). False when it
+    /// ran the session directly (refused, observing, ineligible, disabled): those outputs are pool-rented like any <see cref="InferenceSession.RunAsync"/>
+    /// result, so the caller hands them back with <see cref="InferenceSession.ReturnOutputs"/> once consumed, or each such call leaks one output set.
+    /// </summary>
+    public bool LastRunReplayed { get; private set; }
+
+    /// <summary>
     /// The WebGPU replay's own split of the last frame - input copies, the single plan crossing, and the
     /// wait for GPU completion. Null on CUDA or before a capture is live.
     /// </summary>
@@ -119,6 +126,7 @@ public sealed class SessionGraphCapture : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
+        LastRunReplayed = false;
         bool eligible = Enabled
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
@@ -313,8 +321,8 @@ public sealed class SessionGraphCapture : IDisposable
 
         // Recorded only once a capture is live, so it describes a graph that actually exists.
         if (IsCaptured) _capturedShapes ??= shapes;
-        if (_cuda != null) return await _cuda.ReplayAsync(inputs).ConfigureAwait(false);
-        if (_webGpu != null) return await _webGpu.ReplayAsync(inputs).ConfigureAwait(false);
+        if (_cuda != null) { var r = await _cuda.ReplayAsync(inputs).ConfigureAwait(false); LastRunReplayed = true; return r; }
+        if (_webGpu != null) { var r = await _webGpu.ReplayAsync(inputs).ConfigureAwait(false); LastRunReplayed = true; return r; }
         return await _session.RunAsync(inputs).ConfigureAwait(false);   // capture unavailable - direct
     }
 

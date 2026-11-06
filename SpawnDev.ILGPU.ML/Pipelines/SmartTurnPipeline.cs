@@ -98,6 +98,7 @@ public sealed class SmartTurnPipeline : IDisposable
         // Terminal sink: one float.
         using var host = _accelerator.Allocate1D<float>(1);
         host.View.CopyFrom(probability.Data.SubView(0, 1));
+        _session.ReturnOutputs(outs);   // pool-rented outputs: returned once their last reader is queued (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         return (await host.CopyToHostAsync<float>(0, 1).ConfigureAwait(false))[0];
     }

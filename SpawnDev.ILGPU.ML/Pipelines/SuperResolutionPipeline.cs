@@ -227,6 +227,7 @@ public class SuperResolutionPipeline : IDisposable
                     tileX * scale, tileY * scale,
                     dstW, dstH);
                 await _accelerator.SynchronizeAsync();
+                _session.ReturnOutputs(outputs);   // pool-rented outputs: returned once consumed (unreturned, every call leaked one set; found 2026-11-06 with YOLO's per-frame leak)
             }
         }
 
