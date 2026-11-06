@@ -47,7 +47,7 @@ w("public struct U4 { public uint X, Y, Z, W; }")
 w("")
 w("internal static class MmaGemm")
 w("{")
-w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, V5Threads = 128, RowWords = 20;")
+w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, V5Threads = 128, V7Threads = 256, V7BM = 256, RowWords = 20;")
 w("")
 w("    private static float Activate(float v, int act)")
 w("    {")
@@ -1001,6 +1001,152 @@ kernel_packed_v6r()
 kernel_packed_v6r(acc=True)
 kernel_packed_v6r(split=True)
 kernel_packed_v6r(swiglu=True)
+
+
+def kernel_packed_v7r(acc=False, split=False, swiglu=False):
+    """KernelF16Sm75PackedV7{Acc|Split|SwiGLU} (2026-11-05): the Turing V6 with 256 x 128 block tiles (8 warps of 64 x 64, 256 threads, two
+    swizzled stages in 48 KB). MEASURED by Seven with Nsight on the RTX 2060: a 128 x 128 tile does 64 FLOP per byte it loads, so at the 2060's
+    336 GB/s with no L2 reuse between blocks it tops out near 21.5 TFLOPS: the big GEMMs ran 21 - 24, and the long-K ones (K = 14,336: down
+    forward, gate / up input gradient) 14.5, where blocks drift apart and the 3 MB L2 stops sharing their tiles. 256 x 128 does 85 FLOP per
+    byte. Same MMAs per output in the same K order: bit-identical to V5 / V6 / PackedV2. grid = ceil(M / 256) * ceil(N / 128)."""
+    mma8 = "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+    ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+    RW = 16          # words per row: 32 halves, swizzled
+    MT5, NT5 = 4, 8
+    name = f"KernelF16Sm75PackedV7{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}"
+    w(f"    /// <summary>16-bit A and W (f16): C = A W^T * sc[1]{' + D' if acc else ''}; Turing V5 (64 x 64 warp tiles, ldmatrix, register-staged double buffering). grid = ceil(M/256) * ceil(N/128), group = 256 (V7Threads). sm_75+.</summary>")
+    if swiglu:
+        w("    /// <summary>The gate | up GEMM with SwiGLU in the epilogue: W rows are gate and up interleaved in 8-row blocks (n-tile 2j = gate, 2j + 1 = up of")
+        w("    /// the same 8 columns), N = 2 Nff; writes f16 words S [M, Nff / 2] = cvt.rn(silu(g) u), the expression ActivationKernels.SwiGLUImpl computes")
+        w("    /// and the rounding FusedDequantMatMul.PackA16Impl applies: the down projection's packed input, bit-identical to the separate passes.</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, ArrayView<uint> S, int M, int K, int N)")
+    elif split:
+        w("    /// <summary>The same with the output columns split over three tensors: [0, N0) -> C [M, N0], [N0, N0 + N1) -> C1 [M, N1], the rest -> C2 [M, N - N0 - N1] (sibling projections of one input as one GEMM; N0, N1 multiples of 8).</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, FV C1, FV C2, int M, int K, int N, int N0, int N1)")
+    else:
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
+    w("    {")
+    w("        int numTilesM = (M + 255) / 256;")
+    w("        int tileRow = Grid.IdxX % numTilesM;")
+    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 1, wn = warp & 1;")
+    w("        float inv = sc[1];")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * 256 * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<uint>(2 * 128 * {RW});")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int cr = tid >> 2, cc = tid & 3;")
+    w("        // copy assignment: thread tid copies 16-byte chunk (tid & 3) of A rows (tid >> 2) + 64 i (i < 4) and B rows (tid >> 2) + 64 i (i < 2)")
+    for i in range(4):
+        w(f"        int aR{i} = tileRow * 256 + cr + {64 * i}; bool aOk{i} = aR{i} < M; long aG{i} = (long)(aOk{i} ? aR{i} : 0) * (K >> 3) + cc;")
+        w(f"        int aOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
+    for i in range(2):
+        w(f"        int bR{i} = tileCol * 128 + cr + {64 * i}; bool bOk{i} = bR{i} < N; long bG{i} = (long)(bOk{i} ? bR{i} : 0) * (K >> 3) + cc;")
+        w(f"        int bOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
+    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 64 + (lane & 7) + ((lane >> 4) << 3);")
+    w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;")
+    w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
+    w(f"        int bLd0 = rowB * {RW} + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * {RW} + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);")
+    w("        U4 zero = default;")
+
+    def load(kt_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int kq = ({kt_expr}) >> 3;")
+        for i in range(4):
+            w(f"{ind}    ra{i} = aOk{i} ? Au[aG{i} + kq] : zero;")
+        for i in range(2):
+            w(f"{ind}    rb{i} = bOk{i} ? Wu[bG{i} + kq] : zero;")
+        w(f"{ind}}}")
+
+    def store(buf_expr, ind):
+        w(f"{ind}{{")
+        w(f"{ind}    int sbA = ({buf_expr}) * 256 * {RW}, sbB = ({buf_expr}) * 128 * {RW};")
+        for (arr, r, sbn, off, cnt) in (("aS", "ra", "sbA", "aOff", 4), ("bS", "rb", "sbB", "bOff", 2)):
+            for i in range(cnt):
+                w(f"{ind}    {arr}[{sbn} + {off}{i}] = {r}{i}.X; {arr}[{sbn} + {off}{i} + 1] = {r}{i}.Y; {arr}[{sbn} + {off}{i} + 2] = {r}{i}.Z; {arr}[{sbn} + {off}{i} + 3] = {r}{i}.W;")
+        w(f"{ind}}}")
+
+    w("        U4 ra0, ra1, ra2, ra3, rb0, rb1;")
+    load("0", "        ")
+    store("0", "        ")
+    w("        Group.Barrier();")
+    w("        int cur = 0;")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    w("            bool more = kt + BK < K;")
+    w("            if (more)")
+    load("kt + BK", "            ")
+    w(f"            int soA = cur * 256 * {RW}, soB = cur * 128 * {RW};")
+    w("            for (int ks = 0; ks < 2; ks++)")
+    w("            {")
+    for mt in range(MT5):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[soA + (ks == 0 ? aLd0 : aLd1) + {mt * 16 * RW}]));')
+    for np_ in range(NT5 // 2):
+        w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[soB + (ks == 0 ? bLd0 : bLd1) + {np_ * 16 * RW}]));')
+    for mt in range(MT5):
+        for nt in range(NT5):
+            for (x0, x1, bb) in ((0, 1, 0), (2, 3, 1)):
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma8}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}{x0}, a{mt}{x1}, b{nt}{bb}, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+    w("            }")
+    w("            if (more)")
+    store("1 - cur", "            ")
+    w("            Group.Barrier();")
+    w("            cur = 1 - cur;")
+    w("        }")
+    if swiglu:
+        w("        int Nff = N >> 1;")
+        for mt in range(MT5):
+            for j in range(NT5 // 2):
+                w("        {")
+                w(f"            int m0 = tileRow * 256 + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int oc = ((tileCol * 128 + wn * 64) >> 1) + {8 * j} + 2 * t;")
+                w("            if (oc < Nff)")
+                w("            {")
+                w(f"                if (m0 < M) S[((long)m0 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}0 * inv, c{mt}{2 * j + 1}0 * inv, c{mt}{2 * j}1 * inv, c{mt}{2 * j + 1}1 * inv);")
+                w(f"                if (m1 < M) S[((long)m1 * Nff + oc) >> 1] = SwiPack(c{mt}{2 * j}2 * inv, c{mt}{2 * j + 1}2 * inv, c{mt}{2 * j}3 * inv, c{mt}{2 * j + 1}3 * inv);")
+                w("            }")
+                w("        }")
+        w("    }")
+        w("")
+        return
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w("        {")
+            w(f"            int m0 = tileRow * 256 + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * 128 + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            if split:
+                w("            if (n0 < N)")
+                w("            {")
+                w("                int seg = n0 < N0 ? 0 : (n0 < N0 + N1 ? 1 : 2);")
+                w("                int ns = seg == 0 ? N0 : (seg == 1 ? N1 : N - N0 - N1), nc = seg == 0 ? n0 : (seg == 1 ? n0 - N0 : n0 - N0 - N1);")
+                w("                var T = seg == 0 ? C : (seg == 1 ? C1 : C2);")
+                w(f"                if (m0 < M) {{ T[(long)m0 * ns + nc] = c{mt}{nt}0 * inv; if (n1 < N) T[(long)m0 * ns + nc + 1] = c{mt}{nt}1 * inv; }}")
+                w(f"                if (m1 < M) {{ T[(long)m1 * ns + nc] = c{mt}{nt}2 * inv; if (n1 < N) T[(long)m1 * ns + nc + 1] = c{mt}{nt}3 * inv; }}")
+                w("            }")
+            elif acc:
+                w(f"            if (m0 < M) {{ if (n0 < N) {{ long i = (long)m0 * N + n0; C[i] = c{mt}{nt}0 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m0 * N + n1; C[i] = c{mt}{nt}1 * inv + D[i]; }} }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) {{ long i = (long)m1 * N + n0; C[i] = c{mt}{nt}2 * inv + D[i]; }} if (n1 < N) {{ long i = (long)m1 * N + n1; C[i] = c{mt}{nt}3 * inv + D[i]; }} }}")
+            else:
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0 * inv; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1 * inv; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2 * inv; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3 * inv; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+kernel_packed_v7r()
+kernel_packed_v7r(acc=True)
+kernel_packed_v7r(split=True)
+kernel_packed_v7r(swiglu=True)
+
+
 
 
 def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False):
