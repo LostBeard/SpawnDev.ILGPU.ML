@@ -40,7 +40,7 @@ You hand it a model file. It detects the format, builds a graph, optimizes it an
 - **200+ ONNX operators**, a graph optimizer (constant folding, fusion, strength reduction, dead-node elimination) and fused kernels for linear layers, attention, quantized matmul and more.
 - **Generative models, ported and checked.** FLUX 3 Image Klein, FLUX.2 klein, Stable Diffusion 1.x / 2.x / SDXL (LoRA, ControlNet, ComfyUI's UNet patches, ToMe and ToDo), SD-Turbo, LTX-Video and Wan 2.2 (text, picture, keyframes and story to video), TRELLIS.2 (text and image to textured 3D), SkinTokens and UniRig (auto-rigging), Kimodo (character animation). Stages are gated against the reference implementations.
 - **Language and speech.** Quantized GGUF LLMs with KV-cache decode and TurboQuant cache compression, Whisper speech-to-text, Kokoro and ZipVoice text-to-speech with voice cloning.
-- **Training, not only inference.** LoRA fine-tuning of GGUF language models on the device (llama3.1:8b on a 12 GB card), with adapters in PEFT's format and a step checked against PyTorch ([training.md](Docs/training.md)); backpropagation, SGD and Adam as GPU kernels for small networks, trainable in a browser tab.
+- **Training, not only inference.** LoRA fine-tuning of GGUF language models on the device (llama3.1:8b on a 12 GB card), with adapters in PEFT's format and a step checked against PyTorch: 1.78 s per 1,600-token step on an RTX 4070, 4.53 s on an RTX 2060, on tensor cores ([training.md](Docs/training.md)); backpropagation, SGD and Adam as GPU kernels for small networks, trainable in a browser tab.
 - **Zero-copy by design.** Pixels, activations and weights stay on the GPU. In the browser, bulk data streams from `fetch` and OPFS straight into GPU buffers without touching the .NET heap.
 - **Trim and AOT safe.** The trim analyzer runs on every build of the library.
 
@@ -248,6 +248,7 @@ Measured on an RTX 4070 12 GB, models cached. Full methodology and the other num
 | Wan 2.2, 640x352, 17 frames, 50 steps | CUDA | 75 s, 54 s with MagCache | [video.md](Docs/video.md) |
 | Stable Diffusion 1.5, one 1024 px UNet step | CUDA | 606 ms, 294 ms with ToDo | [stable-diffusion.md](Docs/stable-diffusion.md) |
 | Auto-rig a character (SkinTokens) | CUDA | about 6 s | [rigging.md](Docs/rigging.md) |
+| LoRA training step, llama3.1:8b Q4_K_M, 1,600 tokens | CUDA | 1.78 s (4.53 s on an RTX 2060) | [training.md](Docs/training.md) |
 
 Correctness comes first: kernels are checked against CPU references, vision and language models against ONNX Runtime outputs, and the generative models stage by stage against their reference PyTorch implementations (for example SkinTokens: 295 of 296 generated tokens identical, skin weights within 5.7e-5).
 
@@ -293,12 +294,14 @@ Self-contained projects under [`Examples/`](Examples/README.md), each runnable w
 | [Operators](Docs/operators.md) | ONNX operator support and implementation tiers |
 | [TRELLIS.2](Docs/trellis2.md) | Text and image to 3D: pipeline, API, browser design, numbers |
 | [FLUX 3 Image Klein](Docs/flux3.md) / [FLUX.2 klein](Docs/flux2.md) | Image generation and reference editing |
-| [Training](Docs/training.md) | LoRA fine-tuning of GGUF language models, adapters at inference, the gates |
+| [Training](Docs/training.md) | LoRA fine-tuning of GGUF language models, adapters at inference, the gates, speed |
+| [Many answers, one vote](Docs/test-time-search.md) | Batched decode of N answers and the majority vote (self-consistency) |
 | [Stable Diffusion](Docs/stable-diffusion.md) | SD 1.x / 2.x / SDXL checkpoints, LoRA, ControlNet, ComfyUI's patches, token merging |
 | [Video generation](Docs/video.md) | LTX-Video and Wan 2.2: the /video studio, story writer and narration, MagCache, parity and numbers |
 | [Rigging and animation](Docs/rigging.md) | SkinTokens, UniRig, Kimodo retargeting |
 | [Asset generation](Docs/assetgen.md) / [Scenes](Docs/scenes.md) | Prompt to character, sentence to scene |
 | [System One](Docs/system-one.md) | Typed decision heads |
+| [Testing on another machine](Docs/testing-on-another-machine.md) | Running the test suite on another PC and what a useful report holds |
 | [Changelog](CHANGELOG.md) | Every release, in detail |
 
 ## Build and test

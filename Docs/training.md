@@ -111,7 +111,7 @@ Each fast path has a switch for A/B:
 | Tool | What it does |
 |------|--------------|
 | `tools/TrainLoraJsonl` | Trains on JSONL lines (`prompt_ids`, `target_ids`, `end_of_turn_ids` or `--eot`, `split` train / dev, optional `id` and `expected_tool`), saves the adapter, then generates on the dev split base vs adapter (exact match, and tool choice when lines carry `expected_tool`). `--rank --alpha --lr --accum --epochs --targets --max-len --checkpoint --no-dev-loss --eval-only --engine --exclude-source --progress --save-every --gpu-share --dry-run` |
-| `tools/TrainLoraProbe` | One step at a chosen length: time, memory, gradient check, `--profile` per op, `--no-tc` / `--no-gemm-attn` / `--no-tc-attn` / `--no-flash-attn` for the A/B |
+| `tools/TrainLoraProbe` | One step at a chosen length: time, memory, gradient check, `--profile` per op (with `GGUF_KERNEL_TIMING=1`, per piece inside the GEMM ops), `--seq --steps --rank --targets --checkpoint --labeled N --live --opencl`; for the A/B `--no-tc` / `--no-gemm-attn` / `--no-tc-attn` / `--no-flash-attn` / `--no-group` / `--no-fused-lora` / `--no-sums` / `--no-scratch` |
 | `tools/LoraDecodeBench` | Decode speed and time to first token, base vs adapter (`--unfused`, `--no-prefill-gemm`) |
 | `tools/TrainTinyLora`, `tools/TrainLoraCurve` | The small reference runs behind the gates above |
 
