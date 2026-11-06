@@ -249,6 +249,8 @@ Measured on an RTX 4070 12 GB, models cached. Full methodology and the other num
 | Stable Diffusion 1.5, one 1024 px UNet step | CUDA | 606 ms, 294 ms with ToDo | [stable-diffusion.md](Docs/stable-diffusion.md) |
 | Auto-rig a character (SkinTokens) | CUDA | about 6 s | [rigging.md](Docs/rigging.md) |
 | LoRA training step, llama3.1:8b Q4_K_M, 1,600 tokens | CUDA | 1.78 s (4.53 s on an RTX 2060) | [training.md](Docs/training.md) |
+| LLM decode, qwen3:1.7b Q8_0, short prompt | Chrome, WebGPU | 166 tok/s | [CHANGELOG 5.8.6](CHANGELOG.md) |
+| The same model, same GGUF file, against Ollama 0.34.4 (191 tok/s) | CUDA | 165 tok/s; prefill 7,478 tok/s at 1,830 tokens (Ollama 16,141) | [CHANGELOG 5.8.4](CHANGELOG.md) |
 
 Correctness comes first: kernels are checked against CPU references, vision and language models against ONNX Runtime outputs, and the generative models stage by stage against their reference PyTorch implementations (for example SkinTokens: 295 of 296 generated tokens identical, skin weights within 5.7e-5).
 
