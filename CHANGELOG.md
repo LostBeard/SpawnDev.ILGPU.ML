@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.5 - 2026-11-06 (nuget.org) - in-place LoRA change fix for recorded decode steps; Q6_K vector GEMV
+
+Stable. Full sweep 7,546 passed, 0 failed. On SpawnDev.ILGPU 5.4.16 and SpawnDev.SpawnJS 3.0.8. Confirmed on the consumer side by Data (SpawnDev.AI
+lora-test on CUDA 10/10 with the graph on; the OpenCL session engine's one differing line is a near-tie: syn-30 step 3, logits 11.40754 vs 11.39705).
+
 - **Fix: in-place LoRA changes on a decoder with recorded decode steps** (found by Data, SpawnDev.AI lora-test on 5.8.4): `GgufBatchDecoder.Lora`
   reset the prefix cache but not the recorded steps, so a CUDA graph or WebGPU plan kept replaying the previous adapter set's kernels and buffers
   (Data: 2 of 24 greedy tokens right after `Lora = null`; the WebGPU plans had the same bug since adapters at inference shipped). The setter now drops

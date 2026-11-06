@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.5-local.1</Version>
-		<PackageReleaseNotes>v5.8.4 - GGUF decode about 2x faster on CUDA for Q8_0 models (qwen3:1.7b on an RTX 4070: 80 -> 165 tok/s; vector Q8_0 / F16 GEMVs, faster decode attention, CUDA-graph decode steps, Q8_0 prefill on tensor cores 1,265 -> 7,478 tok/s); a per-run output leak fixed in 23 pipelines (YOLO grew GPU memory ~4 MB per frame); ObjectDetectionPipeline at any input size and opt-in EnableGraphCapture (RX 590: 129 -> 55 ms a frame); Turing V6 / V7 GEMMs for LoRA training. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.5</Version>
+		<PackageReleaseNotes>v5.8.5 - fix: changing GgufBatchDecoder.Lora in place now drops recorded decode steps (CUDA graphs and WebGPU plans kept replaying the old adapter set); a Q6_K vector decode GEMV (Q4_K_M models: qwen3:1.7b CUDA decode 181 -> 190 tok/s). Since 5.8.4: GGUF decode about 2x faster on CUDA for Q8_0 (80 -> 165 tok/s on an RTX 4070), Q8_0 prefill on tensor cores, a per-run output leak fixed in 23 pipelines, ObjectDetectionPipeline at any input size with opt-in EnableGraphCapture. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
