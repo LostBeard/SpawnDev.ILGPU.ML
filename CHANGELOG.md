@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- `GgufBatchDecoder.ProfileRecordedStepAsync()` (WebGPU diagnostic): the last recorded decode step's GPU floor and per-kernel GPU ms (timestamped replay),
+  and `Bench_Qwen3_1_7B_WebGPU_DecodeStepProfile`. MEASURED (Chrome, RTX 4070, Qwen3-1.7B Q8_0, 5.8.5): decode 147.4 tok/s = 6.78 ms a token against
+  6.53 ms of GPU time (345 dispatches), so browser decode is GPU-bound (AOT would not move it). The Q8_0 GEMVs are 5.16 ms of it (79%, ~355 GB/s of the
+  4070's ~504; the LM head 0.92 ms), attention 0.53 ms (1.21 ms at an 1,826-token prompt), the norms 0.40 ms. `GemvQ8_0VecImpl` on WebGPU: 5.94 ms
+  (slower; stays off there).
+
 ## 5.8.5 - 2026-11-06 (nuget.org) - in-place LoRA change fix for recorded decode steps; Q6_K vector GEMV
 
 Stable. Full sweep 7,546 passed, 0 failed. On SpawnDev.ILGPU 5.4.16 and SpawnDev.SpawnJS 3.0.8. Confirmed on the consumer side by Data (SpawnDev.AI

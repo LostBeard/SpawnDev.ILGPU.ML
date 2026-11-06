@@ -590,6 +590,23 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly Dictionary<(int R, float T, bool Dev, bool Pen), StepPlan> _plans = new();
     // the drawn steps run the penalty kernel (Draw with a penalty other than 1); off, it is not dispatched at all (WebGPU pays per dispatch)
     private bool _penOn;
+    private SpawnDev.ILGPU.WebGPU.WebGPUDispatchPlan? _lastReplayedPlan;
+
+    /// <summary>
+    /// Diagnostic (WebGPU): re-runs the most recently replayed decode-step plan <paramref name="replays"/> times (the per-token GPU floor, ms) and once
+    /// with timestamps (<see cref="SpawnDev.ILGPU.WebGPU.WebGPUDispatchPlan.ReplayTimedAsync"/>: GPU ms by kernel label, JSON). Null when no plan has
+    /// replayed. ⚠️ Each replay rewrites the K/V row of the last step's position from the newest drawn token: call it after a generation, not between steps.
+    /// </summary>
+    public async Task<(double FloorMs, string Attribution)?> ProfileRecordedStepAsync(int replays = 20)
+    {
+        var plan = _lastReplayedPlan;
+        if (plan == null) return null;   // (a plan replaced by a recapture is disposed: its replay throws ObjectDisposedException)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int r = 0; r < replays; r++) { await plan.ReplayAsync().ConfigureAwait(false); await _acc.SynchronizeAsync().ConfigureAwait(false); }
+        double floor = sw.Elapsed.TotalMilliseconds / replays;
+        return (floor, await plan.ReplayTimedAsync().ConfigureAwait(false));
+    }
+
     /// <summary>Diagnostics: decode steps replayed from a captured plan, and plans captured, since the decoder was created.</summary>
     public (int Replays, int Captures) CaptureStats { get; private set; }
 
@@ -601,6 +618,7 @@ public sealed class GgufBatchDecoder : IDisposable
             _posBuf!.View.SubView(0, 1).CopyFromCPU(new[] { p });            // the kernels read the position from this buffer
             foreach (var (snap, ofs, v0, slope) in sp.Patches) sp.Plan.PatchScalarInt(snap, ofs, v0 + slope * (p - sp.P0));   // none left now; kept for any scalar that carries it
             await sp.Plan.ReplayAsync().ConfigureAwait(false);
+            _lastReplayedPlan = sp.Plan;
             CaptureStats = (CaptureStats.Replays + 1, CaptureStats.Captures);
             return (sp.Logits, sp.Cand, sp.OutRows);
         }

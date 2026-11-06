@@ -1,0 +1,68 @@
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Pipelines;
+using SpawnDev.ILGPU.ML.Preprocessing;
+using SpawnDev.UnitTesting;
+using System.Diagnostics;
+using System.Text.Json;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+
+public abstract partial class MLTestBase
+{
+    /// <summary>
+    /// A measurement, not a gate: where a WebGPU decode token's GPU time goes, for SpawnDev.AI's chat model (Qwen3-1.7B Q8_0) on the batch decoder (captured
+    /// steps). After 64 greedy tokens from a short prompt and again after an ~1,830-token prompt: the recorded step's per-token GPU floor (plain replays) and its
+    /// per-kernel GPU ms (timestamped replay; PMT's Chrome has --enable-webgpu-developer-features, so timestamps are not quantized). Prints
+    /// <c>[Benchmark] WebGPUDecodeProfile ...</c> (PMT_CONSOLE_LOG=WebGPUDecodeProfile). Added 2026-11-06: the CUDA decode wins did not carry over to WebGPU.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Bench_Qwen3_1_7B_WebGPU_DecodeStepProfile() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("WebGPU dispatch-plan timestamps");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var m = await hub.OpenAsync("Qwen/Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q8_0.gguf", deselect: false);
+        await using (m.Stream)
+        {
+            var gguf = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(m.Stream);
+            var tok = SentencePieceTokenizer.FromGGUF(gguf)!;
+            m.Stream.Seek(0, SeekOrigin.Begin);
+            using var gen = await GgufGenerator.CreateAsync(accelerator, m.Stream, 4096, gguf);
+            var dec = gen.BatchDecoder ?? throw new Exception($"expected the batch decoder, got {gen.Engine}");
+            bool prefixSaved = GgufGenerator.EnablePrefixCache;
+            GgufGenerator.EnablePrefixCache = false;
+            var report = new List<string>();
+            try
+            {
+                string filler = string.Join(" ", Enumerable.Range(0, 1800).Select(i => new[] { "the", "keeper", "watched", "storm", "light", "over", "grey", "water" }[i % 8])) + "\n\n";
+                bool q8WebSaved = Kernels.FusedDequantMatMul.Q8VecWebGPU;
+                // arms: the defaults at both lengths, then the Q8_0 vector GEMV switched on (Q8VecWebGPU) at the short prompt
+                foreach (var (label, text, q8vec) in new[] { ("short", "Write a long story about a lighthouse keeper and a storm.", q8WebSaved),
+                    ("long", filler + "Write a long story about a lighthouse keeper and a storm.", q8WebSaved), ("short q8vec", "Write a long story about a lighthouse keeper and a storm.", !q8WebSaved) })
+                {
+                    Kernels.FusedDequantMatMul.Q8VecWebGPU = q8vec;
+                    dec.InvalidateCapturedSteps();
+                    var (ids, stops) = ChatTemplates.BuildChatPrompt(gguf, tok, new List<(string, string)> { ("user", text) }, thinking: false);
+                    var sw = Stopwatch.StartNew(); double firstMs = -1;
+                    var res = await gen.GenerateAsync(ids, new GenerationConfig { Strategy = "greedy", MaxNewTokens = 64 }, stopTokenIds: stops,
+                        onDelta: _ => { if (firstMs < 0) firstMs = sw.Elapsed.TotalMilliseconds; return Task.CompletedTask; });
+                    double rate = (res.GeneratedTokens - 1) / ((sw.Elapsed.TotalMilliseconds - firstMs) / 1000.0);
+                    var prof = await dec.ProfileRecordedStepAsync(20) ?? throw new Exception("no recorded decode step replayed");
+                    using var doc = JsonDocument.Parse(prof.Attribution);
+                    var root = doc.RootElement;
+                    string head = $"{label} prompt ({ids.Length} tokens): decode {rate:F1} tok/s ({1000.0 / rate:F2} ms a token); recorded step GPU floor {prof.FloorMs:F2} ms";
+                    if (root.TryGetProperty("totalMs", out var tot)) head += $", timestamped total {tot.GetDouble():F2} ms over {root.GetProperty("ops").GetInt32()} dispatches";
+                    Console.WriteLine($"[Benchmark] WebGPUDecodeProfile {head}");
+                    report.Add(head);
+                    if (root.TryGetProperty("kernels", out var ks))
+                        foreach (var k in ks.EnumerateArray().Take(14))
+                            Console.WriteLine($"[Benchmark] WebGPUDecodeProfile   {label}: {k.GetProperty("ms").GetDouble(),7:F3} ms x{k.GetProperty("count").GetInt32(),3} (max {k.GetProperty("maxMs").GetDouble():F3})  {k.GetProperty("label").GetString()}");
+                    else Console.WriteLine($"[Benchmark] WebGPUDecodeProfile   {label}: {prof.Attribution}");
+                }
+            }
+            finally { GgufGenerator.EnablePrefixCache = prefixSaved; Kernels.FusedDequantMatMul.Q8VecWebGPU = false; }
+            return string.Join("; ", report);
+        }
+    });
+}
