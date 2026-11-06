@@ -21,6 +21,9 @@ public class TrainableModel : IDisposable
     private readonly List<Layer> _layers = new();
     private bool _built;
     private int _maxBatch;
+    private bool _adam;
+    private float _beta1 = 0.9f, _beta2 = 0.999f;
+    private int _adamStep;
 
     // Persistent train/predict scratch — never allocated per step.
     private MemoryBuffer1D<float, Stride1D.Dense>? _inputBuf;
@@ -56,6 +59,22 @@ public class TrainableModel : IDisposable
         return this;
     }
 
+    /// <summary>
+    /// Train with Adam (bias-corrected, epsilon 1e-8) instead of plain SGD: the learning rate passed to the train step is Adam's step size.
+    /// Adam keeps two moment buffers per parameter. Call before <see cref="Build"/>.
+    /// </summary>
+    public TrainableModel UseAdam(float beta1 = 0.9f, float beta2 = 0.999f)
+    {
+        if (_built) throw new InvalidOperationException("Call UseAdam before Build().");
+        _adam = true;
+        _beta1 = beta1;
+        _beta2 = beta2;
+        return this;
+    }
+
+    /// <summary>True when <see cref="UseAdam"/> was called.</summary>
+    public bool UsesAdam => _adam;
+
     /// <summary>Allocate GPU buffers and initialize weights.</summary>
     public void Build(int maxBatchSize = 32)
     {
@@ -64,7 +83,7 @@ public class TrainableModel : IDisposable
         _maxBatch = maxBatchSize;
         var rng = new Random(42);
         foreach (var layer in _layers)
-            layer.Allocate(_accelerator, maxBatchSize, rng, _elementWise);
+            layer.Allocate(_accelerator, maxBatchSize, rng, _elementWise, _adam);
 
         _inputBuf = _accelerator.Allocate1D<float>(maxBatchSize * InputSize);
         _targetBuf = _accelerator.Allocate1D<int>(maxBatchSize);
@@ -148,8 +167,9 @@ public class TrainableModel : IDisposable
         for (int i = _layers.Count - 1; i >= 0; i--)
             gradCurrent = _layers[i].Backward(_kernels, _accelerator, gradCurrent, batchSize);
 
+        if (_adam) _adamStep++;
         foreach (var layer in _layers)
-            layer.UpdateWeights(_kernels, learningRate);
+            layer.UpdateWeights(_kernels, learningRate, _adam, _beta1, _beta2, _adamStep);
     }
 
     /// <summary>Drain pending GPU work without host readback.</summary>
@@ -309,10 +329,10 @@ public class TrainableModel : IDisposable
     private abstract class Layer : IDisposable
     {
         public abstract int ParameterCount { get; }
-        public abstract void Allocate(Accelerator accelerator, int maxBatch, Random rng, ElementWiseKernels ew);
+        public abstract void Allocate(Accelerator accelerator, int maxBatch, Random rng, ElementWiseKernels ew, bool adam);
         public abstract ArrayView1D<float, Stride1D.Dense> Forward(TrainingKernels k, Accelerator acc, ArrayView1D<float, Stride1D.Dense> input, int batch);
         public abstract ArrayView1D<float, Stride1D.Dense> Backward(TrainingKernels k, Accelerator acc, ArrayView1D<float, Stride1D.Dense> gradOutput, int batch);
-        public abstract void UpdateWeights(TrainingKernels k, float lr);
+        public abstract void UpdateWeights(TrainingKernels k, float lr, bool adam, float beta1, float beta2, int step);
         public abstract void Dispose();
         public virtual Task AppendWeightsAsync(List<float> dst) => Task.CompletedTask;
         public virtual void LoadWeights(ReadOnlySpan<float> src, ref int offset) { }
@@ -327,6 +347,7 @@ public class TrainableModel : IDisposable
         private MemoryBuffer1D<float, Stride1D.Dense>? _bias;
         private MemoryBuffer1D<float, Stride1D.Dense>? _gradWeight;
         private MemoryBuffer1D<float, Stride1D.Dense>? _gradBias;
+        private MemoryBuffer1D<float, Stride1D.Dense>? _mWeight, _vWeight, _mBias, _vBias;
         private MemoryBuffer1D<float, Stride1D.Dense>? _output;
         private MemoryBuffer1D<float, Stride1D.Dense>? _gradInput;
         private ArrayView1D<float, Stride1D.Dense> _savedInput;
@@ -334,8 +355,16 @@ public class TrainableModel : IDisposable
         public LinearLayer(int inF, int outF) { _inF = inF; _outF = outF; }
         public override int ParameterCount => _inF * _outF + _outF;
 
-        public override void Allocate(Accelerator acc, int maxBatch, Random rng, ElementWiseKernels ew)
+        public override void Allocate(Accelerator acc, int maxBatch, Random rng, ElementWiseKernels ew, bool adam)
         {
+            if (adam)
+            {
+                // uploaded zeros: a fresh allocation is not zero on every backend
+                _mWeight = acc.Allocate1D(new float[_inF * _outF]);
+                _vWeight = acc.Allocate1D(new float[_inF * _outF]);
+                _mBias = acc.Allocate1D(new float[_outF]);
+                _vBias = acc.Allocate1D(new float[_outF]);
+            }
             float std = MathF.Sqrt(2f / _inF);
             var wData = new float[_inF * _outF];
             for (int i = 0; i < wData.Length; i++)
@@ -366,8 +395,14 @@ public class TrainableModel : IDisposable
             return _gradInput!.View.SubView(0, batch * _inF);
         }
 
-        public override void UpdateWeights(TrainingKernels k, float lr)
+        public override void UpdateWeights(TrainingKernels k, float lr, bool adam, float beta1, float beta2, int step)
         {
+            if (adam)
+            {
+                k.AdamUpdate(_weight!.View, _gradWeight!.View, _mWeight!.View, _vWeight!.View, _inF * _outF, lr, beta1, beta2, step);
+                k.AdamUpdate(_bias!.View, _gradBias!.View, _mBias!.View, _vBias!.View, _outF, lr, beta1, beta2, step);
+                return;
+            }
             k.SGDUpdate(_weight!.View, _gradWeight!.View, _inF * _outF, lr);
             k.SGDUpdate(_bias!.View, _gradBias!.View, _outF, lr);
         }
@@ -378,6 +413,10 @@ public class TrainableModel : IDisposable
             _bias?.Dispose();
             _gradWeight?.Dispose();
             _gradBias?.Dispose();
+            _mWeight?.Dispose();
+            _vWeight?.Dispose();
+            _mBias?.Dispose();
+            _vBias?.Dispose();
             _output?.Dispose();
             _gradInput?.Dispose();
         }
@@ -432,7 +471,7 @@ public class TrainableModel : IDisposable
 
         public override int ParameterCount => 0;
 
-        public override void Allocate(Accelerator acc, int maxBatch, Random rng, ElementWiseKernels ew)
+        public override void Allocate(Accelerator acc, int maxBatch, Random rng, ElementWiseKernels ew, bool adam)
         {
             _ew = ew;
         }
@@ -466,7 +505,7 @@ public class TrainableModel : IDisposable
             return _gradInput!.View.SubView(0, size);
         }
 
-        public override void UpdateWeights(TrainingKernels k, float lr) { }
+        public override void UpdateWeights(TrainingKernels k, float lr, bool adam, float beta1, float beta2, int step) { }
 
         public override void Dispose()
         {

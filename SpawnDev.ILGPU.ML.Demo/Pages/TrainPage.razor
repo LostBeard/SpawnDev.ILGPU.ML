@@ -1,13 +1,15 @@
 @page "/train"
 @using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Demo.Shared.Games.DrawToLearn
 @using SpawnDev.SpawnJS
 @using SpawnDev.SpawnJS.JSObjects
+@using global::ILGPU.Runtime
 @implements IDisposable
 
-<PageTitle>Draw to Learn — SpawnDev.ILGPU.ML</PageTitle>
+<PageTitle>Draw to Learn - SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Draw to Learn"
-            Description="Train a classifier in your browser. Draw samples, train on GPU, classify in real-time. Most ML engines only predict — ours learns."
+            Description="Teach a neural network your own shapes in a few seconds. Draw a few examples of each, train it on your GPU, then draw something new and it tells you what it is. Training runs in this tab: nothing leaves your device."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -17,11 +19,11 @@
 
     <div class="train-instructions">
         <div class="step-badges">
-            <span class="step-badge @(_step >= 1 ? "done" : "")">1. Draw Samples</span>
+            <span class="step-badge @(_step >= 1 ? "done" : "")">1. Draw examples</span>
             <span class="step-arrow">&rarr;</span>
             <span class="step-badge @(_step >= 2 ? "done" : "")">2. Train</span>
             <span class="step-arrow">&rarr;</span>
-            <span class="step-badge @(_step >= 3 ? "done" : "")">3. Classify</span>
+            <span class="step-badge @(_step >= 3 ? "done" : "")">3. Draw something new</span>
         </div>
     </div>
 
@@ -34,75 +36,91 @@
                     <button class="class-select-btn" @onclick="() => _selectedClass = cls.Name">
                         <span class="class-color" style="background: @cls.Color;"></span>
                         <span class="class-name">@cls.Name</span>
-                        <span class="class-count">@cls.SampleCount samples</span>
+                        <span class="class-count">@cls.Samples.Count</span>
                     </button>
-                    <button class="class-delete-btn" @onclick="() => RemoveClass(cls.Name)" title="Remove class">&times;</button>
+                    <button class="class-delete-btn" @onclick="() => RemoveClass(cls.Name)" title="Remove class" disabled="@_isRunning">&times;</button>
                 </div>
             }
             <div class="add-class-row">
-                <input type="text" class="add-class-input" @bind="_newClassName" placeholder="New class name" />
-                <button class="add-class-btn" @onclick="AddClass">+</button>
+                <input type="text" class="add-class-input" @bind="_newClassName" @bind:event="oninput" @onkeydown="AddClassOnEnter" placeholder="New class name" maxlength="24" />
+                <button class="add-class-btn" @onclick="AddClass" disabled="@_isRunning">+</button>
             </div>
         </div>
 
         <div class="canvas-panel">
             <div class="drawing-canvas">
                 <canvas @ref="_canvasRef" width="280" height="280" class="draw-surface"
-                        @onmousedown="StartDrawing"
-                        @onmousemove="Draw"
-                        @onmouseup="StopDrawing"
-                        @onmouseleave="StopDrawing"
-                        style="background: black; cursor: crosshair;"></canvas>
+                        @onpointerdown="StartDrawing"
+                        @onpointermove="Draw"
+                        @onpointerup="StopDrawing"
+                        @onpointerleave="StopDrawing"
+                        @onpointercancel="StopDrawing"></canvas>
             </div>
             <div class="canvas-actions">
-                <button class="canvas-btn" @onclick="SaveSample" disabled="@(string.IsNullOrEmpty(_selectedClass))">
-                    Save to "@_selectedClass"
+                <button class="canvas-btn" @onclick="SaveSample" disabled="@(string.IsNullOrEmpty(_selectedClass) || _isRunning)">
+                    Add to "@_selectedClass"
                 </button>
-                <button class="canvas-btn canvas-btn-clear" @onclick="ClearCanvas">Clear</button>
+                <button class="canvas-btn canvas-btn-clear" @onclick="ClearCanvasAndPrediction">Clear</button>
             </div>
         </div>
 
         <div class="results-panel">
-            @if (_step >= 2 && _trainingProgress < 100)
+            @if (_isRunning)
             {
-                <h3 class="panel-title">Training</h3>
+                <h3 class="panel-title">Training on @_selectedBackend</h3>
                 <div class="training-progress">
                     <div class="progress-bar">
-                        <div class="progress-fill" style="width: @_trainingProgress%;"></div>
+                        <div class="progress-fill" style="width: @_trainingProgress.ToString("F0")%;"></div>
                     </div>
-                    <span class="progress-text">Epoch @_currentEpoch / @_totalEpochs</span>
+                    <span class="progress-text">Step @_currentStep / @DrawToLearn.Steps</span>
                     <span class="progress-text">Loss: @_currentLoss.ToString("F4")</span>
                 </div>
             }
             else if (_step >= 3)
             {
-                <h3 class="panel-title">Prediction</h3>
-                <ConfidenceBars Predictions="@_predictions" MaxItems="@_classes.Count" />
+                <h3 class="panel-title">What it sees</h3>
+                @if (_predictions == null)
+                {
+                    <p class="hint">Draw a shape and lift the pen.</p>
+                }
+                else
+                {
+                    <ConfidenceBars Predictions="@_predictions" MaxItems="@_classes.Count" />
+                }
+                <p class="train-stats">Trained on @_trainedOn drawings (@(_trainedOn * DrawToLearn.CopiesPerDrawing) with the augmented copies) in @_trainMs.ToString("F0") ms, final loss @_currentLoss.ToString("F4").</p>
             }
             else
             {
-                <h3 class="panel-title">How It Works</h3>
+                <h3 class="panel-title">How it works</h3>
                 <ol class="how-it-works">
-                    <li>Add 2+ classes (e.g., "Circle", "Square")</li>
-                    <li>Draw 10-20 samples per class</li>
-                    <li>Click "Train" — GPU trains a small neural network</li>
-                    <li>Draw something new — the model classifies it live</li>
+                    <li>Pick a class, draw it, press "Add". @MinPerClass or more of each class; vary them a little.</li>
+                    <li>Train: a small neural network learns from your drawings on your GPU.</li>
+                    <li>Draw something new: lifting the pen shows what the network thinks it is.</li>
                 </ol>
+                <p class="hint">Add your own classes: letters, digits, arrows, smileys.</p>
             }
         </div>
     </div>
 
     <div class="train-actions">
-        @if (_step == 1 && TotalSamples >= 4)
+        <button class="run-btn" @onclick="StartTraining" disabled="@(!CanTrain || _isRunning)">
+            @(_step >= 3 ? "Retrain" : "Train") on @_selectedBackend (@TotalSamples drawings, @_classes.Count classes)
+        </button>
+        @if (!CanTrain && !_isRunning)
         {
-            <button class="run-btn" @onclick="StartTraining">
-                Train on GPU (@TotalSamples samples, @_classes.Count classes)
-            </button>
+            <span class="hint inline">@TrainHint</span>
+        }
+        @if (_error != null)
+        {
+            <div class="train-error">@_error</div>
         }
     </div>
 
     <div class="train-note">
-        This demo uses SpawnDev.ILGPU's GPU compute to run backpropagation directly in the browser. No server, no cloud — your drawings and model stay on your device. This proves the engine supports training, not just inference.
+        Each drawing is cropped to its strokes, scaled to 28 x 28 and slightly blurred, then trained along with @(DrawToLearn.CopiesPerDrawing - 1) rotated, stretched and shifted copies.
+        A 784-@DrawToLearn.Hidden-N network trains for @DrawToLearn.Steps Adam steps with every kernel (forward, backward, optimizer) running on the selected backend.
+        On held-out drawings it classifies 95 to 99% correctly from six examples per class (test <code>Training_DrawToLearn_ClassifiesNewDrawings</code>).
+        For training at scale, see LoRA fine-tuning of 8B language models in <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML/blob/master/Docs/training.md" target="_blank">training.md</a>.
     </div>
 
     <PrivacyBadge />
@@ -113,7 +131,7 @@
 
 <style>
     .train-instructions { margin-bottom: 1rem; }
-    .step-badges { display: flex; align-items: center; gap: 0.5rem; }
+    .step-badges { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
     .step-badge { padding: 0.3rem 0.7rem; border-radius: 12px; font-size: 0.8rem; font-weight: 600; background: rgba(255,255,255,0.05); color: #64748b; border: 1px solid rgba(255,255,255,0.08); }
     .step-badge.done { background: rgba(52,211,153,0.1); color: #34d399; border-color: rgba(52,211,153,0.25); }
     .step-arrow { color: #475569; }
@@ -122,136 +140,197 @@
 
     .panel-title { color: #f1f5f9; font-size: 0.95rem; font-weight: 600; margin-bottom: 0.75rem; }
 
-    .classes-panel { }
     .class-row { display: flex; align-items: center; margin-bottom: 0.3rem; }
     .class-row.selected .class-select-btn { background: rgba(139,92,246,0.15); border-color: rgba(139,92,246,0.3); }
     .class-select-btn { flex: 1; display: flex; align-items: center; gap: 0.4rem; padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); color: #e2e8f0; font-size: 0.82rem; cursor: pointer; }
     .class-select-btn:hover { background: rgba(255,255,255,0.06); }
     .class-color { width: 12px; height: 12px; border-radius: 3px; }
-    .class-name { flex: 1; }
+    .class-name { flex: 1; text-align: left; }
     .class-count { color: #64748b; font-size: 0.72rem; font-family: monospace; }
     .class-delete-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 1rem; padding: 0.2rem; }
     .class-delete-btn:hover { color: #f87171; }
     .add-class-row { display: flex; gap: 0.3rem; margin-top: 0.5rem; }
-    .add-class-input { flex: 1; padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.82rem; }
+    .add-class-input { flex: 1; min-width: 0; padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.82rem; }
     .add-class-input::placeholder { color: #475569; }
     .add-class-btn { width: 30px; border-radius: 6px; border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #34d399; font-weight: 700; cursor: pointer; }
 
     .canvas-panel { text-align: center; }
-    .drawing-canvas { display: inline-block; border: 2px solid rgba(255,255,255,0.15); border-radius: 10px; overflow: hidden; background: #0a0a0a; }
-    .draw-surface { cursor: crosshair; }
+    .drawing-canvas { display: inline-block; border: 2px solid rgba(255,255,255,0.15); border-radius: 10px; overflow: hidden; background: #000; max-width: 100%; }
+    .draw-surface { display: block; width: 280px; max-width: 100%; aspect-ratio: 1; background: #000; cursor: crosshair; touch-action: none; }
     .canvas-actions { display: flex; gap: 0.5rem; justify-content: center; margin-top: 0.5rem; }
     .canvas-btn { padding: 0.35rem 0.75rem; border-radius: 6px; border: 1px solid rgba(139,92,246,0.3); background: rgba(139,92,246,0.1); color: #c4b5fd; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
     .canvas-btn:disabled { opacity: 0.4; cursor: not-allowed; }
     .canvas-btn-clear { border-color: rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
 
-    .results-panel { }
     .how-it-works { color: #94a3b8; font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; }
-    .training-progress { }
+    .hint { color: #64748b; font-size: 0.82rem; }
+    .hint.inline { margin-left: 0.75rem; }
+    .train-stats { color: #64748b; font-size: 0.78rem; margin-top: 0.75rem; }
     .progress-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 0.5rem; }
-    .progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius: 4px; transition: width 0.3s; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius: 4px; transition: width 0.15s; }
     .progress-text { color: #94a3b8; font-size: 0.8rem; font-family: monospace; display: block; }
 
-    .train-actions { margin-top: 1rem; }
+    .train-actions { margin-top: 1rem; display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
     .run-btn { padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; transition: all 0.2s; }
-    .run-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    .run-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    .run-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .train-error { width: 100%; color: #fca5a5; font-size: 0.85rem; }
 
     .train-note { margin-top: 1.5rem; padding: 0.75rem 1rem; background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.15); border-radius: 8px; color: #7dd3fc; font-size: 0.85rem; line-height: 1.5; }
+    .train-note a { color: #93c5fd; }
 
     @@media (max-width: 768px) { .train-layout { grid-template-columns: 1fr; } }
 </style>
 
 @code {
+    const int CanvasSize = 280, MinPerClass = 3;
+
     private string _selectedBackend = "WebGPU";
-    private string _selectedClass = "";
+    private string _selectedClass = "Circle";
     private string _newClassName = "";
     private int _step = 1;
-    private float _trainingProgress;
-    private int _currentEpoch, _totalEpochs = 50;
-    private float _currentLoss;
+    private float _trainingProgress, _currentLoss;
+    private int _currentStep, _trainedOn;
+    private double _trainMs, _inferenceMs;
     private bool _isRunning;
-    private double _inferenceMs;
+    private string? _error;
     private List<ConfidenceBars.Prediction>? _predictions;
 
-    private List<DrawClass> _classes = new()
+    private readonly List<DrawClass> _classes = new()
     {
         new() { Name = "Circle", Color = "#3b82f6" },
         new() { Name = "Square", Color = "#ef4444" },
+        new() { Name = "Triangle", Color = "#22c55e" },
     };
 
-    private int TotalSamples => _classes.Sum(c => c.SampleCount);
+    private int TotalSamples => _classes.Sum(c => c.Samples.Count);
+    private bool CanTrain => _classes.Count >= 2 && _classes.All(c => c.Samples.Count >= MinPerClass);
+    private string TrainHint => _classes.Count < 2 ? "Add at least two classes."
+        : $"Add {MinPerClass}+ drawings to {string.Join(", ", _classes.Where(c => c.Samples.Count < MinPerClass).Select(c => c.Name))}.";
 
-    private List<BackendSelector.BackendInfo> _backends = new()
+    private readonly List<BackendSelector.BackendInfo> _backends = new()
     {
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
-        new() { Id = "CPU", DisplayName = "CPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm" },
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
 
-    private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
+    private Accelerator? _accelerator;
     private SpawnDev.ILGPU.ML.Training.TrainableModel? _model;
     private ElementReference _canvasRef;
     private bool _isDrawing;
-    private List<List<float[]>> _trainingSamples = new(); // per-class samples, each 28*28 floats
     private float _lastX, _lastY;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender)
-        {
-            if (_context == null)
-            {
-                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
-                await builder.AllAcceleratorsAsync();
-                _context = builder.ToContext();
-            }
-            _accelerator = await _context.CreatePreferredAcceleratorAsync();
-            // Initialize per-class sample storage
-            foreach (var _ in _classes)
-                _trainingSamples.Add(new List<float[]>());
-        }
+        if (!firstRender) return;
+        var builder = MLContext.Create();
+        await builder.AllAcceleratorsAsync();
+        _context = builder.ToContext();
     }
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private async Task<Accelerator?> GetAcceleratorAsync()
+    {
+        if (_accelerator != null || _context == null) return _accelerator;
+        try
+        {
+            _accelerator = _selectedBackend switch
+            {
+                "WebGPU" => await TryCreateAsync<SpawnDev.ILGPU.WebGPU.WebGPUILGPUDevice>(),
+                "WebGL" => await TryCreateAsync<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>(),
+                "Wasm" => await TryCreateAsync<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>(),
+                _ => null,
+            };
+        }
+        catch (Exception ex) { _error = $"{_selectedBackend} is not available here: {ex.Message}"; }
+        if (_accelerator == null && _error == null) _error = $"{_selectedBackend} is not available in this browser. Pick another backend.";
+        return _accelerator;
+    }
+
+    private async Task<Accelerator?> TryCreateAsync<TDevice>() where TDevice : global::ILGPU.Runtime.Device
+    {
+        var devices = _context!.GetDevices<TDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private Task HandleBackendChange(string backend)
+    {
+        if (_isRunning) return Task.CompletedTask;
+        _selectedBackend = backend;
+        // the drawings stay; the model trained on the old backend goes with its accelerator
+        ResetModel();
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _error = null;
+        return Task.CompletedTask;
+    }
+
+    private void ResetModel()
+    {
+        _model?.Dispose();
+        _model = null;
+        _predictions = null;
+        _step = 1;
+    }
+
     private void AddClass()
     {
-        if (!string.IsNullOrWhiteSpace(_newClassName))
-        {
-            _classes.Add(new DrawClass { Name = _newClassName, Color = GetNextColor() });
-            _trainingSamples.Add(new List<float[]>());
-            _newClassName = "";
-        }
-    }
-    private void RemoveClass(string name)
-    {
-        int idx = _classes.FindIndex(c => c.Name == name);
-        if (idx >= 0) { _classes.RemoveAt(idx); _trainingSamples.RemoveAt(idx); }
+        var name = _newClassName.Trim();
+        if (name.Length == 0 || _isRunning || _classes.Any(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) return;
+        _classes.Add(new DrawClass { Name = name, Color = GetNextColor() });
+        _selectedClass = name;
+        _newClassName = "";
+        ResetModel();
     }
 
-    private void StartDrawing(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    private void AddClassOnEnter(KeyboardEventArgs e)
     {
+        if (e.Key == "Enter") AddClass();
+    }
+
+    private void RemoveClass(string name)
+    {
+        if (_isRunning) return;
+        int idx = _classes.FindIndex(c => c.Name == name);
+        if (idx < 0) return;
+        _classes.RemoveAt(idx);
+        if (_selectedClass == name) _selectedClass = _classes.FirstOrDefault()?.Name ?? "";
+        ResetModel();
+    }
+
+    // Pointer events: mouse, pen and touch. The canvas can be CSS-scaled (phones), so offsets map to its 280 x 280 pixels.
+    private float _cssToCanvas = 1f;
+
+    private void StartDrawing(PointerEventArgs e)
+    {
+        using (var canvas = _canvasRef.As<HTMLCanvasElement>())
+        {
+            int w = canvas.ClientWidth;
+            _cssToCanvas = w > 0 ? CanvasSize / (float)w : 1f;
+        }
         _isDrawing = true;
-        _lastX = (float)e.OffsetX;
-        _lastY = (float)e.OffsetY;
-        // Draw a dot at the start position
+        _lastX = (float)e.OffsetX * _cssToCanvas;
+        _lastY = (float)e.OffsetY * _cssToCanvas;
         DrawOnCanvas(_lastX, _lastY, _lastX, _lastY);
     }
 
-    private void Draw(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    private void Draw(PointerEventArgs e)
     {
         if (!_isDrawing) return;
-        float x = (float)e.OffsetX, y = (float)e.OffsetY;
+        float x = (float)e.OffsetX * _cssToCanvas, y = (float)e.OffsetY * _cssToCanvas;
         DrawOnCanvas(_lastX, _lastY, x, y);
         _lastX = x; _lastY = y;
     }
 
     private async Task StopDrawing()
     {
+        if (!_isDrawing) return;
         _isDrawing = false;
-        // Live classify: once trained (step 3), lifting the pen runs the model on what was drawn.
-        if (_step >= 3 && _model != null) await ClassifyDrawing();
+        // trained: lifting the pen classifies what is on the canvas
+        if (_step >= 3 && _model != null && !_isRunning) await ClassifyDrawing();
     }
 
     private void DrawOnCanvas(float x1, float y1, float x2, float y2)
@@ -267,59 +346,35 @@
         ctx.Stroke();
     }
 
-    private void SaveSample()
-    {
-        if (string.IsNullOrEmpty(_selectedClass)) return;
-        int classIdx = _classes.FindIndex(c => c.Name == _selectedClass);
-        if (classIdx < 0) return;
-
-        _trainingSamples[classIdx].Add(CaptureSample());
-        _classes[classIdx].SampleCount++;
-        ClearCanvas();
-        StateHasChanged();
-    }
-
-    // Read the 280x280 canvas and downsample to a 28x28 grayscale vector (0..1). Shared by training-sample
-    // capture AND live classification so both feed the model the exact same representation.
-    private float[] CaptureSample()
+    // The canvas pixels through DrawToLearn.Prepare: the same code the test gates.
+    private float[]? CaptureSample()
     {
         using var canvas = _canvasRef.As<HTMLCanvasElement>();
         using var ctx = canvas.Get2DContext();
-        using var imageData = ctx.GetImageData(0, 0, 280, 280);
+        using var imageData = ctx.GetImageData(0, 0, CanvasSize, CanvasSize);
         using var data = imageData.Data;
-        var pixels = data.ReadBytes();
-
-        var sample = new float[28 * 28];
-        for (int y = 0; y < 28; y++)
-            for (int x = 0; x < 28; x++)
-            {
-                float sum = 0;
-                for (int dy = 0; dy < 10; dy++)
-                    for (int dx = 0; dx < 10; dx++)
-                    {
-                        int srcIdx = ((y * 10 + dy) * 280 + (x * 10 + dx)) * 4;
-                        if (srcIdx + 3 < pixels.Length) sum += pixels[srcIdx]; // R channel (white = 255)
-                    }
-                sample[y * 28 + x] = sum / (10 * 10 * 255f);
-            }
-        return sample;
+        return DrawToLearn.Prepare(data.ReadBytes(), CanvasSize, CanvasSize);
     }
 
-    // The formerly-dead "3. Classify" step: after training, drawing something new runs the trained model
-    // forward and shows per-class confidences. (_predictions was declared + rendered but never assigned.)
+    private void SaveSample()
+    {
+        var cls = _classes.FirstOrDefault(c => c.Name == _selectedClass);
+        if (cls == null) return;
+        var sample = CaptureSample();
+        if (sample == null) return;   // blank canvas
+        cls.Samples.Add(sample);
+        ClearCanvas();
+    }
+
     private async Task ClassifyDrawing()
     {
-        if (_model == null || _step < 3) return;
         var sample = CaptureSample();
-        float maxV = 0; foreach (var v in sample) if (v > maxV) maxV = v;
-        if (maxV < 0.02f) { _predictions = null; StateHasChanged(); return; } // blank canvas — nothing to classify
-
-        var logits = await _model.PredictAsync(sample, 1);
-        var probs = SpawnDev.ILGPU.ML.Preprocessing.TextPreprocessor.Softmax(logits);
-        var preds = new List<ConfidenceBars.Prediction>();
-        for (int i = 0; i < _classes.Count; i++)
-            preds.Add(new ConfidenceBars.Prediction { Label = _classes[i].Name, Confidence = i < probs.Length ? probs[i] : 0f });
-        _predictions = preds;
+        if (sample == null || _model == null) { _predictions = null; StateHasChanged(); return; }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var probs = await _model.PredictProbsAsync(sample, 1);
+        _inferenceMs = sw.Elapsed.TotalMilliseconds;
+        _predictions = _classes.Select((c, i) => new ConfidenceBars.Prediction { Label = c.Name, Confidence = i < probs.Length ? probs[i] : 0f })
+            .OrderByDescending(p => p.Confidence).ToList();
         StateHasChanged();
     }
 
@@ -327,75 +382,63 @@
     {
         using var canvas = _canvasRef.As<HTMLCanvasElement>();
         using var ctx = canvas.Get2DContext();
-        ctx.ClearRect(0, 0, 280, 280);
+        ctx.ClearRect(0, 0, CanvasSize, CanvasSize);
+    }
+
+    private void ClearCanvasAndPrediction()
+    {
+        ClearCanvas();
+        _predictions = null;
     }
 
     private async Task StartTraining()
     {
-        if (_accelerator == null || _classes.Count < 2) return;
-        int totalSamples = _trainingSamples.Sum(s => s.Count);
-        if (totalSamples < 4) return; // Need at least a few samples
-
-        _step = 2;
+        if (!CanTrain || _isRunning) return;
+        _error = null;
         _isRunning = true;
+        _step = 2;
+        _currentStep = 0;
+        _trainingProgress = 0;
         StateHasChanged();
         await Task.Yield();
-
         try
         {
-            // Build model: 784 → 64 → ReLU → numClasses
+            var acc = await GetAcceleratorAsync();
+            if (acc == null) { _step = 1; return; }
             _model?.Dispose();
-            _model = new SpawnDev.ILGPU.ML.Training.TrainableModel(_accelerator);
-            _model.AddLinear(28 * 28, 64);
-            _model.AddReLU();
-            _model.AddLinear(64, _classes.Count);
-            _model.Build(maxBatchSize: totalSamples);
-
-            // Flatten training data into batch
-            var inputData = new float[totalSamples * 28 * 28];
-            var labels = new int[totalSamples];
-            int idx = 0;
-            for (int c = 0; c < _trainingSamples.Count; c++)
+            _trainedOn = TotalSamples;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _model = DrawToLearn.CreateModel(acc, _classes.Count, DrawToLearn.BatchSize(_trainedOn));
+            _currentLoss = await DrawToLearn.TrainAsync(_model, _classes.Select(c => (IReadOnlyList<float[]>)c.Samples).ToList(), progress: async (step, loss) =>
             {
-                foreach (var sample in _trainingSamples[c])
-                {
-                    System.Array.Copy(sample, 0, inputData, idx * 28 * 28, 28 * 28);
-                    labels[idx] = c;
-                    idx++;
-                }
-            }
-
-            // Train
-            for (int epoch = 0; epoch < _totalEpochs; epoch++)
-            {
-                _currentEpoch = epoch + 1;
-                _currentLoss = await _model.TrainStepAsync(inputData, labels, totalSamples, learningRate: 0.01f);
-                _trainingProgress = (epoch + 1f) / _totalEpochs * 100f;
-
-                if (epoch % 5 == 0)
-                {
-                    StateHasChanged();
-                    await Task.Yield();
-                }
-            }
-
+                _currentStep = step;
+                _currentLoss = loss;
+                _trainingProgress = 100f * step / DrawToLearn.Steps;
+                StateHasChanged();
+                await Task.Yield();
+            });
+            _trainMs = sw.Elapsed.TotalMilliseconds;
             _step = 3;
-            _trainingProgress = 100;
+            _predictions = null;
+            ClearCanvas();
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Train] Error: {ex.Message}");
+            _error = $"Training failed on {_selectedBackend}: {ex.Message}";
+            Console.WriteLine($"[Train] {ex}");
+            ResetModel();
         }
-
-        _isRunning = false;
-        StateHasChanged();
+        finally
+        {
+            _isRunning = false;
+            StateHasChanged();
+        }
     }
 
-    private string GetNextColor() => _classes.Count switch
+    private string GetNextColor() => (_classes.Count % 8) switch
     {
         0 => "#3b82f6", 1 => "#ef4444", 2 => "#22c55e", 3 => "#f59e0b",
-        4 => "#8b5cf6", 5 => "#ec4899", 6 => "#14b8a6", 7 => "#f97316",
-        _ => "#64748b",
+        4 => "#8b5cf6", 5 => "#ec4899", 6 => "#14b8a6", _ => "#f97316",
     };
 
     public void Dispose()
@@ -405,5 +448,10 @@
         _context?.Dispose();
     }
 
-    private class DrawClass { public string Name { get; set; } = ""; public string Color { get; set; } = ""; public int SampleCount { get; set; } }
+    private class DrawClass
+    {
+        public string Name { get; set; } = "";
+        public string Color { get; set; } = "";
+        public List<float[]> Samples { get; } = new();
+    }
 }

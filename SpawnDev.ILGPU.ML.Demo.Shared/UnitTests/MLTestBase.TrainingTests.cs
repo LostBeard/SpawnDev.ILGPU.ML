@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Training;
+using SpawnDev.ILGPU.ML.Demo.Shared.Games.DrawToLearn;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -274,5 +275,135 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[Training] XOR MLP: first_loss={firstLoss:F4}, last_loss={lastLoss:F4}");
         if (lastLoss >= firstLoss)
             throw new Exception($"Loss did not decrease: {firstLoss:F4} → {lastLoss:F4}");
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Draw to Learn (/train): the page's own code, on hand-drawn-like shapes
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The /train page end to end, minus the mouse: 6 drawings each of a circle, a square and a triangle (wobbly strokes, random place, size,
+    /// rotation and aspect, drawn with the page's 12 px round brush on its 280 x 280 canvas), prepared and trained by <c>DrawToLearn</c>
+    /// exactly as the page does, then 40 NEW drawings per class classified. Gate: 90% right. Also prints what the page's former recipe
+    /// (plain 10 x 10 average downsample, 784-64-N, 50 SGD steps at 0.01) scores on the same drawings.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Training_DrawToLearn_ClassifiesNewDrawings() => await RunTest(async accelerator =>
+    {
+        const int classes = 3, trainPer = 6, testPer = 40, W = 280;
+        var rng = new Random(7);
+        byte[] Draw(int shape)
+        {
+            var px = new byte[W * W * 4];
+            void Stamp(float x, float y)
+            {
+                for (int yy = (int)(y - 6); yy <= (int)(y + 6); yy++)
+                    for (int xx = (int)(x - 6); xx <= (int)(x + 6); xx++)
+                        if ((uint)xx < W && (uint)yy < W && (xx - x) * (xx - x) + (yy - y) * (yy - y) <= 36)
+                            for (int ch = 0; ch < 4; ch++) px[(yy * W + xx) * 4 + ch] = 255;
+            }
+            void Line(float x0, float y0, float x1, float y1)
+            {
+                int steps = Math.Max(1, (int)(MathF.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) / 2));
+                for (int i = 0; i <= steps; i++) Stamp(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+            }
+            float R(float a, float b) => a + (float)rng.NextDouble() * (b - a);
+            float size = R(70, 210), cx = R(size / 2 + 8, W - size / 2 - 8), cy = R(size / 2 + 8, W - size / 2 - 8);
+            float aspect = R(0.8f, 1.2f), rot = R(-0.25f, 0.25f), wob = R(0, 6.28f);
+            var pts = new List<(float X, float Y)>();
+            if (shape == 0)
+            {
+                float start = R(0, 6.28f), sweep = 6.28f + R(-0.35f, 0.35f);
+                for (int i = 0; i <= 48; i++)
+                {
+                    float t = start + sweep * i / 48, r = size / 2 * (1 + 0.05f * MathF.Sin(3 * t + wob));
+                    pts.Add((r * MathF.Cos(t) * aspect, r * MathF.Sin(t) / aspect));
+                }
+            }
+            else
+            {
+                int n = shape == 1 ? 4 : 3;
+                var corners = new List<(float X, float Y)>();
+                for (int i = 0; i < n; i++)
+                {
+                    float t = (shape == 1 ? MathF.PI / 4 : -MathF.PI / 2) + i * 2 * MathF.PI / n;
+                    float r = size / 2 * (shape == 1 ? 1.41f : 1.15f) * 0.75f;
+                    corners.Add((r * MathF.Cos(t) * aspect + R(-8, 8), r * MathF.Sin(t) / aspect + R(-8, 8)));
+                }
+                for (int i = 0; i < n; i++)
+                {
+                    var a = corners[i];
+                    var b = corners[(i + 1) % n];
+                    for (int j = 0; j < 12; j++) { float f = j / 12f; pts.Add((a.X + (b.X - a.X) * f + R(-2, 2), a.Y + (b.Y - a.Y) * f + R(-2, 2))); }
+                }
+                pts.Add(corners[0]);
+            }
+            float cr = MathF.Cos(rot), sr = MathF.Sin(rot);
+            for (int i = 0; i + 1 < pts.Count; i++)
+                Line(cx + cr * pts[i].X - sr * pts[i].Y, cy + sr * pts[i].X + cr * pts[i].Y,
+                     cx + cr * pts[i + 1].X - sr * pts[i + 1].Y, cy + sr * pts[i + 1].X + cr * pts[i + 1].Y);
+            return px;
+        }
+        var train = Enumerable.Range(0, classes).Select(c => Enumerable.Range(0, trainPer).Select(_ => Draw(c)).ToList()).ToList();
+        var test = Enumerable.Range(0, classes).Select(c => Enumerable.Range(0, testPer).Select(_ => Draw(c)).ToList()).ToList();
+        int nTest = classes * testPer;
+
+        async Task<double> Accuracy(TrainableModel model, Func<byte[], float[]> prep)
+        {
+            var x = new float[nTest * 784];
+            int i = 0;
+            for (int c = 0; c < classes; c++)
+                foreach (var d in test[c]) Array.Copy(prep(d), 0, x, (i++) * 784, 784);
+            var logits = await model.PredictAsync(x, nTest);
+            int right = 0;
+            var confusion = new int[classes * classes];
+            for (int j = 0; j < nTest; j++)
+            {
+                int best = 0;
+                for (int k = 1; k < classes; k++) if (logits[j * classes + k] > logits[j * classes + best]) best = k;
+                if (best == j / testPer) right++;
+                confusion[j / testPer * classes + best]++;
+            }
+            Console.WriteLine($"[DrawToLearn] confusion (row = drawn circle / square / triangle): {string.Join(" | ", Enumerable.Range(0, classes).Select(r => string.Join(" ", confusion.Skip(r * classes).Take(classes))))}");
+            return right / (double)nTest;
+        }
+
+        // the page's former recipe
+        float[] Legacy(byte[] px)
+        {
+            var o = new float[784];
+            for (int y = 0; y < 28; y++)
+                for (int x = 0; x < 28; x++)
+                {
+                    float sum = 0;
+                    for (int dy = 0; dy < 10; dy++) for (int dx = 0; dx < 10; dx++) sum += px[((y * 10 + dy) * W + x * 10 + dx) * 4];
+                    o[y * 28 + x] = sum / (100 * 255f);
+                }
+            return o;
+        }
+        double legacy;
+        using (var old = new TrainableModel(accelerator))
+        {
+            old.AddLinear(784, 64); old.AddReLU(); old.AddLinear(64, classes);
+            int n = classes * trainPer;
+            old.Build(maxBatchSize: Math.Max(n, nTest));
+            var x = new float[n * 784];
+            var y = new int[n];
+            int i = 0;
+            for (int c = 0; c < classes; c++) foreach (var d in train[c]) { Array.Copy(Legacy(d), 0, x, i * 784, 784); y[i++] = c; }
+            for (int e = 0; e < 50; e++) await old.TrainStepAsync(x, y, n, 0.01f, readLoss: e == 49);
+            legacy = await Accuracy(old, Legacy);
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var samples = train.Select(c => (IReadOnlyList<float[]>)c.Select(d => DrawToLearn.Prepare(d, W, W)!).ToList()).ToList();
+        using var model = DrawToLearn.CreateModel(accelerator, classes, Math.Max(DrawToLearn.BatchSize(classes * trainPer), nTest));
+        float firstLoss = -1;
+        float loss = await DrawToLearn.TrainAsync(model, samples, progress: (step, l) => { if (firstLoss < 0) firstLoss = l; return Task.CompletedTask; });
+        long trainMs = sw.ElapsedMilliseconds;
+        double acc = await Accuracy(model, d => DrawToLearn.Prepare(d, W, W)!);
+        Console.WriteLine($"[DrawToLearn] {classes} classes x {trainPer} drawings: loss at step 10 {firstLoss:F3} -> {loss:F4} in {trainMs} ms; held-out accuracy {acc:P1} (former recipe {legacy:P1})");
+        if (acc < 0.9)
+            throw new Exception($"Draw to Learn classified {acc:P1} of {nTest} new drawings (need 90%); former recipe {legacy:P1}");
     });
 }

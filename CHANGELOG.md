@@ -14,6 +14,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   4,533, V7 everywhere 4,893 (identical losses).
 - `KernelTimings` (env `GGUF_KERNEL_TIMING=1`, desktop): synchronized per-piece times inside the GEMM ops (dequant, packs, scale, GEMM),
   printed by `TrainLoraProbe --profile`; for machines without a profiler.
+- `TrainableModel.UseAdam(beta1, beta2)`: Adam (bias-corrected, the existing `TrainingKernels.AdamUpdate`) instead of plain SGD; the
+  learning rate passed to the train step becomes Adam's step size. Call before `Build`. SGD stays the default.
+- **Demo: Draw to Learn (/train) now learns.** MEASURED by the new gate `Training_DrawToLearn_ClassifiesNewDrawings` (the page's own code
+  in `Demo.Shared/Games/DrawToLearn`, hand-drawn-like circles, squares and triangles, 6 per class, 120 new ones classified): the former
+  recipe (10 x 10 average of the whole canvas, 784-64-N, 50 SGD steps at 0.01) scored 36 to 50% over 7 seeds, near chance (33%); the
+  new one 95.0 to 99.2%: drawings cropped to their strokes, scaled to 28 x 28 and blurred, 47 rotated / stretched / shifted copies each,
+  784-128-N with 200 Adam steps (~0.4 s on CUDA). The page also takes touch and pen input, honours the backend picker (WebGPU, WebGL,
+  Wasm), starts with a class selected and three classes, and retrains on demand.
+- **Demo: home page rewritten** around the flagship demos (Text to 3D, image generation, the video studio, chat, many answers one vote,
+  speech, Draw to Learn) with status badges from `Docs/DEMO_AND_MODEL_STATUS.md`, what the library can do today (generative models, LLMs,
+  LoRA training, speech, formats), measured times, and the backends. The stale roadmap (image generation and 3D listed as planned) is gone.
 
 ## 5.8.3 - 2026-11-05 (nuget.org) - LoRA training 2.5x faster again (4.5 -> 1.78 s per step); Turing; faster prefill
 
