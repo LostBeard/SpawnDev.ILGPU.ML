@@ -475,7 +475,25 @@ public sealed class GgufBatchDecoder : IDisposable
             Buffer.BlockCopy(raw, 0, f, 0, f.Length * 4);
             _vecs[name] = Own(_acc.Allocate1D(f));
         }
+        // Q8_0 matrices regrouped in place for the faster GEMVs (GGMLType.Q8_0G; FusedDequantMatMul.RepackQ8_0Grouped). The joined q|k|v and gate|up read the
+        // hidden width; every other matrix its own first dimension.
+        if (GroupQ8)
+            foreach (var name in _mats.Keys.ToList())
+            {
+                var (b, ty) = _mats[name];
+                if (ty != GGMLType.Q8_0) continue;
+                int K = name.EndsWith(".weight", StringComparison.Ordinal) ? (int)Tensor(name).Dimensions[0] : Hidden;
+                if (K % 256 != 0) continue;
+                _mm.RepackQ8_0Grouped(b.View, b.Length / 272);
+                _mats[name] = (b, GGMLType.Q8_0G);
+            }
     }
+
+    /// <summary>
+    /// Regroup Q8_0 weights in place at load (<see cref="GGMLType.Q8_0G"/>: per 256 values the 8 block scales, then the int8 values; 16-byte loads). MEASURED
+    /// 2026-11-06, see FusedDequantMatMul.RepackQ8_0Grouped. Read when a decoder loads; env GGUF_Q8_GROUPED=0 keeps the native layout (the A/B).
+    /// </summary>
+    public static bool GroupQ8 { get; set; } = Environment.GetEnvironmentVariable("GGUF_Q8_GROUPED") != "0";
 
     // matrices of one block type stacked along the output dimension: their rows (the blocks of each output) follow each other, so the bytes simply concatenate
     private async Task JoinAsync(string name, string[] parts, CancellationToken ct)

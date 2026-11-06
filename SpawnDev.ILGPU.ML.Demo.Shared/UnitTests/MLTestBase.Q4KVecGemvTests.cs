@@ -235,4 +235,83 @@ public abstract partial class MLTestBase
         }
         finally { Kernels.FusedDequantMatMul.Q6VecWebGPU = q6WebSaved; }
     });
+
+    /// <summary>
+    /// Q8_0 regrouped in place (<see cref="GGMLType.Q8_0G"/>, FusedDequantMatMul.RepackQ8_0Grouped) on every route that reads it, against the CPU oracle of the
+    /// native rows: the device regrouping byte-exact against a CPU one; the one-row vector GEMV (q8g-vec), a misaligned input on the word-wise kernel, three rows
+    /// (word-wise), and a 200-row prefill (CUDA sm_75+: the f16 tensor-core GEMM; elsewhere the tiled GEMM through DecodeOf). Each route must be the one that ran.
+    /// Added 2026-11-06 with the layout (TJ: "Measure twice, cut once").
+    /// </summary>
+    [TestMethod]
+    public async Task Gemm_Q8_0G_MatchesOracle_AllRoutes() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("ForwardRows takes the per-element kernel on WebGL (no shared memory)");
+        int scrMinSaved = Kernels.FusedDequantMatMul.MmaScratchMinRows;
+        Kernels.FusedDequantMatMul.MmaScratchMinRows = 1;
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        var notes = new List<string>();
+        try
+        {
+            foreach (var (K, N) in new[] { (2048, 203), (256, 9), (512, 4100) })
+            {
+                var rng = new Random(91 + K + N);
+                int rb = RowBytes(GGMLType.Q8_0, K);
+                var bytes = new byte[N * rb];
+                var wRows = new float[N][];
+                for (int n = 0; n < N; n++)
+                {
+                    var row = MakeBlocks(GGMLType.Q8_0, K, rng);
+                    Buffer.BlockCopy(row, 0, bytes, n * rb, rb);
+                    wRows[n] = ReferenceDequant(GGMLType.Q8_0, row, K);
+                }
+                // the CPU regrouping: per 272 bytes, 8 scales then 256 values
+                var want = new byte[bytes.Length];
+                for (int g = 0; g < bytes.Length / 272; g++)
+                    for (int b = 0; b < 8; b++)
+                    {
+                        want[g * 272 + 2 * b] = bytes[g * 272 + 34 * b]; want[g * 272 + 2 * b + 1] = bytes[g * 272 + 34 * b + 1];
+                        Buffer.BlockCopy(bytes, g * 272 + 34 * b + 2, want, g * 272 + 16 + 32 * b, 32);
+                    }
+                using var wBuf = AllocatePadded(accelerator, bytes);
+                fused.RepackQ8_0Grouped(wBuf.View, bytes.Length / 272);
+                await accelerator.SynchronizeAsync();
+                var got = await wBuf.View.SubView(0, bytes.Length).CopyToHostAsync();
+                for (int i = 0; i < want.Length; i++)
+                    if (got[i] != want[i]) throw new Exception($"K={K} N={N}: regrouped byte {i} = {got[i]}, expected {want[i]}");
+                const int Mmax = 200;
+                var input = new float[Mmax * K + 1];
+                for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                using var inBuf = accelerator.Allocate1D(input);
+                using var outBuf = accelerator.Allocate1D<float>((long)Mmax * N);
+                async Task Check(int M, int off, string wantRoute, bool gemm)
+                {
+                    if (gemm) fused.Forward(inBuf.View.SubView(off, (long)M * K), wBuf.View, outBuf.View.SubView(0, (long)M * N), M, K, N, GGMLType.Q8_0G);
+                    else fused.ForwardRows(inBuf.View.SubView(off, (long)M * K), wBuf.View, outBuf.View.SubView(0, (long)M * N), M, K, N, GGMLType.Q8_0G);
+                    string route = gemm ? fused.LastGemmKernel : fused.LastRowsKernel;
+                    await accelerator.SynchronizeAsync();
+                    var o = await outBuf.View.SubView(0, (long)M * N).CopyToHostAsync();
+                    if (wantRoute.Length > 0 && !route.StartsWith(wantRoute)) throw new Exception($"K={K} N={N} M={M}: ran on '{route}', not '{wantRoute}'");
+                    int bad = 0; double worst = 0;
+                    for (int m = 0; m < M; m++)
+                        for (int n = 0; n < N; n++)
+                        {
+                            double sum = 0, a = 0;
+                            for (int k = 0; k < K; k++) { double pr = input[off + m * K + k] * wRows[n][k]; sum += pr; a += Math.Abs(pr); }
+                            double e = Math.Abs(o[m * N + n] - sum), bound = (gemm ? 2e-3 : 2e-5) * a + 1e-5;
+                            if (!(e <= bound)) bad++;
+                            worst = Math.Max(worst, e / bound);
+                        }
+                    if (bad > 0) throw new Exception($"{route} K={K} N={N} M={M}: {bad} outputs off (worst {worst:F2} of the bound)");
+                    notes.Add($"{route} K={K} N={N} M={M} worst {worst:F2}");
+                }
+                await Check(1, 0, "q8g-vec", false);
+                await Check(1, 1, "rows-Q8_0G", false);                 // misaligned input
+                await Check(3, 0, "rows-Q8_0G", false);
+                bool tc = accelerator.AcceleratorType == AcceleratorType.Cuda && Kernels.CudaCaps.TuringTensorCores(accelerator);
+                if (N <= 2048) await Check(Mmax, 0, tc ? "mma-q8_0g" : "", true);
+            }
+        }
+        finally { Kernels.FusedDequantMatMul.MmaScratchMinRows = scrMinSaved; }
+        return string.Join("; ", notes);
+    });
 }

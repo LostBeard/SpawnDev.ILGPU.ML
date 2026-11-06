@@ -960,6 +960,9 @@ public enum GGMLType : uint
     IQ1_M = 29,
     BF16 = 30,
     MXFP4 = 39, // OCP MXFP4 (block of 32: 1 E8M0 byte + 16 packed FP4 nibbles); used by gpt-oss
+    /// <summary>NOT a GGUF type (never in a file): Q8_0 regrouped in place on the device by <c>FusedDequantMatMul.RepackQ8_0Grouped</c>. Per 8 blocks
+    /// (256 values, the same 272 bytes): the 8 fp16 scales (a 16-byte header), then the 256 int8 values. Rows keep Q8_0's size; K is a multiple of 256.</summary>
+    Q8_0G = 1008,
 }
 
 /// <summary>GGUF metadata value types.</summary>

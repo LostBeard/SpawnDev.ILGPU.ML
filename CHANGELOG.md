@@ -4,6 +4,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Q8_0 regrouped in place on the device (`GGMLType.Q8_0G`; `GgufBatchDecoder.GroupQ8`, env GGUF_Q8_GROUPED=0 for the A/B).** The decoder regroups its
+  Q8_0 matrices at load (`FusedDequantMatMul.RepackQ8_0Grouped`, in place, no extra memory): per 8 blocks (the same 272 bytes) the 8 fp16 scales as a
+  16-byte header, then the 256 int8 values, so the quants read as 16-byte chunks instead of 32-bit words recombined across 34-byte blocks. Every reader
+  handles it: the one-row GEMV (`GemvQ8_0GVecImpl`: a warp per 4 rows, a lane per 16 values), a word-wise kernel for 2-8 rows, the tensor-core prefill's
+  dequantize, and `DecodeOf` (the tiled prefill GEMM, the embedding gather, the per-element fallback). Measured twice before building it
+  (`Bench_Q8RepackedLayout_Gemv`: DRAM-cold slices of a 140 MB matrix, WebGPU timed by timestamped plan replay): WebGPU o-proj 281 -> 314, q|k
+  302 -> 351, gate|up 363 -> 440, down 334 -> 405 GB/s; CUDA (against the Q8_0 vector kernel) 321 -> 340, 337 -> 386, 438 -> 442, 404 -> 423.
+  End to end, Qwen3-1.7B Q8_0 on an RTX 4070: **Chrome WebGPU decode 147.4 -> 166.3 tok/s** (1,826-token prompt 130.6 -> 145.4), the GEMVs 5.16 -> 4.48 ms
+  a token, the LM head 0.92 -> 0.69 ms; CUDA 163.3 -> 165.4 (interleaved A/B). Gate `Gemm_Q8_0G_MatchesOracle_AllRoutes` (device regrouping
+  byte-exact; vector, word-wise, misaligned and prefill routes against the CPU oracle; CUDA, OpenCL, CPU, WebGPU).
+
 - `GgufBatchDecoder.ProfileRecordedStepAsync()` (WebGPU diagnostic): the last recorded decode step's GPU floor and per-kernel GPU ms (timestamped replay),
   and `Bench_Qwen3_1_7B_WebGPU_DecodeStepProfile`. MEASURED (Chrome, RTX 4070, Qwen3-1.7B Q8_0, 5.8.5): decode 147.4 tok/s = 6.78 ms a token against
   6.53 ms of GPU time (345 dispatches), so browser decode is GPU-bound (AOT would not move it). The Q8_0 GEMVs are 5.16 ms of it (79%, ~355 GB/s of the
