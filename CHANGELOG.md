@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.6 - 2026-11-06 (nuget.org) - Q8_0 regrouped in place: browser decode +13%
+
+Stable. Full sweep 7,555 passed, 0 failed; `Training_DecoderLora_OverQ8Grouped_MatchesNative` (LoRA over the regrouped layout vs the native one,
+Qwen3-0.6B Q8_0: logits within 7.4e-5 where the adapter moves them 3.1 - 6.5) on CUDA, OpenCL and WebGPU. On SpawnDev.ILGPU 5.4.16 and SpawnJS 3.0.8.
+
 - **Q8_0 regrouped in place on the device (`GGMLType.Q8_0G`; `GgufBatchDecoder.GroupQ8`, env GGUF_Q8_GROUPED=0 for the A/B).** The decoder regroups its
   Q8_0 matrices at load (`FusedDequantMatMul.RepackQ8_0Grouped`, in place, no extra memory): per 8 blocks (the same 272 bytes) the 8 fp16 scales as a
   16-byte header, then the 256 int8 values, so the quants read as 16-byte chunks instead of 32-bit words recombined across 34-byte blocks. Every reader

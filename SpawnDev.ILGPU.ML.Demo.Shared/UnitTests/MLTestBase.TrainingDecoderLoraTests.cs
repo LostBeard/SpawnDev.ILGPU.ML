@@ -125,6 +125,70 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// LoRA over Q8_0 weights regrouped in place (<see cref="GgufBatchDecoder.GroupQ8"/>, GGMLType.Q8_0G): Qwen3-0.6B Q8_0 (hidden 1,024 and FFN 3,072, so every
+    /// matrix regroups) with a synthetic rank-8 adapter on q / k / v / o / gate / up / down, against the same model and adapter on the native layout. The last-row
+    /// logits after prompts of 1, 5 and 40 tokens (the one-row vector GEMV, the 2-8 row word-wise GEMV, the prefill GEMM) agree within 2e-3 of the largest
+    /// logit, and the adapter moves them (else the comparison would not cover it). Added 2026-11-06: the in-repo LoRA fixtures are F16, so no test paired LoRA
+    /// with the regrouped layout.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Training_DecoderLora_OverQ8Grouped_MatchesNative() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("the batch decoder's backends (CUDA, OpenCL, WebGPU)");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var hub = new ModelsHostStreamLoader(http);
+        var m = await hub.OpenAsync("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", deselect: false);
+        await using (m.Stream)
+        {
+            var model = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(m.Stream);
+            var peftName = new Dictionary<string, string> { ["attn_q"] = "self_attn.q_proj", ["attn_k"] = "self_attn.k_proj", ["attn_v"] = "self_attn.v_proj",
+                ["attn_output"] = "self_attn.o_proj", ["ffn_gate"] = "mlp.gate_proj", ["ffn_up"] = "mlp.up_proj", ["ffn_down"] = "mlp.down_proj" };
+            const int rank = 8; const float alpha = 16f;
+            var rng = new Random(23);
+            var tensors = new Dictionary<string, float[]>();
+            for (int l = 0; l < (int)model.BlockCount; l++)
+                foreach (var (t, peft) in peftName)
+                {
+                    var info = model.Tensors.First(x => x.Name == $"blk.{l}.{t}.weight");
+                    int fin = (int)info.Dimensions[0], fout = (int)info.Dimensions[1];
+                    string b = $"base_model.model.model.layers.{l}.{peft}";
+                    tensors[b + ".lora_A.weight"] = Enumerable.Range(0, rank * fin).Select(_ => (float)((rng.NextDouble() * 2 - 1) / Math.Sqrt(fin))).ToArray();
+                    tensors[b + ".lora_B.weight"] = Enumerable.Range(0, fout * rank).Select(_ => (float)((rng.NextDouble() * 2 - 1) * 0.05)).ToArray();
+                }
+            using var lora = new LoraRuntime(accelerator, tensors, rank, alpha);
+            bool groupSaved = GgufBatchDecoder.GroupQ8;
+            var notes = new List<string>();
+            try
+            {
+                async Task<GgufBatchDecoder> Make(bool grouped)
+                {
+                    GgufBatchDecoder.GroupQ8 = grouped;
+                    m.Stream.Seek(0, SeekOrigin.Begin);
+                    return await GgufBatchDecoder.CreateAsync(accelerator, m.Stream, model, 256, 1);
+                }
+                using var g = await Make(true);
+                using var n = await Make(false);
+                foreach (int len in new[] { 1, 5, 40 })
+                {
+                    var ids = Enumerable.Range(0, len).Select(i => (i * 131 + 17) % g.Vocab).ToArray();
+                    async Task<float[]> Logits(GgufBatchDecoder d, LoraRuntime? l) { d.Lora = l; await d.PrefillAsync(ids, 0f, false); return await d.ReadLogitsAsync(); }
+                    var lg = await Logits(g, lora); var ln = await Logits(n, lora); var lb = await Logits(n, null);
+                    float scale = ln.Max(Math.Abs), diff = 0, moved = 0;
+                    for (int i = 0; i < ln.Length; i++) { diff = Math.Max(diff, Math.Abs(lg[i] - ln[i])); moved = Math.Max(moved, Math.Abs(ln[i] - lb[i])); }
+                    notes.Add($"{len} tokens: grouped vs native max |diff| {diff:E2} (max |logit| {scale:F1}); the adapter moves them {moved:F2}");
+                    if (moved < 0.05f * scale) throw new Exception($"{len} tokens: the adapter barely moves the logits ({moved:E2}): the comparison would prove nothing");
+                    if (diff > 2e-3f * scale) throw new Exception($"{accelerator.AcceleratorType}: LoRA over Q8_0G differs from the native layout: " + string.Join("; ", notes));
+                }
+            }
+            finally { GgufBatchDecoder.GroupQ8 = groupSaved; }
+            var line = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
+            Console.WriteLine("[Training] " + line);
+            return line;
+        }
+    });
+
+    /// <summary>
     /// The fused LoraLinear / LoraLinearGrad ops (GraphAutograd.FusedLora, ranks that are a multiple of 8) against the four-op form (MatMul, MatMul,
     /// Mul, Add and its autograd): the same loss, logits and every adapter gradient, at ranks 8 and 16 on all seven projection types, with and
     /// without layer checkpointing. Both are fp32; only the summation order differs. Also GraphAutograd.FuseGradientSums against the Add
