@@ -2525,7 +2525,7 @@ public class FusedDequantMatMul : IDisposable
     }
 
     // fp16 bits -> float, every value (subnormals scaled, inf / nan kept): full F16 weights, unlike a block scale, may hold any of them
-    private static float HalfBitsAll(int h)
+    internal static float HalfBitsAll(int h)
     {
         int exp = (h >> 10) & 0x1F, man = h & 0x3FF;
         float r = exp == 0 ? man * (1f / 16777216f) : exp == 31 ? Interop.IntAsFloat((uint)(0x7F800000 | (man << 13))) : Interop.IntAsFloat((uint)(((exp + 112) << 23) | (man << 13)));

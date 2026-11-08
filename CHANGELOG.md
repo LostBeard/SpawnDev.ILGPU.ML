@@ -4,6 +4,20 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.7-local.4 - 2026-11-08 (local feed) - browser decode attention from 16-byte loads
+
+GGUF decoder / generator gates on WebGPU with the route on by default: 18 passed, 0 failed (41 min).
+
+- **Browser LLM decode at long prompts +7%: `GgufBatchDecoder.AttentionVec`** (default on for WebGPU; env GGUF_ATTN_VEC=0 / 1). The grouped-query decode
+  attention's scores now come from 16-byte K loads: D / 8 lanes share a key row, each lane dots one 16-byte unit (8 halves) with its 8 query values per head,
+  and the row's dot is reduced across the lanes with Warp.ShuffleXor (subgroups on WebGPU). The old score loop had each thread walk a whole K row a half at a
+  time - D scalar loads a key, rows 2 KB apart across a warp. Dead chunks (a captured step launches every chunk the cache holds) leave at once. fp16 caches,
+  32-wide warps, D / 8 a power of two up to 32. MEASURED, Chrome WebGPU, RTX 4070, Qwen3-1.7B Q8_0, interleaved A/B over two rounds: 1,826-token prompt
+  154.5 / 152.7 tok/s against 144.7 / 142.3 (attention 0.81 against 1.22 ms a token); 25-token prompt unchanged (167.0-167.9; one live chunk a head is
+  latency-bound). Gate `GgufBatchDecoder_VecAttention_MatchesGrouped` (Qwen2.5-0.5B G 7 D 64, Qwen3-0.6B G 2 D 128; CUDA and WebGPU): logits within the
+  float-order bound (step 1 5.8e-5 - 1.3e-4, step 4 1.3e-4 - 2.6e-4 rel RMS), 32 greedy tokens the same, the route switch captures again. Red-checked: the
+  wrong 16-byte unit puts the logits 1.09 off.
+
 ## 5.8.7-local.3 - 2026-11-08 (local feed) - ComfyUI's attention-multiply nodes
 
 - **`SdUNet.ScaleAsync` / `SdTextEncoder.ScaleAsync(Func<string, float?> factor, bool restorable = true)`**: scale weights in place, `W = W * factor`, by

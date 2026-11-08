@@ -30,18 +30,26 @@ public abstract partial class MLTestBase
             m.Stream.Seek(0, SeekOrigin.Begin);
             using var gen = await GgufGenerator.CreateAsync(accelerator, m.Stream, 4096, gguf);
             var dec = gen.BatchDecoder ?? throw new Exception($"expected the batch decoder, got {gen.Engine}");
-            bool prefixSaved = GgufGenerator.EnablePrefixCache;
+            bool prefixSaved = GgufGenerator.EnablePrefixCache, vecSaved = dec.AttentionVec;
             GgufGenerator.EnablePrefixCache = false;
             var report = new List<string>();
             try
             {
                 string filler = string.Join(" ", Enumerable.Range(0, 1800).Select(i => new[] { "the", "keeper", "watched", "storm", "light", "over", "grey", "water" }[i % 8])) + "\n\n";
-                bool q8WebSaved = Kernels.FusedDequantMatMul.Q8VecWebGPU;
-                // arms: the defaults at both lengths, then the Q8_0 vector GEMV switched on (Q8VecWebGPU) at the short prompt
-                foreach (var (label, text, q8vec) in new[] { ("short", "Write a long story about a lighthouse keeper and a storm.", q8WebSaved),
-                    ("long", filler + "Write a long story about a lighthouse keeper and a storm.", q8WebSaved), ("short q8vec", "Write a long story about a lighthouse keeper and a storm.", !q8WebSaved) })
+
+                const string shortP = "Write a long story about a lighthouse keeper and a storm.";
+                // arms: the decode attention route (AttentionVec, 2026-11-08) on and off at both lengths, interleaved twice (tok/s run-to-run noise is ~5%;
+                // the per-kernel GPU ms are the steadier number)
+                var arms = new List<(string, string, bool)>();
+                for (int round = 0; round < 2; round++)
+                    foreach (var vec in new[] { true, false })
+                    {
+                        arms.Add(($"short {(vec ? "vec" : "plain")}", shortP, vec));
+                        arms.Add(($"long {(vec ? "vec" : "plain")}", filler + shortP, vec));
+                    }
+                foreach (var (label, text, vec) in arms)
                 {
-                    Kernels.FusedDequantMatMul.Q8VecWebGPU = q8vec;
+                    dec.AttentionVec = vec;
                     dec.InvalidateCapturedSteps();
                     var (ids, stops) = ChatTemplates.BuildChatPrompt(gguf, tok, new List<(string, string)> { ("user", text) }, thinking: false);
                     var sw = Stopwatch.StartNew(); double firstMs = -1;
@@ -56,12 +64,12 @@ public abstract partial class MLTestBase
                     Console.WriteLine($"[Benchmark] WebGPUDecodeProfile {head}");
                     report.Add(head);
                     if (root.TryGetProperty("kernels", out var ks))
-                        foreach (var k in ks.EnumerateArray().Take(14))
+                        foreach (var k in ks.EnumerateArray().Take(4))
                             Console.WriteLine($"[Benchmark] WebGPUDecodeProfile   {label}: {k.GetProperty("ms").GetDouble(),7:F3} ms x{k.GetProperty("count").GetInt32(),3} (max {k.GetProperty("maxMs").GetDouble():F3})  {k.GetProperty("label").GetString()}");
                     else Console.WriteLine($"[Benchmark] WebGPUDecodeProfile   {label}: {prof.Attribution}");
                 }
             }
-            finally { GgufGenerator.EnablePrefixCache = prefixSaved; Kernels.FusedDequantMatMul.Q8VecWebGPU = false; }
+            finally { GgufGenerator.EnablePrefixCache = prefixSaved; dec.AttentionVec = vecSaved; }
             return string.Join("; ", report);
         }
     });
