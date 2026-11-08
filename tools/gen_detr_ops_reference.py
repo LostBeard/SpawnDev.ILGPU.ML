@@ -94,3 +94,52 @@ m = model([
    [init("W", rng.standard_normal((8, 6)).astype(np.float32)), init("b", rng.standard_normal((6,)).astype(np.float32)),
     init("lo", np.array(-0.5, np.float32)), init("hi", np.array(0.5, np.float32))])
 save("linear_clip", m, {"X": xl})
+
+# ── operators whose params path changed with OperatorRegistry.ParamsView (2026-11-08) and had no operator-level test ──
+# LRN, Col2Im (opset 18), DeformConv (opset 19): each against onnxruntime, so a wrong params layout shows as a value mismatch.
+def model_op(nodes, inputs, outputs, inits, opset):
+    g = helper.make_graph(nodes, "g", inputs, outputs, inits)
+    return helper.make_model(g, opset_imports=[helper.make_opsetid("", opset)])
+
+xr = rng.standard_normal((1, 6, 5, 7)).astype(np.float32)
+save("op_lrn", model_op([helper.make_node("LRN", ["X"], ["Y"], size=3, alpha=2e-4, beta=0.75, bias=1.5)],
+    [helper.make_tensor_value_info("X", F, [1, 6, 5, 7])], [helper.make_tensor_value_info("Y", F, [1, 6, 5, 7])], [], 17), {"X": xr})
+
+# Col2Im: 2 channels, 3x3 blocks, stride 2, pad 1, dilation 1 into a 7x9 image -> L = 4 * 5 = 20 blocks
+xc = rng.standard_normal((1, 2 * 9, 20)).astype(np.float32)
+save("op_col2im", model_op([helper.make_node("Col2Im", ["X", "img", "blk"], ["Y"], strides=[2, 2], pads=[1, 1, 1, 1])],
+    [helper.make_tensor_value_info("X", F, [1, 18, 20])], [helper.make_tensor_value_info("Y", F, [1, 2, 7, 9])],
+    [init("img", np.array([7, 9], np.int64)), init("blk", np.array([3, 3], np.int64))], 18), {"X": xc})
+
+# DeformConv: [1,4,6,7] input, 3 output channels, 3x3 kernel, pad 1, offsets [1, 2*3*3, 6, 7] (sub-pixel), bias
+xd = rng.standard_normal((1, 4, 6, 7)).astype(np.float32)
+off = (rng.standard_normal((1, 18, 6, 7)) * 0.7).astype(np.float32)
+try:
+    save("op_deformconv", model_op([helper.make_node("DeformConv", ["X", "W", "O", "B"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])],
+        [helper.make_tensor_value_info("X", F, [1, 4, 6, 7]), helper.make_tensor_value_info("O", F, [1, 18, 6, 7])],
+        [helper.make_tensor_value_info("Y", F, [1, 3, 6, 7])],
+        [init("W", rng.standard_normal((3, 4, 3, 3)).astype(np.float32)), init("B", rng.standard_normal((3,)).astype(np.float32))], 19),
+        {"X": xd, "O": off})
+except Exception as ex:
+    print("op_deformconv: onnxruntime cannot run it here:", str(ex)[:200])
+
+# second cases: the features the 2026-11-08 rewrites added (dilation, asymmetric pads; DeformConv mask, groups, offset groups, stride)
+# Col2Im: 3 channels, 2x3 blocks, dilations (2, 1), strides (1, 2), pads [1, 0, 2, 1] into 8x7
+bh = (8 + 1 + 2 - (2 * (2 - 1) + 1)) // 1 + 1; bw = (7 + 0 + 1 - (1 * (3 - 1) + 1)) // 2 + 1
+xc2 = rng.standard_normal((1, 3 * 6, bh * bw)).astype(np.float32)
+save("op_col2im_dil", model_op([helper.make_node("Col2Im", ["X", "img", "blk"], ["Y"], strides=[1, 2], pads=[1, 0, 2, 1], dilations=[2, 1])],
+    [helper.make_tensor_value_info("X", F, [1, 18, bh * bw])], [helper.make_tensor_value_info("Y", F, [1, 3, 8, 7])],
+    [init("img", np.array([8, 7], np.int64)), init("blk", np.array([2, 3], np.int64))], 18), {"X": xc2})
+
+# DeformConv: [2,4,7,8], W [6, 2, 3, 3] (group 2), offset_group 2, stride 2, dilation (1, 2), pads [1, 2, 0, 1], mask, bias
+oh2 = (7 + 1 + 0 - 1 * 2 - 1) // 2 + 1; ow2 = (8 + 2 + 1 - 2 * 2 - 1) // 2 + 1
+xd2 = rng.standard_normal((2, 4, 7, 8)).astype(np.float32)
+off2 = (rng.standard_normal((2, 2 * 9 * 2, oh2, ow2)) * 0.8).astype(np.float32)
+msk2 = rng.uniform(0, 1, (2, 2 * 9, oh2, ow2)).astype(np.float32)
+save("op_deformconv_mask", model_op([helper.make_node("DeformConv", ["X", "W", "O", "B", "M"], ["Y"], kernel_shape=[3, 3], strides=[2, 2],
+        dilations=[1, 2], pads=[1, 2, 0, 1], group=2, offset_group=2)],
+    [helper.make_tensor_value_info("X", F, [2, 4, 7, 8]), helper.make_tensor_value_info("O", F, [2, 36, oh2, ow2]),
+     helper.make_tensor_value_info("M", F, [2, 18, oh2, ow2])],
+    [helper.make_tensor_value_info("Y", F, [2, 6, oh2, ow2])],
+    [init("W", rng.standard_normal((6, 2, 3, 3)).astype(np.float32)), init("B", rng.standard_normal((6,)).astype(np.float32))], 19),
+    {"X": xd2, "O": off2, "M": msk2})

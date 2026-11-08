@@ -461,7 +461,7 @@ public sealed class SdKernels
 
     // ---------------------------------------------------------------------------------------------------
     // Resize channel-last [inH * inW, C] -> [outH * outW, C] as torch's F.interpolate(size=...) with align_corners=False, no antialias (ComfyUI's common_upscale):
-    // mode 0 bicubic (A = -0.75, border-clamped taps), 1 bilinear, 2 nearest-exact. Source coordinate (dst + 0.5) * in / out - 0.5 (bilinear clamps it at 0).
+    // mode 0 bicubic (A = -0.75, border-clamped taps), 1 bilinear, 2 nearest-exact, 3 area (adaptive average; SdResize order). Bislerp (4) is Bislerp(). Source coordinate (dst + 0.5) * in / out - 0.5 (bilinear clamps it at 0).
     // ---------------------------------------------------------------------------------------------------
     private Action<Index1D, FV, FV, int, int, int, int, int, int>? _resize;
     private static float Cubic1(float x) => ((1.25f * x - 2.25f) * x) * x + 1f;                     // |x| <= 1, A = -0.75
@@ -475,6 +475,17 @@ public sealed class SdKernels
         {
             int sy = XMath.Min((int)XMath.Floor((oy + 0.5f) * sh), inH - 1), sx = XMath.Min((int)XMath.Floor((ox + 0.5f) * sw), inW - 1);
             v = src[((long)sy * inW + sx) * C + c];
+        }
+        else if (mode == 3)
+        {
+            // area = adaptive average pool (torch F.interpolate mode="area"): the input cells [floor(o * in / out), ceil((o + 1) * in / out))
+            int y0 = (int)((long)oy * inH / outH), y1 = (int)(((long)(oy + 1) * inH + outH - 1) / outH);
+            int x0 = (int)((long)ox * inW / outW), x1 = (int)(((long)(ox + 1) * inW + outW - 1) / outW);
+            float s = 0f;
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++)
+                    s += src[((long)yy * inW + xx) * C + c];
+            v = s / ((y1 - y0) * (x1 - x0));
         }
         else if (mode == 1)
         {
@@ -506,8 +517,68 @@ public sealed class SdKernels
     }
     public void Resize(FV src, FV dst, int inH, int inW, int outH, int outW, int C, int mode)
     {
+        if (mode == 4) throw new ArgumentException("bislerp needs an intermediate buffer: call Bislerp", nameof(mode));
         _resize ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int>(ResizeImpl);
         _resize((int)((long)outH * outW * C), src, dst, inH, inW, outH, outW, C, mode);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // ComfyUI's bislerp (comfy.utils.bislerp, "bislerp" in common_upscale / PatchModelAddDownscale): resize along W, then along H, each output a SLERP of
+    // the two neighbouring channel VECTORS (directions slerped, norms lerped), the neighbours and ratio taken the way ComfyUI does - torch's bilinear
+    // (align_corners False) applied to the index ramps, truncated to ints. Edge cases as ComfyUI: a zero vector normalises to 0; dot > 1 - 1e-5 gives the
+    // first vector; dot < -1 + 1e-5 gives the plain lerp. Channel-last; `mid` holds [inH * outW, C] between the passes. Reference:
+    // tools/gen_sd_resize_reference.py runs ComfyUI's own function.
+    // ---------------------------------------------------------------------------------------------------
+    private Action<Index1D, FV, FV, int, int, int, int>? _bislerpAxis;
+    private static void BislerpAxisImpl(Index1D p, FV src, FV dst, int inLen, int outLen, int B, int C)
+    {
+        // src [A, inLen, B, C] -> dst [A, outLen, B, C]; one thread per output pixel (a, o, b)
+        int ob = outLen * B;
+        int a = p / ob, rem = p - a * ob, o = rem / B, b = rem - o * B;
+        float scale = (float)inLen / outLen;
+        float s = scale * (o + 0.5f) - 0.5f;
+        if (s < 0f) s = 0f;
+        int k0 = (int)s;
+        float lam = s - k0;
+        int k1 = k0 < inLen - 1 ? k0 + 1 : k0;
+        float lam0 = 1f - lam;
+        // ComfyUI's coords_1 = bilinear(arange) and coords_2 = bilinear(arange + 1, last - 1), truncated; ratio = coords_1 - floor(coords_1)
+        float c1 = lam0 * k0 + lam * k1;
+        float v0 = k0 < inLen - 1 ? k0 + 1 : k0, v1 = k1 < inLen - 1 ? k1 + 1 : k1;
+        float c2 = lam0 * v0 + lam * v1;
+        int i1 = (int)c1, i2 = (int)c2;
+        float r = c1 - XMath.Floor(c1);
+        long p1 = ((long)(a * inLen + i1) * B + b) * C, p2 = ((long)(a * inLen + i2) * B + b) * C, q = ((long)(a * outLen + o) * B + b) * C;
+        float n1 = 0f, n2 = 0f;
+        for (int c = 0; c < C; c++) { float x = src[p1 + c], y = src[p2 + c]; n1 += x * x; n2 += y * y; }
+        n1 = XMath.Sqrt(n1); n2 = XMath.Sqrt(n2);
+        float dot = 0f;
+        for (int c = 0; c < C; c++)
+        {
+            float x = n1 == 0f ? 0f : src[p1 + c] / n1, y = n2 == 0f ? 0f : src[p2 + c] / n2;
+            dot += x * y;
+        }
+        bool same = dot > 1f - 1e-5f;
+        bool opposite = dot < 1e-5f - 1f;
+        float omega = XMath.Acos(dot), so = XMath.Sin(omega);
+        float w1 = XMath.Sin((1f - r) * omega) / so, w2 = XMath.Sin(r * omega) / so, mag = n1 * (1f - r) + n2 * r;
+        for (int c = 0; c < C; c++)
+        {
+            float x = src[p1 + c], y = src[p2 + c];
+            float res;
+            if (same) res = x;
+            else if (opposite) res = x * (1f - r) + y * r;
+            else res = (w1 * (n1 == 0f ? 0f : x / n1) + w2 * (n2 == 0f ? 0f : y / n2)) * mag;
+            dst[q + c] = res;
+        }
+    }
+
+    /// <summary>ComfyUI's bislerp of channel-last <paramref name="src"/> [inH * inW, C] into <paramref name="dst"/> [outH * outW, C]; <paramref name="mid"/> holds inH * outW * C.</summary>
+    public void Bislerp(FV src, FV dst, FV mid, int inH, int inW, int outH, int outW, int C)
+    {
+        _bislerpAxis ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(BislerpAxisImpl);
+        _bislerpAxis(inH * outW, src, mid, inW, outW, 1, C);        // along W: A = inH, B = 1
+        _bislerpAxis(outH * outW, mid, dst, inH, outH, outW, C);    // along H: A = 1, B = outW
     }
 
     // fp16 -> fp32 (reading a small weight back to the host)

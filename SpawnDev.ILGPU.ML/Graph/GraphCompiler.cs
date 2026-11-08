@@ -328,6 +328,15 @@ public class GraphCompiler
                     attrs["_resolved_frame_length"] = (long)lenVals[0];
             }
 
+            // Col2Im's image_shape and block_shape are INPUTS (opset 18), not attributes: fold their values in before inference, as for STFT.
+            if (node.OpType == "Col2Im" && graph.ConstantData != null)
+            {
+                if (node.Inputs.Count >= 2 && graph.ConstantData.TryGetValue(node.Inputs[1], out var imgVals) && imgVals.Length >= 2)
+                    attrs["_resolved_image_shape"] = imgVals.Select(v => (long)v).ToArray();
+                if (node.Inputs.Count >= 3 && graph.ConstantData.TryGetValue(node.Inputs[2], out var blkVals) && blkVals.Length >= 2)
+                    attrs["_resolved_block_shape"] = blkVals.Select(v => (long)v).ToArray();
+            }
+
             // Infer output shapes
             int[][]? outputShapes = TryInferOutputShapes(op, inputShapes, attrs, out var shapeEx);
             if (outputShapes == null)

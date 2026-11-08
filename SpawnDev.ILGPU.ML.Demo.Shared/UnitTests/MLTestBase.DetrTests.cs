@@ -39,6 +39,25 @@ public abstract partial class MLTestBase
         ops => !ops.Contains("FusedLinear") ? "MatMul+Add did not fuse into FusedLinear"
              : !ops.Contains("Clip") ? "the Clip was fused away" : null);
 
+    // Operators whose params moved to OperatorRegistry.ParamsView (content-addressed, write-once) on 2026-11-08 and had no operator-level
+    // test: each against onnxruntime (tools/gen_detr_ops_reference.py), through the whole session path.
+    [TestMethod(Timeout = 180000)]
+    public async Task Op_LRN_MatchesOnnxRuntime() => await FusionFixture("op_lrn", ops => ops.Contains("LRN") ? null : "no LRN node ran", 1e-4);
+
+    [TestMethod(Timeout = 180000)]
+    public async Task Op_Col2Im_MatchesOnnxRuntime() => await FusionFixture("op_col2im", ops => ops.Contains("Col2Im") ? null : "no Col2Im node ran", 1e-4);
+
+    [TestMethod(Timeout = 180000)]
+    public async Task Op_DeformConv_MatchesOnnxRuntime() => await FusionFixture("op_deformconv", ops => ops.Contains("DeformConv") ? null : "no DeformConv node ran", 1e-4);
+
+    // The cases the 2026-11-08 rewrites added: Col2Im dilations + asymmetric pads + unequal strides; DeformConv mask (DCNv2), group 2, offset_group 2,
+    // stride 2, dilation (1, 2), asymmetric pads, batch 2.
+    [TestMethod(Timeout = 180000)]
+    public async Task Op_Col2Im_Dilated_MatchesOnnxRuntime() => await FusionFixture("op_col2im_dil", ops => ops.Contains("Col2Im") ? null : "no Col2Im node ran", 1e-4);
+
+    [TestMethod(Timeout = 180000)]
+    public async Task Op_DeformConv_MaskGroups_MatchesOnnxRuntime() => await FusionFixture("op_deformconv_mask", ops => ops.Contains("DeformConv") ? null : "no DeformConv node ran", 1e-4);
+
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task Detr_DFineS_MatchesOnnxRuntime() => await RunTest(async accelerator =>
         await DetrOrtParity(accelerator, "onnx-community/dfine_s_coco-ONNX", "dfine_s_coco"));

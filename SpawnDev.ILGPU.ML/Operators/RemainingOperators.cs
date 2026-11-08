@@ -310,47 +310,50 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
 }
 public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
 {
+    // 🔴 ONNX Col2Im (opset 18): image_shape AND block_shape are INPUTS 1 and 2; dilations, pads [h_begin, w_begin, h_end, w_end] and strides are
+    // attributes. This read block_shape as an ATTRIBUTE (always its [1, 1] default), took pads as symmetric and ignored dilations - so every real
+    // Col2Im was wrong (MEASURED 2026-11-08 against onnxruntime, Op_Col2Im_MatchesOnnxRuntime: max rel 2.95 on CUDA, OpenCL and WebGPU), and shape
+    // inference read the SHAPE of the image_shape tensor ([2]) as if it were its values.
     public string OpType => "Col2Im";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
-        // Input: [N, C*kH*kW, L], image_shape: [H, W]
-        // Output: [N, C, H, W]
-        if (inputs.Length > 1 && inputs[1].Length >= 2)
+        // Input [N, C*kH*kW, L] -> [N, C, H, W]; image_shape / block_shape values are folded in by GraphCompiler (_resolved_*).
+        if (attrs.TryGetValue("_resolved_image_shape", out var img) && attrs.TryGetValue("_resolved_block_shape", out var blk))
         {
-            int N = inputs[0][0];
-            var blockShape = attrs.ContainsKey("block_shape") ? ((long[])attrs["block_shape"]).Select(x => (int)x).ToArray() : new[] { 1, 1 };
-            int C = inputs[0][1] / (blockShape[0] * blockShape[1]);
-            return new[] { new[] { N, C, inputs[1][0], inputs[1][1] } };
+            var i2 = (long[])img; var b2 = (long[])blk;
+            return new[] { new[] { inputs[0][0], inputs[0][1] / (int)(b2[0] * b2[1]), (int)i2[0], (int)i2[1] } };
         }
-        return new[] { inputs[0] };
+        return new[] { inputs[0] };   // resolved at run time (Execute sets the shape)
     }
     public void Execute(OnnxOpContext ctx)
     {
         var imageShapeVals = ctx.TryGetInputValues(1);
-        var blockShape = ctx.GetInts("block_shape", new[] { 1, 1 });
+        var blockShapeVals = ctx.TryGetInputValues(2);
+        if (imageShapeVals is not { Length: 2 } || blockShapeVals is not { Length: 2 })
+            throw new NotSupportedException("Col2Im: image_shape and block_shape must be constant 2-D shapes (inputs 1 and 2).");
         var strides = ctx.GetInts("strides", new[] { 1, 1 });
         var pads = ctx.GetInts("pads", new int[4]);
+        var dilations = ctx.GetInts("dilations", new[] { 1, 1 });
 
         var xShape = ctx.Inputs[0].Shape;
         int N = xShape[0]; int colDim = xShape[1]; int L = xShape[2];
-        int kH = blockShape.Length > 0 ? blockShape[0] : 1;
-        int kW = blockShape.Length > 1 ? blockShape[1] : 1;
+        int kH = (int)blockShapeVals[0], kW = (int)blockShapeVals[1];
         int C = colDim / (kH * kW);
-        int outH = imageShapeVals != null && imageShapeVals.Length > 0 ? (int)imageShapeVals[0] : 1;
-        int outW = imageShapeVals != null && imageShapeVals.Length > 1 ? (int)imageShapeVals[1] : 1;
-        int sH = strides.Length > 0 ? strides[0] : 1;
-        int sW = strides.Length > 1 ? strides[1] : 1;
-        int pH = pads.Length > 0 ? pads[0] : 0;
-        int pW = pads.Length > 1 ? pads[1] : 0;
-        int paddedW = outW + 2 * pW;
-        int blocksW = (paddedW - kW) / sW + 1;
+        int outH = (int)imageShapeVals[0], outW = (int)imageShapeVals[1];
+        int sH = strides[0], sW = strides.Length > 1 ? strides[1] : sH;
+        int dH = dilations[0], dW = dilations.Length > 1 ? dilations[1] : dH;
+        int pT = pads.Length > 0 ? pads[0] : 0, pL = pads.Length > 1 ? pads[1] : 0;
+        int pB = pads.Length > 2 ? pads[2] : pT, pR = pads.Length > 3 ? pads[3] : pL;
+        int blocksH = (outH + pT + pB - (dH * (kH - 1) + 1)) / sH + 1;
+        int blocksW = (outW + pL + pR - (dW * (kW - 1) + 1)) / sW + 1;
+        if (C * kH * kW != colDim || blocksH * blocksW != L)
+            throw new InvalidOperationException($"Col2Im: input [{string.Join(",", xShape)}] does not hold C x {kH}x{kW} blocks of a {blocksH}x{blocksW} grid "
+                + $"(image {outH}x{outW}, strides {sH},{sW}, dilations {dH},{dW}, pads {pT},{pL},{pB},{pR}).");
+        ctx.Outputs[0].Shape = new[] { N, C, outH, outW };
 
-        // One thread per output position — gather kernel writes every output unconditionally,
-        // so no Fill pre-pass needed. Also correct for overlapping kernels (the prior scatter-add
-        // had a race condition for stride < kernel).
-        int outCount = ctx.Outputs[0].ElementCount;
-        var paramsData = new float[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim };
-        var paramsBuf = reg.ParamsView(paramsData);
+        // One thread per output position (gather): sums every block entry that im2col would have read from it.
+        int outCount = N * C * outH * outW;
+        var paramsBuf = reg.ParamsView(new float[] { C, L, kH, kW, outH, outW, sH, sW, pT, pL, blocksW, colDim, dH, dW });
         reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, outCount);
     }
 }
@@ -364,13 +367,10 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
+        // ONNX DeformConv (opset 19): X, W, offset (required), B?, mask?. See ElementWiseKernels.DeformConvImpl for what this used to get wrong.
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
-        if (x.Shape.Length < 4 || w.Shape.Length < 4)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
-
+        if (x.Shape.Length != 4 || w.Shape.Length != 4 || ctx.Inputs.Length < 3 || ctx.Inputs[2] == null)
+            throw new NotSupportedException($"DeformConv: 2-D only, with the required offset input (X [{string.Join(",", x.Shape)}], W [{string.Join(",", w.Shape)}]).");
         var xShape = x.Shape; var wShape = w.Shape;
         int N = xShape[0], inC = xShape[1], H = xShape[2], W = xShape[3];
         int outC = wShape[0], kH = wShape[2], kW = wShape[3];
@@ -380,31 +380,22 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
         var pads = ctx.GetInts("pads", new int[4]);
         var dilations = ctx.GetInts("dilations", new[] { 1, 1 });
         int sH = strides[0], sW = strides.Length > 1 ? strides[1] : sH;
-        int pH = pads[0], pW = pads.Length > 1 ? pads[1] : pH;
+        int pT = pads.Length > 0 ? pads[0] : 0, pL = pads.Length > 1 ? pads[1] : 0;
+        int pB = pads.Length > 2 ? pads[2] : pT, pR = pads.Length > 3 ? pads[3] : pL;
         int dH = dilations[0], dW = dilations.Length > 1 ? dilations[1] : dH;
-
-        int outH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
-        int outW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
+        int outH = (H + pT + pB - dH * (kH - 1) - 1) / sH + 1;
+        int outW = (W + pL + pR - dW * (kW - 1) - 1) / sW + 1;
         int totalOutput = N * outC * outH * outW;
-
-        // GPU path: offsets tensor on GPU, one thread per output element
-        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
-        {
-            var paramsData = new float[] { inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, group, offsetGroup };
-            var paramsBuf = reg.ParamsView(paramsData);
-            reg.ElementWise.DeformConv(x.Data, w.Data, ctx.Inputs[2].Data,
-                ctx.Outputs[0].Data, paramsBuf, totalOutput);
-            // Add bias if provided
-            if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
-                reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[3].Data, totalOutput, outC);
-        }
-        else
-        {
-            // Fallback: regular conv without offsets
-            var bias = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null ? ctx.Inputs[3].Data : default;
-            reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                inC, H, W, outC, kH, kW, sH, pH);
-        }
+        if (wShape[1] * group != inC || inC % offsetGroup != 0)
+            throw new InvalidOperationException($"DeformConv: W [{string.Join(",", wShape)}] with group {group} / offset_group {offsetGroup} does not fit {inC} input channels.");
+        bool hasBias = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null;
+        bool hasMask = ctx.Inputs.Length > 4 && ctx.Inputs[4] != null;
+        ctx.Outputs[0].Shape = new[] { N, outC, outH, outW };
+        var paramsBuf = reg.ParamsView(new float[] { inC, H, W, outC, outH, outW, kH, kW, sH, sW, pT, pL, group, offsetGroup, dH, dW, hasMask ? 1 : 0, hasBias ? 1 : 0 });
+        // distinct placeholders: WebGPU refuses one buffer bound twice in a dispatch
+        var mask = hasMask ? ctx.Inputs[4].Data : reg.ParamsView(new float[] { 0f });
+        var bias = hasBias ? ctx.Inputs[3].Data : reg.ParamsView(new float[] { 0f, 0f });
+        reg.ElementWise.DeformConv(x.Data, w.Data, ctx.Inputs[2].Data, mask, bias, ctx.Outputs[0].Data, paramsBuf, totalOutput);
     }
 }
 public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator

@@ -1606,13 +1606,14 @@ public class ElementWiseKernels : IDisposable
         // One thread per output position (n, c, oh, ow) — gather, not scatter.
         // Replaces a scatter-add that was WebGL-broken AND race-prone for overlapping
         // kernels on every backend. Now correct on all backends, all stride/kernel combos.
-        // params: [C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim] (float-stored, cast to int)
+        // params: [C, L, kH, kW, outH, outW, sH, sW, pTop, pLeft, blocksW, colDim, dH, dW] (float-stored, cast to int)
         int C = (int)paramsArr[0]; int L = (int)paramsArr[1];
         int kH = (int)paramsArr[2]; int kW = (int)paramsArr[3];
         int outH = (int)paramsArr[4]; int outW = (int)paramsArr[5];
         int sH = (int)paramsArr[6]; int sW = (int)paramsArr[7];
         int pH = (int)paramsArr[8]; int pW = (int)paramsArr[9];
         int blocksW = (int)paramsArr[10]; int colDim = (int)paramsArr[11];
+        int dH = (int)paramsArr[12]; int dW = (int)paramsArr[13];
         int blocksH = L / blocksW;
 
         // Decode idx → (n, c, oh, ow)
@@ -1627,7 +1628,7 @@ public class ElementWiseKernels : IDisposable
         // points to a valid (bh, bw) col block, accumulate that input entry.
         for (int kh = 0; kh < kH; kh++)
         {
-            int bhNum = oh + pH - kh;
+            int bhNum = oh + pH - kh * dH;
             if (bhNum >= 0)
             {
                 int bh = bhNum / sH;
@@ -1636,7 +1637,7 @@ public class ElementWiseKernels : IDisposable
                 {
                     for (int kw = 0; kw < kW; kw++)
                     {
-                        int bwNum = ow + pW - kw;
+                        int bwNum = ow + pW - kw * dW;
                         if (bwNum >= 0)
                         {
                             int bw = bwNum / sW;
@@ -1727,18 +1728,25 @@ public class ElementWiseKernels : IDisposable
         output[selfIdx] = sum;
     }
 
+    // ONNX DeformConv (opset 19, torchvision's deform_conv2d): one thread per output element.
+    // Rewritten 2026-11-08 after its first operator-level test against onnxruntime (Op_DeformConv_MatchesOnnxRuntime: max rel 3.48 on every
+    // backend, and an ILLEGAL MEMORY ACCESS on CUDA). The corner checks tested only the upper bound of the +1 neighbours, so a sample at x0 = -2 read
+    // input[-1]; the bias was added along the LAST dimension (AddBias) instead of per output channel; dilations were ignored; pads were taken as
+    // symmetric; the optional mask (DCNv2) was ignored. Bias and mask are fused here (flags in params; a placeholder view when absent).
     private static void DeformConvImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> weights, ArrayView1D<float, Stride1D.Dense> offsets,
+        ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
-        // params: [inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, groups, offsetGroups] (float-stored, cast to int)
+        // params: [inC, H, W, outC, outH, outW, kH, kW, sH, sW, pTop, pLeft, groups, offsetGroups, dH, dW, hasMask, hasBias] (float-stored)
         int inC = (int)paramsArr[0]; int H = (int)paramsArr[1]; int W = (int)paramsArr[2];
         int outC = (int)paramsArr[3]; int outH = (int)paramsArr[4]; int outW = (int)paramsArr[5];
         int kH = (int)paramsArr[6]; int kW = (int)paramsArr[7];
         int sH = (int)paramsArr[8]; int sW = (int)paramsArr[9];
         int pH = (int)paramsArr[10]; int pW = (int)paramsArr[11];
         int groups = (int)paramsArr[12]; int offsetGroups = (int)paramsArr[13];
-        // idx = n * outC * outH * outW + oc * outH * outW + oh * outW + ow
+        int dH = (int)paramsArr[14]; int dW = (int)paramsArr[15];
+        bool hasMask = paramsArr[16] != 0f; bool hasBias = paramsArr[17] != 0f;
         int tmp = idx;
         int ow = tmp % outW; tmp /= outW;
         int oh = tmp % outH; tmp /= outH;
@@ -1747,38 +1755,48 @@ public class ElementWiseKernels : IDisposable
         int ocPerGroup = outC / groups;
         int g = oc / ocPerGroup;
         int cPerOffGrp = inC / offsetGroups;
+        int hw = outH * outW;
+        int kHW = kH * kW;
         float sum = 0f;
-        for (int ic = g * cPerGroup; ic < (g + 1) * cPerGroup; ic++)
+        int icEnd = (g + 1) * cPerGroup;
+        for (int ic = g * cPerGroup; ic < icEnd; ic++)
         {
             int offGrp = ic / cPerOffGrp;
+            int chOff = (n * inC + ic) * H;
             for (int kh = 0; kh < kH; kh++)
             {
                 for (int kw = 0; kw < kW; kw++)
                 {
-                    // Read learned offset for this position
-                    int offIdx = ((n * offsetGroups + offGrp) * kH * kW + kh * kW + kw) * 2;
-                    int offBase = offIdx * outH * outW + oh * outW + ow;
-                    float dy = offsets[offBase];
-                    float dx = offsets[offBase + outH * outW];
-                    float fy = oh * sH - pH + kh + dy;
-                    float fx = ow * sW - pW + kw + dx;
-                    // Bilinear interpolation
+                    int k = kh * kW + kw;
+                    // offset [N, offsetGroups * kH * kW * 2, outH, outW]: (dy, dx) per kernel tap; mask [N, offsetGroups * kH * kW, outH, outW]
+                    int offBase = ((n * offsetGroups + offGrp) * kHW + k) * 2 * hw + oh * outW + ow;
+                    float fy = oh * sH - pH + kh * dH + offsets[offBase];
+                    float fx = ow * sW - pW + kw * dW + offsets[offBase + hw];
                     int y0 = (int)MathF.Floor(fy); int x0 = (int)MathF.Floor(fx);
+                    int y1 = y0 + 1; int x1 = x0 + 1;
                     float ty = fy - y0; float tx = fx - x0;
-                    int chOff = (n * inC + ic) * H;
+                    bool y0in = (y0 >= 0) & (y0 < H);
+                    bool y1in = (y1 >= 0) & (y1 < H);
+                    bool x0in = (x0 >= 0) & (x0 < W);
+                    bool x1in = (x1 >= 0) & (x1 < W);
+                    bool b00 = y0in & x0in;
+                    bool b01 = y0in & x1in;
+                    bool b10 = y1in & x0in;
+                    bool b11 = y1in & x1in;
                     float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
-                    if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) v00 = input[(chOff + y0) * W + x0];
-                    if (y0 >= 0 && y0 < H && x0 + 1 < W) v01 = input[(chOff + y0) * W + x0 + 1];
-                    if (y0 + 1 < H && x0 >= 0 && x0 < W) v10 = input[(chOff + y0 + 1) * W + x0];
-                    if (y0 + 1 < H && x0 + 1 < W) v11 = input[(chOff + y0 + 1) * W + x0 + 1];
+                    if (b00) v00 = input[(chOff + y0) * W + x0];
+                    if (b01) v01 = input[(chOff + y0) * W + x1];
+                    if (b10) v10 = input[(chOff + y1) * W + x0];
+                    if (b11) v11 = input[(chOff + y1) * W + x1];
                     float interp = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
                         + v10 * ty * (1f - tx) + v11 * ty * tx;
-                    // Weight
+                    if (hasMask) interp *= mask[((n * offsetGroups + offGrp) * kHW + k) * hw + oh * outW + ow];
                     int wIdx = ((oc * cPerGroup + (ic - g * cPerGroup)) * kH + kh) * kW + kw;
                     sum += interp * weights[wIdx];
                 }
             }
         }
+        if (hasBias) sum += bias[oc];
         output[idx] = sum;
     }
 
@@ -2026,8 +2044,8 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _cumSumKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _deformConvKernel;
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _deformConvKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _bernoulliKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _centerCropPadKernel;
@@ -2245,10 +2263,11 @@ public class ElementWiseKernels : IDisposable
     public void CumSum(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int outerTimesInner)
     { EnsureLoaded2(); _cumSumKernel!(outerTimesInner, input, output, paramsBuf); }
+    /// <summary>ONNX DeformConv; mask / bias are read only when params flag them (pass distinct placeholder views otherwise).</summary>
     public void DeformConv(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weights,
-        ArrayView1D<float, Stride1D.Dense> offsets, ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
-    { EnsureLoaded2(); _deformConvKernel!(totalOutput, input, weights, offsets, output, paramsBuf); }
+        ArrayView1D<float, Stride1D.Dense> offsets, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
+    { EnsureLoaded2(); _deformConvKernel!(totalOutput, input, weights, offsets, mask, bias, output, paramsBuf); }
     public void Bernoulli(ArrayView1D<float, Stride1D.Dense> probs, ArrayView1D<float, Stride1D.Dense> output,
         int count, int seed)
     { EnsureLoaded2(); _bernoulliKernel!(count, probs, output, seed); }
@@ -2334,8 +2353,8 @@ public class ElementWiseKernels : IDisposable
         _cumSumKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(CumSumImpl);
         _deformConvKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(DeformConvImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DeformConvImpl);
         _bernoulliKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BernoulliImpl);
         _centerCropPadKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(CenterCropPadImpl);

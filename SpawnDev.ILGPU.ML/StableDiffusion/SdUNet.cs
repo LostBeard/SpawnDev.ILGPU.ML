@@ -20,8 +20,11 @@ using Buf = MemoryBuffer1D<float, Stride1D.Dense>;
 /// </summary>
 public sealed record SdFreeU(float B1, float B2, float S1, float S2, bool V2 = false);
 
-/// <summary>How a feature map is resized (torch's F.interpolate, align_corners False, as ComfyUI's common_upscale).</summary>
-public enum SdResize { Bicubic, Bilinear, NearestExact }
+/// <summary>
+/// How a feature map is resized, as ComfyUI's common_upscale: torch's F.interpolate (align_corners False) for Bicubic, Bilinear, NearestExact and Area
+/// (adaptive average), and ComfyUI's own bislerp (slerp of neighbouring channel vectors, W then H) for Bislerp - the five methods of PatchModelAddDownscale.
+/// </summary>
+public enum SdResize { Bicubic, Bilinear, NearestExact, Area, Bislerp }
 
 /// <summary>
 /// ComfyUI's PatchModelAddDownscale ("Kohya deep shrink", <see cref="SdUNet.DeepShrink"/>): after input block <see cref="Block"/> the features are resized by
@@ -260,6 +263,14 @@ public sealed partial class SdUNet : IDisposable
     // ---------------------------------------------------------------------------------------------------
     // workspace: role slots that only grow (a replaced buffer is kept until Dispose: a browser may still have a dispatch on it queued)
     // ---------------------------------------------------------------------------------------------------
+
+    /// <summary>Deep shrink's resize: <see cref="SdKernels.Resize"/> for the interpolate methods, <see cref="SdKernels.Bislerp"/> (with its pass buffer) for bislerp.</summary>
+    private void ResizeFeatures(ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst, int inH, int inW, int outH, int outW, int C, SdResize mode)
+    {
+        if (mode == SdResize.Bislerp) _k.Bislerp(src, dst, Slot(SlotShrinkMid, (long)inH * outW * C), inH, inW, outH, outW, C);
+        else _k.Resize(src, dst, inH, inW, outH, outW, C, (int)mode);
+    }
+
     private FV Slot(int slot, long n)
     {
         if (!_slots.TryGetValue(slot, out var b) || b.Length < n)
@@ -272,7 +283,7 @@ public sealed partial class SdUNet : IDisposable
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
         SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26, SlotSagMass = 27, SlotSagStats = 28, SlotSagPart = 29,
-        SlotTokA = 30, SlotTokB = 31,
+        SlotTokA = 30, SlotTokB = 31, SlotShrinkMid = 32,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
@@ -616,7 +627,7 @@ public sealed partial class SdUNet : IDisposable
                 int nh = (int)Math.Round(Hc * (1.0 / ds.Factor), MidpointRounding.ToEven), nw = (int)Math.Round(Wc * (1.0 / ds.Factor), MidpointRounding.ToEven);
                 var small = Slot(SlotShrink, (long)nh * nw * Cc);
                 if (ds.AfterSkip) skips.Add((cur, Hc, Wc, Cc));
-                _k.Resize(cur, small, Hc, Wc, nh, nw, Cc, (int)ds.Down);
+                ResizeFeatures(cur, small, Hc, Wc, nh, nw, Cc, ds.Down);
                 (cur, Hc, Wc) = (small, nh, nw);
                 if (!ds.AfterSkip) skips.Add((cur, Hc, Wc, Cc));
             }
@@ -651,7 +662,7 @@ public sealed partial class SdUNet : IDisposable
                 // only deep shrink makes the features miss their skip connection (ComfyUI's output_block_patch resizes them to it)
                 if (DeepShrink is not { } dsu) throw new InvalidOperationException($"skip {sh}x{sw} does not meet {Hc}x{Wc}");
                 var big = Slot(SlotShrinkUp, (long)sh * sw * Cc);
-                _k.Resize(cur, big, Hc, Wc, sh, sw, Cc, (int)dsu.Up);
+                ResizeFeatures(cur, big, Hc, Wc, sh, sw, Cc, dsu.Up);
                 (cur, Hc, Wc) = (big, sh, sw);
             }
             if (FreeU is { } fu && (Cc == mc * 4 || Cc == mc * 2))

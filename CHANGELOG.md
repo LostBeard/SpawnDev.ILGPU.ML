@@ -4,6 +4,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.7-local.2 - 2026-11-08 (local feed) - deep shrink area + bislerp; Col2Im and DeformConv corrected
+
+- **`SdResize.Area` and `SdResize.Bislerp`** - the last two of PatchModelAddDownscale's methods (Lore, SpawnGen). Area = torch's F.interpolate(mode="area")
+  (adaptive average); Bislerp = ComfyUI's `comfy.utils.bislerp` (W then H, each output a slerp of the neighbouring channel vectors with lerped norms,
+  ComfyUI's neighbour/ratio arithmetic and edge cases). Gate `Sd_Resize_AreaAndBislerp_MatchComfyUI` against ComfyUI's OWN functions run under torch
+  (tools/gen_sd_resize_reference.py): integer and non-integer shrinks and growths with zero / identical / opposite vectors planted - max|diff|
+  1.2e-5 on CUDA, OpenCL and WebGPU. `SdKernels.Bislerp`; deep shrink routes through it.
+- **Col2Im was wrong for every real use** (its first test against onnxruntime: max rel 2.95 on all backends): it read `block_shape` as an attribute
+  (it is input 2, so the 1x1 default was always used), took pads as symmetric, ignored dilations, and its shape inference read the image_shape
+  tensor's SHAPE as its values. Now per opset 18, with input values folded in before inference (as for STFT).
+- **DeformConv was wrong and could fault** (max rel 3.48; an illegal memory access on CUDA): the bilinear corner checks missed the lower bound of the
+  +1 neighbours (a sample at x0 = -2 read input[-1]), the bias was added along the last dimension instead of per output channel, dilations and the
+  optional mask (DCNv2) were ignored, pads were taken as symmetric. Rewritten per opset 19 with bias and mask fused into the kernel.
+- Gates against onnxruntime: `Op_LRN_`, `Op_Col2Im_`, `Op_Col2Im_Dilated_`, `Op_DeformConv_`, `Op_DeformConv_MaskGroups_MatchesOnnxRuntime` (mask, group 2,
+  offset_group 2, stride 2, dilation, asymmetric pads, batch 2) on CUDA, OpenCL and WebGPU.
+
 ## 5.8.7-local.1 - 2026-11-08 (local feed) - DETR family + DetrDetectionPipeline; flow-scoped capture
 
 On SpawnDev.ILGPU 5.4.17-local.1 (flow-scoped dispatch-plan recording).
