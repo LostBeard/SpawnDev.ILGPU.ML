@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.7-local.4</Version>
-		<PackageReleaseNotes>v5.8.6 - GGUF Q8_0 weights regrouped in place on the device (GGMLType.Q8_0G, no extra memory): every reader (one-row and multi-row GEMVs, the tensor-core and tiled prefill, the embedding) reads 16-byte chunks. Qwen3-1.7B Q8_0 decode in Chrome WebGPU 147 -> 166 tok/s on an RTX 4070 (CUDA +1.5%). GgufBatchDecoder.ProfileRecordedStepAsync: per-kernel GPU time of a WebGPU decode step. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.7</Version>
+		<PackageReleaseNotes>v5.8.7 - DETR detectors: D-FINE and RT-DETR / RT-DETRv2 run and match onnxruntime (three engine bugs fixed), DetrDetectionPipeline with Pillow-exact preprocessing. Graph capture records only its own async flow (needs SpawnDev.ILGPU 5.4.17); CUDA graph capture of large graphs no longer crashes; Split / Concat one dispatch per output. ComfyUI deep shrink area / bislerp and attention-multiply (SdUNet / SdTextEncoder.ScaleAsync). Col2Im and DeformConv corrected. Chrome WebGPU LLM decode at long prompts +7%. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.17-local.1" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.17" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -4,6 +4,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.7 - 2026-11-08 (nuget.org) - DETR detectors, flow-scoped graph capture, ComfyUI deep shrink + attention multiply, browser decode +7%
+
+Stable: the four 5.8.7-local packages below, together. On SpawnDev.ILGPU 5.4.17 (flow-scoped dispatch-plan recording). SWEEP_RESULT_PLACEHOLDER
+
+- D-FINE, RT-DETR / RT-DETRv2 run and match onnxruntime (three engine bugs fixed); `DetrDetectionPipeline` with Pillow-exact preprocessing.
+- A graph capture records only its own async flow (SpawnDev.ILGPU 5.4.17 + the GraphExecutor capture flags); CUDA graph capture of large graphs no
+  longer kills the process; Split / Concat one dispatch per output.
+- Deep shrink `SdResize.Area` / `SdResize.Bislerp` and `SdUNet` / `SdTextEncoder.ScaleAsync` (ComfyUI's attention-multiply nodes), each equal to ComfyUI.
+- Col2Im and DeformConv corrected per ONNX; GridSample refuses modes it does not implement.
+- Chrome WebGPU LLM decode at long prompts +7% (`GgufBatchDecoder.AttentionVec`).
+
 ## 5.8.7-local.4 - 2026-11-08 (local feed) - browser decode attention from 16-byte loads
 
 GGUF decoder / generator gates on WebGPU with the route on by default: 18 passed, 0 failed (41 min).
