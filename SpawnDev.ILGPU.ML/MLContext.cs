@@ -15,7 +15,15 @@ public static class MLContext
     /// Use this instead of Context.Create() for ML workloads.
     /// </summary>
     public static Context.Builder Create()
-        => Context.Create().AllAccelerators().EnableAlgorithms();
+    {
+        var b = Context.Create().AllAccelerators().EnableAlgorithms();
+        // SpawnDev.ILGPU 5.4.18 made float math strict by default (CUDA / OpenCL no longer fuse a * b + c on their own, so kernels round as the C# does).
+        // ML's hot loops (`sum += a * b` in the GEMMs, GEMVs, attention, norms) were written for the fused form; they keep it here until they are
+        // converted to float.MultiplyAddEstimate (one fma by construction). MEASURED by SpawnDev.ILGPU: a CUDA 4096x4096 GEMV +23% strict. Env
+        // ML_FP_CONTRACT=0 builds strict (the A/B). The plain CPU builder below stays strict: it is the exact reference.
+        if (Environment.GetEnvironmentVariable("ML_FP_CONTRACT") != "0") b = b.EnableFloatingPointContraction();
+        return b;
+    }
 
     /// <summary>
     /// Create a fully initialized context with Algorithms enabled.
