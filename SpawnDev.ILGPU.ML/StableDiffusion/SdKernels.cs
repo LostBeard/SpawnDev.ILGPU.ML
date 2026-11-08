@@ -353,6 +353,20 @@ public sealed class SdKernels
         }
     }
 
+    // w = w * a on fp16 weights in fp32 (ComfyUI's add_patches strength_model with a (None,) patch: the attention-multiply nodes). Chunked like Blend.
+    private Action<Index1D, HV, float>? _scaleHalf;
+    private static void ScaleHalfImpl(Index1D i, HV w, float a)
+        => w[i] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(PrecisionConvert.ConvertToSingle(w[i]) * a);
+    public void ScaleHalf(HV w, float a)
+    {
+        _scaleHalf ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, float>(ScaleHalfImpl);
+        for (long at = 0; at < w.Length; at += BlendChunk)
+        {
+            int n = (int)Math.Min(BlendChunk, w.Length - at);
+            _scaleHalf(n, w.SubView(at, n), a);
+        }
+    }
+
     // channel-first src [C, rows] into columns [colOff, colOff + C) of channel-last dst [rows, dstC]: the inpainting UNet's input is the latent and the
     // concatenated mask + masked-image latent side by side, assembled here with no host copy
     private Action<Index1D, FV, FV, int, int, int, int>? _toLastCols;

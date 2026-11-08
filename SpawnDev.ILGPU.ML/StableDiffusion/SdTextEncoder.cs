@@ -89,6 +89,13 @@ public sealed partial class SdTextEncoder : IDisposable
     /// Merge other text encoders of the same family into these (ComfyUI's CLIPMergeSimple / CLIPAdd / CLIPSubtract: <see cref="SdMerge"/>). Same rules as
     /// <see cref="SdUNet.MergeAsync"/>; tensor names are <c>l. / h. / g.</c> + <c>tok, pos, layers.N.{ln1, qkv, out, ln2, fc1, fc2}, final_ln, proj</c>.
     /// </summary>
+    /// <summary>
+    /// Scale weights in place: <c>W = W * factor(name)</c> (ComfyUI's CLIPAttentionMultiply: <see cref="SdMerge.CLIPAttentionMultiply"/>). Names are the normalised file-level
+    /// names <c>{l.|h.|g.}layers.N.{q,k,v,out}.{weight,bias}</c> (q / k / v scale their rows of the fused <c>qkv</c>). Ordered and restorable like <see cref="MergeAsync"/>.
+    /// </summary>
+    public Task<int> ScaleAsync(Func<string, float?> factor, bool restorable = true, CancellationToken cancellationToken = default)
+        => SdMerge.ScaleAsync(_acc, _k, Patches, factor, restorable, cancellationToken);
+
     public Task<SdMergeReport> MergeAsync(SdTextEncoder other, Func<string, SdMergeFactors?> factors, bool restorable = true, CancellationToken cancellationToken = default)
     {
         if (!ReferenceEquals(other._acc, _acc)) throw new ArgumentException("the other text encoder is on another accelerator", nameof(other));

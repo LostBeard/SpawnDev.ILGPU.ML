@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.7-local.3 - 2026-11-08 (local feed) - ComfyUI's attention-multiply nodes
+
+- **`SdUNet.ScaleAsync` / `SdTextEncoder.ScaleAsync(Func<string, float?> factor, bool restorable = true)`**: scale weights in place, `W = W * factor`, by
+  file-level name - including the parts fused away (`...attn1.to_q.weight` scales the q rows of `attn1.qkv.weight`). Ordered and restorable like
+  `MergeAsync` (ResetAsync). Factor builders for ComfyUI's four nodes (Lore, SpawnGen): `SdMerge.UNetAttentionMultiply("attn1" | "attn2", q, k, v, out)`,
+  `SdMerge.UNetTemporalAttentionMultiply`, `SdMerge.CLIPAttentionMultiply`. Gate `Sd15_AttentionMultiply_MatchComfyFormulas` (SD 1.5, self + cross + CLIP):
+  every one of the 982,581,444 saved values equals the file's weight times the factor ComfyUI's OWN key rules give its checkpoint name (240 tensors),
+  and ResetAsync gives the plain prediction back bit for bit; CUDA and OpenCL. Red-checked: scaling the fused tensor from row 0 put 46 M values off.
+
 ## 5.8.7-local.2 - 2026-11-08 (local feed) - deep shrink area + bislerp; Col2Im and DeformConv corrected
 
 - **`SdResize.Area` and `SdResize.Bislerp`** - the last two of PatchModelAddDownscale's methods (Lore, SpawnGen). Area = torch's F.interpolate(mode="area")

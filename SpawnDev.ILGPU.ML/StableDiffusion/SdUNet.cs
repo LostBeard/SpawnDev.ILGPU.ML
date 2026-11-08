@@ -106,6 +106,14 @@ public sealed partial class SdUNet : IDisposable
     /// <paramref name="restorable"/> keeps the file's weights of every changed tensor on the device (<see cref="ResetAsync"/>), as much memory again as the merged tensors:
     /// false saves that (an SDXL UNet is 5 GB) and makes <see cref="ResetAsync"/> throw.
     /// </summary>
+    /// <summary>
+    /// Scale weights in place: <c>W = W * factor(name)</c> for every tensor whose factor is not null (ComfyUI's attention-multiply nodes: <see cref="SdMerge.UNetAttentionMultiply"/>,
+    /// <see cref="SdMerge.UNetTemporalAttentionMultiply"/>). Names are the file's LDM names without <c>model.diffusion_model.</c>, including the parts fused away
+    /// (<c>...attn1.to_q.weight</c> scales the q rows of <c>attn1.qkv.weight</c>). Ordered and restorable exactly like <see cref="MergeAsync"/>. Returns the tensors scaled.
+    /// </summary>
+    public Task<int> ScaleAsync(Func<string, float?> factor, bool restorable = true, CancellationToken cancellationToken = default)
+        => SdMerge.ScaleAsync(_acc, _k, Patches, factor, restorable, cancellationToken);
+
     public Task<SdMergeReport> MergeAsync(SdUNet other, Func<string, SdMergeFactors?> factors, bool restorable = true, CancellationToken cancellationToken = default)
     {
         if (!ReferenceEquals(other._acc, _acc)) throw new ArgumentException("the other UNet is on another accelerator", nameof(other));
