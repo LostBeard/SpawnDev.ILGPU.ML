@@ -72,8 +72,10 @@ public class FusedLinearOperator : IOnnxOperator, IDisposable
             "sigmoid" => FusedActivation.Sigmoid,
             "tanh" => FusedActivation.Tanh,
             "silu" => FusedActivation.SiLU,
-            "clip" => FusedActivation.ReLU, // RELU6 approximation
-            _ => FusedActivation.None
+            "none" => FusedActivation.None,
+            // No "clip": a clamp needs its min/max, which this node does not carry. It used to map to ReLU ("RELU6
+            // approximation") and silently computed something else - GraphOptimizer no longer fuses Clip.
+            _ => throw new NotSupportedException($"FusedLinear: activation '{actStr}' is not implemented; it must stay a separate node.")
         };
 
         _kernel ??= new FusedLinearKernel(_registry.Accelerator);

@@ -10,21 +10,37 @@ public partial class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "MatMul";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { OutputShape(inputs[0], inputs[1]) };
+
+    /// <summary>
+    /// ONNX (numpy) MatMul output shape. Batch dims broadcast aligned from the RIGHT: [7,37] x [1,384,37,37] ->
+    /// [1,384,7,37], [2,M,K] x [3,2,K,N] -> [3,2,M,N]. A rank-1 A is promoted to [1,K] and a rank-1 B to [K,1], and
+    /// the promoted dim is REMOVED from the result: [S,K] x [K] -> [S], [K] x [K,N] -> [N], [K] x [K] -> [].
+    /// </summary>
+    /// <remarks>
+    /// 🔴 The rank-1 rules are not a corner case. MEASURED 2026-11-08 on D-FINE-N (Riker, AssistZ): the box head's
+    /// distribution integral is <c>MatMul(softmax [1200,33], project [33])</c> -> [1200]. Reading B's last dim as N
+    /// gave [1200,33], the following Reshape(-1, 300, 4) turned the 33 into a batch, and the decoder failed two
+    /// layers later at "MatMul: batch dims do not broadcast (a=[264,300,300], b=[8,300,16])" - 264 = 8 x 33.
+    /// </remarks>
+    public static int[] OutputShape(int[] a, int[] b)
     {
-        var a = inputs[0]; var b = inputs[1];
-        int M = a[^2]; int N = b[^1];
-        // Batch dims broadcast numpy-style, aligned from the RIGHT: [7,37] x [1,384,37,37] -> [1,384,7,37],
-        // [2,M,K] x [3,2,K,N] -> [3,2,M,N]. (Left alignment paired a's first batch dim with b's first.)
-        var outShape = new List<int>(BroadcastBatch(a, b));
-        outShape.Add(M);
-        outShape.Add(N);
-        return new[] { outShape.ToArray() };
+        if (a.Length == 0 || b.Length == 0)
+            throw new InvalidOperationException($"MatMul: rank-0 operand (a=[{string.Join(",", a)}], b=[{string.Join(",", b)}]); ONNX requires rank >= 1.");
+        var a2 = a.Length == 1 ? new[] { 1, a[0] } : a;
+        var b2 = b.Length == 1 ? new[] { b[0], 1 } : b;
+        var outShape = new List<int>(BroadcastBatch(a2, b2));
+        if (a.Length > 1) outShape.Add(a2[^2]);
+        if (b.Length > 1) outShape.Add(b2[^1]);
+        return outShape.ToArray();
     }
+
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        // Handle rank-1 vectors: treat as [1, K] or [K, 1]
         if (a.ElementCount == 0 || b.ElementCount == 0) return; // empty tensor
+        // Rank-1 operands: A as [1, K], B as [K, 1] (see OutputShape). The output's ELEMENT layout is the same with or
+        // without the promoted dim, so the kernels below write it unchanged.
         int M = a.Rank >= 2 ? a.Shape[^2] : 1;
         int K = a.Shape[^1];
         int N = b.Rank >= 2 ? b.Shape[^1] : 1;
@@ -88,6 +104,25 @@ public partial class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
                       "quantized byte-view map (shape-recompiled executor missing quantizedWeights?)."
                     : $"ctx.QuantizedWeights has {ctx.QuantizedWeights.Count} entries but not '{bName}'."));
 
+        ExecuteDense(a, b, ctx.Outputs[0], M, K, N);
+    }
+
+    /// <summary>
+    /// The F32 / native-low-p MatMul for any ONNX operand ranks (rank-1 A or B, broadcast batches, a shared 2-D B).
+    /// Shared with <see cref="FusedScaledMatMulOperator"/> so the fused attention form cannot drift from MatMul.
+    /// </summary>
+    internal void ExecuteDense(Tensor a, Tensor b, Tensor c)
+    {
+        if (a.ElementCount == 0 || b.ElementCount == 0) return;
+        int M = a.Rank >= 2 ? a.Shape[^2] : 1;
+        int K = a.Shape[^1];
+        int N = b.Rank >= 2 ? b.Shape[^1] : 1;
+        if (M == 0 || K == 0 || N == 0) return;
+        ExecuteDense(a, b, c, M, K, N);
+    }
+
+    void ExecuteDense(Tensor a, Tensor b, Tensor c, int M, int K, int N)
+    {
         // Native low-p weights: if B is a low-p-backed weight (Half/bf16/FP8, no float buffer), route to the
         // generic low-p-weight kernel (reads the native type, converts in-register, fp32 accumulate, no f32
         // temp). Activations (A) stay fp32. fp32 weights take the all-fp32 path.
@@ -97,28 +132,30 @@ public partial class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
             if (LowPWeightDispatch.IsLowP(b))
                 throw new NotSupportedException($"MatMul: broadcast batch with a low-precision B is not implemented " +
                     $"(a=[{string.Join(",", a.Shape)}], b=[{string.Join(",", b.Shape)}]).");
-            BroadcastMatMul(a, b, ctx.Outputs[0], M, K, N);
+            BroadcastMatMul(a, b, c, M, K, N);
             return;
         }
 
-        if (b.Rank == 2)
+        if (b.Rank <= 2)
         {
+            // A rank-1 B is the [K, 1] weight of OutputShape: the same flattened-rows GEMM with N = 1. (It used to fall
+            // to BatchedMatMul below, which strides B by K*N per batch entry and reads past a single vector.)
             // Shared 2-D weight (a Linear): flatten ALL of a's rows into M — [totalRows, K] @ [K, N]. Covers
             // a.Rank==2 (M unchanged) AND a.Rank>2 (batched activations = DAv3 multi-view num_images>1): the
             // extra batch is just more rows sharing ONE weight. Previously batched-A @ 2-D-B was routed to
             // BatchedMatMul, which strides the 2-D weight by batch and reads off its end → the multi-view qkv
             // Linear blew up to ~1e19. Flattening rows is the correct + zero-risk form (batch=1 → mRows==M).
             int mRows = K > 0 ? a.ElementCount / K : M;
-            if (LowPWeightDispatch.IsLowP(b)) LowPWeightDispatch.MatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, mRows, K, N);
-            else reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, mRows, K, N);
+            if (LowPWeightDispatch.IsLowP(b)) LowPWeightDispatch.MatMul(reg.MatMul, a.Data, b, c.Data, mRows, K, N);
+            else reg.MatMul.MatMul(a.Data, b.Data, c.Data, mRows, K, N);
         }
         else
         {
             int batch = a.ElementCount / (M * K);
             if (LowPWeightDispatch.IsLowP(b))
-                LowPWeightDispatch.BatchedMatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, batch, M, K, N);
+                LowPWeightDispatch.BatchedMatMul(reg.MatMul, a.Data, b, c.Data, batch, M, K, N);
             else
-                reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
+                reg.MatMul.BatchedMatMul(a.Data, b.Data, c.Data, batch, M, K, N);
         }
     }
 }

@@ -2308,21 +2308,11 @@ public class GraphExecutor : IDisposable
             {
                 var mA = nodeInputs[0]!.Shape;
                 var mB = nodeInputs[1]!.Shape;
-                if (mA.Length >= 2 && mB.Length >= 2)
+                // One rule for compile time and run time (MatMulOperator.OutputShape): batch broadcast AND the rank-1
+                // operand rules ([S,K] x [K] -> [S]); this block once required rank >= 2 and kept a wrong compiled shape.
+                if (mA.Length >= 1 && mB.Length >= 1)
                 {
-                    int mM = mA[mA.Length - 2];
-                    int mN = mB[mB.Length - 1];
-                    int aBatch = mA.Length - 2, bBatch = mB.Length - 2;
-                    int batchRank = Math.Max(aBatch, bBatch);
-                    var mOut = new int[batchRank + 2];
-                    for (int d = 0; d < batchRank; d++)
-                    {
-                        int ad = d - (batchRank - aBatch); int av = ad >= 0 ? mA[ad] : 1;
-                        int bd = d - (batchRank - bBatch); int bv = bd >= 0 ? mB[bd] : 1;
-                        mOut[d] = Math.Max(av, bv); // ONNX numpy-style batch broadcast
-                    }
-                    mOut[batchRank] = mM;
-                    mOut[batchRank + 1] = mN;
+                    var mOut = Operators.MatMulOperator.OutputShape(mA, mB);
                     if (mOut.All(d => d > 0)) runtimeOutputShapes = new[] { mOut };
                 }
             }
@@ -4708,21 +4698,11 @@ public class GraphExecutor : IDisposable
             {
                 var mA = nodeInputs[0]!.Shape;
                 var mB = nodeInputs[1]!.Shape;
-                if (mA.Length >= 2 && mB.Length >= 2)
+                // One rule for compile time and run time (MatMulOperator.OutputShape): batch broadcast AND the rank-1
+                // operand rules ([S,K] x [K] -> [S]); this block once required rank >= 2 and kept a wrong compiled shape.
+                if (mA.Length >= 1 && mB.Length >= 1)
                 {
-                    int mM = mA[mA.Length - 2];
-                    int mN = mB[mB.Length - 1];
-                    int aBatch = mA.Length - 2, bBatch = mB.Length - 2;
-                    int batchRank = Math.Max(aBatch, bBatch);
-                    var mOut = new int[batchRank + 2];
-                    for (int d = 0; d < batchRank; d++)
-                    {
-                        int ad = d - (batchRank - aBatch); int av = ad >= 0 ? mA[ad] : 1;
-                        int bd = d - (batchRank - bBatch); int bv = bd >= 0 ? mB[bd] : 1;
-                        mOut[d] = Math.Max(av, bv); // ONNX numpy-style batch broadcast
-                    }
-                    mOut[batchRank] = mM;
-                    mOut[batchRank + 1] = mN;
+                    var mOut = Operators.MatMulOperator.OutputShape(mA, mB);
                     if (mOut.All(d => d > 0)) runtimeOutputShapes = new[] { mOut };
                 }
             }

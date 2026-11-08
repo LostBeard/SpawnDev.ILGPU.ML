@@ -364,6 +364,64 @@ if (args.Length > 1 && args[0] == "ONNXDIFF")
     finally { oacc?.Dispose(); octx?.Dispose(); }
 }
 
+// Investigation diagnostic (NOT a PMT test): run a WHOLE single-input ONNX model through OUR engine on one f32 input
+// and diff every output against onnxruntime's, saved as <refDir>/<outputName>.bin (raw f32). The model-scale sibling of
+// ONNXDIFF: it is how a port fails first (a shape bug deep in the graph), with ML_TRACE_SHAPES to find the node.
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- MODELDIFF <model.onnx> <input.f32> <d0,d1,..> <refDir> [CPU|CUDA|OPENCL] [noopt]
+if (args.Length > 4 && args[0] == "MODELDIFF")
+{
+    var mbackend = args.Length > 5 ? args[5].ToUpperInvariant() : "CUDA";
+    bool mopt = !(args.Length > 6 && args[6] == "noopt");
+    var mdims = args[3].Split(',').Select(int.Parse).ToArray();
+    static float[] MLoad(string p) { var b = File.ReadAllBytes(p); var f = new float[b.Length / 4]; Buffer.BlockCopy(b, 0, f, 0, b.Length); return f; }
+    var minput = MLoad(args[2]);
+    ILGPU.Context? mctx = null;
+    ILGPU.Runtime.Accelerator? macc = null;
+    try
+    {
+        if (mbackend is "CUDA" or "OPENCL")
+        {
+            mctx = MLContext.Create().ToContext();
+            if (mbackend == "CUDA") { var dd = mctx.GetCudaDevices(); if (dd.Count > 0) macc = dd[0].CreateCudaAccelerator(mctx); }
+            else macc = ILGPU.Runtime.OpenCL.CLContextExtensions.CreateCLAccelerator(mctx, 0);
+            if (macc == null) { Console.WriteLine($"MODELDIFF: no {mbackend} device"); return 1; }
+        }
+        else { mctx = MLContext.CreateContext(); macc = MLContext.CreateCpuAccelerator(mctx); }
+        var minName = SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper.Inspect(await File.ReadAllBytesAsync(args[1])).Inputs[0].Name;
+        var mt0 = System.Diagnostics.Stopwatch.StartNew();
+        using var msession = InferenceSession.CreateFromOnnx(macc, await File.ReadAllBytesAsync(args[1]),
+            inputShapes: new Dictionary<string, int[]> { [minName] = mdims }, enableOptimization: mopt);
+        Console.WriteLine($"MODELDIFF {Path.GetFileName(args[1])} on {macc.AcceleratorType} (optimize={mopt}): load {mt0.ElapsedMilliseconds} ms");
+        using var mbuf = macc.Allocate1D(minput);
+        int mrc = 0;
+        for (int rep = 0; rep < 2; rep++)
+        {
+            mt0.Restart();
+            var mout = await msession.RunAsync(new Dictionary<string, Tensor> { [minName] = new Tensor(mbuf.View, mdims) });
+            await macc.SynchronizeAsync();
+            Console.WriteLine($"MODELDIFF run {rep}: {mt0.ElapsedMilliseconds} ms");
+            if (rep == 0) continue;
+            foreach (var oname in msession.OutputNames)
+            {
+                var ot = mout[oname];
+                var got = new float[ot.ElementCount];
+                ot.Data.SubView(0, got.Length).CopyToCPU(got);
+                var rp = Path.Combine(args[4], oname + ".bin");
+                if (!File.Exists(rp)) { Console.WriteLine($"  {oname} [{string.Join(",", ot.Shape)}] (no reference)"); continue; }
+                var exp = MLoad(rp);
+                if (exp.Length != got.Length) { Console.WriteLine($"  {oname} [{string.Join(",", ot.Shape)}] ELEMENT COUNT {got.Length} vs ORT {exp.Length}"); mrc = 1; continue; }
+                double max = 0; int worst = 0;
+                for (int i = 0; i < got.Length; i++) { var d = Math.Abs(got[i] - exp[i]); if (!(d <= max)) { max = d; worst = i; } }
+                Console.WriteLine($"  {oname} [{string.Join(",", ot.Shape)}] max|diff| {max:E3} at {worst} (ours {got[worst]:G6}, ORT {exp[worst]:G6})");
+                if (!(max < 1e-2)) mrc = 1;
+            }
+        }
+        Console.WriteLine(mrc == 0 ? "MODELDIFF MATCH" : "MODELDIFF MISMATCH");
+        return mrc;
+    }
+    finally { macc?.Dispose(); mctx?.Dispose(); }
+}
+
 // Investigation diagnostic (NOT a PMT test): run OUR ConvTranspose1D on the exact inputs
 // tools/op-oracle.mjs gave onnxruntime, and diff.
 //

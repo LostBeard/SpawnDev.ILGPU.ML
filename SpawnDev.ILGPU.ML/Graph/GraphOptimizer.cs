@@ -16,6 +16,9 @@ namespace SpawnDev.ILGPU.ML.Graph;
 /// </summary>
 public static class GraphOptimizer
 {
+    /// <summary>ML_OPT_TRACE=1: print each rewrite a fusion pass makes (with ML_OPT_SKIP, how a wrong fusion is found).</summary>
+    public static bool OptTrace = Environment.GetEnvironmentVariable("ML_OPT_TRACE") is "1" or "true";
+
     /// <summary>
     /// Apply all optimization passes to a model graph.
     /// Returns a new graph with fused operators where possible.
@@ -52,36 +55,40 @@ public static class GraphOptimizer
         }
 
         // Pass 1: Fold constant subgraphs (Shape → Gather → Cast chains become constants)
-        int folded = FoldConstants(optimized);
+        // ML_OPT_SKIP=<pass>[,<pass>..] skips named passes (fold, identity, layernorm, instancenorm, atan2, gelu, groupnorm,
+        // linear, attention, scaled, strength, constnodes, dead): the bisect switch for "optimized output differs from
+        // enableOptimization:false" without a rebuild per pass (D-FINE, 2026-11-08).
+        var skip = new HashSet<string>((Environment.GetEnvironmentVariable("ML_OPT_SKIP") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), StringComparer.OrdinalIgnoreCase);
+        int folded = skip.Contains("fold") ? 0 : FoldConstants(optimized);
 
         // Pass 2: Eliminate identity/constant-passthrough nodes
-        int eliminated = EliminateIdentityNodes(optimized);
+        int eliminated = skip.Contains("identity") ? 0 : EliminateIdentityNodes(optimized);
 
         // Pass 3: Fuse MatMul → Add (bias) → Activation into FusedLinear
         // LayerNorm FIRST: it matches a nine-node primitive chain, and the later passes rewrite some of
         // those same nodes (FuseLinearLayers claims Add, strength reduction rewrites Mul/Div). Matching
         // before they run keeps the pattern intact.
-        int fusedLayerNorm = FuseLayerNorm(optimized);
+        int fusedLayerNorm = skip.Contains("layernorm") ? 0 : FuseLayerNorm(optimized);
 
         // Pass 3a2: Fuse the nine-node ADAPTIVE normalisation chain (per-CHANNEL scale/bias computed at
         // runtime) into one FusedInstanceNorm. Runs right after FuseLayerNorm, which gets first refusal on
         // any chain that is really a LayerNorm.
-        int fusedInstNorm = FuseInstanceNorm(optimized);
+        int fusedInstNorm = skip.Contains("instancenorm") ? 0 : FuseInstanceNorm(optimized);
 
         // Pass 3b: Fuse the seven-node atan2 decomposition into ONE FusedAtan2 node.
         // 🔴 A CORRECTNESS pass that happens to also cut nodes - the chain it replaces is NOT atan2 at an
         // exactly-zero y. See FuseAtan2. Order: after LayerNorm (which claims its own Add/Sub/Div and
         // cannot overlap this) and BEFORE FuseLinearLayers and strength reduction, both of which rewrite
         // the Add/Sub/Mul this pattern is made of.
-        int fusedAtan2 = FuseAtan2(optimized);
+        int fusedAtan2 = skip.Contains("atan2") ? 0 : FuseAtan2(optimized);
 
         // Pass 3b2: torch's exact-GELU chain (Div, Erf, Add, Mul, Mul) -> ONE Gelu. BEFORE FuseLinearLayers, so the
         // Gelu then folds into the preceding Linear's epilogue. See FuseErfGelu.
-        int fusedGelu = FuseErfGelu(optimized);
+        int fusedGelu = skip.Contains("gelu") ? 0 : FuseErfGelu(optimized);
         // Pass 3b3: torch's GroupNorm export (Reshape, InstanceNorm, Shape, Reshape, Mul, Add) -> ONE GroupNormalization.
-        int fusedGroupNorm = FuseGroupNorm(optimized);
+        int fusedGroupNorm = skip.Contains("groupnorm") ? 0 : FuseGroupNorm(optimized);
 
-        int fusedLinear = FuseLinearLayers(optimized);
+        int fusedLinear = skip.Contains("linear") ? 0 : FuseLinearLayers(optimized);
 
         // Pass 3b: Fuse a full decomposed self-attention subgraph (Q·Kᵀ → scale → [+zero-bias] → Softmax →
         // [Cast] → probs·V) into ONE flash-style FusedAttention node — never materializes the [B·H, S, S]
@@ -90,7 +97,7 @@ public static class GraphOptimizer
         // ML_NO_ATTN_FUSION=1 disables both attention-fusion passes - the bisect/diagnosis switch
         // (the DA2 content-free-depth bug hid inside a mis-fused ViT attention for 6+ weeks; being
         // able to A/B the fusion without a rebuild is how it was isolated).
-        bool noAttnFusion = Environment.GetEnvironmentVariable("ML_NO_ATTN_FUSION") == "1";
+        bool noAttnFusion = Environment.GetEnvironmentVariable("ML_NO_ATTN_FUSION") == "1" || skip.Contains("attention");
         int fusedAttn = noAttnFusion ? 0 : FuseAttention(optimized);
 
         // Pass 3c: Same attention fusion for the EINSUM-form export (DINOv2/DAv3: Einsum(Q·Kᵀ) → scale →
@@ -101,23 +108,23 @@ public static class GraphOptimizer
         fusedAttn += fusedAttnEinsum;
 
         // Pass 4: Fuse MatMul → Mul/Div (scale) into FusedScaledMatMul (attention Q*K^T/sqrt(d))
-        int fusedScaled = FuseScaledMatMul(optimized);
+        int fusedScaled = skip.Contains("scaled") ? 0 : FuseScaledMatMul(optimized);
 
         // Pass 5: Strength reduction (Div by const → Mul, eliminate Mul by 1, Add by 0)
-        int reduced = StrengthReduce(optimized);
+        int reduced = skip.Contains("strength") ? 0 : StrengthReduce(optimized);
 
         // Pass 6: Re-run identity elimination (strength reduction may create new Identity nodes)
-        eliminated += EliminateIdentityNodes(optimized);
+        if (!skip.Contains("identity")) eliminated += EliminateIdentityNodes(optimized);
 
         // Pass 7: Drop Constant nodes the loader already turned into initializers - a third of every graph
         // measured here, all of it walked by the executor for an empty Execute. See EliminateConstantNodes.
         // ⚠️ Restricted to Constants whose initializer is exactly [1] - the only case where removal is
         // provably shape-neutral. An earlier unrestricted version crashed ZipVoice's text encoder, and a
         // green six-backend sweep did NOT catch it (HeavyModel is excluded from sweeps). See the method.
-        int constNodes = EliminateConstantNodes(optimized);
+        int constNodes = skip.Contains("constnodes") ? 0 : EliminateConstantNodes(optimized);
 
         // Pass 8: Remove dead nodes (outputs never consumed)
-        int dead = EliminateDeadNodes(optimized);
+        int dead = skip.Contains("dead") ? 0 : EliminateDeadNodes(optimized);
 
         int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2 + fusedInstNorm + fusedGelu + fusedGroupNorm;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
@@ -904,6 +911,10 @@ public static class GraphOptimizer
         for (int d = 0; d < biasShape.Length - 1; d++)
             if (biasShape[d] != 1) return false;
         int n = biasShape[^1];
+        // A rank-1 constant B is a matrix-VECTOR product ([..,K] x [K] -> [..]): there are no output columns for a bias
+        // to add to, and FusedLinear would read the vector as a [K, N] weight.
+        if (matmul.Inputs.Count >= 2 && graph.Initializers.TryGetValue(matmul.Inputs[1], out var w1) && w1.Length < 2)
+            return false;
         // N from the weight when it is a constant ([K,N]; transB Gemm never gets here). When the weight is an
         // activation its width is unknown at this point, so require a real vector (a 1-wide Add is a scalar).
         if (matmul.Inputs.Count >= 2 && graph.Initializers.TryGetValue(matmul.Inputs[1], out var w) && w.Length >= 2)
@@ -963,6 +974,9 @@ public static class GraphOptimizer
                     && beta.ValueKind == System.Text.Json.JsonValueKind.Number && beta.GetSingle() != 1.0f;
                 if (hasTransB || hasAlpha || hasBeta) continue;
             }
+            // A Gemm that already adds its own C: FusedLinear takes ONE bias (input 2), so [A, B, C, addBias] would add C
+            // and silently drop the Add's bias.
+            if (matmulNode.OpType == "Gemm" && matmulNode.Inputs.Count > 2 && !string.IsNullOrEmpty(matmulNode.Inputs[2])) continue;
 
             string matmulOutput = matmulNode.Outputs[0];
 
@@ -1007,7 +1021,12 @@ public static class GraphOptimizer
                     var candidate = graph.Nodes[j];
                     if (candidate.Inputs.Count > 0 && candidate.Inputs[0] == addOutput)
                     {
-                        if (candidate.OpType is "Relu" or "Gelu" or "Sigmoid" or "Tanh" or "Clip")
+                        // 🔴 NOT Clip. FusedLinear has no clamp epilogue, and "Clip" used to be fused and then run as ReLU
+                        // ("RELU6 approximation"): wrong for EVERY Clip - ReLU6 lost its upper bound, and D-FINE's
+                        // query_pos_head `Clip(-10, 10)` zeroed every negative position embedding (logits off by 4,
+                        // boxes by 0.3 against onnxruntime; MEASURED 2026-11-08). The Clip stays its own exact node
+                        // after the fused MatMul+bias.
+                        if (candidate.OpType is "Relu" or "Gelu" or "Sigmoid" or "Tanh")
                         {
                             activationType = candidate.OpType;
                             actIdx = j;
@@ -1030,6 +1049,10 @@ public static class GraphOptimizer
                 }
             };
 
+            if (OptTrace)
+                Console.WriteLine($"[opt-trace] FusedLinear #{fusedCount} {matmulNode.OpType} {matmulOutput} w={matmulNode.Inputs[1]}"
+                    + $"[{(graph.Initializers.TryGetValue(matmulNode.Inputs[1], out var trW) ? string.Join(",", trW) : "act")}] "
+                    + $"bias={biasName}[{string.Join(",", biasShape)}] act={activationType ?? "none"} -> {fusedOutput}");
             // Replace MatMul node with fused node, mark Add and Activation for removal
             graph.Nodes[i] = fusedNode;
             nodesToRemove.Add(addIdx);
@@ -2464,6 +2487,15 @@ public static class GraphOptimizer
             //
             // A constant known ONLY as an int is left alone. The optimization is worth nothing next to
             // changing what the graph computes, and a truncated value cannot prove the float was exact.
+            //
+            // 🔴 THE VALUE IS NOT ENOUGH - THE RANK MUST ALSO BE NEUTRAL. `x + 0` is the identity only when the
+            // broadcast result has x's shape. A one-element zero of shape [1,1,1,1] added to a rank-3 x gives a
+            // RANK-4 result with the same values: torch exports use exactly this to promote rank. MEASURED
+            // 2026-11-08 on D-FINE-N and RT-DETRv2 (Riker, AssistZ): `Add([40,1,1], zeros[1,1,1,1])` was rewritten
+            // to Identity, the anchor-grid Concat came out [3] instead of [4], and the session died at an Equal
+            // ("Shapes [3] and [4] are not broadcastable"). A rank-0 constant can never change the shape, so it
+            // always qualifies; a rank-r one qualifies only when the other operand's rank is KNOWN and >= r. The
+            // optimizer runs before shape inference, so an unknown rank declines - see ConstantRankIsNeutral.
             if ((node.OpType == "Mul" || node.OpType == "Add") && node.Inputs.Count == 2)
             {
                 for (int inp = 0; inp < 2; inp++)
@@ -2477,7 +2509,7 @@ public static class GraphOptimizer
                         if (node.OpType == "Add" && vals.Length == 1 && vals[0] == 0f)
                             isIdentityOp = true;
 
-                        if (isIdentityOp)
+                        if (isIdentityOp && ConstantRankIsNeutral(graph, constInput, node.Inputs[1 - inp]))
                         {
                             string otherInput = node.Inputs[1 - inp];
                             node.OpType = "Identity";
@@ -2491,6 +2523,29 @@ public static class GraphOptimizer
         }
 
         return reduced;
+    }
+
+    /// <summary>
+    /// True when broadcasting the one-element constant <paramref name="constName"/> against <paramref name="otherName"/>
+    /// provably leaves <paramref name="otherName"/>'s shape unchanged: the constant is rank 0, or its declared rank is
+    /// no larger than the other operand's KNOWN rank. Initializer shapes are stored [1] for rank 0, so rank 0 is read
+    /// from <see cref="ModelGraph.ScalarTensorNames"/>. An operand whose rank is not known statically declines.
+    /// </summary>
+    private static bool ConstantRankIsNeutral(ModelGraph graph, string constName, string otherName)
+    {
+        int? RankOf(string name)
+        {
+            if (graph.ScalarTensorNames != null && graph.ScalarTensorNames.Contains(name)) return 0;
+            if (graph.Initializers.TryGetValue(name, out var s)) return s.Length;
+            foreach (var gi in graph.Inputs)
+                if (gi.Name == name && gi.Shape is { Length: > 0 } inShape) return inShape.Length;
+            return null;
+        }
+        int? constRank = RankOf(constName);
+        if (constRank == null) return false;
+        if (constRank == 0) return true;
+        int? otherRank = RankOf(otherName);
+        return otherRank != null && otherRank >= constRank;
     }
 
     /// <summary>Deep clone a ModelGraph (nodes are mutable, so we need copies).</summary>

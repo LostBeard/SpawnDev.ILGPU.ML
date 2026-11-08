@@ -17,6 +17,7 @@ public class FusedScaledMatMulOperator : IOnnxOperator
 {
     private readonly OperatorRegistry _registry;
     private FusedScaledMatMulKernel? _fusedKernel;
+    private MatMulOperator? _matMul;
 
     public FusedScaledMatMulOperator(OperatorRegistry registry) => _registry = registry;
 
@@ -24,13 +25,9 @@ public class FusedScaledMatMulOperator : IOnnxOperator
 
     public int[][] InferOutputShapes(int[][] inputShapes, Dictionary<string, object> attributes)
     {
-        // Same as MatMul: [M, K] x [K, N] → [M, N]
+        // Exactly MatMul's shape (batch broadcast, rank-1 operands): it IS a MatMul with a scale.
         if (inputShapes.Length < 2) return new[] { inputShapes[0] };
-        int M = inputShapes[0][^2];
-        int N = inputShapes[1][^1];
-        var outShape = inputShapes[0].ToArray();
-        outShape[^1] = N;
-        return new[] { outShape };
+        return new[] { MatMulOperator.OutputShape(inputShapes[0], inputShapes[1]) };
     }
 
     public void Execute(OnnxOpContext ctx)
@@ -39,10 +36,6 @@ public class FusedScaledMatMulOperator : IOnnxOperator
         var B = ctx.Inputs[1];
         var scaleTensor = ctx.Inputs[2];
         var output = ctx.Outputs[0];
-
-        int M = A.Shape[^2];
-        int K = A.Shape[^1];
-        int N = B.Shape[^1];
 
         bool isDiv = ctx.GetString("is_div", "false") == "True" ||
                      ctx.GetString("is_div", "false") == "true";
@@ -60,16 +53,10 @@ public class FusedScaledMatMulOperator : IOnnxOperator
                 $"FusedScaledMatMul: the scale input '{(ctx.InputNames.Length > 2 ? ctx.InputNames[2] : "?")}' is neither resolved at optimize time "
               + "nor a pre-read runtime constant, so its value is unknown here. Refusing to compute unscaled scores.");
 
-        // Batch-aware MatMul: handle multi-head attention [batch, heads, M, K]
-        if (A.Rank == 2 && B.Rank == 2)
-        {
-            _registry.MatMul.MatMul(A.Data, B.Data, output.Data, M, K, N);
-        }
-        else
-        {
-            int batch = A.ElementCount / (M * K);
-            _registry.MatMul.BatchedMatMul(A.Data, B.Data, output.Data, batch, M, K, N);
-        }
+        // The MatMul itself is MatMulOperator's, so every operand form it handles (a shared 2-D B under a batched A,
+        // broadcast batch dims, rank-1 operands) is handled here too. This used to call BatchedMatMul whenever either
+        // operand was not rank 2, which strides B per batch entry: wrong for a shared B and for [1,H,K,N] x [B,H,M,K].
+        (_matMul ??= new MatMulOperator(_registry)).ExecuteDense(A, B, output);
 
         // Apply scale in-place — do NOT use Scale(output, output) which violates WebGPU aliasing
         int totalElements = output.ElementCount;
