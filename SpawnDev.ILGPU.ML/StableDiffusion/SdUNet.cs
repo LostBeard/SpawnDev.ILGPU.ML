@@ -275,7 +275,7 @@ public sealed partial class SdUNet : IDisposable
     /// <summary>Deep shrink's resize: <see cref="SdKernels.Resize"/> for the interpolate methods, <see cref="SdKernels.Bislerp"/> (with its pass buffer) for bislerp.</summary>
     private void ResizeFeatures(ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst, int inH, int inW, int outH, int outW, int C, SdResize mode)
     {
-        if (mode == SdResize.Bislerp) _k.Bislerp(src, dst, Slot(SlotShrinkMid, (long)inH * outW * C), inH, inW, outH, outW, C);
+        if (mode == SdResize.Bislerp) _k.Bislerp(src, dst, Slot(SlotShrinkMid, (long)inH * outW * C), Slot(SlotShrinkStats, SdKernels.BislerpStatsLength(inH, outH, outW)), inH, inW, outH, outW, C);
         else _k.Resize(src, dst, inH, inW, outH, outW, C, (int)mode);
     }
 
@@ -291,7 +291,7 @@ public sealed partial class SdUNet : IDisposable
     }
     private const int SlotH0 = 0, SlotH1 = 1, SlotNorm = 2, SlotT = 3, SlotWide = 4, SlotMid = 5, SlotQ = 6, SlotKv = 7, SlotEmb = 8, SlotProj = 10, SlotIn = 11, SlotOut = 12,
         SlotTFreq = 13, SlotTHid = 14, SlotY = 15, SlotYHid = 16, SlotCtx = 17, SlotScores = 18, SlotHostIn = 19, SlotHostOut = 20, SlotHostConcat = 21, SlotFreeU = 22, SlotShrink = 23, SlotShrinkUp = 24, SlotTileIn = 25, SlotTileOut = 26, SlotSagMass = 27, SlotSagStats = 28, SlotSagPart = 29,
-        SlotTokA = 30, SlotTokB = 31, SlotShrinkMid = 32,
+        SlotTokA = 30, SlotTokB = 31, SlotShrinkMid = 32, SlotShrinkStats = 33,
         SlotSkip = 100;   // + block index: one buffer per skip connection
 
     private ArrayView1D<int, Stride1D.Dense> Table(int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)

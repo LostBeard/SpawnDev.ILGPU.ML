@@ -1772,22 +1772,23 @@ public class ElementWiseKernels : IDisposable
                     int offBase = ((n * offsetGroups + offGrp) * kHW + k) * 2 * hw + oh * outW + ow;
                     float fy = oh * sH - pH + kh * dH + offsets[offBase];
                     float fx = ow * sW - pW + kw * dW + offsets[offBase + hw];
-                    int y0 = (int)MathF.Floor(fy); int x0 = (int)MathF.Floor(fx);
+                    float floorY = MathF.Floor(fy), floorX = MathF.Floor(fx);
+                    int y0 = (int)floorY; int x0 = (int)floorX;
                     int y1 = y0 + 1; int x1 = x0 + 1;
-                    float ty = fy - y0; float tx = fx - x0;
-                    bool y0in = (y0 >= 0) & (y0 < H);
-                    bool y1in = (y1 >= 0) & (y1 < H);
-                    bool x0in = (x0 >= 0) & (x0 < W);
-                    bool x1in = (x1 >= 0) & (x1 < W);
-                    bool b00 = y0in & x0in;
-                    bool b01 = y0in & x1in;
-                    bool b10 = y1in & x0in;
-                    bool b11 = y1in & x1in;
-                    float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
-                    if (b00) v00 = input[(chOff + y0) * W + x0];
-                    if (b01) v01 = input[(chOff + y0) * W + x1];
-                    if (b10) v10 = input[(chOff + y1) * W + x0];
-                    if (b11) v11 = input[(chOff + y1) * W + x1];
+                    float ty = fy - floorY; float tx = fx - floorX;
+                    // Branch-free corners: each index clamped into the image (always a legal load), the value weighted by an in-bounds factor (an
+                    // out-of-image corner contributes 0) - no divergent loads.
+                    // ⚠️ WebGL (SpawnDev.ILGPU 5.4.17): wrong whenever a +1 corner carries weight (any fractional offset), right otherwise, in this form
+                    // and the guarded-load form alike; every step passes in isolation (Bilinear_FractionalSteps_MatchHost). Reported to SpawnDev.ILGPU with
+                    // DeformConv_Kernel_MatchesHostReference_Configs as the repro (2026-11-08).
+                    float fy0 = (y0 >= 0 && y0 < H) ? 1f : 0f, fy1 = (y1 >= 0 && y1 < H) ? 1f : 0f;
+                    float fx0 = (x0 >= 0 && x0 < W) ? 1f : 0f, fx1 = (x1 >= 0 && x1 < W) ? 1f : 0f;
+                    int cy0 = Math.Min(Math.Max(y0, 0), H - 1), cy1 = Math.Min(Math.Max(y1, 0), H - 1);
+                    int cx0 = Math.Min(Math.Max(x0, 0), W - 1), cx1 = Math.Min(Math.Max(x1, 0), W - 1);
+                    float v00 = input[(chOff + cy0) * W + cx0] * (fy0 * fx0);
+                    float v01 = input[(chOff + cy0) * W + cx1] * (fy0 * fx1);
+                    float v10 = input[(chOff + cy1) * W + cx0] * (fy1 * fx0);
+                    float v11 = input[(chOff + cy1) * W + cx1] * (fy1 * fx1);
                     float interp = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
                         + v10 * ty * (1f - tx) + v11 * ty * tx;
                     if (hasMask) interp *= mask[((n * offsetGroups + offGrp) * kHW + k) * hw + oh * outW + ow];

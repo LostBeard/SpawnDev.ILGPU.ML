@@ -543,12 +543,15 @@ public sealed class SdKernels
     // first vector; dot < -1 + 1e-5 gives the plain lerp. Channel-last; `mid` holds [inH * outW, C] between the passes. Reference:
     // tools/gen_sd_resize_reference.py runs ComfyUI's own function.
     // ---------------------------------------------------------------------------------------------------
-    private Action<Index1D, FV, FV, int, int, int, int>? _bislerpAxis;
-    private static void BislerpAxisImpl(Index1D p, FV src, FV dst, int inLen, int outLen, int B, int C)
+    // Two kernels a pass, so every thread writes ONE element (WebGL's transform feedback captures one element per store site per thread: the first version,
+    // a thread per pixel writing its C channels, was refused there - MEASURED 2026-11-08 in the 5.8.7 release sweep): a per-pixel stats kernel (norms, the
+    // slerp weights, the edge case, one store site each), then a per-element kernel. src [A, inLen, B, C] -> dst [A, outLen, B, C]; stats [A * outLen * B, 6].
+    private Action<Index1D, FV, FV, int, int, int, int>? _bislerpStats;
+    private Action<Index1D, FV, FV, FV, int, int, int, int>? _bislerpApply;
+
+    // ComfyUI's neighbours and ratio of output o along an axis of inLen -> outLen: torch's bilinear (align_corners False) of the index ramps, truncated
+    private static void BislerpCoords(int o, int inLen, int outLen, out int i1, out int i2, out float r)
     {
-        // src [A, inLen, B, C] -> dst [A, outLen, B, C]; one thread per output pixel (a, o, b)
-        int ob = outLen * B;
-        int a = p / ob, rem = p - a * ob, o = rem / B, b = rem - o * B;
         float scale = (float)inLen / outLen;
         float s = scale * (o + 0.5f) - 0.5f;
         if (s < 0f) s = 0f;
@@ -556,13 +559,19 @@ public sealed class SdKernels
         float lam = s - k0;
         int k1 = k0 < inLen - 1 ? k0 + 1 : k0;
         float lam0 = 1f - lam;
-        // ComfyUI's coords_1 = bilinear(arange) and coords_2 = bilinear(arange + 1, last - 1), truncated; ratio = coords_1 - floor(coords_1)
         float c1 = lam0 * k0 + lam * k1;
         float v0 = k0 < inLen - 1 ? k0 + 1 : k0, v1 = k1 < inLen - 1 ? k1 + 1 : k1;
         float c2 = lam0 * v0 + lam * v1;
-        int i1 = (int)c1, i2 = (int)c2;
-        float r = c1 - XMath.Floor(c1);
-        long p1 = ((long)(a * inLen + i1) * B + b) * C, p2 = ((long)(a * inLen + i2) * B + b) * C, q = ((long)(a * outLen + o) * B + b) * C;
+        i1 = (int)c1; i2 = (int)c2;
+        r = c1 - XMath.Floor(c1);
+    }
+
+    private static void BislerpStatsImpl(Index1D p, FV src, FV stats, int inLen, int outLen, int B, int C)
+    {
+        int ob = outLen * B;
+        int a = p / ob, rem = p - a * ob, o = rem / B, b = rem - o * B;
+        BislerpCoords(o, inLen, outLen, out int i1, out int i2, out float r);
+        long p1 = ((long)(a * inLen + i1) * B + b) * C, p2 = ((long)(a * inLen + i2) * B + b) * C;
         float n1 = 0f, n2 = 0f;
         for (int c = 0; c < C; c++) { float x = src[p1 + c], y = src[p2 + c]; n1 += x * x; n2 += y * y; }
         n1 = XMath.Sqrt(n1); n2 = XMath.Sqrt(n2);
@@ -572,28 +581,54 @@ public sealed class SdKernels
             float x = n1 == 0f ? 0f : src[p1 + c] / n1, y = n2 == 0f ? 0f : src[p2 + c] / n2;
             dot += x * y;
         }
-        bool same = dot > 1f - 1e-5f;
-        bool opposite = dot < 1e-5f - 1f;
         float omega = XMath.Acos(dot), so = XMath.Sin(omega);
-        float w1 = XMath.Sin((1f - r) * omega) / so, w2 = XMath.Sin(r * omega) / so, mag = n1 * (1f - r) + n2 * r;
-        for (int c = 0; c < C; c++)
-        {
-            float x = src[p1 + c], y = src[p2 + c];
-            float res;
-            if (same) res = x;
-            else if (opposite) res = x * (1f - r) + y * r;
-            else res = (w1 * (n1 == 0f ? 0f : x / n1) + w2 * (n2 == 0f ? 0f : y / n2)) * mag;
-            dst[q + c] = res;
-        }
+        float w1 = XMath.Sin((1f - r) * omega) / so, w2 = XMath.Sin(r * omega) / so;
+        // 1: the first vector (same), 2: plain lerp (opposite), 0: slerp. if / else, NOT a nested ternary with constant arms (miscompiled on CUDA and
+        // OpenCL: memory fb-ilgpu-nested-ternary-const-arms, the VP8 loop filter 2026-10-22)
+        float mode = 0f;
+        if (dot > 1f - 1e-5f) mode = 1f;
+        else if (dot < 1e-5f - 1f) mode = 2f;
+        long q = (long)(int)p * 6;
+        stats[q] = n1;
+        stats[q + 1] = n2;
+        stats[q + 2] = w1;
+        stats[q + 3] = w2;
+        stats[q + 4] = n1 * (1f - r) + n2 * r;
+        stats[q + 5] = mode;
     }
 
-    /// <summary>ComfyUI's bislerp of channel-last <paramref name="src"/> [inH * inW, C] into <paramref name="dst"/> [outH * outW, C]; <paramref name="mid"/> holds inH * outW * C.</summary>
-    public void Bislerp(FV src, FV dst, FV mid, int inH, int inW, int outH, int outW, int C)
+    private static void BislerpApplyImpl(Index1D i, FV src, FV stats, FV dst, int inLen, int outLen, int B, int C)
     {
-        _bislerpAxis ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(BislerpAxisImpl);
-        _bislerpAxis(inH * outW, src, mid, inW, outW, 1, C);        // along W: A = inH, B = 1
-        _bislerpAxis(outH * outW, mid, dst, inH, outH, outW, C);    // along H: A = 1, B = outW
+        int p = i / C, c = i - p * C;
+        int ob = outLen * B;
+        int a = p / ob, rem = p - a * ob, o = rem / B, b = rem - o * B;
+        BislerpCoords(o, inLen, outLen, out int i1, out int i2, out float r);
+        float x = src[((long)(a * inLen + i1) * B + b) * C + c], y = src[((long)(a * inLen + i2) * B + b) * C + c];
+        long q = (long)p * 6;
+        float n1 = stats[q], n2 = stats[q + 1], mode = stats[q + 5];
+        float res;
+        if (mode == 1f) res = x;
+        else if (mode == 2f) res = x * (1f - r) + y * r;
+        else res = (stats[q + 2] * (n1 == 0f ? 0f : x / n1) + stats[q + 3] * (n2 == 0f ? 0f : y / n2)) * stats[q + 4];
+        dst[i] = res;
     }
+
+    /// <summary>
+    /// ComfyUI's bislerp of channel-last <paramref name="src"/> [inH * inW, C] into <paramref name="dst"/> [outH * outW, C]. <paramref name="mid"/> holds inH * outW * C,
+    /// <paramref name="stats"/> 6 * max(inH * outW, outH * outW).
+    /// </summary>
+    public void Bislerp(FV src, FV dst, FV mid, FV stats, int inH, int inW, int outH, int outW, int C)
+    {
+        _bislerpStats ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int>(BislerpStatsImpl);
+        _bislerpApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int>(BislerpApplyImpl);
+        _bislerpStats(inH * outW, src, stats, inW, outW, 1, C);                    // along W: A = inH, B = 1
+        _bislerpApply(inH * outW * C, src, stats, mid, inW, outW, 1, C);
+        _bislerpStats(outH * outW, mid, stats, inH, outH, outW, C);                // along H: A = 1, B = outW
+        _bislerpApply(outH * outW * C, mid, stats, dst, inH, outH, outW, C);
+    }
+
+    /// <summary>Floats of the <see cref="Bislerp"/> stats scratch.</summary>
+    public static long BislerpStatsLength(int inH, int outH, int outW) => 6L * Math.Max((long)inH * outW, (long)outH * outW);
 
     // fp16 -> fp32 (reading a small weight back to the host)
     private Action<Index1D, HV, FV>? _h2f;

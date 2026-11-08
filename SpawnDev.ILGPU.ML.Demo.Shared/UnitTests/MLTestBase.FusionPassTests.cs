@@ -57,10 +57,16 @@ public abstract partial class MLTestBase
                     await host.View.CopyFromAsync(got.Data.SubView(0, expected.Length));
                     await accelerator.SynchronizeAsync();
                     var g = await host.CopyToHostAsync<float>(0, expected.Length);
-                    double worst = 0;
-                    for (int i = 0; i < expected.Length; i++) worst = Math.Max(worst, Math.Abs(g[i] - expected[i]) / Math.Max(1.0, Math.Abs(expected[i])));
+                    double worst = 0; int at = 0, bad = 0, firstBad = -1;
+                    for (int i = 0; i < expected.Length; i++)
+                    {
+                        double rel = Math.Abs(g[i] - expected[i]) / Math.Max(1.0, Math.Abs(expected[i]));
+                        if (!(rel <= worst)) { worst = rel; at = i; }
+                        if (!(rel <= tolerance)) { bad++; if (firstBad < 0) firstBad = i; }
+                    }
                     if (worst > tolerance)
-                        throw new Exception($"{name} {p.Name}: max rel {worst:E2} vs onnxruntime on {BackendName}");
+                        throw new Exception($"{name} {p.Name}: max rel {worst:E2} vs onnxruntime at {at} (ours {g[at]:G6}, ORT {expected[at]:G6}); {bad} of {expected.Length} off, "
+                            + $"first at {firstBad} (ours {g[Math.Max(0, firstBad)]:G6}, ORT {expected[Math.Max(0, firstBad)]:G6}) on {BackendName}");
                 }
                 session.ReturnOutputs(outs);
             }
