@@ -132,6 +132,8 @@ foreach (var model in models)
         }
 }
 Console.WriteLine();
-Console.WriteLine($"SUMMARY ({gpu}, {runs} timed runs each, medians; Ollama {(await http.GetFromJsonAsync<JsonObject>("/api/version"))?["version"]})");
+// --only ours must not need a running Ollama: the version is asked only when Ollama took part (it threw "connection refused" here before 2026-11-08)
+string ollamaVersion = only == "ours" ? "not run" : (await http.GetFromJsonAsync<JsonObject>("/api/version"))?["version"]?.ToString() ?? "?";
+Console.WriteLine($"SUMMARY ({gpu}, {runs} timed runs each, medians; Ollama {ollamaVersion})");
 foreach (var l in results) Console.WriteLine(l);
 return 0;
