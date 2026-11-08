@@ -330,6 +330,9 @@ public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
     /// </summary>
     public static readonly List<string> RecentFreshAllocNames = new();
 
+    /// <summary>True only inside <see cref="CudaGraphCapture"/>'s capture window: a pool miss then throws rather than allocating (see RentCore).</summary>
+    public static volatile bool CudaCaptureActive;
+
     /// <summary>Enables <see cref="RecentFreshAllocNames"/>. Diagnostic; off by default.</summary>
     public static bool TraceFreshAllocNames;
 
@@ -649,6 +652,13 @@ public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
                 try { System.IO.File.AppendAllText(Graph.GraphExecutor.CaptureTraceFile,
                     $"   -> POOL-ALLOC '{name}' count={count} bucket={bucketSize}  (capture priming gap)\n"); } catch { }
             }
+            // 🔴 Inside a CUDA graph capture the allocation below is a cuMemAlloc on a capturing stream: an UNCATCHABLE access violation
+            // that kills the process (MEASURED 2026-11-08, D-FINE-S). Throwing instead lets CudaGraphCapture end the capture and fall
+            // back to a direct forward, and names the rent the warm passes did not prime.
+            if (CudaCaptureActive)
+                throw new InvalidOperationException($"CUDA graph capture: pool rent '{name ?? "(unnamed)"}' ({count} floats, bucket {bucketSize}) at node "
+                    + $"{Graph.GraphExecutor.CurrentRunNodeIndex} ({Graph.GraphExecutor.CurrentRunOpType}) was not primed by the warm passes; "
+                    + "allocating inside the capture window would crash the process, so the capture is abandoned.");
         }
         // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
         // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)

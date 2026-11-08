@@ -893,7 +893,47 @@ public class GraphExecutor : IDisposable
     /// The forward must already be WARM (pools + readback cache primed) so the drain-free pass
     /// allocates nothing and reads nothing back. Always reset to false immediately after EndCapture.
     /// </summary>
-    public static bool SuppressDrains;
+    public static bool SuppressDrains
+    {
+        get => _suppressDrains && InCaptureFlow;
+        set { if (value) ClaimCaptureFlow(); _suppressDrains = value; ReleaseCaptureFlowIfIdle(); }
+    }
+    private static bool _suppressDrains;
+
+    // ── Capture flags are FLOW-SCOPED (2026-11-08) ──
+    // SuppressDrains / UseCaptureParamSlots / KeepDrainsDuringCapture (and FusedAttentionKernel.UseStableCaptureSlots) change how EVERY
+    // forward behaves. As plain statics they did so for every session at once: MEASURED (Riker, AssistZ, RX 590, 2026-11-06) a YOLOv8
+    // capture recorded with the video and audio loops running took 280 dispatches where a quiet one takes 250 - the other loops' forwards
+    // ran in capture mode (no drains, capture param slots) while SpawnDev.ILGPU recorded their kernels into YOLO's plan. SpawnDev.ILGPU now
+    // scopes a dispatch-plan recording to the async flow that began it (Data, 2026-11-08); these flags follow the same rule: setting one
+    // TRUE claims the current async flow, and the getters read true only in that flow (and the flows it awaits into). Outside a capture
+    // the getters cost one field read - the AsyncLocal is consulted only while a flag is set. A second flow claiming while another holds
+    // the capture throws: two concurrent captures were never supported, and silently sharing the flags is how the bug above happened.
+    private static readonly AsyncLocal<object?> _captureFlowToken = new();
+    private static object? _captureOwner;
+    private static readonly object _captureOwnerLock = new();
+    /// <summary>True when the current async flow is the one that set the capture flags.</summary>
+    internal static bool InCaptureFlow
+    {
+        get { var o = _captureOwner; return o != null && ReferenceEquals(_captureFlowToken.Value, o); }
+    }
+    private static void ClaimCaptureFlow()
+    {
+        lock (_captureOwnerLock)
+        {
+            if (_captureOwner != null && ReferenceEquals(_captureFlowToken.Value, _captureOwner)) return;
+            if (_captureOwner != null && (_suppressDrains || _useCaptureParamSlots || _keepDrainsDuringCapture))
+                throw new InvalidOperationException("A graph capture is already in progress in another async flow; captures are one at a time "
+                    + "(GraphExecutor capture flags are flow-scoped - see SuppressDrains).");
+            _captureOwner = new object();
+            _captureFlowToken.Value = _captureOwner;   // set in a SYNC call, so the caller's flow carries it from here on
+        }
+    }
+    private static void ReleaseCaptureFlowIfIdle()
+    {
+        lock (_captureOwnerLock)
+            if (!_suppressDrains && !_useCaptureParamSlots && !_keepDrainsDuringCapture) _captureOwner = null;
+    }
 
     /// <summary>
     /// WebGPU only, opt-in: <see cref="RunAsync"/> ends with a SUBMIT (<c>Flush</c>) instead of the final
@@ -918,7 +958,12 @@ public class GraphExecutor : IDisposable
     /// synchronize, also illegal). When false, kernels keep their normal fresh-alloc + defer-dispose path,
     /// so the browser backends (WebGPU/Wasm) are byte-identical to today. CUDA-only capability.
     /// </summary>
-    public static bool UseCaptureParamSlots;
+    public static bool UseCaptureParamSlots
+    {
+        get => _useCaptureParamSlots && InCaptureFlow;
+        set { if (value) ClaimCaptureFlow(); _useCaptureParamSlots = value; ReleaseCaptureFlowIfIdle(); }
+    }
+    private static bool _useCaptureParamSlots;
 
     /// <summary>
     /// Under <see cref="SuppressDrains"/>, return a consumed buffer to the pool IMMEDIATELY instead of
@@ -962,7 +1007,12 @@ public class GraphExecutor : IDisposable
     /// measured and ruled out.
     /// </para>
     /// </remarks>
-    public static bool KeepDrainsDuringCapture;
+    public static bool KeepDrainsDuringCapture
+    {
+        get => _keepDrainsDuringCapture && InCaptureFlow;
+        set { if (value) ClaimCaptureFlow(); _keepDrainsDuringCapture = value; ReleaseCaptureFlowIfIdle(); }
+    }
+    private static bool _keepDrainsDuringCapture;
 
     /// <summary>
     /// Set by <see cref="WebGPUGraphCapture"/> alongside <see cref="KeepDrainsDuringCapture"/>: the recording
@@ -1030,7 +1080,17 @@ public class GraphExecutor : IDisposable
     /// the SAME device pointer every forward — the requirement for a captured node to read a stable buffer
     /// the host refreshes between replays. Harmless (a monotonic counter) when capture is not in use.
     /// </summary>
-    public static long ForwardGeneration;
+    /// <remarks>
+    /// Per FORWARD, not process-wide (2026-11-08): each forward takes the next value of a global sequence and carries it in its own async
+    /// flow, so a concurrent session's forward no longer resets a capturing forward's slot cursors mid-pass (see <see cref="SuppressDrains"/>).
+    /// </remarks>
+    public static long ForwardGeneration
+    {
+        get => _forwardGeneration.Value;
+        set => _forwardGeneration.Value = value;
+    }
+    private static readonly AsyncLocal<long> _forwardGeneration = new();
+    private static long _forwardGenerationSequence;
 
     /// <summary>
     /// DIAGNOSTIC: incremented each time the Pad readback fallback fires at execute time.
@@ -3269,7 +3329,7 @@ public class GraphExecutor : IDisposable
                 + $"returnsSoFar={Tensors.BufferPool.CaptureReturnCount} "
                 + $"buckets[{_pool.BucketProfileSummary()}]\n"); } catch { }
         }
-        ForwardGeneration++;   // signals per-forward "stable capture slot" counters to reset (CUDA-graph capture)
+        ForwardGeneration = Interlocked.Increment(ref _forwardGenerationSequence);   // per-forward; resets the "stable capture slot" counters (CUDA-graph capture)
         _opLog.Clear();
         LastRunIntegerDivCount = 0;
         LastRunReadbackCount = 0;
@@ -3590,6 +3650,12 @@ public class GraphExecutor : IDisposable
         void ReleaseDeadOutputs(CompiledNode n)
         {
             if (_deadOutputs is not { Count: > 0 }) return;
+            // CUDA-graph capture: the same immediate return as a consumed input (see ReleaseConsumedInputs - single stream, so a later re-Rent
+            // is ordered after this node's kernel). Deferred to a drain that capture suppresses, a dead output was NEVER returned in the
+            // capture pass while the warm passes recycled it, so the capture needed more buffers than warm primed. MEASURED 2026-11-08,
+            // D-FINE-S: a [1,300] dead output (TopK's unread values) left the 512 bucket one short and node 1073 hit cuMemAlloc mid-capture.
+            bool immediate = ImmediateReleaseActive
+                || (SuppressDrains && CaptureImmediateReturn && _accelerator.AcceleratorType == AcceleratorType.Cuda);
             foreach (var outName in n.OutputNames)
             {
                 if (string.IsNullOrEmpty(outName) || !_deadOutputs.Contains(outName)) continue;
@@ -3598,13 +3664,13 @@ public class GraphExecutor : IDisposable
                 if (halfTensors.TryGetValue(outName, out var hdead))
                 {
                     halfTensors.Remove(outName);
-                    if (ImmediateReleaseActive) _pool.ReturnHalf(hdead);
+                    if (immediate) _pool.ReturnHalf(hdead);
                     else { pendingHalfReleases.Add(hdead); pendingReleaseBytes += (long)hdead.ElementCount * 2; }
                 }
                 else if (tensors.TryGetValue(outName, out var dead))
                 {
                     tensors.Remove(outName);
-                    if (ImmediateReleaseActive) _pool.Return(dead);
+                    if (immediate) _pool.Return(dead);
                     else { pendingReleases.Add(dead); pendingReleaseBytes += (long)dead.ElementCount * sizeof(float); }
                 }
             }

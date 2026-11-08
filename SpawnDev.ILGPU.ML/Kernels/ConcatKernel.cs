@@ -191,6 +191,34 @@ public class ConcatKernel : IDisposable
         _kernel4!(total, output, input0, input1, input2, input3, outer, inner, len0, len1, len2, len3);
     }
 
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _blockCopy;
+
+    private static void BlockCopyImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst,
+        int block, int srcStride, int srcOff, int dstStride, int dstOff)
+    {
+        int o = idx / block;
+        int j = idx - o * block;
+        dst[o * dstStride + dstOff + j] = src[o * srcStride + srcOff + j];
+    }
+
+    /// <summary>
+    /// <c>dst[o * dstStride + dstOff + j] = src[o * srcStride + srcOff + j]</c> for <c>o &lt; outer</c>, <c>j &lt; block</c>: ONE dispatch for a
+    /// whole strided block copy - one Split output, or one Concat input placed into its slot.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED 2026-11-08, D-FINE-S on WebGPU: Split issued one copy per (outer index, output) - 10 Split nodes were 25,208 of a forward's
+    /// 26,457 dispatches and 326 ms of a 463 ms warm direct forward, and the recorded plan replayed all of them.
+    /// </remarks>
+    public void BlockCopy(ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst,
+        int outer, int block, int srcStride, int srcOff, int dstStride, int dstOff)
+    {
+        long total = (long)outer * block;
+        if (total <= 0) return;
+        _blockCopy ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int>(BlockCopyImpl);
+        _blockCopy(checked((int)total), src, dst, block, srcStride, srcOff, dstStride, dstOff);
+    }
+
     private void EnsureLoaded2()
     {
         _kernel2 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,

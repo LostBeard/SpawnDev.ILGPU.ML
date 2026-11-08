@@ -394,6 +394,7 @@ public sealed class CudaGraphCapture : IDisposable
                 // aborts the capture; the seeded runtimeConstants keep eliding identical to warm.
                 GraphExecutor.SuppressDrains = true;
                 capStream.BeginCapture(CudaStreamCaptureMode.Global);
+                BufferPool.CudaCaptureActive = true;   // a pool miss now throws instead of calling cuMemAlloc (see BufferPool.RentCore)
                 try
                 {
                     capOut = await session.RunAsync(inputs);
@@ -414,7 +415,7 @@ public sealed class CudaGraphCapture : IDisposable
                     try { capStream.Dispose(); } catch { }
                     throw;
                 }
-                finally { GraphExecutor.SuppressDrains = ExperimentKeepDrainsSuppressed; }
+                finally { GraphExecutor.SuppressDrains = ExperimentKeepDrainsSuppressed; BufferPool.CudaCaptureActive = false; }
             }
         }
         finally

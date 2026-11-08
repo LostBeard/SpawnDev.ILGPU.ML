@@ -48,10 +48,9 @@ public class DFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
         // Pool-rented float params (cast to int in kernel) — avoids Wasm int-buffer allocation races
         var paramsData = new float[] { N, dftLength, outputN, isComplex, inverse };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        var paramsBuf = reg.ParamsView(paramsData);
         // One thread per scalar output (real + imag interleaved) — gather, WebGL TF compatible
-        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.Data, batch * outputN * 2);
+        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf, batch * outputN * 2);
     }
 }
 
@@ -137,11 +136,10 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
         // Params as float (STFTImpl casts to int) — avoids Wasm Int32Array alignment issues
         var paramsData = new float[] { signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        var paramsBuf = reg.ParamsView(paramsData);
 
         // One thread per scalar output (real + imag interleaved) — gather, WebGL TF compatible
-        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowData, ctx.Outputs[0].Data, paramsBuf.Data, totalBins * 2);
+        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowData, ctx.Outputs[0].Data, paramsBuf, totalBins * 2);
     }
 }
 

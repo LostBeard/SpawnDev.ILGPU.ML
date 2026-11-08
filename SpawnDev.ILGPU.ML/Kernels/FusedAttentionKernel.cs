@@ -71,7 +71,13 @@ public class FusedAttentionKernel : IDisposable
     // so the captured node reads a stable buffer the host can refresh between replays. During the actual
     // capture pass (GraphExecutor.SuppressDrains) the H2D is SKIPPED — a CopyFromCPU synchronizes, which is
     // illegal mid-capture; the slot already holds the immediately-preceding warm pass's params (same state).
-    public static bool UseStableCaptureSlots;
+    public static bool UseStableCaptureSlots
+    {
+        // Flow-scoped like GraphExecutor's capture flags: true only in the capturing flow (see GraphExecutor.SuppressDrains).
+        get => _useStableCaptureSlots && SpawnDev.ILGPU.ML.Graph.GraphExecutor.InCaptureFlow;
+        set => _useStableCaptureSlots = value;
+    }
+    private static bool _useStableCaptureSlots;
 
     /// <summary>Patch-point discovery observer (parameterized replay - WebGPUDecodeCapture): fired on
     /// every STABLE-slot params rent that carries data (warm passes; not under SuppressDrains) with

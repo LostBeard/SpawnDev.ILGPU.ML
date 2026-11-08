@@ -367,11 +367,12 @@ if (args.Length > 1 && args[0] == "ONNXDIFF")
 // Investigation diagnostic (NOT a PMT test): run a WHOLE single-input ONNX model through OUR engine on one f32 input
 // and diff every output against onnxruntime's, saved as <refDir>/<outputName>.bin (raw f32). The model-scale sibling of
 // ONNXDIFF: it is how a port fails first (a shape bug deep in the graph), with ML_TRACE_SHAPES to find the node.
-//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- MODELDIFF <model.onnx> <input.f32> <d0,d1,..> <refDir> [CPU|CUDA|OPENCL] [noopt]
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- MODELDIFF <model.onnx> <input.f32> <d0,d1,..> <refDir> [CPU|CUDA|OPENCL] [noopt|opt] [capture]
 if (args.Length > 4 && args[0] == "MODELDIFF")
 {
     var mbackend = args.Length > 5 ? args[5].ToUpperInvariant() : "CUDA";
     bool mopt = !(args.Length > 6 && args[6] == "noopt");
+    bool mcap = args.Length > 7 && args[7] == "capture";   // run through SessionGraphCapture (records, then replays)
     var mdims = args[3].Split(',').Select(int.Parse).ToArray();
     static float[] MLoad(string p) { var b = File.ReadAllBytes(p); var f = new float[b.Length / 4]; Buffer.BlockCopy(b, 0, f, 0, b.Length); return f; }
     var minput = MLoad(args[2]);
@@ -394,13 +395,17 @@ if (args.Length > 4 && args[0] == "MODELDIFF")
         Console.WriteLine($"MODELDIFF {Path.GetFileName(args[1])} on {macc.AcceleratorType} (optimize={mopt}): load {mt0.ElapsedMilliseconds} ms");
         using var mbuf = macc.Allocate1D(minput);
         int mrc = 0;
-        for (int rep = 0; rep < 2; rep++)
+        using var mcapture = mcap ? new SpawnDev.ILGPU.ML.Graph.SessionGraphCapture(msession, macc) : null;
+        if (mcap && Environment.GetEnvironmentVariable("ML_CAPTURE_TRACE") is { Length: > 0 } mtrace) { File.Delete(mtrace); SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureTraceFile = mtrace; }
+        int mreps = mcap ? 5 : 2;
+        for (int rep = 0; rep < mreps; rep++)
         {
             mt0.Restart();
-            var mout = await msession.RunAsync(new Dictionary<string, Tensor> { [minName] = new Tensor(mbuf.View, mdims) });
+            var mfeeds = new Dictionary<string, Tensor> { [minName] = new Tensor(mbuf.View, mdims) };
+            var mout = mcapture != null ? await mcapture.RunAsync(mfeeds) : await msession.RunAsync(mfeeds);
             await macc.SynchronizeAsync();
-            Console.WriteLine($"MODELDIFF run {rep}: {mt0.ElapsedMilliseconds} ms");
-            if (rep == 0) continue;
+            Console.WriteLine($"MODELDIFF run {rep}: {mt0.ElapsedMilliseconds} ms{(mcapture != null ? $" capture: {mcapture.CaptureStatus}, replayed={mcapture.LastRunReplayed}" : "")}");
+            if (rep < mreps - 1) continue;
             foreach (var oname in msession.OutputNames)
             {
                 var ot = mout[oname];

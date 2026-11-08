@@ -90,22 +90,25 @@ internal static class BroadcastHelper
             // already honouring by passing outShape.
             var scalarShape = new int[outShape.Length];
             Array.Fill(scalarShape, 1);
-            var scalarTensor = ctx.Pool.Rent(scalarShape, "_broadcast_scalar");
             if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
             {
-                // Same reasoning as the expanded path: a pooled transient's H2D is skipped during capture
-                // replay, so a deterministic constant needs a stable arena slot instead.
+                // CUDA-graph capture: a pooled transient's H2D is skipped during replay, so the constant takes a stable arena slot
+                // (written in warm, skip-write in capture) and NOTHING is rented from the pool. 🔴 This used to Rent "_broadcast_scalar",
+                // replace the tensor with the arena view and Return THAT: the rented buffer leaked every call and the pool got back a
+                // buffer it never lent ("ALIEN-RETURN '_broadcast_scalar'"). MEASURED 2026-11-08 on D-FINE-S: the capture forward then
+                // allocated fresh - cuMemAlloc inside the CUDA graph capture, an access violation that killed the process.
                 var sView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(bVals);
-                scalarTensor = new Tensor(sView, scalarShape, "_broadcast_scalar");
+                reg.ElementWise.BroadcastBinaryOpND(a.Data, sView, ctx.Outputs[0].Data, a.Shape, scalarShape, outShape, gpuOp);
             }
             else
             {
+                // bVals can be a READBACK (GraphExecutor puts small GPU results in the runtime constants), so per-call content: a pooled
+                // transient, not a content-addressed buffer.
+                var scalarTensor = ctx.Pool.Rent(scalarShape, "_broadcast_scalar");
                 scalarTensor.Data.SubView(0, 1).CopyFromCPU(bVals);
+                reg.ElementWise.BroadcastBinaryOpND(a.Data, scalarTensor.Data, ctx.Outputs[0].Data, a.Shape, scalarShape, outShape, gpuOp);
+                ctx.Pool.Return(scalarTensor);
             }
-            reg.ElementWise.BroadcastBinaryOpND(
-                a.Data, scalarTensor.Data, ctx.Outputs[0].Data,
-                a.Shape, scalarShape, outShape, gpuOp);
-            ctx.Pool.Return(scalarTensor);
         }
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
@@ -1771,9 +1774,8 @@ public class ShrinkOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // Parameterized shrink — GPU kernel with custom lambd/bias
             var fparamsData = new float[] { lambd, bias };
-            var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
-            fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
-            reg.ElementWise.ShrinkParam(ctx.Inputs[0].Data, ctx.Outputs[0].Data, fparamsBuf.Data, count);
+            var fparamsBuf = reg.ParamsView(fparamsData);
+            reg.ElementWise.ShrinkParam(ctx.Inputs[0].Data, ctx.Outputs[0].Data, fparamsBuf, count);
         }
     }
 }

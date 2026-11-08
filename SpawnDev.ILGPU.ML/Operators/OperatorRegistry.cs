@@ -15,6 +15,19 @@ public class OperatorRegistry : IDisposable
     private readonly Accelerator _accelerator;
     public Accelerator Accelerator => _accelerator;
 
+    private Kernels.ContentParamBuffers<float>? _opParams;
+    /// <summary>
+    /// A device view of an operator's small params array: content-addressed and WRITE-ONCE (see <see cref="Kernels.ContentParamBuffers{T}"/>),
+    /// so the same shapes reuse one buffer forever and no call writes the device.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 Replaces "Rent a scratch buffer, CopyFromCPU the params" in 17 operators (GridSample, Col2Im, DFT, STFT, CumSum, LRN, ...). The host
+    /// copy synchronises the CUDA stream, which a CUDA graph capture forbids: MEASURED 2026-11-08, D-FINE-S could not capture on CUDA
+    /// ("GridSample failed: operation not permitted when stream is capturing"), and every frame paid a host write per such node.
+    /// </remarks>
+    public ArrayView1D<float, Stride1D.Dense> ParamsView(float[] data)
+        => (_opParams ??= new Kernels.ContentParamBuffers<float>(_accelerator)).Get(data);
+
     /// <summary>
     /// Canonical, accelerator-free manifest of every ONNX op-type registered by
     /// <see cref="RegisterBuiltins"/>. Consumers that must answer "do we support this op?"
@@ -502,6 +515,7 @@ public class OperatorRegistry : IDisposable
         // it catches the Accelerator property (IDisposable) which we don't own.
         // Disposing the shared Accelerator destroys the GPU device and causes
         // "obj null or undefined" on WebGPU for all subsequent operations.
+        try { _opParams?.Dispose(); _opParams = null; } catch { }
         try { ConvGemm.Dispose(); } catch { }
         try { (MatMul as IDisposable)?.Dispose(); } catch { }
         try { (LayerNorm as IDisposable)?.Dispose(); } catch { }

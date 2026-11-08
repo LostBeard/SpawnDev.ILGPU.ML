@@ -26,9 +26,8 @@ public class LpNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per output element (gather, not scatter — WebGL TF compatible)
         var paramsData = new float[] { axisSize, inner, p };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.LpNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outer * axisSize * inner);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.LpNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, outer * axisSize * inner);
     }
 }
 public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -47,9 +46,8 @@ public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per (N, C) pair, iterates spatial
         var paramsData = new float[] { C, spatial, p };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.GlobalLpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * C);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.GlobalLpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, N * C);
     }
 }
 public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -86,9 +84,8 @@ public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per output element, iterates kernel window
         var paramsData = new float[] { C, H, W, outH, outW, kH, kW, sH, sW, pH, pW, p };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.LpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.LpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, totalOutput);
     }
 }
 public class DetOperator(OperatorRegistry reg) : IOnnxOperator
@@ -187,9 +184,8 @@ public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per output element, reads centered input
         var paramsFloatData = paramsData.Select(v => (float)v).ToArray();
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsFloatData.Length });
-        paramsBuf.Data.SubView(0, paramsFloatData.Length).CopyFromCPU(paramsFloatData);
-        reg.ElementWise.CenterCropPad(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outCount);
+        var paramsBuf = reg.ParamsView(paramsFloatData);
+        reg.ElementWise.CenterCropPad(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, outCount);
     }
 }
 public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -218,12 +214,10 @@ public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
 
         var paramsData = new float[] { C, H, W, pH, pW, roiStride };
         var fparamsData = new float[] { spatialScale };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
+        var paramsBuf = reg.ParamsView(paramsData);
+        var fparamsBuf = reg.ParamsView(fparamsData);
         reg.ElementWise.MaxRoiPool(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
-            paramsBuf.Data, fparamsBuf.Data, totalOut);
+            paramsBuf, fparamsBuf, totalOut);
     }
 }
 public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -279,9 +273,8 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
         int alignCorners = ctx.GetInt("align_corners", 0);
 
         var paramsData = new float[] { H, W, alignCorners };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * H * W * 2);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, N * H * W * 2);
     }
 }
 public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
@@ -301,13 +294,18 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
         int N = xShape[0], C = xShape[1], Hin = xShape[2], Win = xShape[3];
         int Hout = gridShape[1], Wout = gridShape[2];
         int alignCorners = ctx.GetInt("align_corners", 0);
+        // The kernel is bilinear with zero padding (D-FINE / RT-DETR deformable attention). Other modes used to run as that in silence.
+        var mode = ctx.GetString("mode", "linear");
+        var padding = ctx.GetString("padding_mode", "zeros");
+        if (mode is not ("linear" or "bilinear") || padding != "zeros" || xShape.Length != 4)
+            throw new NotSupportedException($"GridSample: mode '{mode}', padding_mode '{padding}' on rank {xShape.Length} is not implemented "
+                + "(bilinear, zeros, 4-D only).");
         int totalOutput = N * C * Hout * Wout;
 
         // GPU path: bilinear interpolation, one thread per output element
         var paramsData = new float[] { N, C, Hin, Win, Hout, Wout, alignCorners };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf, totalOutput);
     }
 }
 public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
@@ -352,9 +350,8 @@ public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
         // had a race condition for stride < kernel).
         int outCount = ctx.Outputs[0].ElementCount;
         var paramsData = new float[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outCount);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, outCount);
     }
 }
 public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
@@ -394,10 +391,9 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
         {
             var paramsData = new float[] { inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, group, offsetGroup };
-            var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-            paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+            var paramsBuf = reg.ParamsView(paramsData);
             reg.ElementWise.DeformConv(x.Data, w.Data, ctx.Inputs[2].Data,
-                ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
+                ctx.Outputs[0].Data, paramsBuf, totalOutput);
             // Add bias if provided
             if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
                 reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[3].Data, totalOutput, outC);
@@ -452,12 +448,10 @@ public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         var paramsData = new float[] { C, H, W, outH, outW, samplingRatio, hasBatch ? 1 : 0 };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
+        var paramsBuf = reg.ParamsView(paramsData);
+        var fparamsBuf = reg.ParamsView(fparamsData);
         reg.ElementWise.RoiAlign(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
-            paramsBuf.Data, fparamsBuf.Data, totalOut);
+            paramsBuf, fparamsBuf, totalOut);
     }
 }
 public class ConvIntegerOperator(OperatorRegistry reg) : IOnnxOperator

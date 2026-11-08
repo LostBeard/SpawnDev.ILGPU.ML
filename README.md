@@ -162,7 +162,7 @@ More: [Docs/assetgen.md](Docs/assetgen.md), [Docs/scenes.md](Docs/scenes.md) (a 
 
 | Area | What is in the box |
 |------|--------------------|
-| **Vision** | Classification, object detection (YOLOv8), face detection (BlazeFace), pose (MoveNet), depth (Depth Anything V2, multi-view and streaming variants), style transfer, super-resolution, background removal (RMBG-1.4, IS-Net), zero-shot classification (CLIP) |
+| **Vision** | Classification, object detection (YOLOv8; D-FINE, RT-DETR / RT-DETRv2 via `DetrDetectionPipeline`, Apache-2.0, matching onnxruntime and transformers' preprocessing bit for bit), face detection (BlazeFace), pose (MoveNet), depth (Depth Anything V2, multi-view and streaming variants), style transfer, super-resolution, background removal (RMBG-1.4, IS-Net), zero-shot classification (CLIP) |
 | **Image generation** | FLUX 3 Image Klein 5.6B (text to image, edits with up to 10 references, Qwen3 caption writer), FLUX.2 klein 4B, Stable Diffusion 1.x / 2.x / SDXL checkpoints (LoRA, ControlNet, TAESD, merging and saving, ComfyUI's FreeU / PAG / SAG / HyperTile / deep shrink / ToMe, ToDo), SD-Turbo, DDPM |
 | **Video generation** | LTX-Video 2B 0.9.8 distilled (text or picture to video, keyframes, clip extension, the x2 upscaler two-pass recipe) and Wan 2.2 TI2V-5B (Turbo 4 steps, or 50 steps with MagCache); a story writer (Qwen3 writes the shots) and narration (Kokoro); live previews while denoising |
 | **3D** | TRELLIS.2 text and image to textured PBR mesh (`Trellis2ImageTo3D`, `Trellis2TextTo3D`), mesh repair, remeshing, simplification, UV atlas and texture baking on the device; glTF, OBJ, PLY and SPZ import and export |

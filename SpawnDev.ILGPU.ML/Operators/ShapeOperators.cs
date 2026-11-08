@@ -537,9 +537,8 @@ public class CumSumOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per output element (gather, not scatter — WebGL TF compatible)
         var paramsData = new float[] { axisSize, inner, exclusive, reverse };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.CumSum(input.Data, output.Data, paramsBuf.Data, outer * axisSize * inner);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.CumSum(input.Data, output.Data, paramsBuf, outer * axisSize * inner);
     }
 }
 
@@ -949,12 +948,10 @@ public class LRNOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: params buffer [C, spatial, halfSize, size], fparams [alpha, beta, bias]
         var paramsData = new float[] { C, spatial, halfSize, size };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        var paramsBuf = reg.ParamsView(paramsData);
         var fparamsData = new float[] { alpha, beta, bias };
-        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
-        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
-        reg.ElementWise.LRN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, fparamsBuf.Data, total);
+        var fparamsBuf = reg.ParamsView(fparamsData);
+        reg.ElementWise.LRN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, fparamsBuf, total);
     }
 }
 
@@ -1183,10 +1180,9 @@ public class ReverseSequenceOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: one thread per element, reads seqLens from GPU
         var paramsData = new float[] { batchAxis, timeAxis, batchSize, timeSize, innerSize };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        var paramsBuf = reg.ParamsView(paramsData);
         reg.ElementWise.ReverseSequence(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
-            ctx.Inputs[1].Data, paramsBuf.Data, total);
+            ctx.Inputs[1].Data, paramsBuf, total);
     }
 }
 

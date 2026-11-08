@@ -4,6 +4,55 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.7-local.1 - 2026-11-08 (local feed) - DETR family + DetrDetectionPipeline; flow-scoped capture
+
+On SpawnDev.ILGPU 5.4.17-local.1 (flow-scoped dispatch-plan recording).
+
+### DETR family: D-FINE, RT-DETRv2 run and match onnxruntime; `DetrDetectionPipeline`; CUDA graph capture of large graphs
+
+Reported by Riker (AssistZ, 2026-11-06), who wants Apache-2.0 detectors (D-FINE-S) in place of YOLOv8.
+
+- **Three engine defects kept the DETR family from running or from matching onnxruntime** (all three exported by transformers / onnx-community):
+  - `GraphOptimizer.StrengthReduce` turned `Add(x, 0)` / `Mul(x, 1)` into Identity whenever the constant had one element, ignoring its RANK:
+    `Add([40,1,1], zeros[1,1,1,1])` is torch's rank promotion, and dropping it made D-FINE's anchor-grid Concat [3] instead of [4]. A rank-r constant
+    now qualifies only when the other operand's rank is known and >= r (rank 0 always).
+  - MatMul ignored ONNX's rank-1 rules (`[S,K] x [K] -> [S]`, `[K] x [K,N] -> [N]`): D-FINE's box integral `MatMul(softmax [1200,33], [33])` came out
+    [1200,33] and became a batch of 33 two decoder layers later. One `MatMulOperator.OutputShape` now serves shape inference, the executor's runtime
+    override and `FusedScaledMatMul`, which also stops striding a shared 2-D B per batch entry (it runs MatMul's own dense path).
+  - `FuseLinearLayers` fused a following Clip and `FusedLinear` ran it as ReLU ("RELU6 approximation", wrong for every Clip): D-FINE's
+    `Clip(-10, 10)` zeroed negative query embeddings (logits off by 4.05). Clip is no longer fused; an unknown FusedLinear activation throws. A Gemm
+    with its own C no longer fuses with a following Add (the Add's bias was dropped).
+  - Result against onnxruntime 1.26 (cat, 640): D-FINE-S logits max|diff| 9.5e-4, boxes 1.6e-5; D-FINE-N 9.9e-4 / 1.6e-5; RT-DETRv2-R18
+    1.4e-4 / 6.4e-5 on WebGPU, the same on CUDA and OpenCL.
+- **`DetrDetectionPipeline`**: the model's own preprocessing (PIL-exact stretch to 640, /255, no mean/std), sigmoid (query, class) pairs above a
+  threshold, highest first, as transformers' `post_process_object_detection`, no NMS; an optional source rect (tile one uploaded frame with no copy);
+  managed / TypedArray / GPU-view overloads; `EnableGraphCapture`. The per-query scan runs on the GPU (7 floats a query read back). D-FINE-S on the
+  street picture gives transformers' 26 detections. D-FINE-S at 640 on an RTX 4070: **WebGPU 92 ms direct, 32.7 ms replayed** (1,326 dispatches;
+  463 / 93 ms before the Split fix below), **CUDA 40 ms direct, 30 ms replayed**.
+- **`ImagePreprocessKernel.ForwardPil`**: Pillow's `Image.resize(BILINEAR)` (antialiased when shrinking) bit for bit - coefficients in double as
+  Pillow's `precompute_coeffs`, 22-bit fixed point, both passes with Pillow's uint8 rounding in one kernel; 0 of 95,232 bytes differ on CUDA,
+  OpenCL and WebGPU. Hugging Face processors resize with PIL, and 4-tap bilinear is a sharper, aliased picture when shrinking 1920 -> 640.
+- **Split** made one copy dispatch per (outer index, output): D-FINE-S's 10 Splits were 25,208 of a forward's 26,457 WebGPU dispatches (326 ms of
+  463). One strided block copy per output now (`ConcatKernel.BlockCopy`), and the same for Concat with more than 4 inputs.
+- **CUDA graph capture of D-FINE**: 22 operator sites (GridSample, Col2Im, DFT, STFT, CumSum, LRN, LpNorm, Trilu, ...) uploaded their params with a
+  host `CopyFromCPU` per call, which synchronises the stream - illegal inside a capture. They use content-addressed, write-once device params now
+  (`OperatorRegistry.ParamsView`). The broadcast scalar fast path under capture rented a pool buffer, swapped in an arena view and returned THAT
+  ("ALIEN-RETURN"), leaking the rented one per call; dead outputs (e.g. TopK's unread values) were returned only at drains a CUDA capture suppresses.
+  Either left the capture pass short of a buffer: **cuMemAlloc mid-capture, an access violation that killed the process.** A pool miss inside a CUDA
+  capture now throws a named exception (the capture falls back to a direct forward) instead.
+- **A graph capture belongs to the async flow that started it** (Riker, AssistZ, RX 590: a YOLOv8 capture recorded with the video and
+  audio loops running took 280 dispatches where a quiet one takes 250, and the video loop's frame copy threw "cannot run while a WebGPU dispatch plan
+  is recording"). SpawnDev.ILGPU 5.4.17 scopes a dispatch-plan recording to its flow (Data); here `GraphExecutor.SuppressDrains` /
+  `UseCaptureParamSlots` / `KeepDrainsDuringCapture` and `FusedAttentionKernel.UseStableCaptureSlots` claim the flow that sets them and read true only
+  there (one field read outside a capture), a second flow claiming while one holds them throws, and `ForwardGeneration` is per forward. Gate
+  `Pipeline_YOLOv8_CaptureWithConcurrentLoop_RecordsOnlyItsOwnWork`: a second session detects in a loop throughout the recording and replays; the
+  plan records the quiet count (250 = 250, with 9 loop frames during the recording) and replays the quiet answer. Red-checked on SpawnDev.ILGPU 5.4.16: the replay submitted a buffer the loop had freed
+  ("used in submit while destroyed"). `Capture_Flags_AreScopedToTheirAsyncFlow` gates the flags alone. (A CUDA capture stays process-global by CUDA's
+  rules: no other work may run during it.)
+- GridSample refuses modes its kernel does not implement (nearest, bicubic, border, reflection) instead of running them as bilinear + zeros.
+- Tooling: DemoConsole `MODELDIFF` (a whole model against onnxruntime outputs, optional capture), `ML_OPT_SKIP=<pass,...>` (skip optimizer passes, to
+  bisect without a rebuild), `ML_OPT_TRACE=1` (print each FusedLinear rewrite), `Bench_DFineS_WebGPU_Profile` (per-op dispatches, capture vs direct).
+
 ## 5.8.6 - 2026-11-06 (nuget.org) - Q8_0 regrouped in place: browser decode +13%
 
 Stable. Full sweep 7,555 passed, 0 failed; `Training_DecoderLora_OverQ8Grouped_MatchesNative` (LoRA over the regrouped layout vs the native one,

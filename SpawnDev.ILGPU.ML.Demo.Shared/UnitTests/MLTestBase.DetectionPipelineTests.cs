@@ -471,6 +471,75 @@ public abstract partial class MLTestBase
     /// direct forward's detections (labels, scores to 1e-4, boxes to 0.05 px) on three frames, and must be the path that ran (<c>CaptureStatus</c>). Prints both
     /// paths' median times. Added 2026-11-06 for Riker (AssistZ: YOLOv8n per-frame cost on the RX 590).
     /// </summary>
+    /// <summary>
+    /// Riker (AssistZ, RX 590, 2026-11-06): a YOLOv8 capture recorded while the app's video and audio loops ran took 280 dispatches where a
+    /// quiet one takes 250 - the other loops' kernels went into the plan (and their forwards ran in capture mode), and the video loop's frame
+    /// copy threw "cannot run while a WebGPU dispatch plan is recording". A recording now belongs to the async flow that started it
+    /// (SpawnDev.ILGPU's dispatch plan + GraphExecutor's capture flags): with a second session detecting in a concurrent loop, the plan
+    /// records exactly the quiet count, its replays give the quiet answer, and the loop's own detections stay right throughout.
+    /// WebGPU only: a CUDA capture is process-global by CUDA's rules (CudaStreamCaptureMode.Global), so no other work may run during it.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Pipeline_YOLOv8_CaptureWithConcurrentLoop_RecordsOnlyItsOwnWork() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException("WebGPU dispatch-plan recording is what is scoped; a CUDA capture admits no concurrent work");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        byte[] onnxBytes;
+        try { onnxBytes = await http.GetByteArrayAsync("models/yolov8n/model.onnx"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"YOLOv8 model missing: {ex.Message}"); }
+        var bin = await http.GetByteArrayAsync("samples/street_rgba.bin");
+        int width = BitConverter.ToInt32(bin, 0), height = BitConverter.ToInt32(bin, 4);
+        var pixels = new int[width * height];
+        Buffer.BlockCopy(bin, 8, pixels, 0, width * height * 4);
+        static int Dispatches(string status) => System.Text.RegularExpressions.Regex.Match(status, @"\((\d+) dispatches\)") is { Success: true } m ? int.Parse(m.Groups[1].Value) : -1;
+        static string? Diff(SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] a, SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] b)
+        {
+            if (a.Length != b.Length) return $"{a.Length} vs {b.Length} detections";
+            for (int i = 0; i < a.Length; i++)
+                if (a[i].Label != b[i].Label || Math.Abs(a[i].Confidence - b[i].Confidence) > 1e-3f || Math.Abs(a[i].X - b[i].X) > 0.5f || Math.Abs(a[i].Y - b[i].Y) > 0.5f)
+                    return $"detection {i}: {a[i].Label} {a[i].Confidence:F4} ({a[i].X:F1},{a[i].Y:F1}) vs {b[i].Label} {b[i].Confidence:F4} ({b[i].X:F1},{b[i].Y:F1})";
+            return null;
+        }
+
+        // Quiet recording: the reference count and answer.
+        int quietCount; SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[] quietObjs;
+        using (var quiet = new ObjectDetectionPipeline(InferenceSession.CreateFromOnnx(accelerator, onnxBytes), accelerator) { EnableGraphCapture = true })
+        {
+            SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[]? last = null;
+            for (int i = 0; i < 4; i++) last = (await quiet.DetectAsync(pixels, width, height, confidenceThreshold: 0.25f)).Objects;
+            quietCount = Dispatches(quiet.CaptureStatus);
+            quietObjs = last!;
+            if (quietCount <= 0) throw new Exception($"quiet capture not live: {quiet.CaptureStatus}");
+        }
+
+        // A second session detecting in a loop the whole time the first one records and replays.
+        using var loopPipeline = new ObjectDetectionPipeline(InferenceSession.CreateFromOnnx(accelerator, onnxBytes), accelerator);
+        bool stop = false; int loopFrames = 0; string? loopWrong = null;
+        async Task Loop()
+        {
+            while (!stop)
+            {
+                var r = await loopPipeline.DetectAsync(pixels, width, height, confidenceThreshold: 0.25f);
+                loopFrames++;
+                if (Diff(r.Objects, quietObjs) is { } d) loopWrong ??= $"loop frame {loopFrames}: {d}";
+                await Task.Yield();
+            }
+        }
+        var loop = Loop();
+        using var busy = new ObjectDetectionPipeline(InferenceSession.CreateFromOnnx(accelerator, onnxBytes), accelerator) { EnableGraphCapture = true };
+        SpawnDev.ILGPU.ML.Preprocessing.DetectedObject[]? busyObjs = null;
+        for (int i = 0; i < 6; i++) busyObjs = (await busy.DetectAsync(pixels, width, height, confidenceThreshold: 0.25f)).Objects;
+        stop = true;
+        await loop;
+        int busyCount = Dispatches(busy.CaptureStatus);
+        Console.WriteLine($"[CaptureFlow] YOLOv8 WebGPU plan: quiet {quietCount} dispatches, with a concurrent loop {busyCount} ({loopFrames} loop frames ran meanwhile)");
+        if (loopFrames < 2) throw new Exception($"the concurrent loop ran only {loopFrames} frame(s): the test did not overlap the recording");
+        if (busyCount != quietCount) throw new Exception($"the plan recorded {busyCount} dispatches with a concurrent loop, {quietCount} without: other work leaked into it");
+        if (Diff(busyObjs!, quietObjs) is { } bd) throw new Exception($"replay with a concurrent loop differs from the quiet one: {bd}");
+        if (loopWrong != null) throw new Exception($"the concurrent loop's own detections went wrong: {loopWrong}");
+    });
+
     [TestMethod(Timeout = 300000)]
     public async Task Pipeline_YOLOv8_GraphCapture_MatchesDirect() => await RunTest(async accelerator =>
     {

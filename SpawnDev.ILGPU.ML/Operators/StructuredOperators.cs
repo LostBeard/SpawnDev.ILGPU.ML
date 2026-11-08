@@ -1644,31 +1644,19 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        // Fallback: per-pair Scale dispatches (correct, but pays per-dispatch overhead)
+        // More than 4 inputs: one strided block copy per input into its slot (it used to be one copy per outer index per input).
+        if ((long)outer * totalConcatDim * inner > ctx.Outputs[0].Data.Length)
+            throw new InvalidOperationException($"Concat: output view holds {ctx.Outputs[0].Data.Length} values, the result is {(long)outer * totalConcatDim * inner}.");
         int outOffset = 0;
         for (int n = 0; n < ctx.Inputs.Length; n++)
         {
             var inp = ctx.Inputs[n];
             int concatDim = inp.Shape[axis];
             int blockSize = concatDim * inner;
-
-            for (int o = 0; o < outer; o++)
-            {
-                int srcOffset = o * blockSize;
-                int dstOffset = o * totalConcatDim * inner + outOffset;
-
-                // Bounds-safe copy — clamp to actual tensor size
-                int actualSrcLen = Math.Min(blockSize, (int)inp.Data.Length - srcOffset);
-                int actualDstLen = Math.Min(blockSize, (int)ctx.Outputs[0].Data.Length - dstOffset);
-                int copyLen = Math.Min(actualSrcLen, actualDstLen);
-                if (copyLen <= 0 || srcOffset < 0 || dstOffset < 0) continue;
-
-                reg.ElementWise.Scale(
-                    inp.Data.SubView(srcOffset, copyLen),
-                    ctx.Outputs[0].Data.SubView(dstOffset, copyLen),
-                    copyLen, 1f);
-            }
-            outOffset += concatDim * inner;
+            if ((long)outer * blockSize > inp.Data.Length)
+                throw new InvalidOperationException($"Concat input {n} [{string.Join(",", inp.Shape)}]: view holds {inp.Data.Length} values, needs {(long)outer * blockSize}.");
+            reg.Concat.BlockCopy(inp.Data, ctx.Outputs[0].Data, outer, blockSize, blockSize, 0, totalConcatDim * inner, outOffset);
+            outOffset += blockSize;
         }
     }
 }
@@ -2241,7 +2229,10 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
         int axisOffset = 0;
         for (int outIdx = 0; outIdx < ctx.Outputs.Length; outIdx++)
         {
-            if (ctx.Outputs[outIdx] == null) continue;
+            // Skipping a missing output would leave axisOffset short and put every LATER output on the wrong slice. The executor binds
+            // every output (unnamed ones get a pool name), so this only fires if that ever changes.
+            if (ctx.Outputs[outIdx] == null)
+                throw new InvalidOperationException($"Split: output {outIdx} is not bound; the slice offsets of the outputs after it depend on its size.");
             var outShape = ctx.Outputs[outIdx].Shape;
             if (axis >= outShape.Length)
                 throw new InvalidOperationException(
@@ -2249,19 +2240,11 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
                     $"Input shape=[{string.Join(",", inShape)}], {ctx.Outputs.Length} outputs.");
             int splitSize = outShape[axis];
             int blockSize = splitSize * inner;
-
-            for (int o = 0; o < outer; o++)
-            {
-                int srcOffset = o * axisDim * inner + axisOffset * inner;
-                int dstOffset = o * blockSize;
-                int copyLen = Math.Min(blockSize, ctx.Outputs[outIdx].ElementCount - dstOffset);
-                if (copyLen <= 0) continue;
-
-                reg.ElementWise.Scale(
-                    ctx.Inputs[0].Data.SubView(srcOffset, copyLen),
-                    ctx.Outputs[outIdx].Data.SubView(dstOffset, copyLen),
-                    copyLen, 1f);
-            }
+            // One strided block copy per output (see ConcatKernel.BlockCopy: one copy per outer index made D-FINE's 10 Splits 25,208 dispatches).
+            if ((long)outer * blockSize > ctx.Outputs[outIdx].Data.Length || axisOffset + splitSize > axisDim)
+                throw new InvalidOperationException($"Split output {outIdx} [{string.Join(",", outShape)}] does not fit input [{string.Join(",", inShape)}] "
+                    + $"at axis offset {axisOffset} (view {ctx.Outputs[outIdx].Data.Length}).");
+            reg.Concat.BlockCopy(ctx.Inputs[0].Data, ctx.Outputs[outIdx].Data, outer, blockSize, axisDim * inner, axisOffset * inner, blockSize, 0);
             axisOffset += splitSize;
         }
     }
@@ -2835,9 +2818,8 @@ public class TriluOperator(OperatorRegistry reg) : IOnnxOperator
 
         // GPU path: params buffer [rows, cols, k, upper, batchStride]
         var paramsData = new float[] { rows, cols, k, upper, batchStride };
-        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
-        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.Trilu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, total);
+        var paramsBuf = reg.ParamsView(paramsData);
+        reg.ElementWise.Trilu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf, total);
     }
 }
 
