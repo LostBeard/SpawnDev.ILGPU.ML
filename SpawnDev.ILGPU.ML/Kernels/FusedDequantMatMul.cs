@@ -2312,6 +2312,14 @@ public class FusedDequantMatMul : IDisposable
         if (M == 1 && type == GGMLType.F16 && !ForceGenericRows && F16Vec && K % 8 == 0
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
         {
+            if ((F16VecRows1 ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32)
+            {
+                _gemvF16Vec1 ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvF16VecShuffle1Impl);
+                _gemvF16Vec1(new KernelConfig((N + Q8VecCols - 1) / Q8VecCols, Q8VecCols * 32),
+                    input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, pb.View);
+                LastRowsKernel = "f16-vec-1";
+                return;
+            }
             _gemvF16Vec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvF16VecImpl);
             _gemvF16Vec(new KernelConfig((N + Q8VecCols * Q8VecRows - 1) / (Q8VecCols * Q8VecRows), Q8VecCols * 32),
                 input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, pb.View);
@@ -2412,7 +2420,13 @@ public class FusedDequantMatMul : IDisposable
     /// <summary><see cref="Q6Vec"/> on WebGPU too (off until measured there: Q8Vec was slower on WebGPU than the word-wise kernel).</summary>
     public static bool Q6VecWebGPU;
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6Vec;
-    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvF16Vec;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvF16Vec, _gemvF16Vec1;
+    /// <summary>
+    /// <see cref="F16Vec"/> with ONE output a warp (<c>GemvF16VecShuffle1Impl</c>: 4x the warps, shuffle reduction; where <see cref="CanShuffle32"/>).
+    /// null (default) = on for CUDA, off elsewhere until measured there; env GGUF_F16_VEC_ROWS=1 / 4 forces it. MEASURED 2026-11-09 (nsys, RTX 4070,
+    /// qwen3:1.7b Q4_K_M captured decode, its F16 attn_v 1024 x 2048): 20.56 -> 10.83 us a GEMV (201 -> 387 GB/s).
+    /// </summary>
+    public static bool? F16VecRows1 = Environment.GetEnvironmentVariable("GGUF_F16_VEC_ROWS") switch { "1" => true, "4" => false, _ => null };
     private const int Q8VecCols = 2;       // warps a group holds
     private const int Q8VecRows = 4;       // outputs a warp computes
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ8Vec;
@@ -2585,6 +2599,29 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (lane < Q8VecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
+    }
+
+    // M = 1, F16, ONE output a warp (GemvF16VecImpl's four, with 4x the warps): a lane per 8 values, the row's 32 lane sums reduced by
+    // Warp.ShuffleXor. F16 has no decode work, so re-reading the (L1-resident) input for each row is cheap, and the four-row kernel leaves the
+    // small decode matrices with few warps (1024 rows = 256 warps on 46 SMs: 201 GB/s on the RTX 4070 for qwen3:1.7b's attn_v). Needs a real
+    // 32-lane warp (CanShuffle32).
+    private static void GemvF16VecShuffle1Impl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView<W16> w16, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, n = Grid.IdxX * Q8VecCols + (tid >> 5);
+        float s = 0f;
+        int nU = K >> 3;                                               // 16-byte chunks a row
+        if (n < N)
+        {
+            long wb = (long)n * nU;
+            for (int u = lane; u < nU; u += 32)
+            {
+                var x0 = x4.AsAligned16()[2 * u]; var x1 = x4.AsAligned16()[2 * u + 1];
+                s += H8(w16.AsAligned16()[wb + u], x0, x1);
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1) s += Warp.ShuffleXor(s, off);
+        if (lane == 0 && n < N) output[n] = s;
     }
 
     // 4 int8 values (the bytes of q) against an input quad

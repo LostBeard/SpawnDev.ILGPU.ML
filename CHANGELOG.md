@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA F16 decode GEMV: one output a warp** (`GemvF16VecShuffle1Impl`, shuffle reduction, 4x the warps of the four-output kernel; where
+  `CanShuffle32`). MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, whose attn_v is F16): nsys 20.56 -> 10.83 us a GEMV (201 -> 387 GB/s); decode tok/s
+  (quiet machine, interleaved x2) 192.6 / 191.9 -> 202.6 / 203.3 short, 159.9 / 160.0 -> 167.2 / 168.5 long (+5-5.6%). Default on for CUDA,
+  opt-in elsewhere (`FusedDequantMatMul.F16VecRows1`, env GGUF_F16_VEC_ROWS=1 / 4). Unlike Q4_K, where two outputs a warp was slower, F16 has no
+  decode work, so re-reading the input per row is cheap. `Gemv_F16Vec_MatchesOracle_AndIsTaken` runs both kernels on every lane.
+
 ## 5.8.9 - 2026-11-09 (nuget.org) - WebGPU shuffle-kernel correctness on browsers without subgroups; faster CUDA Q4_K decode GEMV
 
 On SpawnDev.ILGPU 5.4.22. Release sweep (full default, HeavyModel excluded): 7,654 passed, 0 failed, 443 skipped, 1 h 13 m (RTX 4070,
