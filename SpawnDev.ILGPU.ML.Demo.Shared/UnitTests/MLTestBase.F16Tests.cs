@@ -1060,4 +1060,45 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[F16] E5M2: {raw.Length} B native, no float buffer, maxErr={err:E3}");
         }
     });
+
+    private static void F16_DequantHalfToFloatBits(Index1D i, ArrayView1D<uint, Stride1D.Dense> finite, ArrayView1D<uint, Stride1D.Dense> full)
+    {
+        finite[i] = Interop.FloatAsInt(SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.HalfToFloatFinite(i));
+        full[i] = Interop.FloatAsInt(SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.HalfToFloat(i));
+    }
+
+    /// <summary>
+    /// The dequant kernels' own f16 -> f32 conversions (<c>FusedDequantMatMul.HalfToFloatFinite</c> / <c>HalfToFloat</c>, used for
+    /// every Q4_K / Q6_K / Q8_0 scale) are EXACT for all 65,536 bit patterns on every backend: bit-identical to .NET's
+    /// (float)Half (NaN: any NaN). They used to scale by MathF.Pow(2f, exp - 15), which without CUDA LibDevice is
+    /// Exp(y * Log(2)) - not exactly a power of two - and with it a __nv_powf call in the GEMM / GEMV inner loops.
+    /// </summary>
+    [TestMethod]
+    public Task F16_DequantHalfToFloat_AllBitPatterns_Exact() => RunTest(async accelerator =>
+    {
+        const int n = 65536;
+        using var finite = accelerator.Allocate1D<uint>(n);
+        using var full = accelerator.Allocate1D<uint>(n);
+        var k = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<uint, Stride1D.Dense>>(
+            F16_DequantHalfToFloatBits);
+        k(n, finite.View, full.View);
+        await accelerator.SynchronizeAsync();
+        var gotFinite = await finite.CopyToHostAsync<uint>(0, n);
+        var gotFull = await full.CopyToHostAsync<uint>(0, n);
+        int bad = 0; string first = "";
+        for (int h = 0; h < n; h++)
+        {
+            float want = (float)BitConverter.UInt16BitsToHalf((ushort)h);
+            uint wantBits = BitConverter.SingleToUInt32Bits(want);
+            bool isFinite = ((h >> 10) & 0x1F) != 31;
+            bool fullOk = float.IsNaN(want) ? float.IsNaN(BitConverter.UInt32BitsToSingle(gotFull[h])) : gotFull[h] == wantBits;
+            bool finiteOk = !isFinite || gotFinite[h] == wantBits;   // HalfToFloatFinite is only defined for finite halves
+            if (!(fullOk && finiteOk))
+            {
+                if (bad++ == 0)
+                    first = $"0x{h:X4}: want {want:R} (0x{wantBits:X8}), HalfToFloat 0x{gotFull[h]:X8}, HalfToFloatFinite 0x{gotFinite[h]:X8}";
+            }
+        }
+        if (bad > 0) throw new Exception($"f16 -> f32 dequant conversion wrong for {bad} of {n} bit patterns; first {first}");
+    });
 }

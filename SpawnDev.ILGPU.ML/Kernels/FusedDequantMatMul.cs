@@ -3443,39 +3443,33 @@ public class FusedDequantMatMul : IDisposable
     /// GLSL emitter's block duplication (1.2MB -> ~70KB; measured 2026-06-11).</summary>
     internal static float HalfToFloatFinite(int h)
     {
+        // Built from BITS, exact on every backend: a normal half's float is sign | (exp + 112) << 23 | mant << 13, and a
+        // subnormal's is mant * 2^-24 (exact: a 10-bit integer times a power of two). This used to be
+        // (1 + mant / 1024) * MathF.Pow(2f, exp - 15): inlined into the dequant GEMM / GEMV inner loops, that was a separate
+        // __nv_powf call per conversion on CUDA with LibDevice (SpawnDev.ILGPU 5.4.19+, 9 per TiledGemmImpl / GemvRowsImpl
+        // iteration), and without LibDevice Exp(y * Log(2)), which is not exactly a power of two (scales off in their low bits).
         int sign = (h >> 15) & 1;
         int exp = (h >> 10) & 0x1F;
         int mant = h & 0x3FF;
-        int isNorm = ((-exp) >> 31) & 1; // 1 when exp > 0
-        float frac = mant * (1f / 1024f);
-        float magNorm = (1f + frac) * MathF.Pow(2f, exp - 15);
-        float magSub = frac * (1f / 16384f);
-        return (1 - 2 * sign) * (isNorm * magNorm + (1 - isNorm) * magSub);
+        int normMask = (-exp) >> 31;                                     // all ones when exp > 0
+        int normBits = ((exp + 112) << 23) | (mant << 13);
+        int subBits = (int)Interop.FloatAsInt(mant * (1f / 16777216f));  // mant * 2^-24; mant 0 gives +0
+        int bits = (normBits & normMask) | (subBits & ~normMask) | (sign << 31);
+        return Interop.IntAsFloat((uint)bits);
     }
 
     /// <summary>Convert FP16 bits to float.</summary>
     internal static float HalfToFloat(int h)
     {
-        int sign = (h >> 15) & 1;
-        int exp = (h >> 10) & 0x1F;
-        int mant = h & 0x3FF;
-
-        if (exp == 0)
+        // Finite halves (zeros, subnormals, normals) through the one bit-built conversion; only Inf / NaN differ.
+        // (The zero used to be the constant `sign == 1 ? -0f : 0f`, which SpawnDev.ILGPU 5.4.20 emitted as +0 on WebGPU and
+        // WebGL - reported to SpawnDev.ILGPU 2026-11-09; F16_DequantHalfToFloat_AllBitPatterns_Exact caught it.)
+        if (((h >> 10) & 0x1F) == 31)
         {
-            if (mant == 0) return sign == 1 ? -0f : 0f;
-            // Subnormal
-            float val = mant / 1024f * (1f / 16384f);
-            return sign == 1 ? -val : val;
+            // Inf keeps its sign; NaN keeps sign and payload (half mantissa in the top of the float mantissa)
+            return Interop.IntAsFloat((uint)((((h >> 15) & 1) << 31) | 0x7F800000 | ((h & 0x3FF) << 13)));
         }
-        if (exp == 31)
-        {
-            return mant == 0
-                ? (sign == 1 ? float.NegativeInfinity : float.PositiveInfinity)
-                : float.NaN;
-        }
-
-        float result = (1f + mant / 1024f) * MathF.Pow(2, exp - 15);
-        return sign == 1 ? -result : result;
+        return HalfToFloatFinite(h);
     }
 
     /// <summary>

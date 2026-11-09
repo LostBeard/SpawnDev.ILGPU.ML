@@ -14,9 +14,20 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   MEASURED (RTX 4070, qwen3:1.7b Q8_0, interleaved x2): contraction on and off now give the same numbers - OpenCL long
   prefill 1,320-1,327 tok/s both (strict was 1,257 before), CUDA 7,356-7,427 both. With the flag on nothing changes
   (CUDA 232 / 7,412-7,427 vs 232 / 7,435 prefill). Gate: CUDA / OpenCL / WebGPU lanes 3,308 passed, 0 failed.
-- On SpawnDev.ILGPU 5.4.19 (CUDA nested-loop miscompile fix). MEASURED: it costs CUDA prefill (qwen3:1.7b Q8_0: short
-  273 -> 232 tok/s, long 7,727 -> 7,435; decode -0.4 / -0.9%) against 5.4.18 with the same ML kernels; under investigation
-  with SpawnDev.ILGPU (LibDevice math or the per-edge phi binding).
+- **On SpawnDev.ILGPU 5.4.20** (CUDA: nested-loop miscompile fixed in 5.4.19; an implicitly grouped kernel's `if (i < n)`
+  no longer becomes a warp-uniform branch at O2 in 5.4.20). Since 5.4.19 CUDA finds the toolkit's LibDevice, so MathF.Exp
+  etc. are the accurate `__nv_expf` (1.93 ulp, a call) instead of a 64-ulp inline exp: CUDA prefill fell 270 -> 232 tok/s
+  (short) / 7,698 -> 7,388 (long) with the same kernels (MEASURED with CUDA_PATH set vs unset).
+- **Flash prefill and MMA attention: the log2-domain softmax calls `XMath.Exp2`** instead of `MathF.Exp(x * ln 2)` (it
+  undid its own log2(e) scaling and paid an exp call per score; 2^x is one `ex2` instruction, its error does not grow with
+  x), and **the dequant kernels' f16 -> f32 conversion is built from bits** (`FusedDequantMatMul.HalfToFloat[Finite]`; was
+  `MathF.Pow(2f, exp - 15)` - a `__nv_powf` call per scale in the GEMM / GEMV inner loops with LibDevice, and not exactly a
+  power of two without it). MEASURED (RTX 4070, qwen3:1.7b Q8_0, CUDA, LibDevice, interleaved x2): prefill short 232 -> 294
+  tok/s (+26%; the old 64-ulp exp gave 270), long 7,388 -> 7,534; decode unchanged. Gates: `MmaFlashPrefill_MatchesCausalGqaOracle`,
+  `GgufBatchDecoder_FlashPrefill_MatchesThreeKernelPath`, `Trellis2_FlashAttention_MatchesHostReference` (all backends that run
+  them); new `F16_DequantHalfToFloat_AllBitPatterns_Exact`: all 65,536 patterns bit-identical to .NET's (float)Half on all 7
+  backends (red-checked: an exponent-bias mutation fails it on all 7). It also found SpawnDev.ILGPU 5.4.20 emitting a `-0f`
+  constant as +0 on WebGPU / WebGL (reported; ML no longer uses that constant). ML's CUDA lane on 5.4.20: 1,106 passed, 0 failed.
 - `GGUFLastPositionLogits_MatchesFullLastPosition` reports its phases (session create, first run = compile, warm re-run).
 
 ## 5.8.7 - 2026-11-08 (nuget.org) - DETR detectors, flow-scoped graph capture, ComfyUI deep shrink + attention multiply, browser decode +7%
