@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.7</Version>
+		<Version>5.8.8</Version>
 		<PackageReleaseNotes>v5.8.7 - DETR detectors: D-FINE and RT-DETR / RT-DETRv2 run and match onnxruntime (three engine bugs fixed), DetrDetectionPipeline with Pillow-exact preprocessing. Graph capture records only its own async flow (needs SpawnDev.ILGPU 5.4.17); CUDA graph capture of large graphs no longer crashes; Split / Concat one dispatch per output. ComfyUI deep shrink area / bislerp and attention-multiply (SdUNet / SdTextEncoder.ScaleAsync). Col2Im and DeformConv corrected. Chrome WebGPU LLM decode at long prompts +7%. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.20" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.21" />
 	</ItemGroup>
 
 	<ItemGroup>

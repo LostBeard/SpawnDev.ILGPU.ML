@@ -4,6 +4,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.8 - 2026-11-09 (nuget.org) - accurate CUDA math without the prefill cost, explicit multiply-add, exact f16 dequant
+
+On SpawnDev.ILGPU 5.4.21. Release sweep (full default, HeavyModel excluded): 7,654 passed, 0 failed, 443 skipped, 1 h 16 m
+(RTX 4070, Chrome; -4.6% vs the 5.8.7 sweep). Net effect on CUDA (qwen3:1.7b Q8_0): prefill 293 tok/s short / 7,690 long with
+the CUDA toolkit installed or not, against 5.8.7's 232 / 7,435 on a machine with the toolkit (5.8.7 on SpawnDev.ILGPU 5.4.18 was
+273 / 7,727 only because its exp was off by up to 64 ulp); decode unchanged. Every machine now computes the same accurate math.
+`EnableFloatingPointContraction()` is no longer needed for speed in an app that builds its own `Context`.
+
+- **On SpawnDev.ILGPU 5.4.21**: `XMath.Exp2`, floor, ceiling, sqrt and rsqrt are single instructions on CUDA with or without
+  LibDevice; without the toolkit `MathF.Exp` is an accurate inline exp (2.07 ulp, was 63.8). MEASURED (CUDA_PATH set vs unset,
+  interleaved x2): 293 / 7,691 vs 293 / 7,687-7,702 tok/s prefill, the per-kernel profile identical (257 ms for 1,831 tokens).
+  Also: -0 constants keep their sign on WebGPU / WebGL, codegen is culture-independent (a comma-decimal Windows locale made
+  shaders fail to compile).
 - **ML's hot loops multiply-add explicitly (`float.MultiplyAddEstimate`)**, so a `Context` built WITHOUT
   `EnableFloatingPointContraction()` runs them as fast as `MLContext.Create()` does. 961 accumulations (`acc += x * y`,
   `acc -= x * y`, `acc = acc + x * y`) in 33 hot-path files (GEMM / GEMV / dequant matmul, attention, convolution, norms,
