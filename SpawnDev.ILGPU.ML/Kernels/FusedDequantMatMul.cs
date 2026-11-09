@@ -2335,6 +2335,14 @@ public class FusedDequantMatMul : IDisposable
         if (M == 1 && type == GGMLType.Q6_K && !ForceGenericRows && Q6Vec && (_accelerator.AcceleratorType != AcceleratorType.WebGPU || Q6VecWebGPU) && K % 256 == 0
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 3) == 0)
         {
+            if ((Q6VecSplit ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && N <= Q6SplitMaxN && CanShuffle32)
+            {
+                _gemvQ6VecSplit ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ6_KVecSplitImpl);
+                _gemvQ6VecSplit(new KernelConfig((N + Q8VecRows - 1) / Q8VecRows, Q6SplitWarps * 32),
+                    input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.Cast<byte, int>(), output, pb.View);
+                LastRowsKernel = "q6k-vec-split";
+                return;
+            }
             _gemvQ6Vec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ6_KVecImpl);
             _gemvQ6Vec(new KernelConfig((N + Q8VecCols * Q8VecRows - 1) / (Q8VecCols * Q8VecRows), Q8VecCols * 32),
                 input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.Cast<byte, int>(), output, pb.View);
@@ -2430,6 +2438,16 @@ public class FusedDequantMatMul : IDisposable
     public static bool Q6Vec = Environment.GetEnvironmentVariable("GGUF_Q6_VEC") != "0";
     /// <summary><see cref="Q6Vec"/> on WebGPU too (off until measured there: Q8Vec was slower on WebGPU than the word-wise kernel).</summary>
     public static bool Q6VecWebGPU;
+    /// <summary>
+    /// <see cref="Q6Vec"/> split along K over <see cref="Q6SplitWarps"/> warps a group (<c>GemvQ6_KVecSplitImpl</c>), for N &lt;= <see cref="Q6SplitMaxN"/> and where
+    /// <see cref="CanShuffle32"/>. null (default) = on for CUDA, off elsewhere until measured; env GGUF_Q6_VEC_SPLIT=1 / 0 forces it. MEASURED 2026-11-09
+    /// (nsys, RTX 4070, qwen3:1.7b Q4_K_M ffn_down 2048 x 6144): 41.55 -> 30.91 us a GEMV (249 -> 334 GB/s); the two-warp kernel ran 0.35 waves (ncu).
+    /// </summary>
+    public static bool? Q6VecSplit = Environment.GetEnvironmentVariable("GGUF_Q6_VEC_SPLIT") switch { "1" => true, "0" => false, _ => null };
+    private const int Q6SplitWarps = 4;
+    /// <summary>Largest N the split kernel takes (the LM head, N = vocab, already fills the GPU on the plain kernel).</summary>
+    public static int Q6SplitMaxN = 8192;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6VecSplit;
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6Vec;
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvF16Vec, _gemvF16Vec1;
     /// <summary>
@@ -2565,6 +2583,47 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (lane < Q8VecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
+    }
+
+    // GemvQ6_KVecImpl SPLIT ALONG K: a group of Q6SplitWarps warps shares the same Q8VecRows outputs, warp w taking units w*32 + lane, stepping
+    // 32 * Q6SplitWarps; each warp's sums are shuffle-reduced, then the warps' partials added through shared memory (one barrier). The same per-unit
+    // math and input reuse (four outputs a warp); Q6SplitWarps x the warps. ncu 2026-11-09 (RTX 4070, qwen3:1.7b Q4_K_M ffn_down 2048 x 6144): the
+    // two-warp kernel ran 0.35 waves (256 groups), 21% achieved occupancy, 49% of DRAM bandwidth. Needs a real 32-lane warp (CanShuffle32).
+    private static void GemvQ6_KVecSplitImpl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, wid = tid >> 5, n0 = Grid.IdxX * Q8VecRows;
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
+        int nsb = K >> 8, rowB = nsb * 210, nU = nsb * 16;
+        bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
+        if (r0)
+        {
+            for (int u = wid * 32 + lane; u < nU; u += 32 * Q6SplitWarps)
+            {
+                int sb = u >> 4, h = (u >> 3) & 1, l = (u & 7) << 2;
+                int xb = ((sb << 8) + (h << 7) + l) >> 2;
+                var x0 = x4.AsAligned16()[xb]; var x1 = x4.AsAligned16()[xb + 8]; var x2 = x4.AsAligned16()[xb + 16]; var x3 = x4.AsAligned16()[xb + 24];
+                int so = n0 * rowB + sb * 210;
+                p0 += Q6Unit(w, so, h, l, x0, x1, x2, x3);
+                if (r1) p1 += Q6Unit(w, so + rowB, h, l, x0, x1, x2, x3);
+                if (r2) p2 += Q6Unit(w, so + 2 * rowB, h, l, x0, x1, x2, x3);
+                if (r3) p3 += Q6Unit(w, so + 3 * rowB, h, l, x0, x1, x2, x3);
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            p0 += Warp.ShuffleXor(p0, off); p1 += Warp.ShuffleXor(p1, off);
+            p2 += Warp.ShuffleXor(p2, off); p3 += Warp.ShuffleXor(p3, off);
+        }
+        var sh = SharedMemory.Allocate<float>(Q6SplitWarps * Q8VecRows);
+        if (lane == 0) { sh[wid * 4] = p0; sh[wid * 4 + 1] = p1; sh[wid * 4 + 2] = p2; sh[wid * 4 + 3] = p3; }
+        Group.Barrier();
+        if (tid < Q8VecRows && n0 + tid < N)
+        {
+            float s = 0f;
+            for (int k = 0; k < Q6SplitWarps; k++) s += sh[k * 4 + tid];
+            output[n0 + tid] = s;
+        }
     }
 
     // fp16 bits -> float, every value (subnormals scaled, inf / nan kept): full F16 weights, unlike a block scale, may hold any of them

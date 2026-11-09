@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA Q6_K decode GEMV split along K** (`GemvQ6_KVecSplitImpl`: four warps a group share the same four outputs, each a quarter of K; shuffle,
+  then one shared-memory step) for N <= 8192 (the LM head keeps the plain kernel, which already streams at 81%). Nsight Compute had the two-warp
+  kernel at 0.35 waves and 21% achieved occupancy on qwen3:1.7b Q4_K_M's ffn_down (2048 x 6144). MEASURED (RTX 4070): 41.55 -> 30.91 us a GEMV
+  (249 -> 334 GB/s); decode (quiet, interleaved x2) 202.7 / 203.0 -> 209.2 / 209.0 tok/s short, 167.5 / 168.2 -> 172.4 / 172.6 long. Default on for
+  CUDA, opt-in elsewhere (`FusedDequantMatMul.Q6VecSplit`, env GGUF_Q6_VEC_SPLIT=1 / 0). `Gemv_Q6KVec_MatchesOracle_AndIsTaken` runs both kernels
+  and the decode shape.
+
 - **CUDA F16 decode GEMV: one output a warp** (`GemvF16VecShuffle1Impl`, shuffle reduction, 4x the warps of the four-output kernel; where
   `CanShuffle32`). MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, whose attn_v is F16): nsys 20.56 -> 10.83 us a GEMV (201 -> 387 GB/s); decode tok/s
   (quiet machine, interleaved x2) 192.6 / 191.9 -> 202.6 / 203.3 short, 159.9 / 160.0 -> 167.2 / 168.5 long (+5-5.6%). Default on for CUDA,

@@ -219,7 +219,7 @@ public abstract partial class MLTestBase
         {
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (2048, 203), (256, 9), (6144, 5), (512, 4100), (256, 8200) })
+        foreach (var (K, N) in new[] { (2048, 203), (256, 9), (6144, 5), (512, 4100), (256, 8200), (6144, 2048) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
@@ -242,19 +242,32 @@ public abstract partial class MLTestBase
             using var weightBuf = AllocatePadded(accelerator, weightBytes);
             using var inputBuf = accelerator.Allocate1D(input);
             using var outBuf = accelerator.Allocate1D<float>(N);
-            // aligned (offset 0): the vector kernel
-            fused.ForwardRows(inputBuf.View.SubView(0, K), weightBuf.View, outBuf.View, 1, K, N, type);
-            string route = fused.LastRowsKernel;
-            await accelerator.SynchronizeAsync();
-            var got = await outBuf.CopyToHostAsync<float>(0, N);
-            if (route != "q6k-vec") throw new Exception($"K={K} N={N}: an aligned one-row Q6_K GEMV ran on '{route}', not the vector kernel");
-            AssertCloseQuant(got, Expected(0), 2e-3f, $"Q6_K vector GEMV K={K} N={N}");
+            // aligned (offset 0): the vector kernel, plain and (real 32-lane warps, N <= Q6SplitMaxN) split along K
+            string route = "";
+            bool? splitSaved = Kernels.FusedDequantMatMul.Q6VecSplit;
+            try
+            {
+                foreach (bool split in new[] { false, true })
+                {
+                    Kernels.FusedDequantMatMul.Q6VecSplit = split;
+                    string want = split && fused.CanShuffle32 && N <= Kernels.FusedDequantMatMul.Q6SplitMaxN ? "q6k-vec-split" : "q6k-vec";
+                    outBuf.MemSetToZero();   // a stale result from the other kernel must not pass
+                    fused.ForwardRows(inputBuf.View.SubView(0, K), weightBuf.View, outBuf.View, 1, K, N, type);
+                    string r = fused.LastRowsKernel;
+                    await accelerator.SynchronizeAsync();
+                    var got = await outBuf.CopyToHostAsync<float>(0, N);
+                    if (r != want) throw new Exception($"K={K} N={N}: an aligned one-row Q6_K GEMV ran on '{r}', not '{want}'");
+                    AssertCloseQuant(got, Expected(0), 2e-3f, $"Q6_K vector GEMV ({r}) K={K} N={N}");
+                    route += (route.Length > 0 ? " + " : "") + r;
+                }
+            }
+            finally { Kernels.FusedDequantMatMul.Q6VecSplit = splitSaved; }
             // misaligned by one float: the word-wise kernel, same answer
             fused.ForwardRows(inputBuf.View.SubView(1, K), weightBuf.View, outBuf.View, 1, K, N, type);
             string route2 = fused.LastRowsKernel;
             await accelerator.SynchronizeAsync();
             var got2 = await outBuf.CopyToHostAsync<float>(0, N);
-            if (route2 == "q6k-vec") throw new Exception($"K={K} N={N}: a misaligned input view took the vector kernel (its loads assume 16-byte alignment)");
+            if (route2.StartsWith("q6k-vec")) throw new Exception($"K={K} N={N}: a misaligned input view took the vector kernel (its loads assume 16-byte alignment)");
             AssertCloseQuant(got2, Expected(1), 2e-3f, $"Q6_K rows GEMV (misaligned input) K={K} N={N}");
             notes.Add($"K={K} N={N}: {route} and {route2} match the oracle");
         }
