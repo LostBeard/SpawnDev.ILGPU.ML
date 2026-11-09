@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA fused residual Add + RMSNorm reduces with warp shuffles in double** (`AddRMSNormFusedShuffleImpl`: two group barriers instead of five, no
+  f32 step in the reduction). MEASURED (nsys, RTX 4070, qwen3:1.7b): decode norm 5.71 -> 4.88 us (56 a token), prefill rows 3-5% faster; error
+  vs an f64 reference unchanged. New `AddRmsNormFused_MatchesCpu` (no direct test existed): residual bit-exact, normed output within 2e-6 relative,
+  1 / 3 rows of 1,536 - 4,096, both kernels on CUDA. Env GGUF_RMS_SHUFFLE=0 is the A/B.
+
 - **CUDA Q6_K decode GEMV split along K** (`GemvQ6_KVecSplitImpl`: four warps a group share the same four outputs, each a quarter of K; shuffle,
   then one shared-memory step) for N <= 8192 (the LM head keeps the plain kernel, which already streams at 81%). Nsight Compute had the two-warp
   kernel at 0.35 waves and 21% achieved occupancy on qwen3:1.7b Q4_K_M's ffn_down (2048 x 6144). MEASURED (RTX 4070): 41.55 -> 30.91 us a GEMV

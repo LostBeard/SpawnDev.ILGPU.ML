@@ -297,6 +297,62 @@ public class NormalizationKernels : IDisposable
     }
 
     /// <summary>
+    /// <see cref="AddRMSNormFusedImpl"/> with the sum of squares reduced by Warp.ShuffleXor IN DOUBLE (each warp's 32 lane sums in five
+    /// shuffles, then the warps' sums added by one thread): two group barriers instead of five, no f32 step in the reduction (the tree kernel
+    /// stores its partials as float), no 32-long serial chain. ncu 2026-11-09 (RTX 4070, a 2,048-wide decode row, one group of 256): the tree
+    /// kernel 7.84 us at 49 cycles a issued instruction, ~56 launches a decoded token on qwen3:1.7b. CUDA (a 32-lane warp with 64-bit shuffles).
+    /// </summary>
+    private static void AddRMSNormFusedShuffleImpl(
+        ArrayView1D<float, Stride1D.Dense> a,
+        ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> residualOut,
+        ArrayView1D<float, Stride1D.Dense> normedOut,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        int C, float epsilon, int hasWeight)
+    {
+        int row = Grid.IdxX;
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int offset = row * C;
+
+        var warpSums = SharedMemory.Allocate<double>(MaxRmsGroup / 32);
+        var inv = SharedMemory.Allocate<float>(1);
+
+        double local = 0.0;
+        for (int i = tid; i < C; i += T)
+        {
+            float x = a[offset + i] + b[offset + i];
+            residualOut[offset + i] = x;
+            double v = (double)x; local = double.MultiplyAddEstimate(v, v, local);
+        }
+        for (int off = 16; off > 0; off >>= 1) local += Warp.ShuffleXor(local, off);
+        if ((tid & 31) == 0) warpSums[tid >> 5] = local;
+        Group.Barrier();
+        if (tid == 0)
+        {
+            double sumSq = 0.0;
+            for (int w = 0; w < (T >> 5); w++) sumSq += warpSums[w];
+            inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+        }
+        Group.Barrier();
+
+        float invRms = inv[0];
+        for (int i = tid; i < C; i += T)
+            normedOut[offset + i] = residualOut[offset + i] * invRms * (hasWeight != 0 ? weight[i] : 1f);
+    }
+
+    /// <summary>
+    /// <see cref="AddRMSNormFused"/> on <c>AddRMSNormFusedShuffleImpl</c> (CUDA): on by default; env GGUF_RMS_SHUFFLE=0 is the A/B. MEASURED 2026-11-09
+    /// (nsys, RTX 4070, qwen3:1.7b): the one-row decode norm 5.71 -> 4.88 us (2,048 wide), prefill rows 37.0 -> 35.6 / 49.6 -> 47.4 us; worst error
+    /// against the f64 reference unchanged (AddRmsNormFused_MatchesCpu). The rest of a decode norm is one group's serial memory round trips.
+    /// </summary>
+    public static bool AddRmsShuffle = Environment.GetEnvironmentVariable("GGUF_RMS_SHUFFLE") != "0";
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float, int>? _addRmsNormFusedShuffleKernel;
+    /// <summary>The kernel <see cref="AddRMSNormFused"/> last launched ("tree" / "shuffle"): tests check the route they mean to cover was taken.</summary>
+    public string LastAddRmsKernel { get; private set; } = "";
+
+    /// <summary>
     /// InstanceNorm Pass 1: compute mean and invStd per (N,C) slice.
     /// One thread per slice. Each thread loops over spatial once for mean, once for variance.
     /// Output: means[N*C] and invStds[N*C].
@@ -562,6 +618,17 @@ public class NormalizationKernels : IDisposable
             : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);   // a power of two: the partials reduce by a tree
         if (T < 32) return false;
         if (hasWeight == 0) { _dummyRmsWeight ??= _accelerator.Allocate1D(new float[1]); weight = _dummyRmsWeight.View; }
+        if (AddRmsShuffle && T % 32 == 0 && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+        {
+            _addRmsNormFusedShuffleKernel ??= _accelerator.LoadStreamKernel<
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, float, int>(AddRMSNormFusedShuffleImpl);
+            _addRmsNormFusedShuffleKernel(new KernelConfig(new Index1D(rows), new Index1D(T)), a, b, residualOut, normedOut, weight, C, epsilon, hasWeight);
+            LastAddRmsKernel = "shuffle";
+            return true;
+        }
+        LastAddRmsKernel = "tree";
         _addRmsNormFusedKernel ??= _accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
