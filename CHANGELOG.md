@@ -7,7 +7,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 ## 5.8.7 - 2026-11-08 (nuget.org) - DETR detectors, flow-scoped graph capture, ComfyUI deep shrink + attention multiply, browser decode +7%
 
 Stable: the four 5.8.7-local packages below, together. On SpawnDev.ILGPU 5.4.18 (flow-scoped dispatch-plan recording; WebGL floor / float-to-int
-inside loop nests fixed - ANGLE's D3D compile folded them, which made DeformConv wrong on WebGL; strict float math by default). SWEEP_RESULT_PLACEHOLDER
+inside loop nests fixed - ANGLE's D3D compile folded them, which made DeformConv wrong on WebGL; strict float math by default). Release sweep (848003b9, full default, HeavyModel
+excluded): 7,647 passed, 0 failed, 443 skipped, 1 h 19 m (RTX 4070, Chrome).
 
 - **`MLContext.Create()` enables floating-point contraction** (`Context.Builder.EnableFloatingPointContraction()`): SpawnDev.ILGPU 5.4.18 stopped
   CUDA / OpenCL from fusing `a * b + c` on their own, and ML's hot loops were written for the fused form. MEASURED (RTX 4070, interleaved x2, strict vs contracted): qwen3:1.7b Q8_0 prefill at 1,830 tokens CUDA -2.5%, OpenCL -5%; decode -0.5 to -1%; D-FINE-S CUDA captured 30 vs 29.5 ms (both match onnxruntime). An app that
