@@ -4,6 +4,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **ML's hot loops multiply-add explicitly (`float.MultiplyAddEstimate`)**, so a `Context` built WITHOUT
+  `EnableFloatingPointContraction()` runs them as fast as `MLContext.Create()` does. 961 accumulations (`acc += x * y`,
+  `acc -= x * y`, `acc = acc + x * y`) in 33 hot-path files (GEMM / GEMV / dequant matmul, attention, convolution, norms,
+  recurrent / SSM, the GGUF decoder, training backward + LoRA, the diffusion / DiT kernels) plus the generated tiled attention,
+  tiled GEMM and Q8 GEMM (their generators emit it; unrolled score dots become MultiplyAddEstimate chains in contraction
+  order). Everything else stays strict on purpose: dequant formulas (two decode variants are documented bit-identical),
+  reference-matched image code (Pillow / ComfyUI) and Trellis2 mesh geometry (an edge-collapse choice can flip on one ulp).
+  MEASURED (RTX 4070, qwen3:1.7b Q8_0, interleaved x2): contraction on and off now give the same numbers - OpenCL long
+  prefill 1,320-1,327 tok/s both (strict was 1,257 before), CUDA 7,356-7,427 both. With the flag on nothing changes
+  (CUDA 232 / 7,412-7,427 vs 232 / 7,435 prefill). Gate: CUDA / OpenCL / WebGPU lanes 3,308 passed, 0 failed.
+- On SpawnDev.ILGPU 5.4.19 (CUDA nested-loop miscompile fix). MEASURED: it costs CUDA prefill (qwen3:1.7b Q8_0: short
+  273 -> 232 tok/s, long 7,727 -> 7,435; decode -0.4 / -0.9%) against 5.4.18 with the same ML kernels; under investigation
+  with SpawnDev.ILGPU (LibDevice math or the per-edge phi binding).
+- `GGUFLastPositionLogits_MatchesFullLastPosition` reports its phases (session create, first run = compile, warm re-run).
+
 ## 5.8.7 - 2026-11-08 (nuget.org) - DETR detectors, flow-scoped graph capture, ComfyUI deep shrink + attention multiply, browser decode +7%
 
 Stable: the four 5.8.7-local packages below, together. On SpawnDev.ILGPU 5.4.18 (flow-scoped dispatch-plan recording; WebGL floor / float-to-int

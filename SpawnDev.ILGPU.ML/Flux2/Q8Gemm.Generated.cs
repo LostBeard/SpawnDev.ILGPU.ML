@@ -170,21 +170,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
             }
             {
@@ -296,21 +296,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
             }
             Group.Barrier();
@@ -475,21 +475,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
                 {
                     int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
@@ -550,21 +550,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
             }
             Group.Barrier();
@@ -705,21 +705,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 4 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
                 {
                     int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
@@ -756,21 +756,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 4 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
                 {
                     int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
@@ -807,21 +807,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 4 + 2; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
                 {
                     int a0_0 = 0, a0_1 = 0, a0_2 = 0, a0_3 = 0;
@@ -858,21 +858,21 @@ internal static class Q8Gemm
                     }
                     // sub-block -> float: s (d (dot + 128 S) + m S)
                     { int q = (r0 + 0) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f0_0 += s * (d0 * (a0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (a0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (a0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (a0_3 + 128 * S) + n3 * sF); }
+                      f0_0 = float.MultiplyAddEstimate(s, d0 * (a0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (a0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (a0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (a0_3 + 128 * S) + n3 * sF, f0_3); }
                     { int q = (r0 + 1) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f1_0 += s * (d0 * (a1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (a1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (a1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (a1_3 + 128 * S) + n3 * sF); }
+                      f1_0 = float.MultiplyAddEstimate(s, d0 * (a1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (a1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (a1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (a1_3 + 128 * S) + n3 * sF, f1_3); }
                     { int q = (r0 + 2) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f2_0 += s * (d0 * (a2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (a2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (a2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (a2_3 + 128 * S) + n3 * sF); }
+                      f2_0 = float.MultiplyAddEstimate(s, d0 * (a2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (a2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (a2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (a2_3 + 128 * S) + n3 * sF, f2_3); }
                     { int q = (r0 + 3) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f3_0 += s * (d0 * (a3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (a3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (a3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (a3_3 + 128 * S) + n3 * sF); }
+                      f3_0 = float.MultiplyAddEstimate(s, d0 * (a3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (a3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (a3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (a3_3 + 128 * S) + n3 * sF, f3_3); }
                     { int q = (r0 + 4) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f4_0 += s * (d0 * (a4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (a4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (a4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (a4_3 + 128 * S) + n3 * sF); }
+                      f4_0 = float.MultiplyAddEstimate(s, d0 * (a4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (a4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (a4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (a4_3 + 128 * S) + n3 * sF, f4_3); }
                     { int q = (r0 + 5) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f5_0 += s * (d0 * (a5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (a5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (a5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (a5_3 + 128 * S) + n3 * sF); }
+                      f5_0 = float.MultiplyAddEstimate(s, d0 * (a5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (a5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (a5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (a5_3 + 128 * S) + n3 * sF, f5_3); }
                     { int q = (r0 + 6) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f6_0 += s * (d0 * (a6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (a6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (a6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (a6_3 + 128 * S) + n3 * sF); }
+                      f6_0 = float.MultiplyAddEstimate(s, d0 * (a6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (a6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (a6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (a6_3 + 128 * S) + n3 * sF, f6_3); }
                     { int q = (r0 + 7) * 4 + 3; float s = ss[q]; int S = sS[q]; float sF = S;
-                      f7_0 += s * (d0 * (a7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (a7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (a7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (a7_3 + 128 * S) + n3 * sF); }
+                      f7_0 = float.MultiplyAddEstimate(s, d0 * (a7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (a7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (a7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (a7_3 + 128 * S) + n3 * sF, f7_3); }
                 }
             }
             Group.Barrier();
@@ -1155,21 +1155,21 @@ internal static class Q8Gemm
                 uint h0 = sh[(c0 + 0) * 2 + 0], h1 = sh[(c0 + 1) * 2 + 0], h2 = sh[(c0 + 2) * 2 + 0], h3 = sh[(c0 + 3) * 2 + 0];
                 float d0 = HalfToFloat(h0 & 0xFFFFu), n0 = HalfToFloat(h0 >> 16), d1 = HalfToFloat(h1 & 0xFFFFu), n1 = HalfToFloat(h1 >> 16), d2 = HalfToFloat(h2 & 0xFFFFu), n2 = HalfToFloat(h2 >> 16), d3 = HalfToFloat(h3 & 0xFFFFu), n3 = HalfToFloat(h3 >> 16);
                 { int q = (r0 + 0) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f0_0 += s * (d0 * (t0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (t0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (t0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (t0_3 + 128 * S) + n3 * sF); }
+                  f0_0 = float.MultiplyAddEstimate(s, d0 * (t0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (t0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (t0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (t0_3 + 128 * S) + n3 * sF, f0_3); }
                 { int q = (r0 + 1) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f1_0 += s * (d0 * (t1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (t1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (t1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (t1_3 + 128 * S) + n3 * sF); }
+                  f1_0 = float.MultiplyAddEstimate(s, d0 * (t1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (t1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (t1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (t1_3 + 128 * S) + n3 * sF, f1_3); }
                 { int q = (r0 + 2) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f2_0 += s * (d0 * (t2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (t2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (t2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (t2_3 + 128 * S) + n3 * sF); }
+                  f2_0 = float.MultiplyAddEstimate(s, d0 * (t2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (t2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (t2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (t2_3 + 128 * S) + n3 * sF, f2_3); }
                 { int q = (r0 + 3) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f3_0 += s * (d0 * (t3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (t3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (t3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (t3_3 + 128 * S) + n3 * sF); }
+                  f3_0 = float.MultiplyAddEstimate(s, d0 * (t3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (t3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (t3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (t3_3 + 128 * S) + n3 * sF, f3_3); }
                 { int q = (r0 + 4) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f4_0 += s * (d0 * (t4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (t4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (t4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (t4_3 + 128 * S) + n3 * sF); }
+                  f4_0 = float.MultiplyAddEstimate(s, d0 * (t4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (t4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (t4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (t4_3 + 128 * S) + n3 * sF, f4_3); }
                 { int q = (r0 + 5) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f5_0 += s * (d0 * (t5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (t5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (t5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (t5_3 + 128 * S) + n3 * sF); }
+                  f5_0 = float.MultiplyAddEstimate(s, d0 * (t5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (t5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (t5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (t5_3 + 128 * S) + n3 * sF, f5_3); }
                 { int q = (r0 + 6) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f6_0 += s * (d0 * (t6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (t6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (t6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (t6_3 + 128 * S) + n3 * sF); }
+                  f6_0 = float.MultiplyAddEstimate(s, d0 * (t6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (t6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (t6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (t6_3 + 128 * S) + n3 * sF, f6_3); }
                 { int q = (r0 + 7) * 2 + 0; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f7_0 += s * (d0 * (t7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (t7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (t7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (t7_3 + 128 * S) + n3 * sF); }
+                  f7_0 = float.MultiplyAddEstimate(s, d0 * (t7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (t7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (t7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (t7_3 + 128 * S) + n3 * sF, f7_3); }
             }
             {
                 int e0 = sE[(r0 + 0) * 2 + 1], e1 = sE[(r0 + 1) * 2 + 1], e2 = sE[(r0 + 2) * 2 + 1], e3 = sE[(r0 + 3) * 2 + 1], e4 = sE[(r0 + 4) * 2 + 1], e5 = sE[(r0 + 5) * 2 + 1], e6 = sE[(r0 + 6) * 2 + 1], e7 = sE[(r0 + 7) * 2 + 1];
@@ -1352,21 +1352,21 @@ internal static class Q8Gemm
                 uint h0 = sh[(c0 + 0) * 2 + 1], h1 = sh[(c0 + 1) * 2 + 1], h2 = sh[(c0 + 2) * 2 + 1], h3 = sh[(c0 + 3) * 2 + 1];
                 float d0 = HalfToFloat(h0 & 0xFFFFu), n0 = HalfToFloat(h0 >> 16), d1 = HalfToFloat(h1 & 0xFFFFu), n1 = HalfToFloat(h1 >> 16), d2 = HalfToFloat(h2 & 0xFFFFu), n2 = HalfToFloat(h2 >> 16), d3 = HalfToFloat(h3 & 0xFFFFu), n3 = HalfToFloat(h3 >> 16);
                 { int q = (r0 + 0) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f0_0 += s * (d0 * (t0_0 + 128 * S) + n0 * sF); f0_1 += s * (d1 * (t0_1 + 128 * S) + n1 * sF); f0_2 += s * (d2 * (t0_2 + 128 * S) + n2 * sF); f0_3 += s * (d3 * (t0_3 + 128 * S) + n3 * sF); }
+                  f0_0 = float.MultiplyAddEstimate(s, d0 * (t0_0 + 128 * S) + n0 * sF, f0_0); f0_1 = float.MultiplyAddEstimate(s, d1 * (t0_1 + 128 * S) + n1 * sF, f0_1); f0_2 = float.MultiplyAddEstimate(s, d2 * (t0_2 + 128 * S) + n2 * sF, f0_2); f0_3 = float.MultiplyAddEstimate(s, d3 * (t0_3 + 128 * S) + n3 * sF, f0_3); }
                 { int q = (r0 + 1) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f1_0 += s * (d0 * (t1_0 + 128 * S) + n0 * sF); f1_1 += s * (d1 * (t1_1 + 128 * S) + n1 * sF); f1_2 += s * (d2 * (t1_2 + 128 * S) + n2 * sF); f1_3 += s * (d3 * (t1_3 + 128 * S) + n3 * sF); }
+                  f1_0 = float.MultiplyAddEstimate(s, d0 * (t1_0 + 128 * S) + n0 * sF, f1_0); f1_1 = float.MultiplyAddEstimate(s, d1 * (t1_1 + 128 * S) + n1 * sF, f1_1); f1_2 = float.MultiplyAddEstimate(s, d2 * (t1_2 + 128 * S) + n2 * sF, f1_2); f1_3 = float.MultiplyAddEstimate(s, d3 * (t1_3 + 128 * S) + n3 * sF, f1_3); }
                 { int q = (r0 + 2) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f2_0 += s * (d0 * (t2_0 + 128 * S) + n0 * sF); f2_1 += s * (d1 * (t2_1 + 128 * S) + n1 * sF); f2_2 += s * (d2 * (t2_2 + 128 * S) + n2 * sF); f2_3 += s * (d3 * (t2_3 + 128 * S) + n3 * sF); }
+                  f2_0 = float.MultiplyAddEstimate(s, d0 * (t2_0 + 128 * S) + n0 * sF, f2_0); f2_1 = float.MultiplyAddEstimate(s, d1 * (t2_1 + 128 * S) + n1 * sF, f2_1); f2_2 = float.MultiplyAddEstimate(s, d2 * (t2_2 + 128 * S) + n2 * sF, f2_2); f2_3 = float.MultiplyAddEstimate(s, d3 * (t2_3 + 128 * S) + n3 * sF, f2_3); }
                 { int q = (r0 + 3) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f3_0 += s * (d0 * (t3_0 + 128 * S) + n0 * sF); f3_1 += s * (d1 * (t3_1 + 128 * S) + n1 * sF); f3_2 += s * (d2 * (t3_2 + 128 * S) + n2 * sF); f3_3 += s * (d3 * (t3_3 + 128 * S) + n3 * sF); }
+                  f3_0 = float.MultiplyAddEstimate(s, d0 * (t3_0 + 128 * S) + n0 * sF, f3_0); f3_1 = float.MultiplyAddEstimate(s, d1 * (t3_1 + 128 * S) + n1 * sF, f3_1); f3_2 = float.MultiplyAddEstimate(s, d2 * (t3_2 + 128 * S) + n2 * sF, f3_2); f3_3 = float.MultiplyAddEstimate(s, d3 * (t3_3 + 128 * S) + n3 * sF, f3_3); }
                 { int q = (r0 + 4) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f4_0 += s * (d0 * (t4_0 + 128 * S) + n0 * sF); f4_1 += s * (d1 * (t4_1 + 128 * S) + n1 * sF); f4_2 += s * (d2 * (t4_2 + 128 * S) + n2 * sF); f4_3 += s * (d3 * (t4_3 + 128 * S) + n3 * sF); }
+                  f4_0 = float.MultiplyAddEstimate(s, d0 * (t4_0 + 128 * S) + n0 * sF, f4_0); f4_1 = float.MultiplyAddEstimate(s, d1 * (t4_1 + 128 * S) + n1 * sF, f4_1); f4_2 = float.MultiplyAddEstimate(s, d2 * (t4_2 + 128 * S) + n2 * sF, f4_2); f4_3 = float.MultiplyAddEstimate(s, d3 * (t4_3 + 128 * S) + n3 * sF, f4_3); }
                 { int q = (r0 + 5) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f5_0 += s * (d0 * (t5_0 + 128 * S) + n0 * sF); f5_1 += s * (d1 * (t5_1 + 128 * S) + n1 * sF); f5_2 += s * (d2 * (t5_2 + 128 * S) + n2 * sF); f5_3 += s * (d3 * (t5_3 + 128 * S) + n3 * sF); }
+                  f5_0 = float.MultiplyAddEstimate(s, d0 * (t5_0 + 128 * S) + n0 * sF, f5_0); f5_1 = float.MultiplyAddEstimate(s, d1 * (t5_1 + 128 * S) + n1 * sF, f5_1); f5_2 = float.MultiplyAddEstimate(s, d2 * (t5_2 + 128 * S) + n2 * sF, f5_2); f5_3 = float.MultiplyAddEstimate(s, d3 * (t5_3 + 128 * S) + n3 * sF, f5_3); }
                 { int q = (r0 + 6) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f6_0 += s * (d0 * (t6_0 + 128 * S) + n0 * sF); f6_1 += s * (d1 * (t6_1 + 128 * S) + n1 * sF); f6_2 += s * (d2 * (t6_2 + 128 * S) + n2 * sF); f6_3 += s * (d3 * (t6_3 + 128 * S) + n3 * sF); }
+                  f6_0 = float.MultiplyAddEstimate(s, d0 * (t6_0 + 128 * S) + n0 * sF, f6_0); f6_1 = float.MultiplyAddEstimate(s, d1 * (t6_1 + 128 * S) + n1 * sF, f6_1); f6_2 = float.MultiplyAddEstimate(s, d2 * (t6_2 + 128 * S) + n2 * sF, f6_2); f6_3 = float.MultiplyAddEstimate(s, d3 * (t6_3 + 128 * S) + n3 * sF, f6_3); }
                 { int q = (r0 + 7) * 2 + 1; float s = ss[q]; int S = sS[q]; float sF = S;
-                  f7_0 += s * (d0 * (t7_0 + 128 * S) + n0 * sF); f7_1 += s * (d1 * (t7_1 + 128 * S) + n1 * sF); f7_2 += s * (d2 * (t7_2 + 128 * S) + n2 * sF); f7_3 += s * (d3 * (t7_3 + 128 * S) + n3 * sF); }
+                  f7_0 = float.MultiplyAddEstimate(s, d0 * (t7_0 + 128 * S) + n0 * sF, f7_0); f7_1 = float.MultiplyAddEstimate(s, d1 * (t7_1 + 128 * S) + n1 * sF, f7_1); f7_2 = float.MultiplyAddEstimate(s, d2 * (t7_2 + 128 * S) + n2 * sF, f7_2); f7_3 = float.MultiplyAddEstimate(s, d3 * (t7_3 + 128 * S) + n3 * sF, f7_3); }
             }
             Group.Barrier();
         }

@@ -140,10 +140,10 @@ public class Vec4LoadMatMul
                 float b1 = bTile[k * TILE + threadCol * REG + 1];
                 float b2 = bTile[k * TILE + threadCol * REG + 2];
                 float b3 = bTile[k * TILE + threadCol * REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
 
             Group.Barrier();
@@ -216,10 +216,10 @@ public class Vec4LoadMatMul
                 float b1 = bTile[k * TILE + threadCol * REG + 1];
                 float b2 = bTile[k * TILE + threadCol * REG + 2];
                 float b3 = bTile[k * TILE + threadCol * REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
 
             Group.Barrier();

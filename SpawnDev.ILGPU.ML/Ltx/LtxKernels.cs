@@ -27,7 +27,7 @@ public sealed class LtxKernels
         long b = (long)row * C;
         var sh = SharedMemory.Allocate<float>(NormGroup);
         float s = 0f;
-        for (int c = t; c < C; c += NormGroup) { float v = x[b + c]; s += v * v; }
+        for (int c = t; c < C; c += NormGroup) { float v = x[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         sh[t] = s;
         Group.Barrier();
         for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
@@ -43,7 +43,7 @@ public sealed class LtxKernels
     {
         long b = (long)(int)row * C;
         float s = 0f;
-        for (int c = 0; c < C; c++) { float v = x[b + c]; s += v * v; }
+        for (int c = 0; c < C; c++) { float v = x[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         float inv = 1f / MathF.Sqrt(s / C + eps);
         for (int c = 0; c < C; c++)
         {
@@ -114,7 +114,7 @@ public sealed class LtxKernels
 
     // x[i] += dt * v[i]   (the flow-matching Euler step, on the device)
     private Action<Index1D, FV, FV, float>? _axpy;
-    private static void AxpyImpl(Index1D i, FV x, FV v, float dt) => x[i] += dt * v[i];
+    private static void AxpyImpl(Index1D i, FV x, FV v, float dt) => x[i] = float.MultiplyAddEstimate(dt, v[i], x[i]);
     public void Axpy(FV x, FV v, float dt, int count)
     {
         _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);

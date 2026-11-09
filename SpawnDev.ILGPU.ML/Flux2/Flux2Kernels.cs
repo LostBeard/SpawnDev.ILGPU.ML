@@ -29,7 +29,7 @@ public sealed class Flux2Kernels
         {
             float acc = 0f;
             long qo = (long)t * rowStride + h * D, ko = (long)j * kvCols + (h / rep) * D;
-            for (int d = 0; d < D; d++) acc += qkv[qo + d] * kc[ko + d];
+            for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(qkv[qo + d], kc[ko + d], acc);
             s = acc * scale;
         }
         scores[i] = s;
@@ -51,7 +51,7 @@ public sealed class Flux2Kernels
         int C = H * D, t = i / C, c = i % C, h = c / D, d = c % D, kvCols = C / rep;
         long so = ((long)h * T + t) * T;
         float acc = 0f;
-        for (int j = 0; j < T; j++) acc += scores[so + j] * vc[(long)j * kvCols + (h / rep) * D + d];
+        for (int j = 0; j < T; j++) acc = float.MultiplyAddEstimate(scores[so + j], vc[(long)j * kvCols + (h / rep) * D + d], acc);
         o[i] = acc;
     }
 
@@ -231,7 +231,7 @@ public sealed class Flux2Kernels
     // ───────────────────────────────────────────── the denoising loop and the VAE glue, on the device ──────────────
 
     private Action<Index1D, FV, FV, float>? _euler;
-    private static void EulerImpl(Index1D k, FV lat, FV pred, float dt) { lat[k] += dt * pred[k]; }
+    private static void EulerImpl(Index1D k, FV lat, FV pred, float dt) { lat[k] = float.MultiplyAddEstimate(dt, pred[k], lat[k]); }
     /// <summary>lat += dt * pred for the first <paramref name="count"/> elements: one Euler step of the flow, in place.</summary>
     public void Euler(FV lat, FV pred, float dt, int count)
     {
@@ -299,9 +299,9 @@ public sealed class Flux2Kernels
         long o = (long)(py0 + y) * width + px0 + x, plane = (long)height * width, tp = (long)tilePx * tilePx;
         long t0 = (long)y * tilePx + x;
         wsum[o] += w;
-        sum[o] += w * tile[t0];
-        sum[plane + o] += w * tile[tp + t0];
-        sum[2 * plane + o] += w * tile[2 * tp + t0];
+        sum[o] = float.MultiplyAddEstimate(w, tile[t0], sum[o]);
+        sum[plane + o] = float.MultiplyAddEstimate(w, tile[tp + t0], sum[plane + o]);
+        sum[2 * plane + o] = float.MultiplyAddEstimate(w, tile[2 * tp + t0], sum[2 * plane + o]);
     }
     /// <summary>
     /// Adds a decoded tile [3, tilePx, tilePx] at (py0, px0) into the weighted sums of the picture: each pixel's weight is a linear ramp over <paramref name="ramp"/> pixels at every side that has a neighbour

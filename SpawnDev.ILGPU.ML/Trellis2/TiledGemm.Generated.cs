@@ -120,14 +120,14 @@ internal static class TiledGemm
                     float b5 = Bs[bb + 80];
                     float b6 = Bs[bb + 96];
                     float b7 = Bs[bb + 112];
-                    c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3; c04 += a0 * b4; c05 += a0 * b5; c06 += a0 * b6; c07 += a0 * b7;
-                    c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3; c14 += a1 * b4; c15 += a1 * b5; c16 += a1 * b6; c17 += a1 * b7;
-                    c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3; c24 += a2 * b4; c25 += a2 * b5; c26 += a2 * b6; c27 += a2 * b7;
-                    c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3; c34 += a3 * b4; c35 += a3 * b5; c36 += a3 * b6; c37 += a3 * b7;
-                    c40 += a4 * b0; c41 += a4 * b1; c42 += a4 * b2; c43 += a4 * b3; c44 += a4 * b4; c45 += a4 * b5; c46 += a4 * b6; c47 += a4 * b7;
-                    c50 += a5 * b0; c51 += a5 * b1; c52 += a5 * b2; c53 += a5 * b3; c54 += a5 * b4; c55 += a5 * b5; c56 += a5 * b6; c57 += a5 * b7;
-                    c60 += a6 * b0; c61 += a6 * b1; c62 += a6 * b2; c63 += a6 * b3; c64 += a6 * b4; c65 += a6 * b5; c66 += a6 * b6; c67 += a6 * b7;
-                    c70 += a7 * b0; c71 += a7 * b1; c72 += a7 * b2; c73 += a7 * b3; c74 += a7 * b4; c75 += a7 * b5; c76 += a7 * b6; c77 += a7 * b7;
+                    c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03); c04 = float.MultiplyAddEstimate(a0, b4, c04); c05 = float.MultiplyAddEstimate(a0, b5, c05); c06 = float.MultiplyAddEstimate(a0, b6, c06); c07 = float.MultiplyAddEstimate(a0, b7, c07);
+                    c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13); c14 = float.MultiplyAddEstimate(a1, b4, c14); c15 = float.MultiplyAddEstimate(a1, b5, c15); c16 = float.MultiplyAddEstimate(a1, b6, c16); c17 = float.MultiplyAddEstimate(a1, b7, c17);
+                    c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23); c24 = float.MultiplyAddEstimate(a2, b4, c24); c25 = float.MultiplyAddEstimate(a2, b5, c25); c26 = float.MultiplyAddEstimate(a2, b6, c26); c27 = float.MultiplyAddEstimate(a2, b7, c27);
+                    c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33); c34 = float.MultiplyAddEstimate(a3, b4, c34); c35 = float.MultiplyAddEstimate(a3, b5, c35); c36 = float.MultiplyAddEstimate(a3, b6, c36); c37 = float.MultiplyAddEstimate(a3, b7, c37);
+                    c40 = float.MultiplyAddEstimate(a4, b0, c40); c41 = float.MultiplyAddEstimate(a4, b1, c41); c42 = float.MultiplyAddEstimate(a4, b2, c42); c43 = float.MultiplyAddEstimate(a4, b3, c43); c44 = float.MultiplyAddEstimate(a4, b4, c44); c45 = float.MultiplyAddEstimate(a4, b5, c45); c46 = float.MultiplyAddEstimate(a4, b6, c46); c47 = float.MultiplyAddEstimate(a4, b7, c47);
+                    c50 = float.MultiplyAddEstimate(a5, b0, c50); c51 = float.MultiplyAddEstimate(a5, b1, c51); c52 = float.MultiplyAddEstimate(a5, b2, c52); c53 = float.MultiplyAddEstimate(a5, b3, c53); c54 = float.MultiplyAddEstimate(a5, b4, c54); c55 = float.MultiplyAddEstimate(a5, b5, c55); c56 = float.MultiplyAddEstimate(a5, b6, c56); c57 = float.MultiplyAddEstimate(a5, b7, c57);
+                    c60 = float.MultiplyAddEstimate(a6, b0, c60); c61 = float.MultiplyAddEstimate(a6, b1, c61); c62 = float.MultiplyAddEstimate(a6, b2, c62); c63 = float.MultiplyAddEstimate(a6, b3, c63); c64 = float.MultiplyAddEstimate(a6, b4, c64); c65 = float.MultiplyAddEstimate(a6, b5, c65); c66 = float.MultiplyAddEstimate(a6, b6, c66); c67 = float.MultiplyAddEstimate(a6, b7, c67);
+                    c70 = float.MultiplyAddEstimate(a7, b0, c70); c71 = float.MultiplyAddEstimate(a7, b1, c71); c72 = float.MultiplyAddEstimate(a7, b2, c72); c73 = float.MultiplyAddEstimate(a7, b3, c73); c74 = float.MultiplyAddEstimate(a7, b4, c74); c75 = float.MultiplyAddEstimate(a7, b5, c75); c76 = float.MultiplyAddEstimate(a7, b6, c76); c77 = float.MultiplyAddEstimate(a7, b7, c77);
                 }
                 Group.Barrier();
             }
@@ -178,14 +178,14 @@ internal static class TiledGemm
                     float b5 = Bs[bb + 80];
                     float b6 = Bs[bb + 96];
                     float b7 = Bs[bb + 112];
-                    c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3; c04 += a0 * b4; c05 += a0 * b5; c06 += a0 * b6; c07 += a0 * b7;
-                    c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3; c14 += a1 * b4; c15 += a1 * b5; c16 += a1 * b6; c17 += a1 * b7;
-                    c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3; c24 += a2 * b4; c25 += a2 * b5; c26 += a2 * b6; c27 += a2 * b7;
-                    c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3; c34 += a3 * b4; c35 += a3 * b5; c36 += a3 * b6; c37 += a3 * b7;
-                    c40 += a4 * b0; c41 += a4 * b1; c42 += a4 * b2; c43 += a4 * b3; c44 += a4 * b4; c45 += a4 * b5; c46 += a4 * b6; c47 += a4 * b7;
-                    c50 += a5 * b0; c51 += a5 * b1; c52 += a5 * b2; c53 += a5 * b3; c54 += a5 * b4; c55 += a5 * b5; c56 += a5 * b6; c57 += a5 * b7;
-                    c60 += a6 * b0; c61 += a6 * b1; c62 += a6 * b2; c63 += a6 * b3; c64 += a6 * b4; c65 += a6 * b5; c66 += a6 * b6; c67 += a6 * b7;
-                    c70 += a7 * b0; c71 += a7 * b1; c72 += a7 * b2; c73 += a7 * b3; c74 += a7 * b4; c75 += a7 * b5; c76 += a7 * b6; c77 += a7 * b7;
+                    c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03); c04 = float.MultiplyAddEstimate(a0, b4, c04); c05 = float.MultiplyAddEstimate(a0, b5, c05); c06 = float.MultiplyAddEstimate(a0, b6, c06); c07 = float.MultiplyAddEstimate(a0, b7, c07);
+                    c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13); c14 = float.MultiplyAddEstimate(a1, b4, c14); c15 = float.MultiplyAddEstimate(a1, b5, c15); c16 = float.MultiplyAddEstimate(a1, b6, c16); c17 = float.MultiplyAddEstimate(a1, b7, c17);
+                    c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23); c24 = float.MultiplyAddEstimate(a2, b4, c24); c25 = float.MultiplyAddEstimate(a2, b5, c25); c26 = float.MultiplyAddEstimate(a2, b6, c26); c27 = float.MultiplyAddEstimate(a2, b7, c27);
+                    c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33); c34 = float.MultiplyAddEstimate(a3, b4, c34); c35 = float.MultiplyAddEstimate(a3, b5, c35); c36 = float.MultiplyAddEstimate(a3, b6, c36); c37 = float.MultiplyAddEstimate(a3, b7, c37);
+                    c40 = float.MultiplyAddEstimate(a4, b0, c40); c41 = float.MultiplyAddEstimate(a4, b1, c41); c42 = float.MultiplyAddEstimate(a4, b2, c42); c43 = float.MultiplyAddEstimate(a4, b3, c43); c44 = float.MultiplyAddEstimate(a4, b4, c44); c45 = float.MultiplyAddEstimate(a4, b5, c45); c46 = float.MultiplyAddEstimate(a4, b6, c46); c47 = float.MultiplyAddEstimate(a4, b7, c47);
+                    c50 = float.MultiplyAddEstimate(a5, b0, c50); c51 = float.MultiplyAddEstimate(a5, b1, c51); c52 = float.MultiplyAddEstimate(a5, b2, c52); c53 = float.MultiplyAddEstimate(a5, b3, c53); c54 = float.MultiplyAddEstimate(a5, b4, c54); c55 = float.MultiplyAddEstimate(a5, b5, c55); c56 = float.MultiplyAddEstimate(a5, b6, c56); c57 = float.MultiplyAddEstimate(a5, b7, c57);
+                    c60 = float.MultiplyAddEstimate(a6, b0, c60); c61 = float.MultiplyAddEstimate(a6, b1, c61); c62 = float.MultiplyAddEstimate(a6, b2, c62); c63 = float.MultiplyAddEstimate(a6, b3, c63); c64 = float.MultiplyAddEstimate(a6, b4, c64); c65 = float.MultiplyAddEstimate(a6, b5, c65); c66 = float.MultiplyAddEstimate(a6, b6, c66); c67 = float.MultiplyAddEstimate(a6, b7, c67);
+                    c70 = float.MultiplyAddEstimate(a7, b0, c70); c71 = float.MultiplyAddEstimate(a7, b1, c71); c72 = float.MultiplyAddEstimate(a7, b2, c72); c73 = float.MultiplyAddEstimate(a7, b3, c73); c74 = float.MultiplyAddEstimate(a7, b4, c74); c75 = float.MultiplyAddEstimate(a7, b5, c75); c76 = float.MultiplyAddEstimate(a7, b6, c76); c77 = float.MultiplyAddEstimate(a7, b7, c77);
                 }
                 Group.Barrier();
             }
@@ -236,14 +236,14 @@ internal static class TiledGemm
                     float b5 = Bs[bb + 80];
                     float b6 = Bs[bb + 96];
                     float b7 = Bs[bb + 112];
-                    c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3; c04 += a0 * b4; c05 += a0 * b5; c06 += a0 * b6; c07 += a0 * b7;
-                    c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3; c14 += a1 * b4; c15 += a1 * b5; c16 += a1 * b6; c17 += a1 * b7;
-                    c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3; c24 += a2 * b4; c25 += a2 * b5; c26 += a2 * b6; c27 += a2 * b7;
-                    c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3; c34 += a3 * b4; c35 += a3 * b5; c36 += a3 * b6; c37 += a3 * b7;
-                    c40 += a4 * b0; c41 += a4 * b1; c42 += a4 * b2; c43 += a4 * b3; c44 += a4 * b4; c45 += a4 * b5; c46 += a4 * b6; c47 += a4 * b7;
-                    c50 += a5 * b0; c51 += a5 * b1; c52 += a5 * b2; c53 += a5 * b3; c54 += a5 * b4; c55 += a5 * b5; c56 += a5 * b6; c57 += a5 * b7;
-                    c60 += a6 * b0; c61 += a6 * b1; c62 += a6 * b2; c63 += a6 * b3; c64 += a6 * b4; c65 += a6 * b5; c66 += a6 * b6; c67 += a6 * b7;
-                    c70 += a7 * b0; c71 += a7 * b1; c72 += a7 * b2; c73 += a7 * b3; c74 += a7 * b4; c75 += a7 * b5; c76 += a7 * b6; c77 += a7 * b7;
+                    c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03); c04 = float.MultiplyAddEstimate(a0, b4, c04); c05 = float.MultiplyAddEstimate(a0, b5, c05); c06 = float.MultiplyAddEstimate(a0, b6, c06); c07 = float.MultiplyAddEstimate(a0, b7, c07);
+                    c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13); c14 = float.MultiplyAddEstimate(a1, b4, c14); c15 = float.MultiplyAddEstimate(a1, b5, c15); c16 = float.MultiplyAddEstimate(a1, b6, c16); c17 = float.MultiplyAddEstimate(a1, b7, c17);
+                    c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23); c24 = float.MultiplyAddEstimate(a2, b4, c24); c25 = float.MultiplyAddEstimate(a2, b5, c25); c26 = float.MultiplyAddEstimate(a2, b6, c26); c27 = float.MultiplyAddEstimate(a2, b7, c27);
+                    c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33); c34 = float.MultiplyAddEstimate(a3, b4, c34); c35 = float.MultiplyAddEstimate(a3, b5, c35); c36 = float.MultiplyAddEstimate(a3, b6, c36); c37 = float.MultiplyAddEstimate(a3, b7, c37);
+                    c40 = float.MultiplyAddEstimate(a4, b0, c40); c41 = float.MultiplyAddEstimate(a4, b1, c41); c42 = float.MultiplyAddEstimate(a4, b2, c42); c43 = float.MultiplyAddEstimate(a4, b3, c43); c44 = float.MultiplyAddEstimate(a4, b4, c44); c45 = float.MultiplyAddEstimate(a4, b5, c45); c46 = float.MultiplyAddEstimate(a4, b6, c46); c47 = float.MultiplyAddEstimate(a4, b7, c47);
+                    c50 = float.MultiplyAddEstimate(a5, b0, c50); c51 = float.MultiplyAddEstimate(a5, b1, c51); c52 = float.MultiplyAddEstimate(a5, b2, c52); c53 = float.MultiplyAddEstimate(a5, b3, c53); c54 = float.MultiplyAddEstimate(a5, b4, c54); c55 = float.MultiplyAddEstimate(a5, b5, c55); c56 = float.MultiplyAddEstimate(a5, b6, c56); c57 = float.MultiplyAddEstimate(a5, b7, c57);
+                    c60 = float.MultiplyAddEstimate(a6, b0, c60); c61 = float.MultiplyAddEstimate(a6, b1, c61); c62 = float.MultiplyAddEstimate(a6, b2, c62); c63 = float.MultiplyAddEstimate(a6, b3, c63); c64 = float.MultiplyAddEstimate(a6, b4, c64); c65 = float.MultiplyAddEstimate(a6, b5, c65); c66 = float.MultiplyAddEstimate(a6, b6, c66); c67 = float.MultiplyAddEstimate(a6, b7, c67);
+                    c70 = float.MultiplyAddEstimate(a7, b0, c70); c71 = float.MultiplyAddEstimate(a7, b1, c71); c72 = float.MultiplyAddEstimate(a7, b2, c72); c73 = float.MultiplyAddEstimate(a7, b3, c73); c74 = float.MultiplyAddEstimate(a7, b4, c74); c75 = float.MultiplyAddEstimate(a7, b5, c75); c76 = float.MultiplyAddEstimate(a7, b6, c76); c77 = float.MultiplyAddEstimate(a7, b7, c77);
                 }
                 Group.Barrier();
             }

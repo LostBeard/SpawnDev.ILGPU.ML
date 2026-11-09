@@ -50,7 +50,7 @@ public class QKNormKernel
         int offset = vecIdx * D;
         float sumSq = 0f;
         for (int i = 0; i < D; i++)
-            sumSq += data[offset + i] * data[offset + i];
+            sumSq = float.MultiplyAddEstimate(data[offset + i], data[offset + i], sumSq);
         float invNorm = 1f / MathF.Sqrt(sumSq + 1e-12f);
         output[idx] = data[idx] * invNorm;
     }

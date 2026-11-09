@@ -95,7 +95,7 @@ public class TurboQuantKernels : IDisposable
         int offset = vecIdx * d;
         float sumSq = 0f;
         for (int i = 0; i < d; i++)
-            sumSq += input[offset + i] * input[offset + i];
+            sumSq = float.MultiplyAddEstimate(input[offset + i], input[offset + i], sumSq);
         norms[vecIdx] = MathF.Sqrt(sumSq);
     }
 
@@ -475,7 +475,7 @@ public class TurboQuantKernels : IDisposable
                 {
                     int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[cIdx] * kNorm;
-                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
+                    dot = float.MultiplyAddEstimate(Q[queryIdx * D + p * valuesPerInt + b], kVal, dot);
                 }
             }
             float score = dot * scale;
@@ -500,7 +500,7 @@ public class TurboQuantKernels : IDisposable
                 {
                     int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[cIdx] * kNorm;
-                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
+                    dot = float.MultiplyAddEstimate(Q[queryIdx * D + p * valuesPerInt + b], kVal, dot);
                 }
             }
             float weight = MathF.Exp(dot * scale - maxScore);
@@ -508,7 +508,7 @@ public class TurboQuantKernels : IDisposable
 
             // This element's V contribution only (dequantize one value in-register)
             int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
-            acc += weight * V_codebook[vIdx] * V_norms[kv];
+            acc = float.MultiplyAddEstimate(weight * V_codebook[vIdx], V_norms[kv], acc);
         }
 
         // Single static store — the only output write in the kernel
@@ -630,7 +630,7 @@ public class TurboQuantKernels : IDisposable
                 {
                     int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[cIdx] * kNorm;
-                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
+                    dot = float.MultiplyAddEstimate(Q[queryIdx * D + p * valuesPerInt + b], kVal, dot);
                 }
             }
             float score = dot * scale;
@@ -647,7 +647,7 @@ public class TurboQuantKernels : IDisposable
 
             // ── This element's V contribution (fused dequant, one value) ──
             int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
-            acc += weight * V_codebook[vIdx] * V_norms[kv];
+            acc = float.MultiplyAddEstimate(weight * V_codebook[vIdx], V_norms[kv], acc);
         }
 
         // Single static store — the only output write in the kernel

@@ -206,24 +206,33 @@ public partial class MLTestBase
     /// Slice node also exercises the GGUF graph's last-position path on every backend.
     /// </summary>
     [TestMethod]
-    public async Task GGUFLastPositionLogits_MatchesFullLastPosition() => await RunTest(async accelerator =>
+    public async Task<string> GGUFLastPositionLogits_MatchesFullLastPosition() => await RunTest(async accelerator =>
     {
         // the SIMT GEMM route (see PinSimtGemm): this test is not about the f16 tensor-core GEMM
         using var _simt = PinSimtGemm();
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
         var bytes = BuildTinyQuantizedLlamaGGUF(embd, vocab, ffn, ctx, new Random(7));
         var seq = new float[] { 3, 9, 21, 5 };
+        // Phase timings in the report (results JSON): the model is tiny, so this test's wall time is session creation +
+        // kernel compile. 2026-11-08 it went 2.0 -> 5.5 s on CUDA / OpenCL and 3.3 -> 15.1 s on Velocity between ML on
+        // SpawnDev.ILGPU 5.4.17 and 5.4.18; "full#2" re-runs the full graph with every kernel already compiled, so
+        // full#1 - full#2 is the compile cost.
+        var timings = new List<string>();
 
-        async Task<float[]> LastLogits(bool lastPosOnly)
+        async Task<float[]> LastLogits(bool lastPosOnly, string tag)
         {
             bool saved = GGUFGraphBuilder.EnableLastPositionLogits;
             try
             {
                 GGUFGraphBuilder.EnableLastPositionLogits = lastPosOnly;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 using var session = InferenceSession.CreateFromGGUF(accelerator, bytes);
+                double createMs = sw.Elapsed.TotalMilliseconds;
                 using var inBuf = accelerator.Allocate1D(seq);
                 var outputs = await session.RunAsync(new Dictionary<string, Tensor>
                 { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, seq.Length }, "input_ids") });
+                await accelerator.SynchronizeAsync();
+                timings.Add($"{tag} create {createMs:F0} ms run {sw.Elapsed.TotalMilliseconds - createMs:F0} ms");
                 var lt = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
                 int outSeq = lt.ElementCount / vocab;
                 if (lastPosOnly && outSeq != 1)
@@ -236,8 +245,12 @@ public partial class MLTestBase
             finally { GGUFGraphBuilder.EnableLastPositionLogits = saved; }
         }
 
-        var full = await LastLogits(lastPosOnly: false); // all positions, take the last
-        var sliced = await LastLogits(lastPosOnly: true); // [1,1,vocab]
+        var full = await LastLogits(lastPosOnly: false, "full#1"); // all positions, take the last
+        var full2 = await LastLogits(lastPosOnly: false, "full#2"); // same graph again: kernels compiled
+        var sliced = await LastLogits(lastPosOnly: true, "sliced"); // [1,1,vocab]
+        for (int v = 0; v < vocab; v++)
+            if (full2[v] != full[v])
+                throw new Exception($"GGUFLastPositionLogits: the same full graph run twice differs at logit {v}: {full[v]} vs {full2[v]}");
 
         int argFull = 0, argSliced = 0;
         for (int v = 1; v < vocab; v++)
@@ -253,5 +266,6 @@ public partial class MLTestBase
         Console.WriteLine($"[GGUFLastPos] sliced last-position logits vs full[last]: argmax={argSliced}, maxErr={maxErr:E3}");
         if (maxErr > 1e-2f)
             throw new Exception($"GGUFLastPositionLogits maxErr={maxErr:E3} > 1e-2 — sliced last position differs from full-recompute last position");
+        return $"argmax {argSliced}, maxErr {maxErr:E3}; " + string.Join("; ", timings);
     });
 }

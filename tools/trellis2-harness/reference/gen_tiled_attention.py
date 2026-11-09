@@ -22,6 +22,17 @@ QPG = TH // P      # 64 queries per group
 out = []
 w = out.append
 
+
+def mac_chain(pairs, seed=None):
+    """sum of products as float.MultiplyAddEstimate links, left to right: the chain FP contraction builds
+    (fma(x2, y2, fma(x1, y1, x0 * y0))). Explicit, so the kernel is as fast on a context built without
+    EnableFloatingPointContraction (SpawnDev.ILGPU 5.4.18 made CUDA / OpenCL strict by default)."""
+    acc = seed
+    for x, y in pairs:
+        acc = f"{x} * {y}" if acc is None else f"float.MultiplyAddEstimate({x}, {y}, {acc})"
+    return acc
+
+
 import os
 # Shuffle variant shape: SP lanes share a query, each thread owns SQT queries (every shared K/V load is reused SQT times; a query costs
 # log2(SP) shuffles per key). ATT_CFG="P,QT,BKT128,BKT64" overrides for experiments.
@@ -74,7 +85,7 @@ def kernel_shuffle(D, self_attn):
     for j in range(BKT):
         w("            { " + " ".join(f"float k{t} = ks[{j * D + P_ * t} + p];" for t in range(DT)))
         for r in range(QT):
-            w(f"              s{r}_{j} = " + " + ".join(f"q{r}_{t} * k{t}" for t in range(DT)) + ";")
+            w(f"              s{r}_{j} = " + mac_chain((f"q{r}_{t}", f"k{t}") for t in range(DT)) + ";")
             for st in range(lg):
                 w(f"              s{r}_{j} += Warp.ShuffleXor(s{r}_{j}, {1 << st});")
             w(f"              if (kb + {j} >= Nk) s{r}_{j} = -1e30f;")
@@ -93,7 +104,7 @@ def kernel_shuffle(D, self_attn):
     for j in range(BKT):
         w("            { " + " ".join(f"float v{t} = vs[{j * D + P_ * t} + p];" for t in range(DT)))
         for r in range(QT):
-            w("              " + " ".join(f"o{r}_{t} += p{r}_{j} * v{t};" for t in range(DT)))
+            w("              " + " ".join(f"o{r}_{t} = float.MultiplyAddEstimate(p{r}_{j}, v{t}, o{r}_{t});" for t in range(DT)))
         w("            }")
     w("            Group.Barrier();")
     w("        }")
@@ -150,7 +161,7 @@ def kernel(D, self_attn, shuffle):
     w("            Group.Barrier();")
     # scores
     for j in range(BKT):
-        terms = " + ".join(f"q{t} * ks[{j * D} + {P * t} + p]" for t in range(DT))
+        terms = mac_chain((f"q{t}", f"ks[{j * D} + {P * t} + p]") for t in range(DT))
         w(f"            float s{j} = {terms};")
         if shuffle:
             w(f"            s{j} += Warp.ShuffleXor(s{j}, 1); s{j} += Warp.ShuffleXor(s{j}, 2);")
@@ -172,8 +183,8 @@ def kernel(D, self_attn, shuffle):
         w(f"            float p{j} = MathF.Exp(s{j} - mn);")
     w("            l = l * corr + (" + " + ".join(f"p{j}" for j in range(BKT)) + ");")
     for t in range(DT):
-        terms = " + ".join(f"p{j} * vs[{j * D} + {P * t} + p]" for j in range(BKT))
-        w(f"            o{t} = o{t} * corr + {terms};")
+        terms = mac_chain(((f"p{j}", f"vs[{j * D} + {P * t} + p]") for j in range(BKT)), seed=f"o{t} * corr")
+        w(f"            o{t} = {terms};")
     w("            Group.Barrier();")
     w("        }")
     w("        if (ok)")

@@ -139,7 +139,7 @@ public class ConvTranspose1DKernel : IDisposable
             // ⚠️ WEIGHT IS [inC, outC/groups, kL] - the input channel leads. Conv's is [outC, inC/g, kL].
             // Transposing those two in the index is a silent, plausible-sounding wrongness.
             float weightVal = weight[ic * outCPerGroup * kL + ocLocal * kL + kx];
-            sum += inputVal * weightVal;
+            sum = float.MultiplyAddEstimate(inputVal, weightVal, sum);
         }
 
         if (bias.Length > 0) sum += bias[oc];

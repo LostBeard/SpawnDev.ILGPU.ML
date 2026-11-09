@@ -130,7 +130,7 @@ public sealed class GatedDeltaNetKernel : IDisposable
             {
                 float s = state[sBase + kk] * expG;
                 state[sBase + kk] = s;
-                kv += s * k[qkTok + kk];
+                kv = float.MultiplyAddEstimate(s, k[qkTok + kk], kv);
             }
             float delta = (v[vTok + vd] - kv) * betaT;
 
@@ -140,7 +140,7 @@ public sealed class GatedDeltaNetKernel : IDisposable
             {
                 float s = state[sBase + kk] + k[qkTok + kk] * delta;
                 state[sBase + kk] = s;
-                outAcc += s * (q[qkTok + kk] * qScale);   // q pre-scaled by 1/sqrt(head_k_dim)
+                outAcc = float.MultiplyAddEstimate(s, (q[qkTok + kk] * qScale), outAcc);   // q pre-scaled by 1/sqrt(head_k_dim)
             }
             outp[vTok + vd] = outAcc;
         }

@@ -138,7 +138,7 @@ public sealed class SparseKernels
             int src = nbr[m * 27 + kk];
             if (src < 0) continue;
             long xb = (long)src * cin, wb = ((long)n * taps + kk) * cin;
-            for (int c = 0; c < cin; c++) acc += x[xb + c] * PrecisionConvert.ConvertToSingle(w[wb + c]);
+            for (int c = 0; c < cin; c++) acc = float.MultiplyAddEstimate(x[xb + c], PrecisionConvert.ConvertToSingle(w[wb + c]), acc);
         }
         o[idx] = acc;
     }
@@ -179,7 +179,7 @@ public sealed class SparseKernels
     {
         int m = idx / N, n = idx % N;
         float acc = PrecisionConvert.ConvertToSingle(bias[n]);
-        for (int k = 0; k < K; k++) acc += x[(long)m * K + k] * PrecisionConvert.ConvertToSingle(w[(long)n * K + k]);
+        for (int k = 0; k < K; k++) acc = float.MultiplyAddEstimate(x[(long)m * K + k], PrecisionConvert.ConvertToSingle(w[(long)n * K + k]), acc);
         o[idx] = acc;
     }
 
@@ -219,7 +219,7 @@ public sealed class SparseKernels
             int src = nbr[m * 27 + kk];
             if (src < 0) continue;
             long xb = (long)src * cin, wb = ((long)n * 27 + kk) * cin;
-            for (int c = 0; c < cin; c++) acc += x[xb + c] * w[wb + c];
+            for (int c = 0; c < cin; c++) acc = float.MultiplyAddEstimate(x[xb + c], w[wb + c], acc);
         }
         o[idx] = acc;
     }
@@ -297,7 +297,7 @@ public sealed class SparseKernels
         for (int c = 0; c < C; c++) mean += x[b + c];
         mean /= C;
         float var = 0f;
-        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var += d * d; }
+        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var = float.MultiplyAddEstimate(d, d, var); }
         float rstd = 1f / MathF.Sqrt(var / C + eps);
         for (int c = 0; c < C; c++) o[b + c] = (x[b + c] - mean) * rstd * gamma[c] + beta[c];
     }
@@ -393,7 +393,7 @@ public sealed class SparseKernels
         int m = idx / N, n = idx % N;
         float acc = hasBias != 0 ? PrecisionConvert.ConvertToSingle(bias[n]) : 0f;
         long xb = (long)m * K, wb = (long)n * K;
-        for (int k = 0; k < K; k++) acc += x[xb + k] * PrecisionConvert.ConvertToSingle(w[wb + k]);
+        for (int k = 0; k < K; k++) acc = float.MultiplyAddEstimate(x[xb + k], PrecisionConvert.ConvertToSingle(w[wb + k]), acc);
         if (act == 1) acc = acc / (1f + MathF.Exp(-acc));
         if (act == 3)                                                              // exact GELU (erf), Abramowitz-Stegun 7.1.26
         {
@@ -483,7 +483,7 @@ public sealed class SparseKernels
         for (int c = 0; c < C; c++) mean += x[b + c];
         mean /= C;
         float var = 0f;
-        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var += d * d; }
+        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var = float.MultiplyAddEstimate(d, d, var); }
         float rstd = 1f / MathF.Sqrt(var / C + eps);
         for (int c = 0; c < C; c++)
         {
@@ -508,7 +508,7 @@ public sealed class SparseKernels
         float mean = sh[0] / C;
         Group.Barrier();
         float q = 0f;
-        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q += d * d; }
+        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q = float.MultiplyAddEstimate(d, d, q); }
         sh[t] = q;
         Group.Barrier();
         for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }

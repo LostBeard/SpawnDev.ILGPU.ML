@@ -103,7 +103,7 @@ def kernel(AB, KB):
             w(f"                    // sub-block -> float: s (d (dot + 128 S) + m S)")
             for i in range(TM):
                 w(f"                    {{ int q = (r0 + {i}) * {KB * NSB} + {kb * NSB + sb}; float s = ss[q]; int S = sS[q]; float sF = S;")
-                w("                      " + " ".join(f"f{i}_{j} += s * (d{j} * (a{i}_{j} + 128 * S) + n{j} * sF);" for j in range(TN)) + " }")
+                w("                      " + " ".join(f"f{i}_{j} = float.MultiplyAddEstimate(s, d{j} * (a{i}_{j} + 128 * S) + n{j} * sF, f{i}_{j});" for j in range(TN)) + " }")
             w("                }")
         w("            }")
     w("            Group.Barrier();")
@@ -183,7 +183,7 @@ def kernel_two_level(KB=2):
         w("                float " + ", ".join(f"d{j} = HalfToFloat(h{j} & 0xFFFFu), n{j} = HalfToFloat(h{j} >> 16)" for j in range(TN)) + ";")
         for i in range(TM):
             w(f"                {{ int q = (r0 + {i}) * {KB} + {kb}; float s = ss[q]; int S = sS[q]; float sF = S;")
-            w("                  " + " ".join(f"f{i}_{j} += s * (d{j} * (t{i}_{j} + 128 * S) + n{j} * sF);" for j in range(TN)) + " }")
+            w("                  " + " ".join(f"f{i}_{j} = float.MultiplyAddEstimate(s, d{j} * (t{i}_{j} + 128 * S) + n{j} * sF, f{i}_{j});" for j in range(TN)) + " }")
         w("            }")
     w("            Group.Barrier();")
     w("        }")

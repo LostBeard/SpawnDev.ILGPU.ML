@@ -236,7 +236,7 @@ public class TrainingKernels : IDisposable
         int o = idx % O;
         float sum = 0f;
         for (int i = 0; i < I; i++)
-            sum += input[b * I + i] * weight[o * I + i];
+            sum = float.MultiplyAddEstimate(input[b * I + i], weight[o * I + i], sum);
         output[idx] = sum;
     }
 
@@ -312,7 +312,7 @@ public class TrainingKernels : IDisposable
         int i = idx % I;
         float sum = 0f;
         for (int o = 0; o < O; o++)
-            sum += gradOutput[b * O + o] * weight[o * I + i];
+            sum = float.MultiplyAddEstimate(gradOutput[b * O + o], weight[o * I + i], sum);
         gradInput[idx] = sum;
     }
 
@@ -343,7 +343,7 @@ public class TrainingKernels : IDisposable
         int i = idx % I;
         float sum = 0f;
         for (int b = 0; b < B; b++)
-            sum += gradOutput[b * O + o] * input[b * I + i];
+            sum = float.MultiplyAddEstimate(gradOutput[b * O + o], input[b * I + i], sum);
         gradWeight[idx] = sum;
     }
 
@@ -370,7 +370,7 @@ public class TrainingKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> gradients,
         float lr)
     {
-        weights[idx] -= lr * gradients[idx];
+        weights[idx] = float.MultiplyAddEstimate(-lr, gradients[idx], weights[idx]);
     }
 
     /// <summary>
@@ -455,7 +455,7 @@ public class TrainingKernels : IDisposable
                 {
                     float go = gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
                     float inp = input[((b * inC + ic) * H + (oh + kh)) * W + (ow + kw)];
-                    sum += go * inp;
+                    sum = float.MultiplyAddEstimate(go, inp, sum);
                 }
         gradWeight[wIdx] = sum;
     }

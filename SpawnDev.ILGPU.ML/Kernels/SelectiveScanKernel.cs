@@ -94,7 +94,7 @@ public class SelectiveScanKernel
             {
                 h = a * h + B[baseB + k * dState + s] * x[baseX + k];
             }
-            y += C[(b * seqLen + t) * dState + s] * h;
+            y = float.MultiplyAddEstimate(C[(b * seqLen + t) * dState + s], h, y);
         }
         output[idx] = y;
     }
@@ -167,7 +167,7 @@ public class SelectiveScanKernel
                 float xVal = x[(b * seqLen + k) * dModel + dim];
                 h = a * h + B[(b * seqLen + k) * dState + s] * xVal;
             }
-            y += C[(b * seqLen + t) * dState + s] * h;
+            y = float.MultiplyAddEstimate(C[(b * seqLen + t) * dState + s], h, y);
         }
         output[idx] = y;
     }

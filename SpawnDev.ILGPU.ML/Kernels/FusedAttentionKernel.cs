@@ -605,7 +605,7 @@ public class FusedAttentionKernel : IDisposable
             int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
-                dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+                dot = float.MultiplyAddEstimate(Q[qBase + dd], PrecisionConvert.ConvertToSingle(K[kBase + dd]), dot);
             float score = dot * scale;
 
             int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
@@ -701,7 +701,7 @@ public class FusedAttentionKernel : IDisposable
             int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
-                dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+                dot = float.MultiplyAddEstimate(Q[qBase + dd], PrecisionConvert.ConvertToSingle(K[kBase + dd]), dot);
             float score = dot * scale;
 
             int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
@@ -799,7 +799,7 @@ public class FusedAttentionKernel : IDisposable
             int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float pd = 0f;
             for (int d = 0; d < RegTileD; d++)
-                pd += qr[d] * PrecisionConvert.ConvertToSingle(K[kBase + myDim + d]);
+                pd = float.MultiplyAddEstimate(qr[d], PrecisionConvert.ConvertToSingle(K[kBase + myDim + d]), pd);
             // butterfly-reduce the partial dot across this query's nLanes (aligned power-of-2 → all lanes get it).
             for (int off = nLanes >> 1; off > 0; off >>= 1)
                 pd += Warp.ShuffleXor(pd, off);
@@ -903,10 +903,10 @@ public class FusedAttentionKernel : IDisposable
             for (int i = 0; i < RegTileD / 4; i++)
             {
                 var kv4 = K4.AsAligned16()[kBase4 + i];   // one 128-bit load; MAC order below matches the scalar form
-                pd += qr[i * 4 + 0] * kv4.A;
-                pd += qr[i * 4 + 1] * kv4.B;
-                pd += qr[i * 4 + 2] * kv4.C;
-                pd += qr[i * 4 + 3] * kv4.D;
+                pd = float.MultiplyAddEstimate(qr[i * 4 + 0], kv4.A, pd);
+                pd = float.MultiplyAddEstimate(qr[i * 4 + 1], kv4.B, pd);
+                pd = float.MultiplyAddEstimate(qr[i * 4 + 2], kv4.C, pd);
+                pd = float.MultiplyAddEstimate(qr[i * 4 + 3], kv4.D, pd);
             }
             for (int off = nLanes >> 1; off > 0; off >>= 1)
                 pd += Warp.ShuffleXor(pd, off);
@@ -1087,7 +1087,7 @@ public class FusedAttentionKernel : IDisposable
             int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
-                dot += qSh[dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+                dot = float.MultiplyAddEstimate(qSh[dd], PrecisionConvert.ConvertToSingle(K[kBase + dd]), dot);
             float score = dot * scale;
             int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
             int windowOk = ((qPos - window - kv) >> 31) & 1;
@@ -1244,7 +1244,7 @@ public class FusedAttentionKernel : IDisposable
             {
                 float vv = PrecisionConvert.ConvertToSingle(V[kvHead * kvHeadStride + kvj * kvTokenStride + tid]);
                 for (int r = 0; r < SkMaxRows; r++)
-                    if (r < rows) acc[r] += sc[r * SkChunk + j] * vv;
+                    if (r < rows) acc[r] = float.MultiplyAddEstimate(sc[r * SkChunk + j], vv, acc[r]);
             }
         }
         for (int r = 0; r < SkMaxRows; r++)
@@ -1283,8 +1283,8 @@ public class FusedAttentionKernel : IDisposable
             int b = ((kvHead * nSplits + sp) * rows + r) * (SkD + 2);
             float m = partials[b + SkD];
             float w = m > -1e29f ? MathF.Exp(m - maxM) : 0f;
-            L += partials[b + SkD + 1] * w;
-            A += partials[b + d] * w;
+            L = float.MultiplyAddEstimate(partials[b + SkD + 1], w, L);
+            A = float.MultiplyAddEstimate(partials[b + d], w, A);
         }
         int oBase = p[11] == 1 ? (sq * BH + bh) * SkD : (bh * SQ + sq) * SkD;
         output[oBase + d] = A / (L + 1e-10f);
@@ -1465,7 +1465,7 @@ public class FusedAttentionKernel : IDisposable
                 int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
                 float dot = 0f;
                 for (int dd = 0; dd < D; dd++)
-                    dot += qSh[dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+                    dot = float.MultiplyAddEstimate(qSh[dd], PrecisionConvert.ConvertToSingle(K[kBase + dd]), dot);
                 float score = dot * scale;
                 int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
                 int windowOk = ((qPos - window - kv) >> 31) & 1;

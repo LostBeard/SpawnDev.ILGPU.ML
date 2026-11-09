@@ -121,7 +121,7 @@ public class Conv1DKernel : IDisposable
                 int ic = icStart + icLocal;
                 float inputVal = input[ic * inL + ix];
                 float weightVal = weight[oc * inCPerGroup * kL + icLocal * kL + kx];
-                sum += inputVal * weightVal;
+                sum = float.MultiplyAddEstimate(inputVal, weightVal, sum);
             }
         }
 

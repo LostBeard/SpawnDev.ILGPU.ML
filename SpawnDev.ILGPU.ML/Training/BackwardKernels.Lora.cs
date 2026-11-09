@@ -151,14 +151,14 @@ public sealed partial class BackwardKernels
                 {
                     var p = P[pb + k];
                     long qb = q0 + k;
-                    var q = Q[qb]; a0 += p.X * q.X; a0 += p.Y * q.Y; a0 += p.Z * q.Z; a0 += p.W * q.W;
-                    q = Q[qb + K4]; a1 += p.X * q.X; a1 += p.Y * q.Y; a1 += p.Z * q.Z; a1 += p.W * q.W;
-                    q = Q[qb + 2 * (long)K4]; a2 += p.X * q.X; a2 += p.Y * q.Y; a2 += p.Z * q.Z; a2 += p.W * q.W;
-                    q = Q[qb + 3 * (long)K4]; a3 += p.X * q.X; a3 += p.Y * q.Y; a3 += p.Z * q.Z; a3 += p.W * q.W;
-                    q = Q[qb + 4 * (long)K4]; a4 += p.X * q.X; a4 += p.Y * q.Y; a4 += p.Z * q.Z; a4 += p.W * q.W;
-                    q = Q[qb + 5 * (long)K4]; a5 += p.X * q.X; a5 += p.Y * q.Y; a5 += p.Z * q.Z; a5 += p.W * q.W;
-                    q = Q[qb + 6 * (long)K4]; a6 += p.X * q.X; a6 += p.Y * q.Y; a6 += p.Z * q.Z; a6 += p.W * q.W;
-                    q = Q[qb + 7 * (long)K4]; a7 += p.X * q.X; a7 += p.Y * q.Y; a7 += p.Z * q.Z; a7 += p.W * q.W;
+                    var q = Q[qb]; a0 = float.MultiplyAddEstimate(p.X, q.X, a0); a0 = float.MultiplyAddEstimate(p.Y, q.Y, a0); a0 = float.MultiplyAddEstimate(p.Z, q.Z, a0); a0 = float.MultiplyAddEstimate(p.W, q.W, a0);
+                    q = Q[qb + K4]; a1 = float.MultiplyAddEstimate(p.X, q.X, a1); a1 = float.MultiplyAddEstimate(p.Y, q.Y, a1); a1 = float.MultiplyAddEstimate(p.Z, q.Z, a1); a1 = float.MultiplyAddEstimate(p.W, q.W, a1);
+                    q = Q[qb + 2 * (long)K4]; a2 = float.MultiplyAddEstimate(p.X, q.X, a2); a2 = float.MultiplyAddEstimate(p.Y, q.Y, a2); a2 = float.MultiplyAddEstimate(p.Z, q.Z, a2); a2 = float.MultiplyAddEstimate(p.W, q.W, a2);
+                    q = Q[qb + 3 * (long)K4]; a3 = float.MultiplyAddEstimate(p.X, q.X, a3); a3 = float.MultiplyAddEstimate(p.Y, q.Y, a3); a3 = float.MultiplyAddEstimate(p.Z, q.Z, a3); a3 = float.MultiplyAddEstimate(p.W, q.W, a3);
+                    q = Q[qb + 4 * (long)K4]; a4 = float.MultiplyAddEstimate(p.X, q.X, a4); a4 = float.MultiplyAddEstimate(p.Y, q.Y, a4); a4 = float.MultiplyAddEstimate(p.Z, q.Z, a4); a4 = float.MultiplyAddEstimate(p.W, q.W, a4);
+                    q = Q[qb + 5 * (long)K4]; a5 = float.MultiplyAddEstimate(p.X, q.X, a5); a5 = float.MultiplyAddEstimate(p.Y, q.Y, a5); a5 = float.MultiplyAddEstimate(p.Z, q.Z, a5); a5 = float.MultiplyAddEstimate(p.W, q.W, a5);
+                    q = Q[qb + 6 * (long)K4]; a6 = float.MultiplyAddEstimate(p.X, q.X, a6); a6 = float.MultiplyAddEstimate(p.Y, q.Y, a6); a6 = float.MultiplyAddEstimate(p.Z, q.Z, a6); a6 = float.MultiplyAddEstimate(p.W, q.W, a6);
+                    q = Q[qb + 7 * (long)K4]; a7 = float.MultiplyAddEstimate(p.X, q.X, a7); a7 = float.MultiplyAddEstimate(p.Y, q.Y, a7); a7 = float.MultiplyAddEstimate(p.Z, q.Z, a7); a7 = float.MultiplyAddEstimate(p.W, q.W, a7);
                 }
             }
             int b = row * 64 + kl;
@@ -197,21 +197,21 @@ public sealed partial class BackwardKernels
                     // four rows' loads in flight; the sums stay in row order
                     float qa = Q[qr], qb = Q[qr + N], qc = Q[qr + 2 * (long)N], qd = Q[qr + 3 * (long)N];
                     int pb = mm * 8;
-                    a0 += ps[pb] * qa; a1 += ps[pb + 1] * qa; a2 += ps[pb + 2] * qa; a3 += ps[pb + 3] * qa;
-                    a4 += ps[pb + 4] * qa; a5 += ps[pb + 5] * qa; a6 += ps[pb + 6] * qa; a7 += ps[pb + 7] * qa;
-                    a0 += ps[pb + 8] * qb; a1 += ps[pb + 9] * qb; a2 += ps[pb + 10] * qb; a3 += ps[pb + 11] * qb;
-                    a4 += ps[pb + 12] * qb; a5 += ps[pb + 13] * qb; a6 += ps[pb + 14] * qb; a7 += ps[pb + 15] * qb;
-                    a0 += ps[pb + 16] * qc; a1 += ps[pb + 17] * qc; a2 += ps[pb + 18] * qc; a3 += ps[pb + 19] * qc;
-                    a4 += ps[pb + 20] * qc; a5 += ps[pb + 21] * qc; a6 += ps[pb + 22] * qc; a7 += ps[pb + 23] * qc;
-                    a0 += ps[pb + 24] * qd; a1 += ps[pb + 25] * qd; a2 += ps[pb + 26] * qd; a3 += ps[pb + 27] * qd;
-                    a4 += ps[pb + 28] * qd; a5 += ps[pb + 29] * qd; a6 += ps[pb + 30] * qd; a7 += ps[pb + 31] * qd;
+                    a0 = float.MultiplyAddEstimate(ps[pb], qa, a0); a1 = float.MultiplyAddEstimate(ps[pb + 1], qa, a1); a2 = float.MultiplyAddEstimate(ps[pb + 2], qa, a2); a3 = float.MultiplyAddEstimate(ps[pb + 3], qa, a3);
+                    a4 = float.MultiplyAddEstimate(ps[pb + 4], qa, a4); a5 = float.MultiplyAddEstimate(ps[pb + 5], qa, a5); a6 = float.MultiplyAddEstimate(ps[pb + 6], qa, a6); a7 = float.MultiplyAddEstimate(ps[pb + 7], qa, a7);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 8], qb, a0); a1 = float.MultiplyAddEstimate(ps[pb + 9], qb, a1); a2 = float.MultiplyAddEstimate(ps[pb + 10], qb, a2); a3 = float.MultiplyAddEstimate(ps[pb + 11], qb, a3);
+                    a4 = float.MultiplyAddEstimate(ps[pb + 12], qb, a4); a5 = float.MultiplyAddEstimate(ps[pb + 13], qb, a5); a6 = float.MultiplyAddEstimate(ps[pb + 14], qb, a6); a7 = float.MultiplyAddEstimate(ps[pb + 15], qb, a7);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 16], qc, a0); a1 = float.MultiplyAddEstimate(ps[pb + 17], qc, a1); a2 = float.MultiplyAddEstimate(ps[pb + 18], qc, a2); a3 = float.MultiplyAddEstimate(ps[pb + 19], qc, a3);
+                    a4 = float.MultiplyAddEstimate(ps[pb + 20], qc, a4); a5 = float.MultiplyAddEstimate(ps[pb + 21], qc, a5); a6 = float.MultiplyAddEstimate(ps[pb + 22], qc, a6); a7 = float.MultiplyAddEstimate(ps[pb + 23], qc, a7);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 24], qd, a0); a1 = float.MultiplyAddEstimate(ps[pb + 25], qd, a1); a2 = float.MultiplyAddEstimate(ps[pb + 26], qd, a2); a3 = float.MultiplyAddEstimate(ps[pb + 27], qd, a3);
+                    a4 = float.MultiplyAddEstimate(ps[pb + 28], qd, a4); a5 = float.MultiplyAddEstimate(ps[pb + 29], qd, a5); a6 = float.MultiplyAddEstimate(ps[pb + 30], qd, a6); a7 = float.MultiplyAddEstimate(ps[pb + 31], qd, a7);
                 }
                 for (; mm < rows; mm++, qr += N)
                 {
                     float q = Q[qr];
                     int pb = mm * 8;
-                    a0 += ps[pb] * q; a1 += ps[pb + 1] * q; a2 += ps[pb + 2] * q; a3 += ps[pb + 3] * q;
-                    a4 += ps[pb + 4] * q; a5 += ps[pb + 5] * q; a6 += ps[pb + 6] * q; a7 += ps[pb + 7] * q;
+                    a0 = float.MultiplyAddEstimate(ps[pb], q, a0); a1 = float.MultiplyAddEstimate(ps[pb + 1], q, a1); a2 = float.MultiplyAddEstimate(ps[pb + 2], q, a2); a3 = float.MultiplyAddEstimate(ps[pb + 3], q, a3);
+                    a4 = float.MultiplyAddEstimate(ps[pb + 4], q, a4); a5 = float.MultiplyAddEstimate(ps[pb + 5], q, a5); a6 = float.MultiplyAddEstimate(ps[pb + 6], q, a6); a7 = float.MultiplyAddEstimate(ps[pb + 7], q, a7);
                 }
                 long o = ((long)sl * R + rc) * N + n;
                 part[o] = a0; part[o + N] = a1; part[o + 2 * (long)N] = a2; part[o + 3 * (long)N] = a3;
@@ -243,22 +243,22 @@ public sealed partial class BackwardKernels
                 {
                     var p = P[pb + k];
                     long qb = q0 + k;
-                    var q = Q[qb]; a0 += p.X * q.X; a0 += p.Y * q.Y; a0 += p.Z * q.Z; a0 += p.W * q.W;
-                    q = Q[qb + K4]; a1 += p.X * q.X; a1 += p.Y * q.Y; a1 += p.Z * q.Z; a1 += p.W * q.W;
-                    q = Q[qb + 2 * (long)K4]; a2 += p.X * q.X; a2 += p.Y * q.Y; a2 += p.Z * q.Z; a2 += p.W * q.W;
-                    q = Q[qb + 3 * (long)K4]; a3 += p.X * q.X; a3 += p.Y * q.Y; a3 += p.Z * q.Z; a3 += p.W * q.W;
-                    q = Q[qb + 4 * (long)K4]; a4 += p.X * q.X; a4 += p.Y * q.Y; a4 += p.Z * q.Z; a4 += p.W * q.W;
-                    q = Q[qb + 5 * (long)K4]; a5 += p.X * q.X; a5 += p.Y * q.Y; a5 += p.Z * q.Z; a5 += p.W * q.W;
-                    q = Q[qb + 6 * (long)K4]; a6 += p.X * q.X; a6 += p.Y * q.Y; a6 += p.Z * q.Z; a6 += p.W * q.W;
-                    q = Q[qb + 7 * (long)K4]; a7 += p.X * q.X; a7 += p.Y * q.Y; a7 += p.Z * q.Z; a7 += p.W * q.W;
-                    q = Q[qb + 8 * (long)K4]; a8 += p.X * q.X; a8 += p.Y * q.Y; a8 += p.Z * q.Z; a8 += p.W * q.W;
-                    q = Q[qb + 9 * (long)K4]; a9 += p.X * q.X; a9 += p.Y * q.Y; a9 += p.Z * q.Z; a9 += p.W * q.W;
-                    q = Q[qb + 10 * (long)K4]; a10 += p.X * q.X; a10 += p.Y * q.Y; a10 += p.Z * q.Z; a10 += p.W * q.W;
-                    q = Q[qb + 11 * (long)K4]; a11 += p.X * q.X; a11 += p.Y * q.Y; a11 += p.Z * q.Z; a11 += p.W * q.W;
-                    q = Q[qb + 12 * (long)K4]; a12 += p.X * q.X; a12 += p.Y * q.Y; a12 += p.Z * q.Z; a12 += p.W * q.W;
-                    q = Q[qb + 13 * (long)K4]; a13 += p.X * q.X; a13 += p.Y * q.Y; a13 += p.Z * q.Z; a13 += p.W * q.W;
-                    q = Q[qb + 14 * (long)K4]; a14 += p.X * q.X; a14 += p.Y * q.Y; a14 += p.Z * q.Z; a14 += p.W * q.W;
-                    q = Q[qb + 15 * (long)K4]; a15 += p.X * q.X; a15 += p.Y * q.Y; a15 += p.Z * q.Z; a15 += p.W * q.W;
+                    var q = Q[qb]; a0 = float.MultiplyAddEstimate(p.X, q.X, a0); a0 = float.MultiplyAddEstimate(p.Y, q.Y, a0); a0 = float.MultiplyAddEstimate(p.Z, q.Z, a0); a0 = float.MultiplyAddEstimate(p.W, q.W, a0);
+                    q = Q[qb + K4]; a1 = float.MultiplyAddEstimate(p.X, q.X, a1); a1 = float.MultiplyAddEstimate(p.Y, q.Y, a1); a1 = float.MultiplyAddEstimate(p.Z, q.Z, a1); a1 = float.MultiplyAddEstimate(p.W, q.W, a1);
+                    q = Q[qb + 2 * (long)K4]; a2 = float.MultiplyAddEstimate(p.X, q.X, a2); a2 = float.MultiplyAddEstimate(p.Y, q.Y, a2); a2 = float.MultiplyAddEstimate(p.Z, q.Z, a2); a2 = float.MultiplyAddEstimate(p.W, q.W, a2);
+                    q = Q[qb + 3 * (long)K4]; a3 = float.MultiplyAddEstimate(p.X, q.X, a3); a3 = float.MultiplyAddEstimate(p.Y, q.Y, a3); a3 = float.MultiplyAddEstimate(p.Z, q.Z, a3); a3 = float.MultiplyAddEstimate(p.W, q.W, a3);
+                    q = Q[qb + 4 * (long)K4]; a4 = float.MultiplyAddEstimate(p.X, q.X, a4); a4 = float.MultiplyAddEstimate(p.Y, q.Y, a4); a4 = float.MultiplyAddEstimate(p.Z, q.Z, a4); a4 = float.MultiplyAddEstimate(p.W, q.W, a4);
+                    q = Q[qb + 5 * (long)K4]; a5 = float.MultiplyAddEstimate(p.X, q.X, a5); a5 = float.MultiplyAddEstimate(p.Y, q.Y, a5); a5 = float.MultiplyAddEstimate(p.Z, q.Z, a5); a5 = float.MultiplyAddEstimate(p.W, q.W, a5);
+                    q = Q[qb + 6 * (long)K4]; a6 = float.MultiplyAddEstimate(p.X, q.X, a6); a6 = float.MultiplyAddEstimate(p.Y, q.Y, a6); a6 = float.MultiplyAddEstimate(p.Z, q.Z, a6); a6 = float.MultiplyAddEstimate(p.W, q.W, a6);
+                    q = Q[qb + 7 * (long)K4]; a7 = float.MultiplyAddEstimate(p.X, q.X, a7); a7 = float.MultiplyAddEstimate(p.Y, q.Y, a7); a7 = float.MultiplyAddEstimate(p.Z, q.Z, a7); a7 = float.MultiplyAddEstimate(p.W, q.W, a7);
+                    q = Q[qb + 8 * (long)K4]; a8 = float.MultiplyAddEstimate(p.X, q.X, a8); a8 = float.MultiplyAddEstimate(p.Y, q.Y, a8); a8 = float.MultiplyAddEstimate(p.Z, q.Z, a8); a8 = float.MultiplyAddEstimate(p.W, q.W, a8);
+                    q = Q[qb + 9 * (long)K4]; a9 = float.MultiplyAddEstimate(p.X, q.X, a9); a9 = float.MultiplyAddEstimate(p.Y, q.Y, a9); a9 = float.MultiplyAddEstimate(p.Z, q.Z, a9); a9 = float.MultiplyAddEstimate(p.W, q.W, a9);
+                    q = Q[qb + 10 * (long)K4]; a10 = float.MultiplyAddEstimate(p.X, q.X, a10); a10 = float.MultiplyAddEstimate(p.Y, q.Y, a10); a10 = float.MultiplyAddEstimate(p.Z, q.Z, a10); a10 = float.MultiplyAddEstimate(p.W, q.W, a10);
+                    q = Q[qb + 11 * (long)K4]; a11 = float.MultiplyAddEstimate(p.X, q.X, a11); a11 = float.MultiplyAddEstimate(p.Y, q.Y, a11); a11 = float.MultiplyAddEstimate(p.Z, q.Z, a11); a11 = float.MultiplyAddEstimate(p.W, q.W, a11);
+                    q = Q[qb + 12 * (long)K4]; a12 = float.MultiplyAddEstimate(p.X, q.X, a12); a12 = float.MultiplyAddEstimate(p.Y, q.Y, a12); a12 = float.MultiplyAddEstimate(p.Z, q.Z, a12); a12 = float.MultiplyAddEstimate(p.W, q.W, a12);
+                    q = Q[qb + 13 * (long)K4]; a13 = float.MultiplyAddEstimate(p.X, q.X, a13); a13 = float.MultiplyAddEstimate(p.Y, q.Y, a13); a13 = float.MultiplyAddEstimate(p.Z, q.Z, a13); a13 = float.MultiplyAddEstimate(p.W, q.W, a13);
+                    q = Q[qb + 14 * (long)K4]; a14 = float.MultiplyAddEstimate(p.X, q.X, a14); a14 = float.MultiplyAddEstimate(p.Y, q.Y, a14); a14 = float.MultiplyAddEstimate(p.Z, q.Z, a14); a14 = float.MultiplyAddEstimate(p.W, q.W, a14);
+                    q = Q[qb + 15 * (long)K4]; a15 = float.MultiplyAddEstimate(p.X, q.X, a15); a15 = float.MultiplyAddEstimate(p.Y, q.Y, a15); a15 = float.MultiplyAddEstimate(p.Z, q.Z, a15); a15 = float.MultiplyAddEstimate(p.W, q.W, a15);
                 }
             }
             {
@@ -306,16 +306,16 @@ public sealed partial class BackwardKernels
                 {
                     float qa = Q[qr], qb = Q[qr + N], qc = Q[qr + 2 * (long)N], qd = Q[qr + 3 * (long)N];
                     int pb = mm * 16;
-                    a0 += ps[pb + 0] * qa; a1 += ps[pb + 1] * qa; a2 += ps[pb + 2] * qa; a3 += ps[pb + 3] * qa; a4 += ps[pb + 4] * qa; a5 += ps[pb + 5] * qa; a6 += ps[pb + 6] * qa; a7 += ps[pb + 7] * qa; a8 += ps[pb + 8] * qa; a9 += ps[pb + 9] * qa; a10 += ps[pb + 10] * qa; a11 += ps[pb + 11] * qa; a12 += ps[pb + 12] * qa; a13 += ps[pb + 13] * qa; a14 += ps[pb + 14] * qa; a15 += ps[pb + 15] * qa;
-                    a0 += ps[pb + 16] * qb; a1 += ps[pb + 17] * qb; a2 += ps[pb + 18] * qb; a3 += ps[pb + 19] * qb; a4 += ps[pb + 20] * qb; a5 += ps[pb + 21] * qb; a6 += ps[pb + 22] * qb; a7 += ps[pb + 23] * qb; a8 += ps[pb + 24] * qb; a9 += ps[pb + 25] * qb; a10 += ps[pb + 26] * qb; a11 += ps[pb + 27] * qb; a12 += ps[pb + 28] * qb; a13 += ps[pb + 29] * qb; a14 += ps[pb + 30] * qb; a15 += ps[pb + 31] * qb;
-                    a0 += ps[pb + 32] * qc; a1 += ps[pb + 33] * qc; a2 += ps[pb + 34] * qc; a3 += ps[pb + 35] * qc; a4 += ps[pb + 36] * qc; a5 += ps[pb + 37] * qc; a6 += ps[pb + 38] * qc; a7 += ps[pb + 39] * qc; a8 += ps[pb + 40] * qc; a9 += ps[pb + 41] * qc; a10 += ps[pb + 42] * qc; a11 += ps[pb + 43] * qc; a12 += ps[pb + 44] * qc; a13 += ps[pb + 45] * qc; a14 += ps[pb + 46] * qc; a15 += ps[pb + 47] * qc;
-                    a0 += ps[pb + 48] * qd; a1 += ps[pb + 49] * qd; a2 += ps[pb + 50] * qd; a3 += ps[pb + 51] * qd; a4 += ps[pb + 52] * qd; a5 += ps[pb + 53] * qd; a6 += ps[pb + 54] * qd; a7 += ps[pb + 55] * qd; a8 += ps[pb + 56] * qd; a9 += ps[pb + 57] * qd; a10 += ps[pb + 58] * qd; a11 += ps[pb + 59] * qd; a12 += ps[pb + 60] * qd; a13 += ps[pb + 61] * qd; a14 += ps[pb + 62] * qd; a15 += ps[pb + 63] * qd;
+                    a0 = float.MultiplyAddEstimate(ps[pb + 0], qa, a0); a1 = float.MultiplyAddEstimate(ps[pb + 1], qa, a1); a2 = float.MultiplyAddEstimate(ps[pb + 2], qa, a2); a3 = float.MultiplyAddEstimate(ps[pb + 3], qa, a3); a4 = float.MultiplyAddEstimate(ps[pb + 4], qa, a4); a5 = float.MultiplyAddEstimate(ps[pb + 5], qa, a5); a6 = float.MultiplyAddEstimate(ps[pb + 6], qa, a6); a7 = float.MultiplyAddEstimate(ps[pb + 7], qa, a7); a8 = float.MultiplyAddEstimate(ps[pb + 8], qa, a8); a9 = float.MultiplyAddEstimate(ps[pb + 9], qa, a9); a10 = float.MultiplyAddEstimate(ps[pb + 10], qa, a10); a11 = float.MultiplyAddEstimate(ps[pb + 11], qa, a11); a12 = float.MultiplyAddEstimate(ps[pb + 12], qa, a12); a13 = float.MultiplyAddEstimate(ps[pb + 13], qa, a13); a14 = float.MultiplyAddEstimate(ps[pb + 14], qa, a14); a15 = float.MultiplyAddEstimate(ps[pb + 15], qa, a15);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 16], qb, a0); a1 = float.MultiplyAddEstimate(ps[pb + 17], qb, a1); a2 = float.MultiplyAddEstimate(ps[pb + 18], qb, a2); a3 = float.MultiplyAddEstimate(ps[pb + 19], qb, a3); a4 = float.MultiplyAddEstimate(ps[pb + 20], qb, a4); a5 = float.MultiplyAddEstimate(ps[pb + 21], qb, a5); a6 = float.MultiplyAddEstimate(ps[pb + 22], qb, a6); a7 = float.MultiplyAddEstimate(ps[pb + 23], qb, a7); a8 = float.MultiplyAddEstimate(ps[pb + 24], qb, a8); a9 = float.MultiplyAddEstimate(ps[pb + 25], qb, a9); a10 = float.MultiplyAddEstimate(ps[pb + 26], qb, a10); a11 = float.MultiplyAddEstimate(ps[pb + 27], qb, a11); a12 = float.MultiplyAddEstimate(ps[pb + 28], qb, a12); a13 = float.MultiplyAddEstimate(ps[pb + 29], qb, a13); a14 = float.MultiplyAddEstimate(ps[pb + 30], qb, a14); a15 = float.MultiplyAddEstimate(ps[pb + 31], qb, a15);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 32], qc, a0); a1 = float.MultiplyAddEstimate(ps[pb + 33], qc, a1); a2 = float.MultiplyAddEstimate(ps[pb + 34], qc, a2); a3 = float.MultiplyAddEstimate(ps[pb + 35], qc, a3); a4 = float.MultiplyAddEstimate(ps[pb + 36], qc, a4); a5 = float.MultiplyAddEstimate(ps[pb + 37], qc, a5); a6 = float.MultiplyAddEstimate(ps[pb + 38], qc, a6); a7 = float.MultiplyAddEstimate(ps[pb + 39], qc, a7); a8 = float.MultiplyAddEstimate(ps[pb + 40], qc, a8); a9 = float.MultiplyAddEstimate(ps[pb + 41], qc, a9); a10 = float.MultiplyAddEstimate(ps[pb + 42], qc, a10); a11 = float.MultiplyAddEstimate(ps[pb + 43], qc, a11); a12 = float.MultiplyAddEstimate(ps[pb + 44], qc, a12); a13 = float.MultiplyAddEstimate(ps[pb + 45], qc, a13); a14 = float.MultiplyAddEstimate(ps[pb + 46], qc, a14); a15 = float.MultiplyAddEstimate(ps[pb + 47], qc, a15);
+                    a0 = float.MultiplyAddEstimate(ps[pb + 48], qd, a0); a1 = float.MultiplyAddEstimate(ps[pb + 49], qd, a1); a2 = float.MultiplyAddEstimate(ps[pb + 50], qd, a2); a3 = float.MultiplyAddEstimate(ps[pb + 51], qd, a3); a4 = float.MultiplyAddEstimate(ps[pb + 52], qd, a4); a5 = float.MultiplyAddEstimate(ps[pb + 53], qd, a5); a6 = float.MultiplyAddEstimate(ps[pb + 54], qd, a6); a7 = float.MultiplyAddEstimate(ps[pb + 55], qd, a7); a8 = float.MultiplyAddEstimate(ps[pb + 56], qd, a8); a9 = float.MultiplyAddEstimate(ps[pb + 57], qd, a9); a10 = float.MultiplyAddEstimate(ps[pb + 58], qd, a10); a11 = float.MultiplyAddEstimate(ps[pb + 59], qd, a11); a12 = float.MultiplyAddEstimate(ps[pb + 60], qd, a12); a13 = float.MultiplyAddEstimate(ps[pb + 61], qd, a13); a14 = float.MultiplyAddEstimate(ps[pb + 62], qd, a14); a15 = float.MultiplyAddEstimate(ps[pb + 63], qd, a15);
                 }
                 for (; mm < rows; mm++, qr += N)
                 {
                     float q = Q[qr];
                     int pb = mm * 16;
-                    a0 += ps[pb + 0] * q; a1 += ps[pb + 1] * q; a2 += ps[pb + 2] * q; a3 += ps[pb + 3] * q; a4 += ps[pb + 4] * q; a5 += ps[pb + 5] * q; a6 += ps[pb + 6] * q; a7 += ps[pb + 7] * q; a8 += ps[pb + 8] * q; a9 += ps[pb + 9] * q; a10 += ps[pb + 10] * q; a11 += ps[pb + 11] * q; a12 += ps[pb + 12] * q; a13 += ps[pb + 13] * q; a14 += ps[pb + 14] * q; a15 += ps[pb + 15] * q;
+                    a0 = float.MultiplyAddEstimate(ps[pb + 0], q, a0); a1 = float.MultiplyAddEstimate(ps[pb + 1], q, a1); a2 = float.MultiplyAddEstimate(ps[pb + 2], q, a2); a3 = float.MultiplyAddEstimate(ps[pb + 3], q, a3); a4 = float.MultiplyAddEstimate(ps[pb + 4], q, a4); a5 = float.MultiplyAddEstimate(ps[pb + 5], q, a5); a6 = float.MultiplyAddEstimate(ps[pb + 6], q, a6); a7 = float.MultiplyAddEstimate(ps[pb + 7], q, a7); a8 = float.MultiplyAddEstimate(ps[pb + 8], q, a8); a9 = float.MultiplyAddEstimate(ps[pb + 9], q, a9); a10 = float.MultiplyAddEstimate(ps[pb + 10], q, a10); a11 = float.MultiplyAddEstimate(ps[pb + 11], q, a11); a12 = float.MultiplyAddEstimate(ps[pb + 12], q, a12); a13 = float.MultiplyAddEstimate(ps[pb + 13], q, a13); a14 = float.MultiplyAddEstimate(ps[pb + 14], q, a14); a15 = float.MultiplyAddEstimate(ps[pb + 15], q, a15);
                 }
                 long o = ((long)sl * R + rc) * N + n;
                 part[o + 0 * (long)N] = a0; part[o + 1 * (long)N] = a1; part[o + 2 * (long)N] = a2; part[o + 3 * (long)N] = a3; part[o + 4 * (long)N] = a4; part[o + 5 * (long)N] = a5; part[o + 6 * (long)N] = a6; part[o + 7 * (long)N] = a7; part[o + 8 * (long)N] = a8; part[o + 9 * (long)N] = a9; part[o + 10 * (long)N] = a10; part[o + 11 * (long)N] = a11; part[o + 12 * (long)N] = a12; part[o + 13 * (long)N] = a13; part[o + 14 * (long)N] = a14; part[o + 15 * (long)N] = a15;
@@ -360,38 +360,38 @@ public sealed partial class BackwardKernels
             var pa1 = P[pb1 + (r >> 2)]; var pc1 = P[pb1 + (r >> 2) + 1];
             var pa2 = P[pb2 + (r >> 2)]; var pc2 = P[pb2 + (r >> 2) + 1];
             var pa3 = P[pb3 + (r >> 2)]; var pc3 = P[pb3 + (r >> 2) + 1];
-            s00 += pa0.X * q0.X; s01 += pa0.X * q0.Y; s02 += pa0.X * q0.Z; s03 += pa0.X * q0.W;
-            s00 += pa0.Y * q1.X; s01 += pa0.Y * q1.Y; s02 += pa0.Y * q1.Z; s03 += pa0.Y * q1.W;
-            s00 += pa0.Z * q2.X; s01 += pa0.Z * q2.Y; s02 += pa0.Z * q2.Z; s03 += pa0.Z * q2.W;
-            s00 += pa0.W * q3.X; s01 += pa0.W * q3.Y; s02 += pa0.W * q3.Z; s03 += pa0.W * q3.W;
-            s00 += pc0.X * q4.X; s01 += pc0.X * q4.Y; s02 += pc0.X * q4.Z; s03 += pc0.X * q4.W;
-            s00 += pc0.Y * q5.X; s01 += pc0.Y * q5.Y; s02 += pc0.Y * q5.Z; s03 += pc0.Y * q5.W;
-            s00 += pc0.Z * q6.X; s01 += pc0.Z * q6.Y; s02 += pc0.Z * q6.Z; s03 += pc0.Z * q6.W;
-            s00 += pc0.W * q7.X; s01 += pc0.W * q7.Y; s02 += pc0.W * q7.Z; s03 += pc0.W * q7.W;
-            s10 += pa1.X * q0.X; s11 += pa1.X * q0.Y; s12 += pa1.X * q0.Z; s13 += pa1.X * q0.W;
-            s10 += pa1.Y * q1.X; s11 += pa1.Y * q1.Y; s12 += pa1.Y * q1.Z; s13 += pa1.Y * q1.W;
-            s10 += pa1.Z * q2.X; s11 += pa1.Z * q2.Y; s12 += pa1.Z * q2.Z; s13 += pa1.Z * q2.W;
-            s10 += pa1.W * q3.X; s11 += pa1.W * q3.Y; s12 += pa1.W * q3.Z; s13 += pa1.W * q3.W;
-            s10 += pc1.X * q4.X; s11 += pc1.X * q4.Y; s12 += pc1.X * q4.Z; s13 += pc1.X * q4.W;
-            s10 += pc1.Y * q5.X; s11 += pc1.Y * q5.Y; s12 += pc1.Y * q5.Z; s13 += pc1.Y * q5.W;
-            s10 += pc1.Z * q6.X; s11 += pc1.Z * q6.Y; s12 += pc1.Z * q6.Z; s13 += pc1.Z * q6.W;
-            s10 += pc1.W * q7.X; s11 += pc1.W * q7.Y; s12 += pc1.W * q7.Z; s13 += pc1.W * q7.W;
-            s20 += pa2.X * q0.X; s21 += pa2.X * q0.Y; s22 += pa2.X * q0.Z; s23 += pa2.X * q0.W;
-            s20 += pa2.Y * q1.X; s21 += pa2.Y * q1.Y; s22 += pa2.Y * q1.Z; s23 += pa2.Y * q1.W;
-            s20 += pa2.Z * q2.X; s21 += pa2.Z * q2.Y; s22 += pa2.Z * q2.Z; s23 += pa2.Z * q2.W;
-            s20 += pa2.W * q3.X; s21 += pa2.W * q3.Y; s22 += pa2.W * q3.Z; s23 += pa2.W * q3.W;
-            s20 += pc2.X * q4.X; s21 += pc2.X * q4.Y; s22 += pc2.X * q4.Z; s23 += pc2.X * q4.W;
-            s20 += pc2.Y * q5.X; s21 += pc2.Y * q5.Y; s22 += pc2.Y * q5.Z; s23 += pc2.Y * q5.W;
-            s20 += pc2.Z * q6.X; s21 += pc2.Z * q6.Y; s22 += pc2.Z * q6.Z; s23 += pc2.Z * q6.W;
-            s20 += pc2.W * q7.X; s21 += pc2.W * q7.Y; s22 += pc2.W * q7.Z; s23 += pc2.W * q7.W;
-            s30 += pa3.X * q0.X; s31 += pa3.X * q0.Y; s32 += pa3.X * q0.Z; s33 += pa3.X * q0.W;
-            s30 += pa3.Y * q1.X; s31 += pa3.Y * q1.Y; s32 += pa3.Y * q1.Z; s33 += pa3.Y * q1.W;
-            s30 += pa3.Z * q2.X; s31 += pa3.Z * q2.Y; s32 += pa3.Z * q2.Z; s33 += pa3.Z * q2.W;
-            s30 += pa3.W * q3.X; s31 += pa3.W * q3.Y; s32 += pa3.W * q3.Z; s33 += pa3.W * q3.W;
-            s30 += pc3.X * q4.X; s31 += pc3.X * q4.Y; s32 += pc3.X * q4.Z; s33 += pc3.X * q4.W;
-            s30 += pc3.Y * q5.X; s31 += pc3.Y * q5.Y; s32 += pc3.Y * q5.Z; s33 += pc3.Y * q5.W;
-            s30 += pc3.Z * q6.X; s31 += pc3.Z * q6.Y; s32 += pc3.Z * q6.Z; s33 += pc3.Z * q6.W;
-            s30 += pc3.W * q7.X; s31 += pc3.W * q7.Y; s32 += pc3.W * q7.Z; s33 += pc3.W * q7.W;
+            s00 = float.MultiplyAddEstimate(pa0.X, q0.X, s00); s01 = float.MultiplyAddEstimate(pa0.X, q0.Y, s01); s02 = float.MultiplyAddEstimate(pa0.X, q0.Z, s02); s03 = float.MultiplyAddEstimate(pa0.X, q0.W, s03);
+            s00 = float.MultiplyAddEstimate(pa0.Y, q1.X, s00); s01 = float.MultiplyAddEstimate(pa0.Y, q1.Y, s01); s02 = float.MultiplyAddEstimate(pa0.Y, q1.Z, s02); s03 = float.MultiplyAddEstimate(pa0.Y, q1.W, s03);
+            s00 = float.MultiplyAddEstimate(pa0.Z, q2.X, s00); s01 = float.MultiplyAddEstimate(pa0.Z, q2.Y, s01); s02 = float.MultiplyAddEstimate(pa0.Z, q2.Z, s02); s03 = float.MultiplyAddEstimate(pa0.Z, q2.W, s03);
+            s00 = float.MultiplyAddEstimate(pa0.W, q3.X, s00); s01 = float.MultiplyAddEstimate(pa0.W, q3.Y, s01); s02 = float.MultiplyAddEstimate(pa0.W, q3.Z, s02); s03 = float.MultiplyAddEstimate(pa0.W, q3.W, s03);
+            s00 = float.MultiplyAddEstimate(pc0.X, q4.X, s00); s01 = float.MultiplyAddEstimate(pc0.X, q4.Y, s01); s02 = float.MultiplyAddEstimate(pc0.X, q4.Z, s02); s03 = float.MultiplyAddEstimate(pc0.X, q4.W, s03);
+            s00 = float.MultiplyAddEstimate(pc0.Y, q5.X, s00); s01 = float.MultiplyAddEstimate(pc0.Y, q5.Y, s01); s02 = float.MultiplyAddEstimate(pc0.Y, q5.Z, s02); s03 = float.MultiplyAddEstimate(pc0.Y, q5.W, s03);
+            s00 = float.MultiplyAddEstimate(pc0.Z, q6.X, s00); s01 = float.MultiplyAddEstimate(pc0.Z, q6.Y, s01); s02 = float.MultiplyAddEstimate(pc0.Z, q6.Z, s02); s03 = float.MultiplyAddEstimate(pc0.Z, q6.W, s03);
+            s00 = float.MultiplyAddEstimate(pc0.W, q7.X, s00); s01 = float.MultiplyAddEstimate(pc0.W, q7.Y, s01); s02 = float.MultiplyAddEstimate(pc0.W, q7.Z, s02); s03 = float.MultiplyAddEstimate(pc0.W, q7.W, s03);
+            s10 = float.MultiplyAddEstimate(pa1.X, q0.X, s10); s11 = float.MultiplyAddEstimate(pa1.X, q0.Y, s11); s12 = float.MultiplyAddEstimate(pa1.X, q0.Z, s12); s13 = float.MultiplyAddEstimate(pa1.X, q0.W, s13);
+            s10 = float.MultiplyAddEstimate(pa1.Y, q1.X, s10); s11 = float.MultiplyAddEstimate(pa1.Y, q1.Y, s11); s12 = float.MultiplyAddEstimate(pa1.Y, q1.Z, s12); s13 = float.MultiplyAddEstimate(pa1.Y, q1.W, s13);
+            s10 = float.MultiplyAddEstimate(pa1.Z, q2.X, s10); s11 = float.MultiplyAddEstimate(pa1.Z, q2.Y, s11); s12 = float.MultiplyAddEstimate(pa1.Z, q2.Z, s12); s13 = float.MultiplyAddEstimate(pa1.Z, q2.W, s13);
+            s10 = float.MultiplyAddEstimate(pa1.W, q3.X, s10); s11 = float.MultiplyAddEstimate(pa1.W, q3.Y, s11); s12 = float.MultiplyAddEstimate(pa1.W, q3.Z, s12); s13 = float.MultiplyAddEstimate(pa1.W, q3.W, s13);
+            s10 = float.MultiplyAddEstimate(pc1.X, q4.X, s10); s11 = float.MultiplyAddEstimate(pc1.X, q4.Y, s11); s12 = float.MultiplyAddEstimate(pc1.X, q4.Z, s12); s13 = float.MultiplyAddEstimate(pc1.X, q4.W, s13);
+            s10 = float.MultiplyAddEstimate(pc1.Y, q5.X, s10); s11 = float.MultiplyAddEstimate(pc1.Y, q5.Y, s11); s12 = float.MultiplyAddEstimate(pc1.Y, q5.Z, s12); s13 = float.MultiplyAddEstimate(pc1.Y, q5.W, s13);
+            s10 = float.MultiplyAddEstimate(pc1.Z, q6.X, s10); s11 = float.MultiplyAddEstimate(pc1.Z, q6.Y, s11); s12 = float.MultiplyAddEstimate(pc1.Z, q6.Z, s12); s13 = float.MultiplyAddEstimate(pc1.Z, q6.W, s13);
+            s10 = float.MultiplyAddEstimate(pc1.W, q7.X, s10); s11 = float.MultiplyAddEstimate(pc1.W, q7.Y, s11); s12 = float.MultiplyAddEstimate(pc1.W, q7.Z, s12); s13 = float.MultiplyAddEstimate(pc1.W, q7.W, s13);
+            s20 = float.MultiplyAddEstimate(pa2.X, q0.X, s20); s21 = float.MultiplyAddEstimate(pa2.X, q0.Y, s21); s22 = float.MultiplyAddEstimate(pa2.X, q0.Z, s22); s23 = float.MultiplyAddEstimate(pa2.X, q0.W, s23);
+            s20 = float.MultiplyAddEstimate(pa2.Y, q1.X, s20); s21 = float.MultiplyAddEstimate(pa2.Y, q1.Y, s21); s22 = float.MultiplyAddEstimate(pa2.Y, q1.Z, s22); s23 = float.MultiplyAddEstimate(pa2.Y, q1.W, s23);
+            s20 = float.MultiplyAddEstimate(pa2.Z, q2.X, s20); s21 = float.MultiplyAddEstimate(pa2.Z, q2.Y, s21); s22 = float.MultiplyAddEstimate(pa2.Z, q2.Z, s22); s23 = float.MultiplyAddEstimate(pa2.Z, q2.W, s23);
+            s20 = float.MultiplyAddEstimate(pa2.W, q3.X, s20); s21 = float.MultiplyAddEstimate(pa2.W, q3.Y, s21); s22 = float.MultiplyAddEstimate(pa2.W, q3.Z, s22); s23 = float.MultiplyAddEstimate(pa2.W, q3.W, s23);
+            s20 = float.MultiplyAddEstimate(pc2.X, q4.X, s20); s21 = float.MultiplyAddEstimate(pc2.X, q4.Y, s21); s22 = float.MultiplyAddEstimate(pc2.X, q4.Z, s22); s23 = float.MultiplyAddEstimate(pc2.X, q4.W, s23);
+            s20 = float.MultiplyAddEstimate(pc2.Y, q5.X, s20); s21 = float.MultiplyAddEstimate(pc2.Y, q5.Y, s21); s22 = float.MultiplyAddEstimate(pc2.Y, q5.Z, s22); s23 = float.MultiplyAddEstimate(pc2.Y, q5.W, s23);
+            s20 = float.MultiplyAddEstimate(pc2.Z, q6.X, s20); s21 = float.MultiplyAddEstimate(pc2.Z, q6.Y, s21); s22 = float.MultiplyAddEstimate(pc2.Z, q6.Z, s22); s23 = float.MultiplyAddEstimate(pc2.Z, q6.W, s23);
+            s20 = float.MultiplyAddEstimate(pc2.W, q7.X, s20); s21 = float.MultiplyAddEstimate(pc2.W, q7.Y, s21); s22 = float.MultiplyAddEstimate(pc2.W, q7.Z, s22); s23 = float.MultiplyAddEstimate(pc2.W, q7.W, s23);
+            s30 = float.MultiplyAddEstimate(pa3.X, q0.X, s30); s31 = float.MultiplyAddEstimate(pa3.X, q0.Y, s31); s32 = float.MultiplyAddEstimate(pa3.X, q0.Z, s32); s33 = float.MultiplyAddEstimate(pa3.X, q0.W, s33);
+            s30 = float.MultiplyAddEstimate(pa3.Y, q1.X, s30); s31 = float.MultiplyAddEstimate(pa3.Y, q1.Y, s31); s32 = float.MultiplyAddEstimate(pa3.Y, q1.Z, s32); s33 = float.MultiplyAddEstimate(pa3.Y, q1.W, s33);
+            s30 = float.MultiplyAddEstimate(pa3.Z, q2.X, s30); s31 = float.MultiplyAddEstimate(pa3.Z, q2.Y, s31); s32 = float.MultiplyAddEstimate(pa3.Z, q2.Z, s32); s33 = float.MultiplyAddEstimate(pa3.Z, q2.W, s33);
+            s30 = float.MultiplyAddEstimate(pa3.W, q3.X, s30); s31 = float.MultiplyAddEstimate(pa3.W, q3.Y, s31); s32 = float.MultiplyAddEstimate(pa3.W, q3.Z, s32); s33 = float.MultiplyAddEstimate(pa3.W, q3.W, s33);
+            s30 = float.MultiplyAddEstimate(pc3.X, q4.X, s30); s31 = float.MultiplyAddEstimate(pc3.X, q4.Y, s31); s32 = float.MultiplyAddEstimate(pc3.X, q4.Z, s32); s33 = float.MultiplyAddEstimate(pc3.X, q4.W, s33);
+            s30 = float.MultiplyAddEstimate(pc3.Y, q5.X, s30); s31 = float.MultiplyAddEstimate(pc3.Y, q5.Y, s31); s32 = float.MultiplyAddEstimate(pc3.Y, q5.Z, s32); s33 = float.MultiplyAddEstimate(pc3.Y, q5.W, s33);
+            s30 = float.MultiplyAddEstimate(pc3.Z, q6.X, s30); s31 = float.MultiplyAddEstimate(pc3.Z, q6.Y, s31); s32 = float.MultiplyAddEstimate(pc3.Z, q6.Z, s32); s33 = float.MultiplyAddEstimate(pc3.Z, q6.W, s33);
+            s30 = float.MultiplyAddEstimate(pc3.W, q7.X, s30); s31 = float.MultiplyAddEstimate(pc3.W, q7.Y, s31); s32 = float.MultiplyAddEstimate(pc3.W, q7.Z, s32); s33 = float.MultiplyAddEstimate(pc3.W, q7.W, s33);
         }
         if (m0 + 0 < M)
         {
@@ -449,7 +449,7 @@ public sealed partial class BackwardKernels
         int m = i / R, r = i - m * R;
         long pb = (long)m * K;
         float s = 0f;
-        for (int k = 0; k < K; k++) s += P[pb + k] * (qLayout == 0 ? Q[(long)k * R + r] : Q[(long)r * K + k]);
+        for (int k = 0; k < K; k++) s = float.MultiplyAddEstimate(P[pb + k], (qLayout == 0 ? Q[(long)k * R + r] : Q[(long)r * K + k]), s);
         outp[i] = s * scale;
     }
 
@@ -458,7 +458,7 @@ public sealed partial class BackwardKernels
         int m = i / N, n = i - m * N;
         long pb = (long)m * R;
         float s = 0f;
-        for (int r = 0; r < R; r++) s += P[pb + r] * Q[(long)r * N + n];
+        for (int r = 0; r < R; r++) s = float.MultiplyAddEstimate(P[pb + r], Q[(long)r * N + n], s);
         float v = s * scale;
         outp[i] = hasBase != 0 ? bas[i] + v : v;
     }
@@ -468,7 +468,7 @@ public sealed partial class BackwardKernels
         int r, n;
         if (transpose != 0) { n = i / R; r = i - n * R; } else { r = i / N; n = i - r * N; }
         float s = 0f;
-        for (int m = 0; m < M; m++) s += P[(long)m * R + r] * Q[(long)m * N + n];
+        for (int m = 0; m < M; m++) s = float.MultiplyAddEstimate(P[(long)m * R + r], Q[(long)m * N + n], s);
         outp[i] = s * scale;
     }
 

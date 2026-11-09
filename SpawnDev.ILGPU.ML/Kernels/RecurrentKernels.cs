@@ -155,10 +155,10 @@ public sealed class RecurrentKernels
         for (int k = 0; k < inputSize; k++)
         {
             float xv = x[xBase + k];
-            gi += xv * w[wi + k];
-            go += xv * w[wo + k];
-            gf += xv * w[wf + k];
-            gc += xv * w[wc + k];
+            gi = float.MultiplyAddEstimate(xv, w[wi + k], gi);
+            go = float.MultiplyAddEstimate(xv, w[wo + k], go);
+            gf = float.MultiplyAddEstimate(xv, w[wf + k], gf);
+            gc = float.MultiplyAddEstimate(xv, w[wc + k], gc);
         }
 
         // Ht-1 * R^T.
@@ -170,17 +170,17 @@ public sealed class RecurrentKernels
         for (int k = 0; k < H; k++)
         {
             float hv = hIn[hBase + k];
-            gi += hv * r[ri + k];
-            go += hv * r[ro + k];
-            gf += hv * r[rf + k];
-            gc += hv * r[rc + k];
+            gi = float.MultiplyAddEstimate(hv, r[ri + k], gi);
+            go = float.MultiplyAddEstimate(hv, r[ro + k], go);
+            gf = float.MultiplyAddEstimate(hv, r[rf + k], gf);
+            gc = float.MultiplyAddEstimate(hv, r[rc + k], gc);
         }
 
         float cPrev = cIn[hBase + hi];
         if (hasPeep)
         {
-            gi += p[pOff + hi] * cPrev;
-            gf += p[pOff + 2 * H + hi] * cPrev;
+            gi = float.MultiplyAddEstimate(p[pOff + hi], cPrev, gi);
+            gf = float.MultiplyAddEstimate(p[pOff + 2 * H + hi], cPrev, gf);
         }
 
         float it = 1f / (1f + XMath.Exp(-gi));
@@ -188,7 +188,7 @@ public sealed class RecurrentKernels
         float newC = ft * cPrev + it * XMath.Tanh(gc);
 
         // The output gate's peephole reads the NEW cell, not the previous one.
-        if (hasPeep) go += p[pOff + H + hi] * newC;
+        if (hasPeep) go = float.MultiplyAddEstimate(p[pOff + H + hi], newC, go);
         float ot = 1f / (1f + XMath.Exp(-go));
         float newH = ot * XMath.Tanh(newC);
 

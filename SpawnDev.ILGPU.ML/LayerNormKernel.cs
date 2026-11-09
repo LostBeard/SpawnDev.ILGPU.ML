@@ -184,7 +184,7 @@ public class LayerNormKernel : IDisposable
             double delta = x - mean;
             mean += delta / (i + 1);
             double delta2 = x - mean;
-            m2 += delta * delta2;
+            m2 = double.MultiplyAddEstimate(delta, delta2, m2);
         }
         means[row] = (float)mean;
         invStds[row] = 1f / MathF.Sqrt((float)(m2 / C) + epsilon);

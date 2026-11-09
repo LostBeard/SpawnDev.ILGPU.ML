@@ -247,7 +247,7 @@ public sealed class LoraRuntime : IDisposable
         int row = g / rank, r = g - row * rank;
         int xb = row * fin;
         float s = 0f;
-        for (int i = tid; i < fin; i += DownGroup) s += x[xb + i] * aT[i * rank + r];
+        for (int i = tid; i < fin; i += DownGroup) s = float.MultiplyAddEstimate(x[xb + i], aT[i * rank + r], s);
         sh[tid] = s;
         Group.Barrier();
         for (int w = DownGroup / 2; w > 0; w >>= 1)
@@ -265,7 +265,7 @@ public sealed class LoraRuntime : IDisposable
         int row = idx / rank, r = idx - row * rank;
         int xb = row * fin;
         float s = 0f;
-        for (int i = 0; i < fin; i++) s += x[xb + i] * aT[i * rank + r];
+        for (int i = 0; i < fin; i++) s = float.MultiplyAddEstimate(x[xb + i], aT[i * rank + r], s);
         t[idx] = s;
     }
 
@@ -277,9 +277,9 @@ public sealed class LoraRuntime : IDisposable
         int part = j < d.E1 ? 0 : j < d.E2 ? 1 : 2;
         int tb = row * d.TStride + part * d.Rank;
         float s = 0f;
-        for (int r = 0; r < d.Rank; r++) s += t[tb + r] * bT[r * d.Out + j];
+        for (int r = 0; r < d.Rank; r++) s = float.MultiplyAddEstimate(t[tb + r], bT[r * d.Out + j], s);
         int oi = row * d.RowStride + d.ColOffset + j;
-        o[oi] = o[oi] + d.Scale * s;
+        o[oi] = float.MultiplyAddEstimate(d.Scale, s, o[oi]);
     }
 
     /// <inheritdoc/>

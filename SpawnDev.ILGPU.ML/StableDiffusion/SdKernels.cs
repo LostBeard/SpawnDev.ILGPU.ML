@@ -250,7 +250,7 @@ public sealed class SdKernels
         {
             long kb = (long)j * 3 * C + C + h * D;
             float s = 0f;
-            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], s);
             s *= scale;
             mx = s > mx ? s : mx;
         }
@@ -259,7 +259,7 @@ public sealed class SdKernels
         {
             long kb = (long)j * 3 * C + C + h * D;
             float s = 0f;
-            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], s);
             sum += XMath.Exp(s * scale - mx);
         }
         stats[ii * 2] = mx; stats[ii * 2 + 1] = sum;
@@ -274,7 +274,7 @@ public sealed class SdKernels
         {
             long qb = (long)i * 3 * C + h * D;
             float s = 0f;
-            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], s);
             int r = h * N + i;
             acc += XMath.Exp(s * scale - stats[r * 2]) / stats[r * 2 + 1];
         }
@@ -322,7 +322,7 @@ public sealed class SdKernels
         int n = i / K, k = i % K;
         int kk = taps > 1 ? (k % cin) * taps + k / cin : k;
         float acc = 0f;
-        for (int r = 0; r < rank; r++) acc += PrecisionConvert.ConvertToSingle(up[(long)n * rank + r]) * PrecisionConvert.ConvertToSingle(down[(long)r * K + kk]);
+        for (int r = 0; r < rank; r++) acc = float.MultiplyAddEstimate(PrecisionConvert.ConvertToSingle(up[(long)n * rank + r]), PrecisionConvert.ConvertToSingle(down[(long)r * K + kk]), acc);
         long wi = (long)(rowOff + n) * cols + k;
         w[wi] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(PrecisionConvert.ConvertToSingle(w[wi]) + scale * acc);
     }
@@ -444,7 +444,7 @@ public sealed class SdKernels
             {
                 float th = -6.28318530718f * ((float)(k * m) / H + (float)(l * n) / W);
                 float v = x[((long)m * W + n) * C + c];
-                re += v * XMath.Cos(th); im += v * XMath.Sin(th);
+                re = float.MultiplyAddEstimate(v, XMath.Cos(th), re); im = float.MultiplyAddEstimate(v, XMath.Sin(th), im);
             }
         coef[ii * 2] = re; coef[ii * 2 + 1] = im;
     }
@@ -461,7 +461,7 @@ public sealed class SdKernels
             float re = coef[(c * 4 + f) * 2], im = coef[(c * 4 + f) * 2 + 1];
             add += re * XMath.Cos(th) - im * XMath.Sin(th);
         }
-        x[i] = x[i] + (s - 1f) / (H * W) * add;
+        x[i] = float.MultiplyAddEstimate((s - 1f) / (H * W), add, x[i]);
     }
     /// <summary>ComfyUI's Fourier_filter(x, threshold 1, scale) in place on channel-last [H * W, C]. <paramref name="scratch"/> holds C * 8 floats.</summary>
     public void FreeUFourier(FV x, int H, int W, int C, float scale, FV scratch)
@@ -524,7 +524,7 @@ public sealed class SdKernels
                 float wy = a == 0 ? wy0 : a == 1 ? wy1 : a == 2 ? wy2 : wy3;
                 long row = (long)yy * inW;
                 int xa = XMath.Clamp(fx - 1, 0, inW - 1), xb = XMath.Clamp(fx, 0, inW - 1), xc = XMath.Clamp(fx + 1, 0, inW - 1), xd = XMath.Clamp(fx + 2, 0, inW - 1);
-                v += wy * (wx0 * src[(row + xa) * C + c] + wx1 * src[(row + xb) * C + c] + wx2 * src[(row + xc) * C + c] + wx3 * src[(row + xd) * C + c]);
+                v = float.MultiplyAddEstimate(wy, (wx0 * src[(row + xa) * C + c] + wx1 * src[(row + xb) * C + c] + wx2 * src[(row + xc) * C + c] + wx3 * src[(row + xd) * C + c]), v);
             }
         }
         dst[i] = v;
@@ -573,13 +573,13 @@ public sealed class SdKernels
         BislerpCoords(o, inLen, outLen, out int i1, out int i2, out float r);
         long p1 = ((long)(a * inLen + i1) * B + b) * C, p2 = ((long)(a * inLen + i2) * B + b) * C;
         float n1 = 0f, n2 = 0f;
-        for (int c = 0; c < C; c++) { float x = src[p1 + c], y = src[p2 + c]; n1 += x * x; n2 += y * y; }
+        for (int c = 0; c < C; c++) { float x = src[p1 + c], y = src[p2 + c]; n1 = float.MultiplyAddEstimate(x, x, n1); n2 = float.MultiplyAddEstimate(y, y, n2); }
         n1 = XMath.Sqrt(n1); n2 = XMath.Sqrt(n2);
         float dot = 0f;
         for (int c = 0; c < C; c++)
         {
             float x = n1 == 0f ? 0f : src[p1 + c] / n1, y = n2 == 0f ? 0f : src[p2 + c] / n2;
-            dot += x * y;
+            dot = float.MultiplyAddEstimate(x, y, dot);
         }
         float omega = XMath.Acos(dot), so = XMath.Sin(omega);
         float w1 = XMath.Sin((1f - r) * omega) / so, w2 = XMath.Sin(r * omega) / so;
@@ -671,7 +671,7 @@ public sealed class SdKernels
 
     // x += a * y (the ControlNet residuals, times their strength)
     private Action<Index1D, FV, FV, float>? _axpy;
-    private static void AxpyImpl(Index1D i, FV x, FV y, float a) => x[i] = x[i] + a * y[i];
+    private static void AxpyImpl(Index1D i, FV x, FV y, float a) => x[i] = float.MultiplyAddEstimate(a, y[i], x[i]);
     public void AxpyInPlace(FV x, FV y, float a, long count)
     {
         _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
@@ -715,7 +715,7 @@ public sealed class SdKernels
         {
             long kb = (long)j * 3 * C + C + h * D;
             float s = 0f;
-            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], s);
             mx = MathF.Max(mx, s * scale);
         }
         float sum = 0f;
@@ -725,10 +725,10 @@ public sealed class SdKernels
         {
             long kb = (long)j * 3 * C + C + h * D, vb = kb + C;
             float s = 0f;
-            for (int d = 0; d < D; d++) s += qkv[qb + d] * qkv[kb + d];
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], s);
             float p = MathF.Exp(s * scale - mx);
             sum += p;
-            for (int d = 0; d < D; d++) o[ob + d] += p * qkv[vb + d];
+            for (int d = 0; d < D; d++) o[ob + d] = float.MultiplyAddEstimate(p, qkv[vb + d], o[ob + d]);
         }
         float inv = 1f / sum;
         for (int d = 0; d < D; d++) o[ob + d] *= inv;

@@ -2015,7 +2015,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 if (live)
                 {
                     float acc = 0f;
-                    for (int d = 0; d < D; d++) acc += qs[ti * D + d] * kv[tc * D + d];
+                    for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(qs[ti * D + d], kv[tc * D + d], acc);
                     sc = acc;
                 }
                 ps[ti * FaKeys + tc] = sc;
@@ -2046,7 +2046,7 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 int i = idx / D, d = idx % D;
                 float o = os[idx] * st[2 * FaRows + i];
-                for (int c = 0; c < FaKeys; c++) o += ps[i * FaKeys + c] * kv[c * D + d];
+                for (int c = 0; c < FaKeys; c++) o = float.MultiplyAddEstimate(ps[i * FaKeys + c], kv[c * D + d], o);
                 os[idx] = o;
             }
             Group.Barrier();
@@ -2102,10 +2102,10 @@ public sealed class GgufBatchDecoder : IDisposable
                 for (int d = 0; d < FgDc; d++)
                 {
                     float qv = sh[qb + d];
-                    s0 += qv * sh[kb + d];
-                    s1 += qv * sh[kb + FgPad + d];
-                    s2 += qv * sh[kb + 2 * FgPad + d];
-                    s3 += qv * sh[kb + 3 * FgPad + d];
+                    s0 = float.MultiplyAddEstimate(qv, sh[kb + d], s0);
+                    s1 = float.MultiplyAddEstimate(qv, sh[kb + FgPad + d], s1);
+                    s2 = float.MultiplyAddEstimate(qv, sh[kb + 2 * FgPad + d], s2);
+                    s3 = float.MultiplyAddEstimate(qv, sh[kb + 3 * FgPad + d], s3);
                 }
                 Group.Barrier();
             }
@@ -2162,7 +2162,7 @@ public sealed class GgufBatchDecoder : IDisposable
         FgStore(att, o3, sh[FgSL + oq + 3], oq + 3, G, nv, rowsHere, r0, hk, H, D, dl);
     }
     private static FgAcc FgScale(FgAcc a, float c) { a.X *= c; a.Y *= c; a.Z *= c; a.W *= c; return a; }
-    private static FgAcc FgMac(FgAcc a, float pr, float v0, float v1, float v2, float v3) { a.X += pr * v0; a.Y += pr * v1; a.Z += pr * v2; a.W += pr * v3; return a; }
+    private static FgAcc FgMac(FgAcc a, float pr, float v0, float v1, float v2, float v3) { a.X = float.MultiplyAddEstimate(pr, v0, a.X); a.Y = float.MultiplyAddEstimate(pr, v1, a.Y); a.Z = float.MultiplyAddEstimate(pr, v2, a.Z); a.W = float.MultiplyAddEstimate(pr, v3, a.W); return a; }
     private static void FgStore(FV att, FgAcc a, float l, int v, int G, int nv, int rowsHere, int r0, int hk, int H, int D, int dl)
     {
         int row = v / G;
@@ -2199,7 +2199,7 @@ public sealed class GgufBatchDecoder : IDisposable
             {
                 int ko = j * kvC + hk * D;
                 float acc = 0f;
-                for (int d = 0; d < D; d++) acc += q[qo + d] * PrecisionConvert.ConvertToSingle(kq[ko + d]);
+                for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(q[qo + d], PrecisionConvert.ConvertToSingle(kq[ko + d]), acc);
                 s = acc * scale;
             }
             sc[jj] = s;
@@ -2233,7 +2233,7 @@ public sealed class GgufBatchDecoder : IDisposable
         int keys = Math.Min(AttChunk, pos + 1 - j0);
         float o = 0f;
         int vo = hk * D + t;
-        for (int jj = 0; jj < keys; jj++) o += sc[jj] * PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
+        for (int jj = 0; jj < keys; jj++) o = float.MultiplyAddEstimate(sc[jj], PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]), o);
         part[(long)g * D + t] = o;
         if (t == 0) { ml[2L * g] = m; ml[2L * g + 1] = l; }
     }
@@ -2271,14 +2271,14 @@ public sealed class GgufBatchDecoder : IDisposable
                 for (int d = 0; d < D; d++)
                 {
                     float kv = PrecisionConvert.ConvertToSingle(kq[ko + d]);
-                    s0 += qs[d] * kv;
-                    if (G > 1) s1 += qs[D + d] * kv;
-                    if (G > 2) s2 += qs[2 * D + d] * kv;
-                    if (G > 3) s3 += qs[3 * D + d] * kv;
-                    if (G > 4) s4 += qs[4 * D + d] * kv;
-                    if (G > 5) s5 += qs[5 * D + d] * kv;
-                    if (G > 6) s6 += qs[6 * D + d] * kv;
-                    if (G > 7) s7 += qs[7 * D + d] * kv;
+                    s0 = float.MultiplyAddEstimate(qs[d], kv, s0);
+                    if (G > 1) s1 = float.MultiplyAddEstimate(qs[D + d], kv, s1);
+                    if (G > 2) s2 = float.MultiplyAddEstimate(qs[2 * D + d], kv, s2);
+                    if (G > 3) s3 = float.MultiplyAddEstimate(qs[3 * D + d], kv, s3);
+                    if (G > 4) s4 = float.MultiplyAddEstimate(qs[4 * D + d], kv, s4);
+                    if (G > 5) s5 = float.MultiplyAddEstimate(qs[5 * D + d], kv, s5);
+                    if (G > 6) s6 = float.MultiplyAddEstimate(qs[6 * D + d], kv, s6);
+                    if (G > 7) s7 = float.MultiplyAddEstimate(qs[7 * D + d], kv, s7);
                 }
             }
             sc[jj] = live ? s0 * scale : -1e30f;
@@ -2338,14 +2338,14 @@ public sealed class GgufBatchDecoder : IDisposable
         for (int jj = 0; jj < keys; jj++)
         {
             float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
-            o0 += sc[jj] * v;
-            if (G > 1) o1 += sc[AttChunk + jj] * v;
-            if (G > 2) o2 += sc[2 * AttChunk + jj] * v;
-            if (G > 3) o3 += sc[3 * AttChunk + jj] * v;
-            if (G > 4) o4 += sc[4 * AttChunk + jj] * v;
-            if (G > 5) o5 += sc[5 * AttChunk + jj] * v;
-            if (G > 6) o6 += sc[6 * AttChunk + jj] * v;
-            if (G > 7) o7 += sc[7 * AttChunk + jj] * v;
+            o0 = float.MultiplyAddEstimate(sc[jj], v, o0);
+            if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + jj], v, o1);
+            if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + jj], v, o2);
+            if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + jj], v, o3);
+            if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + jj], v, o4);
+            if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + jj], v, o5);
+            if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + jj], v, o6);
+            if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + jj], v, o7);
         }
         long pb = ((long)r * H + hk * G) * nch + ch;
         part[pb * D + t] = o0;
@@ -2486,14 +2486,14 @@ public sealed class GgufBatchDecoder : IDisposable
         for (int jj = 0; jj < keys; jj++)
         {
             float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
-            o0 += sc[jj] * v;
-            if (G > 1) o1 += sc[AttChunk + jj] * v;
-            if (G > 2) o2 += sc[2 * AttChunk + jj] * v;
-            if (G > 3) o3 += sc[3 * AttChunk + jj] * v;
-            if (G > 4) o4 += sc[4 * AttChunk + jj] * v;
-            if (G > 5) o5 += sc[5 * AttChunk + jj] * v;
-            if (G > 6) o6 += sc[6 * AttChunk + jj] * v;
-            if (G > 7) o7 += sc[7 * AttChunk + jj] * v;
+            o0 = float.MultiplyAddEstimate(sc[jj], v, o0);
+            if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + jj], v, o1);
+            if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + jj], v, o2);
+            if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + jj], v, o3);
+            if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + jj], v, o4);
+            if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + jj], v, o5);
+            if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + jj], v, o6);
+            if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + jj], v, o7);
         }
         long pb = ((long)r * H + hk * G) * nch + ch;
         part[pb * D + t] = o0;
@@ -2549,14 +2549,14 @@ public sealed class GgufBatchDecoder : IDisposable
                 {
                     float k0 = PrecisionConvert.ConvertToSingle(kq[ko + d + 0]); float k1 = PrecisionConvert.ConvertToSingle(kq[ko + d + 1]); float k2 = PrecisionConvert.ConvertToSingle(kq[ko + d + 2]); float k3 = PrecisionConvert.ConvertToSingle(kq[ko + d + 3]);
                     float k4 = PrecisionConvert.ConvertToSingle(kq[ko + d + 4]); float k5 = PrecisionConvert.ConvertToSingle(kq[ko + d + 5]); float k6 = PrecisionConvert.ConvertToSingle(kq[ko + d + 6]); float k7 = PrecisionConvert.ConvertToSingle(kq[ko + d + 7]);
-                    s0 += qs[d + 0] * k0; s0 += qs[d + 1] * k1; s0 += qs[d + 2] * k2; s0 += qs[d + 3] * k3; s0 += qs[d + 4] * k4; s0 += qs[d + 5] * k5; s0 += qs[d + 6] * k6; s0 += qs[d + 7] * k7;
-                    if (G > 1) { s1 += qs[D + d + 0] * k0; s1 += qs[D + d + 1] * k1; s1 += qs[D + d + 2] * k2; s1 += qs[D + d + 3] * k3; s1 += qs[D + d + 4] * k4; s1 += qs[D + d + 5] * k5; s1 += qs[D + d + 6] * k6; s1 += qs[D + d + 7] * k7; }
-                    if (G > 2) { s2 += qs[2 * D + d + 0] * k0; s2 += qs[2 * D + d + 1] * k1; s2 += qs[2 * D + d + 2] * k2; s2 += qs[2 * D + d + 3] * k3; s2 += qs[2 * D + d + 4] * k4; s2 += qs[2 * D + d + 5] * k5; s2 += qs[2 * D + d + 6] * k6; s2 += qs[2 * D + d + 7] * k7; }
-                    if (G > 3) { s3 += qs[3 * D + d + 0] * k0; s3 += qs[3 * D + d + 1] * k1; s3 += qs[3 * D + d + 2] * k2; s3 += qs[3 * D + d + 3] * k3; s3 += qs[3 * D + d + 4] * k4; s3 += qs[3 * D + d + 5] * k5; s3 += qs[3 * D + d + 6] * k6; s3 += qs[3 * D + d + 7] * k7; }
-                    if (G > 4) { s4 += qs[4 * D + d + 0] * k0; s4 += qs[4 * D + d + 1] * k1; s4 += qs[4 * D + d + 2] * k2; s4 += qs[4 * D + d + 3] * k3; s4 += qs[4 * D + d + 4] * k4; s4 += qs[4 * D + d + 5] * k5; s4 += qs[4 * D + d + 6] * k6; s4 += qs[4 * D + d + 7] * k7; }
-                    if (G > 5) { s5 += qs[5 * D + d + 0] * k0; s5 += qs[5 * D + d + 1] * k1; s5 += qs[5 * D + d + 2] * k2; s5 += qs[5 * D + d + 3] * k3; s5 += qs[5 * D + d + 4] * k4; s5 += qs[5 * D + d + 5] * k5; s5 += qs[5 * D + d + 6] * k6; s5 += qs[5 * D + d + 7] * k7; }
-                    if (G > 6) { s6 += qs[6 * D + d + 0] * k0; s6 += qs[6 * D + d + 1] * k1; s6 += qs[6 * D + d + 2] * k2; s6 += qs[6 * D + d + 3] * k3; s6 += qs[6 * D + d + 4] * k4; s6 += qs[6 * D + d + 5] * k5; s6 += qs[6 * D + d + 6] * k6; s6 += qs[6 * D + d + 7] * k7; }
-                    if (G > 7) { s7 += qs[7 * D + d + 0] * k0; s7 += qs[7 * D + d + 1] * k1; s7 += qs[7 * D + d + 2] * k2; s7 += qs[7 * D + d + 3] * k3; s7 += qs[7 * D + d + 4] * k4; s7 += qs[7 * D + d + 5] * k5; s7 += qs[7 * D + d + 6] * k6; s7 += qs[7 * D + d + 7] * k7; }
+                    s0 = float.MultiplyAddEstimate(qs[d + 0], k0, s0); s0 = float.MultiplyAddEstimate(qs[d + 1], k1, s0); s0 = float.MultiplyAddEstimate(qs[d + 2], k2, s0); s0 = float.MultiplyAddEstimate(qs[d + 3], k3, s0); s0 = float.MultiplyAddEstimate(qs[d + 4], k4, s0); s0 = float.MultiplyAddEstimate(qs[d + 5], k5, s0); s0 = float.MultiplyAddEstimate(qs[d + 6], k6, s0); s0 = float.MultiplyAddEstimate(qs[d + 7], k7, s0);
+                    if (G > 1) { s1 = float.MultiplyAddEstimate(qs[D + d + 0], k0, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 1], k1, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 2], k2, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 3], k3, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 4], k4, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 5], k5, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 6], k6, s1); s1 = float.MultiplyAddEstimate(qs[D + d + 7], k7, s1); }
+                    if (G > 2) { s2 = float.MultiplyAddEstimate(qs[2 * D + d + 0], k0, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 1], k1, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 2], k2, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 3], k3, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 4], k4, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 5], k5, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 6], k6, s2); s2 = float.MultiplyAddEstimate(qs[2 * D + d + 7], k7, s2); }
+                    if (G > 3) { s3 = float.MultiplyAddEstimate(qs[3 * D + d + 0], k0, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 1], k1, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 2], k2, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 3], k3, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 4], k4, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 5], k5, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 6], k6, s3); s3 = float.MultiplyAddEstimate(qs[3 * D + d + 7], k7, s3); }
+                    if (G > 4) { s4 = float.MultiplyAddEstimate(qs[4 * D + d + 0], k0, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 1], k1, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 2], k2, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 3], k3, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 4], k4, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 5], k5, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 6], k6, s4); s4 = float.MultiplyAddEstimate(qs[4 * D + d + 7], k7, s4); }
+                    if (G > 5) { s5 = float.MultiplyAddEstimate(qs[5 * D + d + 0], k0, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 1], k1, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 2], k2, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 3], k3, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 4], k4, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 5], k5, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 6], k6, s5); s5 = float.MultiplyAddEstimate(qs[5 * D + d + 7], k7, s5); }
+                    if (G > 6) { s6 = float.MultiplyAddEstimate(qs[6 * D + d + 0], k0, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 1], k1, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 2], k2, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 3], k3, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 4], k4, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 5], k5, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 6], k6, s6); s6 = float.MultiplyAddEstimate(qs[6 * D + d + 7], k7, s6); }
+                    if (G > 7) { s7 = float.MultiplyAddEstimate(qs[7 * D + d + 0], k0, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 1], k1, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 2], k2, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 3], k3, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 4], k4, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 5], k5, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 6], k6, s7); s7 = float.MultiplyAddEstimate(qs[7 * D + d + 7], k7, s7); }
                 }
             }
             sc[jj] = live ? s0 * scale : -1e30f;
@@ -2619,26 +2619,26 @@ public sealed class GgufBatchDecoder : IDisposable
         {
             int vb = vo + (j0 + kj) * kvC;
             float v0 = PrecisionConvert.ConvertToSingle(vq[vb]), v1 = PrecisionConvert.ConvertToSingle(vq[vb + kvC]), v2 = PrecisionConvert.ConvertToSingle(vq[vb + 2 * kvC]), v3 = PrecisionConvert.ConvertToSingle(vq[vb + 3 * kvC]);
-            o0 += sc[kj + 0] * v0; o0 += sc[kj + 1] * v1; o0 += sc[kj + 2] * v2; o0 += sc[kj + 3] * v3;
-            if (G > 1) { o1 += sc[AttChunk + kj + 0] * v0; o1 += sc[AttChunk + kj + 1] * v1; o1 += sc[AttChunk + kj + 2] * v2; o1 += sc[AttChunk + kj + 3] * v3; }
-            if (G > 2) { o2 += sc[2 * AttChunk + kj + 0] * v0; o2 += sc[2 * AttChunk + kj + 1] * v1; o2 += sc[2 * AttChunk + kj + 2] * v2; o2 += sc[2 * AttChunk + kj + 3] * v3; }
-            if (G > 3) { o3 += sc[3 * AttChunk + kj + 0] * v0; o3 += sc[3 * AttChunk + kj + 1] * v1; o3 += sc[3 * AttChunk + kj + 2] * v2; o3 += sc[3 * AttChunk + kj + 3] * v3; }
-            if (G > 4) { o4 += sc[4 * AttChunk + kj + 0] * v0; o4 += sc[4 * AttChunk + kj + 1] * v1; o4 += sc[4 * AttChunk + kj + 2] * v2; o4 += sc[4 * AttChunk + kj + 3] * v3; }
-            if (G > 5) { o5 += sc[5 * AttChunk + kj + 0] * v0; o5 += sc[5 * AttChunk + kj + 1] * v1; o5 += sc[5 * AttChunk + kj + 2] * v2; o5 += sc[5 * AttChunk + kj + 3] * v3; }
-            if (G > 6) { o6 += sc[6 * AttChunk + kj + 0] * v0; o6 += sc[6 * AttChunk + kj + 1] * v1; o6 += sc[6 * AttChunk + kj + 2] * v2; o6 += sc[6 * AttChunk + kj + 3] * v3; }
-            if (G > 7) { o7 += sc[7 * AttChunk + kj + 0] * v0; o7 += sc[7 * AttChunk + kj + 1] * v1; o7 += sc[7 * AttChunk + kj + 2] * v2; o7 += sc[7 * AttChunk + kj + 3] * v3; }
+            o0 = float.MultiplyAddEstimate(sc[kj + 0], v0, o0); o0 = float.MultiplyAddEstimate(sc[kj + 1], v1, o0); o0 = float.MultiplyAddEstimate(sc[kj + 2], v2, o0); o0 = float.MultiplyAddEstimate(sc[kj + 3], v3, o0);
+            if (G > 1) { o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 0], v0, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 1], v1, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 2], v2, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 3], v3, o1); }
+            if (G > 2) { o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 0], v0, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 1], v1, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 2], v2, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 3], v3, o2); }
+            if (G > 3) { o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 0], v0, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 1], v1, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 2], v2, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 3], v3, o3); }
+            if (G > 4) { o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 0], v0, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 1], v1, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 2], v2, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 3], v3, o4); }
+            if (G > 5) { o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 0], v0, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 1], v1, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 2], v2, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 3], v3, o5); }
+            if (G > 6) { o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 0], v0, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 1], v1, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 2], v2, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 3], v3, o6); }
+            if (G > 7) { o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 0], v0, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 1], v1, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 2], v2, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 3], v3, o7); }
         }
         for (; kj < keys; kj++)
         {
             float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + kj) * kvC]);
-            o0 += sc[kj] * v;
-            if (G > 1) o1 += sc[AttChunk + kj] * v;
-            if (G > 2) o2 += sc[2 * AttChunk + kj] * v;
-            if (G > 3) o3 += sc[3 * AttChunk + kj] * v;
-            if (G > 4) o4 += sc[4 * AttChunk + kj] * v;
-            if (G > 5) o5 += sc[5 * AttChunk + kj] * v;
-            if (G > 6) o6 += sc[6 * AttChunk + kj] * v;
-            if (G > 7) o7 += sc[7 * AttChunk + kj] * v;
+            o0 = float.MultiplyAddEstimate(sc[kj], v, o0);
+            if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + kj], v, o1);
+            if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj], v, o2);
+            if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj], v, o3);
+            if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj], v, o4);
+            if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj], v, o5);
+            if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj], v, o6);
+            if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj], v, o7);
         }
         long pb = ((long)r * H + hk * G) * nch + ch;
         part[pb * D + t] = o0;
@@ -2677,7 +2677,7 @@ public sealed class GgufBatchDecoder : IDisposable
         for (int c = 0; c < live; c++)
         {
             float lc = ml[2 * (g0 + c) + 1];
-            if (lc > 0f) { float w = MathF.Exp(ml[2 * (g0 + c)] - M); num += w * part[(g0 + c) * D + d]; den += w * lc; }
+            if (lc > 0f) { float w = MathF.Exp(ml[2 * (g0 + c)] - M); num = float.MultiplyAddEstimate(w, part[(g0 + c) * D + d], num); den = float.MultiplyAddEstimate(w, lc, den); }
         }
         o[ii] = num / den;
     }
@@ -2742,7 +2742,7 @@ public sealed class GgufBatchDecoder : IDisposable
             int kvC = kvH * D, hk = h / (H / kvH);
             long qo = (long)r * H * D + h * D, ko = ((long)seq * maxSeq + j) * kvC + hk * D;
             float acc = 0f;
-            for (int d = 0; d < D; d++) acc += q[qo + d] * PrecisionConvert.ConvertToSingle(kc[ko + d]);
+            for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(q[qo + d], PrecisionConvert.ConvertToSingle(kc[ko + d]), acc);
             s = acc * scale;
         }
         scores[ii] = s;
@@ -2771,7 +2771,7 @@ public sealed class GgufBatchDecoder : IDisposable
         int seq = mode == 0 ? 0 : seqs[r], kvC = kvH * D, hk = h / (H / kvH);
         long so = ((long)h * R + r) * nk, vo = (long)seq * maxSeq * kvC + hk * D + d;
         float acc = 0f;
-        for (int j = 0; j < nk; j++) acc += scores[so + j] * PrecisionConvert.ConvertToSingle(vc[vo + (long)j * kvC]);
+        for (int j = 0; j < nk; j++) acc = float.MultiplyAddEstimate(scores[so + j], PrecisionConvert.ConvertToSingle(vc[vo + (long)j * kvC]), acc);
         o[ii] = acc;
     }
 

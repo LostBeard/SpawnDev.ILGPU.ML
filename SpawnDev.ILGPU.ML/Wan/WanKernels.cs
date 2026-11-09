@@ -42,7 +42,7 @@ public sealed class WanKernels
     {
         long r = (long)(int)t * C;
         float sa = 0f, sb = 0f;
-        for (int c = 0; c < C; c++) { float x = a[r + c], y = b[r + c]; sa += x * x; sb += y * y; }
+        for (int c = 0; c < C; c++) { float x = a[r + c], y = b[r + c]; sa = float.MultiplyAddEstimate(x, x, sa); sb = float.MultiplyAddEstimate(y, y, sb); }
         o[t] = MathF.Sqrt(sa) / MathF.Sqrt(sb);
     }
     /// <summary>o[t] = |a[t]| / |b[t]| over the C columns of each of <paramref name="rows"/> rows (torch: a.norm(dim=-1) / b.norm(dim=-1)).</summary>
@@ -63,7 +63,7 @@ public sealed class WanKernels
         long b = (long)row * stride + off;
         var sh = SharedMemory.Allocate<float>(NormGroup);
         float s = 0f;
-        for (int c = t; c < C; c += NormGroup) { float v = buf[b + c]; s += v * v; }
+        for (int c = t; c < C; c += NormGroup) { float v = buf[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         sh[t] = s;
         Group.Barrier();
         for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
@@ -75,7 +75,7 @@ public sealed class WanKernels
     {
         long b = (long)(int)row * stride + off;
         float s = 0f;
-        for (int c = 0; c < C; c++) { float v = buf[b + c]; s += v * v; }
+        for (int c = 0; c < C; c++) { float v = buf[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         float inv = 1f / MathF.Sqrt(s / C + eps);
         for (int c = 0; c < C; c++) buf[b + c] = buf[b + c] * inv * PrecisionConvert.ConvertToSingle(gamma[c]);
     }
@@ -169,7 +169,7 @@ public sealed class WanKernels
         long b = (long)row * C;
         var sh = SharedMemory.Allocate<float>(NormGroup);
         float s = 0f;
-        for (int c = t; c < C; c += NormGroup) { float v = buf[b + c]; s += v * v; }
+        for (int c = t; c < C; c += NormGroup) { float v = buf[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         sh[t] = s;
         Group.Barrier();
         for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
@@ -181,7 +181,7 @@ public sealed class WanKernels
     {
         long b = (long)(int)row * C;
         float s = 0f;
-        for (int c = 0; c < C; c++) { float v = buf[b + c]; s += v * v; }
+        for (int c = 0; c < C; c++) { float v = buf[b + c]; s = float.MultiplyAddEstimate(v, v, s); }
         float inv = MathF.Sqrt((float)C) / MathF.Max(MathF.Sqrt(s), 1e-12f);
         for (int c = 0; c < C; c++) buf[b + c] = buf[b + c] * inv * gamma[c];
     }
@@ -284,7 +284,7 @@ public sealed class WanKernels
         int i = idx / N, j = idx % N;
         long qb = (long)i * 3 * D, kb = (long)j * 3 * D + D;
         float acc = 0f;
-        for (int d = 0; d < D; d++) acc += qkv[qb + d] * qkv[kb + d];
+        for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], acc);
         s[idx] = acc * scale;
     }
     private Action<Index1D, FV, int>? _softmaxRows;
@@ -304,7 +304,7 @@ public sealed class WanKernels
         int i = idx / D, d = idx % D;
         long pb = (long)i * N, vb = 2L * D + d;
         float acc = 0f;
-        for (int j = 0; j < N; j++) acc += p[pb + j] * qkv[(long)j * 3 * D + vb];
+        for (int j = 0; j < N; j++) acc = float.MultiplyAddEstimate(p[pb + j], qkv[(long)j * 3 * D + vb], acc);
         o[idx] = acc;
     }
     /// <summary>scores [N, N] scratch, o [N, D].</summary>
@@ -403,7 +403,7 @@ public sealed class WanKernels
         int j = idx % L, i = (idx / L) % L, h = idx / (L * L);
         long qb = (long)i * 3 * H * D + h * D, kb = (long)j * 3 * H * D + H * D + h * D;
         float acc = 0f;
-        for (int d = 0; d < D; d++) acc += qkv[qb + d] * qkv[kb + d];
+        for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(qkv[qb + d], qkv[kb + d], acc);
         s[idx] = acc + PrecisionConvert.ConvertToSingle(bias[bucket[j - i + L - 1] * H + h]);
     }
     private Action<Index1D, FV, FV, FV, int, int, int>? _t5Out;
@@ -412,7 +412,7 @@ public sealed class WanKernels
         int hd = H * D, i = idx / hd, c = idx % hd, h = c / D;
         float acc = 0f;
         long pb = ((long)h * L + i) * L, vb = 2L * hd + c;
-        for (int j = 0; j < L; j++) acc += p[pb + j] * qkv[(long)j * 3 * hd + vb];
+        for (int j = 0; j < L; j++) acc = float.MultiplyAddEstimate(p[pb + j], qkv[(long)j * 3 * hd + vb], acc);
         o[idx] = acc;
     }
     /// <summary>qkv [L, 3*H*D] (q | k | v), bias bf16 [numBuckets, H], bucket [2L-1] (index j - i + L - 1), scores scratch [H*L*L], o [L, H*D].</summary>

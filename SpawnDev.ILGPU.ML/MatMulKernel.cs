@@ -83,7 +83,7 @@ public class MatMulKernel
         int aRowOffset, int ty, float sum)
     {
         for (int k = 0; k < TILE; k++)
-            sum += aTile[aRowOffset + k] * bTile[k * TILE + ty];
+            sum = float.MultiplyAddEstimate(aTile[aRowOffset + k], bTile[k * TILE + ty], sum);
         return sum;
     }
 
@@ -211,7 +211,7 @@ public class MatMulKernel
         if (row >= M) return;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * B[k * N + col];
+            sum = float.MultiplyAddEstimate(A[row * K + k], B[k * N + col], sum);
         C[idx] = sum;
     }
 
@@ -233,7 +233,7 @@ public class MatMulKernel
         int bOff = batch * K * N;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[aOff + row * K + k] * B[bOff + k * N + col];
+            sum = float.MultiplyAddEstimate(A[aOff + row * K + k], B[bOff + k * N + col], sum);
         C[idx] = sum;
     }
 
@@ -266,7 +266,7 @@ public class MatMulKernel
         int bOff = i0 * b0 + i1 * b1 + i2 * b2 + col;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[aOff + k] * B[bOff + k * N];
+            sum = float.MultiplyAddEstimate(A[aOff + k], B[bOff + k * N], sum);
         C[idx] = sum;
     }
 
@@ -289,7 +289,7 @@ public class MatMulKernel
         if (row >= M) return;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * PrecisionConvert.ConvertToSingle(B[k * N + col]);
+            sum = float.MultiplyAddEstimate(A[row * K + k], PrecisionConvert.ConvertToSingle(B[k * N + col]), sum);
         C[idx] = sum;
     }
 
@@ -315,7 +315,7 @@ public class MatMulKernel
         int bOff = batch * K * N;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[aOff + row * K + k] * PrecisionConvert.ConvertToSingle(B[bOff + k * N + col]);
+            sum = float.MultiplyAddEstimate(A[aOff + row * K + k], PrecisionConvert.ConvertToSingle(B[bOff + k * N + col]), sum);
         C[idx] = sum;
     }
 
@@ -339,7 +339,7 @@ public class MatMulKernel
         if (row >= M) return;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * PrecisionConvert.ConvertToSingle(B[col * K + k]);
+            sum = float.MultiplyAddEstimate(A[row * K + k], PrecisionConvert.ConvertToSingle(B[col * K + k]), sum);
         C[idx] = sum;
     }
 

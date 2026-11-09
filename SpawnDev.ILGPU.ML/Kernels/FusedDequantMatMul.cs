@@ -892,8 +892,8 @@ public class FusedDequantMatMul : IDisposable
             for (int j = 0; j < 16; j++)
             {
                 int packed = ReadByte(w, bOff + 2 + j);
-                sum += input[inBase + kBase + j] * (((packed & 0xF) - 8) * d);
-                sum += input[inBase + kBase + j + 16] * (((packed >> 4) - 8) * d);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j], (((packed & 0xF) - 8) * d), sum);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j + 16], (((packed >> 4) - 8) * d), sum);
             }
         }
         output[idx] = sum;
@@ -930,8 +930,8 @@ public class FusedDequantMatMul : IDisposable
             for (int j = 0; j < 16; j++)
             {
                 int packed = ReadByte(w, bOff + 4 + j);
-                sum += input[inBase + kBase + j] * ((packed & 0xF) * d + mn);
-                sum += input[inBase + kBase + j + 16] * ((packed >> 4) * d + mn);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j], ((packed & 0xF) * d + mn), sum);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j + 16], ((packed >> 4) * d + mn), sum);
             }
         }
         output[idx] = sum;
@@ -974,8 +974,8 @@ public class FusedDequantMatMul : IDisposable
                 int packed = ReadByte(w, bOff + 6 + j);
                 int xhLo = ((qh >> j) & 1) << 4;          // high bit for element j
                 int xhHi = ((qh >> (j + 16)) & 1) << 4;   // high bit for element j+16
-                sum += input[inBase + kBase + j] * ((((packed & 0xF) | xhLo) - 16) * d);
-                sum += input[inBase + kBase + j + 16] * ((((packed >> 4) | xhHi) - 16) * d);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j], ((((packed & 0xF) | xhLo) - 16) * d), sum);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j + 16], ((((packed >> 4) | xhHi) - 16) * d), sum);
             }
         }
         output[idx] = sum;
@@ -1021,8 +1021,8 @@ public class FusedDequantMatMul : IDisposable
             for (int j = 0; j < 16; j++)
             {
                 int packed = ReadByte(w, bOff + 1 + j);
-                sum += input[inBase + kBase + j] * (Float4E2M1Extensions.RawBitsToFloat(packed & 0xF) * d);
-                sum += input[inBase + kBase + j + 16] * (Float4E2M1Extensions.RawBitsToFloat(packed >> 4) * d);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j], (Float4E2M1Extensions.RawBitsToFloat(packed & 0xF) * d), sum);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j + 16], (Float4E2M1Extensions.RawBitsToFloat(packed >> 4) * d), sum);
             }
         }
         output[idx] = sum;
@@ -1056,7 +1056,7 @@ public class FusedDequantMatMul : IDisposable
             for (int j = 0; j < 32; j++)
             {
                 int q = SignExtend8(ReadByte(w, bOff + 2 + j));
-                sum += input[inBase + kBase + j] * (q * d);
+                sum = float.MultiplyAddEstimate(input[inBase + kBase + j], (q * d), sum);
             }
         }
         output[idx] = sum;
@@ -1096,7 +1096,7 @@ public class FusedDequantMatMul : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[inBase + k] * DecodeQ4KElement(w, rowBase, k);
+            sum = float.MultiplyAddEstimate(input[inBase + k], DecodeQ4KElement(w, rowBase, k), sum);
         output[idx] = sum;
     }
 
@@ -1153,7 +1153,7 @@ public class FusedDequantMatMul : IDisposable
                 {
                     int r = tid + sub * GemvGroupSize;
                     int j = 2 * (r >> 6) + ((r >> 5) & 1);
-                    partial += input[kBase + r] * DecodeQ4KNibble(w, sbOff, r, shDsc[j], shDmm[j]);
+                    partial = float.MultiplyAddEstimate(input[kBase + r], DecodeQ4KNibble(w, sbOff, r, shDsc[j], shDmm[j]), partial);
                 }
                 Group.Barrier(); // before the next block overwrites shDsc/shDmm
             }
@@ -1227,8 +1227,8 @@ public class FusedDequantMatMul : IDisposable
                     int b = (word >> (bi * 8)) & 0xFF;
                     int nib0 = b & 0xF;          // hi=0 nibble → sub-block 2t
                     int nib1 = (b >> 4) & 0xF;   // hi=1 nibble → sub-block 2t+1
-                    partial += input[kHi0 + bi] * (dsc0 * nib0 - dmm0);
-                    partial += input[kHi0 + 32 + bi] * (dsc1 * nib1 - dmm1);
+                    partial = float.MultiplyAddEstimate(input[kHi0 + bi], (dsc0 * nib0 - dmm0), partial);
+                    partial = float.MultiplyAddEstimate(input[kHi0 + 32 + bi], (dsc1 * nib1 - dmm1), partial);
                 }
             }
         }
@@ -1282,10 +1282,10 @@ public class FusedDequantMatMul : IDisposable
                     float s2 = SignExtend8(ReadByte(w, sc + isIdx + 2));
                     float s4 = SignExtend8(ReadByte(w, sc + isIdx + 4));
                     float s6 = SignExtend8(ReadByte(w, sc + isIdx + 6));
-                    partial += input[y + l] * (d * s0 * q1);
-                    partial += input[y + l + 32] * (d * s2 * q2);
-                    partial += input[y + l + 64] * (d * s4 * q3);
-                    partial += input[y + l + 96] * (d * s6 * q4);
+                    partial = float.MultiplyAddEstimate(input[y + l], (d * s0 * q1), partial);
+                    partial = float.MultiplyAddEstimate(input[y + l + 32], (d * s2 * q2), partial);
+                    partial = float.MultiplyAddEstimate(input[y + l + 64], (d * s4 * q3), partial);
+                    partial = float.MultiplyAddEstimate(input[y + l + 96], (d * s6 * q4), partial);
                 }
             }
         }
@@ -1489,10 +1489,10 @@ public class FusedDequantMatMul : IDisposable
                 int d1 = Dp4a(PackQ6(qlB, qhW, 0, 2), qs[(ablkBase + 1) * 8 + lgroup], 0);
                 int d2 = Dp4a(PackQ6(qlA, qhW, 4, 4), qs[(ablkBase + 2) * 8 + lgroup], 0);
                 int d3 = Dp4a(PackQ6(qlB, qhW, 4, 6), qs[(ablkBase + 3) * 8 + lgroup], 0);
-                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 0)) * ds[(ablkBase + 0) * 2] * d0;
-                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 2)) * ds[(ablkBase + 1) * 2] * d1;
-                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 4)) * ds[(ablkBase + 2) * 2] * d2;
-                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 6)) * ds[(ablkBase + 3) * 2] * d3;
+                partial = float.MultiplyAddEstimate(dw * SignExtend8(ReadByte(w, scBase + scIdx + 0)) * ds[(ablkBase + 0) * 2], d0, partial);
+                partial = float.MultiplyAddEstimate(dw * SignExtend8(ReadByte(w, scBase + scIdx + 2)) * ds[(ablkBase + 1) * 2], d1, partial);
+                partial = float.MultiplyAddEstimate(dw * SignExtend8(ReadByte(w, scBase + scIdx + 4)) * ds[(ablkBase + 2) * 2], d2, partial);
+                partial = float.MultiplyAddEstimate(dw * SignExtend8(ReadByte(w, scBase + scIdx + 6)) * ds[(ablkBase + 3) * 2], d3, partial);
             }
         }
         for (int off = 16; off > 0; off >>= 1)
@@ -1614,7 +1614,7 @@ public class FusedDequantMatMul : IDisposable
                     for (int mi = 0; mi < GemmMTile; mi++)
                     {
                         int m = mBase + mi;
-                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
+                        if (m < M) partial[mi] = float.MultiplyAddEstimate(input[m * K + kIdx], wval, partial[mi]);
                     }
                 }
             }
@@ -1674,7 +1674,7 @@ public class FusedDequantMatMul : IDisposable
                     for (int mi = 0; mi < GemmMTile; mi++)
                     {
                         int m = mBase + mi;
-                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
+                        if (m < M) partial[mi] = float.MultiplyAddEstimate(input[m * K + kIdx], wval, partial[mi]);
                     }
                 }
             }
@@ -1802,14 +1802,14 @@ public class FusedDequantMatMul : IDisposable
                 float b5 = bS[k * FgBn + tx + 80];
                 float b6 = bS[k * FgBn + tx + 96];
                 float b7 = bS[k * FgBn + tx + 112];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3; c04 += a0 * b4; c05 += a0 * b5; c06 += a0 * b6; c07 += a0 * b7;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3; c14 += a1 * b4; c15 += a1 * b5; c16 += a1 * b6; c17 += a1 * b7;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3; c24 += a2 * b4; c25 += a2 * b5; c26 += a2 * b6; c27 += a2 * b7;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3; c34 += a3 * b4; c35 += a3 * b5; c36 += a3 * b6; c37 += a3 * b7;
-                c40 += a4 * b0; c41 += a4 * b1; c42 += a4 * b2; c43 += a4 * b3; c44 += a4 * b4; c45 += a4 * b5; c46 += a4 * b6; c47 += a4 * b7;
-                c50 += a5 * b0; c51 += a5 * b1; c52 += a5 * b2; c53 += a5 * b3; c54 += a5 * b4; c55 += a5 * b5; c56 += a5 * b6; c57 += a5 * b7;
-                c60 += a6 * b0; c61 += a6 * b1; c62 += a6 * b2; c63 += a6 * b3; c64 += a6 * b4; c65 += a6 * b5; c66 += a6 * b6; c67 += a6 * b7;
-                c70 += a7 * b0; c71 += a7 * b1; c72 += a7 * b2; c73 += a7 * b3; c74 += a7 * b4; c75 += a7 * b5; c76 += a7 * b6; c77 += a7 * b7;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03); c04 = float.MultiplyAddEstimate(a0, b4, c04); c05 = float.MultiplyAddEstimate(a0, b5, c05); c06 = float.MultiplyAddEstimate(a0, b6, c06); c07 = float.MultiplyAddEstimate(a0, b7, c07);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13); c14 = float.MultiplyAddEstimate(a1, b4, c14); c15 = float.MultiplyAddEstimate(a1, b5, c15); c16 = float.MultiplyAddEstimate(a1, b6, c16); c17 = float.MultiplyAddEstimate(a1, b7, c17);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23); c24 = float.MultiplyAddEstimate(a2, b4, c24); c25 = float.MultiplyAddEstimate(a2, b5, c25); c26 = float.MultiplyAddEstimate(a2, b6, c26); c27 = float.MultiplyAddEstimate(a2, b7, c27);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33); c34 = float.MultiplyAddEstimate(a3, b4, c34); c35 = float.MultiplyAddEstimate(a3, b5, c35); c36 = float.MultiplyAddEstimate(a3, b6, c36); c37 = float.MultiplyAddEstimate(a3, b7, c37);
+                c40 = float.MultiplyAddEstimate(a4, b0, c40); c41 = float.MultiplyAddEstimate(a4, b1, c41); c42 = float.MultiplyAddEstimate(a4, b2, c42); c43 = float.MultiplyAddEstimate(a4, b3, c43); c44 = float.MultiplyAddEstimate(a4, b4, c44); c45 = float.MultiplyAddEstimate(a4, b5, c45); c46 = float.MultiplyAddEstimate(a4, b6, c46); c47 = float.MultiplyAddEstimate(a4, b7, c47);
+                c50 = float.MultiplyAddEstimate(a5, b0, c50); c51 = float.MultiplyAddEstimate(a5, b1, c51); c52 = float.MultiplyAddEstimate(a5, b2, c52); c53 = float.MultiplyAddEstimate(a5, b3, c53); c54 = float.MultiplyAddEstimate(a5, b4, c54); c55 = float.MultiplyAddEstimate(a5, b5, c55); c56 = float.MultiplyAddEstimate(a5, b6, c56); c57 = float.MultiplyAddEstimate(a5, b7, c57);
+                c60 = float.MultiplyAddEstimate(a6, b0, c60); c61 = float.MultiplyAddEstimate(a6, b1, c61); c62 = float.MultiplyAddEstimate(a6, b2, c62); c63 = float.MultiplyAddEstimate(a6, b3, c63); c64 = float.MultiplyAddEstimate(a6, b4, c64); c65 = float.MultiplyAddEstimate(a6, b5, c65); c66 = float.MultiplyAddEstimate(a6, b6, c66); c67 = float.MultiplyAddEstimate(a6, b7, c67);
+                c70 = float.MultiplyAddEstimate(a7, b0, c70); c71 = float.MultiplyAddEstimate(a7, b1, c71); c72 = float.MultiplyAddEstimate(a7, b2, c72); c73 = float.MultiplyAddEstimate(a7, b3, c73); c74 = float.MultiplyAddEstimate(a7, b4, c74); c75 = float.MultiplyAddEstimate(a7, b5, c75); c76 = float.MultiplyAddEstimate(a7, b6, c76); c77 = float.MultiplyAddEstimate(a7, b7, c77);
             }
             Group.Barrier();
         }
@@ -2025,10 +2025,10 @@ public class FusedDequantMatMul : IDisposable
                 float b1 = bTile[k * RB_TILE + threadCol * RB_REG + 1];
                 float b2 = bTile[k * RB_TILE + threadCol * RB_REG + 2];
                 float b3 = bTile[k * RB_TILE + threadCol * RB_REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -2114,10 +2114,10 @@ public class FusedDequantMatMul : IDisposable
                 float b1 = bTile[k * RB_TILE + threadCol * RB_REG + 1];
                 float b2 = bTile[k * RB_TILE + threadCol * RB_REG + 2];
                 float b3 = bTile[k * RB_TILE + threadCol * RB_REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -2179,7 +2179,7 @@ public class FusedDequantMatMul : IDisposable
                 for (int sub = 0; sub < perThread; sub++)
                 {
                     int r = tid + sub * GemvGroupSize;
-                    partial += input[kBase + r] * DecodeQ6KScaled(w, sbOff, r, d);
+                    partial = float.MultiplyAddEstimate(input[kBase + r], DecodeQ6KScaled(w, sbOff, r, d), partial);
                 }
             }
         }
@@ -2816,10 +2816,10 @@ public class FusedDequantMatMul : IDisposable
             {
                 float a0 = As[kk * TgM + tm], a1 = As[kk * TgM + tm + 1], a2 = As[kk * TgM + tm + 2], a3 = As[kk * TgM + tm + 3];
                 float b0 = Ws[kk * TgN + tn], b1 = Ws[kk * TgN + tn + 1], b2 = Ws[kk * TgN + tn + 2], b3 = Ws[kk * TgN + tn + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -2873,14 +2873,14 @@ public class FusedDequantMatMul : IDisposable
             for (int k = tid; k < K; k += GemvGroupSize)
             {
                 float wv = DecodeOf(code, w, rowBase, k);
-                a0 += input[k] * wv;
-                if (M > 1) a1 += input[K + k] * wv;
-                if (M > 2) a2 += input[2 * K + k] * wv;
-                if (M > 3) a3 += input[3 * K + k] * wv;
-                if (M > 4) a4 += input[4 * K + k] * wv;
-                if (M > 5) a5 += input[5 * K + k] * wv;
-                if (M > 6) a6 += input[6 * K + k] * wv;
-                if (M > 7) a7 += input[7 * K + k] * wv;
+                a0 = float.MultiplyAddEstimate(input[k], wv, a0);
+                if (M > 1) a1 = float.MultiplyAddEstimate(input[K + k], wv, a1);
+                if (M > 2) a2 = float.MultiplyAddEstimate(input[2 * K + k], wv, a2);
+                if (M > 3) a3 = float.MultiplyAddEstimate(input[3 * K + k], wv, a3);
+                if (M > 4) a4 = float.MultiplyAddEstimate(input[4 * K + k], wv, a4);
+                if (M > 5) a5 = float.MultiplyAddEstimate(input[5 * K + k], wv, a5);
+                if (M > 6) a6 = float.MultiplyAddEstimate(input[6 * K + k], wv, a6);
+                if (M > 7) a7 = float.MultiplyAddEstimate(input[7 * K + k], wv, a7);
             }
         }
         sh[tid] = a0; sh[GemvGroupSize + tid] = a1; sh[2 * GemvGroupSize + tid] = a2; sh[3 * GemvGroupSize + tid] = a3;
@@ -2911,7 +2911,7 @@ public class FusedDequantMatMul : IDisposable
         {
             int rowBase = n * (K / 32 * 34);
             for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ8_0Element(w, rowBase, k);
+                partial = float.MultiplyAddEstimate(input[k], DecodeQ8_0Element(w, rowBase, k), partial);
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -2948,7 +2948,7 @@ public class FusedDequantMatMul : IDisposable
         if (m >= M) return;
         int rowBase = n * RowBytesOf(code, K);
         float sum = 0f;
-        for (int k = 0; k < K; k++) sum += input[(long)m * K + k] * DecodeOf(code, w, rowBase, k);
+        for (int k = 0; k < K; k++) sum = float.MultiplyAddEstimate(input[(long)m * K + k], DecodeOf(code, w, rowBase, k), sum);
         output[idx] = sum;
     }
 
@@ -3117,7 +3117,7 @@ public class FusedDequantMatMul : IDisposable
         {
             int rowBase = n * (K / 32 * 18);
             for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ4_0Element(w, rowBase, k);
+                partial = float.MultiplyAddEstimate(input[k], DecodeQ4_0Element(w, rowBase, k), partial);
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -3148,7 +3148,7 @@ public class FusedDequantMatMul : IDisposable
         {
             int rowBase = n * (K / 32 * 17);
             for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeMXFP4Element(w, rowBase, k);
+                partial = float.MultiplyAddEstimate(input[k], DecodeMXFP4Element(w, rowBase, k), partial);
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -3201,7 +3201,7 @@ public class FusedDequantMatMul : IDisposable
         {
             int rowBase = n * (K / 32 * 20);
             for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ4_1Element(w, rowBase, k);
+                partial = float.MultiplyAddEstimate(input[k], DecodeQ4_1Element(w, rowBase, k), partial);
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -3242,7 +3242,7 @@ public class FusedDequantMatMul : IDisposable
         {
             int rowBase = n * (K / 32 * 22);
             for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ5_0Element(w, rowBase, k);
+                partial = float.MultiplyAddEstimate(input[k], DecodeQ5_0Element(w, rowBase, k), partial);
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -3387,10 +3387,10 @@ public class FusedDequantMatMul : IDisposable
                     float s2 = SignExtend8(ReadByte(w, sc + isIdx + 2));
                     float s4 = SignExtend8(ReadByte(w, sc + isIdx + 4));
                     float s6 = SignExtend8(ReadByte(w, sc + isIdx + 6));
-                    sum += input[inBase + y + l] * (d * s0 * q1);
-                    sum += input[inBase + y + l + 32] * (d * s2 * q2);
-                    sum += input[inBase + y + l + 64] * (d * s4 * q3);
-                    sum += input[inBase + y + l + 96] * (d * s6 * q4);
+                    sum = float.MultiplyAddEstimate(input[inBase + y + l], (d * s0 * q1), sum);
+                    sum = float.MultiplyAddEstimate(input[inBase + y + l + 32], (d * s2 * q2), sum);
+                    sum = float.MultiplyAddEstimate(input[inBase + y + l + 64], (d * s4 * q3), sum);
+                    sum = float.MultiplyAddEstimate(input[inBase + y + l + 96], (d * s6 * q4), sum);
                 }
                 ql += 64; qh += 32; sc += 8;
             }

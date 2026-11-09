@@ -147,7 +147,7 @@ public sealed class ShortConvKernel : IDisposable
                 }
                 else { b = 0f; x = 0f; }   // zero-pad (fresh sequence, no prior history)
             }
-            acc += weight[wBase + k] * (b * x);
+            acc = float.MultiplyAddEstimate(weight[wBase + k], (b * x), acc);
         }
         float cGate = bcx[t * 3 * H + H + c];   // gate C is always the CURRENT token's chunk-1
         y[idx] = cGate * acc;
@@ -174,7 +174,7 @@ public sealed class ShortConvKernel : IDisposable
                 int rowBase = tt * 3 * H;
                 float b = bcx[rowBase + c];
                 float x = bcx[rowBase + 2 * H + c];
-                acc += weight[wBase + k] * (b * x);
+                acc = float.MultiplyAddEstimate(weight[wBase + k], (b * x), acc);
             }
         }
         float cGate = bcx[t * 3 * H + H + c];

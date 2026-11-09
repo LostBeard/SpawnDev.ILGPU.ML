@@ -57,7 +57,7 @@ public sealed class GatedDeltaNetOps : IDisposable
         for (int j = 0; j < L; j++)
         {
             int tt = t - (L - 1) + j;
-            if (tt >= 0) acc += weight[wBase + j] * qkv[tt * C + c];
+            if (tt >= 0) acc = float.MultiplyAddEstimate(weight[wBase + j], qkv[tt * C + c], acc);
         }
         float silu = acc / (1f + MathF.Exp(-acc));   // acc * sigmoid(acc)
         // Route to the contiguous q / k / v output (channels [0,qDim) / [qDim,qDim+kDim) / rest).
@@ -90,7 +90,7 @@ public sealed class GatedDeltaNetOps : IDisposable
         int D = p[0];
         int baseI = idx * D;
         float s2 = 0f;
-        for (int d = 0; d < D; d++) { float val = x[baseI + d]; s2 += val * val; }
+        for (int d = 0; d < D; d++) { float val = x[baseI + d]; s2 = float.MultiplyAddEstimate(val, val, s2); }
         float inv = 1f / MathF.Sqrt(s2 + 1e-6f);
         for (int d = 0; d < D; d++) x[baseI + d] = x[baseI + d] * inv;
     }
@@ -116,7 +116,7 @@ public sealed class GatedDeltaNetOps : IDisposable
         int D = p[0];
         int baseI = idx * D;
         float s2 = 0f;
-        for (int d = 0; d < D; d++) { float val = scan[baseI + d]; s2 += val * val; }
+        for (int d = 0; d < D; d++) { float val = scan[baseI + d]; s2 = float.MultiplyAddEstimate(val, val, s2); }
         float inv = 1f / MathF.Sqrt(s2 / D + 1e-6f);
         for (int d = 0; d < D; d++)
         {

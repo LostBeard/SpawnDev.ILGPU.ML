@@ -141,7 +141,7 @@ public sealed partial class BackwardKernels
         stats[h * d.SeqQ + i] = m == float.NegativeInfinity ? 0f : m + MathF.Log(sum);
         float dd = 0f;
         long ob = ((long)i * d.Heads + h) * d.HeadDim;
-        for (int e = 0; e < d.HeadDim; e++) dd += dout[ob + e] * outp[ob + e];
+        for (int e = 0; e < d.HeadDim; e++) dd = float.MultiplyAddEstimate(dout[ob + e], outp[ob + e], dd);
         stats[d.Heads * d.SeqQ + h * d.SeqQ + i] = dd;
     }
 

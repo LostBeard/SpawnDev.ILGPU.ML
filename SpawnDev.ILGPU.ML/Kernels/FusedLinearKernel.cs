@@ -210,10 +210,10 @@ public class FusedLinearKernel : IDisposable
                 float b1 = bTile[k * TILE + threadCol * REG + 1];
                 float b2 = bTile[k * TILE + threadCol * REG + 2];
                 float b3 = bTile[k * TILE + threadCol * REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -394,7 +394,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         output[idx] = sum + bias[col];
     }
@@ -411,7 +411,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         float val = sum + bias[col];
         output[idx] = val > 0f ? val : 0f;
@@ -429,7 +429,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         float x = sum + bias[col];
         // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))) — must match ElementWiseKernels.GELUImpl
@@ -466,7 +466,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         float x = sum + bias[col];
         // SiLU = x * sigmoid(x)
@@ -485,7 +485,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         float x = sum + bias[col];
         // ⚠️ CLAMPED. exp(-x) overflows to +inf for x below about -88 in fp32, giving 1/inf = 0 - which is
@@ -508,7 +508,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * weights[k * N + col];
+            sum = float.MultiplyAddEstimate(input[row * K + k], weights[k * N + col], sum);
 
         float x = sum + bias[col];
         // tanh saturates to +-1 well before fp32 range problems; clamped for the same reason as above.
@@ -591,7 +591,7 @@ public class FusedLinearKernel : IDisposable
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += input[row * K + k] * PrecisionConvert.ConvertToSingle(weights[k * N + col]);
+            sum = float.MultiplyAddEstimate(input[row * K + k], PrecisionConvert.ConvertToSingle(weights[k * N + col]), sum);
 
         float x = sum + bias[col];
         if (activation == 1) { output[idx] = x > 0f ? x : 0f; return; }          // ReLU
@@ -709,10 +709,10 @@ public class FusedLinearKernel : IDisposable
                 float b1 = bTile[k * TILE + threadCol * REG + 1];
                 float b2 = bTile[k * TILE + threadCol * REG + 2];
                 float b3 = bTile[k * TILE + threadCol * REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -809,10 +809,10 @@ public class FusedLinearKernel : IDisposable
                 float b1 = bTile[k * TILE + threadCol * REG + 1];
                 float b2 = bTile[k * TILE + threadCol * REG + 2];
                 float b3 = bTile[k * TILE + threadCol * REG + 3];
-                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
-                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
-                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
-                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
             }
             Group.Barrier();
         }
@@ -892,7 +892,7 @@ public class FusedScaledMatMulKernel
 
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * B[col * K + k]; // B transposed: B[col, k]
+            sum = float.MultiplyAddEstimate(A[row * K + k], B[col * K + k], sum); // B transposed: B[col, k]
 
         output[idx] = sum * scale;
     }

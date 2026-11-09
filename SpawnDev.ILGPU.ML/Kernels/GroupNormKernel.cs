@@ -78,7 +78,7 @@ public class GroupNormKernel
         for (int gi = 0; gi < groupSize; gi++)
         {
             float diff = input[groupBase + gi] - mean;
-            varSum += diff * diff;
+            varSum = float.MultiplyAddEstimate(diff, diff, varSum);
         }
         float invStd = 1f / MathF.Sqrt(varSum / groupSize + eps);
 

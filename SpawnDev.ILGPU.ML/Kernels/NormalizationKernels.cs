@@ -153,7 +153,7 @@ public class NormalizationKernels : IDisposable
         for (int i = 0; i < C; i++)
         {
             double v = (double)input[offset + i];
-            sumSq += v * v;
+            sumSq = double.MultiplyAddEstimate(v, v, sumSq);
         }
         invRms[row] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
     }
@@ -220,7 +220,7 @@ public class NormalizationKernels : IDisposable
         // Each thread reduces its strided slice in f64 in-register (T-way parallel over C), then publishes a
         // partial. Thread 0 combines the T partials in f64.
         double local = 0.0;
-        for (int i = tid; i < C; i += T) { double v = (double)input[offset + i]; local += v * v; }
+        for (int i = tid; i < C; i += T) { double v = (double)input[offset + i]; local = double.MultiplyAddEstimate(v, v, local); }
         part[tid] = (float)local;
         Group.Barrier();
 
@@ -271,7 +271,7 @@ public class NormalizationKernels : IDisposable
         {
             float x = a[offset + i] + b[offset + i];
             residualOut[offset + i] = x;        // the residual stream (read by the next residual Add)
-            double v = (double)x; local += v * v;
+            double v = (double)x; local = double.MultiplyAddEstimate(v, v, local);
         }
         part[tid] = (float)local;
         Group.Barrier();
@@ -321,7 +321,7 @@ public class NormalizationKernels : IDisposable
         for (int i = 0; i < spatial; i++)
         {
             float d = input[ncBase + i] - mean;
-            varSum += d * d;
+            varSum = float.MultiplyAddEstimate(d, d, varSum);
         }
         invStds[sliceIdx] = 1f / MathF.Sqrt(varSum / spatial + eps);
     }
@@ -386,7 +386,7 @@ public class NormalizationKernels : IDisposable
         for (int i = tid; i < spatial; i += T)
         {
             float d = input[ncBase + i] - mean;
-            localVar += d * d;
+            localVar = float.MultiplyAddEstimate(d, d, localVar);
         }
         part[tid] = localVar;
         Group.Barrier();
@@ -483,7 +483,7 @@ public class NormalizationKernels : IDisposable
         for (int i = 0; i < spatial; i++)
         {
             float v = input[ncBase + i];
-            sum += v; sumSq += v * v;
+            sum += v; sumSq = float.MultiplyAddEstimate(v, v, sumSq);
         }
         sums[sliceIdx] = sum;
         sumSqs[sliceIdx] = sumSq;
@@ -506,7 +506,7 @@ public class NormalizationKernels : IDisposable
         for (int i = 0; i < spatial; i++)
         {
             float d = input[ncBase + i] - mean;
-            sumSq += d * d;
+            sumSq = float.MultiplyAddEstimate(d, d, sumSq);
         }
         sqDevs[sliceIdx] = sumSq;
     }
@@ -824,7 +824,7 @@ public class NormalizationKernels : IDisposable
         for (int i = tid; i < spatial; i += T)
         {
             float v = input[ncBase + i];
-            sum += v; sumSq += v * v;
+            sum += v; sumSq = float.MultiplyAddEstimate(v, v, sumSq);
         }
         partSum[tid] = sum;
         partSq[tid] = sumSq;
@@ -859,7 +859,7 @@ public class NormalizationKernels : IDisposable
         for (int i = tid; i < spatial; i += T)
         {
             float d = input[ncBase + i] - mean;
-            local += d * d;
+            local = float.MultiplyAddEstimate(d, d, local);
         }
         part[tid] = local;
         Group.Barrier();
@@ -1133,7 +1133,7 @@ public class NormalizationKernels : IDisposable
         for (int i = 0; i < reductionSize; i++)
         {
             float v = input[baseIdx + i];
-            sum += v; sumSq += v * v;
+            sum += v; sumSq = float.MultiplyAddEstimate(v, v, sumSq);
         }
         float mean = sum / reductionSize;
         float var = sumSq / reductionSize - mean * mean;
@@ -1167,7 +1167,7 @@ public class NormalizationKernels : IDisposable
             for (int i = 0; i < H * W; i++)
             {
                 float v = input[nBase + i];
-                sum += v; sumSq += v * v;
+                sum += v; sumSq = float.MultiplyAddEstimate(v, v, sumSq);
             }
         }
         float mean = sum / red;

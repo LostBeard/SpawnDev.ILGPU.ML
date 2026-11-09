@@ -74,7 +74,7 @@ public sealed class EinsumKernel : IDisposable
                 ia += v * table[cBase + 3 * c + 1];
                 ib += v * table[cBase + 3 * c + 2];
             }
-            sum += a[ia] * (hasB != 0 ? b[ib] : 1f);
+            sum = float.MultiplyAddEstimate(a[ia], (hasB != 0 ? b[ib] : 1f), sum);
         }
         output[o] = sum;
     }

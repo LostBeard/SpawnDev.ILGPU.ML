@@ -117,7 +117,8 @@ def kernel(name, BK):
             for j in range(8):
                 w(f"{ind}float b{j} = Bs[bb + {s * LD + 16 * j}];")
             for i in range(8):
-                w(f"{ind}" + " ".join(f"c{i}{j} += a{i} * b{j};" for j in range(8)))
+                # explicit multiply-add: as fast on a context built without EnableFloatingPointContraction (SpawnDev.ILGPU 5.4.18 strict default)
+                w(f"{ind}" + " ".join(f"c{i}{j} = float.MultiplyAddEstimate(a{i}, b{j}, c{i}{j});" for j in range(8)))
             if ku > 1:
                 w(f"{body_indent}}}")
         if ku < BK:

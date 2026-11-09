@@ -34,7 +34,7 @@ public sealed class DiTKernels
         long xo = (long)m * K, wo = (long)n * K;
         float acc = 0f;
         for (int k = 0; k < K; k++)
-            acc += x[xo + k] * PrecisionConvert.ConvertToSingle(w[wo + k]);
+            acc = float.MultiplyAddEstimate(x[xo + k], PrecisionConvert.ConvertToSingle(w[wo + k]), acc);
         if (hasBias != 0) acc += PrecisionConvert.ConvertToSingle(bias[n]);
         o[i] = Activate(acc, act);
     }
@@ -170,7 +170,7 @@ public sealed class DiTKernels
         for (int c = 0; c < C; c++) mean += x[b + c];
         mean /= C;
         float var = 0f;
-        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var += d * d; }
+        for (int c = 0; c < C; c++) { float d = x[b + c] - mean; var = float.MultiplyAddEstimate(d, d, var); }
         float rstd = 1f / MathF.Sqrt(var / C + eps);
         for (int c = 0; c < C; c++)
         {
@@ -198,7 +198,7 @@ public sealed class DiTKernels
         float mean = sh[0] / C;
         Group.Barrier();
         float q = 0f;
-        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q += d * d; }
+        for (int c = t; c < C; c += NormGroup) { float d = x[b + c] - mean; q = float.MultiplyAddEstimate(d, d, q); }
         sh[t] = q;
         Group.Barrier();
         for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
@@ -247,7 +247,7 @@ public sealed class DiTKernels
     private static void GateResidualImpl(Index1D i, FV x, FV h, FV mod, int gateOff, int C)
     {
         float g = gateOff < 0 ? 1f : mod[gateOff + i % C];
-        x[i] = x[i] + g * h[i];
+        x[i] = float.MultiplyAddEstimate(g, h[i], x[i]);
     }
     public void GateResidual(FV x, FV h, FV mod, int gateOff, int count, int C)
     {
@@ -266,7 +266,7 @@ public sealed class DiTKernels
         int h = i % H, n = i / H;
         long b = (long)n * stride + off + h * D;
         float ss = 0f;
-        for (int d = 0; d < D; d++) { float v = buf[b + d]; ss += v * v; }
+        for (int d = 0; d < D; d++) { float v = buf[b + d]; ss = float.MultiplyAddEstimate(v, v, ss); }
         // torch F.normalize: x / max(||x||, 1e-12)
         float inv = 1f / MathF.Max(MathF.Sqrt(ss), 1e-12f);
         float scale = MathF.Sqrt((float)D);
@@ -400,7 +400,7 @@ public sealed class DiTKernels
         long jj = idx % Nk; long rest = idx / Nk; int i = (int)(rest % Nq); int h = (int)(rest / Nq);
         long qb = (long)i * qStride + qOff + h * D, kb = jj * kStride + kOff + h * D;
         float acc = 0f;
-        for (int d = 0; d < D; d++) acc += q[qb + d] * k[kb + d];
+        for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(q[qb + d], k[kb + d], acc);
         s[idx] = acc * scale;
     }
     private Action<Index1D, FV, int>? _softmaxRows;
@@ -420,7 +420,7 @@ public sealed class DiTKernels
         int d = idx % D; int rest = idx / D; int h = rest % H; int i = rest / H;
         long pb = ((long)h * Nq + i) * Nk;
         float acc = 0f;
-        for (int j = 0; j < Nk; j++) acc += p[pb + j] * v[(long)j * vStride + vOff + h * D + d];
+        for (int j = 0; j < Nk; j++) acc = float.MultiplyAddEstimate(p[pb + j], v[(long)j * vStride + vOff + h * D + d], acc);
         o[idx] = acc;
     }
 

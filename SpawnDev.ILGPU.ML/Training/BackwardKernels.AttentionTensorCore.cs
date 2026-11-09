@@ -297,7 +297,7 @@ public sealed partial class BackwardKernels
         Group.Barrier();
         long ob = ((long)i * d.Heads + h) * d.HeadDim;
         float dd = 0f;
-        for (int e = tid; e < d.HeadDim; e += StatsThreads) dd += dout[ob + e] * outp[ob + e];
+        for (int e = tid; e < d.HeadDim; e += StatsThreads) dd = float.MultiplyAddEstimate(dout[ob + e], outp[ob + e], dd);
         sh[tid] = dd;
         Group.Barrier();
         for (int w = StatsThreads / 2; w > 0; w >>= 1)

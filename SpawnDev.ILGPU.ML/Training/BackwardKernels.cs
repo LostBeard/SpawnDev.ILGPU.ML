@@ -92,7 +92,7 @@ public sealed partial class BackwardKernels : IDisposable
         int row = Grid.IdxX, tid = Group.IdxX;
         long b = (long)row * C;
         float ss = 0f, dot = 0f;
-        for (int c = tid; c < C; c += RowStatsThreads) { float v = x[b + c]; ss += v * v; dot += v * w[c] * dy[b + c]; }
+        for (int c = tid; c < C; c += RowStatsThreads) { float v = x[b + c]; ss = float.MultiplyAddEstimate(v, v, ss); dot = float.MultiplyAddEstimate(v * w[c], dy[b + c], dot); }
         sh[tid] = ss; sh2[tid] = dot;
         Group.Barrier();
         for (int s = RowStatsThreads / 2; s > 0; s >>= 1)
@@ -112,7 +112,7 @@ public sealed partial class BackwardKernels : IDisposable
     {
         int b = row * C;
         float ss = 0f;
-        for (int c = 0; c < C; c++) { float v = x[b + c]; ss += v * v; }
+        for (int c = 0; c < C; c++) { float v = x[b + c]; ss = float.MultiplyAddEstimate(v, v, ss); }
         rstd[row] = 1f / MathF.Sqrt(ss / C + eps);
     }
 
@@ -122,7 +122,7 @@ public sealed partial class BackwardKernels : IDisposable
         int b = row * C;
         float r = stats[row];
         float dot = 0f;   // sum(xhat * w * dy)
-        for (int c = 0; c < C; c++) dot += x[b + c] * r * w[c] * dy[b + c];
+        for (int c = 0; c < C; c++) dot = float.MultiplyAddEstimate(x[b + c] * r * w[c], dy[b + c], dot);
         stats[rows + row] = dot / C;
     }
 
@@ -820,10 +820,10 @@ public sealed partial class BackwardKernels : IDisposable
                 float d0 = dyT[(mb + 0) * TqN + nn], d1 = dyT[(mb + 1) * TqN + nn], d2 = dyT[(mb + 2) * TqN + nn], d3 = dyT[(mb + 3) * TqN + nn];
                 int wb = nn * TqK + kb;
                 float w0 = wT[wb], w1 = wT[wb + 1], w2 = wT[wb + 2], w3 = wT[wb + 3];
-                c00 += d0 * w0; c01 += d0 * w1; c02 += d0 * w2; c03 += d0 * w3;
-                c10 += d1 * w0; c11 += d1 * w1; c12 += d1 * w2; c13 += d1 * w3;
-                c20 += d2 * w0; c21 += d2 * w1; c22 += d2 * w2; c23 += d2 * w3;
-                c30 += d3 * w0; c31 += d3 * w1; c32 += d3 * w2; c33 += d3 * w3;
+                c00 = float.MultiplyAddEstimate(d0, w0, c00); c01 = float.MultiplyAddEstimate(d0, w1, c01); c02 = float.MultiplyAddEstimate(d0, w2, c02); c03 = float.MultiplyAddEstimate(d0, w3, c03);
+                c10 = float.MultiplyAddEstimate(d1, w0, c10); c11 = float.MultiplyAddEstimate(d1, w1, c11); c12 = float.MultiplyAddEstimate(d1, w2, c12); c13 = float.MultiplyAddEstimate(d1, w3, c13);
+                c20 = float.MultiplyAddEstimate(d2, w0, c20); c21 = float.MultiplyAddEstimate(d2, w1, c21); c22 = float.MultiplyAddEstimate(d2, w2, c22); c23 = float.MultiplyAddEstimate(d2, w3, c23);
+                c30 = float.MultiplyAddEstimate(d3, w0, c30); c31 = float.MultiplyAddEstimate(d3, w1, c31); c32 = float.MultiplyAddEstimate(d3, w2, c32); c33 = float.MultiplyAddEstimate(d3, w3, c33);
             }
             Group.Barrier();
         }
@@ -851,7 +851,7 @@ public sealed partial class BackwardKernels : IDisposable
         int dyBase = m * N;
         float acc = 0f;
         for (int n = 0; n < N; n++)
-            acc += dy[dyBase + n] * Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k);
+            acc = float.MultiplyAddEstimate(dy[dyBase + n], Kernels.FusedDequantMatMul.DecodeOf(code, w, n * rowBytes, k), acc);
         dx[i] = acc;
     }
 
@@ -1066,7 +1066,7 @@ public sealed partial class BackwardKernels : IDisposable
                     if (i < d.SeqQ && j < d.SeqKV && Allowed(i, j, d))
                     {
                         float sc = 0f, dp = 0f;
-                        for (int c = 0; c < hd; c++) { sc += qS[ii * hd + c] * kB[jj * hd + c]; dp += doS[ii * hd + c] * vB[jj * hd + c]; }
+                        for (int c = 0; c < hd; c++) { sc = float.MultiplyAddEstimate(qS[ii * hd + c], kB[jj * hd + c], sc); dp = float.MultiplyAddEstimate(doS[ii * hd + c], vB[jj * hd + c], dp); }
                         int sr = h * d.SeqQ + i;
                         p = MathF.Exp(sc * d.Scale - stats[sr]);
                         ds = p * (dp - stats[d.Heads * d.SeqQ + sr]);
@@ -1082,8 +1082,8 @@ public sealed partial class BackwardKernels : IDisposable
                     float addK = 0f, addV = 0f;
                     for (int ii = 0; ii < FaS; ii++)
                     {
-                        addK += dsS[ii * FaB + jj] * qS[ii * hd + c];
-                        addV += pS[ii * FaB + jj] * doS[ii * hd + c];
+                        addK = float.MultiplyAddEstimate(dsS[ii * FaB + jj], qS[ii * hd + c], addK);
+                        addV = float.MultiplyAddEstimate(pS[ii * FaB + jj], doS[ii * hd + c], addV);
                     }
                     switch (t)
                     {
@@ -1155,7 +1155,7 @@ public sealed partial class BackwardKernels : IDisposable
                 if (i < d.SeqQ && j < d.SeqKV && Allowed(i, j, d))
                 {
                     float sc = 0f, dp = 0f;
-                    for (int c = 0; c < hd; c++) { sc += qB[ii * hd + c] * kS[jj * hd + c]; dp += doB[ii * hd + c] * vS[jj * hd + c]; }
+                    for (int c = 0; c < hd; c++) { sc = float.MultiplyAddEstimate(qB[ii * hd + c], kS[jj * hd + c], sc); dp = float.MultiplyAddEstimate(doB[ii * hd + c], vS[jj * hd + c], dp); }
                     int sr = h * d.SeqQ + i;
                     float p = MathF.Exp(sc * d.Scale - stats[sr]);
                     ds = p * (dp - stats[d.Heads * d.SeqQ + sr]);
@@ -1169,7 +1169,7 @@ public sealed partial class BackwardKernels : IDisposable
                 if (e >= nOut) break;
                 int ii = e / hd, c = e - ii * hd;
                 float add = 0f;
-                for (int jj = 0; jj < FaS; jj++) add += dsS[ii * FaS + jj] * kS[jj * hd + c];
+                for (int jj = 0; jj < FaS; jj++) add = float.MultiplyAddEstimate(dsS[ii * FaS + jj], kS[jj * hd + c], add);
                 switch (t)
                 {
                     case 0: a0 += add; break;
@@ -1206,7 +1206,7 @@ public sealed partial class BackwardKernels : IDisposable
     {
         int qb = (i * d.Heads + h) * d.HeadDim, kb = (j * d.KvHeads + kvh) * d.HeadDim;
         float s = 0f;
-        for (int e = 0; e < d.HeadDim; e++) s += q[qb + e] * k[kb + e];
+        for (int e = 0; e < d.HeadDim; e++) s = float.MultiplyAddEstimate(q[qb + e], k[kb + e], s);
         return s * d.Scale;
     }
 
@@ -1223,7 +1223,7 @@ public sealed partial class BackwardKernels : IDisposable
         stats[t] = m + MathF.Log(sum);
         int ob = (i * d.Heads + h) * d.HeadDim;
         float dd = 0f;
-        for (int e = 0; e < d.HeadDim; e++) dd += dout[ob + e] * outp[ob + e];
+        for (int e = 0; e < d.HeadDim; e++) dd = float.MultiplyAddEstimate(dout[ob + e], outp[ob + e], dd);
         stats[d.Heads * d.SeqQ + t] = dd;
     }
 
@@ -1245,8 +1245,8 @@ public sealed partial class BackwardKernels : IDisposable
             float p = MathF.Exp(QK(q, k, h, i, kvh, j, d) - lse);
             int vb = (j * d.KvHeads + kvh) * d.HeadDim;
             float dp = 0f;
-            for (int f = 0; f < d.HeadDim; f++) dp += dout[ob + f] * v[vb + f];
-            acc += p * (dp - D) * k[vb + e];
+            for (int f = 0; f < d.HeadDim; f++) dp = float.MultiplyAddEstimate(dout[ob + f], v[vb + f], dp);
+            acc = float.MultiplyAddEstimate(p * (dp - D), k[vb + e], acc);
         }
         dq[t] = acc * d.Scale;
     }
@@ -1271,9 +1271,9 @@ public sealed partial class BackwardKernels : IDisposable
                 float p = MathF.Exp(QK(q, k, h, i, kvh, j, d) - stats[sr]);
                 int ob = (i * d.Heads + h) * d.HeadDim;
                 float dp = 0f;
-                for (int f = 0; f < d.HeadDim; f++) dp += dout[ob + f] * v[vb + f];
-                accK += p * (dp - stats[d.Heads * d.SeqQ + sr]) * q[ob + e];
-                accV += p * dout[ob + e];
+                for (int f = 0; f < d.HeadDim; f++) dp = float.MultiplyAddEstimate(dout[ob + f], v[vb + f], dp);
+                accK = float.MultiplyAddEstimate(p * (dp - stats[d.Heads * d.SeqQ + sr]), q[ob + e], accK);
+                accV = float.MultiplyAddEstimate(p, dout[ob + e], accV);
             }
         }
         dk[t] = accK * d.Scale;
