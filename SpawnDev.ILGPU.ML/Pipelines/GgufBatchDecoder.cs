@@ -122,6 +122,15 @@ public sealed class GgufBatchDecoder : IDisposable
     /// forces it.
     /// </summary>
     public bool AttentionShuffle { get => _attShuffle; set { if (_attShuffle != value) { _attShuffle = value; _bufGen++; } } }
+    /// <summary>
+    /// The split-K decode attention's chunk merge on <c>AttnCombineGroupImpl</c> (a group per row and head: the chunk weights found once in shared memory;
+    /// bit-identical) instead of <c>AttnCombineImpl</c> (a thread per value, each re-reading every chunk). Head widths a power of two up to 256. Env
+    /// GGUF_ATTN_COMBINE_GROUP=0 / 1 forces it. Default: on for CUDA (measured in the constructor).
+    /// </summary>
+    public bool AttentionCombineGroup { get => _attCombineGroupOn; set { if (_attCombineGroupOn != value) { _attCombineGroupOn = value; _bufGen++; } } }
+    private bool _attCombineGroupOn;
+    /// <summary>The chunk merge the last fused decode step ran: "group" or "per-value" (null before one).</summary>
+    public string? LastAttentionMergeKernel { get; private set; }
     private bool _attShuffle;
     private bool ShuffleAttentionFits(int d) => global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc, 32) && (d == 32 || d == 64 || d == 128);
     /// <summary>
@@ -224,6 +233,10 @@ public sealed class GgufBatchDecoder : IDisposable
         // prompt): ILP kernel 16.97 / 38.52 us, + shuffle 16.79 / 38.55, vector + ILP P.V 15.66 / 23.42, + shuffle 15.17 / 23.01; decode (quiet, interleaved
         // x2) 212.9 / 211.9 -> 215.3 / 212.9 tok/s short, 174.2 / 174.4 -> 188.8 / 188.5 long. Bit-identical per GgufBatchDecoder_ShuffleAttention_BitIdentical.
         _attShuffle = Environment.GetEnvironmentVariable("GGUF_ATTN_SHUFFLE") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda || webGpuVec };
+        // MEASURED 2026-11-09 (RTX 4070, qwen3:1.7b Q4_K_M, 64-key chunks, nsys per call short / long prompt): per-value merge 2.62 / 15.97 us, group 2.00 /
+        // 3.07 (at 128-key chunks 2.14 / 9.79 vs 1.95 / 2.41, but the attention kernel itself is 24 / 34 us there); decode (quiet, interleaved x2) 214.5 / 212.5
+        // -> 213.0 / 211.4 tok/s short (noise), 186.4 / 186.0 -> 200.2 / 199.6 long (+7.4%).
+        _attCombineGroupOn = Environment.GetEnvironmentVariable("GGUF_ATTN_COMBINE_GROUP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda };
         _attVec = Environment.GetEnvironmentVariable("GGUF_ATTN_VEC") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.Cuda };
         CaptureCuda = accelerator is global::ILGPU.Runtime.Cuda.CudaAccelerator && global::ILGPU.Runtime.Cuda.CudaStream.SupportsGraphCapture
             && Environment.GetEnvironmentVariable("GGUF_BATCH_CUDA_GRAPH") != "0";
@@ -947,7 +960,17 @@ public sealed class GgufBatchDecoder : IDisposable
                     LastDecodeAttentionKernel = "per-head";
                 }
                 Prof("attn");
-                _attCombine!((int)((long)R * Q), part, ml, att, posView, HeadDim, ach, gqa ? ck : AttChunk, Heads, mode); Prof("attn-merge");
+                if (AttentionCombineGroup && _attCombineGroup != null && ach <= CombineMaxChunks)
+                {
+                    _attCombineGroup(new KernelConfig(R * Heads, HeadDim), part, ml, att, posView, ach, gqa ? ck : AttChunk, Heads, mode);
+                    LastAttentionMergeKernel = "group";
+                }
+                else
+                {
+                    _attCombine!((int)((long)R * Q), part, ml, att, posView, HeadDim, ach, gqa ? ck : AttChunk, Heads, mode);
+                    LastAttentionMergeKernel = "per-value";
+                }
+                Prof("attn-merge");
             }
             else
             {
@@ -1540,6 +1563,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
     private Action<Index1D, FV, FV, FV, IV, int, int, int, int, int>? _attCombine;
+    private Action<KernelConfig, FV, FV, FV, IV, int, int, int, int>? _attCombineGroup;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
     private Action<Index1D, FV, FV, IV, int, int, int>? _chunkMax;
     private Action<Index1D, FV, IV, FV, IV, int, int>? _floor;
@@ -1563,6 +1587,8 @@ public sealed class GgufBatchDecoder : IDisposable
         if (FusedAttention)
         {
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, int, int, int, int, int>(AttnCombineImpl);
+            if (HeadDim <= CombineMaxD && (HeadDim & (HeadDim - 1)) == 0 && HeadDim <= _acc.MaxNumThreadsPerGroup)
+                _attCombineGroup = _acc.LoadStreamKernel<FV, FV, FV, IV, int, int, int, int>(AttnCombineGroupImpl);
         }
         _hasFlash = _acc.AcceleratorType != AcceleratorType.WebGL && HeadDim <= FaMaxD && FaThreads <= _acc.MaxNumThreadsPerGroup;
         // the tensor-core flash prefill: CUDA sm_75+, head dim 128 (the F16-cache check is the store's: FlashMma returns false on F32 caches)
@@ -2798,6 +2824,56 @@ public sealed class GgufBatchDecoder : IDisposable
         }
         o[ii] = num / den;
     }
+
+    /// <summary>
+    /// <see cref="AttnCombineImpl"/> with a group per (row, head) and a thread per value (D threads, D a power of two up to CombineMaxD): the live chunks'
+    /// max M, their weights e^(m_c - M) and sums l_c are found ONCE into shared memory (the per-value kernel had every thread re-read every chunk's
+    /// (m, l) twice and take every exp: two serial chains of global loads, 29 links each at 1,830 tokens), then each thread sums its value over the chunks
+    /// in the same order with the same fused multiply-adds, four partials loaded ahead: bit-identical (a max takes no rounding; each weight is the
+    /// same exp of the same operands). Needs nch <= CombineMaxChunks.
+    /// </summary>
+    private static void AttnCombineGroupImpl(FV part, FV ml, FV o, IV posBuf, int nch, int ck, int H, int mode)
+    {
+        int rh = Grid.IdxX, d = Group.IdxX, D = Group.DimX;
+        int pos = mode == 0 ? posBuf[0] + rh / H : posBuf[0];
+        int live = Math.Min(nch, pos / ck + 1);
+        long g0 = (long)rh * nch;
+        var wc = SharedMemory.Allocate<float>(CombineMaxChunks);    // e^(m_c - M), 0 for a chunk without a key
+        var lcs = SharedMemory.Allocate<float>(CombineMaxChunks);   // l_c
+        var red = SharedMemory.Allocate<float>(CombineMaxD);
+        float m = -1e30f;
+        for (int c = d; c < live; c += D) if (ml[2 * (g0 + c) + 1] > 0f) m = MathF.Max(m, ml[2 * (g0 + c)]);
+        red[d] = m;
+        Group.Barrier();
+        for (int w = D / 2; w > 0; w >>= 1)
+        {
+            if (d < w) red[d] = MathF.Max(red[d], red[d + w]);
+            Group.Barrier();
+        }
+        float M = red[0];
+        for (int c = d; c < live; c += D)
+        {
+            float lc = ml[2 * (g0 + c) + 1];
+            lcs[c] = lc;
+            wc[c] = lc > 0f ? MathF.Exp(ml[2 * (g0 + c)] - M) : 0f;
+        }
+        Group.Barrier();
+        float num = 0f, den = 0f;
+        long pb = g0 * D + d;
+        int c4 = 0;
+        for (; c4 + 4 <= live; c4 += 4)
+        {
+            float p0 = part[pb + (long)c4 * D], p1 = part[pb + (long)(c4 + 1) * D], p2 = part[pb + (long)(c4 + 2) * D], p3 = part[pb + (long)(c4 + 3) * D];
+            if (lcs[c4] > 0f) { num = float.MultiplyAddEstimate(wc[c4], p0, num); den = float.MultiplyAddEstimate(wc[c4], lcs[c4], den); }
+            if (lcs[c4 + 1] > 0f) { num = float.MultiplyAddEstimate(wc[c4 + 1], p1, num); den = float.MultiplyAddEstimate(wc[c4 + 1], lcs[c4 + 1], den); }
+            if (lcs[c4 + 2] > 0f) { num = float.MultiplyAddEstimate(wc[c4 + 2], p2, num); den = float.MultiplyAddEstimate(wc[c4 + 2], lcs[c4 + 2], den); }
+            if (lcs[c4 + 3] > 0f) { num = float.MultiplyAddEstimate(wc[c4 + 3], p3, num); den = float.MultiplyAddEstimate(wc[c4 + 3], lcs[c4 + 3], den); }
+        }
+        for (; c4 < live; c4++)
+            if (lcs[c4] > 0f) { num = float.MultiplyAddEstimate(wc[c4], part[pb + (long)c4 * D], num); den = float.MultiplyAddEstimate(wc[c4], lcs[c4], den); }
+        o[(long)rh * D + d] = num / den;
+    }
+    private const int CombineMaxChunks = 1024, CombineMaxD = 256;
 
     // region 0's first n values into regions 1, 2, ... (sequence s + 1 gets element i of index s * n + i)
     private static void ForkImpl<T>(Index1D i, ArrayView1D<T, Stride1D.Dense> cache, long n, long region) where T : unmanaged, System.Numerics.INumber<T>

@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA decode attention chunk merge: a group per (row, head)** (`AttnCombineGroupImpl`, `GgufBatchDecoder.AttentionCombineGroup`, default
+  on for CUDA). The per-value merge had every thread re-read every chunk's (max, sum) twice from global memory and take every exp; the group
+  finds the chunk max, weights and sums once in shared memory, then sums each value in the same order with the same fused multiply-adds
+  (four partials loaded ahead): bit-identical. MEASURED (nsys, RTX 4070, qwen3:1.7b Q4_K_M, per call, short / long prompt): 2.62 / 15.97 us ->
+  2.00 / 3.07 us; decode (quiet, interleaved x2) 186.4 / 186.0 -> 200.2 / 199.6 tok/s long (+7.4%), short unchanged (~213). Long-prompt CUDA
+  decode is ~200 tok/s with the attention entry below (174 before). Env GGUF_ATTN_COMBINE_GROUP=0 / 1 is the A/B.
+
 - **CUDA decode attention on the vector kernel, with four-ahead P.V and warp-shuffle reductions** (`GgufBatchDecoder.AttentionVec` now
   default on for CUDA as well as WebGPU; new `AttentionShuffle`, default on for CUDA). The vector kernel's 16-byte K loads replace the ILP
   kernel's per-thread row walks (scalar loads 2 KB apart across a warp, half the group idle at 64-key chunks); with `AttentionIlp` its P.V now

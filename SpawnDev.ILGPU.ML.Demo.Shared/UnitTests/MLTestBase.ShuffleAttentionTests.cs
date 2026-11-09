@@ -13,7 +13,8 @@ public abstract partial class MLTestBase
     /// Warp.ShuffleXor instead of the shared-memory tree, on the ILP kernel and on the vector kernel (whose P.V can also load four V rows ahead,
     /// <see cref="GgufBatchDecoder.AttentionIlp"/>). The shuffle path keeps the tree's pairing for the sum, a max takes no rounding, and the four-ahead P.V sums
     /// in the same order, so every variant's logits must be BIT-IDENTICAL to its base kernel's (ILP with the tree; the vector kernel with the tree and one V row at
-    /// a time), not merely close. The vector variants need an fp16 cache. Two head shapes: Qwen2.5-0.5B (G = 7, head width 64: 2 warps a group) and Qwen3-0.6B (G = 2, width
+    /// a time), not merely close. The vector variants need an fp16 cache. The group chunk merge (<see cref="GgufBatchDecoder.AttentionCombineGroup"/>) is held
+    /// to the same: its weights are the same exps and its sums the same fused multiply-adds in the same order. Two head shapes: Qwen2.5-0.5B (G = 7, head width 64: 2 warps a group) and Qwen3-0.6B (G = 2, width
     /// 128: 4 warps). A ~700-token prompt (11 chunks of 64 keys live, the last one partial), four sequences forked, four batched steps, 32 greedy tokens; the
     /// route is checked each run (LastDecodeAttentionKernel), and switching it must capture again where steps are captured.
     /// </summary>
@@ -33,14 +34,14 @@ public abstract partial class MLTestBase
             var text = string.Concat(Enumerable.Repeat("The keeper climbed the stairs of the lighthouse every evening to light the lamp. ", 34));
             var (ids, stops) = ChatTemplates.BuildChatPrompt(dec.Model, tok, new List<(string, string)> { ("user", text + "What does the keeper do each evening?") }, thinking: false);
             var stopSet = stops.ToHashSet(); if (tok.EosId >= 0) stopSet.Add(tok.EosId);
-            async Task<(float[] Step1, float[] Step4, int[] Greedy, string Route)> Run(bool vec, bool ilp, bool shuffle)
+            async Task<(float[] Step1, float[] Step4, int[] Greedy, string Route)> Run(bool vec, bool ilp, bool shuffle, bool combine)
             {
-                dec.AttentionVec = vec; dec.AttentionIlp = ilp; dec.AttentionShuffle = shuffle;
+                dec.AttentionVec = vec; dec.AttentionIlp = ilp; dec.AttentionShuffle = shuffle; dec.AttentionCombineGroup = combine;
                 await dec.PrefillAsync(ids, 0f);
                 dec.Fork(4);
                 var nx = new[] { 11, 22, 33, 44 };
                 await dec.StepAsync(nx, 0f);
-                string route = dec.LastDecodeAttentionKernel ?? "(none)";
+                string route = (dec.LastDecodeAttentionKernel ?? "(none)") + (dec.LastAttentionMergeKernel == "group" ? "+group-merge" : "");
                 var s1 = await dec.ReadLogitsAsync();
                 for (int s = 1; s < 4; s++) await dec.StepAsync(nx.Select(x => x + s).ToArray(), 0f);
                 var s4 = await dec.ReadLogitsAsync();
@@ -58,15 +59,18 @@ public abstract partial class MLTestBase
             // chunking (and the float sums) - seen 2026-11-09 as 607,493 differing logits on Qwen3 that were not the kernel's
             dec.GqaChunk = 64;
             // (vec, ilp, shuffle, expected route); the first of each family is its base
-            var arms = new List<(bool Vec, bool Ilp, bool Shuffle, string Route)> { (false, true, false, "gqa-ilp"), (false, true, true, "gqa-ilp-shuffle") };
+            // ("+group-merge": the chunk merge on AttnCombineGroupImpl, also bit-identical)
+            var arms = new List<(bool Vec, bool Ilp, bool Shuffle, bool Combine, string Route)> { (false, true, false, false, "gqa-ilp"), (false, true, true, false, "gqa-ilp-shuffle"),
+                (false, true, false, true, "gqa-ilp+group-merge") };
             if (dec.KvCacheIsHalf)
-                arms.AddRange(new[] { (true, false, false, "gqa-vec"), (true, false, true, "gqa-vec-shuffle"), (true, true, false, "gqa-vec-ilp"), (true, true, true, "gqa-vec-ilp-shuffle") });
+                arms.AddRange(new[] { (true, false, false, false, "gqa-vec"), (true, false, true, false, "gqa-vec-shuffle"), (true, true, false, false, "gqa-vec-ilp"),
+                    (true, true, true, false, "gqa-vec-ilp-shuffle"), (true, true, true, true, "gqa-vec-ilp-shuffle+group-merge") });
             (float[] Step1, float[] Step4, int[] Greedy, string Route) baseRun = default;
             var parts = new List<string>();
             foreach (var arm in arms)
             {
                 int capturesBefore = dec.CaptureStats.Captures;
-                var run = await Run(arm.Vec, arm.Ilp, arm.Shuffle);
+                var run = await Run(arm.Vec, arm.Ilp, arm.Shuffle, arm.Combine);
                 if (run.Route != arm.Route) throw new Exception($"{file}: arm {arm.Route} ran on '{run.Route}'");
                 bool isBase = arm.Route is "gqa-ilp" or "gqa-vec";
                 if (isBase) { baseRun = run; parts.Add($"{arm.Route} (base)"); continue; }
