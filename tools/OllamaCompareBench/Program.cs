@@ -118,6 +118,9 @@ foreach (var model in models)
                     var sw = Stopwatch.StartNew(); double firstMs = -1;
                     var res = await gen.GenerateAsync(ids, cfg, stopTokenIds: stops, onDelta: _ => { if (firstMs < 0) firstMs = sw.Elapsed.TotalMilliseconds; return Task.CompletedTask; });
                     double ms = sw.Elapsed.TotalMilliseconds;
+                    // --dump-text <file>: the greedy text of timed run 1, per prompt (an A/B of numerics: diff two dumps, e.g. GGUF_GEMV_DP4A=0 / 1)
+                    if (r == 1 && arm.Name == "greedy" && Arg("--dump-text", "") is { Length: > 0 } dumpPath)
+                        File.AppendAllText(dumpPath, $"### {label} ({res.GeneratedTokens} tokens)\n{res.Text}\n");
                     if (r == 0 || firstMs < 0 || res.GeneratedTokens < 2) continue;
                     sPrompt = ids.Length; sGen = res.GeneratedTokens;
                     sPre.Add(ids.Length / (firstMs / 1000.0));

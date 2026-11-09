@@ -102,6 +102,12 @@ public class FusedDequantMatMul : IDisposable
     // GEMV's ~26%). NUMERICS: int8-approximate (the activation quant), NOT float-exact — same approximation
     // Ollama uses; validate vs the int8-activation reference / Ollama oracle, not the float GEMV. CUDA only
     // (dp4a is a CUDA inline-PTX intrinsic). Q4_K first (qwen's main decode weight).
+    // MEASURED 2026-11-09 in the batch decoder (RTX 4070, qwen3:1.7b Q4_K_M, nsys + interleaved tok/s, quiet machine; TJ: int8 activations only as an
+    // opt-in, measure first): per GEMV vs the float vector kernels Q4_K 39.3 -> 36.5 / 13.5 -> 13.8 / 14.8 -> 12.1 us, Q6_K down 41.2 -> 37.8, the Q6_K
+    // LM head 648 -> 810 (slower), plus QuantizeActQ8_1 (one group, 4.8 us) per launch, ~112 a token. Decode 203.9 / 203.4 -> 183.4 / 183.1 tok/s
+    // (-10%), and the greedy text leaves the float path after ~10 tokens. Not wired into the decode path (ForwardRows): as built it is slower AND
+    // less accurate. A worthwhile opt-in would need the activation quantized once per input (fused into the preceding norm), vector-style dp4a
+    // kernels, and the head left in float: estimated ~+4% decode at that accuracy cost.
     public static bool EnableDp4aGemv =
         Environment.GetEnvironmentVariable("GGUF_GEMV_DP4A") == "1";
 
