@@ -111,13 +111,15 @@ public sealed class GgufBatchDecoder : IDisposable
     public int GqaChunk { get => _gqaChunk; set { if (_gqaChunk != value) { _gqaChunk = value; _bufGen++; } } }
     /// <summary>
     /// The decode attention on <c>AttnPartialGqaIlpImpl</c> (chunks past the position leave at once; K / V loads issued ahead of their FMAs; bit-identical) instead of
-    /// <c>AttnPartialGqaImpl</c>. Default: on for CUDA and OpenCL, off for WebGPU, per the A/B below (env GGUF_ATTN_ILP=0 / 1 forces it). With <see cref="AttentionVec"/>
+    /// <c>AttnPartialGqaImpl</c>. Default: on for CUDA and OpenCL, and for WebGPU with subgroups (where <see cref="AttentionVec"/> runs instead; see the
+    /// constructor), off for WebGPU without them, per the A/B below (env GGUF_ATTN_ILP=0 / 1 forces it). With <see cref="AttentionVec"/>
     /// it picks the vector kernel's P.V loop: four V rows loaded ahead of their FMAs (bit-identical) or one at a time.
     /// </summary>
     public bool AttentionIlp { get => _attIlp; set { if (_attIlp != value) { _attIlp = value; _bufGen++; } } }
     /// <summary>
     /// The grouped-query decode attention (<see cref="AttentionIlp"/>'s kernel or <see cref="AttentionVec"/>'s) with each head's chunk max and exp-sum reduced by
-    /// Warp.ShuffleXor (2 group barriers in place of 17; bit-identical, see IGqaReduce). Needs a real 32-lane warp and a head width of 32, 64 or 128. Default: on for CUDA (measured in the constructor); env GGUF_ATTN_SHUFFLE=0 / 1 forces it.
+    /// Warp.ShuffleXor (2 group barriers in place of 17; bit-identical, see IGqaReduce). Needs a real 32-lane warp and a head width of 32, 64 or 128. Default: on for CUDA and for WebGPU with subgroups (measured in the constructor); env GGUF_ATTN_SHUFFLE=0 / 1
+    /// forces it.
     /// </summary>
     public bool AttentionShuffle { get => _attShuffle; set { if (_attShuffle != value) { _attShuffle = value; _bufGen++; } } }
     private bool _attShuffle;
@@ -213,11 +215,15 @@ public sealed class GgufBatchDecoder : IDisposable
         _head = model.Tensors.Any(t => t.Name == "output.weight") ? "output.weight" : "token_embd.weight";
         MaxSeq = maxSeq; MaxBatch = maxBatch;
         CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
-        _attIlp = Environment.GetEnvironmentVariable("GGUF_ATTN_ILP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL };
+        // WebGPU: on where the vector kernel runs (subgroups), for its four-ahead P.V and 64-key chunks; the ILP kernel itself stays off there (it lost the
+        // 2026-11-05 A/B to the plain one, which a browser without subgroups keeps). MEASURED 2026-11-09 (Chrome, qwen3 1.7B Q8_0, vector kernel, attention GPU
+        // ms a token short / long): 0.509 / 0.807 -> 0.420 / 0.617, + shuffle 0.401 / ~0.60; decode 170.2 / 154.9 -> 170.7 / 157.5 tok/s.
+        bool webGpuVec = accelerator.AcceleratorType is AcceleratorType.WebGPU && global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(accelerator, 32);
+        _attIlp = Environment.GetEnvironmentVariable("GGUF_ATTN_ILP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL || webGpuVec };
         // CUDA: the vector kernel with four-ahead P.V and shuffle reductions. MEASURED 2026-11-09 (RTX 4070, qwen3:1.7b Q4_K_M, nsys per call, short / long
         // prompt): ILP kernel 16.97 / 38.52 us, + shuffle 16.79 / 38.55, vector + ILP P.V 15.66 / 23.42, + shuffle 15.17 / 23.01; decode (quiet, interleaved
         // x2) 212.9 / 211.9 -> 215.3 / 212.9 tok/s short, 174.2 / 174.4 -> 188.8 / 188.5 long. Bit-identical per GgufBatchDecoder_ShuffleAttention_BitIdentical.
-        _attShuffle = Environment.GetEnvironmentVariable("GGUF_ATTN_SHUFFLE") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda };
+        _attShuffle = Environment.GetEnvironmentVariable("GGUF_ATTN_SHUFFLE") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda || webGpuVec };
         _attVec = Environment.GetEnvironmentVariable("GGUF_ATTN_VEC") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.Cuda };
         CaptureCuda = accelerator is global::ILGPU.Runtime.Cuda.CudaAccelerator && global::ILGPU.Runtime.Cuda.CudaStream.SupportsGraphCapture
             && Environment.GetEnvironmentVariable("GGUF_BATCH_CUDA_GRAPH") != "0";

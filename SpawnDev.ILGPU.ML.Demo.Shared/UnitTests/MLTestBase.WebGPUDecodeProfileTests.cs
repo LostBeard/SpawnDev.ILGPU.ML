@@ -30,7 +30,7 @@ public abstract partial class MLTestBase
             m.Stream.Seek(0, SeekOrigin.Begin);
             using var gen = await GgufGenerator.CreateAsync(accelerator, m.Stream, 4096, gguf);
             var dec = gen.BatchDecoder ?? throw new Exception($"expected the batch decoder, got {gen.Engine}");
-            bool prefixSaved = GgufGenerator.EnablePrefixCache, vecSaved = dec.AttentionVec;
+            bool prefixSaved = GgufGenerator.EnablePrefixCache, vecSaved = dec.AttentionVec, ilpSaved = dec.AttentionIlp, shufSaved = dec.AttentionShuffle;
             GgufGenerator.EnablePrefixCache = false;
             var report = new List<string>();
             try
@@ -38,18 +38,20 @@ public abstract partial class MLTestBase
                 string filler = string.Join(" ", Enumerable.Range(0, 1800).Select(i => new[] { "the", "keeper", "watched", "storm", "light", "over", "grey", "water" }[i % 8])) + "\n\n";
 
                 const string shortP = "Write a long story about a lighthouse keeper and a storm.";
-                // arms: the decode attention route (AttentionVec, 2026-11-08) on and off at both lengths, interleaved twice (tok/s run-to-run noise is ~5%;
-                // the per-kernel GPU ms are the steadier number)
-                var arms = new List<(string, string, bool)>();
+                // arms: the vector decode attention (the WebGPU default since 2026-11-08) as it is, with AttentionIlp (64-key chunks, four V rows loaded ahead in
+                // P.V), and with AttentionShuffle as well (both the CUDA default since 2026-11-09: long-prompt decode +8.3% there), at both lengths, interleaved
+                // twice (tok/s run-to-run noise is ~5%; the per-kernel GPU ms are the steadier number). AttentionVec off (the plain kernels) lost on 2026-11-08.
+                var arms = new List<(string, string, bool, bool)>();
                 for (int round = 0; round < 2; round++)
-                    foreach (var vec in new[] { true, false })
+                    foreach (var (ilp, shuffle) in new[] { (false, false), (true, false), (true, true) })
                     {
-                        arms.Add(($"short {(vec ? "vec" : "plain")}", shortP, vec));
-                        arms.Add(($"long {(vec ? "vec" : "plain")}", filler + shortP, vec));
+                        string name = "vec" + (ilp ? "-ilp" : "") + (shuffle ? "-shuffle" : "");
+                        arms.Add(($"short {name}", shortP, ilp, shuffle));
+                        arms.Add(($"long {name}", filler + shortP, ilp, shuffle));
                     }
-                foreach (var (label, text, vec) in arms)
+                foreach (var (label, text, ilp, shuffle) in arms)
                 {
-                    dec.AttentionVec = vec;
+                    dec.AttentionVec = true; dec.AttentionIlp = ilp; dec.AttentionShuffle = shuffle;
                     dec.InvalidateCapturedSteps();
                     var (ids, stops) = ChatTemplates.BuildChatPrompt(gguf, tok, new List<(string, string)> { ("user", text) }, thinking: false);
                     var sw = Stopwatch.StartNew(); double firstMs = -1;
@@ -59,7 +61,7 @@ public abstract partial class MLTestBase
                     var prof = await dec.ProfileRecordedStepAsync(20) ?? throw new Exception("no recorded decode step replayed");
                     using var doc = JsonDocument.Parse(prof.Attribution);
                     var root = doc.RootElement;
-                    string head = $"{label} prompt ({ids.Length} tokens): decode {rate:F1} tok/s ({1000.0 / rate:F2} ms a token); recorded step GPU floor {prof.FloorMs:F2} ms";
+                    string head = $"{label} [{dec.LastDecodeAttentionKernel}] prompt ({ids.Length} tokens): decode {rate:F1} tok/s ({1000.0 / rate:F2} ms a token); recorded step GPU floor {prof.FloorMs:F2} ms";
                     if (root.TryGetProperty("totalMs", out var tot)) head += $", timestamped total {tot.GetDouble():F2} ms over {root.GetProperty("ops").GetInt32()} dispatches";
                     Console.WriteLine($"[Benchmark] WebGPUDecodeProfile {head}");
                     report.Add(head);
@@ -69,7 +71,7 @@ public abstract partial class MLTestBase
                     else Console.WriteLine($"[Benchmark] WebGPUDecodeProfile   {label}: {prof.Attribution}");
                 }
             }
-            finally { GgufGenerator.EnablePrefixCache = prefixSaved; dec.AttentionVec = vecSaved; }
+            finally { GgufGenerator.EnablePrefixCache = prefixSaved; dec.AttentionVec = vecSaved; dec.AttentionIlp = ilpSaved; dec.AttentionShuffle = shufSaved; }
             return string.Join("; ", report);
         }
     });

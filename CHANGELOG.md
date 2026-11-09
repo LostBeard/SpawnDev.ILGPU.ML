@@ -13,6 +13,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   188.8 / 188.5 long (+8.3%). New `GgufBatchDecoder_ShuffleAttention_BitIdentical`: every variant's logits bit-identical to its base (Qwen2.5-0.5B
   G = 7 D = 64, Qwen3-0.6B G = 2 D = 128; CUDA, WebGPU), red-checked (a changed sum pairing moves 607k logits). New
   `GgufBatchDecoder.LastDecodeAttentionKernel` and `KvCacheIsHalf`. Env GGUF_ATTN_VEC / GGUF_ATTN_SHUFFLE / GGUF_ATTN_ILP = 0 / 1 are the A/B.
+  WebGPU with subgroups (where the vector kernel already ran) now takes the four-ahead P.V, 64-key chunks and the shuffle reductions too:
+  MEASURED (Chrome, qwen3 1.7B Q8_0, attention GPU ms a token, short / long) 0.509 / 0.807 -> 0.401 / ~0.60, decode 170.2 / 154.9 -> 170.7 /
+  157.5 tok/s (the Q8_0 GEMVs, 4.47 ms a token, dominate there). WebGPU without subgroups keeps the plain kernel.
 
 - **CUDA fused residual Add + RMSNorm reduces with warp shuffles in double** (`AddRMSNormFusedShuffleImpl`: two group barriers instead of five, no
   f32 step in the reduction). MEASURED (nsys, RTX 4070, qwen3:1.7b): decode norm 5.71 -> 4.88 us (56 a token), prefill rows 3-5% faster; error
