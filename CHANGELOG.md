@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.9 - 2026-11-09 (nuget.org) - WebGPU shuffle-kernel correctness on browsers without subgroups; faster CUDA Q4_K decode GEMV
+
+On SpawnDev.ILGPU 5.4.22. Release sweep (full default, HeavyModel excluded): 7,654 passed, 0 failed, 443 skipped, 1 h 13 m (RTX 4070,
+Chrome; -3.9% vs 5.8.8). Upgrade from 5.8.8 if you run ML on WebGPU: 5.8.8 picked its warp-shuffle kernels (the vector decode attention is
+on by default there) from WarpSize == 32, which a browser without the subgroups feature also reports. Known: one model-inspection test
+runs ~100 s late in a full sweep (33 s alone) since 5.8.8; under investigation.
+
 - **Shuffle kernels gated on `SupportsWarpShuffle` (SpawnDev.ILGPU 5.4.22)**, not on `WarpSize == 32`: a WebGPU accelerator without subgroups
   reports WarpSize 32 but emulates a "warp" as the whole workgroup, so a WarpSize gate would have run the vector decode attention (default on for
   WebGPU), the register attention and the Q4_K shuffle GEMV with lanes that do not exchange values the way the kernels assume - wrong numbers

@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.8</Version>
-		<PackageReleaseNotes>v5.8.8 - Accurate CUDA math without the prefill cost: on SpawnDev.ILGPU 5.4.21 the flash-prefill softmax runs XMath.Exp2 (one ex2) and the dequant f16 scales are converted from bits, so CUDA prefill is 293 tok/s short / 7,690 long (qwen3:1.7b Q8_0, RTX 4070) with or without the CUDA toolkit, against 232 / 7,435 in 5.8.7 on a toolkit machine. ML hot loops use float.MultiplyAddEstimate, so an app that builds its own Context no longer needs EnableFloatingPointContraction for speed. SpawnDev.ILGPU 5.4.19-5.4.21 CUDA fixes (nested-loop miscompile, warp-uniform branch at O2), -0 constants and locale-independent codegen on the browser backends. Release sweep 7,654 passed, 0 failed. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.9</Version>
+		<PackageReleaseNotes>v5.8.9 - WebGPU correctness: ML now chooses its warp-shuffle kernels (vector decode attention, register attention, the Q4_K shuffle GEMV, TRELLIS.2 shuffle attention) with SpawnDev.ILGPU 5.4.22's SupportsWarpShuffle instead of WarpSize == 32, which a browser without the subgroups feature also reports while its warp is the whole workgroup - 5.8.8 could compute wrong attention there. CUDA: the Q4_K decode GEMV reduces with warp shuffles (+1-1.5% decode). On SpawnDev.ILGPU 5.4.22. Release sweep 7,654 passed, 0 failed. Full notes: CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.22-local.1" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.22" />
 	</ItemGroup>
 
 	<ItemGroup>
