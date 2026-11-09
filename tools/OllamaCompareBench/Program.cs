@@ -138,6 +138,21 @@ foreach (var model in models)
                         Console.WriteLine($"PROFILE {label}: {pids.Length} prompt tokens, {tot:F1} ms in profiled kernels");
                         foreach (var kv in pbd.KernelTimes.OrderByDescending(kv => kv.Value))
                             Console.WriteLine($"PROFILE   {kv.Key,-24} {kv.Value,9:F2} ms  {kv.Value / tot * 100,5:F1}%");
+                        // decode per token: the same prompt generating 1 + D tokens minus the prefill-only run, per kernel, / D
+                        // (KernelTimes is cleared at each prefill, so each run's table is its own). Profiled steps are not captured.
+                        const int D = 32;
+                        var prefillOnly = new Dictionary<string, double>(pbd.KernelTimes);
+                        var dcfg = new GenerationConfig { Strategy = "greedy", MaxNewTokens = 1 + D };
+                        var dres = await gen.GenerateAsync(pids, dcfg, stopTokenIds: pstops);
+                        int dsteps = dres.GeneratedTokens - 1;
+                        if (dsteps > 0)
+                        {
+                            var per = pbd.KernelTimes.ToDictionary(kv => kv.Key, kv => (kv.Value - prefillOnly.GetValueOrDefault(kv.Key)) / dsteps);
+                            double dtot = per.Values.Sum();
+                            Console.WriteLine($"PROFILE {label}: decode, {dsteps} steps, {dtot:F3} ms a token in profiled kernels (uncaptured)");
+                            foreach (var kv in per.Where(kv => kv.Value > 0.0005).OrderByDescending(kv => kv.Value))
+                                Console.WriteLine($"PROFILE-DEC   {kv.Key,-24} {kv.Value,8:F3} ms  {kv.Value / dtot * 100,5:F1}%");
+                        }
                     }
                     finally { pbd.ProfileKernels = false; }
                 }
