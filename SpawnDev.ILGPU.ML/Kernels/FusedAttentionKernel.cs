@@ -390,7 +390,7 @@ public class FusedAttentionKernel : IDisposable
         // (headDim 48: ReDimNet2's attention) the butterfly mixes lanes of DIFFERENT queries and 2 lanes idle: the output
         // was 67% wrong with no error. MEASURED on ReDimNet2-B6 against onnxruntime; flipping only this switch fixed it.
         // Heads of 80 (T=5), 96 (T=6), 112 (T=7) were wrong the same way; 16/32/64/128/256 are unaffected.
-        if (EnableRegisterAttention && headDim % RegTileD == 0 && IsPowerOfTwo(headDim / RegTileD) && _accelerator.WarpSize == 32
+        if (EnableRegisterAttention && headDim % RegTileD == 0 && IsPowerOfTwo(headDim / RegTileD) && global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_accelerator, 32)
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU))
         {

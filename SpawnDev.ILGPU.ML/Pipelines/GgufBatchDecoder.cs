@@ -121,7 +121,8 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public bool AttentionVec { get => _attVec; set { if (_attVec != value) { _attVec = value; _bufGen++; } } }
     private bool _attVec;
-    private bool VecAttentionFits(int d) => _acc.WarpSize == 32 && d % 8 == 0 && (d / 8 & (d / 8 - 1)) == 0 && d / 8 <= 32 && d <= GqaMaxD;
+    // a real 32-lane warp: a WebGPU accelerator without subgroups reports WarpSize 32 but its "warp" is the whole workgroup (SpawnDev.ILGPU 5.4.22)
+    private bool VecAttentionFits(int d) => global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc, 32) && d % 8 == 0 && (d / 8 & (d / 8 - 1)) == 0 && d / 8 <= 32 && d <= GqaMaxD;
     private bool _attIlp;
     /// <summary>The next decode step records its kernels again (WebGPU plans, CUDA graphs): call after changing a static kernel switch (e.g. FusedDequantMatMul.Q8Vec)
     /// that a captured step would otherwise keep replaying.</summary>

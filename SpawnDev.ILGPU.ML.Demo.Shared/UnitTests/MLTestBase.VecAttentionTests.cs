@@ -22,7 +22,7 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.WebGPU))
             throw new UnsupportedTestException("the vector route needs 32-wide warp shuffles (CUDA, WebGPU with subgroups)");
-        if (accelerator.WarpSize != 32) throw new UnsupportedTestException($"warp size {accelerator.WarpSize}");
+        if (!global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(accelerator, 32)) throw new UnsupportedTestException($"no 32-lane warp shuffle (warp size {accelerator.WarpSize})");
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
         var hub = new ModelsHostStreamLoader(http);
         var reports = new List<string>();

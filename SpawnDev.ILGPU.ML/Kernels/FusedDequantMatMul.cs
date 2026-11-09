@@ -2384,8 +2384,7 @@ public class FusedDequantMatMul : IDisposable
     /// Warp.ShuffleXor compiles and the warp is 32 lanes. WarpSize alone is not enough: NVIDIA's OpenCL reports 32 but has no subgroup shuffle extension
     /// (the kernel fails to compile: "Subgroup shuffle requires SubGroupShuffle capability"). CUDA always has it; WebGPU reports 32 only with subgroups.
     /// </summary>
-    internal bool CanShuffle32 => _accelerator.WarpSize == 32
-        && (_accelerator is not global::ILGPU.Runtime.OpenCL.CLAccelerator cl || cl.Capabilities.SubGroupShuffle);
+    internal bool CanShuffle32 => global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_accelerator, 32);
     /// <summary>
     /// One Q8_0 row (M = 1, a decode step) on <see cref="GemvQ8_0VecImpl"/>: a warp per <see cref="Q8VecRows"/> outputs, a lane per pair of blocks (64 values,
     /// 68 bytes: 17 aligned 32-bit loads, no word read twice), its 64 inputs read once (sixteen float4 loads) for all the warp's outputs. Needs K a multiple of

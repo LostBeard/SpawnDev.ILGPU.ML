@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Shuffle kernels gated on `SupportsWarpShuffle` (SpawnDev.ILGPU 5.4.22)**, not on `WarpSize == 32`: a WebGPU accelerator without subgroups
+  reports WarpSize 32 but emulates a "warp" as the whole workgroup, so a WarpSize gate would have run the vector decode attention (default on for
+  WebGPU), the register attention and the Q4_K shuffle GEMV with lanes that do not exchange values the way the kernels assume - wrong numbers
+  on such a browser. Migrated: FusedDequantMatMul.CanShuffle32, GgufBatchDecoder.VecAttentionFits, FusedAttentionKernel register attention,
+  Trellis2 DiTKernels shuffle attention, and two test gates. Gates: Gemv_Q4KVec, GgufBatchDecoder_VecAttention_MatchesGrouped,
+  Attn_RegisterPerQuery_MatchesCpu, Trellis2_FlashAttention on all 7 lanes: 20 passed, 0 failed, 10 intended skips.
 - **CUDA Q4_K decode GEMV reduces its warp sums with Warp.ShuffleXor** (`GemvQ4_KVecShuffleImpl`) instead of shared memory and six group
   barriers. MEASURED (nsys, RTX 4070, qwen3:1.7b Q4_K_M captured decode, interleaved): 13.91 -> 13.47 / 15.75 -> 14.86 / 40.61 -> 39.39 us per
   GEMV (2048 / 3072 / 12288 rows), decode +1-1.5%. Default on for CUDA, opt-in elsewhere (`FusedDequantMatMul.Q4KVecShuffle`, env

@@ -515,7 +515,7 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int> CrossKernel(int key)
     {
         if (_tiledCross[key] != null) return _tiledCross[key]!;
-        if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery || !global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc)) _shuffleOk = false;   // a fixed warp whose lanes exchange values (not WebGPU without subgroups)
         if (_shuffleOk != false)
         {
             try { _tiledCross[key] = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, FV, int, int, int, int, int, int, int, int>)CrossShuffle[key / 2]); _shuffleOk = true; return _tiledCross[key]!; }
@@ -526,7 +526,7 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, FV, int, int, int, int, int, int, int, int> SelfKernel(int key)
     {
         if (_tiledSelf[key] != null) return _tiledSelf[key]!;
-        if (_acc.WarpSize < TiledAttention.LanesPerQuery) _shuffleOk = false;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery || !global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc)) _shuffleOk = false;   // a fixed warp whose lanes exchange values (not WebGPU without subgroups)
         if (_shuffleOk != false)
         {
             try { _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, int, int, int, int, int, int, int, int>)SelfShuffle[key / 2]); _shuffleOk = true; return _tiledSelf[key]!; }

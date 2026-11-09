@@ -143,7 +143,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 180000)]
     public async Task Benchmark_RegisterAttention_vs_SharedSlice() => await RunTest(async accelerator =>
     {
-        bool canRegister = accelerator.WarpSize == 32
+        bool canRegister = global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(accelerator, 32)
             && (accelerator.AcceleratorType == AcceleratorType.Cuda || accelerator.AcceleratorType == AcceleratorType.WebGPU);
         if (!canRegister)
         { Console.WriteLine($"[Benchmark] Register attention [{accelerator.AcceleratorType}]: N/A (no warp-32 subgroups — keeps shared-slice)"); return; }
