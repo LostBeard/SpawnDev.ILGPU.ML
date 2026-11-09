@@ -2380,6 +2380,11 @@ public class FusedDequantMatMul : IDisposable
     // MEASURED 2026-11-09 (nsys, RTX 4070, qwen3:1.7b Q4_K_M captured decode, shuffle path): 2 outputs a warp (twice the warps) is SLOWER - 13.42 -> 16.37 us
     // (2048 rows), 14.70 -> 14.18 (3072), 39.00 -> 43.52 (12288), decode -4.5%: the input re-reads cost more than the extra warps win. The small decode GEMVs
     // are bound by a fixed per-kernel cost (ramp-up, tail, graph-node launch: 3072 rows take ~14 us where streaming alone would be ~8), not by warp count.
+    // ncu 2026-11-09 (RTX 4070, captured decode; registers / theoretical occupancy / us for the 3072 / 2048 / 12288-row GEMVs): shuffle kernel
+    // 128 / 33% / 16.3, 10.3, 40.6 (q+k runs 1.04 waves). Row loop outside the input halves (8 live float4): 48 / 83% / 19.2, 14.0, 63.5 - SLOWER.
+    // KernelSpecialization(64, 9 groups an SM): 96 / 42% / 14.8, 11.3, 45.3 - only q+k gains, net worse. No spills. The kernel is load/store and
+    // issue bound: a lane moves 256 B of input (L1) per t-unit against 192 B of weights for its four rows, so re-reading inputs costs more than
+    // occupancy wins. Not adopted. (int8 activations + dp4a would cut that traffic but rounds the activations: not done, accuracy first.)
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec, _gemvQ4KVecShuffle;
     /// <summary>
     /// <see cref="Q4KVec"/> with the warp's sums reduced by Warp.ShuffleXor instead of shared memory + six group barriers (where <see cref="CanShuffle32"/>).
