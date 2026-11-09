@@ -123,6 +123,24 @@ foreach (var model in models)
                     sPre.Add(ids.Length / (firstMs / 1000.0));
                     sDec.Add((res.GeneratedTokens - 1) / ((ms - firstMs) / 1000.0));
                 }
+                // --profile: one prefill of this prompt with GgufBatchDecoder.ProfileKernels (a sync after every launch, so the total runs high;
+                // the per-kernel split is the point - e.g. what LibDevice's exp / sin / cos cost, with CUDA_PATH set vs unset)
+                if (args.Contains("--profile") && gen.BatchDecoder is { } pbd && arm.Name == "greedy")
+                {
+                    var (pids, pstops) = ChatTemplates.BuildChatPrompt(gguf, tok, new List<(string, string)> { ("user", Content(longCtx, 99)) }, thinking: false);
+                    var pcfg = new GenerationConfig { Strategy = "greedy", MaxNewTokens = 1 };
+                    pbd.ProfileKernels = true;
+                    try
+                    {
+                        await gen.GenerateAsync(pids, pcfg, stopTokenIds: pstops);   // warm (kernels compiled)
+                        await gen.GenerateAsync(pids, pcfg, stopTokenIds: pstops);
+                        double tot = pbd.KernelTimes.Values.Sum();
+                        Console.WriteLine($"PROFILE {label}: {pids.Length} prompt tokens, {tot:F1} ms in profiled kernels");
+                        foreach (var kv in pbd.KernelTimes.OrderByDescending(kv => kv.Value))
+                            Console.WriteLine($"PROFILE   {kv.Key,-24} {kv.Value,9:F2} ms  {kv.Value / tot * 100,5:F1}%");
+                    }
+                    finally { pbd.ProfileKernels = false; }
+                }
                 var bd = gen.BatchDecoder; lastCapture = bd == null ? "-" : $"{bd.CaptureStats.Captures} captured, {bd.CaptureStats.Replays} replayed, cuda {bd.CaptureCuda}{(bd.LastCudaCaptureRefusal is string w ? ", refused: " + w : "")}";
             }
             if (only != "ollama") engine += $" (captures {lastCapture})";
