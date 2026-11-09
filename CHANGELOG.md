@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA decode attention on the vector kernel, with four-ahead P.V and warp-shuffle reductions** (`GgufBatchDecoder.AttentionVec` now
+  default on for CUDA as well as WebGPU; new `AttentionShuffle`, default on for CUDA). The vector kernel's 16-byte K loads replace the ILP
+  kernel's per-thread row walks (scalar loads 2 KB apart across a warp, half the group idle at 64-key chunks); with `AttentionIlp` its P.V now
+  loads four V rows ahead; each head's chunk max and exp-sum reduce by `Warp.ShuffleXor` (2 group barriers instead of 17), pairing the sum as the
+  tree did, so every variant is bit-identical to its base kernel. MEASURED (nsys, RTX 4070, qwen3:1.7b Q4_K_M, per call, short / long prompt):
+  ILP kernel 16.97 / 38.52 us -> 15.17 / 23.01 us; decode (quiet, interleaved x2) 212.9 / 211.9 -> 215.3 / 212.9 tok/s short, 174.2 / 174.4 ->
+  188.8 / 188.5 long (+8.3%). New `GgufBatchDecoder_ShuffleAttention_BitIdentical`: every variant's logits bit-identical to its base (Qwen2.5-0.5B
+  G = 7 D = 64, Qwen3-0.6B G = 2 D = 128; CUDA, WebGPU), red-checked (a changed sum pairing moves 607k logits). New
+  `GgufBatchDecoder.LastDecodeAttentionKernel` and `KvCacheIsHalf`. Env GGUF_ATTN_VEC / GGUF_ATTN_SHUFFLE / GGUF_ATTN_ILP = 0 / 1 are the A/B.
+
 - **CUDA fused residual Add + RMSNorm reduces with warp shuffles in double** (`AddRMSNormFusedShuffleImpl`: two group barriers instead of five, no
   f32 step in the reduction). MEASURED (nsys, RTX 4070, qwen3:1.7b): decode norm 5.71 -> 4.88 us (56 a token), prefill rows 3-5% faster; error
   vs an f64 reference unchanged. New `AddRmsNormFused_MatchesCpu` (no direct test existed): residual bit-exact, normed output within 2e-6 relative,

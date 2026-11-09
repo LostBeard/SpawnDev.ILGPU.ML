@@ -111,13 +111,21 @@ public sealed class GgufBatchDecoder : IDisposable
     public int GqaChunk { get => _gqaChunk; set { if (_gqaChunk != value) { _gqaChunk = value; _bufGen++; } } }
     /// <summary>
     /// The decode attention on <c>AttnPartialGqaIlpImpl</c> (chunks past the position leave at once; K / V loads issued ahead of their FMAs; bit-identical) instead of
-    /// <c>AttnPartialGqaImpl</c>. Default: on for CUDA and OpenCL, off for WebGPU, per the A/B below (env GGUF_ATTN_ILP=0 / 1 forces it).
+    /// <c>AttnPartialGqaImpl</c>. Default: on for CUDA and OpenCL, off for WebGPU, per the A/B below (env GGUF_ATTN_ILP=0 / 1 forces it). With <see cref="AttentionVec"/>
+    /// it picks the vector kernel's P.V loop: four V rows loaded ahead of their FMAs (bit-identical) or one at a time.
     /// </summary>
     public bool AttentionIlp { get => _attIlp; set { if (_attIlp != value) { _attIlp = value; _bufGen++; } } }
     /// <summary>
+    /// The grouped-query decode attention (<see cref="AttentionIlp"/>'s kernel or <see cref="AttentionVec"/>'s) with each head's chunk max and exp-sum reduced by
+    /// Warp.ShuffleXor (2 group barriers in place of 17; bit-identical, see IGqaReduce). Needs a real 32-lane warp and a head width of 32, 64 or 128. Default: on for CUDA (measured in the constructor); env GGUF_ATTN_SHUFFLE=0 / 1 forces it.
+    /// </summary>
+    public bool AttentionShuffle { get => _attShuffle; set { if (_attShuffle != value) { _attShuffle = value; _bufGen++; } } }
+    private bool _attShuffle;
+    private bool ShuffleAttentionFits(int d) => global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc, 32) && (d == 32 || d == 64 || d == 128);
+    /// <summary>
     /// The grouped-query decode attention on <c>AttnPartialGqaVecImpl</c> (dead chunks leave at once; scores from 16-byte K loads reduced across lanes with
-    /// Warp.ShuffleXor). Needs an fp16 cache, a 32-wide warp / subgroup and a head width whose D / 8 is a power of two up to 32. Default: on for WebGPU
-    /// (env GGUF_ATTN_VEC=0 / 1 forces it); see the remarks in the kernel for what it replaces.
+    /// Warp.ShuffleXor). Needs an fp16 cache, a 32-wide warp / subgroup and a head width whose D / 8 is a power of two up to 32. Default: on for WebGPU and CUDA
+    /// (CUDA since 2026-11-09, with <see cref="AttentionIlp"/>'s four-ahead P.V; env GGUF_ATTN_VEC=0 / 1 forces it); see the remarks in the kernel for what it replaces.
     /// </summary>
     public bool AttentionVec { get => _attVec; set { if (_attVec != value) { _attVec = value; _bufGen++; } } }
     private bool _attVec;
@@ -206,7 +214,11 @@ public sealed class GgufBatchDecoder : IDisposable
         MaxSeq = maxSeq; MaxBatch = maxBatch;
         CaptureWebGPU = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator;
         _attIlp = Environment.GetEnvironmentVariable("GGUF_ATTN_ILP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL };
-        _attVec = Environment.GetEnvironmentVariable("GGUF_ATTN_VEC") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.WebGPU };
+        // CUDA: the vector kernel with four-ahead P.V and shuffle reductions. MEASURED 2026-11-09 (RTX 4070, qwen3:1.7b Q4_K_M, nsys per call, short / long
+        // prompt): ILP kernel 16.97 / 38.52 us, + shuffle 16.79 / 38.55, vector + ILP P.V 15.66 / 23.42, + shuffle 15.17 / 23.01; decode (quiet, interleaved
+        // x2) 212.9 / 211.9 -> 215.3 / 212.9 tok/s short, 174.2 / 174.4 -> 188.8 / 188.5 long. Bit-identical per GgufBatchDecoder_ShuffleAttention_BitIdentical.
+        _attShuffle = Environment.GetEnvironmentVariable("GGUF_ATTN_SHUFFLE") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda };
+        _attVec = Environment.GetEnvironmentVariable("GGUF_ATTN_VEC") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.Cuda };
         CaptureCuda = accelerator is global::ILGPU.Runtime.Cuda.CudaAccelerator && global::ILGPU.Runtime.Cuda.CudaStream.SupportsGraphCapture
             && Environment.GetEnvironmentVariable("GGUF_BATCH_CUDA_GRAPH") != "0";
         DeviceSampling = SupportsDeviceDraws(accelerator);
@@ -233,6 +245,8 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public static bool HalfKvCache = Environment.GetEnvironmentVariable("GGUF_BATCH_KV_F32") != "1";
 
+    /// <summary>This decoder's K / V caches are F16 (<see cref="HalfKvCache"/> when it was created).</summary>
+    public bool KvCacheIsHalf => _kv.IsHalf;
     /// <summary>The K / V caches' device memory (bytes), F16 or F32 per <see cref="HalfKvCache"/> when the decoder was created.</summary>
     public long KvCacheBytes { get; }
 
@@ -247,9 +261,9 @@ public sealed class GgufBatchDecoder : IDisposable
         /// <summary>The tensor-core flash prefill (<see cref="MmaFlashPrefill"/>; F16 caches only, head dim 128): false when this store cannot take it.</summary>
         public abstract bool FlashMma(int l, FV q, FV att, int R, int H, int kvH, int p);
         public abstract void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale);
-        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp);
+        public abstract void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp, bool shuffle);
         public abstract bool IsHalf { get; }
-        public abstract void AttPartialGqaVec(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale);
+        public abstract void AttPartialGqaVec(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool shuffle, bool ilp);
         public abstract void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale);
         public abstract void Pv(int l, int n, FV scores, IV seqs, FV o, int R, int nk, int H, int D, int kvH, int maxSeq, int mode);
         public abstract void Fork(int l, int n, long count, long region);
@@ -267,23 +281,32 @@ public sealed class GgufBatchDecoder : IDisposable
             new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
         private readonly Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqaIlp =
             new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
-        private readonly Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqaVec =
-            new Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
-        private Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqaVec<TG>() where TG : struct, IGqaGroup =>
-            _a.LoadStreamKernel<FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaVecImpl<TG>);
+        private readonly Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[] _attGqaIlpShuffle =
+            new Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1];
+        // [variant][G], variant = (shuffle ? 2 : 0) | (ilp ? 1 : 0)
+        private readonly Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[][] _attGqaVec = [new Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1], new Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1], new Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1], new Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>?[GqaMaxG + 1]];
+        private Action<KernelConfig, FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqaVec<TG>(int variant) where TG : struct, IGqaGroup => variant switch
+        {
+            0 => _a.LoadStreamKernel<FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaVecImpl<TG, GqaReduceTree, GqaPvPlain>),
+            1 => _a.LoadStreamKernel<FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaVecImpl<TG, GqaReduceTree, GqaPvIlp>),
+            2 => _a.LoadStreamKernel<FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaVecImpl<TG, GqaReduceShuffle, GqaPvPlain>),
+            _ => _a.LoadStreamKernel<FV, ArrayView<FusedDequantMatMul.W16>, ArrayView<global::ILGPU.Half>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaVecImpl<TG, GqaReduceShuffle, GqaPvIlp>),
+        };
         /// <summary>The fp16 cache can take AttnPartialGqaVecImpl (16-byte K loads).</summary>
         public override bool IsHalf => typeof(T) == typeof(global::ILGPU.Half);
-        public override void AttPartialGqaVec(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
+        public override void AttPartialGqaVec(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool shuffle, bool ilp)
         {
             if (!IsHalf) throw new InvalidOperationException("the vector decode attention reads an fp16 cache");
-            (_attGqaVec[H / kvH] ??= (H / kvH) switch
+            int variant = (shuffle ? 2 : 0) | (ilp ? 1 : 0);
+            (_attGqaVec[variant][H / kvH] ??= (H / kvH) switch
             {
-                2 => LoadGqaVec<Gqa2>(), 3 => LoadGqaVec<Gqa3>(), 4 => LoadGqaVec<Gqa4>(), 5 => LoadGqaVec<Gqa5>(), 6 => LoadGqaVec<Gqa6>(), 7 => LoadGqaVec<Gqa7>(), 8 => LoadGqaVec<Gqa8>(),
+                2 => LoadGqaVec<Gqa2>(variant), 3 => LoadGqaVec<Gqa3>(variant), 4 => LoadGqaVec<Gqa4>(variant), 5 => LoadGqaVec<Gqa5>(variant), 6 => LoadGqaVec<Gqa6>(variant), 7 => LoadGqaVec<Gqa7>(variant), 8 => LoadGqaVec<Gqa8>(variant),
                 _ => throw new ArgumentOutOfRangeException(nameof(H), $"grouped-query attention takes 2..{GqaMaxG} query heads a kv head, not {H / kvH}"),
             })(cfg, q, _k[l].View.BaseView.Cast<FusedDequantMatMul.W16>(), _v[l].View.BaseView.Cast<global::ILGPU.Half>(), seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, ck, scale);
         }
-        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqa<TG>(bool ilp) where TG : struct, IGqaGroup =>
-            ilp ? _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaIlpImpl<T, TG>)
+        private Action<KernelConfig, FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float> LoadGqa<TG>(bool ilp, bool shuffle) where TG : struct, IGqaGroup =>
+            shuffle ? _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaIlpImpl<T, TG, GqaReduceShuffle>)
+            : ilp ? _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaIlpImpl<T, TG, GqaReduceTree>)
                 : _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, int, float>(AttnPartialGqaImpl<T, TG>);
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int, int, float>? _scores;
         private Action<Index1D, FV, ArrayView1D<T, Stride1D.Dense>, IV, FV, int, int, int, int, int, int, int>? _pv;
@@ -325,10 +348,11 @@ public sealed class GgufBatchDecoder : IDisposable
         public override void AttPartial(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, float scale) =>
             (_att ??= _a.LoadStreamKernel<FV, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>, IV, IV, FV, FV, int, int, int, int, int, float>(AttnPartialImpl<T>))(
                 cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, scale);
-        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp) =>
-            ((ilp ? _attGqaIlp : _attGqa)[H / kvH] ??= (H / kvH) switch
+        // shuffle runs the ILP kernel (the caller passes it only with ilp)
+        public override void AttPartialGqa(int l, KernelConfig cfg, FV q, IV seqs, IV pos, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale, bool ilp, bool shuffle) =>
+            ((shuffle ? _attGqaIlpShuffle : ilp ? _attGqaIlp : _attGqa)[H / kvH] ??= (H / kvH) switch
             {
-                2 => LoadGqa<Gqa2>(ilp), 3 => LoadGqa<Gqa3>(ilp), 4 => LoadGqa<Gqa4>(ilp), 5 => LoadGqa<Gqa5>(ilp), 6 => LoadGqa<Gqa6>(ilp), 7 => LoadGqa<Gqa7>(ilp), 8 => LoadGqa<Gqa8>(ilp),
+                2 => LoadGqa<Gqa2>(ilp, shuffle), 3 => LoadGqa<Gqa3>(ilp, shuffle), 4 => LoadGqa<Gqa4>(ilp, shuffle), 5 => LoadGqa<Gqa5>(ilp, shuffle), 6 => LoadGqa<Gqa6>(ilp, shuffle), 7 => LoadGqa<Gqa7>(ilp, shuffle), 8 => LoadGqa<Gqa8>(ilp, shuffle),
                 _ => throw new ArgumentOutOfRangeException(nameof(H), $"grouped-query attention takes 2..{GqaMaxG} query heads a kv head, not {H / kvH}"),
             })(cfg, q, _k[l].View, _v[l].View, seqs, pos, part, ml, H, kvH, maxSeq, mode, nch, ck, scale);
         public override void Scores(int l, int n, FV q, IV seqs, FV scores, int R, int nk, int H, int D, int kvH, int maxSeq, int p, int mode, float scale) =>
@@ -900,11 +924,22 @@ public sealed class GgufBatchDecoder : IDisposable
                 int ach = _fixedChunks ? (MaxSeq + ck - 1) / ck : (nk + ck - 1) / ck;
                 var part = Buf(ref _attPart, (long)R * Heads * ach * HeadDim); var ml = Buf(ref _attMl, (long)R * Heads * ach * 2);
                 if (gqa && AttentionVec && _kv.IsHalf && VecAttentionFits(HeadDim))
-                    _kv.AttPartialGqaVec(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim));
+                {
+                    bool shuffle = AttentionShuffle && ShuffleAttentionFits(HeadDim);
+                    _kv.AttPartialGqaVec(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim), shuffle, AttentionIlp);
+                    LastDecodeAttentionKernel = "gqa-vec" + (AttentionIlp ? "-ilp" : "") + (shuffle ? "-shuffle" : "");
+                }
                 else if (gqa)
-                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim), AttentionIlp);
+                {
+                    bool shuffle = AttentionIlp && AttentionShuffle && ShuffleAttentionFits(HeadDim);
+                    _kv.AttPartialGqa(l, new KernelConfig(R * KvHeads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, ck, 1f / MathF.Sqrt(HeadDim), AttentionIlp, shuffle);
+                    LastDecodeAttentionKernel = shuffle ? "gqa-ilp-shuffle" : AttentionIlp ? "gqa-ilp" : "gqa";
+                }
                 else
+                {
                     _kv.AttPartial(l, new KernelConfig(R * Heads * ach, HeadDim), q, seqView, posView, part, ml, Heads, KvHeads, MaxSeq, mode, ach, 1f / MathF.Sqrt(HeadDim));
+                    LastDecodeAttentionKernel = "per-head";
+                }
                 Prof("attn");
                 _attCombine!((int)((long)R * Q), part, ml, att, posView, HeadDim, ach, gqa ? ck : AttChunk, Heads, mode); Prof("attn-merge");
             }
@@ -1108,6 +1143,8 @@ public sealed class GgufBatchDecoder : IDisposable
     public bool FlashMma { get; set; } = Environment.GetEnvironmentVariable("GGUF_FLASH_MMA") != "0";
     /// <summary>The kernel the last prefill's attention ran on: "mma", "gqa-tiled", "tiled", or null before any flash prefill.</summary>
     public string? LastFlashKernel { get; private set; }
+    /// <summary>The split-K decode attention kernel the last fused decode step ran: "gqa-vec[-ilp][-shuffle]", "gqa-ilp[-shuffle]", "gqa" or "per-head" (null before one).</summary>
+    public string? LastDecodeAttentionKernel { get; private set; }
 
     /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
     public int LastReusedPrefix { get; private set; }
@@ -2364,8 +2401,8 @@ public sealed class GgufBatchDecoder : IDisposable
     // loads: L = D / 8 lanes share a key row, each lane one 16-byte unit (8 halves) dotted with its 8 query values per head, the row's dot reduced across the
     // L lanes with Warp.ShuffleXor (offsets < L stay inside the row). The old score loop had each thread walk a whole row a half at a time: D scalar loads a
     // key, rows 2 KB apart across a warp. fp16 caches, WarpSize 32 (subgroups on WebGPU), D / 8 a power of two up to 32. P.V and the reductions are unchanged.
-    private static void AttnPartialGqaVecImpl<TG>(FV q, ArrayView<FusedDequantMatMul.W16> k16, ArrayView<global::ILGPU.Half> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
-        where TG : struct, IGqaGroup
+    private static void AttnPartialGqaVecImpl<TG, TR, TP>(FV q, ArrayView<FusedDequantMatMul.W16> k16, ArrayView<global::ILGPU.Half> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
+        where TG : struct, IGqaGroup where TR : struct, IGqaReduce where TP : struct, IGqaPv
     {
         int p = posBuf[0];
         int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
@@ -2376,6 +2413,7 @@ public sealed class GgufBatchDecoder : IDisposable
         var qs = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxD);
         var sc = SharedMemory.Allocate<float>(GqaMaxG * AttChunk);
         var mxs = SharedMemory.Allocate<float>(GqaMaxG);
+        var wmx = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxWarps);
         if (Group.BarrierOr(j0 > pos))
         {
             if (t < G) { long gq = ((long)r * H + hk * G + t) * nch + ch; ml[2 * gq] = -1e30f; ml[2 * gq + 1] = 0f; }
@@ -2442,59 +2480,52 @@ public sealed class GgufBatchDecoder : IDisposable
         Group.Barrier();
         int keys = Math.Min(ck, pos + 1 - j0);
         int vo = hk * D + t;
-        // every head's chunk max, then exp-sum, in ONE tree reduction each (the probabilities replace the scores in place); the G heads reduce side by side, so
-        // the barriers do not grow with G. MEASURED 2026-11-02 before it (WebGPU, qwen3-0.6b, G = 2, short prompt, captured steps): a reduction pair per head
-        // made this kernel 14% slower per token than the per-head kernel (216 against 251 tok/s): half the groups, each with G times the barrier chain.
-        for (int gi = 0; gi < G; gi++)
-        {
-            float m = -1e30f;
-            for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
-            qs[gi * D + t] = m;
-        }
-        Group.Barrier();
-        for (int w = D / 2; w > 0; w >>= 1)
-        {
-            if (t < w)
-                for (int gi = 0; gi < G; gi++) qs[gi * D + t] = MathF.Max(qs[gi * D + t], qs[gi * D + t + w]);
-            Group.Barrier();
-        }
-        if (t < G) mxs[t] = qs[t * D];
-        Group.Barrier();
-        for (int gi = 0; gi < G; gi++)
-        {
-            float m = mxs[gi], l = 0f;
-            for (int jj = t; jj < ck; jj += D)
-            {
-                int si = gi * AttChunk + jj;
-                float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
-                sc[si] = e; l += e;
-            }
-            qs[gi * D + t] = l;
-        }
-        Group.Barrier();
-        for (int w = D / 2; w > 0; w >>= 1)
-        {
-            if (t < w)
-                for (int gi = 0; gi < G; gi++) qs[gi * D + t] += qs[gi * D + t + w];
-            Group.Barrier();
-        }
-        if (t < G)
-        {
-            long gq = ((long)r * H + hk * G + t) * nch + ch;
-            ml[2 * gq] = mxs[t]; ml[2 * gq + 1] = qs[t * D];
-        }
+        GqaChunkSoftmax<TG, TR>(qs, sc, mxs, wmx, ml, t, D, ck, ((long)r * H + hk * G) * nch + ch, nch);
         float o0 = 0f, o1 = 0f, o2 = 0f, o3 = 0f, o4 = 0f, o5 = 0f, o6 = 0f, o7 = 0f;
-        for (int jj = 0; jj < keys; jj++)
+        if (default(TP).Ilp)
         {
-            float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
-            o0 = float.MultiplyAddEstimate(sc[jj], v, o0);
-            if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + jj], v, o1);
-            if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + jj], v, o2);
-            if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + jj], v, o3);
-            if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + jj], v, o4);
-            if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + jj], v, o5);
-            if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + jj], v, o6);
-            if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + jj], v, o7);
+            // four V rows in flight before their FMAs, the sums in the same key order; then the remainder one key at a time
+            int kj = 0;
+            for (; kj + 4 <= keys; kj += 4)
+            {
+                int vb = vo + (j0 + kj) * kvC;
+                float v0 = PrecisionConvert.ConvertToSingle(vq[vb]), v1 = PrecisionConvert.ConvertToSingle(vq[vb + kvC]), v2 = PrecisionConvert.ConvertToSingle(vq[vb + 2 * kvC]), v3 = PrecisionConvert.ConvertToSingle(vq[vb + 3 * kvC]);
+                o0 = float.MultiplyAddEstimate(sc[kj + 0], v0, o0); o0 = float.MultiplyAddEstimate(sc[kj + 1], v1, o0); o0 = float.MultiplyAddEstimate(sc[kj + 2], v2, o0); o0 = float.MultiplyAddEstimate(sc[kj + 3], v3, o0);
+                if (G > 1) { o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 0], v0, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 1], v1, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 2], v2, o1); o1 = float.MultiplyAddEstimate(sc[AttChunk + kj + 3], v3, o1); }
+                if (G > 2) { o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 0], v0, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 1], v1, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 2], v2, o2); o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj + 3], v3, o2); }
+                if (G > 3) { o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 0], v0, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 1], v1, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 2], v2, o3); o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj + 3], v3, o3); }
+                if (G > 4) { o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 0], v0, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 1], v1, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 2], v2, o4); o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj + 3], v3, o4); }
+                if (G > 5) { o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 0], v0, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 1], v1, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 2], v2, o5); o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj + 3], v3, o5); }
+                if (G > 6) { o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 0], v0, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 1], v1, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 2], v2, o6); o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj + 3], v3, o6); }
+                if (G > 7) { o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 0], v0, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 1], v1, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 2], v2, o7); o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj + 3], v3, o7); }
+            }
+            for (; kj < keys; kj++)
+            {
+                float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + kj) * kvC]);
+                o0 = float.MultiplyAddEstimate(sc[kj], v, o0);
+                if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + kj], v, o1);
+                if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + kj], v, o2);
+                if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + kj], v, o3);
+                if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + kj], v, o4);
+                if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + kj], v, o5);
+                if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + kj], v, o6);
+                if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + kj], v, o7);
+            }
+        }
+        else
+        {
+            for (int jj = 0; jj < keys; jj++)
+            {
+                float v = PrecisionConvert.ConvertToSingle(vq[vo + (j0 + jj) * kvC]);
+                o0 = float.MultiplyAddEstimate(sc[jj], v, o0);
+                if (G > 1) o1 = float.MultiplyAddEstimate(sc[AttChunk + jj], v, o1);
+                if (G > 2) o2 = float.MultiplyAddEstimate(sc[2 * AttChunk + jj], v, o2);
+                if (G > 3) o3 = float.MultiplyAddEstimate(sc[3 * AttChunk + jj], v, o3);
+                if (G > 4) o4 = float.MultiplyAddEstimate(sc[4 * AttChunk + jj], v, o4);
+                if (G > 5) o5 = float.MultiplyAddEstimate(sc[5 * AttChunk + jj], v, o5);
+                if (G > 6) o6 = float.MultiplyAddEstimate(sc[6 * AttChunk + jj], v, o6);
+                if (G > 7) o7 = float.MultiplyAddEstimate(sc[7 * AttChunk + jj], v, o7);
+            }
         }
         long pb = ((long)r * H + hk * G) * nch + ch;
         part[pb * D + t] = o0;
@@ -2508,10 +2539,105 @@ public sealed class GgufBatchDecoder : IDisposable
     }
 
 
+    /// <summary>
+    /// A chunk's softmax statistics for the G heads of a grouped-query attention group: each head's max over its chunk scores (sc, G rows of AttChunk), the scores
+    /// replaced in place by exp(score - max) (masked scores, -1e30, by 0), the exp-sum, and (max, sum) written to ml at gq0 + head * nch. qs (G x D) is scratch:
+    /// its queries must already be read. Either path's barriers publish sc for the P.V that follows. Shared by AttnPartialGqaIlpImpl and AttnPartialGqaVecImpl
+    /// (inlined into each kernel); TR picks the tree or the warp-shuffle reduction (bit-identical, see IGqaReduce).
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void GqaChunkSoftmax<TG, TR>(ArrayView<float> qs, ArrayView<float> sc, ArrayView<float> mxs, ArrayView<float> wmx, FV ml, int t, int D, int ck, long gq0, int nch)
+        where TG : struct, IGqaGroup where TR : struct, IGqaReduce
+    {
+        int G = default(TG).G;
+        if (default(TR).Shuffle)
+        {
+            // the same max and exp-sum with 2 barriers in place of 17 (see IGqaReduce). Max: each warp's lanes by Warp.ShuffleXor, the D / 32 warp maxima
+            // through shared memory (a max takes no rounding: any order gives the tree's value). Sum: the per-thread partials through shared memory, then
+            // every lane adds its column of warps in the tree's pairing ((c, c + 64) + (c + 32, c + 96) at D = 128) and the 32 columns by ShuffleXor 16, 8,
+            // 4, 2, 1: the tree's last five levels, the same operands in the same pairs. Every lane holds the tree's sum; every thread runs every shuffle.
+            int lane = t & 31, nw = D >> 5;
+            for (int gi = 0; gi < G; gi++)
+            {
+                float m = -1e30f;
+                for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
+                m = default(TR).WarpMax(m);
+                if (lane == 0) wmx[gi * GqaMaxWarps + (t >> 5)] = m;
+            }
+            Group.Barrier();
+            for (int gi = 0; gi < G; gi++)
+            {
+                float m = wmx[gi * GqaMaxWarps];
+                for (int w = 1; w < nw; w++) m = MathF.Max(m, wmx[gi * GqaMaxWarps + w]);
+                float l = 0f;
+                for (int jj = t; jj < ck; jj += D)
+                {
+                    int si = gi * AttChunk + jj;
+                    float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
+                    sc[si] = e; l += e;
+                }
+                qs[gi * D + t] = l;                                  // qs is free: the scores were the last to read the queries
+                if (t == gi) ml[2 * (gq0 + (long)t * nch)] = m;
+            }
+            Group.Barrier();                                         // the partials, and the probabilities the caller's P.V reads
+            for (int gi = 0; gi < G; gi++)
+            {
+                int b = gi * D + lane;
+                float s = nw == 4 ? (qs[b] + qs[b + 64]) + (qs[b + 32] + qs[b + 96]) : nw == 2 ? qs[b] + qs[b + 32] : qs[b];
+                s = default(TR).WarpSum(s);
+                if (t == gi) ml[2 * (gq0 + (long)t * nch) + 1] = s;
+            }
+        }
+        else
+        {
+            // every head's chunk max, then exp-sum, in ONE tree reduction each (the probabilities replace the scores in place); the G heads reduce side by side, so
+            // the barriers do not grow with G. MEASURED 2026-11-02 before it (WebGPU, qwen3-0.6b, G = 2, short prompt, captured steps): a reduction pair per head
+            // made this kernel 14% slower per token than the per-head kernel (216 against 251 tok/s): half the groups, each with G times the barrier chain.
+            for (int gi = 0; gi < G; gi++)
+            {
+                float m = -1e30f;
+                for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
+                qs[gi * D + t] = m;
+            }
+            Group.Barrier();
+            for (int w = D / 2; w > 0; w >>= 1)
+            {
+                if (t < w)
+                    for (int gi = 0; gi < G; gi++) qs[gi * D + t] = MathF.Max(qs[gi * D + t], qs[gi * D + t + w]);
+                Group.Barrier();
+            }
+            if (t < G) mxs[t] = qs[t * D];
+            Group.Barrier();
+            for (int gi = 0; gi < G; gi++)
+            {
+                float m = mxs[gi], l = 0f;
+                for (int jj = t; jj < ck; jj += D)
+                {
+                    int si = gi * AttChunk + jj;
+                    float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
+                    sc[si] = e; l += e;
+                }
+                qs[gi * D + t] = l;
+            }
+            Group.Barrier();
+            for (int w = D / 2; w > 0; w >>= 1)
+            {
+                if (t < w)
+                    for (int gi = 0; gi < G; gi++) qs[gi * D + t] += qs[gi * D + t + w];
+                Group.Barrier();
+            }
+            if (t < G)
+            {
+                long gq = gq0 + (long)t * nch;
+                ml[2 * gq] = mxs[t]; ml[2 * gq + 1] = qs[t * D];
+            }
+        }
+    }
+
     // AttnPartialGqaImpl with (1) a chunk wholly past the position leaving at once (Group.BarrierOr: uniform in WGSL) and (2) the K / V loads issued ahead of
     // their FMAs (eight K, four V; the same sums in the same order: bit-identical). MEASURED 2026-11-05 on CUDA (RTX 4070): see AttentionIlp.
-    private static void AttnPartialGqaIlpImpl<T, TG>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
-        where T : unmanaged, System.Numerics.INumber<T> where TG : struct, IGqaGroup
+    private static void AttnPartialGqaIlpImpl<T, TG, TR>(FV q, ArrayView1D<T, Stride1D.Dense> kc, ArrayView1D<T, Stride1D.Dense> vc, IV seqs, IV posBuf, FV part, FV ml, int H, int kvH, int maxSeq, int mode, int nch, int ck, float scale)
+        where T : unmanaged, System.Numerics.INumber<T> where TG : struct, IGqaGroup where TR : struct, IGqaReduce
     {
         int p = posBuf[0];
         int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX;
@@ -2522,6 +2648,7 @@ public sealed class GgufBatchDecoder : IDisposable
         var qs = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxD);
         var sc = SharedMemory.Allocate<float>(GqaMaxG * AttChunk);
         var mxs = SharedMemory.Allocate<float>(GqaMaxG);              // each head's chunk max (the reductions run in qs, free after the scores)
+        var wmx = SharedMemory.Allocate<float>(GqaMaxG * GqaMaxWarps);       // the shuffle reduction's per-warp maxima
         // this sequence's rows of the caches: the offsets below stay 32-bit (a sequence's maxSeq x kvC is far below 2^31), so the inner loops carry no 64-bit
         // arithmetic (emulated on WebGPU: an i64 add per K element and an i64 multiply per V row before 2026-11-02)
         // a chunk wholly past the position (a captured step launches every chunk the cache holds): the empty partial it would compute (max -1e30, sum 0: the
@@ -2572,47 +2699,7 @@ public sealed class GgufBatchDecoder : IDisposable
         Group.Barrier();
         int keys = Math.Min(ck, pos + 1 - j0);
         int vo = hk * D + t;
-        // every head's chunk max, then exp-sum, in ONE tree reduction each (the probabilities replace the scores in place); the G heads reduce side by side, so
-        // the barriers do not grow with G. MEASURED 2026-11-02 before it (WebGPU, qwen3-0.6b, G = 2, short prompt, captured steps): a reduction pair per head
-        // made this kernel 14% slower per token than the per-head kernel (216 against 251 tok/s): half the groups, each with G times the barrier chain.
-        for (int gi = 0; gi < G; gi++)
-        {
-            float m = -1e30f;
-            for (int jj = t; jj < ck; jj += D) m = MathF.Max(m, sc[gi * AttChunk + jj]);
-            qs[gi * D + t] = m;
-        }
-        Group.Barrier();
-        for (int w = D / 2; w > 0; w >>= 1)
-        {
-            if (t < w)
-                for (int gi = 0; gi < G; gi++) qs[gi * D + t] = MathF.Max(qs[gi * D + t], qs[gi * D + t + w]);
-            Group.Barrier();
-        }
-        if (t < G) mxs[t] = qs[t * D];
-        Group.Barrier();
-        for (int gi = 0; gi < G; gi++)
-        {
-            float m = mxs[gi], l = 0f;
-            for (int jj = t; jj < ck; jj += D)
-            {
-                int si = gi * AttChunk + jj;
-                float e = sc[si] <= -1e29f ? 0f : MathF.Exp(sc[si] - m);
-                sc[si] = e; l += e;
-            }
-            qs[gi * D + t] = l;
-        }
-        Group.Barrier();
-        for (int w = D / 2; w > 0; w >>= 1)
-        {
-            if (t < w)
-                for (int gi = 0; gi < G; gi++) qs[gi * D + t] += qs[gi * D + t + w];
-            Group.Barrier();
-        }
-        if (t < G)
-        {
-            long gq = ((long)r * H + hk * G + t) * nch + ch;
-            ml[2 * gq] = mxs[t]; ml[2 * gq + 1] = qs[t * D];
-        }
+        GqaChunkSoftmax<TG, TR>(qs, sc, mxs, wmx, ml, t, D, ck, ((long)r * H + hk * G) * nch + ch, nch);
         float o0 = 0f, o1 = 0f, o2 = 0f, o3 = 0f, o4 = 0f, o5 = 0f, o6 = 0f, o7 = 0f;
         // four V rows in flight before their FMAs, the sums in the same key order; then the remainder one key at a time
         int kj = 0;
@@ -2651,7 +2738,30 @@ public sealed class GgufBatchDecoder : IDisposable
         if (G > 6) part[(pb + 6L * nch) * D + t] = o6;
         if (G > 7) part[(pb + 7L * nch) * D + t] = o7;
     }
-    private const int GqaMaxG = 8, GqaMaxD = 128;
+    private const int GqaMaxG = 8, GqaMaxD = 128, GqaMaxWarps = GqaMaxD / 32;
+    /// <summary>
+    /// How <see cref="AttnPartialGqaIlpImpl"/> reduces each head's chunk max and exp-sum, as a type (compiled per choice, the other path folds away): a shared-memory
+    /// tree over the D threads (two 7-level chains at D = 128, a barrier a level) or Warp.ShuffleXor inside each warp with one shared hop between warps. The two
+    /// give bit-identical results (the shuffle path keeps the tree's pairing for the sum). The shuffle path needs a real 32-lane warp and D in {32, 64, 128}.
+    /// The shuffles live in the struct, not the kernel: ILGPU keeps the untaken <c>if (default(TR).Shuffle)</c> branch, so a WarpShuffle written in the kernel
+    /// reached the tree variant's code and OpenCL without subgroup shuffles refused to compile it (MEASURED 2026-11-09, GqaAttention_MatchesPerHead on OpenCL).
+    /// The tree struct's WarpMax / WarpSum are never called (its kernel takes the tree branch) and hold no shuffle.
+    /// </summary>
+    internal interface IGqaReduce { bool Shuffle { get; } float WarpMax(float v); float WarpSum(float v); }
+    internal struct GqaReduceTree : IGqaReduce { public bool Shuffle => false; public float WarpMax(float v) => v; public float WarpSum(float v) => v; }
+    /// <summary>How <see cref="AttnPartialGqaVecImpl"/> walks P.V: one V row at a time, or four rows loaded ahead of their FMAs (AttnPartialGqaIlpImpl's loop; the
+    /// same sums in the same order: bit-identical).</summary>
+    internal interface IGqaPv { bool Ilp { get; } }
+    internal struct GqaPvPlain : IGqaPv { public bool Ilp => false; }
+    internal struct GqaPvIlp : IGqaPv { public bool Ilp => true; }
+    internal struct GqaReduceShuffle : IGqaReduce
+    {
+        public bool Shuffle => true;
+        /// <summary>The warp's max in every lane (xor butterfly 16, 8, 4, 2, 1).</summary>
+        public float WarpMax(float v) { for (int off = 16; off > 0; off >>= 1) v = MathF.Max(v, Warp.ShuffleXor(v, off)); return v; }
+        /// <summary>The warp's sum in every lane, paired as a shared-memory tree's last five levels pair it (lane c with c + 16, then + 8, ...).</summary>
+        public float WarpSum(float v) { for (int off = 16; off > 0; off >>= 1) v += Warp.ShuffleXor(v, off); return v; }
+    }
     /// <summary>The query heads per kv head of <see cref="AttnPartialGqaImpl"/>, as a type: the kernel is compiled per G, so its G-way guards are constants.</summary>
     internal interface IGqaGroup { int G { get; } }
     internal struct Gqa2 : IGqaGroup { public int G => 2; }
