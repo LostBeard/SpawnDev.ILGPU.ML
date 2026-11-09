@@ -2339,10 +2339,13 @@ public class FusedDequantMatMul : IDisposable
         if (M == 1 && type == GGMLType.Q4_K && !ForceGenericRows && Q4KVec && K % 256 == 0
             && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
         {
-            _gemvQ4KVec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ4_KVecImpl);
-            _gemvQ4KVec(new KernelConfig((N + Q4KVecCols * Q4KVecRows - 1) / (Q4KVecCols * Q4KVecRows), Q4KVecCols * 32),
+            bool shuffle = (Q4KVecShuffle ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32;
+            var q4k = shuffle
+                ? _gemvQ4KVecShuffle ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ4_KVecShuffleImpl)
+                : _gemvQ4KVec ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ4_KVecImpl);
+            q4k(new KernelConfig((N + Q4KVecCols * Q4KVecRows - 1) / (Q4KVecCols * Q4KVecRows), Q4KVecCols * 32),
                 input.SubView(0, (long)K).BaseView.Cast<Vec4LoadMatMul.F4>(), weightQuant.BaseView.Cast<W16>(), output, pb.View);
-            LastRowsKernel = "q4k-vec";
+            LastRowsKernel = shuffle ? "q4k-vec-shuffle" : "q4k-vec";
             return;
         }
         LastRowsKernel = kernel == null ? "per-element" : $"rows-{type}";
@@ -2366,7 +2369,20 @@ public class FusedDequantMatMul : IDisposable
     public static bool Q4KVec = Environment.GetEnvironmentVariable("GGUF_Q4K_VEC") != "0";
     private const int Q4KVecCols = 2;      // warps a group holds: 32 lanes each
     private const int Q4KVecRows = 4;      // outputs a warp computes: each lane's inputs are read once for all of them
-    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec, _gemvQ4KVecShuffle;
+    /// <summary>
+    /// <see cref="Q4KVec"/> with the warp's sums reduced by Warp.ShuffleXor instead of shared memory + six group barriers (where <see cref="CanShuffle32"/>).
+    /// null (default) = on for CUDA, off elsewhere until measured there; env GGUF_Q4K_VEC_SHUFFLE=0 / 1 forces it. MEASURED 2026-11-09 (nsys, RTX 4070,
+    /// qwen3:1.7b Q4_K_M captured decode, interleaved): per GEMV 13.91 -> 13.47 us (2048 rows), 15.75 -> 14.86 (3072), 40.61 -> 39.39 (12288); decode
+    /// +1-1.5% (190.8 / 190.2 -> 192.9 / 191.7 tok/s short, 158.5 / 158.9 -> 161.1 / 160.3 long).
+    /// </summary>
+    public static bool? Q4KVecShuffle = Environment.GetEnvironmentVariable("GGUF_Q4K_VEC_SHUFFLE") switch { "0" => false, "1" => true, _ => null };
+    /// <summary>
+    /// Warp.ShuffleXor compiles and the warp is 32 lanes. WarpSize alone is not enough: NVIDIA's OpenCL reports 32 but has no subgroup shuffle extension
+    /// (the kernel fails to compile: "Subgroup shuffle requires SubGroupShuffle capability"). CUDA always has it; WebGPU reports 32 only with subgroups.
+    /// </summary>
+    internal bool CanShuffle32 => _accelerator.WarpSize == 32
+        && (_accelerator is not global::ILGPU.Runtime.OpenCL.CLAccelerator cl || cl.Capabilities.SubGroupShuffle);
     /// <summary>
     /// One Q8_0 row (M = 1, a decode step) on <see cref="GemvQ8_0VecImpl"/>: a warp per <see cref="Q8VecRows"/> outputs, a lane per pair of blocks (64 values,
     /// 68 bytes: 17 aligned 32-bit loads, no word read twice), its 64 inputs read once (sixteen float4 loads) for all the warp's outputs. Needs K a multiple of
@@ -2706,6 +2722,47 @@ public class FusedDequantMatMul : IDisposable
     {
         int K = p[1], N = p[2];
         int tid = Group.IdxX, lane = tid & 31, n0 = (Grid.IdxX * Q4KVecCols + (tid >> 5)) * Q4KVecRows;
+        var s = Q4KVecLaneSums(x4, w16, K, N, n0, lane);
+        float p0 = s.A, p1 = s.B, p2 = s.C, p3 = s.D;
+        // per warp, per output: the 32 lanes' sums
+        var sh = SharedMemory.Allocate<float>(Q4KVecCols * 32 * Q4KVecRows);
+        int wb = (tid >> 5) * 32 * Q4KVecRows;
+        sh[wb + lane] = p0; sh[wb + 32 + lane] = p1; sh[wb + 64 + lane] = p2; sh[wb + 96 + lane] = p3;
+        Group.Barrier();
+        for (int stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                for (int r = 0; r < Q4KVecRows; r++) sh[wb + 32 * r + lane] += sh[wb + 32 * r + lane + stride];
+            Group.Barrier();
+        }
+        if (lane < Q4KVecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
+    }
+
+    // GemvQ4_KVecImpl with the warp's sums reduced by Warp.ShuffleXor (five shuffles an output) instead of shared memory and six group barriers: for
+    // the decode shapes (K = 2048: one t-unit a lane) the reduction is a large part of the kernel. Needs 32-wide warps (the lane layout already assumes 32).
+    private static void GemvQ4_KVecShuffleImpl(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView<W16> w16, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, n0 = (Grid.IdxX * Q4KVecCols + (tid >> 5)) * Q4KVecRows;
+        var s = Q4KVecLaneSums(x4, w16, K, N, n0, lane);
+        float p0 = s.A, p1 = s.B, p2 = s.C, p3 = s.D;
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            p0 += Warp.ShuffleXor(p0, off); p1 += Warp.ShuffleXor(p1, off);
+            p2 += Warp.ShuffleXor(p2, off); p3 += Warp.ShuffleXor(p3, off);
+        }
+        if (lane == 0)
+        {
+            if (n0 < N) output[n0] = p0;
+            if (n0 + 1 < N) output[n0 + 1] = p1;
+            if (n0 + 2 < N) output[n0 + 2] = p2;
+            if (n0 + 3 < N) output[n0 + 3] = p3;
+        }
+    }
+
+    // one lane's partial sums of a warp's Q4KVecRows outputs (GemvQ4_KVecImpl and GemvQ4_KVecShuffleImpl share it; they differ only in the reduction)
+    private static Vec4LoadMatMul.F4 Q4KVecLaneSums(ArrayView<Vec4LoadMatMul.F4> x4, ArrayView<W16> w16, int K, int N, int n0, int lane)
+    {
         float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
         int nsb = K >> 8, rowW = nsb * 9, nTU = nsb * 4;           // a super-block is 144 B = 9 W16
         bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
@@ -2726,18 +2783,7 @@ public class FusedDequantMatMul : IDisposable
                 if (r3) p3 += Q4KTUnit(w16, so16 + 3 * rowW, t, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7, sl, shh);
             }
         }
-        // per warp, per output: the 32 lanes' sums
-        var sh = SharedMemory.Allocate<float>(Q4KVecCols * 32 * Q4KVecRows);
-        int wb = (tid >> 5) * 32 * Q4KVecRows;
-        sh[wb + lane] = p0; sh[wb + 32 + lane] = p1; sh[wb + 64 + lane] = p2; sh[wb + 96 + lane] = p3;
-        Group.Barrier();
-        for (int stride = 16; stride > 0; stride >>= 1)
-        {
-            if (lane < stride)
-                for (int r = 0; r < Q4KVecRows; r++) sh[wb + 32 * r + lane] += sh[wb + 32 * r + lane + stride];
-            Group.Barrier();
-        }
-        if (lane < Q4KVecRows && n0 + lane < N) output[n0 + lane] = sh[wb + 32 * lane];
+        return new Vec4LoadMatMul.F4 { A = p0, B = p1, C = p2, D = p3 };
     }
 
     // Q6_K (210 B per 256: 128 B low nibbles, 64 B high bit pairs, 16 int8 scales, fp16 d): a thread per 16 values (one half, four l of the 32: values l, l + 32,

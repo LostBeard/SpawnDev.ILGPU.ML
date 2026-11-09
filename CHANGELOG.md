@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA Q4_K decode GEMV reduces its warp sums with Warp.ShuffleXor** (`GemvQ4_KVecShuffleImpl`) instead of shared memory and six group
+  barriers. MEASURED (nsys, RTX 4070, qwen3:1.7b Q4_K_M captured decode, interleaved): 13.91 -> 13.47 / 15.75 -> 14.86 / 40.61 -> 39.39 us per
+  GEMV (2048 / 3072 / 12288 rows), decode +1-1.5%. Default on for CUDA, opt-in elsewhere (`FusedDequantMatMul.Q4KVecShuffle`, env
+  GGUF_Q4K_VEC_SHUFFLE); gated on `CanShuffle32` (NVIDIA OpenCL reports 32-wide warps but has no subgroup shuffle). `Gemv_Q4KVec_MatchesOracle_AndIsTaken`
+  runs both reductions and a decode shape (K 2048, N 3072). Where decode goes (nsys): the GEMVs are 3.98 ms of a 5.2 ms token; small matrices
+  stream at 40-56% of bandwidth (occupancy-bound), large ones at 69-78%.
+
+
 ## 5.8.8 - 2026-11-09 (nuget.org) - accurate CUDA math without the prefill cost, explicit multiply-add, exact f16 dequant
 
 On SpawnDev.ILGPU 5.4.21. Release sweep (full default, HeavyModel excluded): 7,654 passed, 0 failed, 443 skipped, 1 h 16 m

@@ -19,7 +19,10 @@ public abstract partial class MLTestBase
         var type = GGMLType.Q4_K;
         using var fused = new Kernels.FusedDequantMatMul(accelerator);
         var notes = new List<string>();
-        foreach (var (K, N) in new[] { (4096, 203), (1536, 9), (512, 4100), (256, 8200) })
+        bool? shuffleSaved = Kernels.FusedDequantMatMul.Q4KVecShuffle;
+        try
+        {
+        foreach (var (K, N) in new[] { (4096, 203), (1536, 9), (512, 4100), (256, 8200), (2048, 3072) })
         {
             var rng = new Random(71 + K + N);
             int bytesPerRow = RowBytes(type, K);
@@ -42,22 +45,33 @@ public abstract partial class MLTestBase
             using var weightBuf = AllocatePadded(accelerator, weightBytes);
             using var inputBuf = accelerator.Allocate1D(input);
             using var outBuf = accelerator.Allocate1D<float>(N);
-            // aligned (offset 0): the vector kernel
-            fused.ForwardRows(inputBuf.View.SubView(0, K), weightBuf.View, outBuf.View, 1, K, N, type);
-            string route = fused.LastRowsKernel;
-            await accelerator.SynchronizeAsync();
-            var got = await outBuf.CopyToHostAsync<float>(0, N);
-            if (route != "q4k-vec") throw new Exception($"K={K} N={N}: an aligned one-row Q4_K GEMV ran on '{route}', not the vector kernel");
-            AssertCloseQuant(got, Expected(0), 2e-3f, $"Q4_K vector GEMV K={K} N={N}");
+            // aligned (offset 0): the vector kernel, with the shared-memory reduction and (32-wide warps) with the shuffle reduction
+            string route = "";
+            foreach (bool shuffle in new[] { false, true })
+            {
+                Kernels.FusedDequantMatMul.Q4KVecShuffle = shuffle;
+                string want = shuffle && fused.CanShuffle32 ? "q4k-vec-shuffle" : "q4k-vec";
+                outBuf.MemSetToZero();   // a stale result from the other reduction must not pass
+                fused.ForwardRows(inputBuf.View.SubView(0, K), weightBuf.View, outBuf.View, 1, K, N, type);
+                string r = fused.LastRowsKernel;
+                await accelerator.SynchronizeAsync();
+                var got = await outBuf.CopyToHostAsync<float>(0, N);
+                if (r != want) throw new Exception($"K={K} N={N}: an aligned one-row Q4_K GEMV ran on '{r}', not '{want}'");
+                AssertCloseQuant(got, Expected(0), 2e-3f, $"Q4_K vector GEMV ({r}) K={K} N={N}");
+                route += (route.Length > 0 ? " + " : "") + r;
+            }
+            Kernels.FusedDequantMatMul.Q4KVecShuffle = shuffleSaved;
             // misaligned by one float: the word-wise kernel, same answer
             fused.ForwardRows(inputBuf.View.SubView(1, K), weightBuf.View, outBuf.View, 1, K, N, type);
             string route2 = fused.LastRowsKernel;
             await accelerator.SynchronizeAsync();
             var got2 = await outBuf.CopyToHostAsync<float>(0, N);
-            if (route2 == "q4k-vec") throw new Exception($"K={K} N={N}: a misaligned input view took the vector kernel (its loads assume 16-byte alignment)");
+            if (route2.StartsWith("q4k-vec")) throw new Exception($"K={K} N={N}: a misaligned input view took the vector kernel (its loads assume 16-byte alignment)");
             AssertCloseQuant(got2, Expected(1), 2e-3f, $"Q4_K word-wise GEMV (misaligned input) K={K} N={N}");
             notes.Add($"K={K} N={N}: {route} and {route2} match the oracle");
         }
+        }
+        finally { Kernels.FusedDequantMatMul.Q4KVecShuffle = shuffleSaved; }
         return string.Join("; ", notes);
     });
 
