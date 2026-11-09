@@ -2369,6 +2369,9 @@ public class FusedDequantMatMul : IDisposable
     public static bool Q4KVec = Environment.GetEnvironmentVariable("GGUF_Q4K_VEC") != "0";
     private const int Q4KVecCols = 2;      // warps a group holds: 32 lanes each
     private const int Q4KVecRows = 4;      // outputs a warp computes: each lane's inputs are read once for all of them
+    // MEASURED 2026-11-09 (nsys, RTX 4070, qwen3:1.7b Q4_K_M captured decode, shuffle path): 2 outputs a warp (twice the warps) is SLOWER - 13.42 -> 16.37 us
+    // (2048 rows), 14.70 -> 14.18 (3072), 39.00 -> 43.52 (12288), decode -4.5%: the input re-reads cost more than the extra warps win. The small decode GEMVs
+    // are bound by a fixed per-kernel cost (ramp-up, tail, graph-node launch: 3072 rows take ~14 us where streaming alone would be ~8), not by warp count.
     private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KVec, _gemvQ4KVecShuffle;
     /// <summary>
     /// <see cref="Q4KVec"/> with the warp's sums reduced by Warp.ShuffleXor instead of shared memory + six group barriers (where <see cref="CanShuffle32"/>).
