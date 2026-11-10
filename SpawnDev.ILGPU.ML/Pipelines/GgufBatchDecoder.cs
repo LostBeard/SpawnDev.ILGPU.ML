@@ -125,7 +125,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>
     /// The split-K decode attention's chunk merge on <c>AttnCombineGroupImpl</c> (a group per row and head: the chunk weights found once in shared memory;
     /// bit-identical) instead of <c>AttnCombineImpl</c> (a thread per value, each re-reading every chunk). Head widths a power of two up to 256. Env
-    /// GGUF_ATTN_COMBINE_GROUP=0 / 1 forces it. Default: on for CUDA (measured in the constructor).
+    /// GGUF_ATTN_COMBINE_GROUP=0 / 1 forces it. Default: on for CUDA and WebGPU (measured in the constructor).
     /// </summary>
     public bool AttentionCombineGroup { get => _attCombineGroupOn; set { if (_attCombineGroupOn != value) { _attCombineGroupOn = value; _bufGen++; } } }
     private bool _attCombineGroupOn;
@@ -200,18 +200,19 @@ public sealed class GgufBatchDecoder : IDisposable
     /// <summary>
     /// Each step's candidate selection with a group per chunk of logits (<c>TopKKernels.ChunkMaxGroupImpl</c> / <c>SelectGroupImpl</c>: coalesced reads, tree
     /// reductions) and a group per row for the floor (<c>FloorGroupImpl</c>: the chunk maxima ranked from shared memory) instead of a thread per chunk. The same candidates; the chunks' softmax mass summed pairwise. Env GGUF_TOPK_GROUP=0 / 1
-    /// forces it; default on for CUDA (<see cref="TopKGroupDefault"/>, also <see cref="DrawRowsAsync"/>'s).
+    /// forces it; default on for CUDA and WebGPU (<see cref="TopKGroupDefault"/>, also <see cref="DrawRowsAsync"/>'s).
     /// </summary>
     public bool TopKGroup { get => _topKGroup; set { if (_topKGroup != value) { _topKGroup = value; _bufGen++; } } }
     private bool _topKGroup;
     /// <summary>
     /// <see cref="TopKGroup"/>'s default on an accelerator: env GGUF_TOPK_GROUP=0 / 1, else on for CUDA. MEASURED 2026-11-09 (RTX 4070, qwen3:1.7b
     /// Q4_K_M, 151,936 logits, nsys per step): ChunkMax 61.6 -> 4.3 us, Floor 28.8 -> 8.4, Select 76.3 -> 4.3 (Final 2.8 either way); decode (quiet,
-    /// interleaved x2, greedy and sampled alike) 215.6 / 215.8 -> 222.5 / 222.7 tok/s short, 202.5 / 202.7 -> 208.2 / 209.0 long.
+    /// interleaved x2, greedy and sampled alike) 215.6 / 215.8 -> 222.5 / 222.7 tok/s short, 202.5 / 202.7 -> 208.2 / 209.0 long. WebGPU since
+    /// 2026-11-09 (Chrome, Qwen3-0.6B Q8_0, the same 151,936 logits, GPU timestamps): ChunkMax + Floor + Select 0.091 -> 0.029 ms a step.
     /// </summary>
     public static bool TopKGroupDefault(Accelerator accelerator) => Environment.GetEnvironmentVariable("GGUF_TOPK_GROUP") switch
     {
-        "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda,
+        "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.WebGPU,
     };
     private static bool TopKGroupFits(Accelerator a) => a.AcceleratorType != AcceleratorType.WebGL && a.MaxNumThreadsPerGroup >= Chunk;
     private int Chunks => (Vocab + Chunk - 1) / Chunk;
@@ -254,7 +255,9 @@ public sealed class GgufBatchDecoder : IDisposable
         // 3.07 (at 128-key chunks 2.14 / 9.79 vs 1.95 / 2.41, but the attention kernel itself is 24 / 34 us there); decode (quiet, interleaved x2) 214.5 / 212.5
         // -> 213.0 / 211.4 tok/s short (noise), 186.4 / 186.0 -> 200.2 / 199.6 long (+7.4%).
         _topKGroup = TopKGroupDefault(accelerator);
-        _attCombineGroupOn = Environment.GetEnvironmentVariable("GGUF_ATTN_COMBINE_GROUP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda };
+        // WebGPU since 2026-11-09 (Chrome, Qwen3-0.6B Q8_0, GPU timestamps, interleaved x2): merge 0.275 -> 0.136 ms a token at 1,826 tokens, 0.075 -> 0.080 at 25;
+        // the step's timestamped total 3.39 -> 3.26 ms long, 2.99 -> 3.00 short
+        _attCombineGroupOn = Environment.GetEnvironmentVariable("GGUF_ATTN_COMBINE_GROUP") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.WebGPU };
         _attVec = Environment.GetEnvironmentVariable("GGUF_ATTN_VEC") switch { "0" => false, "1" => true, _ => accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.Cuda };
         CaptureCuda = accelerator is global::ILGPU.Runtime.Cuda.CudaAccelerator && global::ILGPU.Runtime.Cuda.CudaStream.SupportsGraphCapture
             && Environment.GetEnvironmentVariable("GGUF_BATCH_CUDA_GRAPH") != "0";

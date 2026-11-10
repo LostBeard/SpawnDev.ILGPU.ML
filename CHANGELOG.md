@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **On SpawnDev.ILGPU 5.4.23** (its Inliner always inlines trivial methods: a large kernel's struct-constant branch, `if (default(TR).Flag)`,
+  could keep its dead arm when the inlining budget ran out first). ML's decode kernels are unchanged in speed on it (CUDA, nsys, every kernel
+  within 2%).
+- **WebGPU: the group top-K candidate kernels and the group attention merge are default there too** (were CUDA-only). MEASURED (Chrome, RTX
+  4070, Qwen3-0.6B Q8_0, GPU timestamps, interleaved x2): candidate selection 0.091 -> 0.029 ms a step; the merge 0.275 -> 0.136 ms a token at a
+  1,826-token prompt (0.075 -> 0.080 at 25 tokens); the decode step's timestamped total 3.07 / 3.25 -> 3.00 / 3.00 ms short, 3.66 / 3.46 -> 3.26 /
+  3.25 ms long. `Bench_Qwen3_0_6B_WebGPU_DecodeStepProfile` joins the 1.7B bench (same vocabulary; the 1.7B file is slow to fetch from the
+  models host).
+
 - **CUDA decode candidate selection on group kernels** (`TopKKernels.ChunkMaxGroupImpl` / `FloorGroupImpl` / `SelectGroupImpl`,
   `GgufBatchDecoder.TopKGroup`, default on for CUDA; `DrawRowsAsync` follows it). Each step's top-64 over the vocabulary scanned each 256-value
   chunk on one thread (neighbouring threads 1 KB apart) and ranked the 594 chunk maxima with every thread re-reading all of them from device
