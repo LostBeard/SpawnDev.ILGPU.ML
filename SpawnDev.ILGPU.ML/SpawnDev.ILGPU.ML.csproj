@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.9</Version>
-		<PackageReleaseNotes>v5.8.9 - WebGPU correctness: ML now chooses its warp-shuffle kernels (vector decode attention, register attention, the Q4_K shuffle GEMV, TRELLIS.2 shuffle attention) with SpawnDev.ILGPU 5.4.22's SupportsWarpShuffle instead of WarpSize == 32, which a browser without the subgroups feature also reports while its warp is the whole workgroup - 5.8.8 could compute wrong attention there. CUDA: the Q4_K decode GEMV reduces with warp shuffles (+1-1.5% decode). On SpawnDev.ILGPU 5.4.22. Release sweep 7,654 passed, 0 failed. Full notes: CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.10</Version>
+		<PackageReleaseNotes>v5.8.10 - faster decode on CUDA (and WebGPU attention), accuracy unchanged: qwen3:1.7b Q4_K_M on an RTX 4070 decodes at ~213 tok/s at a short prompt and ~200 at an 1,800-token prompt (5.8.9: ~192 / ~160). CUDA decode GEMVs: F16 one output a warp (2x a GEMV), Q6_K split along K (+35% bandwidth on ffn_down); the fused residual Add + RMSNorm reduces with warp shuffles in double. Decode attention: CUDA now runs the vector kernel (16-byte K loads) with four-ahead P.V and warp-shuffle reductions (also WebGPU with subgroups), and the chunk merge runs a group per row and head (long-prompt attention 38.5 + 16.0 us -&gt; 23.0 + 3.1 us a layer). Every attention variant is bit-identical to the kernel it replaces (new GgufBatchDecoder_ShuffleAttention_BitIdentical, red-checked). Env switches (GGUF_ATTN_VEC / _ILP / _SHUFFLE / _COMBINE_GROUP, GGUF_F16_VEC_ROWS, GGUF_Q6_VEC_SPLIT, GGUF_RMS_SHUFFLE) are the A/B. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

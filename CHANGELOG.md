@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.10 - 2026-11-09 (nuget.org) - faster CUDA decode: GEMVs, fused norm, attention and its chunk merge
+
+On SpawnDev.ILGPU 5.4.22. Release sweep (full default, HeavyModel excluded): 7,659 passed, 0 failed, 445 skipped, 1 h 12 m (RTX 4070,
+Chrome; 5.8.9: 7,654 / 0 / 443, 1 h 13 m). qwen3:1.7b Q4_K_M on CUDA decodes at ~213 tok/s at a short prompt and ~200 at an 1,800-token
+prompt (5.8.9: ~192 / ~160). Every attention change is bit-identical to the kernel it replaces. Known: the model-inspection heavy group
+still runs ~2 min in a full sweep (33 s alone); a memory sampler showed ~7.5 GB free during it, so memory pressure is ruled out.
+
 - **CUDA decode attention chunk merge: a group per (row, head)** (`AttnCombineGroupImpl`, `GgufBatchDecoder.AttentionCombineGroup`, default
   on for CUDA). The per-value merge had every thread re-read every chunk's (max, sum) twice from global memory and take every exp; the group
   finds the chunk max, weights and sums once in shared memory, then sums each value in the same order with the same fused multiply-adds
