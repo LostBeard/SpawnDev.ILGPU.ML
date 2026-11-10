@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Fix: joined and separate q|k|v projections disagreed on CUDA with FP contraction on** (since `ML_FP_CONTRACT` became the default, 2026-11-07):
+  the compiler fused the rotation `x0 * c - x1 * s` into multiply-adds differently in `RopeImpl` and the fused `QkvPostImpl`, so a model loaded
+  with joined projections drifted 2.6e-4 / 6.2e-4 from the same model with separate ones (`GgufBatchDecoder_GreedyMatchesGenerator`'s joinOk,
+  limit 1e-6; green with `ML_FP_CONTRACT=0`). Both kernels now write the rotation's FMAs out (`float.MultiplyAddEstimate`), so the two routes are
+  bit-identical again with contraction on or off.
+- **qwen3 decode: the q and k head norms in one launch** (`HeadNormQkImpl`; the q heads then the k heads are contiguous in each joined row): 85.5
+  -> 45.3 us a token on CUDA (nsys), the same math per head (greedy text identical).
+
 - **Q6_K decode GEMV: fewer instructions a unit, bit-identical** (`Q6Unit`): the four int8 scales come from two word reads with a branchless sign
   extension (were four byte reads, each with a signed divide and modulo and a branch), and the four 6-bit values of a word are assembled at once
   (`(lo & 0x0F0F0F0F) | ((hi & 0x03030303) << 4)`, byte-wise, no carries) instead of one at a time: the same ints, so the same sums. Nsight Compute

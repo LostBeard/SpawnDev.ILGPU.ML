@@ -915,8 +915,9 @@ public sealed class GgufBatchDecoder : IDisposable
                 if (_qkNorm)
                 {
                     // qwen3: an RMS norm per head of q and of k (weight [head width]) before the rotary; no biases, so the post kernel's zero bias changes nothing
-                    _headNorm!(new KernelConfig(R * Heads, HeadDim), qkv, _vecs[b + "attn_q_norm.weight"].View, n, 0, Heads, _eps);
-                    _headNorm(new KernelConfig(R * KvHeads, HeadDim), qkv, _vecs[b + "attn_k_norm.weight"].View, n, Q, KvHeads, _eps); Prof("qk-norm");
+                    // one launch for both (the q heads then the k heads are contiguous in each qkv row); bit-identical to the two-launch form
+                    _headNormQk!(new KernelConfig(R * (Heads + KvHeads), HeadDim), qkv, _vecs[b + "attn_q_norm.weight"].View, _vecs[b + "attn_k_norm.weight"].View,
+                        n, Heads, Heads + KvHeads, _eps); Prof("qk-norm");
                 }
                 int U = Heads * (HeadDim / 2) + KvHeads * (HeadDim / 2) + kvC;
                 _kv.QkvPost(l, R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, seqView, posView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1) | (rope << 1), MaxSeq); Prof("qkv-post");
@@ -1590,6 +1591,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, FV, int>? _swigluJoined;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
+    private Action<KernelConfig, FV, FV, FV, int, int, int, float>? _headNormQk;
     private Action<Index1D, FV, FV, FV, IV, int, int, int, int, int>? _attCombine;
     private Action<KernelConfig, FV, FV, FV, IV, int, int, int, int>? _attCombineGroup;
     private Action<Index1D, IV, ArrayView1D<int, Stride1D.Dense>, FV, int, int, int>? _embed;
@@ -1614,7 +1616,11 @@ public sealed class GgufBatchDecoder : IDisposable
         _softmaxNorm = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SoftmaxNormImpl);
         _swiglu = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(SwigluImpl);
         _swigluJoined = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(SwigluJoinedImpl);
-        if (_qkNorm) _headNorm = _acc.LoadStreamKernel<FV, FV, int, int, int, float>(HeadNormImpl);
+        if (_qkNorm)
+        {
+            _headNorm = _acc.LoadStreamKernel<FV, FV, int, int, int, float>(HeadNormImpl);
+            _headNormQk = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, float>(HeadNormQkImpl);
+        }
         if (FusedAttention)
         {
             _attCombine = _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, IV, int, int, int, int, int>(AttnCombineImpl);
@@ -1674,7 +1680,10 @@ public sealed class GgufBatchDecoder : IDisposable
             int col = (isQ ? 0 : C) + hh * D;
             float x0 = qkv[row + col + i0] + bias[col + i0], x1 = qkv[row + col + i1] + bias[col + i1];
             float ang = pos * invFreq[kk], c = MathF.Cos(ang), s = MathF.Sin(ang);
-            float y0 = x0 * c - x1 * s, y1 = x1 * c + x0 * s;
+            // the rotation with its fused multiply-adds written out (one product, then one FMA), identical in RopeImpl and QkvPostImpl: with FP contraction on
+            // (CUDA, ML_FP_CONTRACT) the compiler fused `x0 * c - x1 * s` differently in the two kernels, so joined and separate projections drifted 2.6e-4
+            // (GgufBatchDecoder_GreedyMatchesGenerator's joinOk, measured 2026-11-10; passes with ML_FP_CONTRACT=0)
+            float y0 = float.MultiplyAddEstimate(x0, c, -(x1 * s)), y1 = float.MultiplyAddEstimate(x1, c, x0 * s);
             if (isQ) { long qo = (long)r * C + hh * D; qOut[qo + i0] = y0; qOut[qo + i1] = y1; }
             else { long ko = cacheRow + hh * D; kc[ko + i0] = PrecisionConvert.ConvertFromSingle<T>(y0); kc[ko + i1] = PrecisionConvert.ConvertFromSingle<T>(y1); }
         }
@@ -2938,8 +2947,9 @@ public sealed class GgufBatchDecoder : IDisposable
         long b = (long)r * H * D + h * D;
         int i0 = (mode & 2) != 0 ? 2 * k : k, i1 = (mode & 2) != 0 ? 2 * k + 1 : half + k;
         float x0 = buf[b + i0], x1 = buf[b + i1];
-        buf[b + i0] = x0 * c - x1 * s;
-        buf[b + i1] = x1 * c + x0 * s;
+        // the same explicit FMAs as QkvPostImpl (see there)
+        buf[b + i0] = float.MultiplyAddEstimate(x0, c, -(x1 * s));
+        buf[b + i1] = float.MultiplyAddEstimate(x1, c, x0 * s);
     }
     // an RMS norm of each head's D values in place (qwen3's q / k norms): group g = (row, head), a thread per value; rows are stride apart, the heads start at off
     private static void HeadNormImpl(FV buf, FV w, int stride, int off, int heads, float eps)
@@ -2956,6 +2966,25 @@ public sealed class GgufBatchDecoder : IDisposable
             Group.Barrier();
         }
         buf[b + t] = x * (1f / MathF.Sqrt(red[0] / D + eps)) * w[t];
+    }
+
+    // HeadNormImpl for the joined q|k rows in ONE launch (qwen3's q and k norms were two): group g = (row, head) over the row's qHeads q heads then its k
+    // heads, contiguous from the row's start (k begins at qHeads x D), each head normed with its own weight vector (q's or k's): the same math per head
+    private static void HeadNormQkImpl(FV buf, FV wq, FV wk, int stride, int qHeads, int heads, float eps)
+    {
+        int g = Grid.IdxX, t = Group.IdxX, D = Group.DimX, hh = g % heads;
+        long b = (long)(g / heads) * stride + (long)hh * D;
+        var red = SharedMemory.Allocate<float>(AttChunk);
+        float x = buf[b + t];
+        red[t] = x * x;
+        Group.Barrier();
+        for (int s2 = D / 2; s2 > 0; s2 >>= 1)
+        {
+            if (t < s2) red[t] += red[t + s2];
+            Group.Barrier();
+        }
+        float wt = hh < qHeads ? wq[t] : wk[t];
+        buf[b + t] = x * (1f / MathF.Sqrt(red[0] / D + eps)) * wt;
     }
 
     // the row's k / v into its sequence's cache at its position
