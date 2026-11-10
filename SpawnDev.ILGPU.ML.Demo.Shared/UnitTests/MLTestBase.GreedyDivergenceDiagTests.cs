@@ -15,10 +15,10 @@ public abstract partial class MLTestBase
     /// two logits (the margin) and how far the engines' logits are apart: a margin under that gap is a near-tie (two kernel sets one ulp-chain apart), a margin
     /// well above it is a real difference.
     /// Env knobs (2026-11-10, for SpawnDev.AI's engine comparisons): GREEDY_DIV_MODEL = an Ollama name:tag in the local cache (default smollm2:360m),
-    /// GREEDY_DIV_PROMPT = the user message, GREEDY_DIV_SYSTEM = an optional system message, GREEDY_DIV_THINK=1 = the template's thinking on, GREEDY_DIV_STEPS (300).
+    /// GREEDY_DIV_PROMPT = the user message, GREEDY_DIV_SYSTEM = an optional system message, GREEDY_DIV_THINK=1 = the template's thinking on, GREEDY_DIV_STEPS (300), GREEDY_DIV_PROMPT_IDS = comma-separated prompt token ids fed as they are (no chat template; overrides the prompt knobs).
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task Bench_OllamaGreedyDivergence_Margin() => await RunTest(async accelerator =>
+    public async Task<string> Bench_OllamaGreedyDivergence_Margin() => await RunTest(async accelerator =>
     {
         if (OperatingSystem.IsBrowser() || accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL))
             throw new UnsupportedTestException("reads the local Ollama cache (CUDA / OpenCL lanes)");
@@ -50,7 +50,9 @@ public abstract partial class MLTestBase
         using (var gen = await GgufTextGenerationPipeline.CreateFromFileAsync(accelerator, path!, maxSeqLen: Math.Max(1024, Steps + 512), engine: GgufEngine.Generator))
         {
             var session = gen.Session; tok = gen.Tokenizer;
-            (prompt, _) = ChatTemplates.BuildChatPrompt(session.GgufModel!, tok, q, thinking: think);
+            prompt = Environment.GetEnvironmentVariable("GREEDY_DIV_PROMPT_IDS") is { Length: > 0 } pids
+                ? pids.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse).ToArray()     // raw ids, no chat template
+                : ChatTemplates.BuildChatPrompt(session.GgufModel!, tok, q, thinking: think).Item1;
             using var inBuf = accelerator.Allocate1D<float>(Math.Max(1024, prompt.Length));
             async Task<float[]> Step(int[] tokens)
             {
