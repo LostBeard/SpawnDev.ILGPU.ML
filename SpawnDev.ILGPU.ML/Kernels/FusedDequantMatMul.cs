@@ -2394,6 +2394,9 @@ public class FusedDequantMatMul : IDisposable
     // MEASURED 2026-11-09 (nsys, RTX 4070, qwen3:1.7b Q4_K_M captured decode, shuffle path): 2 outputs a warp (twice the warps) is SLOWER - 13.42 -> 16.37 us
     // (2048 rows), 14.70 -> 14.18 (3072), 39.00 -> 43.52 (12288), decode -4.5%: the input re-reads cost more than the extra warps win. The small decode GEMVs
     // are bound by a fixed per-kernel cost (ramp-up, tail, graph-node launch: 3072 rows take ~14 us where streaming alone would be ~8), not by warp count.
+    // MEASURED 2026-11-09 the other way (nsys, same model, an 8-outputs-a-warp shuffle kernel, bit-identical: each lane's 16 input loads serving 8 rows):
+    // 12288 rows 39.26 -> 41.86 us, 2048 (o / ffn_down) 13.45 -> 17.17, only 3072 (q+k) 14.84 -> 13.45. No size threshold separates the winner, so
+    // the kernel was not kept: fewer, longer warps lose the latency hiding the input reuse would buy.
     // ncu 2026-11-09 (RTX 4070, captured decode; registers / theoretical occupancy / us for the 3072 / 2048 / 12288-row GEMVs): shuffle kernel
     // 128 / 33% / 16.3, 10.3, 40.6 (q+k runs 1.04 waves). Row loop outside the input halves (8 live float4): 48 / 83% / 19.2, 14.0, 63.5 - SLOWER.
     // KernelSpecialization(64, 9 groups an SM): 96 / 42% / 14.8, 11.3, 45.3 - only q+k gains, net worse. No spills. The kernel is load/store and
