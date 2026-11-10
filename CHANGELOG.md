@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **On SpawnDev.ILGPU 5.4.24.** CUDA: v's projection GEMV runs on a second stream beside the q|k GEMV and the head norms
+  (`GgufBatchDecoder.OverlapV`, default on; captured as parallel branches of the step's graph with 5.4.24's `CudaStream.WaitFor` fork / join) when
+  v's block type differs from q / k (Q4_K_M), no LoRA applies and kernels are not profiled. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, three
+  interleaved rounds): decode 225.6 -> 234.6 tok/s short (+4.0%), 213.2 -> 218.9 long (+2.7%), prefill ~+3.5%; greedy text identical. Env
+  GGUF_OVERLAP_V=0 is the A/B.
+
 - **Fix: joined and separate q|k|v projections disagreed on CUDA with FP contraction on** (since `ML_FP_CONTRACT` became the default, 2026-11-07):
   the compiler fused the rotation `x0 * c - x1 * s` into multiply-adds differently in `RopeImpl` and the fused `QkvPostImpl`, so a model loaded
   with joined projections drifted 2.6e-4 / 6.2e-4 from the same model with separate ones (`GgufBatchDecoder_GreedyMatchesGenerator`'s joinOk,

@@ -797,6 +797,15 @@ public sealed class GgufBatchDecoder : IDisposable
     private bool CaptureCudaActive => CaptureCuda && FusedAttention && !ProfileKernels && _acc is global::ILGPU.Runtime.Cuda.CudaAccelerator;
     private bool _cudaCapturing;                                              // EncodeForward is recording: no host writes (illegal mid-capture)
     private global::ILGPU.Runtime.Cuda.CudaStream? _capStream;
+    private global::ILGPU.Runtime.Cuda.CudaStream? _vStream;
+    /// <summary>
+    /// CUDA: run v's GEMV (when v's block type differs from q / k, as in Q4_K_M) on a second stream concurrently with the q|k GEMV and head norms
+    /// (parallel branches of the captured step graph). Default on (it applies on CUDA only); env GGUF_OVERLAP_V=0 / 1. MEASURED 2026-11-10 (RTX 4070,
+    /// qwen3:1.7b Q4_K_M, SpawnDev.ILGPU 5.4.24, three interleaved rounds, quiet machine): decode 224.9 / 230.7 / 221.1 -> 234.9 / 233.8 / 235.1 tok/s
+    /// short (+4.0%), 212.8 / 216.1 / 210.7 -> 219.4 / 216.6 / 220.8 long (+2.7%), prefill ~+3.5%; greedy text identical every round.
+    /// </summary>
+    public bool OverlapV { get => _overlapV; set { if (_overlapV != value) { _overlapV = value; _bufGen++; } } }
+    private bool _overlapV = Environment.GetEnvironmentVariable("GGUF_OVERLAP_V") != "0";
     private sealed class CudaStepPlan
     {
         public global::ILGPU.Runtime.Cuda.CudaGraphExec? Exec;
@@ -903,6 +912,18 @@ public sealed class GgufBatchDecoder : IDisposable
                 bool all = _qkvAll[l];
                 int n = all ? Q + 2 * kvC : Q + kvC;
                 var qkv = Buf(ref _qkv, (long)R * (Q + 2 * kvC));
+                // CUDA: v's GEMV (its own block type, so not in qkv) on a second stream beside the q|k GEMV and the head norms - two small latency-bound
+                // GEMVs on the same input; captured as parallel branches of the step's graph (SpawnDev.ILGPU CudaStream.WaitFor: fork here, join before
+                // QkvPost reads v). Off when LoRA applies (its deltas are not stream-aware) or kernels are profiled (Prof syncs).
+                bool overlapV = !all && OverlapV && Lora == null && !ProfileKernels && _acc is global::ILGPU.Runtime.Cuda.CudaAccelerator;
+                global::ILGPU.Runtime.Cuda.CudaStream? mainStream = null;
+                if (overlapV)
+                {
+                    mainStream = (global::ILGPU.Runtime.Cuda.CudaStream)_acc.DefaultStream;
+                    _vStream ??= (global::ILGPU.Runtime.Cuda.CudaStream)_acc.CreateStream();
+                    _vStream.WaitFor(mainStream);                                // fork: v reads hn, written on the main stream
+                    using (_acc.WithDefaultStream(_vStream)) Gemm(hn, b + "attn_v.weight", v, R, C, kvC);
+                }
                 Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
                 if (Lora != null)
                 {
@@ -911,7 +932,8 @@ public sealed class GgufBatchDecoder : IDisposable
                     else Lora.ApplyAdjacent(l, LoraQk, _loraQkOff ??= new[] { 0, Q }, hn, qkv, R, n);
                 }
                 var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
-                if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
+                if (overlapV) vb = v;
+                else if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
                 if (_qkNorm)
                 {
                     // qwen3: an RMS norm per head of q and of k (weight [head width]) before the rotary; no biases, so the post kernel's zero bias changes nothing
@@ -919,6 +941,7 @@ public sealed class GgufBatchDecoder : IDisposable
                     _headNormQk!(new KernelConfig(R * (Heads + KvHeads), HeadDim), qkv, _vecs[b + "attn_q_norm.weight"].View, _vecs[b + "attn_k_norm.weight"].View,
                         n, Heads, Heads + KvHeads, _eps); Prof("qk-norm");
                 }
+                if (overlapV) mainStream!.WaitFor(_vStream!);                    // join: QkvPost reads v
                 int U = Heads * (HeadDim / 2) + KvHeads * (HeadDim / 2) + kvC;
                 _kv.QkvPost(l, R * U, qkv, vb, _vecs[b + "attn_qkv.bias"].View, _invFreq.View, q, seqView, posView, Heads | (KvHeads << 16), HeadDim, n, (all ? 1 : 0) | (mode << 1) | (rope << 1), MaxSeq); Prof("qkv-post");
             }
@@ -3050,6 +3073,7 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var cp in _cudaPlans.Values) cp.Exec?.Dispose();
         _cudaPlans.Clear();
         _capStream?.Dispose();
+        _vStream?.Dispose();
         _capStream = null;
         _mm.Dispose();
         _norm.Dispose();
