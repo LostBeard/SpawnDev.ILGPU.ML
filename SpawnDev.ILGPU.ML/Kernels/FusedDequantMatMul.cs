@@ -212,7 +212,22 @@ public class FusedDequantMatMul : IDisposable
     /// it slower (3.0 -> 3.6 s). The largest layer weight of an 8B model is 112 MiB.
     /// </summary>
     public static long MmaScratchMaxWeightBytes = 256L << 20;
-    private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchA16, _scratchW16;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchA16, _scratchW16, _scratchA16Lo;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _scratchF16Out;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>? _packA16Lo;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInto;
+    /// <summary>
+    /// M &gt; 1 of F16 weights on the tensor-core GEMM (CUDA sm_75+): the weights feed it in place (GGUF's F16 rows are the f16 [N][K] the kernel reads),
+    /// the activations split as A = hi + lo * 2^-11, both f16, and the GEMM run on each (the two products added in f32): A to ~22 bits, so the activations
+    /// are not rounded to f16 (that alone gives ~2e-4 of sum |x w|). MEASURED 2026-11-10 (RTX 4070, Gemm_F16_MmaSplit_MatchesFp32): error 0.7-1.3e-6 of
+    /// sum |x w| (the fp32 tiled GEMM: 0.3-0.4e-6; the rest is the tensor cores' own f32 accumulation); qwen3:1.7b Q4_K_M prefill (its attn_v is F16)
+    /// 8,054 / 7,989 -> 9,867 / 9,839 tok/s at 1,830 tokens (+23%), 810 / 808 -> 918 / 940 at 25 (+14%), greedy text identical. Default on (CUDA sm_75+
+    /// only); env GGUF_GEMM_MMA_F16=0 is the A/B.
+    /// </summary>
+    public static bool EnableMmaF16 = Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_F16") != "0";
+    /// <summary>The fewest rows <see cref="EnableMmaF16"/> takes (env GGUF_GEMM_MMA_F16_MIN_ROWS): 9, every M past ForwardRows (RowsMax 8). MEASURED 2026-11-10:
+    /// at 64 the 25-token prefill stayed on the tiled GEMM (810 tok/s); at 9 it took the split (918 / 940).</summary>
+    public static int MmaF16MinRows = int.TryParse(Environment.GetEnvironmentVariable("GGUF_GEMM_MMA_F16_MIN_ROWS"), out var f16r) ? f16r : 9;
     private MemoryBuffer1D<float, Stride1D.Dense>? _scratchOnes;
     private readonly List<IDisposable> _scratchRetired = new();
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>? _packA16;
@@ -227,6 +242,69 @@ public class FusedDequantMatMul : IDisposable
         CudaAsm.Emit("{ .reg .b16 plo, phi; cvt.rn.f16.f32 plo, %1; cvt.rn.f16.f32 phi, %2; mov.b32 %0, {plo, phi}; }", out uint packed, x[2 * i], x[2 * i + 1]);
         o[i] = packed;
     }
+
+    // the low half of PackA16Impl's split, SCALED: lo = f16((x - f32(f16(x))) * 2^11) for each value, packed as PackA16Impl packs. The residual is below
+    // half an f16 ulp of x, so unscaled it is subnormal for |x| below ~0.1 (2^-24 steps: ~3 bits left at |x| = 1e-3); times 2^11 (exact) it keeps 11 bits,
+    // so A = hi + lo * 2^-11 holds ~22 bits at every magnitude down to ~1e-8. AddIntoImpl scales the lo product back by 2^-11 (exact). The F16-weight
+    // tensor-core GEMM runs both halves, so its activations are not rounded to f16.
+    private static void PackA16LoImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView<uint> o)
+    {
+        CudaAsm.Emit("{ .reg .b16 h0, h1, l0, l1; .reg .f32 f0, f1; cvt.rn.f16.f32 h0, %1; cvt.rn.f16.f32 h1, %2; cvt.f32.f16 f0, h0; cvt.f32.f16 f1, h1; "
+            + "sub.rn.f32 f0, %1, f0; sub.rn.f32 f1, %2, f1; mul.rn.f32 f0, f0, 0f45000000; mul.rn.f32 f1, f1, 0f45000000; "
+            + "cvt.rn.f16.f32 l0, f0; cvt.rn.f16.f32 l1, f1; mov.b32 %0, {l0, l1}; }", out uint packed, x[2 * i], x[2 * i + 1]);
+        o[i] = packed;
+    }
+    // EnableMmaF16: out = (A_hi + A_lo) x W^T on the tensor-core GEMM, W the F16 rows in place, A split into two f16 halves (PackA16Impl / PackA16LoImpl),
+    // the second product added in f32 (AddIntoImpl). The same kernel choice as the scratch route below.
+    private void ForwardMmaF16Split(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> weightQuant, ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, bool turing)
+    {
+        long aWords = (long)M * K / 2, wWords = (long)N * K / 2;
+        var aHi = GrowScratch(ref _scratchA16, aWords);
+        var aLo = GrowScratch(ref _scratchA16Lo, aWords);
+        if (_scratchF16Out == null || _scratchF16Out.Length < (long)M * N)
+        {
+            // a replaced buffer may still be referenced by queued work: keep it owned until dispose, as GrowScratch does
+            if (_scratchF16Out != null) _scratchRetired.Add(_scratchF16Out);
+            _scratchF16Out = _accelerator.Allocate1D<float>((long)M * N);
+        }
+        _scratchOnes ??= _accelerator.Allocate1D(new[] { 1f, 1f });
+        _packA16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16Impl);
+        _packA16Lo ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>(PackA16LoImpl);
+        _addInto ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddIntoImpl);
+        var x = input.SubView(0, (long)M * K);
+        _packA16((int)aWords, x, aHi.View.BaseView);
+        _packA16Lo((int)aWords, x, aLo.View.BaseView);
+        var w = weightQuant.SubView(0, wWords * 4).Cast<byte, uint>().Cast<uint, Trellis2.U4>();
+        var tmp = _scratchF16Out.View.SubView(0, (long)M * N);
+        bool v5 = turing ? EnableMmaSm75V5 : EnableMmaV5;
+        void Gemm(MemoryBuffer1D<uint, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> o)
+        {
+            var a4 = a.View.SubView(0, aWords).Cast<uint, Trellis2.U4>();
+            if (turing && v5 && UseSm75V7(K))
+            {
+                (_f16Sm75V7 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV7))(
+                    new KernelConfig(V7Tiles(M, N), Trellis2.MmaGemm.V7Threads), a4, w, _scratchOnes.View, o, M, K, N);
+                return;
+            }
+            var gemm = turing && v5
+                ? (EnableMmaSm75V6 ? _f16Sm75V5V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV6) : _f16Sm75V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV5))
+                : turing
+                ? _f16Sm75V2 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16Sm75PackedV2)
+                : v5 && EnableMmaV6 ? _f16V6 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV6)
+                : v5 ? _f16V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV5)
+                : _f16V4 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV4);
+            int tilesS = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
+            gemm(new KernelConfig(tilesS, v5 ? Trellis2.MmaGemm.V5Threads : Trellis2.MmaGemm.Threads), a4, w, _scratchOnes.View, o, M, K, N);
+        }
+        Gemm(aHi, output);
+        Gemm(aLo, tmp);
+        _addInto((int)((long)M * N), output.SubView(0, (long)M * N), tmp);
+        LastGemmKernel = "mma-f16-split" + (turing ? "-sm75" : "") + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
+    }
+
+    // o[i] += t[i] * 2^-11 (the scaled lo product back to scale: exact)
+    private static void AddIntoImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> o, ArrayView1D<float, Stride1D.Dense> t) => o[i] += t[i] * (1f / 2048f);
 
     private MemoryBuffer1D<uint, Stride1D.Dense> GrowScratch(ref MemoryBuffer1D<uint, Stride1D.Dense>? b, long words)
     {
@@ -509,11 +587,20 @@ public class FusedDequantMatMul : IDisposable
             if (_accelerator.AcceleratorType != AcceleratorType.WebGL)
             {
                 if (M <= RowsMax) { ForwardRows(input, weightQuant, output, M, K, N, type); return; }
+                // CUDA sm_75+: F16 rows on the tensor cores with the activations split hi + lo (EnableMmaF16; fp32-path accuracy)
+                bool tc80 = CudaCaps.TensorCores(_accelerator), tc75 = CudaCaps.TuringTensorCores(_accelerator);
+                if (type == GGMLType.F16 && EnableMmaF16 && EnableMmaGemm && M >= MmaF16MinRows && K % 256 == 0 && (tc80 || tc75)
+                    && (((IContiguousArrayView)input.BaseView).IndexInBytes & 15) == 0 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 15) == 0)
+                {
+                    ForwardMmaF16Split(input, weightQuant, output, M, K, N, !tc80 || ForceSm75Mma);
+                    return;
+                }
                 if (EnableTiledGemm && _accelerator.MaxGroupSize.X >= TgThreads && K % TgK == 0)
                 {
                     _tiledGemm ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         int, int, int, int>(TiledGemmImpl);
                     _tiledGemm(new KernelConfig(((M + TgM - 1) / TgM) * ((N + TgN - 1) / TgN), TgThreads), input, intView, output, M, K, N, wcode);
+                    LastGemmKernel = "tiled";
                     return;
                 }
             }
@@ -3662,6 +3749,8 @@ public class FusedDequantMatMul : IDisposable
     {
         _scratchA16?.Dispose(); _scratchA16 = null;
         _scratchW16?.Dispose(); _scratchW16 = null;
+        _scratchA16Lo?.Dispose(); _scratchA16Lo = null;
+        _scratchF16Out?.Dispose(); _scratchF16Out = null;
         _scratchS16?.Dispose(); _scratchS16 = null;
         _scratchOnes?.Dispose(); _scratchOnes = null;
         foreach (var r in _scratchRetired) r.Dispose();

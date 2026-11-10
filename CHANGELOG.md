@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA prefill: F16 weights on the tensor cores with split activations** (`FusedDequantMatMul.EnableMmaF16`, default on for sm_75+; rows from 9).
+  F16 weights (qwen3 Q4_K_M's attn_v) took the fp32 tiled GEMM at M > 8: 279 of 1,051 ms of a profiled run's prefill kernel time. Now they feed the
+  tensor-core GEMM in place, with the activations split A = hi + lo * 2^-11 (both f16, exact scaling) and the GEMM run on each, so A is not rounded to
+  f16 (alone ~2e-4 of sum |x w|). MEASURED (RTX 4070): error 0.7-1.3e-6 of sum |x w| (the tiled fp32 GEMM 0.3-0.4e-6; the rest is the tensor cores'
+  f32 accumulation), new `Gemm_F16_MmaSplit_MatchesFp32` (red-checked: without the lo half 3.5e-5); qwen3:1.7b Q4_K_M prefill 8,054 / 7,989 -> 9,867 /
+  9,839 tok/s at 1,830 tokens (+23%), 810 / 808 -> 918 / 940 at 25 (+14%), greedy text identical. Env GGUF_GEMM_MMA_F16=0 is the A/B.
+
 ## 5.8.11 - 2026-11-10 (nuget.org) - faster CUDA decode; joined vs separate projections fixed under FP contraction
 
 On SpawnDev.ILGPU 5.4.24. Release sweep (full default, HeavyModel excluded): 7,659 passed, 0 failed, 445 skipped, 1 h 09 m (RTX 4070,
