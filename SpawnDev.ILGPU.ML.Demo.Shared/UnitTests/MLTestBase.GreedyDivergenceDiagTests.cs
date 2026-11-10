@@ -14,6 +14,8 @@ public abstract partial class MLTestBase
     /// identically on CUDA and OpenCL. Both engines' greedy token ids for the same prompt (300 tokens), the first divergence, and at that step each engine's top
     /// two logits (the margin) and how far the engines' logits are apart: a margin under that gap is a near-tie (two kernel sets one ulp-chain apart), a margin
     /// well above it is a real difference.
+    /// Env knobs (2026-11-10, for SpawnDev.AI's engine comparisons): GREEDY_DIV_MODEL = an Ollama name:tag in the local cache (default smollm2:360m),
+    /// GREEDY_DIV_PROMPT = the user message, GREEDY_DIV_SYSTEM = an optional system message, GREEDY_DIV_THINK=1 = the template's thinking on, GREEDY_DIV_STEPS (300).
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Bench_OllamaGreedyDivergence_Margin() => await RunTest(async accelerator =>
@@ -22,14 +24,19 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("reads the local Ollama cache (CUDA / OpenCL lanes)");
         string root = Environment.GetEnvironmentVariable("OLLAMA_MODELS") is { Length: > 0 } env ? env
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
-        var manifest = Path.Combine(root, "manifests", "registry.ollama.ai", "library", "smollm2", "360m");
-        if (!File.Exists(manifest)) throw new UnsupportedTestException("smollm2:360m not in the Ollama cache");
+        string modelTag = Environment.GetEnvironmentVariable("GREEDY_DIV_MODEL") is { Length: > 0 } mt ? mt : "smollm2:360m";
+        var mparts = modelTag.Split(':');
+        var manifest = Path.Combine(root, "manifests", "registry.ollama.ai", "library", mparts[0], mparts.Length > 1 ? mparts[1] : "latest");
+        if (!File.Exists(manifest)) throw new UnsupportedTestException($"{modelTag} not in the Ollama cache");
         string? path = null;
         using (var doc = JsonDocument.Parse(File.ReadAllText(manifest)))
             foreach (var layer in doc.RootElement.GetProperty("layers").EnumerateArray())
                 if (layer.GetProperty("mediaType").GetString()!.EndsWith(".model")) path = Path.Combine(root, "blobs", layer.GetProperty("digest").GetString()!.Replace(':', '-'));
-        var q = new List<(string, string)> { ("user", "Write a short paragraph about why GPUs are good at running neural networks.") };
-        const int Steps = 300;
+        var q = new List<(string, string)>();
+        if (Environment.GetEnvironmentVariable("GREEDY_DIV_SYSTEM") is { Length: > 0 } sys) q.Add(("system", sys));
+        q.Add(("user", Environment.GetEnvironmentVariable("GREEDY_DIV_PROMPT") is { Length: > 0 } up ? up : "Write a short paragraph about why GPUs are good at running neural networks."));
+        bool think = Environment.GetEnvironmentVariable("GREEDY_DIV_THINK") == "1";
+        int Steps = int.TryParse(Environment.GetEnvironmentVariable("GREEDY_DIV_STEPS"), out var st) && st > 0 ? st : 300;
         static int ArgMax(float[] a) { int b = 0; for (int i = 1; i < a.Length; i++) if (a[i] > a[b]) b = i; return b; }
         static (int, float, int, float) Top2(float[] a)
         {
@@ -40,11 +47,11 @@ public abstract partial class MLTestBase
 
         // the session engine, greedy step by step (its logits kept per step)
         int[] prompt; var sessIds = new List<int>(); var sessRows = new List<float[]>(); SentencePieceTokenizer tok;
-        using (var gen = await GgufTextGenerationPipeline.CreateFromFileAsync(accelerator, path!, maxSeqLen: 1024, engine: GgufEngine.Generator))
+        using (var gen = await GgufTextGenerationPipeline.CreateFromFileAsync(accelerator, path!, maxSeqLen: Math.Max(1024, Steps + 512), engine: GgufEngine.Generator))
         {
             var session = gen.Session; tok = gen.Tokenizer;
-            (prompt, _) = ChatTemplates.BuildChatPrompt(session.GgufModel!, tok, q, thinking: false);
-            using var inBuf = accelerator.Allocate1D<float>(1024);
+            (prompt, _) = ChatTemplates.BuildChatPrompt(session.GgufModel!, tok, q, thinking: think);
+            using var inBuf = accelerator.Allocate1D<float>(Math.Max(1024, prompt.Length));
             async Task<float[]> Step(int[] tokens)
             {
                 inBuf.View.SubView(0, tokens.Length).CopyFromCPU(tokens.Select(t => (float)t).ToArray());
@@ -67,12 +74,12 @@ public abstract partial class MLTestBase
         // the batch decoder, greedy
         int[] batchIds;
         using (var fs = new FileStream(path!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true))
-        using (var dec = await GgufBatchDecoder.CreateAsync(accelerator, fs, maxSeq: 1024, maxBatch: 1))
+        using (var dec = await GgufBatchDecoder.CreateAsync(accelerator, fs, maxSeq: Math.Max(1024, Steps + 512), maxBatch: 1))
         {
             batchIds = (await dec.GenerateAsync(prompt, 1, Steps, 0f, 1f, 1, new HashSet<int> { tok.EosId }))[0];
             int d = 0; while (d < Math.Min(batchIds.Length, sessIds.Count) && batchIds[d] == sessIds[d]) d++;
             string report;
-            if (d == Math.Min(batchIds.Length, sessIds.Count)) report = $"{accelerator.AcceleratorType}: no divergence in {d} tokens";
+            if (d == Math.Min(batchIds.Length, sessIds.Count)) report = $"{modelTag} {accelerator.AcceleratorType}: no divergence in {d} tokens";
             else
             {
                 // the batch decoder's logits at the divergence step: the prompt and the common tokens prefilled, the last row read
@@ -83,7 +90,7 @@ public abstract partial class MLTestBase
                 var (ba, bav, bb, bbv) = Top2(b);
                 float gap = 0; for (int i = 0; i < s.Length; i++) gap = Math.Max(gap, Math.Abs(s[i] - b[i]));
                 string T(int id) => tok.Decode(new[] { id }).Replace("\n", "\\n");
-                report = $"{accelerator.AcceleratorType}: first divergence at token {d} | session top-2: {sa} '{T(sa)}' {sav:F4}, {sb} '{T(sb)}' {sbv:F4} (margin {sav - sbv:F4}) | " +
+                report = $"{modelTag} {accelerator.AcceleratorType}: first divergence at token {d} | session top-2: {sa} '{T(sa)}' {sav:F4}, {sb} '{T(sb)}' {sbv:F4} (margin {sav - sbv:F4}) | " +
                     $"batch top-2: {ba} '{T(ba)}' {bav:F4}, {bb} '{T(bb)}' {bbv:F4} (margin {bav - bbv:F4}) | the two engines' logits at this step: max |diff| {gap:F4}, " +
                     $"on the two candidates {Math.Abs(s[sa] - b[sa]):F4} / {Math.Abs(s[sb] - b[sb]):F4} | text so far: ...{tok.Decode(batchIds.Take(d).ToArray())[^Math.Min(60, tok.Decode(batchIds.Take(d).ToArray()).Length)..].Replace("\n", " ")}";
             }
