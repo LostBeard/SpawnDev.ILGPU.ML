@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Q6_K decode GEMV: fewer instructions a unit, bit-identical** (`Q6Unit`): the four int8 scales come from two word reads with a branchless sign
+  extension (were four byte reads, each with a signed divide and modulo and a branch), and the four 6-bit values of a word are assembled at once
+  (`(lo & 0x0F0F0F0F) | ((hi & 0x03030303) << 4)`, byte-wise, no carries) instead of one at a time: the same ints, so the same sums. Nsight Compute
+  had the qwen3:1.7b Q6_K LM head issue-bound (SM 85.5% beside DRAM 80.9%). MEASURED (nsys, RTX 4070): the LM head 657 -> 557 us a token (-15%, now
+  ~458 GB/s); greedy 256-token text identical before and after. Q6_K tests green on every lane.
+
 - **On SpawnDev.ILGPU 5.4.23** (its Inliner always inlines trivial methods: a large kernel's struct-constant branch, `if (default(TR).Flag)`,
   could keep its dead arm when the inlining budget ran out first). ML's decode kernels are unchanged in speed on it (CUDA, nsys, every kernel
   within 2%).

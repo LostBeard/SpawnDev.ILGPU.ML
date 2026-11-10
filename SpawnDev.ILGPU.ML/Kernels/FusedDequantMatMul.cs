@@ -2548,8 +2548,20 @@ public class FusedDequantMatMul : IDisposable
         float d = HalfBits(ReadU16(w, so + 208));
         int sc = so + 192 + 8 * h + (l >> 4);
         int qa = ReadWordAt(w, so + 64 * h + l), qb = ReadWordAt(w, so + 64 * h + l + 32), qh = ReadWordAt(w, so + 128 + 32 * h + l);
-        return d * (SignExtend8(ReadByte(w, sc)) * Q6x4(qa, 0, qh, 0, x0) + SignExtend8(ReadByte(w, sc + 2)) * Q6x4(qb, 0, qh, 2, x1)
-                  + SignExtend8(ReadByte(w, sc + 4)) * Q6x4(qa, 4, qh, 4, x2) + SignExtend8(ReadByte(w, sc + 6)) * Q6x4(qb, 4, qh, 6, x3));
+        // the four scales (bytes sc, sc + 2, sc + 4, sc + 6) from two word reads, sign-extended without a branch: the same ints as four ReadByte /
+        // SignExtend8 (a load, a signed divide and modulo, and a branch each). MEASURED 2026-11-10 (ncu, RTX 4070, the qwen3:1.7b Q6_K LM head):
+        // SM throughput 85.5% beside DRAM 80.9% - the head was issue-bound as much as memory-bound.
+        int sa = ReadWordAt(w, sc), sb4 = ReadWordAt(w, sc + 4);
+        int s0 = ((sa & 0xFF) ^ 0x80) - 0x80, s2 = (((sa >> 16) & 0xFF) ^ 0x80) - 0x80;
+        int s4 = ((sb4 & 0xFF) ^ 0x80) - 0x80, s6 = (((sb4 >> 16) & 0xFF) ^ 0x80) - 0x80;
+        return d * (s0 * Q6x4p(qa, 0, qh, 0, x0) + s2 * Q6x4p(qb, 0, qh, 2, x1) + s4 * Q6x4p(qa, 4, qh, 4, x2) + s6 * Q6x4p(qb, 4, qh, 6, x3));
+    }
+    // Q6x4 with the four 6-bit values assembled in one word (low nibbles | high bit pairs << 4, byte-wise: each byte 0..63, no carries between bytes) and
+    // read out a byte at a time: the same four ints, so the same sum, in fewer instructions
+    private static float Q6x4p(int lo, int ls, int hi, int hs, Vec4LoadMatMul.F4 x)
+    {
+        int q = ((lo >> ls) & 0x0F0F0F0F) | (((hi >> hs) & 0x03030303) << 4);
+        return x.A * ((q & 0xFF) - 32) + x.B * (((q >> 8) & 0xFF) - 32) + x.C * (((q >> 16) & 0xFF) - 32) + x.D * (((q >> 24) & 0xFF) - 32);
     }
 
     // M = 1, Q6_K: a warp per Q8VecRows outputs, a lane per 16-value unit (u over 16 units a super-block: half h = (u >> 3) & 1, l = 4 (u & 7)); the
