@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **On SpawnDev.ILGPU 5.4.25** (a type-cycle guard; no generated-code change for ML's kernels).
+- **OPT-IN int8 activations for Q4_K decode, Ollama's MMVQ scheme** (`FusedDequantMatMul.Int8ActGemv`, env GGUF_INT8_ACT=1; OFF by default). The
+  activation vector is quantized to ggml's q8_1 (32-value blocks, d = amax / 127, q = round(x / d)) and the Q4_K GEMV runs on dp4a
+  (`GemvQ4_KDp4aVecImpl`: the float kernel's layout, four 128-bit activation loads a lane instead of sixteen). The accuracy cost is Ollama's for the
+  same technique: new `Gemv_Q4K_Int8Act_MatchesGgmlQ8_1Scheme` shows the kernel computes the q8_1 scheme to 1e-8, and the scheme itself differs from
+  fp32 activations by mean 2-3e-4 (worst ~1e-3) of sum |w x|. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, quiet, interleaved x2): decode 234.2 / 237.1 ->
+  255.9 / 251.1 tok/s short, 221.8 / 221.9 -> 238.0 / 238.2 long (+7.5%); greedy text matches fp32 for ~140 tokens, then a coherent alternative.
+
 - **CUDA prefill: F16 weights on the tensor cores with split activations** (`FusedDequantMatMul.EnableMmaF16`, default on for sm_75+; rows from 9).
   F16 weights (qwen3 Q4_K_M's attn_v) took the fp32 tiled GEMM at M > 8: 279 of 1,051 ms of a profiled run's prefill kernel time. Now they feed the
   tensor-core GEMM in place, with the activations split A = hi + lo * 2^-11 (both f16, exact scaling) and the GEMM run on each, so A is not rounded to
