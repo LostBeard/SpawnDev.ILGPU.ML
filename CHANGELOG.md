@@ -4,13 +4,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.11 - 2026-11-10 (nuget.org) - faster CUDA decode; joined vs separate projections fixed under FP contraction
+
+On SpawnDev.ILGPU 5.4.24. Release sweep (full default, HeavyModel excluded): 7,659 passed, 0 failed, 445 skipped, 1 h 09 m (RTX 4070,
+Chrome). qwen3:1.7b Q4_K_M on CUDA decodes at ~235 tok/s at a short prompt and ~219 at an 1,800-token prompt (5.8.10: ~213 / ~200). The
+model-inspection heavy group ran 41 s in this and the validation sweep (the ~2 min of 5.8.8 - 5.8.10 sweeps did not recur).
+
 - **On SpawnDev.ILGPU 5.4.24.** CUDA: v's projection GEMV runs on a second stream beside the q|k GEMV and the head norms
   (`GgufBatchDecoder.OverlapV`, default on; captured as parallel branches of the step's graph with 5.4.24's `CudaStream.WaitFor` fork / join) when
   v's block type differs from q / k (Q4_K_M), no LoRA applies and kernels are not profiled. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, three
   interleaved rounds): decode 225.6 -> 234.6 tok/s short (+4.0%), 213.2 -> 218.9 long (+2.7%), prefill ~+3.5%; greedy text identical. Env
   GGUF_OVERLAP_V=0 is the A/B.
 
-- **Fix: joined and separate q|k|v projections disagreed on CUDA with FP contraction on** (since `ML_FP_CONTRACT` became the default, 2026-11-07):
+- **Fix: joined and separate q|k|v projections disagreed on CUDA with FP contraction on** (since FP contraction became the default in 5.8.7, 2026-11-08):
   the compiler fused the rotation `x0 * c - x1 * s` into multiply-adds differently in `RopeImpl` and the fused `QkvPostImpl`, so a model loaded
   with joined projections drifted 2.6e-4 / 6.2e-4 from the same model with separate ones (`GgufBatchDecoder_GreedyMatchesGenerator`'s joinOk,
   limit 1e-6; green with `ML_FP_CONTRACT=0`). Both kernels now write the rotation's FMAs out (`float.MultiplyAddEstimate`), so the two routes are
