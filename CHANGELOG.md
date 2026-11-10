@@ -24,6 +24,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   2-7e-4 (red-checked: a wrong -32 offset in one byte gives 3.1e-3). MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, quiet, interleaved x2): ffn_down 30.91 ->
   27.40 us; decode 258.9 / 257.9 -> 261.1 / 261.2 tok/s short, 239.8 / 239.7 -> 242.4 / 242.7 long (+1.1%). The LM head stays on fp32 activations: a
   dp4a kernel in the plain layout was slower there (558 -> 596 us), and the logits keep no int8 rounding.
+- **What the int8 opt-in costs, end to end** (new `Bench_Int8Act_TeacherForced_KLD`, llama.cpp's quantization metrics): qwen3:1.7b Q4_K_M, 331
+  teacher-forced steps of plain prose, int8 activations (Q4_K + Q6_K split, fused) against the default fp32: KL divergence mean 5.5e-3 (median 1.9e-3,
+  p99 4.9e-2), the same top-1 token at 96.4% of steps, perplexity +1.13% (46.45 -> 46.97). The kernels compute ggml's q8_1 scheme to 1e-8 (keeping d
+  in float where ggml rounds it to fp16), so this is Ollama's cost for the same technique or less.
 - `Bench_OllamaGreedyDivergence_Margin` takes a model, prompt (or raw prompt ids), system message, thinking flag and step count by env (GREEDY_DIV_*)
   and returns its report.
 
