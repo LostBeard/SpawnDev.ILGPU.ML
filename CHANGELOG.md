@@ -11,6 +11,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   same technique: new `Gemv_Q4K_Int8Act_MatchesGgmlQ8_1Scheme` shows the kernel computes the q8_1 scheme to 1e-8, and the scheme itself differs from
   fp32 activations by mean 2-3e-4 (worst ~1e-3) of sum |w x|. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, quiet, interleaved x2): decode 234.2 / 237.1 ->
   255.9 / 251.1 tok/s short, 221.8 / 221.9 -> 238.0 / 238.2 long (+7.5%); greedy text matches fp32 for ~140 tokens, then a coherent alternative.
+- **Opt-in int8 activations: the producers write the q8_1 form** (with `Int8ActGemv`; env GGUF_INT8_ACT_FUSE=0 is the A/B). The quantize was its own
+  launch before each Q4_K GEMV (~98 a token, 1.15 us each). Now the fused residual-add + RMSNorm (`AddRMSNormFusedQ8`, four values a thread with
+  their shuffle chains interleaved), the SwiGLU (`SwigluJoinedQ8Impl`) and the attention chunk merge (`AttnCombineGroupQ8Impl`) write it beside
+  their float output, and the GEMV reads it (`FusedDequantMatMul.Q8Act`). The same bytes: new `AddRmsNormQ8_Fused_BitIdentical` (residual, normed
+  and GEMV outputs bit-identical to the unfused pair) and `GgufBatchDecoder_Int8ActFused_BitIdentical` (qwen2.5 1.5B Q4_K_M, graph capture: logits
+  bit-identical, 32 greedy tokens the same), each red-checked per producer. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, quiet, interleaved x2): the
+  fused norm 4.80 us (the plain one 4.89); decode 255.7 / 255.8 -> 259.7 / 259.8 tok/s short, 237.8 / 237.6 -> 242.0 / 241.0 long (+1.6%). With
+  int8 activations decode is now +9.6% short / +9.0% long over the default fp32 activations (237.2 / 222.2 tok/s on the same runs).
+- **Opt-in int8 activations cover Q6_K's split GEMV** (ggml's vec_dot_q6_K_q8_1 in dp4a: `GemvQ6_KDp4aSplitImpl`, N <= `Q6SplitMaxN`, i.e. ffn_down and
+  v; env GGUF_INT8_ACT_Q6=0 is the A/B). New `Gemv_Q6K_Int8Act_MatchesGgmlQ8_1Scheme`: the scheme to 1-4e-8, its cost against fp32 activations mean
+  2-7e-4 (red-checked: a wrong -32 offset in one byte gives 3.1e-3). MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, quiet, interleaved x2): ffn_down 30.91 ->
+  27.40 us; decode 258.9 / 257.9 -> 261.1 / 261.2 tok/s short, 239.8 / 239.7 -> 242.4 / 242.7 long (+1.1%). The LM head stays on fp32 activations: a
+  dp4a kernel in the plain layout was slower there (558 -> 596 us), and the logits keep no int8 rounding.
+- `Bench_OllamaGreedyDivergence_Margin` takes a model, prompt (or raw prompt ids), system message, thinking flag and step count by env (GREEDY_DIV_*)
+  and returns its report.
 
 - **CUDA prefill: F16 weights on the tensor cores with split activations** (`FusedDequantMatMul.EnableMmaF16`, default on for sm_75+; rows from 9).
   F16 weights (qwen3 Q4_K_M's attn_v) took the fp32 tiled GEMM at M > 8: 279 of 1,051 ms of a profiled run's prefill kernel time. Now they feed the

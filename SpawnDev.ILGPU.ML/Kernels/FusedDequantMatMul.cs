@@ -214,6 +214,9 @@ public class FusedDequantMatMul : IDisposable
     public static long MmaScratchMaxWeightBytes = 256L << 20;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchA16, _scratchW16, _scratchA16Lo;
     private MemoryBuffer1D<byte, Stride1D.Dense>? _q8Qs;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6Dp4aSplit;
+    /// <summary>A/B switch for the Q6_K half of <see cref="Int8ActGemv"/> (env GGUF_INT8_ACT_Q6=0 keeps Q6_K on fp32 activations).</summary>
+    public static bool Int8ActQ6 = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_Q6") != "0";
     private MemoryBuffer1D<float, Stride1D.Dense>? _q8Ds;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _quantQ8Warp;
     private Action<KernelConfig, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ4KDp4aVec;
@@ -227,6 +230,39 @@ public class FusedDequantMatMul : IDisposable
     /// coherent alternative. The quantize is its own launch per GEMV (1.15 us, ~112 us a token): fusing it into the producers is the next step.
     /// </summary>
     public static bool Int8ActGemv = Environment.GetEnvironmentVariable("GGUF_INT8_ACT") == "1";
+
+    /// <summary>Activations already quantized to q8_1 by their producer (<see cref="Q8_1WarpStore"/>): Qs one int8 a value, Ds (d, d * sum q) a 32-value block.</summary>
+    public readonly struct Q8Act
+    {
+        public readonly ArrayView1D<byte, Stride1D.Dense> Qs;
+        public readonly ArrayView1D<float, Stride1D.Dense> Ds;
+        public Q8Act(ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds) { Qs = qs; Ds = ds; }
+    }
+
+    /// <summary>
+    /// Whether <see cref="ForwardRows"/> on this accelerator takes the int8-activation route for a one-row GEMV of K columns (any Q4_K weight): a producer
+    /// writes <see cref="Q8Act"/> only when it is read. Fusion env A/B: GGUF_INT8_ACT_FUSE=0 keeps the GEMV's own quantize launch.
+    /// </summary>
+    public bool Int8ActFor(int M, int K) => Int8ActGemv && Int8ActFuse && M == 1 && !ForceGenericRows && Q4KVec && K % 256 == 0
+        && (Q4KVecShuffle ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32 && CudaCaps.Dp4a(_accelerator);
+    // the input as q8_1: the producer's (pre) when it wrote one, else quantized here into the scratch (one launch); true when pre was used
+    private bool Q8Input(ArrayView1D<float, Stride1D.Dense> input, int K, Q8Act? pre, out ArrayView1D<byte, Stride1D.Dense> qs, out ArrayView1D<float, Stride1D.Dense> ds)
+    {
+        if (pre.HasValue && pre.Value.Qs.Length >= K && pre.Value.Ds.Length >= K / 16 && (((IContiguousArrayView)pre.Value.Qs.BaseView).IndexInBytes & 15) == 0)
+        {
+            qs = pre.Value.Qs; ds = pre.Value.Ds;
+            return true;
+        }
+        if (_q8Qs == null || _q8Qs.Length < K) { if (_q8Qs != null) _scratchRetired.Add(_q8Qs); _q8Qs = _accelerator.Allocate1D<byte>(Math.Max(K, 256)); }
+        if (_q8Ds == null || _q8Ds.Length < K / 16) { if (_q8Ds != null) _scratchRetired.Add(_q8Ds); _q8Ds = _accelerator.Allocate1D<float>(Math.Max(K / 16, 16)); }
+        _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
+        _quantQ8Warp(K, input.SubView(0, K), _q8Qs.View, _q8Ds.View);
+        qs = _q8Qs.View; ds = _q8Ds.View;
+        return false;
+    }
+
+    /// <summary>A/B switch for the producers' fused q8_1 (on by default with <see cref="Int8ActGemv"/>; env GGUF_INT8_ACT_FUSE=0).</summary>
+    public static bool Int8ActFuse = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_FUSE") != "0";
     private MemoryBuffer1D<float, Stride1D.Dense>? _scratchF16Out;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView<uint>>? _packA16Lo;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInto;
@@ -2393,7 +2429,22 @@ public class FusedDequantMatMul : IDisposable
     /// it also suits WebGPU's uniformity rule (not WebGL: no shared memory).
     /// </summary>
     public void ForwardRows(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> weightQuant, ArrayView1D<float, Stride1D.Dense> output, int M, int K, int N, GGMLType type)
+        => ForwardRows(input, weightQuant, output, M, K, N, type, null);
+
+    /// <summary>ForwardRows with the input's q8_1 form when its producer wrote one (<see cref="Int8ActFor"/>); used only on the int8-activation route, ignored elsewhere.</summary>
+    public void ForwardRows(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> weightQuant, ArrayView1D<float, Stride1D.Dense> output, int M, int K, int N, GGMLType type, Q8Act? pre)
     {
+        if (M == 1 && type == GGMLType.Q6_K && Int8ActGemv && Int8ActQ6 && !ForceGenericRows && K % 256 == 0 && N <= Q6SplitMaxN && Q6VecSplit != false && CanShuffle32 && CudaCaps.Dp4a(_accelerator)
+            && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & 3) == 0)
+        {
+            int code6 = TypeCode(type);
+            if (!_rowsParams.TryGetValue((M, K, N, code6), out var pb6)) { pb6 = _accelerator.Allocate1D(new[] { M, K, N, code6 }); _rowsParams[(M, K, N, code6)] = pb6; }
+            bool fused6 = Q8Input(input, K, pre, out var qs6, out var ds6);
+            _gemvQ6Dp4aSplit ??= _accelerator.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ6_KDp4aSplitImpl);
+            _gemvQ6Dp4aSplit(new KernelConfig((N + Q8VecRows - 1) / Q8VecRows, Q6SplitWarps * 32), qs6.SubView(0, K).Cast<byte, int>(), ds6, weightQuant.Cast<byte, int>(), output, pb6.View);
+            LastRowsKernel = "q6k-dp4a-split" + (fused6 ? "-pre" : "");
+            return;
+        }
         if (M < 1 || M > RowsMax) throw new ArgumentOutOfRangeException(nameof(M), $"1..{RowsMax}");
         if (!Accepts(type)) throw new NotSupportedException($"ForwardRows: {type}");
         if (_accelerator.AcceleratorType == AcceleratorType.WebGL) { Forward(input, weightQuant, output, M, K, N, type); return; }
@@ -2465,14 +2516,11 @@ public class FusedDequantMatMul : IDisposable
             bool shuffle = (Q4KVecShuffle ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32;
             if (Int8ActGemv && shuffle && CudaCaps.Dp4a(_accelerator))
             {
-                if (_q8Qs == null || _q8Qs.Length < K) { if (_q8Qs != null) _scratchRetired.Add(_q8Qs); _q8Qs = _accelerator.Allocate1D<byte>(Math.Max(K, 256)); }
-                if (_q8Ds == null || _q8Ds.Length < K / 16) { if (_q8Ds != null) _scratchRetired.Add(_q8Ds); _q8Ds = _accelerator.Allocate1D<float>(Math.Max(K / 16, 16)); }
-                _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
-                _quantQ8Warp(K, input.SubView(0, K), _q8Qs.View, _q8Ds.View);
+                bool fused = Q8Input(input, K, pre, out var qs, out var ds);
                 _gemvQ4KDp4aVec ??= _accelerator.LoadStreamKernel<ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvQ4_KDp4aVecImpl);
                 _gemvQ4KDp4aVec(new KernelConfig((N + Q4KVecCols * Q4KVecRows - 1) / (Q4KVecCols * Q4KVecRows), Q4KVecCols * 32),
-                    _q8Qs.View.BaseView.Cast<W16>(), _q8Ds.View, weightQuant.BaseView.Cast<W16>(), output, pb.View);
-                LastRowsKernel = "q4k-dp4a-vec";
+                    qs.SubView(0, K).BaseView.Cast<W16>(), ds, weightQuant.BaseView.Cast<W16>(), output, pb.View);
+                LastRowsKernel = fused ? "q4k-dp4a-vec-pre" : "q4k-dp4a-vec";
                 return;
             }
             var q4k = shuffle
@@ -2754,6 +2802,73 @@ public class FusedDequantMatMul : IDisposable
         }
     }
 
+    // ---- opt-in int8 activations, Q6_K (ggml vec_dot_q6_K_q8_1 in dp4a) ----
+    // one output's unit (half h, values l..l+3 of its four 32-value groups) against the four q8_1 words of those values (xj: group j's 4 int8, d8j: its
+    // block's d): d * sum_j s_j * d8_j * sum((q - 32) x) - the 6-bit values assembled byte-wise as in Q6x4p (0..63), the -32 as a second dp4a against
+    // bytes of -32 (0xE0E0E0E0)
+    private static float Q6Dp4aUnit(ArrayView1D<int, Stride1D.Dense> w, int so, int h, int l, int x0, int x1, int x2, int x3, float d80, float d81, float d82, float d83)
+    {
+        float d = HalfBits(ReadU16(w, so + 208));
+        int sc = so + 192 + 8 * h + (l >> 4);
+        int qa = ReadWordAt(w, so + 64 * h + l), qb = ReadWordAt(w, so + 64 * h + l + 32), qh = ReadWordAt(w, so + 128 + 32 * h + l);
+        int sa = ReadWordAt(w, sc), sb4 = ReadWordAt(w, sc + 4);
+        int s0 = ((sa & 0xFF) ^ 0x80) - 0x80, s2 = (((sa >> 16) & 0xFF) ^ 0x80) - 0x80;
+        int s4 = ((sb4 & 0xFF) ^ 0x80) - 0x80, s6 = (((sb4 >> 16) & 0xFF) ^ 0x80) - 0x80;
+        const int m32 = unchecked((int)0xE0E0E0E0);
+        int v0 = (qa & 0x0F0F0F0F) | ((qh & 0x03030303) << 4), v1 = (qb & 0x0F0F0F0F) | (((qh >> 2) & 0x03030303) << 4);
+        int v2 = ((qa >> 4) & 0x0F0F0F0F) | (((qh >> 4) & 0x03030303) << 4), v3 = ((qb >> 4) & 0x0F0F0F0F) | (((qh >> 6) & 0x03030303) << 4);
+        int t0 = Dp4a(v0, x0, Dp4a(m32, x0, 0)), t1 = Dp4a(v1, x1, Dp4a(m32, x1, 0)), t2 = Dp4a(v2, x2, Dp4a(m32, x2, 0)), t3 = Dp4a(v3, x3, Dp4a(m32, x3, 0));
+        return d * (d80 * (s0 * t0) + d81 * (s2 * t1) + d82 * (s4 * t2) + d83 * (s6 * t3));
+    }
+
+    // the lane's unit u: its four q8_1 words and their blocks' d (qi: the q8_1 bytes as ints)
+    private static void Q6Dp4aLoad(ArrayView1D<int, Stride1D.Dense> qi, ArrayView1D<float, Stride1D.Dense> ds, int u,
+        out int x0, out int x1, out int x2, out int x3, out float d0, out float d1, out float d2, out float d3, out int sb, out int h, out int l)
+    {
+        sb = u >> 4; h = (u >> 3) & 1; l = (u & 7) << 2;
+        int v = (sb << 8) + (h << 7) + l, wi = v >> 2, b = v >> 5;
+        x0 = qi[wi]; x1 = qi[wi + 8]; x2 = qi[wi + 16]; x3 = qi[wi + 24];
+        d0 = ds[2 * b]; d1 = ds[2 * b + 2]; d2 = ds[2 * b + 4]; d3 = ds[2 * b + 6];
+    }
+
+    // GemvQ6_KVecSplitImpl on q8_1 activations: Q6SplitWarps warps share the same Q8VecRows outputs, each a slice of the units. Only the split shapes
+    // (N <= Q6SplitMaxN: ffn_down, v): MEASURED 2026-11-10 (nsys, RTX 4070, qwen3:1.7b Q4_K_M) ffn_down 30.91 -> 27.40 us; a plain-layout dp4a kernel
+    // on the LM head (2048 x 151,936) was SLOWER than the float one (558 -> 596 us), so the head keeps fp32 activations (no int8 rounding in the logits).
+    private static void GemvQ6_KDp4aSplitImpl(ArrayView1D<int, Stride1D.Dense> qi, ArrayView1D<float, Stride1D.Dense> ds, ArrayView1D<int, Stride1D.Dense> w, ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int tid = Group.IdxX, lane = tid & 31, wid = tid >> 5, n0 = Grid.IdxX * Q8VecRows;
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f;
+        int nsb = K >> 8, rowB = nsb * 210, nU = nsb * 16;
+        bool r0 = n0 < N, r1 = n0 + 1 < N, r2 = n0 + 2 < N, r3 = n0 + 3 < N;
+        if (r0)
+        {
+            for (int u = wid * 32 + lane; u < nU; u += 32 * Q6SplitWarps)
+            {
+                Q6Dp4aLoad(qi, ds, u, out int x0, out int x1, out int x2, out int x3, out float d0, out float d1, out float d2, out float d3, out int sb, out int h, out int l);
+                int so = n0 * rowB + sb * 210;
+                p0 += Q6Dp4aUnit(w, so, h, l, x0, x1, x2, x3, d0, d1, d2, d3);
+                if (r1) p1 += Q6Dp4aUnit(w, so + rowB, h, l, x0, x1, x2, x3, d0, d1, d2, d3);
+                if (r2) p2 += Q6Dp4aUnit(w, so + 2 * rowB, h, l, x0, x1, x2, x3, d0, d1, d2, d3);
+                if (r3) p3 += Q6Dp4aUnit(w, so + 3 * rowB, h, l, x0, x1, x2, x3, d0, d1, d2, d3);
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            p0 += Warp.ShuffleXor(p0, off); p1 += Warp.ShuffleXor(p1, off);
+            p2 += Warp.ShuffleXor(p2, off); p3 += Warp.ShuffleXor(p3, off);
+        }
+        var sh = SharedMemory.Allocate<float>(Q6SplitWarps * Q8VecRows);
+        if (lane == 0) { sh[wid * 4] = p0; sh[wid * 4 + 1] = p1; sh[wid * 4 + 2] = p2; sh[wid * 4 + 3] = p3; }
+        Group.Barrier();
+        if (tid < Q8VecRows && n0 + tid < N)
+        {
+            float t = 0f;
+            for (int k = 0; k < Q6SplitWarps; k++) t += sh[k * 4 + tid];
+            output[n0 + tid] = t;
+        }
+    }
+
     // fp16 bits -> float, every value (subnormals scaled, inf / nan kept): full F16 weights, unlike a block scale, may hold any of them
     internal static float HalfBitsAll(int h)
     {
@@ -3003,18 +3118,63 @@ public class FusedDequantMatMul : IDisposable
     // the block's int8 quants to qs (byte i), and per block ds = (d, d * sum q) - the min term of the Q4_K dot uses the sum of the QUANTIZED values, as ggml's
     // vec_dot_q4_K_q8_1 does (dp4a(0x01010101, u)). ggml keeps d as half; it stays float here (no less exact).
     private static void QuantizeQ8_1WarpImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds)
+        => Q8_1WarpStore(x[(int)i], i, qs, ds);
+
+    /// <summary>
+    /// One value's share of ggml's q8_1 for a whole warp: lane (ii &amp; 31) holds value ii of a 32-aligned block, all 32 lanes active. Producers that already hold the
+    /// values in warp-aligned order (the CUDA residual-add + RMSNorm, the decoder's SwiGLU) call it to write the int8 activations a <see cref="Int8ActGemv"/> GEMV
+    /// reads (<see cref="Q8Act"/>), so the GEMV skips its own quantize launch. The same arithmetic as <c>QuantizeQ8_1WarpImpl</c>, so the same bytes.
+    /// </summary>
+    internal static void Q8_1WarpStore(float v, int ii, ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds)
     {
-        int ii = i, lane = ii & 31;
-        float v = x[ii];
+        int lane = ii & 31;
         float amax = MathF.Abs(v);
         for (int off = 16; off > 0; off >>= 1) amax = MathF.Max(amax, Warp.ShuffleXor(amax, off));
         float d = amax / 127f;
-        int q = 0;
-        if (amax > 0f) { float t = v / d; q = (int)(t + (t >= 0f ? 0.5f : -0.5f)); }
+        int q = Q8Of(v, amax, d);
         qs[ii] = (byte)(q & 0xFF);
         int sum = q;
         for (int off = 16; off > 0; off >>= 1) sum += Warp.ShuffleXor(sum, off);
         if (lane == 0) { int b = ii >> 5; ds[2 * b] = d; ds[2 * b + 1] = d * sum; }
+    }
+
+    // q8_1's value: round(v / d) half away from zero, 0 for an all-zero block
+    private static int Q8Of(float v, float amax, float d)
+    {
+        int q = 0;
+        if (amax > 0f) { float t = v / d; q = (int)(t + (t >= 0f ? 0.5f : -0.5f)); }
+        return q;
+    }
+
+    /// <summary>
+    /// <see cref="Q8_1WarpStore"/> for four values a lane in four blocks (indices i0..i3, each 32-aligned across the warp) with the eight shuffle chains
+    /// interleaved: a producer that walks its row in steps (the norm's group strides it) pays one chain's latency for four blocks instead of four in a row.
+    /// The same arithmetic per block, so the same bytes.
+    /// </summary>
+    internal static void Q8_1WarpStore4(float v0, float v1, float v2, float v3, int i0, int i1, int i2, int i3,
+        ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds)
+    {
+        float a0 = MathF.Abs(v0), a1 = MathF.Abs(v1), a2 = MathF.Abs(v2), a3 = MathF.Abs(v3);
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            a0 = MathF.Max(a0, Warp.ShuffleXor(a0, off)); a1 = MathF.Max(a1, Warp.ShuffleXor(a1, off));
+            a2 = MathF.Max(a2, Warp.ShuffleXor(a2, off)); a3 = MathF.Max(a3, Warp.ShuffleXor(a3, off));
+        }
+        float d0 = a0 / 127f, d1 = a1 / 127f, d2 = a2 / 127f, d3 = a3 / 127f;
+        int q0 = Q8Of(v0, a0, d0), q1 = Q8Of(v1, a1, d1), q2 = Q8Of(v2, a2, d2), q3 = Q8Of(v3, a3, d3);
+        qs[i0] = (byte)(q0 & 0xFF); qs[i1] = (byte)(q1 & 0xFF); qs[i2] = (byte)(q2 & 0xFF); qs[i3] = (byte)(q3 & 0xFF);
+        int s0 = q0, s1 = q1, s2 = q2, s3 = q3;
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            s0 += Warp.ShuffleXor(s0, off); s1 += Warp.ShuffleXor(s1, off);
+            s2 += Warp.ShuffleXor(s2, off); s3 += Warp.ShuffleXor(s3, off);
+        }
+        if ((i0 & 31) == 0)
+        {
+            int b0 = i0 >> 5, b1 = i1 >> 5, b2 = i2 >> 5, b3 = i3 >> 5;
+            ds[2 * b0] = d0; ds[2 * b0 + 1] = d0 * s0; ds[2 * b1] = d1; ds[2 * b1 + 1] = d1 * s1;
+            ds[2 * b2] = d2; ds[2 * b2 + 1] = d2 * s2; ds[2 * b3] = d3; ds[2 * b3 + 1] = d3 * s3;
+        }
     }
 
     // one output's t-unit (sub-blocks 2t, 2t + 1) against the lane's two q8_1 blocks (xa, xb: block 2t's 32 int8; xc, xd: block 2t + 1's), ggml's

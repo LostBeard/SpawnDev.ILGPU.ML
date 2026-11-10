@@ -342,6 +342,91 @@ public class NormalizationKernels : IDisposable
     }
 
     /// <summary>
+    /// <c>AddRMSNormFusedShuffleImpl</c> that also writes the normed rows in ggml's q8_1 (<see cref="FusedDequantMatMul.Q8_1WarpStore"/>) for the opt-in int8-activation
+    /// GEMVs that read them (<see cref="FusedDequantMatMul.Int8ActGemv"/>): the normed values are computed by the same expression, so the floats and the bytes equal the
+    /// unfused kernel's and the GEMV's own quantize. Needs C and the group a multiple of 32 (a warp's lanes are 32 consecutive values of a block).
+    /// </summary>
+    private static void AddRMSNormFusedShuffleQ8Impl(
+        ArrayView1D<float, Stride1D.Dense> a,
+        ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> residualOut,
+        ArrayView1D<float, Stride1D.Dense> normedOut,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<byte, Stride1D.Dense> qs,
+        ArrayView1D<float, Stride1D.Dense> ds,
+        int C, float epsilon, int hasWeight)
+    {
+        int row = Grid.IdxX;
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int offset = row * C;
+
+        var warpSums = SharedMemory.Allocate<double>(MaxRmsGroup / 32);
+        var inv = SharedMemory.Allocate<float>(1);
+
+        double local = 0.0;
+        for (int i = tid; i < C; i += T)
+        {
+            float x = a[offset + i] + b[offset + i];
+            residualOut[offset + i] = x;
+            double v = (double)x; local = double.MultiplyAddEstimate(v, v, local);
+        }
+        for (int off = 16; off > 0; off >>= 1) local += Warp.ShuffleXor(local, off);
+        if ((tid & 31) == 0) warpSums[tid >> 5] = local;
+        Group.Barrier();
+        if (tid == 0)
+        {
+            double sumSq = 0.0;
+            for (int w = 0; w < (T >> 5); w++) sumSq += warpSums[w];
+            inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+        }
+        Group.Barrier();
+
+        float invRms = inv[0];
+        int j = tid;
+        // four values a thread at a time (warp-uniform: C and T multiples of 32), their q8_1 shuffle chains interleaved; then the rest one at a time
+        for (; j + 3 * T < C; j += 4 * T)
+        {
+            float y0 = residualOut[offset + j] * invRms * (hasWeight != 0 ? weight[j] : 1f);
+            float y1 = residualOut[offset + j + T] * invRms * (hasWeight != 0 ? weight[j + T] : 1f);
+            float y2 = residualOut[offset + j + 2 * T] * invRms * (hasWeight != 0 ? weight[j + 2 * T] : 1f);
+            float y3 = residualOut[offset + j + 3 * T] * invRms * (hasWeight != 0 ? weight[j + 3 * T] : 1f);
+            normedOut[offset + j] = y0; normedOut[offset + j + T] = y1; normedOut[offset + j + 2 * T] = y2; normedOut[offset + j + 3 * T] = y3;
+            FusedDequantMatMul.Q8_1WarpStore4(y0, y1, y2, y3, offset + j, offset + j + T, offset + j + 2 * T, offset + j + 3 * T, qs, ds);
+        }
+        for (; j < C; j += T)
+        {
+            float y = residualOut[offset + j] * invRms * (hasWeight != 0 ? weight[j] : 1f);
+            normedOut[offset + j] = y;
+            FusedDequantMatMul.Q8_1WarpStore(y, offset + j, qs, ds);
+        }
+    }
+
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float, int>? _addRmsNormFusedShuffleQ8Kernel;
+
+    /// <summary>
+    /// <see cref="AddRMSNormFused"/> that also writes the normed rows as q8_1 activations (qs one byte a value, ds two floats a 32-value block) for the opt-in
+    /// int8-activation GEMVs. Only on the CUDA shuffle kernel: returns false (nothing launched) elsewhere, and the caller runs the plain fused norm.
+    /// </summary>
+    public bool AddRMSNormFusedQ8(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> residualOut, ArrayView1D<float, Stride1D.Dense> normedOut,
+        ArrayView1D<float, Stride1D.Dense> weight, ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds, int rows, int C, float epsilon)
+    {
+        EnsureLoaded();
+        if (rows <= 0 || C % 32 != 0 || !AddRmsShuffle || _accelerator.AcceleratorType != AcceleratorType.Cuda) return false;
+        int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
+            : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);
+        if (T < 32 || T % 32 != 0) return false;
+        _addRmsNormFusedShuffleQ8Kernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float, int>(AddRMSNormFusedShuffleQ8Impl);
+        _addRmsNormFusedShuffleQ8Kernel(new KernelConfig(new Index1D(rows), new Index1D(T)), a, b, residualOut, normedOut, weight, qs, ds, C, epsilon, 1);
+        LastAddRmsKernel = "shuffle-q8";
+        return true;
+    }
+
+    /// <summary>
     /// <see cref="AddRMSNormFused"/> on <c>AddRMSNormFusedShuffleImpl</c> (CUDA): on by default; env GGUF_RMS_SHUFFLE=0 is the A/B. MEASURED 2026-11-09
     /// (nsys, RTX 4070, qwen3:1.7b): the one-row decode norm 5.71 -> 4.88 us (2,048 wide), prefill rows 37.0 -> 35.6 / 49.6 -> 47.4 us; worst error
     /// against the f64 reference unchanged (AddRmsNormFused_MatchesCpu). The rest of a decode norm is one group's serial memory round trips.

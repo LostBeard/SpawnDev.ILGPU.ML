@@ -648,6 +648,13 @@ public sealed class GgufBatchDecoder : IDisposable
     // sum = a + b (the residual stream), normed = rmsnorm(sum) * w; one fused pass, or (WebGL: no shared memory) an add then the two-pass norm
     private void AddNorm(FV a, FV b, FV sum, FV normed, FV w, int rows, int C)
     {
+        _hnQ8 = null;
+        if (_mm.Int8ActFor(rows, C))
+        {
+            // opt-in int8 activations: the norm also writes hn as q8_1 for the Q4_K GEMVs that read it (no quantize launch of their own)
+            if (_hnQs == null) { _hnQs = _acc.Allocate1D<byte>(Math.Max(C, 256)); _owned.Add(_hnQs); _hnDs = _acc.Allocate1D<float>(Math.Max(C / 16, 16)); _owned.Add(_hnDs); _bufGen++; }
+            if (_norm.AddRMSNormFusedQ8(a, b, sum, normed, w, _hnQs.View, _hnDs!.View, rows, C, _eps)) { _hnQ8 = new FusedDequantMatMul.Q8Act(_hnQs.View, _hnDs.View); return; }
+        }
         if (_norm.AddRMSNormFused(a, b, sum, normed, w, rows, C, _eps, 1)) return;
         _add3!((int)((long)rows * C), a, b, sum);
         _norm.RMSNorm(sum, normed, w, rows, C, _eps);
@@ -670,11 +677,19 @@ public sealed class GgufBatchDecoder : IDisposable
     private static readonly string[] LoraQkv = { "attn_q", "attn_k", "attn_v" }, LoraQk = { "attn_q", "attn_k" }, LoraGateUp = { "ffn_gate", "ffn_up" };
     private int[]? _loraQkvOff, _loraQkOff, _loraGateUpOff;
 
-    // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM
-    private void Gemm(FV x, string name, FV o, int rows, int K, int N)
+    // the opt-in int8 activations' q8_1 forms of hn (written by AddNorm) and of the SwiGLU output (the down projection's input); null when not written this step
+    private MemoryBuffer1D<byte, Stride1D.Dense>? _hnQs, _ffQs;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hnDs, _ffDs;
+    private FusedDequantMatMul.Q8Act? _hnQ8;
+    private MemoryBuffer1D<byte, Stride1D.Dense>? _attQs;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _attDs;
+    private Action<KernelConfig, FV, FV, FV, IV, int, int, int, int, ArrayView1D<byte, Stride1D.Dense>, FV>? _attCombineGroupQ8;
+
+    // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM. pre: x as q8_1, when its producer wrote it (opt-in int8 activations)
+    private void Gemm(FV x, string name, FV o, int rows, int K, int N, FusedDequantMatMul.Q8Act? pre = null)
     {
         var (w, t) = _mats[name];
-        if (rows <= FusedDequantMatMul.RowsMax) _mm.ForwardRows(x, w.View, o, rows, K, N, t);
+        if (rows <= FusedDequantMatMul.RowsMax) _mm.ForwardRows(x, w.View, o, rows, K, N, t, pre);
         else _mm.Forward(x, w.View, o, rows, K, N, t);
     }
 
@@ -903,9 +918,11 @@ public sealed class GgufBatchDecoder : IDisposable
         // the residual stream alternates between hid and hid2; every residual add is fused with the norm after it (a layer's FFN add with the next layer's
         // attention norm, the last one with the output norm): one group per row, not a thread per row walking the row twice
         _norm.RMSNorm(hid, hn, _vecs["blk.0.attn_norm.weight"].View, R, C, _eps); Prof("rms");
+        _hnQ8 = null;
         for (int l = 0; l < Layers; l++)
         {
             string b = $"blk.{l}.";
+            FusedDequantMatMul.Q8Act? attQ8 = null;                     // att as q8_1 when the merge wrote it (opt-in int8 activations)
             if (_mats.ContainsKey(b + "attn_qkv"))
             {
                 // one GEMV for q|k(|v), then bias + rotary + the cache store in one kernel (q to its buffer, k and v to the caches)
@@ -922,9 +939,9 @@ public sealed class GgufBatchDecoder : IDisposable
                     mainStream = (global::ILGPU.Runtime.Cuda.CudaStream)_acc.DefaultStream;
                     _vStream ??= (global::ILGPU.Runtime.Cuda.CudaStream)_acc.CreateStream();
                     _vStream.WaitFor(mainStream);                                // fork: v reads hn, written on the main stream
-                    using (_acc.WithDefaultStream(_vStream)) Gemm(hn, b + "attn_v.weight", v, R, C, kvC);
+                    using (_acc.WithDefaultStream(_vStream)) Gemm(hn, b + "attn_v.weight", v, R, C, kvC, _hnQ8);
                 }
-                Gemm(hn, b + "attn_qkv", qkv, R, C, n); Prof("qkv");
+                Gemm(hn, b + "attn_qkv", qkv, R, C, n, _hnQ8); Prof("qkv");
                 if (Lora != null)
                 {
                     // LoRA deltas into the fused q|k|v columns, before the bias / rotary / cache-store kernel reads them (one packed launch)
@@ -933,7 +950,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 }
                 var vb = att;                                                // unread when v is in qkv (a distinct buffer: no aliasing)
                 if (overlapV) vb = v;
-                else if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
+                else if (!all) { Gemm(hn, b + "attn_v.weight", v, R, C, kvC, _hnQ8); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); vb = v; Prof("v"); }
                 if (_qkNorm)
                 {
                     // qwen3: an RMS norm per head of q and of k (weight [head width]) before the rotary; no biases, so the post kernel's zero bias changes nothing
@@ -947,9 +964,9 @@ public sealed class GgufBatchDecoder : IDisposable
             }
             else
             {
-                Gemm(hn, b + "attn_q.weight", q, R, C, Q); Lora?.Apply(l, "attn_q", hn, q, R, 0, Q); _bias!((int)((long)R * Q), q, _vecs[b + "attn_q.bias"].View, Q); Prof("q");
-                Gemm(hn, b + "attn_k.weight", k, R, C, kvC); Lora?.Apply(l, "attn_k", hn, k, R, 0, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
-                Gemm(hn, b + "attn_v.weight", v, R, C, kvC); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
+                Gemm(hn, b + "attn_q.weight", q, R, C, Q, _hnQ8); Lora?.Apply(l, "attn_q", hn, q, R, 0, Q); _bias!((int)((long)R * Q), q, _vecs[b + "attn_q.bias"].View, Q); Prof("q");
+                Gemm(hn, b + "attn_k.weight", k, R, C, kvC, _hnQ8); Lora?.Apply(l, "attn_k", hn, k, R, 0, kvC); _bias!((int)((long)R * kvC), k, _vecs[b + "attn_k.bias"].View, kvC); Prof("k");
+                Gemm(hn, b + "attn_v.weight", v, R, C, kvC, _hnQ8); Lora?.Apply(l, "attn_v", hn, v, R, 0, kvC); _bias!((int)((long)R * kvC), v, _vecs[b + "attn_v.bias"].View, kvC); Prof("v");
                 if (_qkNorm)
                 {
                     _headNorm!(new KernelConfig(R * Heads, HeadDim), q, _vecs[b + "attn_q_norm.weight"].View, Q, 0, Heads, _eps);
@@ -1005,7 +1022,16 @@ public sealed class GgufBatchDecoder : IDisposable
                     LastDecodeAttentionKernel = "per-head";
                 }
                 Prof("attn");
-                if (AttentionCombineGroup && _attCombineGroup != null && ach <= CombineMaxChunks)
+                if (AttentionCombineGroup && _attCombineGroup != null && ach <= CombineMaxChunks && HeadDim % 32 == 0 && _mm.Int8ActFor(R, Q))
+                {
+                    // opt-in int8 activations: the merge also writes att as q8_1 for the o projection
+                    if (_attQs == null) { _attQs = _acc.Allocate1D<byte>(Math.Max(Q, 256)); _owned.Add(_attQs); _attDs = _acc.Allocate1D<float>(Math.Max(Q / 16, 16)); _owned.Add(_attDs); _bufGen++; }
+                    _attCombineGroupQ8 ??= _acc.LoadStreamKernel<FV, FV, FV, IV, int, int, int, int, ArrayView1D<byte, Stride1D.Dense>, FV>(AttnCombineGroupQ8Impl);
+                    _attCombineGroupQ8(new KernelConfig(R * Heads, HeadDim), part, ml, att, posView, ach, gqa ? ck : AttChunk, Heads, mode, _attQs.View, _attDs!.View);
+                    attQ8 = new FusedDequantMatMul.Q8Act(_attQs.View, _attDs.View);
+                    LastAttentionMergeKernel = "group-q8";
+                }
+                else if (AttentionCombineGroup && _attCombineGroup != null && ach <= CombineMaxChunks)
                 {
                     _attCombineGroup(new KernelConfig(R * Heads, HeadDim), part, ml, att, posView, ach, gqa ? ck : AttChunk, Heads, mode);
                     LastAttentionMergeKernel = "group";
@@ -1026,22 +1052,31 @@ public sealed class GgufBatchDecoder : IDisposable
                 _softmaxNorm!((int)((long)Heads * R * nk), scores, stats, nk); Prof("softmax");
                 _kv.Pv(l, (int)((long)R * Q), scores, seqView, att, R, nk, Heads, HeadDim, KvHeads, MaxSeq, mode); Prof("pv");
             }
-            Gemm(att, b + "attn_output.weight", proj, R, Q, C); Lora?.Apply(l, "attn_output", att, proj, R, 0, C); Prof("o");
+            Gemm(att, b + "attn_output.weight", proj, R, Q, C, attQ8); Lora?.Apply(l, "attn_output", att, proj, R, 0, C); Prof("o");
             AddNorm(hid, proj, hid2, hn, _vecs[b + "ffn_norm.weight"].View, R, C); Prof("add+rms");
+            FusedDequantMatMul.Q8Act? ffQ8 = null;
             if (_mats.ContainsKey(b + "ffn_gate_up"))
             {
                 var gu = Buf(ref _gateUp, (long)R * 2 * FfnDim);
-                Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim); Prof("gate-up");
+                Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim, _hnQ8); Prof("gate-up");
                 Lora?.ApplyAdjacent(l, LoraGateUp, _loraGateUpOff ??= new[] { 0, FfnDim }, hn, gu, R, 2 * FfnDim);
-                _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu");
+                if (_mm.Int8ActFor(R, FfnDim) && FfnDim % 32 == 0)
+                {
+                    // opt-in int8 activations: the SwiGLU also writes its output as q8_1 for the down projection (a thread a value, warps aligned with blocks)
+                    if (_ffQs == null) { _ffQs = _acc.Allocate1D<byte>(Math.Max(FfnDim, 256)); _owned.Add(_ffQs); _ffDs = _acc.Allocate1D<float>(Math.Max(FfnDim / 16, 16)); _owned.Add(_ffDs); _bufGen++; }
+                    _swigluJoinedQ8 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, ArrayView1D<byte, Stride1D.Dense>, FV, int>(SwigluJoinedQ8Impl);
+                    _swigluJoinedQ8(FfnDim, gu, gate, _ffQs.View, _ffDs!.View, FfnDim); Prof("swiglu");
+                    ffQ8 = new FusedDequantMatMul.Q8Act(_ffQs.View, _ffDs.View);
+                }
+                else { _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu"); }
             }
             else
             {
-                Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim); Lora?.Apply(l, "ffn_gate", hn, gate, R, 0, FfnDim); Prof("gate");
-                Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim); Lora?.Apply(l, "ffn_up", hn, up, R, 0, FfnDim); Prof("up");
+                Gemm(hn, b + "ffn_gate.weight", gate, R, C, FfnDim, _hnQ8); Lora?.Apply(l, "ffn_gate", hn, gate, R, 0, FfnDim); Prof("gate");
+                Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim, _hnQ8); Lora?.Apply(l, "ffn_up", hn, up, R, 0, FfnDim); Prof("up");
                 _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
             }
-            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C); Lora?.Apply(l, "ffn_down", gate, proj, R, 0, C); Prof("down");
+            Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C, ffQ8); Lora?.Apply(l, "ffn_down", gate, proj, R, 0, C); Prof("down");
             AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
             // a prefill submits each layer on its own (WebGPU): one submission is then at most one layer of one PrefillChunk, whatever the model's size (SpawnDev.AI
             // lost the device on qwen3:4b with a prefill encoded as one command buffer, 2026-11-01). A decode step is untouched (its captured plan replays it).
@@ -1051,7 +1086,7 @@ public sealed class GgufBatchDecoder : IDisposable
         int outRows = decode ? R : 1;
         var hnOut = decode ? hn : hn.SubView((long)(R - 1) * C, C);
         var logits = Buf(ref _logits, (long)outRows * Vocab);
-        Gemm(hnOut, _head, logits, outRows, C, Vocab); Prof("head");
+        Gemm(hnOut, _head, logits, outRows, C, Vocab, decode ? _hnQ8 : null); Prof("head");
         // WebGL: no candidates (the gather takes its slots from Atomic.Add, which WebGL cannot return: SpawnDev.ILGPU's vote emulation; 5.4.15 refuses the kernel),
         // a draw reads the row
         if (NoCandidates) return (logits, default, outRows);
@@ -1226,6 +1261,8 @@ public sealed class GgufBatchDecoder : IDisposable
     public string? LastFlashKernel { get; private set; }
     /// <summary>The split-K decode attention kernel the last fused decode step ran: "gqa-vec[-ilp][-shuffle]", "gqa-ilp[-shuffle]", "gqa" or "per-head" (null before one).</summary>
     public string? LastDecodeAttentionKernel { get; private set; }
+    /// <summary>Whether the last step's final norm wrote its rows as q8_1 for the opt-in int8-activation GEMVs (<see cref="FusedDequantMatMul.Int8ActFor"/>): tests check the fused route ran.</summary>
+    public bool LastStepInt8Fused => _hnQ8 != null;
 
     /// <summary>Cache rows the last <see cref="PrefillAsync(int[], float, bool, CancellationToken)"/> kept from the generation before it (0: a full prefill).</summary>
     public int LastReusedPrefix { get; private set; }
@@ -1613,6 +1650,7 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<Index1D, FV, FV, int>? _softmaxStats, _softmaxNorm;
     private Action<Index1D, FV, FV>? _swiglu;
     private Action<Index1D, FV, FV, int>? _swigluJoined;
+    private Action<Index1D, FV, FV, ArrayView1D<byte, Stride1D.Dense>, FV, int>? _swigluJoinedQ8;
     private Action<KernelConfig, FV, FV, int, int, int, float>? _headNorm;
     private Action<KernelConfig, FV, FV, FV, int, int, int, float>? _headNormQk;
     private Action<Index1D, FV, FV, FV, IV, int, int, int, int, int>? _attCombine;
@@ -1683,6 +1721,16 @@ public sealed class GgufBatchDecoder : IDisposable
         long b = (long)r * 2 * F;
         float x = gu[b + f];
         o[ii] = x / (1f + MathF.Exp(-x)) * gu[b + F + f];
+    }
+    // SwigluJoinedImpl for one row (a decode step) that also writes the output as q8_1 (opt-in int8 activations): F a multiple of 32, an auto-grouped launch of F
+    // threads, so a warp's lanes are one 32-value block; the same float as SwigluJoinedImpl, the same bytes as the GEMV's own quantize
+    private static void SwigluJoinedQ8Impl(Index1D i, FV gu, FV o, ArrayView1D<byte, Stride1D.Dense> qs, FV ds, int F)
+    {
+        int f = i;
+        float x = gu[f];
+        float y = x / (1f + MathF.Exp(-x)) * gu[F + f];
+        o[f] = y;
+        FusedDequantMatMul.Q8_1WarpStore(y, f, qs, ds);
     }
     // after the joined q|k(|v) GEMV (row stride sa): bias, rotary (NeoX pairs d, d + D/2) and the store, the arithmetic of BiasImpl + RopeImpl + StoreImpl. Per row the
     // threads are the q pairs, the k pairs, then v's values; q goes to qOut [r, C], k and v to their sequence's cache row; v comes from qkv (flags bit 0) or from vb
@@ -2910,13 +2958,34 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     private static void AttnCombineGroupImpl(FV part, FV ml, FV o, IV posBuf, int nch, int ck, int H, int mode)
     {
+        var wc = SharedMemory.Allocate<float>(CombineMaxChunks);    // e^(m_c - M), 0 for a chunk without a key
+        var lcs = SharedMemory.Allocate<float>(CombineMaxChunks);   // l_c
+        var red = SharedMemory.Allocate<float>(CombineMaxD);
+        int rh = Grid.IdxX, d = Group.IdxX, D = Group.DimX;
+        o[(long)rh * D + d] = AttnCombineGroupValue(part, ml, posBuf, nch, ck, H, mode, wc, lcs, red);
+    }
+
+    // AttnCombineGroupImpl that also writes the merged rows as q8_1 for the o projection's opt-in int8-activation GEMV (FusedDequantMatMul.Int8ActGemv): the
+    // same value, and a warp's lanes are 32 consecutive values of a head (D a multiple of 32), so the bytes equal the GEMV's own quantize. CUDA.
+    private static void AttnCombineGroupQ8Impl(FV part, FV ml, FV o, IV posBuf, int nch, int ck, int H, int mode, ArrayView1D<byte, Stride1D.Dense> qs, FV ds)
+    {
+        var wc = SharedMemory.Allocate<float>(CombineMaxChunks);
+        var lcs = SharedMemory.Allocate<float>(CombineMaxChunks);
+        var red = SharedMemory.Allocate<float>(CombineMaxD);
+        int rh = Grid.IdxX, d = Group.IdxX, D = Group.DimX;
+        float y = AttnCombineGroupValue(part, ml, posBuf, nch, ck, H, mode, wc, lcs, red);
+        int idx = rh * D + d;
+        o[idx] = y;
+        FusedDequantMatMul.Q8_1WarpStore(y, idx, qs, ds);
+    }
+
+    // the body of the group merge: this thread's merged value (row-head Grid.IdxX, value Group.IdxX); wc / lcs / red are the group's shared arrays
+    private static float AttnCombineGroupValue(FV part, FV ml, IV posBuf, int nch, int ck, int H, int mode, ArrayView<float> wc, ArrayView<float> lcs, ArrayView<float> red)
+    {
         int rh = Grid.IdxX, d = Group.IdxX, D = Group.DimX;
         int pos = mode == 0 ? posBuf[0] + rh / H : posBuf[0];
         int live = Math.Min(nch, pos / ck + 1);
         long g0 = (long)rh * nch;
-        var wc = SharedMemory.Allocate<float>(CombineMaxChunks);    // e^(m_c - M), 0 for a chunk without a key
-        var lcs = SharedMemory.Allocate<float>(CombineMaxChunks);   // l_c
-        var red = SharedMemory.Allocate<float>(CombineMaxD);
         float m = -1e30f;
         for (int c = d; c < live; c += D) if (ml[2 * (g0 + c) + 1] > 0f) m = MathF.Max(m, ml[2 * (g0 + c)]);
         red[d] = m;
@@ -2947,7 +3016,7 @@ public sealed class GgufBatchDecoder : IDisposable
         }
         for (; c4 < live; c4++)
             if (lcs[c4] > 0f) { num = float.MultiplyAddEstimate(wc[c4], part[pb + (long)c4 * D], num); den = float.MultiplyAddEstimate(wc[c4], lcs[c4], den); }
-        o[(long)rh * D + d] = num / den;
+        return num / den;
     }
     private const int CombineMaxChunks = 1024, CombineMaxD = 256;
 
