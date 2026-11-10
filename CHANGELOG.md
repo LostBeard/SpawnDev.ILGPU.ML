@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **CUDA decode candidate selection on group kernels** (`TopKKernels.ChunkMaxGroupImpl` / `FloorGroupImpl` / `SelectGroupImpl`,
+  `GgufBatchDecoder.TopKGroup`, default on for CUDA; `DrawRowsAsync` follows it). Each step's top-64 over the vocabulary scanned each 256-value
+  chunk on one thread (neighbouring threads 1 KB apart) and ranked the 594 chunk maxima with every thread re-reading all of them from device
+  memory. Now a group per chunk (a thread per value, tree reductions) and the maxima ranked from shared memory with four independent counters:
+  the same candidates; the chunks' softmax mass summed pairwise (error vs f64 2.5e-8 - 1.4e-7, the serial sum's 7.5e-7 - 8.3e-7). MEASURED (nsys,
+  RTX 4070, qwen3:1.7b Q4_K_M, 151,936 logits): ChunkMax 61.6 -> 4.3 us, Floor 28.8 -> 8.4, Select 76.3 -> 4.3; decode (quiet, interleaved x2,
+  greedy and sampled alike) 215.6 / 215.8 -> 222.5 / 222.7 tok/s short, 202.5 / 202.7 -> 208.2 / 209.0 long. `TopKKernels_ExactTop64` runs both
+  kernel sets (exact top-64 on CUDA, WebGPU, OpenCL, Wasm) and now checks the mass. Env GGUF_TOPK_GROUP=0 / 1 is the A/B.
+
 ## 5.8.10 - 2026-11-09 (nuget.org) - faster CUDA decode: GEMVs, fused norm, attention and its chunk merge
 
 On SpawnDev.ILGPU 5.4.22. Release sweep (full default, HeavyModel excluded): 7,659 passed, 0 failed, 445 skipped, 1 h 12 m (RTX 4070,
