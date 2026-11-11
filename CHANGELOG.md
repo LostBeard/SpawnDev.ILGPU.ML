@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Fix (CUDA, since 5.8.11): wrong logits on prompts over 512 tokens when v's block type differs from q|k** (`GgufBatchDecoder.OverlapV`). v's
+  projection on the second stream and q|k's on the main stream shared one `FusedDequantMatMul`, whose prefill GEMM stages the weights in per-instance
+  scratch from 512 rows: v's weights could overwrite q|k's mid-GEMM. MEASURED (RTX 4070, qwen2.5 1.5B Q4_K_M, v Q6_K in some layers, an 854-token
+  prompt): logits off by up to 27 (a logit range of 35) against overlap off; greedy text happened to match for 32 tokens. Models whose v is F16 (qwen3
+  Q4_K_M) stage no v weights and were not affected. v's GEMM now has its own instance: overlap on and off are bit-identical (new
+  `GgufBatchDecoder_OverlapV_LongPrefill_BitIdentical`, red before the fix). 5.8.11 / 5.8.12 users: GGUF_OVERLAP_V=0 avoids it.
+
 ## 5.8.12 - 2026-11-10 (nuget.org) - faster CUDA prefill; opt-in int8-activation decode (Ollama's scheme)
 
 On SpawnDev.ILGPU 5.4.25. Release sweep (full default, HeavyModel excluded): 7,663 passed, 0 failed, 469 skipped, 1 h 12 m (RTX 4070, Chrome;

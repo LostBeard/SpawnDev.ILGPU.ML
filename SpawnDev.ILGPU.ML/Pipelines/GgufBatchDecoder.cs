@@ -38,6 +38,10 @@ public sealed class GgufBatchDecoder : IDisposable
     private readonly GGUFModel _model;
     private readonly Stream _stream;
     private readonly FusedDequantMatMul _mm;
+    // OverlapV's second stream gets its OWN matmul: FusedDequantMatMul stages prefill weights and activations in per-instance scratch (the f16 scratch GEMM
+    // from 512 rows, the int8 GEMM always), so v's GEMM on one instance with q|k's overwrote q|k's weights mid-GEMM (2026-11-10, ML 5.8.11 - 5.8.12, CUDA,
+    // prompts over 512 tokens where v's block type differs from q|k; GgufBatchDecoder_OverlapV_LongPrefill_BitIdentical)
+    private FusedDequantMatMul? _mmV;
     private readonly NormalizationKernels _norm;
     private readonly List<IDisposable> _owned = new();
     private readonly Dictionary<string, (MemoryBuffer1D<byte, Stride1D.Dense> Data, GGMLType Type)> _mats = new();
@@ -686,11 +690,12 @@ public sealed class GgufBatchDecoder : IDisposable
     private Action<KernelConfig, FV, FV, FV, IV, int, int, int, int, ArrayView1D<byte, Stride1D.Dense>, FV>? _attCombineGroupQ8;
 
     // decode steps (a few rows) read each weight once for all rows (ForwardRows); a prefill is a real GEMM. pre: x as q8_1, when its producer wrote it (opt-in int8 activations)
-    private void Gemm(FV x, string name, FV o, int rows, int K, int N, FusedDequantMatMul.Q8Act? pre = null)
+    private void Gemm(FV x, string name, FV o, int rows, int K, int N, FusedDequantMatMul.Q8Act? pre = null, FusedDequantMatMul? mm = null)
     {
         var (w, t) = _mats[name];
-        if (rows <= FusedDequantMatMul.RowsMax) _mm.ForwardRows(x, w.View, o, rows, K, N, t, pre);
-        else _mm.Forward(x, w.View, o, rows, K, N, t);
+        mm ??= _mm;
+        if (rows <= FusedDequantMatMul.RowsMax) mm.ForwardRows(x, w.View, o, rows, K, N, t, pre);
+        else mm.Forward(x, w.View, o, rows, K, N, t);
     }
 
     /// <summary>
@@ -939,7 +944,7 @@ public sealed class GgufBatchDecoder : IDisposable
                     mainStream = (global::ILGPU.Runtime.Cuda.CudaStream)_acc.DefaultStream;
                     _vStream ??= (global::ILGPU.Runtime.Cuda.CudaStream)_acc.CreateStream();
                     _vStream.WaitFor(mainStream);                                // fork: v reads hn, written on the main stream
-                    using (_acc.WithDefaultStream(_vStream)) Gemm(hn, b + "attn_v.weight", v, R, C, kvC, _hnQ8);
+                    using (_acc.WithDefaultStream(_vStream)) Gemm(hn, b + "attn_v.weight", v, R, C, kvC, _hnQ8, _mmV ??= new FusedDequantMatMul(_acc));
                 }
                 Gemm(hn, b + "attn_qkv", qkv, R, C, n, _hnQ8); Prof("qkv");
                 if (Lora != null)
@@ -3145,6 +3150,7 @@ public sealed class GgufBatchDecoder : IDisposable
         _vStream?.Dispose();
         _capStream = null;
         _mm.Dispose();
+        _mmV?.Dispose();
         _norm.Dispose();
         _stream.Dispose();
     }
