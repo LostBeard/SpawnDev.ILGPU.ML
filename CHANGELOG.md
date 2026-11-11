@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Short prompts: split-K for the tensor-core GEMMs' small grids** (`MmaS8Gemm.S8Q4KDirect`'s kSplit, new `MmaGemm.KernelF16PackedV6SplitK`; env
+  GGUF_S8_SPLITK=0 / GGUF_F16_SPLITK=0 are the A/Bs). A short prompt's GEMMs had fewer 128 x 128 tiles than the GPU has SMs, each block looping over all of
+  K while most SMs sat idle: nsys (RTX 4070, qwen3:1.7b Q4_K_M, 29 tokens) had the o projection on 16 blocks of 46 SMs (63 us) and the F16 v projection on
+  8 (121 us; on the OverlapV critical path: 27 per-layer idle gaps, 5.3 ms of a 15.6 ms prefill). Now K is split so the grid fills the SMs once; each slice
+  writes partial sums and a reduce adds them in slice order (deterministic). Same math: `Gemm_Int8Act_MatchesGgmlQ8_1Scheme` covers split shapes (2.9-4.7e-8
+  to the scheme), `Gemm_F16_MmaSplit_MatchesFp32`'s small shapes split (worst 0.7-1.6e-7 of sum |x w|, BETTER than unsplit's 0.7-1.3e-6: shorter fp32
+  chains), the decoder bit-identity and greedy-vs-generator gates green. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, interleaved x2): prefill at 29 tokens
+  915 / 933 -> 1,062 / 1,065 tok/s with the default (+15%), 1,422 / 1,456 -> 1,796 / 1,835 with the int8 opt-in (+26%); long prompts unchanged (+0.5-1%).
+  For reference, Ollama prefills these 33 tokens at ~3.4k tok/s.
+
 - **On SpawnDev.ILGPU 5.4.27** (CUDA dynamic shared memory above 48 KB through the per-kernel opt-in, `MaxSharedMemoryPerGroupOptIn`; Velocity's
   adaptive team count). No change for ML's kernels yet. CUDA check on it: the int8, F16-split, overlap, shuffle-attention and greedy-vs-generator gates,
   9 passed, 0 failed.

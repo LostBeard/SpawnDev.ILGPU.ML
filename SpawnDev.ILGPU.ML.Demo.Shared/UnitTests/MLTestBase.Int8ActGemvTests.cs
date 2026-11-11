@@ -269,8 +269,11 @@ public abstract partial class MLTestBase
                 string route = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
                 var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
-                string want = type == GGMLType.Q4_K ? (direct ? "mma-s8-q4k-direct" : "mma-s8-q4k") : "mma-s8-q6k";
+                // small grids (fewer tiles than SMs) take split-K on the direct kernel: 77 x 200 (2 tiles) must, the 48-tile shapes must not
+                bool small = ((M + 127) / 128) * ((N + 127) / 128) < 16;
+                string want = type == GGMLType.Q4_K ? (direct ? (small && route.Contains("-splitk") ? "mma-s8-q4k-direct-splitk" : "mma-s8-q4k-direct") : "mma-s8-q4k") : "mma-s8-q6k";
                 if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: the int8 GEMM did not run (ran '{route}', wanted '{want}')");
+                if (type == GGMLType.Q4_K && direct && M == 77 && !route.Contains("-splitk")) throw new Exception($"M=77 N=200 (2 tiles) did not take split-K ('{route}')");
                 double worstFid = 0, worstCost = 0, sumCost = 0;
                 int samples = Math.Min(3000, M * N);
                 for (int s = 0; s < samples; s++)
