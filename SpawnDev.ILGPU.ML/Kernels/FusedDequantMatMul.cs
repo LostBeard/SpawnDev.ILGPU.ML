@@ -266,13 +266,38 @@ public class FusedDequantMatMul : IDisposable
     public static bool S8SplitK = Environment.GetEnvironmentVariable("GGUF_S8_SPLITK") != "0";
     /// <summary>The same split-K for the F16-weight tensor-core GEMM's small grids (MmaGemm.KernelF16PackedV6SplitK; qwen3 Q4_K_M's attn_v at a short prompt ran 8 blocks on 46 SMs, 121 us, on the OverlapV critical path); env GGUF_F16_SPLITK=0 is the A/B.</summary>
     public static bool F16SplitK = Environment.GetEnvironmentVariable("GGUF_F16_SPLITK") != "0";
+    /// <summary>The same split-K for the default path's Q4_K / Q6_K tensor-core GEMMs below the scratch threshold (MmaKQuantGemm.Q4KV2SplitK / Q6KV2SplitK); env GGUF_KQ_SPLITK=0 is the A/B.</summary>
+    public static bool KqSplitK = Environment.GetEnvironmentVariable("GGUF_KQ_SPLITK") != "0";
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _mmaQ4KV2SplitK;
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _mmaQ6KV2SplitK;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _kqPart;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _f16V6SplitK;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _f16Part;
     private int S8KSplit(int tiles, int K)
     {
         int sms = _accelerator.NumMultiprocessors, kt = K / MmaS8Gemm.BK;
-        if (!S8SplitK || tiles >= sms) return 1;
-        return Math.Max(1, Math.Min((sms + tiles - 1) / tiles, kt / 2));      // each slice at least 2 K tiles
+        if (!S8SplitK) return 1;
+        return SplitCount(tiles, kt, sms);
+    }
+    /// <summary>
+    /// The split for a grid of <paramref name="tiles"/> blocks over <paramref name="kt"/> K tiles on <paramref name="sms"/> SMs: floor(SMs / tiles), so the split
+    /// grid is ONE wave (1 when tiles &gt; SMs / 2); each slice at least 2 K tiles, none empty. MEASURED 2026-11-11 (RTX 4070, qwen3:1.7b Q4_K_M, 29 tokens,
+    /// interleaved x3): floor 1,282 tok/s vs ceil(SMs / tiles) 1,240 on the default path (+3.3%: 16 tiles x 3 = 48 blocks left a 2-block tail wave), int8 1,888 vs 1,877.
+    /// </summary>
+    internal static int SplitCount(int tiles, int kt, int sms)
+    {
+        if (tiles <= 0 || tiles * 2 > sms) return 1;
+        return SplitNoEmpty(Math.Min(sms / tiles, kt / 2), kt);
+    }
+    /// <summary>
+    /// The split kernels give slice s the K tiles [s per, (s + 1) per) with per = ceil(kt / kSplit); a raw kSplit can leave the LAST slice empty
+    /// (kt = 32, kSplit = 12: per = 3, slice 11 starts at tile 33), whose prologue load would read past K. ceil(kt / per) slices cover kt with none empty.
+    /// </summary>
+    internal static int SplitNoEmpty(int kSplit, int kt)
+    {
+        if (kSplit <= 1 || kt <= 1) return 1;
+        int per = (kt + kSplit - 1) / kSplit;
+        return (kt + per - 1) / per;
     }
     // C[i] = sum over s of P[s mn + i], in slice order (split-K's deterministic reduction)
     private static void SumSlicesImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> p, ArrayView1D<float, Stride1D.Dense> c, int slices, long mn)
@@ -291,7 +316,7 @@ public class FusedDequantMatMul : IDisposable
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ4KS8;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ6KS8;
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
-        ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4K, _s8Q6K;
+        ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _s8Q4K, _s8Q6K;
 
     // Q4_K rows -> int8 nibbles [N][K] (two W16 a 32-value block) and per block (ws, wm) = (d * sc_j, dmin * m_j): w = ws * q - wm. A thread per (row, block):
     // i = n * (K / 32) + blk; sub-block j = blk % 8 of super-block blk / 8 takes the low (j even) or high nibbles of qs bytes 32 (j / 2) .. +31
@@ -476,8 +501,7 @@ public class FusedDequantMatMul : IDisposable
                 : v5 ? _f16V5 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV5)
                 : _f16V4 ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(Trellis2.MmaGemm.KernelF16PackedV4);
             int tilesS = ((M + Trellis2.MmaGemm.BM - 1) / Trellis2.MmaGemm.BM) * ((N + Trellis2.MmaGemm.BN - 1) / Trellis2.MmaGemm.BN);
-            int kSplit = !turing && v5 && EnableMmaV6 && F16SplitK && tilesS < _accelerator.NumMultiprocessors
-                ? Math.Max(1, Math.Min((_accelerator.NumMultiprocessors + tilesS - 1) / tilesS, (K / Trellis2.MmaGemm.BK) / 2)) : 1;
+            int kSplit = !turing && v5 && EnableMmaV6 && F16SplitK ? SplitCount(tilesS, (K + Trellis2.MmaGemm.BK - 1) / Trellis2.MmaGemm.BK, _accelerator.NumMultiprocessors) : 1;
             if (kSplit > 1)
             {
                 // a small grid (a short prompt): K split over kSplit slices so every SM works, the partials summed in slice order (deterministic)
@@ -1002,13 +1026,25 @@ public class FusedDequantMatMul : IDisposable
                     nBlk, weightQuant.Cast<byte, int>(), s8w.View.BaseView.Cast<W16>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, float>(), K);
             var g8 = type == GGMLType.Q4_K
                 ? _s8Q4K ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
-                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q4K)
+                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaS8Gemm.S8Q4K)
                 : _s8Q6K ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
-                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q6K);
+                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaS8Gemm.S8Q6K);
             int tiles8 = ((M + MmaS8Gemm.BM - 1) / MmaS8Gemm.BM) * ((N + MmaS8Gemm.BN - 1) / MmaS8Gemm.BN);
-            g8(new KernelConfig(tiles8, MmaS8Gemm.Threads), aqU, asU,
-                s8w.View.SubView(0, wQ / 4).Cast<uint, Trellis2.U4>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, Trellis2.U4>(), output, M, K, N);
-            LastGemmKernel = (type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k") + (fused8 ? "-pre" : "");
+            int kSplit8 = S8KSplit(tiles8, K);
+            if (kSplit8 > 1)
+            {
+                // a small grid (a short prompt): split K, the partials summed in slice order (deterministic)
+                long mn = (long)M * N;
+                var part = GrowScratch(ref _s8Part, kSplit8 * mn);
+                g8(new KernelConfig(tiles8 * kSplit8, MmaS8Gemm.Threads), aqU, asU, s8w.View.SubView(0, wQ / 4).Cast<uint, Trellis2.U4>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, Trellis2.U4>(),
+                    part.View.SubView(0, kSplit8 * mn).Cast<uint, float>(), M, K, N, kSplit8);
+                (_sumSlices ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, long>(SumSlicesImpl))(
+                    (int)mn, part.View.SubView(0, kSplit8 * mn).Cast<uint, float>(), output.SubView(0, mn), kSplit8, mn);
+            }
+            else
+                g8(new KernelConfig(tiles8, MmaS8Gemm.Threads), aqU, asU,
+                    s8w.View.SubView(0, wQ / 4).Cast<uint, Trellis2.U4>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, Trellis2.U4>(), output, M, K, N, 1);
+            LastGemmKernel = (type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k") + (kSplit8 > 1 ? "-splitk" : "") + (fused8 ? "-pre" : "");
             return;
         }
         // sm_75 (Turing) on the same kernels built from m16n8k8 (the Sm75 variants); ForceSm75Mma runs those on a newer card (the tests)
@@ -1071,6 +1107,27 @@ public class FusedDequantMatMul : IDisposable
             bool v3 = EnableMmaV3 && M >= MmaV3MinRows;
             var cfg = new KernelConfig(((M + (v3 ? 256 : MmaKQuantGemm.BM) - 1) / (v3 ? 256 : MmaKQuantGemm.BM)) * ((N + MmaKQuantGemm.BN - 1) / MmaKQuantGemm.BN), MmaKQuantGemm.Threads);
             var a4 = input.SubView(0, (long)M * K).BaseView.Cast<Vec4LoadMatMul.F4>();
+            // a small grid (a short prompt: fewer 128 x 128 tiles than SMs) on sm_80+ V2: split K so every SM works (Q4KV2SplitK / Q6KV2SplitK), the partials
+            // summed in slice order (deterministic); env GGUF_KQ_SPLITK=0 is the A/B
+            int tilesKq = ((M + MmaKQuantGemm.BM - 1) / MmaKQuantGemm.BM) * ((N + MmaKQuantGemm.BN - 1) / MmaKQuantGemm.BN);
+            int kSplitKq = !v3 && !turing && EnableMmaV2 && KqSplitK ? SplitCount(tilesKq, K / MmaKQuantGemm.BK, _accelerator.NumMultiprocessors) : 1;
+            if (kSplitKq > 1)
+            {
+                long mn = (long)M * N;
+                var part = GrowScratch(ref _kqPart, kSplitKq * mn);
+                var pv = part.View.SubView(0, kSplitKq * mn).Cast<uint, float>();
+                var cfgS = new KernelConfig(tilesKq * kSplitKq, MmaKQuantGemm.Threads);
+                if (type == GGMLType.Q4_K)
+                    (_mmaQ4KV2SplitK ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaKQuantGemm.Q4KV2SplitK))(
+                        cfgS, a4, weightQuant.BaseView.Cast<W16>(), pv, M, K, N, kSplitKq);
+                else
+                    (_mmaQ6KV2SplitK ??= _accelerator.LoadStreamKernel<ArrayView<Vec4LoadMatMul.F4>, ArrayView<ushort>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MmaKQuantGemm.Q6KV2SplitK))(
+                        cfgS, a4, weightQuant.BaseView.Cast<ushort>(), pv, M, K, N, kSplitKq);
+                (_sumSlices ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, long>(SumSlicesImpl))(
+                    (int)mn, pv, output.SubView(0, mn), kSplitKq, mn);
+                LastGemmKernel = (type == GGMLType.Q4_K ? "mma-q4k" : "mma-q6k") + "-v2-splitk";
+                return;
+            }
             if (type == GGMLType.Q4_K)
             {
                 var kernel = v3
@@ -4221,7 +4278,7 @@ public class FusedDequantMatMul : IDisposable
         _scratchW16?.Dispose(); _scratchW16 = null;
         _scratchA16Lo?.Dispose(); _scratchA16Lo = null;
         _q8Qs?.Dispose(); _q8Qs = null;
-        _s8Part?.Dispose(); _s8Part = null; _f16Part?.Dispose(); _f16Part = null;
+        _s8Part?.Dispose(); _s8Part = null; _f16Part?.Dispose(); _f16Part = null; _kqPart?.Dispose(); _kqPart = null;
         _s8A?.Dispose(); _s8A = null; _s8As?.Dispose(); _s8As = null; _s8W?.Dispose(); _s8W = null; _s8Ws?.Dispose(); _s8Ws = null;
         _q8Ds?.Dispose(); _q8Ds = null;
         _scratchF16Out?.Dispose(); _scratchF16Out = null;

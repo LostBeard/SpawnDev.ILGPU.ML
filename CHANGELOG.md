@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Short prompts: split-K on the default path's K-quant tensor-core GEMMs too, and on the int8 opt-in's unpacked Q4_K / Q6_K GEMMs**
+  (new `MmaKQuantGemm.Q4KV2SplitK` / `Q6KV2SplitK`, env GGUF_KQ_SPLITK=0 is the A/B; `MmaS8Gemm.S8Q4K` / `S8Q6K` gain kSplit). The split size is now
+  floor(SMs / tiles), so the split grid is one wave (a grid of more than half the SMs does not split): ceil(SMs / tiles) put 16 tiles x 3 = 48 blocks on
+  46 SMs, a 2-block tail wave. A slice count that would leave the last slice empty (its prologue reads past K) is reduced so every slice has K tiles.
+  Correctness: `Gemm_MmaKQuant_MatchesOracle_AndIsTaken` gained a split arm (route asserted, held to the oracle bound; the bit-identity ladder runs with
+  the split off), `Gemm_Int8Act_MatchesGgmlQ8_1Scheme` covers S8Q4K / S8Q6K split shapes (2.9-5.5e-8 to the scheme), the decoder bit-identity and
+  greedy-vs-generator gates green. MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, 29-token prefill, interleaved): default path all splits off ~931 -> on
+  ~1,282 tok/s (+38%; the previous entry's S8 / F16 split alone gave ~1,064), int8 opt-in ~1,480 -> ~1,888 (+28%). Long prompts unchanged (prefill
+  chunks of 1,024 rows never split: 56+ tiles).
+
 - **Short prompts: split-K for the tensor-core GEMMs' small grids** (`MmaS8Gemm.S8Q4KDirect`'s kSplit, new `MmaGemm.KernelF16PackedV6SplitK`; env
   GGUF_S8_SPLITK=0 / GGUF_F16_SPLITK=0 are the A/Bs). A short prompt's GEMMs had fewer 128 x 128 tiles than the GPU has SMs, each block looping over all of
   K while most SMs sat idle: nsys (RTX 4070, qwen3:1.7b Q4_K_M, 29 tokens) had the o projection on 16 blocks of 46 SMs (63 us) and the F16 v projection on

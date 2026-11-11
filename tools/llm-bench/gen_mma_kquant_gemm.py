@@ -233,23 +233,35 @@ def kernel(sm75, qt):
 mma = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
 
 
-def kernel_v2(sm75, qt):
+def kernel_v2(sm75, qt, splitk=False):
     """{Q4K|Q6K}{Sm75}V2 (2026-11-05): the same GEMM with (1) double-buffered shared tiles (one barrier per K tile; the next tile's global
     loads and weight decode overlap the current tile's MMAs) and (2) 64-bit fragment loads. Each thread stages ONE row's k16 block: A as four
     adjacent float4 (16 values), the weights as the half-sub-block it already decodes, and writes the 8 words as the pairs (w, w+4), so a0/a2,
     a1/a3 and b0/b1 are each one ld.shared.u64. Shared rows are 10 ulongs (8 data + 2 pad). MEASURED gains: see the benchmark notes."""
     sfx = "Sm75" if sm75 else ""
     q6 = qt == "q6k"
-    kname = ("Q6K" if q6 else "Q4K") + sfx + "V2"
+    kname = ("Q6K" if q6 else "Q4K") + sfx + "V2" + ("SplitK" if splitk else "")
     wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
     RW = 10
     w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'}, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W {'2' if q6 else '16'}-byte aligned. {'Turing (sm_75): two m16n8k8 per 16 k.' if sm75 else 'sm_80+: m16n8k16.'}</summary>")
-    w(f"    public static void {kname}(ArrayView<F4> A, {wtype} Wq, FV C, int M, int K, int N)")
+    if splitk:
+        w("    /// <summary>Split-K for SMALL grids (a short prompt: fewer 128 x 128 tiles than SMs): grid = tiles * kSplit; block slice s takes K [s per, (s + 1) per)")
+        w("    /// and writes its partial C to C + s M N (the caller sums the slices in order: deterministic).</summary>")
+        w(f"    public static void {kname}(ArrayView<F4> A, {wtype} Wq, FV C, int M, int K, int N, int kSplit)")
+    else:
+        w(f"    public static void {kname}(ArrayView<F4> A, {wtype} Wq, FV C, int M, int K, int N)")
     w("    {")
     w("        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile")
     w("        int numTilesM = (M + BM - 1) / BM;")
-    w("        int tileRow = Grid.IdxX % numTilesM;")
-    w("        int tileCol = Grid.IdxX / numTilesM;")
+    if splitk:
+        w("        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;")
+        w("        int tileRow = bIdx % numTilesM;")
+        w("        int tileCol = bIdx / numTilesM;")
+        w("        long cOff = (long)slice * M * N;")
+        w("        int ktPer = (K / BK + kSplit - 1) / kSplit, kBeg = slice * ktPer * BK, kEnd = Math.Min(K, kBeg + ktPer * BK);")
+    else:
+        w("        int tileRow = Grid.IdxX % numTilesM;")
+        w("        int tileCol = Grid.IdxX / numTilesM;")
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
@@ -313,13 +325,16 @@ def kernel_v2(sm75, qt):
         w(f"{ind}    bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);")
         w(f"{ind}}}")
 
-    load("0", "        ")
-    store("0", "0", "        ")
+    load("kBeg" if splitk else "0", "        ")
+    store("kBeg" if splitk else "0", "0", "        ")
     w("        Group.Barrier();")
     w("        int cur = 0;")
-    w("        for (int kt = 0; kt < K; kt += BK)")
+    if splitk:
+        w("        for (int kt = kBeg; kt < kEnd; kt += BK)")
+    else:
+        w("        for (int kt = 0; kt < K; kt += BK)")
     w("        {")
-    w("            bool more = kt + BK < K;")
+    w("            bool more = kt + BK < " + ("kEnd;" if splitk else "K;"))
     w("            if (more)")
     w("            {")
     load("kt + BK", "                ")
@@ -362,8 +377,9 @@ def kernel_v2(sm75, qt):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
-            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
+            co = "cOff + " if splitk else ""
+            w(f"            if (m0 < M) {{ if (n0 < N) C[{co}(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[{co}(long)m0 * N + n1] = c{mt}{nt}1; }}")
+            w(f"            if (m1 < M) {{ if (n0 < N) C[{co}(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[{co}(long)m1 * N + n1] = c{mt}{nt}3; }}")
             w("        }")
     w("    }")
 
@@ -558,6 +574,8 @@ for qt_ in ("q4k", "q6k"):
     w("")
     dequant_f16(False, qt_)
     dequant_f16(True, qt_)
+    kernel_v2(False, qt_, splitk=True)
+    w("")
     dequant_f16(False, qt_, rows=True)
     dequant_f16(True, qt_, rows=True)
 w("}")

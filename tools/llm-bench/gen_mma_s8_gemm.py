@@ -55,12 +55,15 @@ cpa = "cp.async.cg.shared.global [%0], [%1], 16, %2;"
 
 def kernel(q6):
     name = "S8Q6K" if q6 else "S8Q4K"
-    w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256 (8 warps of 64 x 32). K a multiple of 64. sm_80+.</summary>")
-    w(f"    public static unsafe void {name}(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N)")
+    w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.")
+    w("    /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>")
+    w(f"    public static unsafe void {name}(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)")
     w("    {")
     w("        int numTilesM = (M + BM - 1) / BM;")
-    w("        int tileRow = Grid.IdxX % numTilesM;")
-    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;")
+    w("        int tileRow = bIdx % numTilesM;")
+    w("        int tileCol = bIdx / numTilesM;")
+    w("        long cOff = (long)slice * M * N;")
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
@@ -87,7 +90,8 @@ def kernel(q6):
     w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;")
     w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
     w(f"        int bLd0 = rowB * {RW} + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * {RW} + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);")
-    w("        int nk = K / BK;")
+    w("        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;")
+    w("        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles")
 
     def issue(kt_expr, st_expr, ind):
         w(f"{ind}{{")
@@ -100,14 +104,14 @@ def kernel(q6):
         w(f"{ind}    else CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);")
         w(f"{ind}}}")
 
-    issue("0", "0", "        ")
+    issue("kt0 * BK", "0", "        ")
     w('        CudaAsm.Emit("cp.async.commit_group;");')
     w("        for (int it = 0; it < nk; it++)")
     w("        {")
     w('            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed')
     w("            Group.Barrier();                             // and every warp is past tile it - 1, whose stage the next issue overwrites")
     w("            if (it + 1 < nk)")
-    issue("(it + 1) * BK", "(it + 1) & 1", "            ")
+    issue("(kt0 + it + 1) * BK", "(it + 1) & 1", "            ")
     w('            CudaAsm.Emit("cp.async.commit_group;");')
     w(f"            int so = (it & 1) * BM * {RW}, sc4c = (it & 1) * BM * 4;")
     for ks in range(2):
@@ -149,8 +153,8 @@ def kernel(q6):
             w("        {")
             w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
-            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
+            w(f"            if (m0 < M) {{ if (n0 < N) C[cOff + (long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[cOff + (long)m0 * N + n1] = c{mt}{nt}1; }}")
+            w(f"            if (m1 < M) {{ if (n0 < N) C[cOff + (long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[cOff + (long)m1 * N + n1] = c{mt}{nt}3; }}")
             w("        }")
     w("    }")
     w("")

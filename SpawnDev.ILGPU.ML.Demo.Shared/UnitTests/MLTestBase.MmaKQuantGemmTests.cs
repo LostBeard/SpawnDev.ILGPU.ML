@@ -216,6 +216,7 @@ public abstract partial class MLTestBase
                 // V6 is sm_80 only: the forced sm_75 path runs its V5 there
                 string sfx = v6 && want.Contains("sm75") ? "-scratch-v5" : sfx0;
                 FusedDequantMatMul.EnableMmaV6 = v6;
+                FusedDequantMatMul.KqSplitK = false;   // the bit-identity ladder: one K order per output (split-K is its own arm below)
                 FusedDequantMatMul.EnableMmaV2 = v2;
                 FusedDequantMatMul.EnableMmaV3 = v3;
                 FusedDequantMatMul.EnableMmaScratch = scr;
@@ -236,6 +237,22 @@ public abstract partial class MLTestBase
             }
             int bad = Bad(got, Oracle(0), out float worst);
             if (bad > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: {bad} of {got.Length} outputs past 2e-3 x sum|a w| (worst {worst:F2}x the bound)");
+            // split-K (sm_80 V2, a grid smaller than the SM count: every shape here): its own K order, so held to the oracle's bound, not to V1's bits
+            string splitNote = "";
+            if (!force)
+            {
+                FusedDequantMatMul.KqSplitK = true; FusedDequantMatMul.EnableMmaV2 = true; FusedDequantMatMul.EnableMmaV3 = false; FusedDequantMatMul.EnableMmaScratch = false;
+                fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
+                string rs = fused.LastGemmKernel;
+                await accelerator.SynchronizeAsync();
+                var gs = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
+                bool small = ((M + 127) / 128) * ((N + 127) / 128) * 2 <= accelerator.NumMultiprocessors;   // split only when one wave holds 2+ slices per tile
+                string wantS = want + "-v2" + (small ? "-splitk" : "");
+                if (rs != wantS) throw new Exception($"{type} M={M} K={K} N={N}: ran '{rs}', not {wantS}");
+                int badS = Bad(gs, Oracle(0), out float worstS);
+                if (badS > 0) throw new Exception($"{type} M={M} K={K} N={N} {rs}: {badS} of {gs.Length} outputs past the bound (worst {worstS:F2}x)");
+                splitNote = $", {rs} {worstS:F3}x";
+            }
             // misaligned by one float: the SIMT kernels, the same answer
             FusedDequantMatMul.EnableMmaScratch = false;
             fused.Forward(inputBuf.View.SubView(1, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
@@ -245,12 +262,12 @@ public abstract partial class MLTestBase
             if (route2.StartsWith("mma")) throw new Exception($"{type} M={M} K={K} N={N}: a misaligned input took the tensor-core kernel (its loads assume 16-byte alignment)");
             int bad2 = Bad(got2, Oracle(1), out float worst2);
             if (bad2 > 0) throw new Exception($"{type} M={M} K={K} N={N}: SIMT GEMM (misaligned input), {bad2} of {got2.Length} outputs past the bound (worst {worst2:F2}x)");
-            notes.Add($"{type} M={M} K={K} N={N}: {route} worst {worst:F3}x the bound, {route2} {worst2:F3}x");
+            notes.Add($"{type} M={M} K={K} N={N}: {route} worst {worst:F3}x the bound{splitNote}, {route2} {worst2:F3}x");
         }
         }
         finally
         {
-            FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved;
+            FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved; FusedDequantMatMul.KqSplitK = true;
             FusedDequantMatMul.MmaV3MinRows = v3MinSaved; FusedDequantMatMul.EnableMmaScratch = scrSaved; FusedDequantMatMul.MmaScratchMinRows = scrMinSaved;
             FusedDequantMatMul.EnableMmaV5 = v5Saved; FusedDequantMatMul.EnableMmaSm75V5 = v5t75Saved; FusedDequantMatMul.EnableMmaV6 = v6Saved;
         }

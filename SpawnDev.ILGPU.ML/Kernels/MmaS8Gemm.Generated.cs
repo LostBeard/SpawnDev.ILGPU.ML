@@ -18,12 +18,15 @@ internal static class MmaS8Gemm
 {
     public const int BM = 128, BN = 128, BK = 64, Threads = 256;
 
-    /// <summary>Q4_K on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256 (8 warps of 64 x 32). K a multiple of 64. sm_80+.</summary>
-    public static unsafe void S8Q4K(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N)
+    /// <summary>Q4_K on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.
+    /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>
+    public static unsafe void S8Q4K(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)
     {
         int numTilesM = (M + BM - 1) / BM;
-        int tileRow = Grid.IdxX % numTilesM;
-        int tileCol = Grid.IdxX / numTilesM;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -66,9 +69,10 @@ internal static class MmaS8Gemm
         int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;
         int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
         int bLd0 = rowB * 16 + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * 16 + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);
-        int nk = K / BK;
+        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;
+        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles
         {
-            int kq = (0) >> 4, ks6 = (0) >> 6;
+            int kq = (kt0 * BK) >> 4, ks6 = (kt0 * BK) >> 6;
             int sb = (0) * BM * 16, sc4 = (0) * BM * 4;
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
@@ -84,7 +88,7 @@ internal static class MmaS8Gemm
             Group.Barrier();                             // and every warp is past tile it - 1, whose stage the next issue overwrites
             if (it + 1 < nk)
             {
-                int kq = ((it + 1) * BK) >> 4, ks6 = ((it + 1) * BK) >> 6;
+                int kq = ((kt0 + it + 1) * BK) >> 4, ks6 = ((kt0 + it + 1) * BK) >> 6;
                 int sb = ((it + 1) & 1) * BM * 16, sc4 = ((it + 1) & 1) * BM * 4;
                 CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);
                 CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
@@ -336,107 +340,110 @@ internal static class MmaS8Gemm
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c000; if (n1 < N) C[(long)m0 * N + n1] = c001; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c002; if (n1 < N) C[(long)m1 * N + n1] = c003; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c010; if (n1 < N) C[(long)m0 * N + n1] = c011; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c012; if (n1 < N) C[(long)m1 * N + n1] = c013; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c020; if (n1 < N) C[(long)m0 * N + n1] = c021; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c022; if (n1 < N) C[(long)m1 * N + n1] = c023; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c020; if (n1 < N) C[cOff + (long)m0 * N + n1] = c021; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c022; if (n1 < N) C[cOff + (long)m1 * N + n1] = c023; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c030; if (n1 < N) C[(long)m0 * N + n1] = c031; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c032; if (n1 < N) C[(long)m1 * N + n1] = c033; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c030; if (n1 < N) C[cOff + (long)m0 * N + n1] = c031; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c032; if (n1 < N) C[cOff + (long)m1 * N + n1] = c033; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c100; if (n1 < N) C[(long)m0 * N + n1] = c101; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c102; if (n1 < N) C[(long)m1 * N + n1] = c103; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c110; if (n1 < N) C[(long)m0 * N + n1] = c111; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c112; if (n1 < N) C[(long)m1 * N + n1] = c113; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c120; if (n1 < N) C[(long)m0 * N + n1] = c121; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c122; if (n1 < N) C[(long)m1 * N + n1] = c123; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c120; if (n1 < N) C[cOff + (long)m0 * N + n1] = c121; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c122; if (n1 < N) C[cOff + (long)m1 * N + n1] = c123; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c130; if (n1 < N) C[(long)m0 * N + n1] = c131; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c132; if (n1 < N) C[(long)m1 * N + n1] = c133; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c130; if (n1 < N) C[cOff + (long)m0 * N + n1] = c131; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c132; if (n1 < N) C[cOff + (long)m1 * N + n1] = c133; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c200; if (n1 < N) C[(long)m0 * N + n1] = c201; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c202; if (n1 < N) C[(long)m1 * N + n1] = c203; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c200; if (n1 < N) C[cOff + (long)m0 * N + n1] = c201; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c202; if (n1 < N) C[cOff + (long)m1 * N + n1] = c203; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c210; if (n1 < N) C[(long)m0 * N + n1] = c211; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c212; if (n1 < N) C[(long)m1 * N + n1] = c213; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c210; if (n1 < N) C[cOff + (long)m0 * N + n1] = c211; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c212; if (n1 < N) C[cOff + (long)m1 * N + n1] = c213; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c220; if (n1 < N) C[(long)m0 * N + n1] = c221; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c222; if (n1 < N) C[(long)m1 * N + n1] = c223; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c220; if (n1 < N) C[cOff + (long)m0 * N + n1] = c221; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c222; if (n1 < N) C[cOff + (long)m1 * N + n1] = c223; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c230; if (n1 < N) C[(long)m0 * N + n1] = c231; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c232; if (n1 < N) C[(long)m1 * N + n1] = c233; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c230; if (n1 < N) C[cOff + (long)m0 * N + n1] = c231; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c232; if (n1 < N) C[cOff + (long)m1 * N + n1] = c233; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c300; if (n1 < N) C[(long)m0 * N + n1] = c301; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c302; if (n1 < N) C[(long)m1 * N + n1] = c303; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c300; if (n1 < N) C[cOff + (long)m0 * N + n1] = c301; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c302; if (n1 < N) C[cOff + (long)m1 * N + n1] = c303; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c310; if (n1 < N) C[(long)m0 * N + n1] = c311; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c312; if (n1 < N) C[(long)m1 * N + n1] = c313; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c310; if (n1 < N) C[cOff + (long)m0 * N + n1] = c311; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c312; if (n1 < N) C[cOff + (long)m1 * N + n1] = c313; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c320; if (n1 < N) C[(long)m0 * N + n1] = c321; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c322; if (n1 < N) C[(long)m1 * N + n1] = c323; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c320; if (n1 < N) C[cOff + (long)m0 * N + n1] = c321; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c322; if (n1 < N) C[cOff + (long)m1 * N + n1] = c323; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c330; if (n1 < N) C[(long)m0 * N + n1] = c331; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c332; if (n1 < N) C[(long)m1 * N + n1] = c333; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c330; if (n1 < N) C[cOff + (long)m0 * N + n1] = c331; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c332; if (n1 < N) C[cOff + (long)m1 * N + n1] = c333; }
         }
     }
 
-    /// <summary>Q6_K on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256 (8 warps of 64 x 32). K a multiple of 64. sm_80+.</summary>
-    public static unsafe void S8Q6K(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N)
+    /// <summary>Q6_K on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.
+    /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>
+    public static unsafe void S8Q6K(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)
     {
         int numTilesM = (M + BM - 1) / BM;
-        int tileRow = Grid.IdxX % numTilesM;
-        int tileCol = Grid.IdxX / numTilesM;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
         int tid = Group.IdxX;
         int warp = tid >> 5, lane = tid & 31;
         int g = lane >> 2, t = lane & 3;
@@ -479,9 +486,10 @@ internal static class MmaS8Gemm
         int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;
         int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
         int bLd0 = rowB * 16 + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * 16 + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);
-        int nk = K / BK;
+        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;
+        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles
         {
-            int kq = (0) >> 4, ks6 = (0) >> 6;
+            int kq = (kt0 * BK) >> 4, ks6 = (kt0 * BK) >> 6;
             int sb = (0) * BM * 16, sc4 = (0) * BM * 4;
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
@@ -497,7 +505,7 @@ internal static class MmaS8Gemm
             Group.Barrier();                             // and every warp is past tile it - 1, whose stage the next issue overwrites
             if (it + 1 < nk)
             {
-                int kq = ((it + 1) * BK) >> 4, ks6 = ((it + 1) * BK) >> 6;
+                int kq = ((kt0 + it + 1) * BK) >> 4, ks6 = ((kt0 + it + 1) * BK) >> 6;
                 int sb = ((it + 1) & 1) * BM * 16, sc4 = ((it + 1) & 1) * BM * 4;
                 CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);
                 CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
@@ -773,98 +781,98 @@ internal static class MmaS8Gemm
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c000; if (n1 < N) C[(long)m0 * N + n1] = c001; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c002; if (n1 < N) C[(long)m1 * N + n1] = c003; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c010; if (n1 < N) C[(long)m0 * N + n1] = c011; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c012; if (n1 < N) C[(long)m1 * N + n1] = c013; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c020; if (n1 < N) C[(long)m0 * N + n1] = c021; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c022; if (n1 < N) C[(long)m1 * N + n1] = c023; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c020; if (n1 < N) C[cOff + (long)m0 * N + n1] = c021; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c022; if (n1 < N) C[cOff + (long)m1 * N + n1] = c023; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 0 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c030; if (n1 < N) C[(long)m0 * N + n1] = c031; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c032; if (n1 < N) C[(long)m1 * N + n1] = c033; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c030; if (n1 < N) C[cOff + (long)m0 * N + n1] = c031; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c032; if (n1 < N) C[cOff + (long)m1 * N + n1] = c033; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c100; if (n1 < N) C[(long)m0 * N + n1] = c101; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c102; if (n1 < N) C[(long)m1 * N + n1] = c103; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c110; if (n1 < N) C[(long)m0 * N + n1] = c111; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c112; if (n1 < N) C[(long)m1 * N + n1] = c113; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c120; if (n1 < N) C[(long)m0 * N + n1] = c121; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c122; if (n1 < N) C[(long)m1 * N + n1] = c123; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c120; if (n1 < N) C[cOff + (long)m0 * N + n1] = c121; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c122; if (n1 < N) C[cOff + (long)m1 * N + n1] = c123; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 16 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c130; if (n1 < N) C[(long)m0 * N + n1] = c131; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c132; if (n1 < N) C[(long)m1 * N + n1] = c133; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c130; if (n1 < N) C[cOff + (long)m0 * N + n1] = c131; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c132; if (n1 < N) C[cOff + (long)m1 * N + n1] = c133; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c200; if (n1 < N) C[(long)m0 * N + n1] = c201; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c202; if (n1 < N) C[(long)m1 * N + n1] = c203; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c200; if (n1 < N) C[cOff + (long)m0 * N + n1] = c201; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c202; if (n1 < N) C[cOff + (long)m1 * N + n1] = c203; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c210; if (n1 < N) C[(long)m0 * N + n1] = c211; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c212; if (n1 < N) C[(long)m1 * N + n1] = c213; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c210; if (n1 < N) C[cOff + (long)m0 * N + n1] = c211; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c212; if (n1 < N) C[cOff + (long)m1 * N + n1] = c213; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c220; if (n1 < N) C[(long)m0 * N + n1] = c221; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c222; if (n1 < N) C[(long)m1 * N + n1] = c223; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c220; if (n1 < N) C[cOff + (long)m0 * N + n1] = c221; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c222; if (n1 < N) C[cOff + (long)m1 * N + n1] = c223; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 32 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c230; if (n1 < N) C[(long)m0 * N + n1] = c231; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c232; if (n1 < N) C[(long)m1 * N + n1] = c233; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c230; if (n1 < N) C[cOff + (long)m0 * N + n1] = c231; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c232; if (n1 < N) C[cOff + (long)m1 * N + n1] = c233; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 0 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c300; if (n1 < N) C[(long)m0 * N + n1] = c301; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c302; if (n1 < N) C[(long)m1 * N + n1] = c303; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c300; if (n1 < N) C[cOff + (long)m0 * N + n1] = c301; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c302; if (n1 < N) C[cOff + (long)m1 * N + n1] = c303; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 8 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c310; if (n1 < N) C[(long)m0 * N + n1] = c311; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c312; if (n1 < N) C[(long)m1 * N + n1] = c313; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c310; if (n1 < N) C[cOff + (long)m0 * N + n1] = c311; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c312; if (n1 < N) C[cOff + (long)m1 * N + n1] = c313; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 16 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c320; if (n1 < N) C[(long)m0 * N + n1] = c321; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c322; if (n1 < N) C[(long)m1 * N + n1] = c323; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c320; if (n1 < N) C[cOff + (long)m0 * N + n1] = c321; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c322; if (n1 < N) C[cOff + (long)m1 * N + n1] = c323; }
         }
         {
             int m0 = tileRow * BM + wm * 64 + 48 + g, m1 = m0 + 8;
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
-            if (m0 < M) { if (n0 < N) C[(long)m0 * N + n0] = c330; if (n1 < N) C[(long)m0 * N + n1] = c331; }
-            if (m1 < M) { if (n0 < N) C[(long)m1 * N + n0] = c332; if (n1 < N) C[(long)m1 * N + n1] = c333; }
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c330; if (n1 < N) C[cOff + (long)m0 * N + n1] = c331; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c332; if (n1 < N) C[cOff + (long)m1 * N + n1] = c333; }
         }
     }
 
