@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Opt-in int8 activations: prefill's producers write the q8_1 form too** (`Int8ActFor` now covers M > 1 rows on the int8 GEMM; GGUF_INT8_ACT_FUSE=0 is the
+  A/B): the residual-add + RMSNorm and the SwiGLU write their rows' q8_1 beside the floats, and the int8 GEMM reads them (`Forward(..., Q8Act?)`), so a
+  prefill launches no quantize for q|k, gate|up and down (nsys: 354 quantize launches left in a bench run, the attention outputs). The same bytes:
+  `GgufBatchDecoder_Int8ActFused_BitIdentical` and `GgufBatchDecoder_OverlapV_LongPrefill_BitIdentical` (854-token prefill) stay bit-identical.
+  MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, int8 on, quiet, interleaved x2): prefill 1,830 tokens 12,352 / 12,300 -> 12,634 / 12,542 tok/s (+2%), 29
+  tokens 1,206 / 1,196 -> 1,215 / 1,220; decode 257.6 / 257.8 -> 261.7 / 261.1 (the decode fusion, as before).
+  **Where the opt-in stands now** (same machine, interleaved x2, default fp32 vs int8): prefill 9,930 / 9,920 -> 12,516 / 12,563 tok/s at 1,830 tokens
+  (+26%), 942 / 929 -> 1,216 / 1,217 at 29 (+30%); decode 237.3 / 236.9 -> 261.7 / 259.8 short, 222.0 / 221.8 -> 243.8 / 243.6 long (+10%). The int8
+  GEMM's +9% in 5.8.13's entry was measured before the OverlapV fix, with v's GEMM sharing q|k's matmul instance.
+
 ## 5.8.13 - 2026-11-11 (nuget.org) - FIX: wrong logits on long prompts on CUDA (since 5.8.11); opt-in int8 prefill
 
 On SpawnDev.ILGPU 5.4.25. **Upgrade from 5.8.11 / 5.8.12 if you run GGUF models on CUDA** (workaround there: GGUF_OVERLAP_V=0). Release sweep (full

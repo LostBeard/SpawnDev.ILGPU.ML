@@ -298,11 +298,14 @@ public class FusedDequantMatMul : IDisposable
     }
 
     /// <summary>
-    /// Whether <see cref="ForwardRows"/> on this accelerator takes the int8-activation route for a one-row GEMV of K columns (any Q4_K weight): a producer
-    /// writes <see cref="Q8Act"/> only when it is read. Fusion env A/B: GGUF_INT8_ACT_FUSE=0 keeps the GEMV's own quantize launch.
+    /// Whether this accelerator takes an int8-activation route for M rows of K columns: the one-row GEMVs (<see cref="ForwardRows"/>, M = 1) or the int8
+    /// tensor-core GEMM (<see cref="Forward(ArrayView1D{float, Stride1D.Dense}, ArrayView1D{byte, Stride1D.Dense}, ArrayView1D{float, Stride1D.Dense}, int, int, int, GGMLType, Q8Act?)"/>,
+    /// M &gt; 1, <see cref="Int8ActGemm"/>), for Q4_K / Q6_K weights: a producer writes <see cref="Q8Act"/> only when it is read. Fusion env A/B:
+    /// GGUF_INT8_ACT_FUSE=0 keeps the consumers' own quantize launches.
     /// </summary>
-    public bool Int8ActFor(int M, int K) => Int8ActGemv && Int8ActFuse && M == 1 && !ForceGenericRows && Q4KVec && K % 256 == 0
-        && (Q4KVecShuffle ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32 && CudaCaps.Dp4a(_accelerator);
+    public bool Int8ActFor(int M, int K) => Int8ActGemv && Int8ActFuse && K % 256 == 0 && (M == 1
+        ? !ForceGenericRows && Q4KVec && (Q4KVecShuffle ?? _accelerator.AcceleratorType == AcceleratorType.Cuda) && CanShuffle32 && CudaCaps.Dp4a(_accelerator)
+        : M > 1 && Int8ActGemm && CudaCaps.TensorCores(_accelerator) && CudaCaps.Dp4a(_accelerator) && CanShuffle32);
     // the input as q8_1: the producer's (pre) when it wrote one, else quantized here into the scratch (one launch); true when pre was used
     private bool Q8Input(ArrayView1D<float, Stride1D.Dense> input, int K, Q8Act? pre, out ArrayView1D<byte, Stride1D.Dense> qs, out ArrayView1D<float, Stride1D.Dense> ds)
     {
@@ -666,7 +669,14 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<byte, Stride1D.Dense> weightQuant,
         ArrayView1D<float, Stride1D.Dense> output,
-        int M, int K, int N, GGMLType type)
+        int M, int K, int N, GGMLType type) => Forward(input, weightQuant, output, M, K, N, type, null);
+
+    /// <summary>Forward with the input rows' q8_1 form when their producer wrote it (<see cref="Int8ActFor"/>): used only by the opt-in int8 GEMM, ignored elsewhere.</summary>
+    public void Forward(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<byte, Stride1D.Dense> weightQuant,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, GGMLType type, Q8Act? pre)
     {
         if (!Accepts(type))
             throw new NotSupportedException(
@@ -863,10 +873,19 @@ public class FusedDequantMatMul : IDisposable
             && CudaCaps.Dp4a(_accelerator) && CanShuffle32 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & (type == GGMLType.Q4_K ? 15 : 3)) == 0)
         {
             long aQ = (long)M * K, wQ = (long)N * K;
-            var s8a = GrowScratch(ref _s8A, aQ / 4); var s8as = GrowScratch(ref _s8As, aQ / 16);
             var s8w = GrowScratch(ref _s8W, wQ / 4); var s8ws = GrowScratch(ref _s8Ws, wQ / 16);
-            _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
-            _quantQ8Warp((int)aQ, input.SubView(0, aQ), s8a.View.SubView(0, aQ / 4).Cast<uint, byte>(), s8as.View.SubView(0, aQ / 16).Cast<uint, float>());
+            // the rows as q8_1: the producer's (a fused norm / SwiGLU wrote them, pre), else quantized here (one launch)
+            ArrayView1D<Trellis2.U4, Stride1D.Dense> aqU, asU;
+            bool fused8 = pre.HasValue && pre.Value.Qs.Length >= aQ && pre.Value.Ds.Length >= aQ / 16 && (((IContiguousArrayView)pre.Value.Qs.BaseView).IndexInBytes & 15) == 0
+                && (((IContiguousArrayView)pre.Value.Ds.BaseView).IndexInBytes & 15) == 0;
+            if (fused8) { aqU = pre!.Value.Qs.SubView(0, aQ).Cast<byte, Trellis2.U4>(); asU = pre.Value.Ds.SubView(0, aQ / 16).Cast<float, Trellis2.U4>(); }
+            else
+            {
+                var s8a = GrowScratch(ref _s8A, aQ / 4); var s8as = GrowScratch(ref _s8As, aQ / 16);
+                _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
+                _quantQ8Warp((int)aQ, input.SubView(0, aQ), s8a.View.SubView(0, aQ / 4).Cast<uint, byte>(), s8as.View.SubView(0, aQ / 16).Cast<uint, float>());
+                aqU = s8a.View.SubView(0, aQ / 4).Cast<uint, Trellis2.U4>(); asU = s8as.View.SubView(0, aQ / 16).Cast<uint, Trellis2.U4>();
+            }
             int nBlk = (int)(wQ >> 5);
             if (type == GGMLType.Q4_K)
                 (_unpackQ4KS8 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>(UnpackQ4KS8Impl))(
@@ -880,9 +899,9 @@ public class FusedDequantMatMul : IDisposable
                 : _s8Q6K ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
                     ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q6K);
             int tiles8 = ((M + MmaS8Gemm.BM - 1) / MmaS8Gemm.BM) * ((N + MmaS8Gemm.BN - 1) / MmaS8Gemm.BN);
-            g8(new KernelConfig(tiles8, MmaS8Gemm.Threads), s8a.View.SubView(0, aQ / 4).Cast<uint, Trellis2.U4>(), s8as.View.SubView(0, aQ / 16).Cast<uint, Trellis2.U4>(),
+            g8(new KernelConfig(tiles8, MmaS8Gemm.Threads), aqU, asU,
                 s8w.View.SubView(0, wQ / 4).Cast<uint, Trellis2.U4>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, Trellis2.U4>(), output, M, K, N);
-            LastGemmKernel = type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k";
+            LastGemmKernel = (type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k") + (fused8 ? "-pre" : "");
             return;
         }
         // sm_75 (Turing) on the same kernels built from m16n8k8 (the Sm75 variants); ForceSm75Mma runs those on a newer card (the tests)

@@ -656,7 +656,9 @@ public sealed class GgufBatchDecoder : IDisposable
         if (_mm.Int8ActFor(rows, C))
         {
             // opt-in int8 activations: the norm also writes hn as q8_1 for the Q4_K GEMVs that read it (no quantize launch of their own)
-            if (_hnQs == null) { _hnQs = _acc.Allocate1D<byte>(Math.Max(C, 256)); _owned.Add(_hnQs); _hnDs = _acc.Allocate1D<float>(Math.Max(C / 16, 16)); _owned.Add(_hnDs); _bufGen++; }
+            // (prefill rows too: the int8 tensor-core GEMM reads them); a grown buffer's predecessor stays owned (a queued launch may read it)
+            long n8 = (long)rows * C;
+            if (_hnQs == null || _hnQs.Length < n8) { _hnQs = _acc.Allocate1D<byte>(Math.Max(n8, 256)); _owned.Add(_hnQs); _hnDs = _acc.Allocate1D<float>(Math.Max(n8 / 16, 16)); _owned.Add(_hnDs); _bufGen++; }
             if (_norm.AddRMSNormFusedQ8(a, b, sum, normed, w, _hnQs.View, _hnDs!.View, rows, C, _eps)) { _hnQ8 = new FusedDequantMatMul.Q8Act(_hnQs.View, _hnDs.View); return; }
         }
         if (_norm.AddRMSNormFused(a, b, sum, normed, w, rows, C, _eps, 1)) return;
@@ -695,7 +697,7 @@ public sealed class GgufBatchDecoder : IDisposable
         var (w, t) = _mats[name];
         mm ??= _mm;
         if (rows <= FusedDequantMatMul.RowsMax) mm.ForwardRows(x, w.View, o, rows, K, N, t, pre);
-        else mm.Forward(x, w.View, o, rows, K, N, t);
+        else mm.Forward(x, w.View, o, rows, K, N, t, pre);
     }
 
     /// <summary>
@@ -1068,9 +1070,10 @@ public sealed class GgufBatchDecoder : IDisposable
                 if (_mm.Int8ActFor(R, FfnDim) && FfnDim % 32 == 0)
                 {
                     // opt-in int8 activations: the SwiGLU also writes its output as q8_1 for the down projection (a thread a value, warps aligned with blocks)
-                    if (_ffQs == null) { _ffQs = _acc.Allocate1D<byte>(Math.Max(FfnDim, 256)); _owned.Add(_ffQs); _ffDs = _acc.Allocate1D<float>(Math.Max(FfnDim / 16, 16)); _owned.Add(_ffDs); _bufGen++; }
+                    long nf = (long)R * FfnDim;
+                    if (_ffQs == null || _ffQs.Length < nf) { _ffQs = _acc.Allocate1D<byte>(Math.Max(nf, 256)); _owned.Add(_ffQs); _ffDs = _acc.Allocate1D<float>(Math.Max(nf / 16, 16)); _owned.Add(_ffDs); _bufGen++; }
                     _swigluJoinedQ8 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, ArrayView1D<byte, Stride1D.Dense>, FV, int>(SwigluJoinedQ8Impl);
-                    _swigluJoinedQ8(FfnDim, gu, gate, _ffQs.View, _ffDs!.View, FfnDim); Prof("swiglu");
+                    _swigluJoinedQ8((int)nf, gu, gate, _ffQs.View, _ffDs!.View, FfnDim); Prof("swiglu");
                     ffQ8 = new FusedDequantMatMul.Q8Act(_ffQs.View, _ffDs.View);
                 }
                 else { _swigluJoined!((int)((long)R * FfnDim), gu, gate, FfnDim); Prof("swiglu"); }
@@ -1727,15 +1730,16 @@ public sealed class GgufBatchDecoder : IDisposable
         float x = gu[b + f];
         o[ii] = x / (1f + MathF.Exp(-x)) * gu[b + F + f];
     }
-    // SwigluJoinedImpl for one row (a decode step) that also writes the output as q8_1 (opt-in int8 activations): F a multiple of 32, an auto-grouped launch of F
-    // threads, so a warp's lanes are one 32-value block; the same float as SwigluJoinedImpl, the same bytes as the GEMV's own quantize
+    // SwigluJoinedImpl that also writes the output as q8_1 (opt-in int8 activations): F a multiple of 32, an auto-grouped launch of R * F threads, so a warp's
+    // lanes are one 32-value block of one row; the same float as SwigluJoinedImpl, the same bytes as the consumer's own quantize
     private static void SwigluJoinedQ8Impl(Index1D i, FV gu, FV o, ArrayView1D<byte, Stride1D.Dense> qs, FV ds, int F)
     {
-        int f = i;
-        float x = gu[f];
-        float y = x / (1f + MathF.Exp(-x)) * gu[F + f];
-        o[f] = y;
-        FusedDequantMatMul.Q8_1WarpStore(y, f, qs, ds);
+        int ii = i, r = ii / F, f = ii - r * F;
+        long b = (long)r * 2 * F;
+        float x = gu[b + f];
+        float y = x / (1f + MathF.Exp(-x)) * gu[b + F + f];
+        o[ii] = y;
+        FusedDequantMatMul.Q8_1WarpStore(y, ii, qs, ds);
     }
     // after the joined q|k(|v) GEMV (row stride sa): bias, rotary (NeoX pairs d, d + D/2) and the store, the arithmetic of BiasImpl + RopeImpl + StoreImpl. Per row the
     // threads are the q pairs, the k pairs, then v's values; q goes to qOut [r, C], k and v to their sequence's cache row; v comes from qkv (flags bit 0) or from vb
