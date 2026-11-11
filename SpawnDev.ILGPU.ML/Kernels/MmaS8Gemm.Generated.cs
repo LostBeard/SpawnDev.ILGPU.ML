@@ -912,9 +912,10 @@ internal static class MmaS8Gemm
         int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;
         long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16
         int bOff = wr * 8 + ((wc ^ ((wr >> 2) & 1)) << 2);
-        // scales: threads 0..127 stage A row tid's (cp.async); 128..255 compute W row tid - 128's (ws, wm) for the pair from its super-block header
-        int sr = tid & 127;
-        int sAR = tileRow * BM + sr, sBR = tileCol * BN + sr;
+        // scales: threads 0..127 stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair
+        // (when only warps 4..7 computed them, every tile's barrier waited on those warps: ncu 2026-11-11, barrier stalls 13% of the kernel)
+        int sr = tid & 127, wsr = tid >> 1, wsh = tid & 1;
+        int sAR = tileRow * BM + sr, sBR = tileCol * BN + wsr;
         bool sBOk = sBR < N;
         int sASz = sAR < M ? 16 : 0;
         long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);
@@ -927,7 +928,7 @@ internal static class MmaS8Gemm
         // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs
         // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)
         W16 h0 = default, hPre = default;
-        if (tid >= 128 && sBOk) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }
+        if (sBOk) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }
         {
             int ktI = 0;
             int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
@@ -936,18 +937,16 @@ internal static class MmaS8Gemm
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
             if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
-            else
             {
-                float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;
+                float ws = 0f, wmn = 0f;
                 if (sBOk)
                 {
                     W16 h = h0;
-                    float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);
-                    int sm0 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI), sm1 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + 1);
-                    ws0 = d * (sm0 & 0xFF); wm0 = dmin * (sm0 >> 8); ws1 = d * (sm1 & 0xFF); wm1 = dmin * (sm1 >> 8);
+                    int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                    ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
                 }
-                int o = sc4 + sr * 4;
-                bSc[o] = ws0; bSc[o + 1] = wm0; bSc[o + 2] = ws1; bSc[o + 3] = wm1;
+                int o = sc4 + wsr * 4 + 2 * wsh;
+                bSc[o] = ws; bSc[o + 1] = wmn;
             }
         }
         CudaAsm.Emit("cp.async.commit_group;");
@@ -965,21 +964,19 @@ internal static class MmaS8Gemm
                     CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
                     CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
                     if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
-                    else
                     {
-                        float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;
+                        float ws = 0f, wmn = 0f;
                         if (sBOk)
                         {
                             W16 h = hPre;
-                            float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);
-                            int sm0 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI), sm1 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + 1);
-                            ws0 = d * (sm0 & 0xFF); wm0 = dmin * (sm0 >> 8); ws1 = d * (sm1 & 0xFF); wm1 = dmin * (sm1 >> 8);
+                            int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                            ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
                         }
-                        int o = sc4 + sr * 4;
-                        bSc[o] = ws0; bSc[o + 1] = wm0; bSc[o + 2] = ws1; bSc[o + 3] = wm1;
+                        int o = sc4 + wsr * 4 + 2 * wsh;
+                        bSc[o] = ws; bSc[o + 1] = wmn;
                     }
                 }
-                if (tid >= 128 && sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];
+                if (sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];
             }
             CudaAsm.Emit("cp.async.commit_group;");
             int so = (it & 1) * BM * 16, sow = (it & 1) * BN * 8, sc4c = (it & 1) * BM * 4;
@@ -1371,9 +1368,10 @@ internal static class MmaS8Gemm
         int bRg = (wb8 & 1) == 0 ? ffw : Nff + ffw; int bSz = ffw < Nff ? 16 : 0;
         long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16
         int bOff = wr * 8 + ((wc ^ ((wr >> 2) & 1)) << 2);
-        // scales: threads 0..127 stage A row tid's (cp.async); 128..255 compute W row tid - 128's (ws, wm) for the pair from its super-block header
-        int sr = tid & 127;
-        int sb8 = sr >> 3, ffs = tileCol * 64 + (sb8 >> 1) * 8 + (sr & 7);
+        // scales: threads 0..127 stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair
+        // (when only warps 4..7 computed them, every tile's barrier waited on those warps: ncu 2026-11-11, barrier stalls 13% of the kernel)
+        int sr = tid & 127, wsr = tid >> 1, wsh = tid & 1;
+        int sb8 = wsr >> 3, ffs = tileCol * 64 + (sb8 >> 1) * 8 + (wsr & 7);
         int sAR = tileRow * BM + sr, sBR = (sb8 & 1) == 0 ? ffs : Nff + ffs;
         bool sBOk = ffs < Nff;
         int sASz = sAR < M ? 16 : 0;
@@ -1387,7 +1385,7 @@ internal static class MmaS8Gemm
         // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs
         // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)
         W16 h0 = default, hPre = default;
-        if (tid >= 128 && sBOk) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }
+        if (sBOk) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }
         {
             int ktI = 0;
             int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
@@ -1396,18 +1394,16 @@ internal static class MmaS8Gemm
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
             CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
             if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
-            else
             {
-                float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;
+                float ws = 0f, wmn = 0f;
                 if (sBOk)
                 {
                     W16 h = h0;
-                    float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);
-                    int sm0 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI), sm1 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + 1);
-                    ws0 = d * (sm0 & 0xFF); wm0 = dmin * (sm0 >> 8); ws1 = d * (sm1 & 0xFF); wm1 = dmin * (sm1 >> 8);
+                    int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                    ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
                 }
-                int o = sc4 + sr * 4;
-                bSc[o] = ws0; bSc[o + 1] = wm0; bSc[o + 2] = ws1; bSc[o + 3] = wm1;
+                int o = sc4 + wsr * 4 + 2 * wsh;
+                bSc[o] = ws; bSc[o + 1] = wmn;
             }
         }
         CudaAsm.Emit("cp.async.commit_group;");
@@ -1425,21 +1421,19 @@ internal static class MmaS8Gemm
                     CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Aq[aG1 + kq]), aSz1);
                     CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
                     if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
-                    else
                     {
-                        float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;
+                        float ws = 0f, wmn = 0f;
                         if (sBOk)
                         {
                             W16 h = hPre;
-                            float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);
-                            int sm0 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI), sm1 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + 1);
-                            ws0 = d * (sm0 & 0xFF); wm0 = dmin * (sm0 >> 8); ws1 = d * (sm1 & 0xFF); wm1 = dmin * (sm1 >> 8);
+                            int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                            ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
                         }
-                        int o = sc4 + sr * 4;
-                        bSc[o] = ws0; bSc[o + 1] = wm0; bSc[o + 2] = ws1; bSc[o + 3] = wm1;
+                        int o = sc4 + wsr * 4 + 2 * wsh;
+                        bSc[o] = ws; bSc[o + 1] = wmn;
                     }
                 }
-                if (tid >= 128 && sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];
+                if (sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];
             }
             CudaAsm.Emit("cp.async.commit_group;");
             int so = (it & 1) * BM * 16, sow = (it & 1) * BN * 8, sc4c = (it & 1) * BM * 4;

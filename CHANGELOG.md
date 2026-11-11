@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Opt-in int8 prefill GEMM: the per-tile scale work is spread over all eight warps** (`MmaS8Gemm.S8Q4KDirect{SwiGLU}`). Only warps 4..7 computed the weight
+  rows' (d sc, dmin m) each tile, so every tile's barrier waited on them; now each of the 256 threads computes one sub-block's pair. Same values (the
+  scheme test 3.9-9.8e-8; the decoder bit-identity tests green). MEASURED (ncu, RTX 4070, qwen3:1.7b Q4_K_M gate | up with SwiGLU, 1,024 rows): 843 ->
+  821 us, barrier stalls 16.1k -> 9.3k. Investigated and not taken (measured): a 128-value K tile with 3 stages in 96 KB of dynamic shared memory (needs
+  SpawnDev.ILGPU 5.4.27's opt-in; it launched and computed the scheme but ptxas spilled at 255 registers: 864 us), source-level software pipelining of the
+  n tiles (identical SASS).
+
 ## 5.8.14 - 2026-11-11 (nuget.org) - opt-in int8 activations: prefill +42% over the default
 
 On SpawnDev.ILGPU 5.4.26. Release sweep (full default, HeavyModel excluded): 7,664 passed, 0 failed, 475 skipped, 1 h 13 m (RTX 4070, Chrome). LLM-path
