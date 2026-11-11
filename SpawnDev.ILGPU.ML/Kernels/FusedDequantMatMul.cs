@@ -222,6 +222,11 @@ public class FusedDequantMatMul : IDisposable
     /// <summary>Q4_K prefill rows on <see cref="MmaS8Gemm"/>'s direct kernel (raw Q4_K, no unpack pass; default) or the unpack + S8Q4K pair (env GGUF_S8_DIRECT=0).</summary>
     public static bool S8Direct = Environment.GetEnvironmentVariable("GGUF_S8_DIRECT") != "0";
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4KDirect;
+    /// <summary>
+    /// With <see cref="Int8ActGemv"/>: F16-weight prefill rows (qwen3 Q4_K_M's attn_v) as Ollama runs them, the activations rounded to f16 and ONE tensor-core
+    /// GEMM, instead of the default's hi + lo split (two GEMMs, fp32-path accuracy). On by default with the opt-in; env GGUF_INT8_ACT_F16=0 keeps the split.
+    /// </summary>
+    public static bool Int8ActF16Round = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_F16") != "0";
     public static bool Int8ActGemm = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_GEMM") != "0";
     private MemoryBuffer1D<uint, Stride1D.Dense>? _s8A, _s8As, _s8W, _s8Ws;
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ4KS8;
@@ -388,7 +393,9 @@ public class FusedDequantMatMul : IDisposable
         _addInto ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddIntoImpl);
         var x = input.SubView(0, (long)M * K);
         _packA16((int)aWords, x, aHi.View.BaseView);
-        _packA16Lo((int)aWords, x, aLo.View.BaseView);
+        // the opt-in int8 activations take Ollama's F16 matmul as it is: A rounded to f16, one GEMM (ggml casts src1 to f16 for an F16 weight on CUDA)
+        bool hiOnly = Int8ActGemv && Int8ActF16Round;
+        if (!hiOnly) _packA16Lo((int)aWords, x, aLo.View.BaseView);
         var w = weightQuant.SubView(0, wWords * 4).Cast<byte, uint>().Cast<uint, Trellis2.U4>();
         var tmp = _scratchF16Out.View.SubView(0, (long)M * N);
         bool v5 = turing ? EnableMmaSm75V5 : EnableMmaV5;
@@ -412,9 +419,12 @@ public class FusedDequantMatMul : IDisposable
             gemm(new KernelConfig(tilesS, v5 ? Trellis2.MmaGemm.V5Threads : Trellis2.MmaGemm.Threads), a4, w, _scratchOnes.View, o, M, K, N);
         }
         Gemm(aHi, output);
-        Gemm(aLo, tmp);
-        _addInto((int)((long)M * N), output.SubView(0, (long)M * N), tmp);
-        LastGemmKernel = "mma-f16-split" + (turing ? "-sm75" : "") + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
+        if (!hiOnly)
+        {
+            Gemm(aLo, tmp);
+            _addInto((int)((long)M * N), output.SubView(0, (long)M * N), tmp);
+        }
+        LastGemmKernel = (hiOnly ? "mma-f16" : "mma-f16-split") + (turing ? "-sm75" : "") + (v5 ? (!turing && EnableMmaV6 ? "-v6" : "-v5") : "");
     }
 
     // o[i] += t[i] * 2^-11 (the scaled lo product back to scale: exact)

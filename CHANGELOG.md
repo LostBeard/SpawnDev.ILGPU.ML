@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Opt-in int8 activations: F16 weights' prefill as Ollama runs it** (`Int8ActF16Round`, on with `Int8ActGemv`; env GGUF_INT8_ACT_F16=0 keeps the split):
+  the activations rounded to f16 and ONE tensor-core GEMM (ggml casts the activations to f16 for an F16 weight on CUDA) instead of the default's hi + lo
+  split (two GEMMs, fp32-path accuracy; the default is unchanged, `Gemm_F16_MmaSplit_MatchesFp32` green). nsys before: the split F16 GEMM (qwen3 Q4_K_M's
+  attn_v) was 11% of an int8 prefill. `Bench_Int8Act_TeacherForced_KLD` with it: prefill KL 3.9e-3 mean, top-1 the same 10 of 10 (decode unchanged).
+  MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, int8 on, quiet, interleaved x2): prefill 1,830 tokens 12,810 / 12,686 -> 13,311 / 13,283 tok/s (+5%), 29
+  tokens 1,353 / 1,362 -> 1,503 / 1,513 (+10%). The opt-in's prefill against the default fp32 is now ~13.3k vs ~9.9k at 1,830 tokens (+34%).
+
 - **Opt-in int8 prefill reads Q4_K straight from the GGUF rows** (`MmaS8Gemm.S8Q4KDirect`, default with the int8 GEMM; env GGUF_S8_DIRECT=0 runs the
   unpack + S8Q4K pair): no per-call unpack pass and no N x K int8 scratch. A 64-value K tile is one Q4_K sub-block pair, ONE 32-byte nibble chunk a row:
   one ldmatrix of it gives both blocks' fragments (w & 0x0F0F0F0F, (w >> 4) & 0x0F0F0F0F), and the W rows' threads compute the pair's (d sc, dmin m)
