@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.12 - 2026-11-10 (nuget.org) - faster CUDA prefill; opt-in int8-activation decode (Ollama's scheme)
+
+On SpawnDev.ILGPU 5.4.25. Release sweep (full default, HeavyModel excluded): 7,663 passed, 0 failed, 469 skipped, 1 h 12 m (RTX 4070, Chrome;
+5.8.11: 7,659 / 0 / 445, 1 h 09 m; the added skips are the CUDA-only int8 tests on the other lanes). LLM-path HeavyModel subset (CUDA, OpenCL,
+WebGPU): 78 passed, 0 failed, 17 skipped. qwen3:1.7b Q4_K_M on CUDA: prefill ~9.85k tok/s at 1,830 tokens (5.8.11: ~8.0k); decode unchanged by
+default (~237 / ~222 tok/s), ~261 / ~242 with the opt-in int8 activations.
+
 - **On SpawnDev.ILGPU 5.4.25** (a type-cycle guard; no generated-code change for ML's kernels).
 - **OPT-IN int8 activations for Q4_K decode, Ollama's MMVQ scheme** (`FusedDequantMatMul.Int8ActGemv`, env GGUF_INT8_ACT=1; OFF by default). The
   activation vector is quantized to ggml's q8_1 (32-value blocks, d = amax / 127, q = round(x / d)) and the Q4_K GEMV runs on dp4a
