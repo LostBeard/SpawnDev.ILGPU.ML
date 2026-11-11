@@ -1542,6 +1542,12 @@ public sealed class GgufBatchDecoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// The device-draw loop hands out a token read that has already completed before it queues the next step (the desktop backends' reads are synchronous):
+    /// the first token no longer waits for the first decode step's encode and run. Env GGUF_HANDOUT_FIRST=0 restores queue-first (the A/B).
+    /// </summary>
+    public static bool HandOutCompletedFirst = Environment.GetEnvironmentVariable("GGUF_HANDOUT_FIRST") != "0";
+
     private async Task<int[][]> GenerateForkedAsync(List<int>[] outs, int n, int maxNew, float temperature, float topP, int seed, IReadOnlyCollection<int> stopIds,
         Action<int, int>? onToken, Action<int>? onFinished, CancellationToken ct, float repetitionPenalty, int repeatLastN, Func<int, int, ValueTask<bool>>? shouldContinue, int topK)
     {
@@ -1592,8 +1598,8 @@ public sealed class GgufBatchDecoder : IDisposable
             return outs.Select(o => o.ToArray()).ToArray();
         }
         // device draws, one step ahead: step P (its inputs the tokens drawn for P, its draws the tokens for P + 1) is queued before the tokens for P are read, so the
-        // device always has the next step while the host streams the last one. A sequence that drew a stop token rides one step more (its row is thrown away), then
-        // leaves the batch.
+        // device always has the next step while the host streams the last one (an asynchronous read: WebGPU; a read that has already completed is handed out first,
+        // below). A sequence that drew a stop token rides one step more on that overlapped path (its row is thrown away), then leaves the batch.
         Draw(temperature > 0f ? topP : 1f, seed, repetitionPenalty, repeatLastN, temperature > 0f ? topK : 0);
         var live2 = Enumerable.Range(0, n).ToArray();
         Task<int[]>? pending = ReadDrawnAsync(), ahead = null;
@@ -1602,13 +1608,30 @@ public sealed class GgufBatchDecoder : IDisposable
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
+                // a read that has ALREADY completed is handed out before the next step is queued: the desktop backends read synchronously (the read IS the wait),
+                // so queuing first made every token wait for the next step's encode AND its run, the first token included: time to first text paid a whole
+                // uncaptured decode step (nsys 2026-11-11, RTX 4070, qwen3:1.7b, 29-token prompt: ~3.6 ms of a 12.5 ms start). The GPU idles across the
+                // hand-out either way there; an asynchronous read (WebGPU) that is still in flight keeps the one-step-ahead overlap below. The draws are keyed
+                // by (seed, sequence, position), so stepping only the still-live sequences one step sooner changes no token.
+                bool handed = false;
+                if (HandOutCompletedFirst && pending!.IsCompleted)
+                {
+                    var t0 = await pending.ConfigureAwait(false);
+                    pending = null; handed = true;
+                    foreach (int s in live2) await Take(s, t0[s]).ConfigureAwait(false);
+                    live2 = live2.Where(s => !done[s]).ToArray();
+                    if (live2.Length == 0) break;
+                }
                 ahead = null;
                 if (Position + 1 <= MaxSeq) { await StepDrawnAsync(live2, temperature, ct).ConfigureAwait(false); ahead = ReadDrawnAsync(); }
-                var tokens = await pending!.ConfigureAwait(false);
-                pending = null;
-                foreach (int s in live2) await Take(s, tokens[s]).ConfigureAwait(false);
-                live2 = live2.Where(s => !done[s]).ToArray();
-                if (live2.Length == 0) break;
+                if (!handed)
+                {
+                    var tokens = await pending!.ConfigureAwait(false);
+                    pending = null;
+                    foreach (int s in live2) await Take(s, tokens[s]).ConfigureAwait(false);
+                    live2 = live2.Where(s => !done[s]).ToArray();
+                    if (live2.Length == 0) break;
+                }
                 if (ahead == null) { FinishAll(); break; }
                 pending = ahead; ahead = null;
             }

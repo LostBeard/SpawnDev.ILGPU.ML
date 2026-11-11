@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Time to first token: the batch decoder hands out a completed token read before it queues the next step** (`GgufBatchDecoder`'s device-draw loop;
+  env GGUF_HANDOUT_FIRST=0 is the A/B). The loop queued decode step P + 1 and only then awaited step P's tokens, to keep the device one step ahead. On the
+  desktop backends the read is synchronous (the read IS the wait), so every token waited for the next step's encode and run, the FIRST token included:
+  the time to first text paid a whole uncaptured decode step (nsys, RTX 4070, qwen3:1.7b, 29-token prompt: ~3.6 ms of a 12.5 ms start). A read that has
+  already completed is now handed out first; an asynchronous read still in flight (WebGPU) keeps the overlap. The device draws are keyed by (seed,
+  sequence, position), so no token changes. Gates (CUDA): greedy vs generator (qwen and other architectures), device draws and top-k vs the host sampler,
+  prefix reuse, the pipeline's batch engine, the int8 bit-identity: green. MEASURED (interleaved x3, prompt tokens / time to first text): 29-token prompt
+  default 1,878 -> 2,551 tok/s (+36%), int8 opt-in 2,253 -> 3,319 (+40%; Ollama's own prompt_eval timer: ~3.4k); 1,830-token prompt +1.8-2.7%. Decode
+  reads 0.3-0.7% lower: the first step's time moved from the first-text time into the decode window (total time unchanged).
+
 - **Short prompts: 32-row A tiles for the tensor-core GEMMs** (prompts of at most 64 tokens; new `MmaS8Gemm.S8Q4KDirectM32` / `S8Q4KDirectSwiGLUM32` /
   `S8Q4KM32` / `S8Q6KM32`, `MmaKQuantGemm.Q4KV2M32SplitK` / `Q6KV2M32SplitK`, `MmaGemm.KernelF16PackedV6M32SplitK`; env GGUF_S8_M32_MAX, GGUF_KQ_M32_MAX,
   GGUF_F16_M32_MAX (rows; 0 = off) are the A/Bs). The GEMMs tiled the prompt's rows by 128, so a 29-token prompt spent 4.4x the needed MMAs on padding
