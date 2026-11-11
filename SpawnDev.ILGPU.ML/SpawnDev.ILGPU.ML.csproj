@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.12</Version>
-		<PackageReleaseNotes>v5.8.12 - on SpawnDev.ILGPU 5.4.25. CUDA prefill: F16 weights now run on the tensor cores with split activations (A = hi + lo * 2^-11, so the activations are not rounded to f16): qwen3:1.7b Q4_K_M prefill ~8.0k -&gt; ~9.85k tok/s at 1,830 tokens (+23%), greedy text identical. NEW OPT-IN (off by default, env GGUF_INT8_ACT=1 or FusedDequantMatMul.Int8ActGemv): Ollama's int8-activation decode (ggml q8_1 + dp4a) for Q4_K and Q6_K GEMVs, with the quantize fused into the norm, SwiGLU and attention merge: decode ~237 -&gt; ~261 tok/s short, ~222 -&gt; ~242 long on an RTX 4070, at a measured cost of KL 5.5e-3 / top-1 96.4% / perplexity +1.1% against the default (the kernels compute ggml's scheme to 1e-8). The default stays fp32 activations. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.13</Version>
+		<PackageReleaseNotes>v5.8.13 - FIX (CUDA, since 5.8.11; upgrade from 5.8.11 / 5.8.12): prompts over 512 tokens on models whose attention v projection has a different block type than q / k (common in Q4_K_M files: llama3, qwen2.5) could get badly wrong logits (up to 27 off, measured), because the v projection running on a second CUDA stream shared prefill scratch memory with the q / k projection. Fixed; overlap on and off are bit-identical. (Workaround for 5.8.11 / 5.8.12: env GGUF_OVERLAP_V=0.) Also: the opt-in int8 activations (GGUF_INT8_ACT=1, off by default) now cover prefill too, on int8 tensor cores (Ollama's MMQ scheme): qwen3:1.7b Q4_K_M prefill +9% at 1,830 tokens, +22% at 29 on an RTX 4070. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

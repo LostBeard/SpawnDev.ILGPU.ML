@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.13 - 2026-11-11 (nuget.org) - FIX: wrong logits on long prompts on CUDA (since 5.8.11); opt-in int8 prefill
+
+On SpawnDev.ILGPU 5.4.25. **Upgrade from 5.8.11 / 5.8.12 if you run GGUF models on CUDA** (workaround there: GGUF_OVERLAP_V=0). Release sweep (full
+default, HeavyModel excluded): 7,664 passed, 0 failed, 475 skipped, 1 h 09 m (RTX 4070, Chrome). LLM-path HeavyModel subset (CUDA, OpenCL, WebGPU):
+80 passed, 0 failed, 21 skipped.
+
 - **Fix (CUDA, since 5.8.11): wrong logits on prompts over 512 tokens when v's block type differs from q|k** (`GgufBatchDecoder.OverlapV`). v's
   projection on the second stream and q|k's on the main stream shared one `FusedDequantMatMul`, whose prefill GEMM stages the weights in per-instance
   scratch from 512 rows: v's weights could overwrite q|k's mid-GEMM. MEASURED (RTX 4070, qwen2.5 1.5B Q4_K_M, v Q6_K in some layers, an 854-token
