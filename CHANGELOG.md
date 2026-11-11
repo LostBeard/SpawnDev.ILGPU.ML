@@ -4,6 +4,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **On SpawnDev.ILGPU 5.4.27** (CUDA dynamic shared memory above 48 KB through the per-kernel opt-in, `MaxSharedMemoryPerGroupOptIn`; Velocity's
+  adaptive team count). No change for ML's kernels yet. CUDA check on it: the int8, F16-split, overlap, shuffle-attention and greedy-vs-generator gates,
+  9 passed, 0 failed.
+
 - **Opt-in int8 prefill GEMM: the per-tile scale work is spread over all eight warps** (`MmaS8Gemm.S8Q4KDirect{SwiGLU}`). Only warps 4..7 computed the weight
   rows' (d sc, dmin m) each tile, so every tile's barrier waited on them; now each of the 256 threads computes one sub-block's pair. Same values (the
   scheme test 3.9-9.8e-8; the decoder bit-identity tests green). MEASURED (ncu, RTX 4070, qwen3:1.7b Q4_K_M gate | up with SwiGLU, 1,024 rows): 843 ->
