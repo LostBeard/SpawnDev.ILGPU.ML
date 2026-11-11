@@ -219,6 +219,39 @@ public class FusedDequantMatMul : IDisposable
     /// The prefill half of <see cref="Int8ActGemv"/> (on with it; env GGUF_INT8_ACT_GEMM=0 is the A/B): M &gt; 1 rows of Q4_K / Q6_K on the int8 tensor-core
     /// GEMMs (<see cref="MmaS8Gemm"/>, llama.cpp / Ollama's MMQ scheme: A in q8_1, W unpacked to int8 with per-32-value scales). CUDA sm_80+.
     /// </summary>
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4KDirectSwiGLU;
+
+    /// <summary>
+    /// Opt-in int8 activations, prefill: a JOINED Q4_K gate | up weight [2 Nff, K] with SwiGLU in the GEMM's epilogue (<c>MmaS8Gemm.S8Q4KDirectSwiGLU</c>):
+    /// writes s [M, Nff] = silu(x W_gate^T) * (x W_up^T) without the gate | up output reaching memory. The same MMAs and SwiGLU expression as the GEMM then
+    /// <c>GgufBatchDecoder.SwigluJoinedImpl</c>: bit-identical. pre: x as q8_1 when its producer wrote it. Returns false (nothing launched) where it does
+    /// not apply (the int8 GEMM's conditions, Q4_K, Nff % 64, <see cref="Int8ActFuse"/>); the caller then runs the GEMM and the SwiGLU.
+    /// </summary>
+    public bool ForwardGateUpSwiGLUInt8(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<byte, Stride1D.Dense> wGateUp, GGMLType type,
+        ArrayView1D<float, Stride1D.Dense> s, int M, int K, int Nff, Q8Act? pre)
+    {
+        if (!(M > RowsMax && Int8ActGemv && Int8ActGemm && Int8ActFuse && S8Direct && type == GGMLType.Q4_K && K % 256 == 0 && Nff % 64 == 0
+            && CudaCaps.TensorCores(_accelerator) && CudaCaps.Dp4a(_accelerator) && CanShuffle32 && (((IContiguousArrayView)wGateUp.BaseView).IndexInBytes & 15) == 0))
+            return false;
+        long aQ = (long)M * K;
+        ArrayView1D<Trellis2.U4, Stride1D.Dense> aqU, asU;
+        bool fused8 = pre.HasValue && pre.Value.Qs.Length >= aQ && pre.Value.Ds.Length >= aQ / 16 && (((IContiguousArrayView)pre.Value.Qs.BaseView).IndexInBytes & 15) == 0
+            && (((IContiguousArrayView)pre.Value.Ds.BaseView).IndexInBytes & 15) == 0;
+        if (fused8) { aqU = pre!.Value.Qs.SubView(0, aQ).Cast<byte, Trellis2.U4>(); asU = pre.Value.Ds.SubView(0, aQ / 16).Cast<float, Trellis2.U4>(); }
+        else
+        {
+            var s8a = GrowScratch(ref _s8A, aQ / 4); var s8as = GrowScratch(ref _s8As, aQ / 16);
+            _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
+            _quantQ8Warp((int)aQ, input.SubView(0, aQ), s8a.View.SubView(0, aQ / 4).Cast<uint, byte>(), s8as.View.SubView(0, aQ / 16).Cast<uint, float>());
+            aqU = s8a.View.SubView(0, aQ / 4).Cast<uint, Trellis2.U4>(); asU = s8as.View.SubView(0, aQ / 16).Cast<uint, Trellis2.U4>();
+        }
+        int tiles = ((M + MmaS8Gemm.BM - 1) / MmaS8Gemm.BM) * (Nff / 64);
+        (_s8Q4KDirectSwiGLU ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q4KDirectSwiGLU))(
+            new KernelConfig(tiles, MmaS8Gemm.Threads), aqU, asU, wGateUp.BaseView.Cast<W16>(), s, M, K, Nff);
+        LastGemmKernel = "mma-s8-q4k-direct-swiglu" + (fused8 ? "-pre" : "");
+        return true;
+    }
+
     /// <summary>Q4_K prefill rows on <see cref="MmaS8Gemm"/>'s direct kernel (raw Q4_K, no unpack pass; default) or the unpack + S8Q4K pair (env GGUF_S8_DIRECT=0).</summary>
     public static bool S8Direct = Environment.GetEnvironmentVariable("GGUF_S8_DIRECT") != "0";
     private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4KDirect;

@@ -1065,6 +1065,13 @@ public sealed class GgufBatchDecoder : IDisposable
             if (_mats.ContainsKey(b + "ffn_gate_up"))
             {
                 var gu = Buf(ref _gateUp, (long)R * 2 * FfnDim);
+                var (wgu, tgu) = _mats[b + "ffn_gate_up"];
+                // opt-in int8 activations, prefill rows: gate | up with SwiGLU in the int8 GEMM's epilogue (gate | up never reaches memory); down quantizes its input
+                if (Lora == null && R > FusedDequantMatMul.RowsMax && _mm.ForwardGateUpSwiGLUInt8(hn, wgu.View, tgu, gate, R, C, FfnDim, _hnQ8))
+                {
+                    Prof("gate-up+swiglu");
+                    goto FfnDown;
+                }
                 Gemm(hn, b + "ffn_gate_up", gu, R, C, 2 * FfnDim, _hnQ8); Prof("gate-up");
                 Lora?.ApplyAdjacent(l, LoraGateUp, _loraGateUpOff ??= new[] { 0, FfnDim }, hn, gu, R, 2 * FfnDim);
                 if (_mm.Int8ActFor(R, FfnDim) && FfnDim % 32 == 0)
@@ -1084,6 +1091,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 Gemm(hn, b + "ffn_up.weight", up, R, C, FfnDim, _hnQ8); Lora?.Apply(l, "ffn_up", hn, up, R, 0, FfnDim); Prof("up");
                 _swiglu!((int)((long)R * FfnDim), gate, up); Prof("swiglu");
             }
+            FfnDown:
             Gemm(gate, b + "ffn_down.weight", proj, R, FfnDim, C, ffQ8); Lora?.Apply(l, "ffn_down", gate, proj, R, 0, C); Prof("down");
             AddNorm(hid2, proj, hid, hn, _vecs[l + 1 < Layers ? $"blk.{l + 1}.attn_norm.weight" : "output_norm.weight"].View, R, C); Prof("add+rms");
             // a prefill submits each layer on its own (WebGPU): one submission is then at most one layer of one PrefillChunk, whatever the model's size (SpawnDev.AI

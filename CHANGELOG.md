@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Opt-in int8 activations: gate | up with SwiGLU in the int8 GEMM's epilogue** (`FusedDequantMatMul.ForwardGateUpSwiGLUInt8`,
+  `MmaS8Gemm.S8Q4KDirectSwiGLU`; with `Int8ActFuse`, GGUF_INT8_ACT_FUSE=0 is the A/B): the direct Q4_K kernel stages the joined gate | up rows remapped so
+  each 8-row block pair is (gate, up) of the same 8 ff columns, a thread holds g and u, and it writes silu(g) u straight to the down projection's input -
+  the M x 2 Nff gate | up output never reaches memory and the SwiGLU launch is gone (nsys: it was 5% of an int8 prefill). Same MMAs and the same SwiGLU
+  expression: `GgufBatchDecoder_Int8ActFused_BitIdentical` and the 854-token `GgufBatchDecoder_OverlapV_LongPrefill_BitIdentical` stay bit-identical.
+  MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, int8 on, quiet, interleaved x2, all producer fusions off vs on): prefill 1,830 tokens 13,127 / 13,018 -> 14,271 /
+  14,041 tok/s (+8%; the prefill quantize fusion alone was +2%), 29 tokens 1,467 / 1,470 -> 1,486 / 1,498; decode 258.0 -> 262.2 / 262.5. The opt-in's
+  long-prompt prefill is now ~14.1k tok/s against the default's ~9.9k (+42%).
+
 - **Opt-in int8 activations: F16 weights' prefill as Ollama runs it** (`Int8ActF16Round`, on with `Int8ActGemv`; env GGUF_INT8_ACT_F16=0 keeps the split):
   the activations rounded to f16 and ONE tensor-core GEMM (ggml casts the activations to f16 for an F16 weight on CUDA) instead of the default's hi + lo
   split (two GEMMs, fp32-path accuracy; the default is unchanged, `Gemm_F16_MmaSplit_MatchesFp32` green). nsys before: the split F16 GEMM (qwen3 Q4_K_M's

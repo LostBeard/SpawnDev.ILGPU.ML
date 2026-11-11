@@ -156,16 +156,25 @@ def kernel(q6):
     w("")
 
 
-def kernel_direct():
+def kernel_direct(swiglu=False):
     """S8Q4KDirect (2026-11-11): S8Q4K reading the raw Q4_K rows, no unpack pass. A 64-value K tile is one Q4_K sub-block PAIR (2p, 2p + 1 of a super-block):
     ONE 32-byte nibble chunk per row (qs bytes 32p..32p + 31; low nibbles = sub-block 2p, high = 2p + 1). Each W row stages that chunk (16 bytes a thread,
     rows 32 bytes, chunk c of row r at c ^ ((r >> 2) & 1): conflict-free ldmatrix at that stride), and one ldmatrix of it gives BOTH blocks' B fragments:
     block 0 = w & 0x0F0F0F0F, block 1 = (w >> 4) & 0x0F0F0F0F (the int8 k32 fragment's byte positions are the chunk's). The W threads compute the pair's
     (d sc, dmin m) from the super-block header into the scale tile S8Q4K reads (same layout), so the epilogue is unchanged. W 16-byte aligned, K % 256 == 0."""
     RWB = 8
-    w("    /// <summary>Q4_K on int8 straight from the raw GGUF rows (no unpack): C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; W 16-byte aligned. sm_80+.</summary>")
-    w("    public static unsafe void S8Q4KDirect(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N)")
-    w("    {")
+    if swiglu:
+        w("    /// <summary>S8Q4KDirect over a JOINED gate | up weight (rows [0, Nff) gate, [Nff, 2 Nff) up) with SwiGLU in the epilogue: the staged W rows are")
+        w("    /// remapped so 8-row block 2j is gate and 2j + 1 is up of the same 8 ff columns, a thread holds g and u of the same (row, column), and it writes")
+        w("    /// S [M, Nff] = g / (1 + exp(-g)) * u (GgufBatchDecoder.SwigluJoinedImpl's expression): gate | up never reaches memory. grid = ceil(M/128) * (Nff / 64),")
+        w("    /// group = 256; Nff a multiple of 64, K of 256. sm_80+.</summary>")
+        w("    public static unsafe void S8Q4KDirectSwiGLU(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int Nff)")
+        w("    {")
+        w("        int N = 2 * Nff;")
+    else:
+        w("    /// <summary>Q4_K on int8 straight from the raw GGUF rows (no unpack): C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; W 16-byte aligned. sm_80+.</summary>")
+        w("    public static unsafe void S8Q4KDirect(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N)")
+        w("    {")
     w("        int numTilesM = (M + BM - 1) / BM;")
     w("        int tileRow = Grid.IdxX % numTilesM;")
     w("        int tileCol = Grid.IdxX / numTilesM;")
@@ -188,15 +197,25 @@ def kernel_direct():
         w(f"        int sOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
     w("        // W: thread tid stages row tid >> 1, 16-byte chunk tid & 1 of the tile's nibble chunk")
     w("        int wr = tid >> 1, wc = tid & 1;")
-    w("        int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;")
+    if swiglu:
+        w("        int wb8 = wr >> 3, ffw = tileCol * 64 + (wb8 >> 1) * 8 + (wr & 7);       // block 2j: gate row ff, block 2j + 1: up row Nff + ff")
+        w("        int bRg = (wb8 & 1) == 0 ? ffw : Nff + ffw; int bSz = ffw < Nff ? 16 : 0;")
+    else:
+        w("        int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;")
     w("        long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16")
     w(f"        int bOff = wr * {RWB} + ((wc ^ ((wr >> 2) & 1)) << 2);")
     w("        // scales: threads 0..127 stage A row tid's (cp.async); 128..255 compute W row tid - 128's (ws, wm) for the pair from its super-block header")
     w("        int sr = tid & 127;")
-    w("        int sAR = tileRow * BM + sr, sBR = tileCol * BN + sr;")
+    if swiglu:
+        w("        int sb8 = sr >> 3, ffs = tileCol * 64 + (sb8 >> 1) * 8 + (sr & 7);")
+        w("        int sAR = tileRow * BM + sr, sBR = (sb8 & 1) == 0 ? ffs : Nff + ffs;")
+        w("        bool sBOk = ffs < Nff;")
+    else:
+        w("        int sAR = tileRow * BM + sr, sBR = tileCol * BN + sr;")
+        w("        bool sBOk = sBR < N;")
     w("        int sASz = sAR < M ? 16 : 0;")
     w("        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);")
-    w("        long sWRow = (long)(sBR < N ? sBR : 0) * ((K >> 8) * 9);")
+    w("        long sWRow = (long)(sBOk ? sBR : 0) * ((K >> 8) * 9);")
     w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 32 + (lane & 7) + ((lane >> 4) << 3);")
     w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 2) & 1;")
     w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
@@ -215,7 +234,7 @@ def kernel_direct():
         w(f"{ind}    else")
         w(f"{ind}    {{")
         w(f"{ind}        float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;")
-        w(f"{ind}        if (sBR < N)")
+        w(f"{ind}        if (sBOk)")
         w(f"{ind}        {{")
         w(f"{ind}            W16 h = {hv};")
         w(f"{ind}            float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);")
@@ -230,7 +249,7 @@ def kernel_direct():
     w("        // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs")
     w("        // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)")
     w("        W16 h0 = default, hPre = default;")
-    w("        if (tid >= 128 && sBR < N) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }")
+    w("        if (tid >= 128 && sBOk) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }")
     issue("0", "0", "        ", "h0")
     w('        CudaAsm.Emit("cp.async.commit_group;");')
     w("        for (int it = 0; it < nk; it++)")
@@ -240,7 +259,7 @@ def kernel_direct():
     w("            if (it + 1 < nk)")
     w("            {")
     issue("(it + 1) * BK", "(it + 1) & 1", "                ", "hPre")
-    w("                if (tid >= 128 && sBR < N && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];")
+    w("                if (tid >= 128 && sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];")
     w("            }")
     w('            CudaAsm.Emit("cp.async.commit_group;");')
     w(f"            int so = (it & 1) * BM * {RW}, sow = (it & 1) * BN * {RWB}, sc4c = (it & 1) * BM * 4;")
@@ -273,14 +292,25 @@ def kernel_direct():
         w("            }")
     w("        }")
     w('        CudaAsm.Emit("cp.async.wait_group 0;");')
-    for mt in range(MT5):
-        for nt in range(NT5):
-            w("        {")
-            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
-            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
-            w("        }")
+    if swiglu:
+        for mt in range(MT5):
+            for pp in range(NT5 // 2):
+                gt, ut = 2 * pp, 2 * pp + 1
+                w("        {")
+                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int f0 = tileCol * 64 + wn * 16 + {pp * 8} + 2 * t, f1 = f0 + 1;")
+                for (mrow, a0, a1) in (("m0", 0, 1), ("m1", 2, 3)):
+                    w(f"            if ({mrow} < M) {{ if (f0 < Nff) C[(long){mrow} * Nff + f0] = Silu(c{mt}{gt}{a0}) * c{mt}{ut}{a0}; if (f1 < Nff) C[(long){mrow} * Nff + f1] = Silu(c{mt}{gt}{a1}) * c{mt}{ut}{a1}; }}")
+                w("        }")
+    else:
+        for mt in range(MT5):
+            for nt in range(NT5):
+                w("        {")
+                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+                w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
+                w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
+                w("        }")
     w("    }")
     w("")
 
@@ -288,6 +318,9 @@ def kernel_direct():
 kernel(False)
 kernel(True)
 kernel_direct()
+kernel_direct(swiglu=True)
+w("    // GgufBatchDecoder.SwigluJoinedImpl's x / (1 + exp(-x)): the fused SwiGLU's output equals the separate kernel's")
+w("    private static float Silu(float x) => x / (1f + MathF.Exp(-x));")
 w("}")
 
 path = sys.argv[1]
