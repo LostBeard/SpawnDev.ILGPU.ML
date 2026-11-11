@@ -10,6 +10,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   prompt): logits off by up to 27 (a logit range of 35) against overlap off; greedy text happened to match for 32 tokens. Models whose v is F16 (qwen3
   Q4_K_M) stage no v weights and were not affected. v's GEMM now has its own instance: overlap on and off are bit-identical (new
   `GgufBatchDecoder_OverlapV_LongPrefill_BitIdentical`, red before the fix). 5.8.11 / 5.8.12 users: GGUF_OVERLAP_V=0 avoids it.
+- **Opt-in int8 activations now cover prefill: int8 tensor-core GEMMs, Ollama's MMQ scheme** (`MmaS8Gemm`, with `Int8ActGemv`; env
+  GGUF_INT8_ACT_GEMM=0 is the A/B; CUDA sm_80+). M > 1 rows of Q4_K / Q6_K: the activations quantized to q8_1, the weights unpacked per call to int8 with
+  per-32-value scales, `mma.sync m16n8k32 s8` (Q6_K: two m16n8k16 a block, one per 16-value scale), int32 per block scaled into fp32
+  (C += da ws dot - (da sum qa) wm). Built on the f16 V6 GEMM's staging (an int8 k32 fragment has the f16 k16 one's word layout), 8 warps of 64 x 32 (ncu:
+  64 x 64 spilled the epilogue's registers). New `Gemm_Int8Act_MatchesGgmlQ8_1Scheme`: the GEMM computes the scheme to 3-9e-8 on ragged Q4_K / Q6_K shapes;
+  `Bench_Int8Act_TeacherForced_KLD` adds prefills of 32..320 tokens: KL 4.3e-3 mean against fp32, the same top-1 token 10 of 10. MEASURED (RTX 4070,
+  qwen3:1.7b Q4_K_M, int8 on, interleaved x2): prefill 1,830 tokens 9,859 / 9,901 -> 10,747 / 10,766 tok/s (+9%), 29 tokens 948 / 948 -> 1,161 /
+  1,154 (+22%); the gate|up GEMM 1,028 (f16) -> 807 us. The int8 GEMM is issue-bound on its per-32-value epilogue (ncu: IMMA pipe ~28% busy).
 
 ## 5.8.12 - 2026-11-10 (nuget.org) - faster CUDA prefill; opt-in int8-activation decode (Ollama's scheme)
 

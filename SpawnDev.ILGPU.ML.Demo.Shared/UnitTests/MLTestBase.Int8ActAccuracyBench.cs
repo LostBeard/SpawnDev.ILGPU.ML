@@ -97,10 +97,38 @@ public abstract partial class MLTestBase
             kls[t] = Math.Max(0, kl);
             if (ap == aq) top1Same++;
         }
+        // the prefill path (M > 1 rows: the int8 tensor-core GEMM, Int8ActGemm): prefixes of 32, 64, ... tokens prefilled whole, the last row's distribution
+        var pre = new List<double>();
+        int preTop1 = 0;
+        try
+        {
+            for (int len = 32; len <= ids.Length; len += 32)
+            {
+                var prefix = ids.Take(len).ToArray();
+                float[]? lp0 = null;
+                foreach (bool int8 in new[] { false, true })
+                {
+                    SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = int8;
+                    dec.InvalidateCapturedSteps();
+                    await dec.PrefillAsync(prefix, 0f);
+                    var l = await dec.ReadLogitsAsync();
+                    double mx = double.NegativeInfinity; for (int i = 0; i < l.Length; i++) if (l[i] > mx) mx = l[i];
+                    double z = 0; for (int i = 0; i < l.Length; i++) z += Math.Exp(l[i] - mx);
+                    double lz = mx + Math.Log(z);
+                    var lp = new float[l.Length]; for (int i = 0; i < l.Length; i++) lp[i] = (float)(l[i] - lz);
+                    if (!int8) { lp0 = lp; continue; }
+                    double kl = 0; int a0 = 0, a1 = 0;
+                    for (int i = 0; i < lp.Length; i++) { double pi = Math.Exp(lp0![i]); if (pi > 0) kl += pi * (lp0[i] - lp[i]); if (lp0[i] > lp0[a0]) a0 = i; if (lp[i] > lp[a1]) a1 = i; }
+                    pre.Add(Math.Max(0, kl)); if (a0 == a1) preTop1++;
+                }
+            }
+        }
+        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = saved; dec.InvalidateCapturedSteps(); }
+        string preNote = pre.Count == 0 ? "" : $"; PREFILL (int8 tensor-core GEMM, {pre.Count} prefixes of 32..{32 * pre.Count} tokens, last row): KL mean {pre.Average():E2}, max {pre.Max():E2}, top-1 same {preTop1} of {pre.Count}";
         var sorted = kls.OrderBy(v => v).ToArray();
         string report = $"{modelTag} ({Path.GetFileName(path)}), {steps} teacher-forced steps, int8 activations vs fp32: KL mean {kls.Average():E2}, " +
             $"median {sorted[steps / 2]:E2}, p99 {sorted[(int)(steps * 0.99)]:E2}, max {sorted[^1]:E2}; top-1 same {100.0 * top1Same / steps:F1}%; " +
-            $"perplexity fp32 {Math.Exp(fp.Nll / steps):F4}, int8 {Math.Exp(i8.Nll / steps):F4} ({100.0 * (Math.Exp((i8.Nll - fp.Nll) / steps) - 1):+0.000;-0.000}%)";
+            $"perplexity fp32 {Math.Exp(fp.Nll / steps):F4}, int8 {Math.Exp(i8.Nll / steps):F4} ({100.0 * (Math.Exp((i8.Nll - fp.Nll) / steps) - 1):+0.000;-0.000}%)" + preNote;
         Console.WriteLine("[Int8ActKLD] " + report);
         return report;
     });

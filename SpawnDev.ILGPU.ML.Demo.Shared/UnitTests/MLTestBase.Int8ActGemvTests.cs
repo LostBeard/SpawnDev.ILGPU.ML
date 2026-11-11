@@ -211,4 +211,85 @@ public abstract partial class MLTestBase
             dec.InvalidateCapturedSteps();
         }
     });
+
+    /// <summary>
+    /// The prefill half of the OPT-IN int8 activations (2026-11-10, <c>FusedDequantMatMul.Int8ActGemm</c>: MmaS8Gemm, llama.cpp / Ollama's MMQ scheme): M &gt; 1
+    /// rows of Q4_K and Q6_K on the int8 tensor-core GEMMs, A in ggml's q8_1. Per shape, on 3,000 sampled outputs: (1) FIDELITY to the scheme against an f64
+    /// CPU dot of the dequantized weights with each row's q8_1-dequantized activations, within 1e-5 of sum |w x_q|; (2) the scheme's cost against fp32
+    /// activations, reported. Shapes: ragged M and N around the 128 x 128 tiles, qwen3 1.7B's q+k (2048 x 3072) and down (6144 x 2048) at a prefill's rows.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task<string> Gemm_Int8Act_MatchesGgmlQ8_1Scheme() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda) throw new UnsupportedTestException("int8 tensor cores (CUDA)");
+        if (!SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator)) throw new UnsupportedTestException("sm_80+");
+        using var fused = new SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul(accelerator);
+        bool saved = SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv;
+        var notes = new List<string>();
+        try
+        {
+            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = true;
+            foreach (var (type, M, K, N) in new[] { (GGMLType.Q4_K, 9, 256, 8), (GGMLType.Q4_K, 130, 2048, 3072), (GGMLType.Q4_K, 300, 6144, 2048), (GGMLType.Q4_K, 77, 512, 200),
+                (GGMLType.Q6_K, 9, 256, 8), (GGMLType.Q6_K, 130, 6144, 2048), (GGMLType.Q6_K, 257, 2048, 1000) })
+            {
+                var rng = new Random(31 + M + K + N);
+                int bytesPerRow = RowBytes(type, K);
+                var weightBytes = new byte[N * bytesPerRow];
+                var wRows = new float[N][];
+                for (int n = 0; n < N; n++)
+                {
+                    var rowBytes = MakeBlocks(type, K, rng);
+                    Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                    wRows[n] = ReferenceDequant(type, rowBytes, K);
+                }
+                var x = new float[M * K];
+                for (int i = 0; i < x.Length; i++) x[i] = (float)((rng.NextDouble() * 2 - 1) * Math.Pow(10, -2 + 2 * rng.NextDouble()));
+                var xq = new double[M * K];
+                for (int b = 0; b < M * K / 32; b++)
+                {
+                    float amax = 0f;
+                    for (int j = 0; j < 32; j++) amax = MathF.Max(amax, MathF.Abs(x[b * 32 + j]));
+                    float d = amax / 127f;
+                    for (int j = 0; j < 32; j++)
+                    {
+                        int q = 0;
+                        if (amax > 0f) { float t = x[b * 32 + j] / d; q = (int)(t + (t >= 0f ? 0.5f : -0.5f)); }
+                        xq[b * 32 + j] = (double)d * q;
+                    }
+                }
+                using var weightBuf = AllocatePadded(accelerator, weightBytes);
+                using var inputBuf = accelerator.Allocate1D(x);
+                using var outBuf = accelerator.Allocate1D<float>((long)M * N);
+                outBuf.MemSetToZero();
+                fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+                string route = fused.LastGemmKernel;
+                await accelerator.SynchronizeAsync();
+                var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
+                string want = type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k";
+                if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: the int8 GEMM did not run (ran '{route}')");
+                double worstFid = 0, worstCost = 0, sumCost = 0;
+                int samples = Math.Min(3000, M * N);
+                for (int s = 0; s < samples; s++)
+                {
+                    int m = samples == M * N ? s / N : rng.Next(M), n = samples == M * N ? s % N : rng.Next(N);
+                    double refQ = 0, absQ = 0, refF = 0, absF = 0;
+                    for (int k = 0; k < K; k++)
+                    {
+                        double wv = wRows[n][k];
+                        refQ += wv * xq[m * K + k]; absQ += Math.Abs(wv * xq[m * K + k]);
+                        refF += wv * x[m * K + k]; absF += Math.Abs(wv * x[m * K + k]);
+                    }
+                    double g = got[(long)m * N + n];
+                    worstFid = Math.Max(worstFid, Math.Abs(g - refQ) / Math.Max(1e-30, absQ));
+                    double cost = Math.Abs(g - refF) / Math.Max(1e-30, absF);
+                    worstCost = Math.Max(worstCost, cost); sumCost += cost;
+                }
+                string note = $"{type} M={M} K={K} N={N}: vs the q8_1 scheme worst {worstFid:E1}; cost vs fp32 activations mean {sumCost / samples:E1} worst {worstCost:E1}";
+                notes.Add(note);
+                if (!(worstFid < 1e-5)) throw new Exception(note + " - the GEMM does not compute ggml's q8_1 scheme (limit 1e-5)");
+            }
+        }
+        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = saved; }
+        return string.Join("; ", notes);
+    });
 }

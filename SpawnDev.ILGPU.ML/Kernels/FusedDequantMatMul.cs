@@ -215,6 +215,64 @@ public class FusedDequantMatMul : IDisposable
     private MemoryBuffer1D<uint, Stride1D.Dense>? _scratchA16, _scratchW16, _scratchA16Lo;
     private MemoryBuffer1D<byte, Stride1D.Dense>? _q8Qs;
     private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gemvQ6Dp4aSplit;
+    /// <summary>
+    /// The prefill half of <see cref="Int8ActGemv"/> (on with it; env GGUF_INT8_ACT_GEMM=0 is the A/B): M &gt; 1 rows of Q4_K / Q6_K on the int8 tensor-core
+    /// GEMMs (<see cref="MmaS8Gemm"/>, llama.cpp / Ollama's MMQ scheme: A in q8_1, W unpacked to int8 with per-32-value scales). CUDA sm_80+.
+    /// </summary>
+    public static bool Int8ActGemm = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_GEMM") != "0";
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _s8A, _s8As, _s8W, _s8Ws;
+    private Action<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ4KS8;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ6KS8;
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
+        ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4K, _s8Q6K;
+
+    // Q4_K rows -> int8 nibbles [N][K] (two W16 a 32-value block) and per block (ws, wm) = (d * sc_j, dmin * m_j): w = ws * q - wm. A thread per (row, block):
+    // i = n * (K / 32) + blk; sub-block j = blk % 8 of super-block blk / 8 takes the low (j even) or high nibbles of qs bytes 32 (j / 2) .. +31
+    private static void UnpackQ4KS8Impl(Index1D i, ArrayView<W16> w16, ArrayView<W16> q8, ArrayView1D<float, Stride1D.Dense> sc, int K)
+    {
+        int ii = i, nb = K >> 5, n = ii / nb, blk = ii - n * nb, sb = blk >> 3, j = blk & 7;
+        long so = (long)n * (K >> 8) * 9 + sb * 9;
+        W16 h = w16.AsAligned16()[so];
+        W16 qa = w16.AsAligned16()[so + 1 + 2 * (j >> 1)], qb = w16.AsAligned16()[so + 2 + 2 * (j >> 1)];
+        int sh = (j & 1) * 4;
+        const int m4 = 0x0F0F0F0F;
+        W16 o0, o1;
+        o0.a = (qa.a >> sh) & m4; o0.b = (qa.b >> sh) & m4; o0.c = (qa.c >> sh) & m4; o0.d = (qa.d >> sh) & m4;
+        o1.a = (qb.a >> sh) & m4; o1.b = (qb.b >> sh) & m4; o1.c = (qb.c >> sh) & m4; o1.d = (qb.d >> sh) & m4;
+        q8.AsAligned16()[2L * ii] = o0; q8.AsAligned16()[2L * ii + 1] = o1;
+        int sm = ScaleMinRegs(h.b, h.c, h.d, j);
+        sc[2L * ii] = HalfBits(h.a & 0xFFFF) * (sm & 0xFF);
+        sc[2L * ii + 1] = HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
+    }
+
+    // Q6_K rows (210-byte super-blocks: ql[128], qh[64], int8 sc[16], fp16 d) -> int8 q - 32 [N][K] and per 32-value block (s0, s1) = d * sc of its two
+    // 16-value halves: block (half nh, quarter q) of a super-block is values 128 nh + 32 q + l: the low (q < 2) or high nibble of ql[64 nh + 32 (q & 1) + l],
+    // bits 2q.. of qh[32 nh + l], scales sc[8 nh + 2q] (l < 16) and sc[8 nh + 2q + 1] (llama.cpp dequantize_row_q6_K)
+    private static void UnpackQ6KS8Impl(Index1D i, ArrayView1D<int, Stride1D.Dense> w, ArrayView<W16> q8, ArrayView1D<float, Stride1D.Dense> sc, int K)
+    {
+        int ii = i, nb = K >> 5, n = ii / nb, blk = ii - n * nb, sb = blk >> 3, nh = (blk >> 2) & 1, q = blk & 3;
+        int so = n * (K >> 8) * 210 + sb * 210;
+        int ls = 4 * (q >> 1), hs = 2 * q;
+        int qlo = so + 64 * nh + 32 * (q & 1), qho = so + 128 + 32 * nh;
+        W16 o0, o1;
+        o0.a = Q6S8(ReadWordAt(w, qlo), ReadWordAt(w, qho), ls, hs); o0.b = Q6S8(ReadWordAt(w, qlo + 4), ReadWordAt(w, qho + 4), ls, hs);
+        o0.c = Q6S8(ReadWordAt(w, qlo + 8), ReadWordAt(w, qho + 8), ls, hs); o0.d = Q6S8(ReadWordAt(w, qlo + 12), ReadWordAt(w, qho + 12), ls, hs);
+        o1.a = Q6S8(ReadWordAt(w, qlo + 16), ReadWordAt(w, qho + 16), ls, hs); o1.b = Q6S8(ReadWordAt(w, qlo + 20), ReadWordAt(w, qho + 20), ls, hs);
+        o1.c = Q6S8(ReadWordAt(w, qlo + 24), ReadWordAt(w, qho + 24), ls, hs); o1.d = Q6S8(ReadWordAt(w, qlo + 28), ReadWordAt(w, qho + 28), ls, hs);
+        q8.AsAligned16()[2L * ii] = o0; q8.AsAligned16()[2L * ii + 1] = o1;
+        float d = HalfBits(ReadU16(w, so + 208));
+        int s2 = ReadU16(w, so + 192 + 8 * nh + 2 * q);
+        sc[2L * ii] = d * (((s2 & 0xFF) ^ 0x80) - 0x80);
+        sc[2L * ii + 1] = d * ((((s2 >> 8) & 0xFF) ^ 0x80) - 0x80);
+    }
+    // four 6-bit values (low nibbles of lo >> ls | 2 bits of hi >> hs, byte-wise: 0..63) minus 32 as four int8, byte-wise without borrows: (b | 0x80) - 32 stays
+    // in 96..159, and ^ 0x80 maps it to (b - 32) & 0xFF
+    private static int Q6S8(int lo, int hi, int ls, int hs)
+    {
+        int v = ((lo >> ls) & 0x0F0F0F0F) | (((hi >> hs) & 0x03030303) << 4);
+        return ((v | unchecked((int)0x80808080)) - 0x20202020) ^ unchecked((int)0x80808080);
+    }
+
     /// <summary>A/B switch for the Q6_K half of <see cref="Int8ActGemv"/> (env GGUF_INT8_ACT_Q6=0 keeps Q6_K on fp32 activations).</summary>
     public static bool Int8ActQ6 = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_Q6") != "0";
     private MemoryBuffer1D<float, Stride1D.Dense>? _q8Ds;
@@ -800,6 +858,33 @@ public class FusedDequantMatMul : IDisposable
         // M > 1 of Q4_K / Q6_K on CUDA sm_75+: the tensor-core GEMMs (MmaKQuantGemm: weights dequantised to f16 in shared memory, f16 x f16 -> f32 mma.sync). MEASURED
         // 2026-11-02 before it (RTX 4070, llama3.1:8b, a 4,400-token prefill): the SIMT GEMMs ran gate-up at ~7.6 TFLOPS and down at ~4.8, 67% of the prefill.
         LastGemmKernel = "simt";
+        // OPT-IN int8 activations, prefill: the int8 tensor-core GEMM (MmaS8Gemm) for Q4_K / Q6_K rows
+        if (M > 1 && Int8ActGemv && Int8ActGemm && (type == GGMLType.Q4_K || type == GGMLType.Q6_K) && K % 256 == 0 && CudaCaps.TensorCores(_accelerator)
+            && CudaCaps.Dp4a(_accelerator) && CanShuffle32 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & (type == GGMLType.Q4_K ? 15 : 3)) == 0)
+        {
+            long aQ = (long)M * K, wQ = (long)N * K;
+            var s8a = GrowScratch(ref _s8A, aQ / 4); var s8as = GrowScratch(ref _s8As, aQ / 16);
+            var s8w = GrowScratch(ref _s8W, wQ / 4); var s8ws = GrowScratch(ref _s8Ws, wQ / 16);
+            _quantQ8Warp ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(QuantizeQ8_1WarpImpl);
+            _quantQ8Warp((int)aQ, input.SubView(0, aQ), s8a.View.SubView(0, aQ / 4).Cast<uint, byte>(), s8as.View.SubView(0, aQ / 16).Cast<uint, float>());
+            int nBlk = (int)(wQ >> 5);
+            if (type == GGMLType.Q4_K)
+                (_unpackQ4KS8 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>(UnpackQ4KS8Impl))(
+                    nBlk, weightQuant.BaseView.Cast<W16>(), s8w.View.BaseView.Cast<W16>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, float>(), K);
+            else
+                (_unpackQ6KS8 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>(UnpackQ6KS8Impl))(
+                    nBlk, weightQuant.Cast<byte, int>(), s8w.View.BaseView.Cast<W16>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, float>(), K);
+            var g8 = type == GGMLType.Q4_K
+                ? _s8Q4K ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
+                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q4K)
+                : _s8Q6K ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>,
+                    ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q6K);
+            int tiles8 = ((M + MmaS8Gemm.BM - 1) / MmaS8Gemm.BM) * ((N + MmaS8Gemm.BN - 1) / MmaS8Gemm.BN);
+            g8(new KernelConfig(tiles8, MmaS8Gemm.Threads), s8a.View.SubView(0, aQ / 4).Cast<uint, Trellis2.U4>(), s8as.View.SubView(0, aQ / 16).Cast<uint, Trellis2.U4>(),
+                s8w.View.SubView(0, wQ / 4).Cast<uint, Trellis2.U4>(), s8ws.View.SubView(0, wQ / 16).Cast<uint, Trellis2.U4>(), output, M, K, N);
+            LastGemmKernel = type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k";
+            return;
+        }
         // sm_75 (Turing) on the same kernels built from m16n8k8 (the Sm75 variants); ForceSm75Mma runs those on a newer card (the tests)
         bool sm80 = CudaCaps.TensorCores(_accelerator), sm75 = CudaCaps.TuringTensorCores(_accelerator);
         long inByte = ((IContiguousArrayView)input.BaseView).IndexInBytes, wByte = ((IContiguousArrayView)weightQuant.BaseView).IndexInBytes;
@@ -4010,6 +4095,7 @@ public class FusedDequantMatMul : IDisposable
         _scratchW16?.Dispose(); _scratchW16 = null;
         _scratchA16Lo?.Dispose(); _scratchA16Lo = null;
         _q8Qs?.Dispose(); _q8Qs = null;
+        _s8A?.Dispose(); _s8A = null; _s8As?.Dispose(); _s8As = null; _s8W?.Dispose(); _s8W = null; _s8Ws?.Dispose(); _s8Ws = null;
         _q8Ds?.Dispose(); _q8Ds = null;
         _scratchF16Out?.Dispose(); _scratchF16Out = null;
         _scratchS16?.Dispose(); _scratchS16 = null;
