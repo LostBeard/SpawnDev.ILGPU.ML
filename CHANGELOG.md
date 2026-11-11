@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.14 - 2026-11-11 (nuget.org) - opt-in int8 activations: prefill +42% over the default
+
+On SpawnDev.ILGPU 5.4.26. Release sweep (full default, HeavyModel excluded): 7,664 passed, 0 failed, 475 skipped, 1 h 13 m (RTX 4070, Chrome). LLM-path
+HeavyModel subset (CUDA, OpenCL, WebGPU): 80 passed, 0 failed, 21 skipped. The default (fp32 activations) is unchanged; with the opt-in int8 activations
+(GGUF_INT8_ACT=1) qwen3:1.7b Q4_K_M on CUDA prefills ~14.1k tok/s at 1,830 tokens (default ~9.9k) and decodes ~261 / ~243 tok/s (default ~237 / ~222).
+
+- **On SpawnDev.ILGPU 5.4.26** (Velocity: an adaptive host path for wide barrier-free launches; no change for ML's GPU kernels).
 - **Opt-in int8 activations: gate | up with SwiGLU in the int8 GEMM's epilogue** (`FusedDequantMatMul.ForwardGateUpSwiGLUInt8`,
   `MmaS8Gemm.S8Q4KDirectSwiGLU`; with `Int8ActFuse`, GGUF_INT8_ACT_FUSE=0 is the A/B): the direct Q4_K kernel stages the joined gate | up rows remapped so
   each 8-row block pair is (gate, up) of the same 8 ff columns, a thread holds g and u, and it writes silu(g) u straight to the down projection's input -

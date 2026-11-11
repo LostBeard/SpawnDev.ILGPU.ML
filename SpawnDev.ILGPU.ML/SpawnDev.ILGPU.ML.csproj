@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.13</Version>
-		<PackageReleaseNotes>v5.8.13 - FIX (CUDA, since 5.8.11; upgrade from 5.8.11 / 5.8.12): prompts over 512 tokens on models whose attention v projection has a different block type than q / k (common in Q4_K_M files: llama3, qwen2.5) could get badly wrong logits (up to 27 off, measured), because the v projection running on a second CUDA stream shared prefill scratch memory with the q / k projection. Fixed; overlap on and off are bit-identical. (Workaround for 5.8.11 / 5.8.12: env GGUF_OVERLAP_V=0.) Also: the opt-in int8 activations (GGUF_INT8_ACT=1, off by default) now cover prefill too, on int8 tensor cores (Ollama's MMQ scheme): qwen3:1.7b Q4_K_M prefill +9% at 1,830 tokens, +22% at 29 on an RTX 4070. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.14</Version>
+		<PackageReleaseNotes>v5.8.14 - on SpawnDev.ILGPU 5.4.26. The opt-in int8-activation mode (env GGUF_INT8_ACT=1 or FusedDequantMatMul.Int8ActGemv; off by default, CUDA) is much faster at prefill: qwen3:1.7b Q4_K_M on an RTX 4070 prefills a 1,830-token prompt at ~14.1k tok/s against the default's ~9.9k (+42%), and decodes at ~261 / ~243 tok/s (default ~237 / ~222). New: the int8 Q4_K GEMM reads the GGUF rows directly (no unpack pass), the norm and SwiGLU write the int8 activations, gate | up applies SwiGLU in its epilogue, and F16 weights take one f16 GEMM as Ollama does. Measured cost of the mode against the default: KL 5.5e-3 (decode), 3.9e-3 (prefill), perplexity +1.1%. The default fp32 path is unchanged. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.25" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.26" />
 	</ItemGroup>
 
 	<ItemGroup>
