@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Short prompts: 32-row A tiles for the tensor-core GEMMs** (prompts of at most 64 tokens; new `MmaS8Gemm.S8Q4KDirectM32` / `S8Q4KDirectSwiGLUM32` /
+  `S8Q4KM32` / `S8Q6KM32`, `MmaKQuantGemm.Q4KV2M32SplitK` / `Q6KV2M32SplitK`, `MmaGemm.KernelF16PackedV6M32SplitK`; env GGUF_S8_M32_MAX, GGUF_KQ_M32_MAX,
+  GGUF_F16_M32_MAX (rows; 0 = off) are the A/Bs). The GEMMs tiled the prompt's rows by 128, so a 29-token prompt spent 4.4x the needed MMAs on padding
+  rows: nsys (RTX 4070, qwen3:1.7b Q4_K_M) had Ollama's mmq at ~20 us a GEMM, ours 64-140 us. ggml sizes its token tile to the batch; these kernels use
+  32 rows (8 warps of 32 x 16, or 4 of 32 x 32 for F16), the same staging, scales and epilogues, and split K on top when the grid is still small.
+  Correctness: the K-quant M32 kernel is bit-identical to V1 at every oracle shape (forced on, several row tiles included); `Gemm_Int8Act_MatchesGgmlQ8_1Scheme`
+  gained 29 / 47 / 64-row shapes (3.6e-8 to 1.0e-7 to the scheme) and a check of the fused SwiGLU kernel against silu(g) u of the plain GEMM (worst 1.8e-7);
+  `Gemm_F16_MmaSplit_MatchesFp32` asserts the M32 route (worst 1.8-4.6e-7 of sum |x w|); the decoder bit-identity and greedy gates green. MEASURED
+  (29-token prefill, interleaved x3): default 1,284 -> 1,890 tok/s (+47%), int8 opt-in 1,892 -> 2,320 (+23%); long prompts and decode unchanged.
+
 - **Short prompts: split-K on the default path's K-quant tensor-core GEMMs too, and on the int8 opt-in's unpacked Q4_K / Q6_K GEMMs**
   (new `MmaKQuantGemm.Q4KV2SplitK` / `Q6KV2SplitK`, env GGUF_KQ_SPLITK=0 is the A/B; `MmaS8Gemm.S8Q4K` / `S8Q6K` gain kSplit). The split size is now
   floor(SMs / tiles), so the split grid is one wave (a grid of more than half the SMs does not split): ceil(SMs / tiles) put 16 tiles x 3 = 48 blocks on

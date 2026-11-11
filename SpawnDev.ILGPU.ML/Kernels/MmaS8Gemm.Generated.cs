@@ -17,6 +17,8 @@ using W16 = FusedDequantMatMul.W16;
 internal static class MmaS8Gemm
 {
     public const int BM = 128, BN = 128, BK = 64, Threads = 256;
+    /// <summary>The M32 kernels' A (token) tile: a short prompt's rows (see kernel(small) in the generator).</summary>
+    public const int BMS = 32;
 
     /// <summary>Q4_K on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.
     /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>
@@ -1740,6 +1742,776 @@ internal static class MmaS8Gemm
             int f0 = tileCol * 64 + wn * 16 + 8 + 2 * t, f1 = f0 + 1;
             if (m0 < M) { if (f0 < Nff) C[(long)m0 * Nff + f0] = Silu(c320) * c330; if (f1 < Nff) C[(long)m0 * Nff + f1] = Silu(c321) * c331; }
             if (m1 < M) { if (f0 < Nff) C[(long)m1 * Nff + f0] = Silu(c322) * c332; if (f1 < Nff) C[(long)m1 * Nff + f1] = Silu(c323) * c333; }
+        }
+    }
+
+    /// <summary>Q4_K on int8 for a SHORT prompt: S8Q4K with a 32-row A tile. grid = ceil(M/32) * ceil(N/128) * kSplit, group = 256 (8 warps of 32 x 16).
+    /// K a multiple of 64. kSplit as in the 128-row kernel. sm_80+.</summary>
+    public static unsafe void S8Q4KM32(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)
+    {
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<uint>(2 * BMS * 16);
+        var bS = SharedMemory.Allocate<uint>(2 * BN * 16);
+        var aSc = SharedMemory.Allocate<float>(2 * BMS * 4);
+        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        int cr = tid >> 2, cc = tid & 3;
+        int aR0 = tileRow * BMS + cr + 0, bR0 = tileCol * BN + cr + 0;
+        int aSz0 = aR0 < M ? 16 : 0, bSz0 = bR0 < N ? 16 : 0;
+        long aG0 = (long)(aSz0 != 0 ? aR0 : 0) * (K >> 4) + cc, bG0 = (long)(bSz0 != 0 ? bR0 : 0) * (K >> 4) + cc;
+        int sOff0 = (cr + 0) * 16 + ((cc ^ (((cr + 0) >> 1) & 3)) << 2);
+        int aR1 = tileRow * BMS + cr + 64, bR1 = tileCol * BN + cr + 64;
+        int aSz1 = aR1 < M ? 16 : 0, bSz1 = bR1 < N ? 16 : 0;
+        long aG1 = (long)(aSz1 != 0 ? aR1 : 0) * (K >> 4) + cc, bG1 = (long)(bSz1 != 0 ? bR1 : 0) * (K >> 4) + cc;
+        int sOff1 = (cr + 64) * 16 + ((cc ^ (((cr + 64) >> 1) & 3)) << 2);
+        // the scale rows: threads 0..31 stage row tid of the A tile, 128..255 row tid - 128 of the W tile (16 bytes = the tile's two blocks)
+        int sr = tid & 127;
+        int sAR = tileRow * BMS + sr, sBR = tileCol * BN + sr;
+        int sASz = sAR < M ? 16 : 0, sBSz = sBR < N ? 16 : 0;
+        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6), sBG = (long)(sBSz != 0 ? sBR : 0) * (K >> 6);
+        int rowA = wm * 32 + (lane & 15), rowB = wn * 16 + (lane & 7) + ((lane >> 4) << 3);
+        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;
+        int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
+        int bLd0 = rowB * 16 + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * 16 + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);
+        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;
+        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles
+        {
+            int kq = (kt0 * BK) >> 4, ks6 = (kt0 * BK) >> 6;
+            int sb = (0) * BM * 16, sc4 = (0) * BM * 4;
+            int sbA = (0) * BMS * 16, sc4a = (0) * BMS * 4;
+            if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Wq[bG0 + kq]), bSz0);
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Wq[bG1 + kq]), bSz1);
+            if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+            else if (tid >= 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);
+        }
+        CudaAsm.Emit("cp.async.commit_group;");
+        for (int it = 0; it < nk; it++)
+        {
+            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed
+            Group.Barrier();                             // and every warp is past tile it - 1, whose stage the next issue overwrites
+            if (it + 1 < nk)
+            {
+                int kq = ((kt0 + it + 1) * BK) >> 4, ks6 = ((kt0 + it + 1) * BK) >> 6;
+                int sb = ((it + 1) & 1) * BM * 16, sc4 = ((it + 1) & 1) * BM * 4;
+                int sbA = ((it + 1) & 1) * BMS * 16, sc4a = ((it + 1) & 1) * BMS * 4;
+                if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+                CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Wq[bG0 + kq]), bSz0);
+                CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Wq[bG1 + kq]), bSz1);
+                if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+                else if (tid >= 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);
+            }
+            CudaAsm.Emit("cp.async.commit_group;");
+            int so = (it & 1) * BM * 16, sc4c = (it & 1) * BM * 4;
+            int soA = (it & 1) * BMS * 16, sc4ca = (it & 1) * BMS * 4;
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[soA + aLd0 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[soA + aLd0 + 256]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref bS[so + bLd0 + 0]));
+                // the A scales of the thread's 8 rows (rows g, g + 8 of each 16-row tile) for this block, held across the n tiles
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 0;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];       // -(d * sum q)
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 0;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];       // -(d * sum q)
+                // per n tile: its column scales, its 4 MMAs issued back to back (independent: the tensor pipe overlaps them), then their epilogues
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[soA + aLd1 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[soA + aLd1 + 256]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref bS[so + bLd1 + 0]));
+                // the A scales of the thread's 8 rows (rows g, g + 8 of each 16-row tile) for this block, held across the n tiles
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 2;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];       // -(d * sum q)
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 2;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];       // -(d * sum q)
+                // per n tile: its column scales, its 4 MMAs issued back to back (independent: the tensor pipe overlaps them), then their epilogues
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+        }
+        CudaAsm.Emit("cp.async.wait_group 0;");
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
+        }
+    }
+
+    /// <summary>Q6_K on int8 for a SHORT prompt: S8Q6K with a 32-row A tile. grid = ceil(M/32) * ceil(N/128) * kSplit, group = 256 (8 warps of 32 x 16).
+    /// K a multiple of 64. kSplit as in the 128-row kernel. sm_80+.</summary>
+    public static unsafe void S8Q6KM32(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)
+    {
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<uint>(2 * BMS * 16);
+        var bS = SharedMemory.Allocate<uint>(2 * BN * 16);
+        var aSc = SharedMemory.Allocate<float>(2 * BMS * 4);
+        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        int cr = tid >> 2, cc = tid & 3;
+        int aR0 = tileRow * BMS + cr + 0, bR0 = tileCol * BN + cr + 0;
+        int aSz0 = aR0 < M ? 16 : 0, bSz0 = bR0 < N ? 16 : 0;
+        long aG0 = (long)(aSz0 != 0 ? aR0 : 0) * (K >> 4) + cc, bG0 = (long)(bSz0 != 0 ? bR0 : 0) * (K >> 4) + cc;
+        int sOff0 = (cr + 0) * 16 + ((cc ^ (((cr + 0) >> 1) & 3)) << 2);
+        int aR1 = tileRow * BMS + cr + 64, bR1 = tileCol * BN + cr + 64;
+        int aSz1 = aR1 < M ? 16 : 0, bSz1 = bR1 < N ? 16 : 0;
+        long aG1 = (long)(aSz1 != 0 ? aR1 : 0) * (K >> 4) + cc, bG1 = (long)(bSz1 != 0 ? bR1 : 0) * (K >> 4) + cc;
+        int sOff1 = (cr + 64) * 16 + ((cc ^ (((cr + 64) >> 1) & 3)) << 2);
+        // the scale rows: threads 0..31 stage row tid of the A tile, 128..255 row tid - 128 of the W tile (16 bytes = the tile's two blocks)
+        int sr = tid & 127;
+        int sAR = tileRow * BMS + sr, sBR = tileCol * BN + sr;
+        int sASz = sAR < M ? 16 : 0, sBSz = sBR < N ? 16 : 0;
+        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6), sBG = (long)(sBSz != 0 ? sBR : 0) * (K >> 6);
+        int rowA = wm * 32 + (lane & 15), rowB = wn * 16 + (lane & 7) + ((lane >> 4) << 3);
+        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;
+        int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
+        int bLd0 = rowB * 16 + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * 16 + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);
+        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;
+        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles
+        {
+            int kq = (kt0 * BK) >> 4, ks6 = (kt0 * BK) >> 6;
+            int sb = (0) * BM * 16, sc4 = (0) * BM * 4;
+            int sbA = (0) * BMS * 16, sc4a = (0) * BMS * 4;
+            if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Wq[bG0 + kq]), bSz0);
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Wq[bG1 + kq]), bSz1);
+            if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+            else if (tid >= 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);
+        }
+        CudaAsm.Emit("cp.async.commit_group;");
+        for (int it = 0; it < nk; it++)
+        {
+            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed
+            Group.Barrier();                             // and every warp is past tile it - 1, whose stage the next issue overwrites
+            if (it + 1 < nk)
+            {
+                int kq = ((kt0 + it + 1) * BK) >> 4, ks6 = ((kt0 + it + 1) * BK) >> 6;
+                int sb = ((it + 1) & 1) * BM * 16, sc4 = ((it + 1) & 1) * BM * 4;
+                int sbA = ((it + 1) & 1) * BMS * 16, sc4a = ((it + 1) & 1) * BMS * 4;
+                if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+                CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Wq[bG0 + kq]), bSz0);
+                CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sb + sOff1]), (ulong)Unsafe.AsPointer(ref Wq[bG1 + kq]), bSz1);
+                if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+                else if (tid >= 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);
+            }
+            CudaAsm.Emit("cp.async.commit_group;");
+            int so = (it & 1) * BM * 16, sc4c = (it & 1) * BM * 4;
+            int soA = (it & 1) * BMS * 16, sc4ca = (it & 1) * BMS * 4;
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[soA + aLd0 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[soA + aLd0 + 256]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref bS[so + bLd0 + 0]));
+                // the A scales of the thread's 8 rows (rows g, g + 8 of each 16-row tile) for this block, held across the n tiles
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 0;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 0;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                // per n tile: its column scales, its 4 MMAs issued back to back (independent: the tensor pipe overlaps them), then their epilogues
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, b00);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j00, out int j01, out int j02, out int j03, a02, a03, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, b00);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j10, out int j11, out int j12, out int j13, a12, a13, b01);
+                c000 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x0, (float)i00, y0 * (float)j00), c000);
+                c001 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x1, (float)i01, y1 * (float)j01), c001);
+                c002 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x0, (float)i02, y0 * (float)j02), c002);
+                c003 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x1, (float)i03, y1 * (float)j03), c003);
+                c100 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x0, (float)i10, y0 * (float)j10), c100);
+                c101 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x1, (float)i11, y1 * (float)j11), c101);
+                c102 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x0, (float)i12, y0 * (float)j12), c102);
+                c103 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x1, (float)i13, y1 * (float)j13), c103);
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, b10);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j00, out int j01, out int j02, out int j03, a02, a03, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, b10);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j10, out int j11, out int j12, out int j13, a12, a13, b11);
+                c010 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x0, (float)i00, y0 * (float)j00), c010);
+                c011 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x1, (float)i01, y1 * (float)j01), c011);
+                c012 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x0, (float)i02, y0 * (float)j02), c012);
+                c013 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x1, (float)i03, y1 * (float)j03), c013);
+                c110 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x0, (float)i10, y0 * (float)j10), c110);
+                c111 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x1, (float)i11, y1 * (float)j11), c111);
+                c112 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x0, (float)i12, y0 * (float)j12), c112);
+                c113 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x1, (float)i13, y1 * (float)j13), c113);
+                }
+            }
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[soA + aLd1 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[soA + aLd1 + 256]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint b00, out uint b01, out uint b10, out uint b11, (ulong)Unsafe.AsPointer(ref bS[so + bLd1 + 0]));
+                // the A scales of the thread's 8 rows (rows g, g + 8 of each 16-row tile) for this block, held across the n tiles
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 2;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 2;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                // per n tile: its column scales, its 4 MMAs issued back to back (independent: the tensor pipe overlaps them), then their epilogues
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, b00);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j00, out int j01, out int j02, out int j03, a02, a03, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, b00);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j10, out int j11, out int j12, out int j13, a12, a13, b01);
+                c000 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x0, (float)i00, y0 * (float)j00), c000);
+                c001 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x1, (float)i01, y1 * (float)j01), c001);
+                c002 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x0, (float)i02, y0 * (float)j02), c002);
+                c003 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x1, (float)i03, y1 * (float)j03), c003);
+                c100 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x0, (float)i10, y0 * (float)j10), c100);
+                c101 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x1, (float)i11, y1 * (float)j11), c101);
+                c102 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x0, (float)i12, y0 * (float)j12), c102);
+                c103 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x1, (float)i13, y1 * (float)j13), c103);
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, b10);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j00, out int j01, out int j02, out int j03, a02, a03, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, b10);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }", out int j10, out int j11, out int j12, out int j13, a12, a13, b11);
+                c010 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x0, (float)i00, y0 * (float)j00), c010);
+                c011 = float.MultiplyAddEstimate(da00, float.MultiplyAddEstimate(x1, (float)i01, y1 * (float)j01), c011);
+                c012 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x0, (float)i02, y0 * (float)j02), c012);
+                c013 = float.MultiplyAddEstimate(da01, float.MultiplyAddEstimate(x1, (float)i03, y1 * (float)j03), c013);
+                c110 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x0, (float)i10, y0 * (float)j10), c110);
+                c111 = float.MultiplyAddEstimate(da10, float.MultiplyAddEstimate(x1, (float)i11, y1 * (float)j11), c111);
+                c112 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x0, (float)i12, y0 * (float)j12), c112);
+                c113 = float.MultiplyAddEstimate(da11, float.MultiplyAddEstimate(x1, (float)i13, y1 * (float)j13), c113);
+                }
+            }
+        }
+        CudaAsm.Emit("cp.async.wait_group 0;");
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
+        }
+    }
+
+    /// <summary>S8Q4KDirect for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16), as ggml's mmq sizes mmq_x to the batch;
+    /// grid = ceil(M/32) * ceil(N/128) * kSplit. Same staging, scales and epilogue as the 128-row kernel. sm_80+.</summary>
+    public static unsafe void S8Q4KDirectM32(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N, int kSplit)
+    {
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        int ktAll = K / BK, ktPer = (ktAll + kSplit - 1) / kSplit, kt0 = slice * ktPer;
+        long cOff = (long)slice * M * N;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<uint>(2 * BMS * 16);
+        var bS = SharedMemory.Allocate<uint>(2 * BN * 8);
+        var aSc = SharedMemory.Allocate<float>(2 * BMS * 4);
+        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        int cr = tid >> 2, cc = tid & 3;
+        int aR0 = tileRow * BMS + cr + 0;
+        int aSz0 = aR0 < M ? 16 : 0;
+        long aG0 = (long)(aSz0 != 0 ? aR0 : 0) * (K >> 4) + cc;
+        int sOff0 = (cr + 0) * 16 + ((cc ^ (((cr + 0) >> 1) & 3)) << 2);
+        // W: thread tid stages row tid >> 1, 16-byte chunk tid & 1 of the tile's nibble chunk
+        int wr = tid >> 1, wc = tid & 1;
+        int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;
+        long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16
+        int bOff = wr * 8 + ((wc ^ ((wr >> 2) & 1)) << 2);
+        // scales: threads 0..31 stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair
+        // (when only warps 4..7 computed them, every tile's barrier waited on those warps: ncu 2026-11-11, barrier stalls 13% of the kernel)
+        int sr = tid & 127, wsr = tid >> 1, wsh = tid & 1;
+        int sAR = tileRow * BMS + sr, sBR = tileCol * BN + wsr;
+        bool sBOk = sBR < N;
+        int sASz = sAR < M ? 16 : 0;
+        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);
+        long sWRow = (long)(sBOk ? sBR : 0) * ((K >> 8) * 9);
+        int rowA = wm * 32 + (lane & 15), rowB = wn * 16 + (lane & 7) + ((lane >> 4) << 3);
+        int swA = (rowA >> 1) & 3, swB = (rowB >> 2) & 1;
+        int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
+        int bLd = rowB * 8 + ((((lane >> 3) & 1) ^ swB) << 2);
+        int nk = Math.Min(ktAll, kt0 + ktPer) - kt0;                              // this slice's K tiles
+        // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs
+        // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)
+        W16 h0 = default, hPre = default;
+        if (sBOk && nk > 0) { h0 = Wq.AsAligned16()[sWRow + ((kt0 * BK) >> 8) * 9]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + (((kt0 + 1) * BK) >> 8) * 9]; }
+        {
+            int ktI = kt0 * BK;
+            int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
+            int sb = (0) * BMS * 16, sbw = (0) * BN * 8, sc4 = (0) * BN * 4, sc4a = (0) * BMS * 4;
+            if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
+            if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+            {
+                float ws = 0f, wmn = 0f;
+                if (sBOk)
+                {
+                    W16 h = h0;
+                    int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                    ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
+                }
+                int o = sc4 + wsr * 4 + 2 * wsh;
+                bSc[o] = ws; bSc[o + 1] = wmn;
+            }
+        }
+        CudaAsm.Emit("cp.async.commit_group;");
+        for (int it = 0; it < nk; it++)
+        {
+            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed (and its computed W scales: the barrier publishes them)
+            Group.Barrier();
+            if (it + 1 < nk)
+            {
+                {
+                    int ktI = (kt0 + it + 1) * BK;
+                    int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
+                    int sb = ((it + 1) & 1) * BMS * 16, sbw = ((it + 1) & 1) * BN * 8, sc4 = ((it + 1) & 1) * BN * 4, sc4a = ((it + 1) & 1) * BMS * 4;
+                    if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+                    CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
+                    if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+                    {
+                        float ws = 0f, wmn = 0f;
+                        if (sBOk)
+                        {
+                            W16 h = hPre;
+                            int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                            ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
+                        }
+                        int o = sc4 + wsr * 4 + 2 * wsh;
+                        bSc[o] = ws; bSc[o + 1] = wmn;
+                    }
+                }
+                if (sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((kt0 + it + 2) * BK) >> 8) * 9];
+            }
+            CudaAsm.Emit("cp.async.commit_group;");
+            int so = (it & 1) * BMS * 16, sow = (it & 1) * BN * 8, sc4c = (it & 1) * BN * 4, sc4ca = (it & 1) * BMS * 4;
+            // the pair's raw nibble words, once for both blocks
+            CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint r00, out uint r01, out uint r10, out uint r11, (ulong)Unsafe.AsPointer(ref bS[sow + bLd + 0]));
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[so + aLd0 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[so + aLd0 + 256]));
+                uint b00 = r00 & 0x0F0F0F0Fu, b01 = r01 & 0x0F0F0F0Fu;
+                uint b10 = r10 & 0x0F0F0F0Fu, b11 = r11 & 0x0F0F0F0Fu;
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 0;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 0;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[so + aLd1 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[so + aLd1 + 256]));
+                uint b00 = (r00 >> 4) & 0x0F0F0F0Fu, b01 = (r01 >> 4) & 0x0F0F0F0Fu;
+                uint b10 = (r10 >> 4) & 0x0F0F0F0Fu, b11 = (r11 >> 4) & 0x0F0F0F0Fu;
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 2;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 2;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+        }
+        CudaAsm.Emit("cp.async.wait_group 0;");
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
+        }
+    }
+
+    /// <summary>S8Q4KDirectSwiGLU for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16), as ggml's mmq sizes mmq_x to the batch;
+    /// grid = ceil(M/32) * (Nff / 64). Same staging, scales and epilogue as the 128-row kernel. sm_80+.</summary>
+    public static unsafe void S8Q4KDirectSwiGLUM32(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int Nff)
+    {
+        int N = 2 * Nff;
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tileRow = Grid.IdxX % numTilesM;
+        int tileCol = Grid.IdxX / numTilesM;
+        int kt0 = 0;
+        long cOff = 0;
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<uint>(2 * BMS * 16);
+        var bS = SharedMemory.Allocate<uint>(2 * BN * 8);
+        var aSc = SharedMemory.Allocate<float>(2 * BMS * 4);
+        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        int cr = tid >> 2, cc = tid & 3;
+        int aR0 = tileRow * BMS + cr + 0;
+        int aSz0 = aR0 < M ? 16 : 0;
+        long aG0 = (long)(aSz0 != 0 ? aR0 : 0) * (K >> 4) + cc;
+        int sOff0 = (cr + 0) * 16 + ((cc ^ (((cr + 0) >> 1) & 3)) << 2);
+        // W: thread tid stages row tid >> 1, 16-byte chunk tid & 1 of the tile's nibble chunk
+        int wr = tid >> 1, wc = tid & 1;
+        int wb8 = wr >> 3, ffw = tileCol * 64 + (wb8 >> 1) * 8 + (wr & 7);       // block 2j: gate row ff, block 2j + 1: up row Nff + ff
+        int bRg = (wb8 & 1) == 0 ? ffw : Nff + ffw; int bSz = ffw < Nff ? 16 : 0;
+        long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16
+        int bOff = wr * 8 + ((wc ^ ((wr >> 2) & 1)) << 2);
+        // scales: threads 0..31 stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair
+        // (when only warps 4..7 computed them, every tile's barrier waited on those warps: ncu 2026-11-11, barrier stalls 13% of the kernel)
+        int sr = tid & 127, wsr = tid >> 1, wsh = tid & 1;
+        int sb8 = wsr >> 3, ffs = tileCol * 64 + (sb8 >> 1) * 8 + (wsr & 7);
+        int sAR = tileRow * BMS + sr, sBR = (sb8 & 1) == 0 ? ffs : Nff + ffs;
+        bool sBOk = ffs < Nff;
+        int sASz = sAR < M ? 16 : 0;
+        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);
+        long sWRow = (long)(sBOk ? sBR : 0) * ((K >> 8) * 9);
+        int rowA = wm * 32 + (lane & 15), rowB = wn * 16 + (lane & 7) + ((lane >> 4) << 3);
+        int swA = (rowA >> 1) & 3, swB = (rowB >> 2) & 1;
+        int aLd0 = rowA * 16 + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * 16 + (((2 + (lane >> 4)) ^ swA) << 2);
+        int bLd = rowB * 8 + ((((lane >> 3) & 1) ^ swB) << 2);
+        int nk = K / BK;
+        // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs
+        // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)
+        W16 h0 = default, hPre = default;
+        if (sBOk && nk > 0) { h0 = Wq.AsAligned16()[sWRow + ((kt0 * BK) >> 8) * 9]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + (((kt0 + 1) * BK) >> 8) * 9]; }
+        {
+            int ktI = kt0 * BK;
+            int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
+            int sb = (0) * BMS * 16, sbw = (0) * BN * 8, sc4 = (0) * BN * 4, sc4a = (0) * BMS * 4;
+            if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+            CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
+            if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+            {
+                float ws = 0f, wmn = 0f;
+                if (sBOk)
+                {
+                    W16 h = h0;
+                    int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                    ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
+                }
+                int o = sc4 + wsr * 4 + 2 * wsh;
+                bSc[o] = ws; bSc[o + 1] = wmn;
+            }
+        }
+        CudaAsm.Emit("cp.async.commit_group;");
+        for (int it = 0; it < nk; it++)
+        {
+            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed (and its computed W scales: the barrier publishes them)
+            Group.Barrier();
+            if (it + 1 < nk)
+            {
+                {
+                    int ktI = (kt0 + it + 1) * BK;
+                    int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;
+                    int sb = ((it + 1) & 1) * BMS * 16, sbw = ((it + 1) & 1) * BN * 8, sc4 = ((it + 1) & 1) * BN * 4, sc4a = ((it + 1) & 1) * BMS * 4;
+                    if (tid < 128) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows
+                    CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);
+                    if (tid < 32) CudaAsm.Emit("cp.async.cg.shared.global [%0], [%1], 16, %2;", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);
+                    {
+                        float ws = 0f, wmn = 0f;
+                        if (sBOk)
+                        {
+                            W16 h = hPre;
+                            int sm = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + wsh);
+                            ws = FusedDequantMatMul.HalfBits(h.a & 0xFFFF) * (sm & 0xFF); wmn = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF) * (sm >> 8);
+                        }
+                        int o = sc4 + wsr * 4 + 2 * wsh;
+                        bSc[o] = ws; bSc[o + 1] = wmn;
+                    }
+                }
+                if (sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((kt0 + it + 2) * BK) >> 8) * 9];
+            }
+            CudaAsm.Emit("cp.async.commit_group;");
+            int so = (it & 1) * BMS * 16, sow = (it & 1) * BN * 8, sc4c = (it & 1) * BN * 4, sc4ca = (it & 1) * BMS * 4;
+            // the pair's raw nibble words, once for both blocks
+            CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint r00, out uint r01, out uint r10, out uint r11, (ulong)Unsafe.AsPointer(ref bS[sow + bLd + 0]));
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[so + aLd0 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[so + aLd0 + 256]));
+                uint b00 = r00 & 0x0F0F0F0Fu, b01 = r01 & 0x0F0F0F0Fu;
+                uint b10 = r10 & 0x0F0F0F0Fu, b11 = r11 & 0x0F0F0F0Fu;
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 0;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 0;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 0;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+            {
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a00, out uint a01, out uint a02, out uint a03, (ulong)Unsafe.AsPointer(ref aS[so + aLd1 + 0]));
+                CudaAsm.Emit("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];", out uint a10, out uint a11, out uint a12, out uint a13, (ulong)Unsafe.AsPointer(ref aS[so + aLd1 + 256]));
+                uint b00 = (r00 >> 4) & 0x0F0F0F0Fu, b01 = (r01 >> 4) & 0x0F0F0F0Fu;
+                uint b10 = (r10 >> 4) & 0x0F0F0F0Fu, b11 = (r11 >> 4) & 0x0F0F0F0Fu;
+                int ac0 = sc4ca + (wm * 32 + 0 + g) * 4 + 2;
+                float da00 = aSc[ac0], da01 = aSc[ac0 + 32];
+                float sa00 = -aSc[ac0 + 1], sa01 = -aSc[ac0 + 33];
+                int ac1 = sc4ca + (wm * 32 + 16 + g) * 4 + 2;
+                float da10 = aSc[ac1], da11 = aSc[ac1 + 32];
+                float sa10 = -aSc[ac1 + 1], sa11 = -aSc[ac1 + 33];
+                {
+                int bc = sc4c + (wn * 16 + 0 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b00, b01);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b00, b01);
+                c000 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c000));
+                c001 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c001));
+                c002 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c002));
+                c003 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c003));
+                c100 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c100));
+                c101 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c101));
+                c102 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c102));
+                c103 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c103));
+                }
+                {
+                int bc = sc4c + (wn * 16 + 8 + 2 * t) * 4 + 2;
+                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i00, out int i01, out int i02, out int i03, a00, a01, a02, a03, b10, b11);
+                CudaAsm.Emit("{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }", out int i10, out int i11, out int i12, out int i13, a10, a11, a12, a13, b10, b11);
+                c010 = float.MultiplyAddEstimate(sa00, y0, float.MultiplyAddEstimate(da00 * x0, (float)i00, c010));
+                c011 = float.MultiplyAddEstimate(sa00, y1, float.MultiplyAddEstimate(da00 * x1, (float)i01, c011));
+                c012 = float.MultiplyAddEstimate(sa01, y0, float.MultiplyAddEstimate(da01 * x0, (float)i02, c012));
+                c013 = float.MultiplyAddEstimate(sa01, y1, float.MultiplyAddEstimate(da01 * x1, (float)i03, c013));
+                c110 = float.MultiplyAddEstimate(sa10, y0, float.MultiplyAddEstimate(da10 * x0, (float)i10, c110));
+                c111 = float.MultiplyAddEstimate(sa10, y1, float.MultiplyAddEstimate(da10 * x1, (float)i11, c111));
+                c112 = float.MultiplyAddEstimate(sa11, y0, float.MultiplyAddEstimate(da11 * x0, (float)i12, c112));
+                c113 = float.MultiplyAddEstimate(sa11, y1, float.MultiplyAddEstimate(da11 * x1, (float)i13, c113));
+                }
+            }
+        }
+        CudaAsm.Emit("cp.async.wait_group 0;");
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int f0 = tileCol * 64 + wn * 8 + 0 + 2 * t, f1 = f0 + 1;
+            if (m0 < M) { if (f0 < Nff) C[(long)m0 * Nff + f0] = Silu(c000) * c010; if (f1 < Nff) C[(long)m0 * Nff + f1] = Silu(c001) * c011; }
+            if (m1 < M) { if (f0 < Nff) C[(long)m1 * Nff + f0] = Silu(c002) * c012; if (f1 < Nff) C[(long)m1 * Nff + f1] = Silu(c003) * c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int f0 = tileCol * 64 + wn * 8 + 0 + 2 * t, f1 = f0 + 1;
+            if (m0 < M) { if (f0 < Nff) C[(long)m0 * Nff + f0] = Silu(c100) * c110; if (f1 < Nff) C[(long)m0 * Nff + f1] = Silu(c101) * c111; }
+            if (m1 < M) { if (f0 < Nff) C[(long)m1 * Nff + f0] = Silu(c102) * c112; if (f1 < Nff) C[(long)m1 * Nff + f1] = Silu(c103) * c113; }
         }
     }
 

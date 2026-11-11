@@ -48,6 +48,8 @@ w("")
 w("internal static class MmaGemm")
 w("{")
 w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, V5Threads = 128, V7Threads = 256, V7BM = 256, RowWords = 20;")
+w("    /// <summary>The V6M32 kernel's A (token) tile: a short prompt's rows.</summary>")
+w("    public const int BMS = 32;")
 w("")
 w("    private static float Activate(float v, int act)")
 w("    {")
@@ -1149,7 +1151,7 @@ kernel_packed_v7r(swiglu=True)
 
 
 
-def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
+def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, small=False):
     """Kernel{Bf16|F16}PackedV6{Acc} (2026-11-05): V5 (4 warps of 64 x 64, cp.async, ldmatrix, column-major block order) with THREE stages:
     two K tiles in flight while one computes. Rows are 64 bytes with no padding and the 16-byte chunks XOR-swizzled (chunk c of row r at
     c ^ ((r >> 1) & 3)), so the 8 row addresses of every ldmatrix 8 x 8 read land in 8 distinct bank groups and 3 stages fit the 48 KB of
@@ -1161,7 +1163,12 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
     RW = 16          # words per row: 32 halves, no padding
     ST = 3
     MT5, NT5 = 4, 8
-    name = f"Kernel{dtype}PackedV6{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}{'SplitK' if splitk else ''}"
+    # small (2026-11-11, M32; with splitk only): a 32-row A (token) tile for a SHORT prompt (ggml's mmq sizes mmq_x to the batch; the 128-row tile spent
+    # 4.4x the needed MMAs on padding at 29 tokens). 4 warps of 32 x 32; A staged one 16-byte chunk a thread (row tid >> 2), W unchanged.
+    if small:
+        MT5, NT5 = 2, 4
+    BMx, WMr, WNc = ("BMS", 32, 32) if small else ("BM", 64, 64)
+    name = f"Kernel{dtype}PackedV6{'M32' if small else ''}{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}{'SplitK' if splitk else ''}"
     w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
     if swiglu:
         w("    /// <summary>The gate | up GEMM with SwiGLU in the epilogue: W rows are gate and up interleaved in 8-row blocks (n-tile 2j = gate, 2j + 1 = up of")
@@ -1174,11 +1181,13 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
     elif splitk:
         w("    /// <summary>Split-K for SMALL grids (a short prompt: fewer 128 x 128 tiles than SMs, ML's F16 v projection ran 8 blocks on 46 SMs): grid = tiles * kSplit;")
         w("    /// block slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (the caller sums the slices in order: deterministic).</summary>")
+        if small:
+            w("    /// <summary>KernelF16PackedV6SplitK for a SHORT prompt: a 32-row A tile (4 warps of 32 x 32). grid = ceil(M/32) * ceil(N/128) * kSplit (kSplit 1: no split).</summary>")
         w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, int M, int K, int N, int kSplit)")
     else:
         w(f"    public static unsafe void {name}(U4V Au, U4V Wu, FV sc, FV C, {'FV D, ' if acc else ''}int M, int K, int N)")
     w("    {")
-    w("        int numTilesM = (M + BM - 1) / BM;")
+    w(f"        int numTilesM = (M + {BMx} - 1) / {BMx};")
     if splitk:
         w("        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;")
         w("        int tileRow = bIdx % numTilesM;")
@@ -1190,21 +1199,21 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
-    w("        int wm = warp >> 1, wn = warp & 1;")
+    w("        int wm = 0, wn = warp;" if small else "        int wm = warp >> 1, wn = warp & 1;")
     w("        float inv = sc[1];")
-    w(f"        var aS = SharedMemory.Allocate<uint>({ST} * BM * {RW});")
+    w(f"        var aS = SharedMemory.Allocate<uint>({ST} * {BMx} * {RW});")
     w(f"        var bS = SharedMemory.Allocate<uint>({ST} * BN * {RW});")
     for mt in range(MT5):
         for nt in range(NT5):
             w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
     w("        int cr = tid >> 2, cc = tid & 3;")
     for i in range(4):
-        w(f"        int aR{i} = tileRow * BM + cr + {32 * i}, bR{i} = tileCol * BN + cr + {32 * i};")
+        w(f"        int aR{i} = tileRow * {BMx} + cr + {32 * i}, bR{i} = tileCol * BN + cr + {32 * i};")
         w(f"        int aSz{i} = aR{i} < M ? 16 : 0, bSz{i} = bR{i} < N ? 16 : 0;")
         w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 3) + cc, bG{i} = (long)(bSz{i} != 0 ? bR{i} : 0) * (K >> 3) + cc;")
         w(f"        int sOff{i} = (cr + {32 * i}) * {RW} + ((cc ^ (((cr + {32 * i}) >> 1) & 3)) << 2);")
     w("        // ldmatrix lane rows and their swizzled chunk offsets per k16 step (adding 16-row tile offsets keeps (row >> 1) & 3)")
-    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 64 + (lane & 7) + ((lane >> 4) << 3);")
+    w(f"        int rowA = wm * {WMr} + (lane & 15), rowB = wn * {WNc} + (lane & 7) + ((lane >> 4) << 3);")
     w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;")
     w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
     w(f"        int bLd0 = rowB * {RW} + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * {RW} + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);")
@@ -1218,7 +1227,10 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
         w(f"{ind}{{")
         w(f"{ind}    int kq = ({kt_expr}) >> 3;")
         w(f"{ind}    int sb = ({st_expr}) * BM * {RW};")
-        for (arr, src, gp, zp) in (("aS", "Au", "aG", "aSz"), ("bS", "Wu", "bG", "bSz")):
+        if small:
+            w(f"{ind}    int sbA = ({st_expr}) * BMS * {RW};")
+            w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Au[aG0 + kq]), aSz0);   // the 32 A rows")
+        for (arr, src, gp, zp) in ((("bS", "Wu", "bG", "bSz"),) if small else (("aS", "Au", "aG", "aSz"), ("bS", "Wu", "bG", "bSz"))):
             for i in range(4):
                 w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref {arr}[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref {src}[{gp}{i} + kq]), {zp}{i});")
         w(f"{ind}}}")
@@ -1237,10 +1249,12 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
     issue("(kt0 + it + 2) * BK" if splitk else "(it + 2) * BK", "(it + 2) % 3", "            ")
     w('            CudaAsm.Emit("cp.async.commit_group;");')
     w(f"            int so = (it % 3) * BM * {RW};")
+    if small:
+        w(f"            int soA = (it % 3) * BMS * {RW};")
     for ks in range(2):
         w("            {")
         for mt in range(MT5):
-            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd{ks} + {mt * 16 * RW}]));')
+            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[{"soA" if small else "so"} + aLd{ks} + {mt * 16 * RW}]));')
         for np_ in range(NT5 // 2):
             w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[so + bLd{ks} + {np_ * 16 * RW}]));')
         for mt in range(MT5):
@@ -1272,8 +1286,8 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False):
     for mt in range(MT5):
         for nt in range(NT5):
             w("        {")
-            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-            w(f"            int n0 = tileCol * BN + wn * 64 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * {WNc} + {nt * 8} + 2 * t, n1 = n0 + 1;")
             if split:
                 w("            if (n0 < N)")
                 w("            {")
@@ -1303,6 +1317,7 @@ kernel_packed_v6("Bf16", acc=True)
 kernel_packed_v6("F16", split=True)
 kernel_packed_v6("F16", swiglu=True)
 kernel_packed_v6("F16", splitk=True)
+kernel_packed_v6("F16", splitk=True, small=True)
 w("    // silu(g) u for two columns, rounded to f16 and packed (low half = the first): ActivationKernels.SwiGLUImpl's expression, PackA16Impl's rounding")
 w("    private static uint SwiPack(float g0, float u0, float g1, float u1)")
 w("    {")

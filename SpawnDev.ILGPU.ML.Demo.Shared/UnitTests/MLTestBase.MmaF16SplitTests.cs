@@ -70,6 +70,9 @@ public abstract partial class MLTestBase
                 string note = $"M={M} K={K} N={N}: {split.Route} worst {split.Worst:E1}, {fp32.Route} (fp32 path) worst {fp32.Worst:E1}";
                 notes.Add(note);
                 if (!split.Route.StartsWith("mma-f16-split")) throw new Exception($"{note} - the F16 GEMM did not take the split tensor-core route");
+                // a short prompt (M <= F16M32Max: 16, 64 here) takes the 32-row A tile on sm_80+
+                if (SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator) && (M <= SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.F16M32Max) != split.Route.Contains("-m32"))
+                    throw new Exception($"{note} - the 32-row tile {(M <= SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.F16M32Max ? "was not" : "was")} taken");
                 if (!(split.Worst < 4e-6)) throw new Exception($"{note} - the split route lost accuracy (limit 4e-6 of sum |x w|)");
             }
         }

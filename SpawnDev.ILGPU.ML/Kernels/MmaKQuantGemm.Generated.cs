@@ -17,6 +17,8 @@ using W16 = FusedDequantMatMul.W16;
 internal static class MmaKQuantGemm
 {
     public const int BM = 128, BN = 128, BK = 32, Threads = 256, RowWords = 20;
+    /// <summary>The V2M32 kernels' A (token) tile: a short prompt's rows.</summary>
+    public const int BMS = 32;
 
     private static uint PackF16(float lo, float hi)
     {
@@ -3172,6 +3174,152 @@ internal static class MmaKQuantGemm
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c330; if (n1 < N) C[cOff + (long)m0 * N + n1] = c331; }
             if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c332; if (n1 < N) C[cOff + (long)m1 * N + n1] = c333; }
+        }
+    }
+
+    /// <summary>Q4KV2 for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16). grid = ceil(M/32) * ceil(N/128) * kSplit (kSplit 1: no split).</summary>
+    /// <summary>Q4_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 16-byte aligned. sm_80+: m16n8k16.</summary>
+    /// <summary>Split-K for SMALL grids (a short prompt: fewer 128 x 128 tiles than SMs): grid = tiles * kSplit; block slice s takes K [s per, (s + 1) per)
+    /// and writes its partial C to C + s M N (the caller sums the slices in order: deterministic).</summary>
+    public static void Q4KV2M32SplitK(ArrayView<F4> A, ArrayView<W16> Wq, FV C, int M, int K, int N, int kSplit)
+    {
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
+        int ktPer = (K / BK + kSplit - 1) / kSplit, kBeg = slice * ktPer * BK, kEnd = Math.Min(K, kBeg + ktPer * BK);
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<ulong>(2 * BMS * 10);
+        var bS = SharedMemory.Allocate<ulong>(2 * BN * 10);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        // staging: thread = (row sr = tid >> 1, k16 block kb = tid & 1) for A; (weight row brow = tid >> 1, half bh = tid & 1) for W
+        int sr = tid >> 1, kb = tid & 1;
+        int aRg = tileRow * BMS + sr; int aOk = sr < BMS && aRg < M ? 1 : 0;            // threads 0..63 stage the 32 A rows
+        long aBase = (long)aRg * (K >> 2) + kb * 4;
+        int brow = tid >> 1, bh = tid & 1;
+        int bRg = tileCol * BN + brow; int bOk = bRg < N ? 1 : 0;
+        long bRow = (long)bRg * ((K >> 8) * 9);                            // a super-block is 144 bytes = 9 W16
+        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;
+        W16 ph = default, pq = default;
+        if (aOk != 0) { long ab = aBase + ((kBeg) >> 2); pa0 = A.AsAligned16()[ab]; pa1 = A.AsAligned16()[ab + 1]; pa2 = A.AsAligned16()[ab + 2]; pa3 = A.AsAligned16()[ab + 3]; }
+        else { pa0 = default; pa1 = default; pa2 = default; pa3 = default; }
+        { int ktL = kBeg; long sbL = bRow + (ktL >> 8) * 9; int jL = (ktL >> 5) & 7;
+          ph = bOk != 0 ? Wq.AsAligned16()[sbL] : default(W16); pq = bOk != 0 ? Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh] : default(W16); }
+        {
+            uint x0 = PackF16(pa0.A, pa0.B), x1 = PackF16(pa0.C, pa0.D), x2 = PackF16(pa1.A, pa1.B), x3 = PackF16(pa1.C, pa1.D);
+            uint x4 = PackF16(pa2.A, pa2.B), x5 = PackF16(pa2.C, pa2.D), x6 = PackF16(pa3.A, pa3.B), x7 = PackF16(pa3.C, pa3.D);
+            int o = 0 * BMS * 10 + sr * 10 + kb * 4;
+            if (sr < BMS) { aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32); }
+        }
+        {
+            int j = ((kBeg) >> 5) & 7, sh = (j & 1) * 4;
+            ScaleMin s = SubBlockScale(ph, j);
+            uint y0 = Pair(pq.a, 0, sh, s), y1 = Pair(pq.a, 1, sh, s);
+            uint y2 = Pair(pq.b, 0, sh, s), y3 = Pair(pq.b, 1, sh, s);
+            uint y4 = Pair(pq.c, 0, sh, s), y5 = Pair(pq.c, 1, sh, s);
+            uint y6 = Pair(pq.d, 0, sh, s), y7 = Pair(pq.d, 1, sh, s);
+            int o = 0 * BN * 10 + brow * 10 + bh * 4;
+            bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);
+        }
+        Group.Barrier();
+        int cur = 0;
+        for (int kt = kBeg; kt < kEnd; kt += BK)
+        {
+            bool more = kt + BK < kEnd;
+            if (more)
+            {
+                if (aOk != 0) { long ab = aBase + ((kt + BK) >> 2); pa0 = A.AsAligned16()[ab]; pa1 = A.AsAligned16()[ab + 1]; pa2 = A.AsAligned16()[ab + 2]; pa3 = A.AsAligned16()[ab + 3]; }
+                else { pa0 = default; pa1 = default; pa2 = default; pa3 = default; }
+                { int ktL = kt + BK; long sbL = bRow + (ktL >> 8) * 9; int jL = (ktL >> 5) & 7;
+                  ph = bOk != 0 ? Wq.AsAligned16()[sbL] : default(W16); pq = bOk != 0 ? Wq.AsAligned16()[sbL + 1 + 2 * (jL >> 1) + bh] : default(W16); }
+            }
+            int aOff = cur * BMS * 10, bOff = cur * BN * 10;
+            for (int ks = 0; ks < 2; ks++)
+            {
+                ulong la0 = aS[aOff + (wm * 32 + 0 + g) * 10 + ks * 4 + t];
+                ulong lb0 = aS[aOff + (wm * 32 + 0 + g + 8) * 10 + ks * 4 + t];
+                uint a00 = (uint)la0, a02 = (uint)(la0 >> 32), a01 = (uint)lb0, a03 = (uint)(lb0 >> 32);
+                ulong la1 = aS[aOff + (wm * 32 + 16 + g) * 10 + ks * 4 + t];
+                ulong lb1 = aS[aOff + (wm * 32 + 16 + g + 8) * 10 + ks * 4 + t];
+                uint a10 = (uint)la1, a12 = (uint)(la1 >> 32), a11 = (uint)lb1, a13 = (uint)(lb1 >> 32);
+                ulong lw0 = bS[bOff + (wn * 16 + 0 + g) * 10 + ks * 4 + t];
+                uint b00 = (uint)lw0, b01 = (uint)(lw0 >> 32);
+                ulong lw1 = bS[bOff + (wn * 16 + 8 + g) * 10 + ks * 4 + t];
+                uint b10 = (uint)lw1, b11 = (uint)(lw1 >> 32);
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, a02, a03, b00, b01, c000, c001, c002, c003);
+                c000 = d0; c001 = d1; c002 = d2; c003 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, a02, a03, b10, b11, c010, c011, c012, c013);
+                c010 = d0; c011 = d1; c012 = d2; c013 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, a12, a13, b00, b01, c100, c101, c102, c103);
+                c100 = d0; c101 = d1; c102 = d2; c103 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, a12, a13, b10, b11, c110, c111, c112, c113);
+                c110 = d0; c111 = d1; c112 = d2; c113 = d3;
+                }
+            }
+            if (more)
+            {
+                {
+                    uint x0 = PackF16(pa0.A, pa0.B), x1 = PackF16(pa0.C, pa0.D), x2 = PackF16(pa1.A, pa1.B), x3 = PackF16(pa1.C, pa1.D);
+                    uint x4 = PackF16(pa2.A, pa2.B), x5 = PackF16(pa2.C, pa2.D), x6 = PackF16(pa3.A, pa3.B), x7 = PackF16(pa3.C, pa3.D);
+                    int o = (1 - cur) * BMS * 10 + sr * 10 + kb * 4;
+                    if (sr < BMS) { aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32); }
+                }
+                {
+                    int j = ((kt + BK) >> 5) & 7, sh = (j & 1) * 4;
+                    ScaleMin s = SubBlockScale(ph, j);
+                    uint y0 = Pair(pq.a, 0, sh, s), y1 = Pair(pq.a, 1, sh, s);
+                    uint y2 = Pair(pq.b, 0, sh, s), y3 = Pair(pq.b, 1, sh, s);
+                    uint y4 = Pair(pq.c, 0, sh, s), y5 = Pair(pq.c, 1, sh, s);
+                    uint y6 = Pair(pq.d, 0, sh, s), y7 = Pair(pq.d, 1, sh, s);
+                    int o = (1 - cur) * BN * 10 + brow * 10 + bh * 4;
+                    bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);
+                }
+            }
+            Group.Barrier();
+            cur = 1 - cur;
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
         }
     }
 
@@ -6403,6 +6551,168 @@ internal static class MmaKQuantGemm
             int n0 = tileCol * BN + wn * 32 + 24 + 2 * t, n1 = n0 + 1;
             if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c330; if (n1 < N) C[cOff + (long)m0 * N + n1] = c331; }
             if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c332; if (n1 < N) C[cOff + (long)m1 * N + n1] = c333; }
+        }
+    }
+
+    /// <summary>Q6KV2 for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16). grid = ceil(M/32) * ceil(N/128) * kSplit (kSplit 1: no split).</summary>
+    /// <summary>Q6_K, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W 2-byte aligned. sm_80+: m16n8k16.</summary>
+    /// <summary>Split-K for SMALL grids (a short prompt: fewer 128 x 128 tiles than SMs): grid = tiles * kSplit; block slice s takes K [s per, (s + 1) per)
+    /// and writes its partial C to C + s M N (the caller sums the slices in order: deterministic).</summary>
+    public static void Q6KV2M32SplitK(ArrayView<F4> A, ArrayView<ushort> Wq, FV C, int M, int K, int N, int kSplit)
+    {
+        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile
+        int numTilesM = (M + BMS - 1) / BMS;
+        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;
+        int tileRow = bIdx % numTilesM;
+        int tileCol = bIdx / numTilesM;
+        long cOff = (long)slice * M * N;
+        int ktPer = (K / BK + kSplit - 1) / kSplit, kBeg = slice * ktPer * BK, kEnd = Math.Min(K, kBeg + ktPer * BK);
+        int tid = Group.IdxX;
+        int warp = tid >> 5, lane = tid & 31;
+        int g = lane >> 2, t = lane & 3;
+        int wm = 0, wn = warp;
+        var aS = SharedMemory.Allocate<ulong>(2 * BMS * 10);
+        var bS = SharedMemory.Allocate<ulong>(2 * BN * 10);
+        float c000 = 0f, c001 = 0f, c002 = 0f, c003 = 0f;
+        float c010 = 0f, c011 = 0f, c012 = 0f, c013 = 0f;
+        float c100 = 0f, c101 = 0f, c102 = 0f, c103 = 0f;
+        float c110 = 0f, c111 = 0f, c112 = 0f, c113 = 0f;
+        // staging: thread = (row sr = tid >> 1, k16 block kb = tid & 1) for A; (weight row brow = tid >> 1, half bh = tid & 1) for W
+        int sr = tid >> 1, kb = tid & 1;
+        int aRg = tileRow * BMS + sr; int aOk = sr < BMS && aRg < M ? 1 : 0;            // threads 0..63 stage the 32 A rows
+        long aBase = (long)aRg * (K >> 2) + kb * 4;
+        int brow = tid >> 1, bh = tid & 1;
+        int bRg = tileCol * BN + brow; int bOk = bRg < N ? 1 : 0;
+        long bRow = (long)bRg * ((K >> 8) * 105);                          // a super-block is 210 bytes = 105 ushorts
+        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;
+        int l0 = 0, l1 = 0, l2 = 0, l3 = 0, l4 = 0, l5 = 0, l6 = 0, l7 = 0, h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0, scw = 0, dw = 0;
+        if (aOk != 0) { long ab = aBase + ((kBeg) >> 2); pa0 = A.AsAligned16()[ab]; pa1 = A.AsAligned16()[ab + 1]; pa2 = A.AsAligned16()[ab + 2]; pa3 = A.AsAligned16()[ab + 3]; }
+        else { pa0 = default; pa1 = default; pa2 = default; pa3 = default; }
+        if (bOk != 0) { int ktL = kBeg; long sbL = bRow + (ktL >> 8) * 105; int oL = ktL & 255, nL = oL >> 7, qqL = (oL >> 5) & 3;
+          long qlL = sbL + 32 * nL + 16 * (qqL & 1) + 8 * bh, qhL = sbL + 64 + 16 * nL + 8 * bh;
+          l0 = Wq[qlL + 0]; l1 = Wq[qlL + 1]; l2 = Wq[qlL + 2]; l3 = Wq[qlL + 3]; l4 = Wq[qlL + 4]; l5 = Wq[qlL + 5]; l6 = Wq[qlL + 6]; l7 = Wq[qlL + 7];
+          h0 = Wq[qhL + 0]; h1 = Wq[qhL + 1]; h2 = Wq[qhL + 2]; h3 = Wq[qhL + 3]; h4 = Wq[qhL + 4]; h5 = Wq[qhL + 5]; h6 = Wq[qhL + 6]; h7 = Wq[qhL + 7];
+          scw = Wq[sbL + 96 + 4 * nL + qqL]; dw = Wq[sbL + 104]; }
+        {
+            uint x0 = PackF16(pa0.A, pa0.B), x1 = PackF16(pa0.C, pa0.D), x2 = PackF16(pa1.A, pa1.B), x3 = PackF16(pa1.C, pa1.D);
+            uint x4 = PackF16(pa2.A, pa2.B), x5 = PackF16(pa2.C, pa2.D), x6 = PackF16(pa3.A, pa3.B), x7 = PackF16(pa3.C, pa3.D);
+            int o = 0 * BMS * 10 + sr * 10 + kb * 4;
+            if (sr < BMS) { aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32); }
+        }
+        {
+            int qq = ((kBeg) >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;
+            int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);
+            float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);   // the scale is an int8
+            uint y0 = Q6Pair(l0, h0, lsh, hsh, ds);
+            uint y1 = Q6Pair(l1, h1, lsh, hsh, ds);
+            uint y2 = Q6Pair(l2, h2, lsh, hsh, ds);
+            uint y3 = Q6Pair(l3, h3, lsh, hsh, ds);
+            uint y4 = Q6Pair(l4, h4, lsh, hsh, ds);
+            uint y5 = Q6Pair(l5, h5, lsh, hsh, ds);
+            uint y6 = Q6Pair(l6, h6, lsh, hsh, ds);
+            uint y7 = Q6Pair(l7, h7, lsh, hsh, ds);
+            int o = 0 * BN * 10 + brow * 10 + bh * 4;
+            bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);
+        }
+        Group.Barrier();
+        int cur = 0;
+        for (int kt = kBeg; kt < kEnd; kt += BK)
+        {
+            bool more = kt + BK < kEnd;
+            if (more)
+            {
+                if (aOk != 0) { long ab = aBase + ((kt + BK) >> 2); pa0 = A.AsAligned16()[ab]; pa1 = A.AsAligned16()[ab + 1]; pa2 = A.AsAligned16()[ab + 2]; pa3 = A.AsAligned16()[ab + 3]; }
+                else { pa0 = default; pa1 = default; pa2 = default; pa3 = default; }
+                if (bOk != 0) { int ktL = kt + BK; long sbL = bRow + (ktL >> 8) * 105; int oL = ktL & 255, nL = oL >> 7, qqL = (oL >> 5) & 3;
+                  long qlL = sbL + 32 * nL + 16 * (qqL & 1) + 8 * bh, qhL = sbL + 64 + 16 * nL + 8 * bh;
+                  l0 = Wq[qlL + 0]; l1 = Wq[qlL + 1]; l2 = Wq[qlL + 2]; l3 = Wq[qlL + 3]; l4 = Wq[qlL + 4]; l5 = Wq[qlL + 5]; l6 = Wq[qlL + 6]; l7 = Wq[qlL + 7];
+                  h0 = Wq[qhL + 0]; h1 = Wq[qhL + 1]; h2 = Wq[qhL + 2]; h3 = Wq[qhL + 3]; h4 = Wq[qhL + 4]; h5 = Wq[qhL + 5]; h6 = Wq[qhL + 6]; h7 = Wq[qhL + 7];
+                  scw = Wq[sbL + 96 + 4 * nL + qqL]; dw = Wq[sbL + 104]; }
+            }
+            int aOff = cur * BMS * 10, bOff = cur * BN * 10;
+            for (int ks = 0; ks < 2; ks++)
+            {
+                ulong la0 = aS[aOff + (wm * 32 + 0 + g) * 10 + ks * 4 + t];
+                ulong lb0 = aS[aOff + (wm * 32 + 0 + g + 8) * 10 + ks * 4 + t];
+                uint a00 = (uint)la0, a02 = (uint)(la0 >> 32), a01 = (uint)lb0, a03 = (uint)(lb0 >> 32);
+                ulong la1 = aS[aOff + (wm * 32 + 16 + g) * 10 + ks * 4 + t];
+                ulong lb1 = aS[aOff + (wm * 32 + 16 + g + 8) * 10 + ks * 4 + t];
+                uint a10 = (uint)la1, a12 = (uint)(la1 >> 32), a11 = (uint)lb1, a13 = (uint)(lb1 >> 32);
+                ulong lw0 = bS[bOff + (wn * 16 + 0 + g) * 10 + ks * 4 + t];
+                uint b00 = (uint)lw0, b01 = (uint)(lw0 >> 32);
+                ulong lw1 = bS[bOff + (wn * 16 + 8 + g) * 10 + ks * 4 + t];
+                uint b10 = (uint)lw1, b11 = (uint)(lw1 >> 32);
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, a02, a03, b00, b01, c000, c001, c002, c003);
+                c000 = d0; c001 = d1; c002 = d2; c003 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a00, a01, a02, a03, b10, b11, c010, c011, c012, c013);
+                c010 = d0; c011 = d1; c012 = d2; c013 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, a12, a13, b00, b01, c100, c101, c102, c103);
+                c100 = d0; c101 = d1; c102 = d2; c103 = d3;
+                }
+                {
+                CudaAsm.Emit("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};",
+                    out float d0, out float d1, out float d2, out float d3, a10, a11, a12, a13, b10, b11, c110, c111, c112, c113);
+                c110 = d0; c111 = d1; c112 = d2; c113 = d3;
+                }
+            }
+            if (more)
+            {
+                {
+                    uint x0 = PackF16(pa0.A, pa0.B), x1 = PackF16(pa0.C, pa0.D), x2 = PackF16(pa1.A, pa1.B), x3 = PackF16(pa1.C, pa1.D);
+                    uint x4 = PackF16(pa2.A, pa2.B), x5 = PackF16(pa2.C, pa2.D), x6 = PackF16(pa3.A, pa3.B), x7 = PackF16(pa3.C, pa3.D);
+                    int o = (1 - cur) * BMS * 10 + sr * 10 + kb * 4;
+                    if (sr < BMS) { aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32); }
+                }
+                {
+                    int qq = ((kt + BK) >> 5) & 3, lsh = (qq >> 1) * 4, hsh = 2 * qq;
+                    int scb = bh == 0 ? (scw & 0xFF) : ((scw >> 8) & 0xFF);
+                    float ds = FusedDequantMatMul.HalfToFloat(dw & 0xFFFF) * (float)((scb ^ 0x80) - 0x80);   // the scale is an int8
+                    uint y0 = Q6Pair(l0, h0, lsh, hsh, ds);
+                    uint y1 = Q6Pair(l1, h1, lsh, hsh, ds);
+                    uint y2 = Q6Pair(l2, h2, lsh, hsh, ds);
+                    uint y3 = Q6Pair(l3, h3, lsh, hsh, ds);
+                    uint y4 = Q6Pair(l4, h4, lsh, hsh, ds);
+                    uint y5 = Q6Pair(l5, h5, lsh, hsh, ds);
+                    uint y6 = Q6Pair(l6, h6, lsh, hsh, ds);
+                    uint y7 = Q6Pair(l7, h7, lsh, hsh, ds);
+                    int o = (1 - cur) * BN * 10 + brow * 10 + bh * 4;
+                    bS[o] = (ulong)y0 | ((ulong)y4 << 32); bS[o + 1] = (ulong)y1 | ((ulong)y5 << 32); bS[o + 2] = (ulong)y2 | ((ulong)y6 << 32); bS[o + 3] = (ulong)y3 | ((ulong)y7 << 32);
+                }
+            }
+            Group.Barrier();
+            cur = 1 - cur;
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c000; if (n1 < N) C[cOff + (long)m0 * N + n1] = c001; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c002; if (n1 < N) C[cOff + (long)m1 * N + n1] = c003; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 0 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c010; if (n1 < N) C[cOff + (long)m0 * N + n1] = c011; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c012; if (n1 < N) C[cOff + (long)m1 * N + n1] = c013; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 0 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c100; if (n1 < N) C[cOff + (long)m0 * N + n1] = c101; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c102; if (n1 < N) C[cOff + (long)m1 * N + n1] = c103; }
+        }
+        {
+            int m0 = tileRow * BMS + wm * 32 + 16 + g, m1 = m0 + 8;
+            int n0 = tileCol * BN + wn * 16 + 8 + 2 * t, n1 = n0 + 1;
+            if (m0 < M) { if (n0 < N) C[cOff + (long)m0 * N + n0] = c110; if (n1 < N) C[cOff + (long)m0 * N + n1] = c111; }
+            if (m1 < M) { if (n0 < N) C[cOff + (long)m1 * N + n0] = c112; if (n1 < N) C[cOff + (long)m1 * N + n1] = c113; }
         }
     }
 

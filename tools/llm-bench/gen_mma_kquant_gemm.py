@@ -49,6 +49,8 @@ w("/// </summary>")
 w("internal static class MmaKQuantGemm")
 w("{")
 w("    public const int BM = 128, BN = 128, BK = 32, Threads = 256, RowWords = 20;")
+w("    /// <summary>The V2M32 kernels' A (token) tile: a short prompt's rows.</summary>")
+w("    public const int BMS = 32;")
 w("")
 w("    private static uint PackF16(float lo, float hi)")
 w("    {")
@@ -233,7 +235,7 @@ def kernel(sm75, qt):
 mma = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
 
 
-def kernel_v2(sm75, qt, splitk=False):
+def kernel_v2(sm75, qt, splitk=False, small=False):
     """{Q4K|Q6K}{Sm75}V2 (2026-11-05): the same GEMM with (1) double-buffered shared tiles (one barrier per K tile; the next tile's global
     loads and weight decode overlap the current tile's MMAs) and (2) 64-bit fragment loads. Each thread stages ONE row's k16 block: A as four
     adjacent float4 (16 values), the weights as the half-sub-block it already decodes, and writes the 8 words as the pairs (w, w+4), so a0/a2,
@@ -243,6 +245,14 @@ def kernel_v2(sm75, qt, splitk=False):
     kname = ("Q6K" if q6 else "Q4K") + sfx + "V2" + ("SplitK" if splitk else "")
     wtype = "ArrayView<ushort>" if q6 else "ArrayView<W16>"
     RW = 10
+    # small (2026-11-11, M32): a 32-row A (token) tile for a SHORT prompt (ggml's mmq sizes mmq_x to the batch; at 29 tokens the 128-row tile spent 4.4x
+    # the needed MMAs on padding rows). 8 warps of 32 x 16; A staged by threads 0..63 (row tid >> 1), the W staging unchanged. Emitted in the split-K form.
+    MTx, NTx = (2, 2) if small else (MT, NT)
+    BMx, WMr, WNc = ("BMS", 32, 16) if small else ("BM", 64, 32)
+    if small:
+        kname = ("Q6K" if q6 else "Q4K") + sfx + "V2M32" + ("SplitK" if splitk else "")
+    if small:
+        w(f"    /// <summary>{kname[:3]}V2 for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16). grid = ceil(M/32) * ceil(N/128) * kSplit (kSplit 1: no split).</summary>")
     w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'}, double-buffered with 64-bit fragment loads: grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; A 16-byte aligned, W {'2' if q6 else '16'}-byte aligned. {'Turing (sm_75): two m16n8k8 per 16 k.' if sm75 else 'sm_80+: m16n8k16.'}</summary>")
     if splitk:
         w("    /// <summary>Split-K for SMALL grids (a short prompt: fewer 128 x 128 tiles than SMs): grid = tiles * kSplit; block slice s takes K [s per, (s + 1) per)")
@@ -252,7 +262,7 @@ def kernel_v2(sm75, qt, splitk=False):
         w(f"    public static void {kname}(ArrayView<F4> A, {wtype} Wq, FV C, int M, int K, int N)")
     w("    {")
     w("        // column-major block order (see the V4 kernel): each W tile is read from DRAM about once, not once per row tile")
-    w("        int numTilesM = (M + BM - 1) / BM;")
+    w(f"        int numTilesM = (M + {BMx} - 1) / {BMx};")
     if splitk:
         w("        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;")
         w("        int tileRow = bIdx % numTilesM;")
@@ -265,15 +275,18 @@ def kernel_v2(sm75, qt, splitk=False):
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
-    w("        int wm = warp >> 2, wn = warp & 3;")
-    w(f"        var aS = SharedMemory.Allocate<ulong>(2 * BM * {RW});")
+    w("        int wm = 0, wn = warp;" if small else "        int wm = warp >> 2, wn = warp & 3;")
+    w(f"        var aS = SharedMemory.Allocate<ulong>(2 * {BMx} * {RW});")
     w(f"        var bS = SharedMemory.Allocate<ulong>(2 * BN * {RW});")
-    for mt in range(MT):
-        for nt in range(NT):
+    for mt in range(MTx):
+        for nt in range(NTx):
             w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
     w("        // staging: thread = (row sr = tid >> 1, k16 block kb = tid & 1) for A; (weight row brow = tid >> 1, half bh = tid & 1) for W")
     w("        int sr = tid >> 1, kb = tid & 1;")
-    w("        int aRg = tileRow * BM + sr; int aOk = aRg < M ? 1 : 0;")
+    if small:
+        w("        int aRg = tileRow * BMS + sr; int aOk = sr < BMS && aRg < M ? 1 : 0;            // threads 0..63 stage the 32 A rows")
+    else:
+        w("        int aRg = tileRow * BM + sr; int aOk = aRg < M ? 1 : 0;")
     w("        long aBase = (long)aRg * (K >> 2) + kb * 4;")
     w("        int brow = tid >> 1, bh = tid & 1;")
     w("        int bRg = tileCol * BN + brow; int bOk = bRg < N ? 1 : 0;")
@@ -305,8 +318,8 @@ def kernel_v2(sm75, qt, splitk=False):
         w(f"{ind}{{")
         w(f"{ind}    uint x0 = PackF16{sfx}(pa0.A, pa0.B), x1 = PackF16{sfx}(pa0.C, pa0.D), x2 = PackF16{sfx}(pa1.A, pa1.B), x3 = PackF16{sfx}(pa1.C, pa1.D);")
         w(f"{ind}    uint x4 = PackF16{sfx}(pa2.A, pa2.B), x5 = PackF16{sfx}(pa2.C, pa2.D), x6 = PackF16{sfx}(pa3.A, pa3.B), x7 = PackF16{sfx}(pa3.C, pa3.D);")
-        w(f"{ind}    int o = {buf_expr} * BM * {RW} + sr * {RW} + kb * 4;")
-        w(f"{ind}    aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32);")
+        w(f"{ind}    int o = {buf_expr} * {BMx} * {RW} + sr * {RW} + kb * 4;")
+        w(f"{ind}    {'if (sr < BMS) { ' if small else ''}aS[o] = (ulong)x0 | ((ulong)x4 << 32); aS[o + 1] = (ulong)x1 | ((ulong)x5 << 32); aS[o + 2] = (ulong)x2 | ((ulong)x6 << 32); aS[o + 3] = (ulong)x3 | ((ulong)x7 << 32);{' }' if small else ''}")
         w(f"{ind}}}")
         # W: this thread's 8 decoded words of row brow, half bh (= k16 block bh of the 32-value sub-block)
         w(f"{ind}{{")
@@ -339,18 +352,18 @@ def kernel_v2(sm75, qt, splitk=False):
     w("            {")
     load("kt + BK", "                ")
     w("            }")
-    w(f"            int aOff = cur * BM * {RW}, bOff = cur * BN * {RW};")
+    w(f"            int aOff = cur * {BMx} * {RW}, bOff = cur * BN * {RW};")
     w("            for (int ks = 0; ks < 2; ks++)")
     w("            {")
-    for mt in range(MT):
-        w(f"                ulong la{mt} = aS[aOff + (wm * 64 + {mt * 16} + g) * {RW} + ks * 4 + t];")
-        w(f"                ulong lb{mt} = aS[aOff + (wm * 64 + {mt * 16} + g + 8) * {RW} + ks * 4 + t];")
+    for mt in range(MTx):
+        w(f"                ulong la{mt} = aS[aOff + (wm * {WMr} + {mt * 16} + g) * {RW} + ks * 4 + t];")
+        w(f"                ulong lb{mt} = aS[aOff + (wm * {WMr} + {mt * 16} + g + 8) * {RW} + ks * 4 + t];")
         w(f"                uint a{mt}0 = (uint)la{mt}, a{mt}2 = (uint)(la{mt} >> 32), a{mt}1 = (uint)lb{mt}, a{mt}3 = (uint)(lb{mt} >> 32);")
-    for nt in range(NT):
-        w(f"                ulong lw{nt} = bS[bOff + (wn * 32 + {nt * 8} + g) * {RW} + ks * 4 + t];")
+    for nt in range(NTx):
+        w(f"                ulong lw{nt} = bS[bOff + (wn * {WNc} + {nt * 8} + g) * {RW} + ks * 4 + t];")
         w(f"                uint b{nt}0 = (uint)lw{nt}, b{nt}1 = (uint)(lw{nt} >> 32);")
-    for mt in range(MT):
-        for nt in range(NT):
+    for mt in range(MTx):
+        for nt in range(NTx):
             if not sm75:
                 w("                {")
                 w(f'                CudaAsm.Emit("{mma}",')
@@ -372,11 +385,11 @@ def kernel_v2(sm75, qt, splitk=False):
     w("            Group.Barrier();")
     w("            cur = 1 - cur;")
     w("        }")
-    for mt in range(MT):
-        for nt in range(NT):
+    for mt in range(MTx):
+        for nt in range(NTx):
             w("        {")
-            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * {WNc} + {nt * 8} + 2 * t, n1 = n0 + 1;")
             co = "cOff + " if splitk else ""
             w(f"            if (m0 < M) {{ if (n0 < N) C[{co}(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[{co}(long)m0 * N + n1] = c{mt}{nt}1; }}")
             w(f"            if (m1 < M) {{ if (n0 < N) C[{co}(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[{co}(long)m1 * N + n1] = c{mt}{nt}3; }}")
@@ -575,6 +588,8 @@ for qt_ in ("q4k", "q6k"):
     dequant_f16(False, qt_)
     dequant_f16(True, qt_)
     kernel_v2(False, qt_, splitk=True)
+    w("")
+    kernel_v2(False, qt_, splitk=True, small=True)
     w("")
     dequant_f16(False, qt_, rows=True)
     dequant_f16(True, qt_, rows=True)

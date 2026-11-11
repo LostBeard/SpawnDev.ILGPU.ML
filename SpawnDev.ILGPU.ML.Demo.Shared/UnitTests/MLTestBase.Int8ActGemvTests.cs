@@ -229,8 +229,10 @@ public abstract partial class MLTestBase
         try
         {
             SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = true;
+            // M <= FusedDequantMatMul.S8M32Max (64) takes the M32 kernels: 9, 29 (a short prompt's q / o and Q6_K down), 47 (ragged), 64 (two 32-row tiles)
             foreach (var (type, M, K, N) in new[] { (GGMLType.Q4_K, 9, 256, 8), (GGMLType.Q4_K, 130, 2048, 3072), (GGMLType.Q4_K, 300, 6144, 2048), (GGMLType.Q4_K, 77, 512, 200),
-                (GGMLType.Q6_K, 9, 256, 8), (GGMLType.Q6_K, 130, 6144, 2048), (GGMLType.Q6_K, 257, 2048, 1000) })
+                (GGMLType.Q4_K, 29, 2048, 2048), (GGMLType.Q4_K, 47, 512, 256), (GGMLType.Q4_K, 64, 1024, 384), (GGMLType.Q4_K, 29, 512, 6144),
+                (GGMLType.Q6_K, 9, 256, 8), (GGMLType.Q6_K, 130, 6144, 2048), (GGMLType.Q6_K, 257, 2048, 1000), (GGMLType.Q6_K, 29, 6144, 2048) })
             {
                 var rng = new Random(31 + M + K + N);
                 int bytesPerRow = RowBytes(type, K);
@@ -270,8 +272,10 @@ public abstract partial class MLTestBase
                 await accelerator.SynchronizeAsync();
                 var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
                 // grids of at most half the GPU's SM count take split-K (every int8 kernel; floor(SMs / tiles) slices = one wave): e.g. 77 x 200 (2 tiles), 9 x 8
-                bool small = ((M + 127) / 128) * ((N + 127) / 128) * 2 <= accelerator.NumMultiprocessors;   // split only when one wave holds 2+ slices per tile
-                string want = (type == GGMLType.Q4_K ? (direct ? "mma-s8-q4k-direct" : "mma-s8-q4k") : "mma-s8-q6k") + (small ? "-splitk" : "");
+                bool m32 = M <= SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.S8M32Max;
+                int bmT = m32 ? 32 : 128;
+                bool small = ((M + bmT - 1) / bmT) * ((N + 127) / 128) * 2 <= accelerator.NumMultiprocessors;   // split only when one wave holds 2+ slices per tile
+                string want = (type == GGMLType.Q4_K ? (direct ? "mma-s8-q4k-direct" : "mma-s8-q4k") : "mma-s8-q6k") + (m32 ? "-m32" : "") + (small ? "-splitk" : "");
                 if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: the int8 GEMM did not run (ran '{route}', wanted '{want}')");
                 if (type == GGMLType.Q4_K && direct && M == 77 && !route.Contains("-splitk")) throw new Exception($"M=77 N=200 (2 tiles) did not take split-K ('{route}')");
                 double worstFid = 0, worstCost = 0, sumCost = 0;
@@ -294,6 +298,34 @@ public abstract partial class MLTestBase
                 string note = $"{route} M={M} K={K} N={N}: vs the q8_1 scheme worst {worstFid:E1}; cost vs fp32 activations mean {sumCost / samples:E1} worst {worstCost:E1}";
                 notes.Add(note);
                 if (!(worstFid < 1e-5)) throw new Exception(note + " - the GEMM does not compute ggml's q8_1 scheme (limit 1e-5)");
+                // the fused gate | up SwiGLU kernel over the same weight (gate = rows [0, N/2), up = [N/2, N)): silu(g) * u of the GEMM's own outputs
+                if (type == GGMLType.Q4_K && direct && N % 128 == 0)
+                {
+                    int nff = N / 2;
+                    using var sBuf = accelerator.Allocate1D<float>((long)M * nff);
+                    if (!fused.ForwardGateUpSwiGLUInt8(inputBuf.View, weightBuf.View, type, sBuf.View, M, K, nff, null))
+                    {
+                        int tilesSw = ((M + bmT - 1) / bmT) * (nff / 64);
+                        if (tilesSw * 2 > accelerator.NumMultiprocessors) throw new Exception($"M={M} K={K} Nff={nff}: the fused SwiGLU GEMM declined a grid of {tilesSw} tiles");
+                    }
+                    else
+                    {
+                        string rsw = fused.LastGemmKernel;
+                        if (rsw != "mma-s8-q4k-direct-swiglu" + (m32 ? "-m32" : "")) throw new Exception($"M={M} Nff={nff}: ran '{rsw}'");
+                        await accelerator.SynchronizeAsync();
+                        var sw = await sBuf.CopyToHostAsync<float>(0, (long)M * nff);
+                        double worstSw = 0;
+                        for (int m = 0; m < M; m++)
+                            for (int f = 0; f < nff; f++)
+                            {
+                                float gv = got[(long)m * N + f], uv = got[(long)m * N + nff + f];
+                                double want2 = gv / (1.0 + Math.Exp(-gv)) * uv;
+                                worstSw = Math.Max(worstSw, Math.Abs(sw[(long)m * nff + f] - want2) / Math.Max(1e-20, Math.Abs(want2) + 1e-6 * Math.Abs(uv)));
+                            }
+                        notes.Add($"{rsw} M={M} Nff={nff}: vs silu(g) u of the GEMM worst {worstSw:E1}");
+                        if (!(worstSw < 1e-5)) throw new Exception($"{rsw} M={M} Nff={nff}: worst {worstSw:E1} vs silu(g) u of the plain GEMM's outputs (limit 1e-5)");
+                    }
+                }
                 }
             }
         }

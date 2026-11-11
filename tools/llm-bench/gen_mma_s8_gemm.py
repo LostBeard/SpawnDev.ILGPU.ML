@@ -45,6 +45,8 @@ w("/// </summary>")
 w("internal static class MmaS8Gemm")
 w("{")
 w("    public const int BM = 128, BN = 128, BK = 64, Threads = 256;")
+w("    /// <summary>The M32 kernels' A (token) tile: a short prompt's rows (see kernel(small) in the generator).</summary>")
+w("    public const int BMS = 32;")
 w("")
 
 mma32 = "{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {z, z, z, z}; }"
@@ -53,13 +55,22 @@ ldm4 = "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
 cpa = "cp.async.cg.shared.global [%0], [%1], 16, %2;"
 
 
-def kernel(q6):
-    name = "S8Q6K" if q6 else "S8Q4K"
-    w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.")
-    w("    /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>")
+def kernel(q6, small=False):
+    # small (2026-11-11, the M32 kernels): a 32-row A (token) tile for a SHORT prompt, as ggml's mmq sizes mmq_x to the batch: at 29 tokens the 128-row
+    # tile spent 4.4x the needed MMAs on padding rows (nsys: Ollama's mmq 20 us a GEMM, ours 64-140). 8 warps of 32 x 16, W staging unchanged.
+    MT, NT = (2, 2) if small else (MT5, NT5)
+    BMx, WMr, WNc = ("BMS", 32, 16) if small else ("BM", 64, 32)
+    sbA, soA, sc4A, sc4cA = ("sbA", "soA", "sc4a", "sc4ca") if small else ("sb", "so", "sc4", "sc4c")
+    name = ("S8Q6K" if q6 else "S8Q4K") + ("M32" if small else "")
+    if small:
+        w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} on int8 for a SHORT prompt: {name[:5]} with a 32-row A tile. grid = ceil(M/32) * ceil(N/128) * kSplit, group = 256 (8 warps of 32 x 16).")
+        w("    /// K a multiple of 64. kSplit as in the 128-row kernel. sm_80+.</summary>")
+    else:
+        w(f"    /// <summary>{'Q6_K' if q6 else 'Q4_K'} on int8: C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256 (8 warps of 64 x 32). K a multiple of 64.")
+        w("    /// kSplit &gt; 1 (a small grid) splits K: slice s takes K tiles [s per, (s + 1) per) and writes its partial C to C + s M N (summed in slice order by the caller). sm_80+.</summary>")
     w(f"    public static unsafe void {name}(U4V Aq, U4V As, U4V Wq, U4V Ws, FV C, int M, int K, int N, int kSplit)")
     w("    {")
-    w("        int numTilesM = (M + BM - 1) / BM;")
+    w(f"        int numTilesM = (M + {BMx} - 1) / {BMx};")
     w("        int tilesMN = numTilesM * ((N + BN - 1) / BN), bIdx = Grid.IdxX % tilesMN, slice = Grid.IdxX / tilesMN;")
     w("        int tileRow = bIdx % numTilesM;")
     w("        int tileCol = bIdx / numTilesM;")
@@ -67,26 +78,29 @@ def kernel(q6):
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
-    w("        int wm = warp >> 2, wn = warp & 3;")
-    w(f"        var aS = SharedMemory.Allocate<uint>(2 * BM * {RW});")
+    w("        int wm = 0, wn = warp;" if small else "        int wm = warp >> 2, wn = warp & 3;")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * {BMx} * {RW});")
     w(f"        var bS = SharedMemory.Allocate<uint>(2 * BN * {RW});")
-    w("        var aSc = SharedMemory.Allocate<float>(2 * BM * 4);")
+    w(f"        var aSc = SharedMemory.Allocate<float>(2 * {BMx} * 4);")
     w("        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);")
-    for mt in range(MT5):
-        for nt in range(NT5):
+    for mt in range(MT):
+        for nt in range(NT):
             w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
     w("        int cr = tid >> 2, cc = tid & 3;")
     for i in range(2):
-        w(f"        int aR{i} = tileRow * BM + cr + {64 * i}, bR{i} = tileCol * BN + cr + {64 * i};")
+        w(f"        int aR{i} = tileRow * {BMx} + cr + {64 * i}, bR{i} = tileCol * BN + cr + {64 * i};")
         w(f"        int aSz{i} = aR{i} < M ? 16 : 0, bSz{i} = bR{i} < N ? 16 : 0;")
         w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 4) + cc, bG{i} = (long)(bSz{i} != 0 ? bR{i} : 0) * (K >> 4) + cc;")
         w(f"        int sOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
-    w("        // the scale rows: threads 0..127 stage row tid of the A tile, 128..255 row tid - 128 of the W tile (16 bytes = the tile's two blocks)")
+    if small:
+        w("        // the scale rows: threads 0..31 stage row tid of the A tile, 128..255 row tid - 128 of the W tile (16 bytes = the tile's two blocks)")
+    else:
+        w("        // the scale rows: threads 0..127 stage row tid of the A tile, 128..255 row tid - 128 of the W tile (16 bytes = the tile's two blocks)")
     w("        int sr = tid & 127;")
-    w("        int sAR = tileRow * BM + sr, sBR = tileCol * BN + sr;")
+    w(f"        int sAR = tileRow * {BMx} + sr, sBR = tileCol * BN + sr;")
     w("        int sASz = sAR < M ? 16 : 0, sBSz = sBR < N ? 16 : 0;")
     w("        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6), sBG = (long)(sBSz != 0 ? sBR : 0) * (K >> 6);")
-    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 32 + (lane & 7) + ((lane >> 4) << 3);")
+    w(f"        int rowA = wm * {WMr} + (lane & 15), rowB = wn * {WNc} + (lane & 7) + ((lane >> 4) << 3);")
     w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 1) & 3;")
     w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
     w(f"        int bLd0 = rowB * {RW} + ((((lane >> 3) & 1) ^ swB) << 2), bLd1 = rowB * {RW} + (((2 + ((lane >> 3) & 1)) ^ swB) << 2);")
@@ -97,11 +111,19 @@ def kernel(q6):
         w(f"{ind}{{")
         w(f"{ind}    int kq = ({kt_expr}) >> 4, ks6 = ({kt_expr}) >> 6;")
         w(f"{ind}    int sb = ({st_expr}) * BM * {RW}, sc4 = ({st_expr}) * BM * 4;")
-        for (arr, src, gp, zp) in (("aS", "Aq", "aG", "aSz"), ("bS", "Wq", "bG", "bSz")):
+        if small:
+            w(f"{ind}    int sbA = ({st_expr}) * BMS * {RW}, sc4a = ({st_expr}) * BMS * 4;")
+            w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sbA + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows")
             for i in range(2):
-                w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref {arr}[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref {src}[{gp}{i} + kq]), {zp}{i});")
-        w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
-        w(f"{ind}    else CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);")
+                w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bS[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref Wq[bG{i} + kq]), bSz{i});")
+            w(f"{ind}    if (tid < 32) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
+            w(f"{ind}    else if (tid >= 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);")
+        else:
+            for (arr, src, gp, zp) in (("aS", "Aq", "aG", "aSz"), ("bS", "Wq", "bG", "bSz")):
+                for i in range(2):
+                    w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref {arr}[sb + sOff{i}]), (ulong)Unsafe.AsPointer(ref {src}[{gp}{i} + kq]), {zp}{i});")
+            w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
+            w(f"{ind}    else CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref Ws[sBG + ks6]), sBSz);")
         w(f"{ind}}}")
 
     issue("kt0 * BK", "0", "        ")
@@ -114,30 +136,32 @@ def kernel(q6):
     issue("(kt0 + it + 1) * BK", "(it + 1) & 1", "            ")
     w('            CudaAsm.Emit("cp.async.commit_group;");')
     w(f"            int so = (it & 1) * BM * {RW}, sc4c = (it & 1) * BM * 4;")
+    if small:
+        w(f"            int soA = (it & 1) * BMS * {RW}, sc4ca = (it & 1) * BMS * 4;")
     for ks in range(2):
         w("            {")
-        for mt in range(MT5):
-            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd{ks} + {mt * 16 * RW}]));')
-        for np_ in range(NT5 // 2):
+        for mt in range(MT):
+            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[{soA} + aLd{ks} + {mt * 16 * RW}]));')
+        for np_ in range(NT // 2):
             w(f'                CudaAsm.Emit("{ldm4}", out uint b{2 * np_}0, out uint b{2 * np_}1, out uint b{2 * np_ + 1}0, out uint b{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[so + bLd{ks} + {np_ * 16 * RW}]));')
         w("                // the A scales of the thread's 8 rows (rows g, g + 8 of each 16-row tile) for this block, held across the n tiles")
-        for mt in range(MT5):
-            w(f"                int ac{mt} = sc4c + (wm * 64 + {mt * 16} + g) * 4 + {2 * ks};")
+        for mt in range(MT):
+            w(f"                int ac{mt} = {sc4cA} + (wm * {WMr} + {mt * 16} + g) * 4 + {2 * ks};")
             w(f"                float da{mt}0 = aSc[ac{mt}], da{mt}1 = aSc[ac{mt} + 32];")
             if not q6:
                 w(f"                float sa{mt}0 = -aSc[ac{mt} + 1], sa{mt}1 = -aSc[ac{mt} + 33];       // -(d * sum q)")
         w("                // per n tile: its column scales, its 4 MMAs issued back to back (independent: the tensor pipe overlaps them), then their epilogues")
-        for nt in range(NT5):
+        for nt in range(NT):
             w("                {")
-            w(f"                int bc = sc4c + (wn * 32 + {nt * 8} + 2 * t) * 4 + {2 * ks};")
+            w(f"                int bc = sc4c + (wn * {WNc} + {nt * 8} + 2 * t) * 4 + {2 * ks};")
             w("                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];")
-            for mt in range(MT5):
+            for mt in range(MT):
                 if not q6:
                     w(f'                CudaAsm.Emit("{mma32}", out int i{mt}0, out int i{mt}1, out int i{mt}2, out int i{mt}3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1);')
                 else:
                     w(f'                CudaAsm.Emit("{mma16}", out int i{mt}0, out int i{mt}1, out int i{mt}2, out int i{mt}3, a{mt}0, a{mt}1, b{nt}0);')
                     w(f'                CudaAsm.Emit("{mma16}", out int j{mt}0, out int j{mt}1, out int j{mt}2, out int j{mt}3, a{mt}2, a{mt}3, b{nt}1);')
-            for mt in range(MT5):
+            for mt in range(MT):
                 if not q6:
                     for (ci, r, col) in ((0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)):
                         w(f"                c{mt}{nt}{ci} = float.MultiplyAddEstimate(sa{mt}{r}, y{col}, float.MultiplyAddEstimate(da{mt}{r} * x{col}, (float)i{mt}{ci}, c{mt}{nt}{ci}));")
@@ -148,11 +172,11 @@ def kernel(q6):
         w("            }")
     w("        }")
     w('        CudaAsm.Emit("cp.async.wait_group 0;");')
-    for mt in range(MT5):
-        for nt in range(NT5):
+    for mt in range(MT):
+        for nt in range(NT):
             w("        {")
-            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * {WNc} + {nt * 8} + 2 * t, n1 = n0 + 1;")
             w(f"            if (m0 < M) {{ if (n0 < N) C[cOff + (long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[cOff + (long)m0 * N + n1] = c{mt}{nt}1; }}")
             w(f"            if (m1 < M) {{ if (n0 < N) C[cOff + (long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[cOff + (long)m1 * N + n1] = c{mt}{nt}3; }}")
             w("        }")
@@ -160,28 +184,36 @@ def kernel(q6):
     w("")
 
 
-def kernel_direct(swiglu=False):
+def kernel_direct(swiglu=False, small=False):
     """S8Q4KDirect (2026-11-11): S8Q4K reading the raw Q4_K rows, no unpack pass. A 64-value K tile is one Q4_K sub-block PAIR (2p, 2p + 1 of a super-block):
     ONE 32-byte nibble chunk per row (qs bytes 32p..32p + 31; low nibbles = sub-block 2p, high = 2p + 1). Each W row stages that chunk (16 bytes a thread,
     rows 32 bytes, chunk c of row r at c ^ ((r >> 2) & 1): conflict-free ldmatrix at that stride), and one ldmatrix of it gives BOTH blocks' B fragments:
     block 0 = w & 0x0F0F0F0F, block 1 = (w >> 4) & 0x0F0F0F0F (the int8 k32 fragment's byte positions are the chunk's). The W threads compute the pair's
     (d sc, dmin m) from the super-block header into the scale tile S8Q4K reads (same layout), so the epilogue is unchanged. W 16-byte aligned, K % 256 == 0."""
     RWB = 8
+    MT, NT = (2, 2) if small else (MT5, NT5)
+    BMx, WMr, WNc = ("BMS", 32, 16) if small else ("BM", 64, 32)
+    sfx = "M32" if small else ""
+    if small:
+        w(f"    /// <summary>{'S8Q4KDirectSwiGLU' if swiglu else 'S8Q4KDirect'} for a SHORT prompt: a 32-row A tile (8 warps of 32 x 16), as ggml's mmq sizes mmq_x to the batch;")
+        w(f"    /// grid = ceil(M/32) * {'(Nff / 64)' if swiglu else 'ceil(N/128) * kSplit'}. Same staging, scales and epilogue as the 128-row kernel. sm_80+.</summary>")
     if swiglu:
-        w("    /// <summary>S8Q4KDirect over a JOINED gate | up weight (rows [0, Nff) gate, [Nff, 2 Nff) up) with SwiGLU in the epilogue: the staged W rows are")
-        w("    /// remapped so 8-row block 2j is gate and 2j + 1 is up of the same 8 ff columns, a thread holds g and u of the same (row, column), and it writes")
-        w("    /// S [M, Nff] = g / (1 + exp(-g)) * u (GgufBatchDecoder.SwigluJoinedImpl's expression): gate | up never reaches memory. grid = ceil(M/128) * (Nff / 64),")
-        w("    /// group = 256; Nff a multiple of 64, K of 256. sm_80+.</summary>")
-        w("    public static unsafe void S8Q4KDirectSwiGLU(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int Nff)")
+        if not small:
+            w("    /// <summary>S8Q4KDirect over a JOINED gate | up weight (rows [0, Nff) gate, [Nff, 2 Nff) up) with SwiGLU in the epilogue: the staged W rows are")
+            w("    /// remapped so 8-row block 2j is gate and 2j + 1 is up of the same 8 ff columns, a thread holds g and u of the same (row, column), and it writes")
+            w("    /// S [M, Nff] = g / (1 + exp(-g)) * u (GgufBatchDecoder.SwigluJoinedImpl's expression): gate | up never reaches memory. grid = ceil(M/128) * (Nff / 64),")
+            w("    /// group = 256; Nff a multiple of 64, K of 256. sm_80+.</summary>")
+        w(f"    public static unsafe void S8Q4KDirectSwiGLU{sfx}(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int Nff)")
         w("    {")
         w("        int N = 2 * Nff;")
     else:
-        w("    /// <summary>Q4_K on int8 straight from the raw GGUF rows (no unpack): C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256. K a multiple of 256;")
-        w("    /// W 16-byte aligned. kSplit &gt; 1 (a SMALL grid, e.g. a short prompt: fewer tiles than SMs) splits K: block slice s takes K tiles [s per, (s + 1) per)")
-        w("    /// and writes its partial C to C + s M N (the caller sums the slices in order: deterministic). sm_80+.</summary>")
-        w("    public static unsafe void S8Q4KDirect(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N, int kSplit)")
+        if not small:
+            w("    /// <summary>Q4_K on int8 straight from the raw GGUF rows (no unpack): C = A W^T. grid = ceil(M/128) * ceil(N/128) * kSplit, group = 256. K a multiple of 256;")
+            w("    /// W 16-byte aligned. kSplit &gt; 1 (a SMALL grid, e.g. a short prompt: fewer tiles than SMs) splits K: block slice s takes K tiles [s per, (s + 1) per)")
+            w("    /// and writes its partial C to C + s M N (the caller sums the slices in order: deterministic). sm_80+.</summary>")
+        w(f"    public static unsafe void S8Q4KDirect{sfx}(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N, int kSplit)")
         w("    {")
-    w("        int numTilesM = (M + BM - 1) / BM;")
+    w(f"        int numTilesM = (M + {BMx} - 1) / {BMx};")
     if swiglu:
         w("        int tileRow = Grid.IdxX % numTilesM;")
         w("        int tileCol = Grid.IdxX / numTilesM;")
@@ -196,17 +228,17 @@ def kernel_direct(swiglu=False):
     w("        int tid = Group.IdxX;")
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
-    w("        int wm = warp >> 2, wn = warp & 3;")
-    w(f"        var aS = SharedMemory.Allocate<uint>(2 * BM * {RW});")
+    w("        int wm = 0, wn = warp;" if small else "        int wm = warp >> 2, wn = warp & 3;")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * {BMx} * {RW});")
     w(f"        var bS = SharedMemory.Allocate<uint>(2 * BN * {RWB});")
-    w("        var aSc = SharedMemory.Allocate<float>(2 * BM * 4);")
+    w(f"        var aSc = SharedMemory.Allocate<float>(2 * {BMx} * 4);")
     w("        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);")
-    for mt in range(MT5):
-        for nt in range(NT5):
+    for mt in range(MT):
+        for nt in range(NT):
             w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
     w("        int cr = tid >> 2, cc = tid & 3;")
-    for i in range(2):
-        w(f"        int aR{i} = tileRow * BM + cr + {64 * i};")
+    for i in range(1 if small else 2):
+        w(f"        int aR{i} = tileRow * {BMx} + cr + {64 * i};")
         w(f"        int aSz{i} = aR{i} < M ? 16 : 0;")
         w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 4) + cc;")
         w(f"        int sOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
@@ -219,20 +251,20 @@ def kernel_direct(swiglu=False):
         w("        int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;")
     w("        long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16")
     w(f"        int bOff = wr * {RWB} + ((wc ^ ((wr >> 2) & 1)) << 2);")
-    w("        // scales: threads 0..127 stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair")
+    w(f"        // scales: threads 0..{31 if small else 127} stage A row tid's (cp.async); ALL 256 compute W scales, thread tid row tid >> 1, sub-block 2p + (tid & 1) of the pair")
     w("        // (when only warps 4..7 computed them, every tile's barrier waited on those warps: ncu 2026-11-11, barrier stalls 13% of the kernel)")
     w("        int sr = tid & 127, wsr = tid >> 1, wsh = tid & 1;")
     if swiglu:
         w("        int sb8 = wsr >> 3, ffs = tileCol * 64 + (sb8 >> 1) * 8 + (wsr & 7);")
-        w("        int sAR = tileRow * BM + sr, sBR = (sb8 & 1) == 0 ? ffs : Nff + ffs;")
+        w(f"        int sAR = tileRow * {BMx} + sr, sBR = (sb8 & 1) == 0 ? ffs : Nff + ffs;")
         w("        bool sBOk = ffs < Nff;")
     else:
-        w("        int sAR = tileRow * BM + sr, sBR = tileCol * BN + wsr;")
+        w(f"        int sAR = tileRow * {BMx} + sr, sBR = tileCol * BN + wsr;")
         w("        bool sBOk = sBR < N;")
     w("        int sASz = sAR < M ? 16 : 0;")
     w("        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);")
     w("        long sWRow = (long)(sBOk ? sBR : 0) * ((K >> 8) * 9);")
-    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 32 + (lane & 7) + ((lane >> 4) << 3);")
+    w(f"        int rowA = wm * {WMr} + (lane & 15), rowB = wn * {WNc} + (lane & 7) + ((lane >> 4) << 3);")
     w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 2) & 1;")
     w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
     w(f"        int bLd = rowB * {RWB} + ((((lane >> 3) & 1) ^ swB) << 2);")
@@ -245,11 +277,19 @@ def kernel_direct(swiglu=False):
         w(f"{ind}{{")
         w(f"{ind}    int ktI = {kt_expr};")
         w(f"{ind}    int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;")
-        w(f"{ind}    int sb = ({st_expr}) * BM * {RW}, sbw = ({st_expr}) * BN * {RWB}, sc4 = ({st_expr}) * BM * 4;")
-        for ii in range(2):
-            w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sb + sOff{ii}]), (ulong)Unsafe.AsPointer(ref Aq[aG{ii} + kq]), aSz{ii});")
+        if small:
+            # sc4 stays the W scale tile's stage offset (BN rows); the A tile's is sc4a (32 rows)
+            w(f"{ind}    int sb = ({st_expr}) * BMS * {RW}, sbw = ({st_expr}) * BN * {RWB}, sc4 = ({st_expr}) * BN * 4, sc4a = ({st_expr}) * BMS * 4;")
+            w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sb + sOff0]), (ulong)Unsafe.AsPointer(ref Aq[aG0 + kq]), aSz0);   // the 32 A rows")
+        else:
+            w(f"{ind}    int sb = ({st_expr}) * BM * {RW}, sbw = ({st_expr}) * BN * {RWB}, sc4 = ({st_expr}) * BM * 4;")
+            for ii in range(2):
+                w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sb + sOff{ii}]), (ulong)Unsafe.AsPointer(ref Aq[aG{ii} + kq]), aSz{ii});")
         w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);")
-        w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
+        if small:
+            w(f"{ind}    if (tid < 32) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4a + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
+        else:
+            w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
         w(f"{ind}    {{")
         w(f"{ind}        float ws = 0f, wmn = 0f;")
         w(f"{ind}        if (sBOk)")
@@ -279,30 +319,33 @@ def kernel_direct(swiglu=False):
     w("                if (sBOk && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((kt0 + it + 2) * BK) >> 8) * 9];")
     w("            }")
     w('            CudaAsm.Emit("cp.async.commit_group;");')
-    w(f"            int so = (it & 1) * BM * {RW}, sow = (it & 1) * BN * {RWB}, sc4c = (it & 1) * BM * 4;")
+    if small:
+        w(f"            int so = (it & 1) * BMS * {RW}, sow = (it & 1) * BN * {RWB}, sc4c = (it & 1) * BN * 4, sc4ca = (it & 1) * BMS * 4;")
+    else:
+        w(f"            int so = (it & 1) * BM * {RW}, sow = (it & 1) * BN * {RWB}, sc4c = (it & 1) * BM * 4;")
     w("            // the pair's raw nibble words, once for both blocks")
-    for np_ in range(NT5 // 2):
+    for np_ in range(NT // 2):
         w(f'            CudaAsm.Emit("{ldm4}", out uint r{2 * np_}0, out uint r{2 * np_}1, out uint r{2 * np_ + 1}0, out uint r{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[sow + bLd + {np_ * 16 * RWB}]));')
     for ks in range(2):
         w("            {")
-        for mt in range(MT5):
+        for mt in range(MT):
             w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd{ks} + {mt * 16 * RW}]));')
-        for nt in range(NT5):
+        for nt in range(NT):
             if ks == 0:
                 w(f"                uint b{nt}0 = r{nt}0 & 0x0F0F0F0Fu, b{nt}1 = r{nt}1 & 0x0F0F0F0Fu;")
             else:
                 w(f"                uint b{nt}0 = (r{nt}0 >> 4) & 0x0F0F0F0Fu, b{nt}1 = (r{nt}1 >> 4) & 0x0F0F0F0Fu;")
-        for mt in range(MT5):
-            w(f"                int ac{mt} = sc4c + (wm * 64 + {mt * 16} + g) * 4 + {2 * ks};")
+        for mt in range(MT):
+            w(f"                int ac{mt} = {'sc4ca' if small else 'sc4c'} + (wm * {WMr} + {mt * 16} + g) * 4 + {2 * ks};")
             w(f"                float da{mt}0 = aSc[ac{mt}], da{mt}1 = aSc[ac{mt} + 32];")
             w(f"                float sa{mt}0 = -aSc[ac{mt} + 1], sa{mt}1 = -aSc[ac{mt} + 33];")
-        for nt in range(NT5):
+        for nt in range(NT):
             w("                {")
-            w(f"                int bc = sc4c + (wn * 32 + {nt * 8} + 2 * t) * 4 + {2 * ks};")
+            w(f"                int bc = sc4c + (wn * {WNc} + {nt * 8} + 2 * t) * 4 + {2 * ks};")
             w("                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];")
-            for mt in range(MT5):
+            for mt in range(MT):
                 w(f'                CudaAsm.Emit("{mma32}", out int i{mt}0, out int i{mt}1, out int i{mt}2, out int i{mt}3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1);')
-            for mt in range(MT5):
+            for mt in range(MT):
                 for (ci, r, col) in ((0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)):
                     w(f"                c{mt}{nt}{ci} = float.MultiplyAddEstimate(sa{mt}{r}, y{col}, float.MultiplyAddEstimate(da{mt}{r} * x{col}, (float)i{mt}{ci}, c{mt}{nt}{ci}));")
             w("                }")
@@ -310,21 +353,21 @@ def kernel_direct(swiglu=False):
     w("        }")
     w('        CudaAsm.Emit("cp.async.wait_group 0;");')
     if swiglu:
-        for mt in range(MT5):
-            for pp in range(NT5 // 2):
+        for mt in range(MT):
+            for pp in range(NT // 2):
                 gt, ut = 2 * pp, 2 * pp + 1
                 w("        {")
-                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-                w(f"            int f0 = tileCol * 64 + wn * 16 + {pp * 8} + 2 * t, f1 = f0 + 1;")
+                w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int f0 = tileCol * 64 + wn * {WNc // 2} + {pp * 8} + 2 * t, f1 = f0 + 1;")
                 for (mrow, a0, a1) in (("m0", 0, 1), ("m1", 2, 3)):
                     w(f"            if ({mrow} < M) {{ if (f0 < Nff) C[(long){mrow} * Nff + f0] = Silu(c{mt}{gt}{a0}) * c{mt}{ut}{a0}; if (f1 < Nff) C[(long){mrow} * Nff + f1] = Silu(c{mt}{gt}{a1}) * c{mt}{ut}{a1}; }}")
                 w("        }")
     else:
-        for mt in range(MT5):
-            for nt in range(NT5):
+        for mt in range(MT):
+            for nt in range(NT):
                 w("        {")
-                w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
-                w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+                w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
+                w(f"            int n0 = tileCol * BN + wn * {WNc} + {nt * 8} + 2 * t, n1 = n0 + 1;")
                 w(f"            if (m0 < M) {{ if (n0 < N) C[cOff + (long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[cOff + (long)m0 * N + n1] = c{mt}{nt}1; }}")
                 w(f"            if (m1 < M) {{ if (n0 < N) C[cOff + (long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[cOff + (long)m1 * N + n1] = c{mt}{nt}3; }}")
                 w("        }")
@@ -336,6 +379,10 @@ kernel(False)
 kernel(True)
 kernel_direct()
 kernel_direct(swiglu=True)
+kernel(False, small=True)
+kernel(True, small=True)
+kernel_direct(small=True)
+kernel_direct(swiglu=True, small=True)
 w("    // GgufBatchDecoder.SwigluJoinedImpl's x / (1 + exp(-x)): the fused SwiGLU's output equals the separate kernel's")
 w("    private static float Silu(float x) => x / (1f + MathF.Exp(-x));")
 w("}")

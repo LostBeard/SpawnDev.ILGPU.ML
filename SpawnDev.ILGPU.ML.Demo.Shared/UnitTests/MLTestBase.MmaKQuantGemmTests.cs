@@ -152,7 +152,7 @@ public abstract partial class MLTestBase
         var forces = CudaCaps.TensorCores(accelerator) ? new[] { false, true } : new[] { true };
         bool forceSaved = FusedDequantMatMul.ForceSm75Mma, v2Saved = FusedDequantMatMul.EnableMmaV2, v3Saved = FusedDequantMatMul.EnableMmaV3; bool v5Saved = FusedDequantMatMul.EnableMmaV5, v5t75Saved = FusedDequantMatMul.EnableMmaSm75V5, v6Saved = FusedDequantMatMul.EnableMmaV6;
         bool scrSaved = FusedDequantMatMul.EnableMmaScratch;
-        int v3MinSaved = FusedDequantMatMul.MmaV3MinRows, scrMinSaved = FusedDequantMatMul.MmaScratchMinRows;
+        int v3MinSaved = FusedDequantMatMul.MmaV3MinRows, scrMinSaved = FusedDequantMatMul.MmaScratchMinRows, m32Saved = FusedDequantMatMul.KqM32Max;
         FusedDequantMatMul.MmaV3MinRows = 1;   // every shape on V3 too
         FusedDequantMatMul.MmaScratchMinRows = 1;   // and on the scratch-operand GEMM
         using var fused = new FusedDequantMatMul(accelerator);
@@ -161,7 +161,7 @@ public abstract partial class MLTestBase
         {
         foreach (var type in new[] { GGMLType.Q4_K, GGMLType.Q6_K })
         foreach (bool force in forces)
-        foreach (var (M, K, N) in new[] { (200, 4096, 300), (16, 1024, 130), (1000, 2048, 257) })
+        foreach (var (M, K, N) in new[] { (200, 4096, 300), (16, 1024, 130), (1000, 2048, 257), (29, 2048, 2048) })
         {
             FusedDequantMatMul.ForceSm75Mma = force;
             string want = (type == GGMLType.Q4_K ? "mma-q4k" : "mma-q6k") + (force ? "-sm75" : "");
@@ -217,6 +217,7 @@ public abstract partial class MLTestBase
                 string sfx = v6 && want.Contains("sm75") ? "-scratch-v5" : sfx0;
                 FusedDequantMatMul.EnableMmaV6 = v6;
                 FusedDequantMatMul.KqSplitK = false;   // the bit-identity ladder: one K order per output (split-K is its own arm below)
+                FusedDequantMatMul.KqM32Max = 0;       // and the 128-row tiles (V2M32 is its own arm below)
                 FusedDequantMatMul.EnableMmaV2 = v2;
                 FusedDequantMatMul.EnableMmaV3 = v3;
                 FusedDequantMatMul.EnableMmaScratch = scr;
@@ -235,6 +236,20 @@ public abstract partial class MLTestBase
                 else got = g;
                 route = r;
             }
+            // V2M32 (sm_80, the 32-row A tile; forced on for every shape here, M > 32 included: several row tiles): the same MMAs per output as V1, bit-identical
+            if (!force)
+            {
+                FusedDequantMatMul.KqSplitK = false; FusedDequantMatMul.EnableMmaV2 = true; FusedDequantMatMul.EnableMmaV3 = false; FusedDequantMatMul.EnableMmaScratch = false;
+                FusedDequantMatMul.KqM32Max = int.MaxValue;
+                fused.Forward(inputBuf.View.SubView(0, (long)M * K), weightBuf.View, outBuf.View, M, K, N, type);
+                string rm = fused.LastGemmKernel;
+                await accelerator.SynchronizeAsync();
+                var gm = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
+                if (rm != want + "-v2-m32") throw new Exception($"{type} M={M} K={K} N={N}: ran '{rm}', not {want}-v2-m32");
+                int diffM = 0; for (int i = 0; i < gm.Length; i++) if (BitConverter.SingleToInt32Bits(gm[i]) != BitConverter.SingleToInt32Bits(got[i])) diffM++;
+                if (diffM > 0) throw new Exception($"{type} M={M} K={K} N={N} {rm}: differs from V1 in {diffM} of {gm.Length} outputs");
+                FusedDequantMatMul.KqM32Max = m32Saved;
+            }
             int bad = Bad(got, Oracle(0), out float worst);
             if (bad > 0) throw new Exception($"{type} M={M} K={K} N={N} {want}: {bad} of {got.Length} outputs past 2e-3 x sum|a w| (worst {worst:F2}x the bound)");
             // split-K (sm_80 V2, a grid smaller than the SM count: every shape here): its own K order, so held to the oracle's bound, not to V1's bits
@@ -246,8 +261,10 @@ public abstract partial class MLTestBase
                 string rs = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
                 var gs = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
-                bool small = ((M + 127) / 128) * ((N + 127) / 128) * 2 <= accelerator.NumMultiprocessors;   // split only when one wave holds 2+ slices per tile
-                string wantS = want + "-v2" + (small ? "-splitk" : "");
+                bool m32 = M <= FusedDequantMatMul.KqM32Max;   // a short prompt: the 32-row A tile
+                int bmT = m32 ? 32 : 128;
+                bool small = ((M + bmT - 1) / bmT) * ((N + 127) / 128) * 2 <= accelerator.NumMultiprocessors;   // split only when one wave holds 2+ slices per tile
+                string wantS = want + "-v2" + (m32 ? "-m32" : "") + (small ? "-splitk" : "");
                 if (rs != wantS) throw new Exception($"{type} M={M} K={K} N={N}: ran '{rs}', not {wantS}");
                 int badS = Bad(gs, Oracle(0), out float worstS);
                 if (badS > 0) throw new Exception($"{type} M={M} K={K} N={N} {rs}: {badS} of {gs.Length} outputs past the bound (worst {worstS:F2}x)");
@@ -267,7 +284,7 @@ public abstract partial class MLTestBase
         }
         finally
         {
-            FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved; FusedDequantMatMul.KqSplitK = true;
+            FusedDequantMatMul.ForceSm75Mma = forceSaved; FusedDequantMatMul.EnableMmaV2 = v2Saved; FusedDequantMatMul.EnableMmaV3 = v3Saved; FusedDequantMatMul.KqSplitK = true; FusedDequantMatMul.KqM32Max = m32Saved;
             FusedDequantMatMul.MmaV3MinRows = v3MinSaved; FusedDequantMatMul.EnableMmaScratch = scrSaved; FusedDequantMatMul.MmaScratchMinRows = scrMinSaved;
             FusedDequantMatMul.EnableMmaV5 = v5Saved; FusedDequantMatMul.EnableMmaSm75V5 = v5t75Saved; FusedDequantMatMul.EnableMmaV6 = v6Saved;
         }
