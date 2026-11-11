@@ -219,6 +219,9 @@ public class FusedDequantMatMul : IDisposable
     /// The prefill half of <see cref="Int8ActGemv"/> (on with it; env GGUF_INT8_ACT_GEMM=0 is the A/B): M &gt; 1 rows of Q4_K / Q6_K on the int8 tensor-core
     /// GEMMs (<see cref="MmaS8Gemm"/>, llama.cpp / Ollama's MMQ scheme: A in q8_1, W unpacked to int8 with per-32-value scales). CUDA sm_80+.
     /// </summary>
+    /// <summary>Q4_K prefill rows on <see cref="MmaS8Gemm"/>'s direct kernel (raw Q4_K, no unpack pass; default) or the unpack + S8Q4K pair (env GGUF_S8_DIRECT=0).</summary>
+    public static bool S8Direct = Environment.GetEnvironmentVariable("GGUF_S8_DIRECT") != "0";
+    private Action<KernelConfig, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>? _s8Q4KDirect;
     public static bool Int8ActGemm = Environment.GetEnvironmentVariable("GGUF_INT8_ACT_GEMM") != "0";
     private MemoryBuffer1D<uint, Stride1D.Dense>? _s8A, _s8As, _s8W, _s8Ws;
     private Action<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>? _unpackQ4KS8;
@@ -873,7 +876,6 @@ public class FusedDequantMatMul : IDisposable
             && CudaCaps.Dp4a(_accelerator) && CanShuffle32 && (((IContiguousArrayView)weightQuant.BaseView).IndexInBytes & (type == GGMLType.Q4_K ? 15 : 3)) == 0)
         {
             long aQ = (long)M * K, wQ = (long)N * K;
-            var s8w = GrowScratch(ref _s8W, wQ / 4); var s8ws = GrowScratch(ref _s8Ws, wQ / 16);
             // the rows as q8_1: the producer's (a fused norm / SwiGLU wrote them, pre), else quantized here (one launch)
             ArrayView1D<Trellis2.U4, Stride1D.Dense> aqU, asU;
             bool fused8 = pre.HasValue && pre.Value.Qs.Length >= aQ && pre.Value.Ds.Length >= aQ / 16 && (((IContiguousArrayView)pre.Value.Qs.BaseView).IndexInBytes & 15) == 0
@@ -886,6 +888,16 @@ public class FusedDequantMatMul : IDisposable
                 _quantQ8Warp((int)aQ, input.SubView(0, aQ), s8a.View.SubView(0, aQ / 4).Cast<uint, byte>(), s8as.View.SubView(0, aQ / 16).Cast<uint, float>());
                 aqU = s8a.View.SubView(0, aQ / 4).Cast<uint, Trellis2.U4>(); asU = s8as.View.SubView(0, aQ / 16).Cast<uint, Trellis2.U4>();
             }
+            int tilesD = ((M + MmaS8Gemm.BM - 1) / MmaS8Gemm.BM) * ((N + MmaS8Gemm.BN - 1) / MmaS8Gemm.BN);
+            if (type == GGMLType.Q4_K && S8Direct)
+            {
+                // straight from the raw Q4_K rows: no unpack pass, no N x K scratch
+                (_s8Q4KDirect ??= _accelerator.LoadStreamKernel<ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView1D<Trellis2.U4, Stride1D.Dense>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(MmaS8Gemm.S8Q4KDirect))(
+                    new KernelConfig(tilesD, MmaS8Gemm.Threads), aqU, asU, weightQuant.BaseView.Cast<W16>(), output, M, K, N);
+                LastGemmKernel = "mma-s8-q4k-direct" + (fused8 ? "-pre" : "");
+                return;
+            }
+            var s8w = GrowScratch(ref _s8W, wQ / 4); var s8ws = GrowScratch(ref _s8Ws, wQ / 16);
             int nBlk = (int)(wQ >> 5);
             if (type == GGMLType.Q4_K)
                 (_unpackQ4KS8 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<W16>, ArrayView<W16>, ArrayView1D<float, Stride1D.Dense>, int>(UnpackQ4KS8Impl))(
@@ -2735,7 +2747,7 @@ public class FusedDequantMatMul : IDisposable
     //    multiplies them into all M rows; the shared-memory reduction over the group is the per-element kernel's ──
 
     // fp16 bits -> float, exact: subnormals scaled, the exponent built in the float's bits (inf / nan do not occur in a block scale)
-    private static float HalfBits(int h)
+    internal static float HalfBits(int h)
     {
         int exp = (h >> 10) & 0x1F, man = h & 0x3FF;
         float r = exp == 0 ? man * (1f / 16777216f) : Interop.IntAsFloat((uint)(((exp + 112) << 23) | (man << 13)));
@@ -3141,7 +3153,7 @@ public class FusedDequantMatMul : IDisposable
         return (word >> ((i & 3) << 3)) & 0xFF;
     }
     // sub-block j's 6-bit scale (low byte) and min (high byte), from the scale bytes in registers (GetScaleMinK4's packing)
-    private static int ScaleMinRegs(int b0, int b1, int b2, int j)
+    internal static int ScaleMinRegs(int b0, int b1, int b2, int j)
     {
         bool low = j < 4;
         int bj = ScaleByte(b0, b1, b2, j), bj4 = ScaleByte(b0, b1, b2, j + 4), bjm4 = ScaleByte(b0, b1, b2, low ? j : j - 4);

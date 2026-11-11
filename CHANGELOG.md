@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Opt-in int8 prefill reads Q4_K straight from the GGUF rows** (`MmaS8Gemm.S8Q4KDirect`, default with the int8 GEMM; env GGUF_S8_DIRECT=0 runs the
+  unpack + S8Q4K pair): no per-call unpack pass and no N x K int8 scratch. A 64-value K tile is one Q4_K sub-block pair, ONE 32-byte nibble chunk a row:
+  one ldmatrix of it gives both blocks' fragments (w & 0x0F0F0F0F, (w >> 4) & 0x0F0F0F0F), and the W rows' threads compute the pair's (d sc, dmin m)
+  from the super-block header, loaded one tile ahead (loaded at issue time it stalled them: 1% behind the unpack pair at long prompts). Same scheme:
+  `Gemm_Int8Act_MatchesGgmlQ8_1Scheme` runs both Q4_K kernels (3.9-9.4e-8). MEASURED (RTX 4070, qwen3:1.7b Q4_K_M, int8 on, quiet, interleaved x2):
+  prefill 29 tokens 1,208 / 1,222 -> 1,352 / 1,369 tok/s (+12%), 1,830 tokens 12,618 / 12,542 -> 12,682 / 12,654 (+0.7%).
+
 - **Opt-in int8 activations: prefill's producers write the q8_1 form too** (`Int8ActFor` now covers M > 1 rows on the int8 GEMM; GGUF_INT8_ACT_FUSE=0 is the
   A/B): the residual-add + RMSNorm and the SwiGLU write their rows' q8_1 beside the floats, and the int8 GEMM reads them (`Forward(..., Q8Act?)`), so a
   prefill launches no quantize for q|k, gate|up and down (nsys: 354 quantize launches left in a bench run, the attention outputs). The same bytes:

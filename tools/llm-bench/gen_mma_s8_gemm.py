@@ -36,6 +36,7 @@ w("namespace SpawnDev.ILGPU.ML.Kernels;")
 w("")
 w("using FV = ArrayView1D<float, Stride1D.Dense>;")
 w("using U4V = ArrayView1D<SpawnDev.ILGPU.ML.Trellis2.U4, Stride1D.Dense>;")
+w("using W16 = FusedDequantMatMul.W16;")
 w("")
 w("/// <summary>")
 w("/// OPT-IN int8 tensor-core GEMMs (llama.cpp / Ollama's MMQ scheme) for a prefill's rows over Q4_K / Q6_K weights: A in ggml's q8_1, W unpacked to int8")
@@ -155,8 +156,138 @@ def kernel(q6):
     w("")
 
 
+def kernel_direct():
+    """S8Q4KDirect (2026-11-11): S8Q4K reading the raw Q4_K rows, no unpack pass. A 64-value K tile is one Q4_K sub-block PAIR (2p, 2p + 1 of a super-block):
+    ONE 32-byte nibble chunk per row (qs bytes 32p..32p + 31; low nibbles = sub-block 2p, high = 2p + 1). Each W row stages that chunk (16 bytes a thread,
+    rows 32 bytes, chunk c of row r at c ^ ((r >> 2) & 1): conflict-free ldmatrix at that stride), and one ldmatrix of it gives BOTH blocks' B fragments:
+    block 0 = w & 0x0F0F0F0F, block 1 = (w >> 4) & 0x0F0F0F0F (the int8 k32 fragment's byte positions are the chunk's). The W threads compute the pair's
+    (d sc, dmin m) from the super-block header into the scale tile S8Q4K reads (same layout), so the epilogue is unchanged. W 16-byte aligned, K % 256 == 0."""
+    RWB = 8
+    w("    /// <summary>Q4_K on int8 straight from the raw GGUF rows (no unpack): C = A W^T. grid = ceil(M/128) * ceil(N/128), group = 256. K a multiple of 256; W 16-byte aligned. sm_80+.</summary>")
+    w("    public static unsafe void S8Q4KDirect(U4V Aq, U4V As, ArrayView<W16> Wq, FV C, int M, int K, int N)")
+    w("    {")
+    w("        int numTilesM = (M + BM - 1) / BM;")
+    w("        int tileRow = Grid.IdxX % numTilesM;")
+    w("        int tileCol = Grid.IdxX / numTilesM;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 2, wn = warp & 3;")
+    w(f"        var aS = SharedMemory.Allocate<uint>(2 * BM * {RW});")
+    w(f"        var bS = SharedMemory.Allocate<uint>(2 * BN * {RWB});")
+    w("        var aSc = SharedMemory.Allocate<float>(2 * BM * 4);")
+    w("        var bSc = SharedMemory.Allocate<float>(2 * BN * 4);")
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int cr = tid >> 2, cc = tid & 3;")
+    for i in range(2):
+        w(f"        int aR{i} = tileRow * BM + cr + {64 * i};")
+        w(f"        int aSz{i} = aR{i} < M ? 16 : 0;")
+        w(f"        long aG{i} = (long)(aSz{i} != 0 ? aR{i} : 0) * (K >> 4) + cc;")
+        w(f"        int sOff{i} = (cr + {64 * i}) * {RW} + ((cc ^ (((cr + {64 * i}) >> 1) & 3)) << 2);")
+    w("        // W: thread tid stages row tid >> 1, 16-byte chunk tid & 1 of the tile's nibble chunk")
+    w("        int wr = tid >> 1, wc = tid & 1;")
+    w("        int bRg = tileCol * BN + wr; int bSz = bRg < N ? 16 : 0;")
+    w("        long wRow = (long)(bSz != 0 ? bRg : 0) * ((K >> 8) * 9);                 // a super-block is 144 bytes = 9 W16")
+    w(f"        int bOff = wr * {RWB} + ((wc ^ ((wr >> 2) & 1)) << 2);")
+    w("        // scales: threads 0..127 stage A row tid's (cp.async); 128..255 compute W row tid - 128's (ws, wm) for the pair from its super-block header")
+    w("        int sr = tid & 127;")
+    w("        int sAR = tileRow * BM + sr, sBR = tileCol * BN + sr;")
+    w("        int sASz = sAR < M ? 16 : 0;")
+    w("        long sAG = (long)(sASz != 0 ? sAR : 0) * (K >> 6);")
+    w("        long sWRow = (long)(sBR < N ? sBR : 0) * ((K >> 8) * 9);")
+    w("        int rowA = wm * 64 + (lane & 15), rowB = wn * 32 + (lane & 7) + ((lane >> 4) << 3);")
+    w("        int swA = (rowA >> 1) & 3, swB = (rowB >> 2) & 1;")
+    w(f"        int aLd0 = rowA * {RW} + (((lane >> 4) ^ swA) << 2), aLd1 = rowA * {RW} + (((2 + (lane >> 4)) ^ swA) << 2);")
+    w(f"        int bLd = rowB * {RWB} + ((((lane >> 3) & 1) ^ swB) << 2);")
+    w("        int nk = K / BK;")
+
+    def issue(kt_expr, st_expr, ind, hv):
+        w(f"{ind}{{")
+        w(f"{ind}    int ktI = {kt_expr};")
+        w(f"{ind}    int kq = ktI >> 4, ks6 = ktI >> 6, sbI = ktI >> 8, pI = (ktI >> 6) & 3;")
+        w(f"{ind}    int sb = ({st_expr}) * BM * {RW}, sbw = ({st_expr}) * BN * {RWB}, sc4 = ({st_expr}) * BM * 4;")
+        for ii in range(2):
+            w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aS[sb + sOff{ii}]), (ulong)Unsafe.AsPointer(ref Aq[aG{ii} + kq]), aSz{ii});")
+        w(f"{ind}    CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref bS[sbw + bOff]), (ulong)Unsafe.AsPointer(ref Wq[wRow + sbI * 9 + 1 + 2 * pI + wc]), bSz);")
+        w(f"{ind}    if (tid < 128) CudaAsm.Emit(\"{cpa}\", (ulong)Unsafe.AsPointer(ref aSc[sc4 + sr * 4]), (ulong)Unsafe.AsPointer(ref As[sAG + ks6]), sASz);")
+        w(f"{ind}    else")
+        w(f"{ind}    {{")
+        w(f"{ind}        float ws0 = 0f, wm0 = 0f, ws1 = 0f, wm1 = 0f;")
+        w(f"{ind}        if (sBR < N)")
+        w(f"{ind}        {{")
+        w(f"{ind}            W16 h = {hv};")
+        w(f"{ind}            float d = FusedDequantMatMul.HalfBits(h.a & 0xFFFF), dmin = FusedDequantMatMul.HalfBits((h.a >> 16) & 0xFFFF);")
+        w(f"{ind}            int sm0 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI), sm1 = FusedDequantMatMul.ScaleMinRegs(h.b, h.c, h.d, 2 * pI + 1);")
+        w(f"{ind}            ws0 = d * (sm0 & 0xFF); wm0 = dmin * (sm0 >> 8); ws1 = d * (sm1 & 0xFF); wm1 = dmin * (sm1 >> 8);")
+        w(f"{ind}        }}")
+        w(f"{ind}        int o = sc4 + sr * 4;")
+        w(f"{ind}        bSc[o] = ws0; bSc[o + 1] = wm0; bSc[o + 2] = ws1; bSc[o + 3] = wm1;")
+        w(f"{ind}    }}")
+        w(f"{ind}}}")
+
+    w("        // the W threads' super-block header for the next tile to stage, loaded one iteration AHEAD (a register): its latency hides behind a tile's MMAs")
+    w("        // (loaded at issue time it stalled warps 4..7 every tile: the direct kernel ran 1% behind the unpack pair at a 1,830-token prefill)")
+    w("        W16 h0 = default, hPre = default;")
+    w("        if (tid >= 128 && sBR < N) { h0 = Wq.AsAligned16()[sWRow]; if (nk > 1) hPre = Wq.AsAligned16()[sWRow + ((BK >> 8) * 9)]; }")
+    issue("0", "0", "        ", "h0")
+    w('        CudaAsm.Emit("cp.async.commit_group;");')
+    w("        for (int it = 0; it < nk; it++)")
+    w("        {")
+    w('            CudaAsm.Emit("cp.async.wait_group 0;");   // tile it has landed (and its computed W scales: the barrier publishes them)')
+    w("            Group.Barrier();")
+    w("            if (it + 1 < nk)")
+    w("            {")
+    issue("(it + 1) * BK", "(it + 1) & 1", "                ", "hPre")
+    w("                if (tid >= 128 && sBR < N && it + 2 < nk) hPre = Wq.AsAligned16()[sWRow + (((it + 2) * BK) >> 8) * 9];")
+    w("            }")
+    w('            CudaAsm.Emit("cp.async.commit_group;");')
+    w(f"            int so = (it & 1) * BM * {RW}, sow = (it & 1) * BN * {RWB}, sc4c = (it & 1) * BM * 4;")
+    w("            // the pair's raw nibble words, once for both blocks")
+    for np_ in range(NT5 // 2):
+        w(f'            CudaAsm.Emit("{ldm4}", out uint r{2 * np_}0, out uint r{2 * np_}1, out uint r{2 * np_ + 1}0, out uint r{2 * np_ + 1}1, (ulong)Unsafe.AsPointer(ref bS[sow + bLd + {np_ * 16 * RWB}]));')
+    for ks in range(2):
+        w("            {")
+        for mt in range(MT5):
+            w(f'                CudaAsm.Emit("{ldm4}", out uint a{mt}0, out uint a{mt}1, out uint a{mt}2, out uint a{mt}3, (ulong)Unsafe.AsPointer(ref aS[so + aLd{ks} + {mt * 16 * RW}]));')
+        for nt in range(NT5):
+            if ks == 0:
+                w(f"                uint b{nt}0 = r{nt}0 & 0x0F0F0F0Fu, b{nt}1 = r{nt}1 & 0x0F0F0F0Fu;")
+            else:
+                w(f"                uint b{nt}0 = (r{nt}0 >> 4) & 0x0F0F0F0Fu, b{nt}1 = (r{nt}1 >> 4) & 0x0F0F0F0Fu;")
+        for mt in range(MT5):
+            w(f"                int ac{mt} = sc4c + (wm * 64 + {mt * 16} + g) * 4 + {2 * ks};")
+            w(f"                float da{mt}0 = aSc[ac{mt}], da{mt}1 = aSc[ac{mt} + 32];")
+            w(f"                float sa{mt}0 = -aSc[ac{mt} + 1], sa{mt}1 = -aSc[ac{mt} + 33];")
+        for nt in range(NT5):
+            w("                {")
+            w(f"                int bc = sc4c + (wn * 32 + {nt * 8} + 2 * t) * 4 + {2 * ks};")
+            w("                float x0 = bSc[bc], y0 = bSc[bc + 1], x1 = bSc[bc + 4], y1 = bSc[bc + 5];")
+            for mt in range(MT5):
+                w(f'                CudaAsm.Emit("{mma32}", out int i{mt}0, out int i{mt}1, out int i{mt}2, out int i{mt}3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1);')
+            for mt in range(MT5):
+                for (ci, r, col) in ((0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)):
+                    w(f"                c{mt}{nt}{ci} = float.MultiplyAddEstimate(sa{mt}{r}, y{col}, float.MultiplyAddEstimate(da{mt}{r} * x{col}, (float)i{mt}{ci}, c{mt}{nt}{ci}));")
+            w("                }")
+        w("            }")
+    w("        }")
+    w('        CudaAsm.Emit("cp.async.wait_group 0;");')
+    for mt in range(MT5):
+        for nt in range(NT5):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w(f"            if (m0 < M) {{ if (n0 < N) C[(long)m0 * N + n0] = c{mt}{nt}0; if (n1 < N) C[(long)m0 * N + n1] = c{mt}{nt}1; }}")
+            w(f"            if (m1 < M) {{ if (n0 < N) C[(long)m1 * N + n0] = c{mt}{nt}2; if (n1 < N) C[(long)m1 * N + n1] = c{mt}{nt}3; }}")
+            w("        }")
+    w("    }")
+    w("")
+
+
 kernel(False)
 kernel(True)
+kernel_direct()
 w("}")
 
 path = sys.argv[1]

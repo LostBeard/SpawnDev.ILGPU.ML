@@ -260,13 +260,17 @@ public abstract partial class MLTestBase
                 using var weightBuf = AllocatePadded(accelerator, weightBytes);
                 using var inputBuf = accelerator.Allocate1D(x);
                 using var outBuf = accelerator.Allocate1D<float>((long)M * N);
+                // Q4_K on both kernels: S8Q4KDirect (raw rows, the default) and the unpack + S8Q4K pair
+                foreach (bool direct in type == GGMLType.Q4_K ? new[] { true, false } : new[] { true })
+                {
+                SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.S8Direct = direct;
                 outBuf.MemSetToZero();
                 fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
                 string route = fused.LastGemmKernel;
                 await accelerator.SynchronizeAsync();
                 var got = await outBuf.CopyToHostAsync<float>(0, (long)M * N);
-                string want = type == GGMLType.Q4_K ? "mma-s8-q4k" : "mma-s8-q6k";
-                if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: the int8 GEMM did not run (ran '{route}')");
+                string want = type == GGMLType.Q4_K ? (direct ? "mma-s8-q4k-direct" : "mma-s8-q4k") : "mma-s8-q6k";
+                if (route != want) throw new Exception($"{type} M={M} K={K} N={N}: the int8 GEMM did not run (ran '{route}', wanted '{want}')");
                 double worstFid = 0, worstCost = 0, sumCost = 0;
                 int samples = Math.Min(3000, M * N);
                 for (int s = 0; s < samples; s++)
@@ -284,12 +288,13 @@ public abstract partial class MLTestBase
                     double cost = Math.Abs(g - refF) / Math.Max(1e-30, absF);
                     worstCost = Math.Max(worstCost, cost); sumCost += cost;
                 }
-                string note = $"{type} M={M} K={K} N={N}: vs the q8_1 scheme worst {worstFid:E1}; cost vs fp32 activations mean {sumCost / samples:E1} worst {worstCost:E1}";
+                string note = $"{route} M={M} K={K} N={N}: vs the q8_1 scheme worst {worstFid:E1}; cost vs fp32 activations mean {sumCost / samples:E1} worst {worstCost:E1}";
                 notes.Add(note);
                 if (!(worstFid < 1e-5)) throw new Exception(note + " - the GEMM does not compute ggml's q8_1 scheme (limit 1e-5)");
+                }
             }
         }
-        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = saved; }
+        finally { SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.Int8ActGemv = saved; SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.S8Direct = true; }
         return string.Join("; ", notes);
     });
 }
