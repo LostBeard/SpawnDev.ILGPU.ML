@@ -2,7 +2,13 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (master)
+## 5.8.15 - 2026-11-12 (nuget.org) - short prompts: first token 2.7x (default) / 2.2x (int8) faster on CUDA
+
+- **On SpawnDev.ILGPU 5.4.28.** Its fixes that ML needs: the delegate-specialization launcher cache was keyed by the accelerator's hash code, so a new
+  accelerator could get a disposed one's launcher (ML's 5.8.15 sweep on 5.4.27 failed `Vad_Reset_ReproducesTheStreamExactly` with "this WebGPU accelerator
+  has been disposed", in suite order only); and WebGPU read an in-kernel `view.Length` too large for a host sub-view not on a 256-byte boundary (ML's
+  TurboQuant sign flip and face letterbox use the length as data; new gates `TurboQuant_SignFlip_UnalignedSignsSubView`, `FaceStages_Letterbox_UnalignedBlobSubView`,
+  red on WebGPU with 5.4.27).
 
 - **FIX: Wan's default repo paths named a text encoder the models host does not serve.** `Wan22Paths.InRepo()` defaulted to `umt5_xxl_enc_bf16.safetensors`;
   models.spawndev.com serves only the 8-bit umT5 (the 11.4 GB bf16 file is not hosted, by design), so a default repo load failed at the text encoder (404; SpawnGen
