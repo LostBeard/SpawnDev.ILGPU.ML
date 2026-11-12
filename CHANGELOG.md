@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **FIX: Wan's default repo paths named a text encoder the models host does not serve.** `Wan22Paths.InRepo()` defaulted to `umt5_xxl_enc_bf16.safetensors`;
+  models.spawndev.com serves only the 8-bit umT5 (the 11.4 GB bf16 file is not hosted, by design), so a default repo load failed at the text encoder (404; SpawnGen
+  found it). The default is now `umt5_xxl_enc_q8.safetensors`, as `LtxPaths.InRepo` already does. No quality cost: the 8-bit umT5 is 2.6e-2 to 3.4e-2 from the bf16
+  reference against the bf16 port's 2.3e-2, the reference itself 2.2e-2 to 2.8e-2 from exact math (`Wan_UmT5_Quantized_MatchesReference`). `Wan22Paths.InFolder`
+  keeps the bf16 file (local exports). New gate `ModelsHost_RepoDefaultFiles_AreServed`: every file Wan's and LTX's default repo paths name must be served (byte 0
+  by Range request).
+
 - **Time to first token: the batch decoder hands out a completed token read before it queues the next step** (`GgufBatchDecoder`'s device-draw loop;
   env GGUF_HANDOUT_FIRST=0 is the A/B). The loop queued decode step P + 1 and only then awaited step P's tokens, to keep the device one step ahead. On the
   desktop backends the read is synchronous (the read IS the wait), so every token waited for the next step's encode and run, the FIRST token included:

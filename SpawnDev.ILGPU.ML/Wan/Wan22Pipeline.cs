@@ -13,13 +13,19 @@ public sealed class Wan22Paths
     public required string Dit { get; init; }
     /// <summary><c>wan22_vae_f16.safetensors</c> (1.4 GB).</summary>
     public required string Vae { get; init; }
-    /// <summary><c>umt5_xxl_enc_bf16.safetensors</c> (11.4 GB, streamed layer by layer).</summary>
+    /// <summary><c>umt5_xxl_enc_q8.safetensors</c> (6.4 GB) or <c>umt5_xxl_enc_bf16.safetensors</c> (11.4 GB), streamed layer by layer.</summary>
     public required string TextEncoder { get; init; }
     /// <summary>The umT5 <c>tokenizer.json</c>.</summary>
     public required string Tokenizer { get; init; }
 
-    /// <summary>The file names the exporters write and a model repo holds (relative, forward slashes).</summary>
-    public static Wan22Paths InRepo(string dit = "wan22_ti2v_5b_dit_q8.safetensors", string textEncoder = "umt5_xxl_enc_bf16.safetensors") => new()
+    /// <summary>
+    /// The file names a model repo holds (relative, forward slashes). <see cref="Wan22Pipeline.DefaultRepo"/> on models.spawndev.com serves the 8-bit and 4-bit DiT, the VAE,
+    /// the 8-bit umT5 (the 11.4 GB bf16 one is not hosted) and the tokenizer, so the text encoder defaults to the 8-bit file, as <c>LtxPaths.InRepo</c> does. It defaulted to the
+    /// bf16 file until 2026-11-11, which the host answers 404 for: a default repo load failed at the text encoder (found by SpawnGen). The 8-bit umT5 is as faithful as the bf16
+    /// one: 2.6e-2 to 3.4e-2 against the bf16 reference versus 2.3e-2, the reference itself 2.2e-2 to 2.8e-2 from exact math; the whole pipeline's decoded video 0.11 relRMS
+    /// with it (Docs/video.md, <c>Wan_UmT5_Quantized_MatchesReference</c>).
+    /// </summary>
+    public static Wan22Paths InRepo(string dit = "wan22_ti2v_5b_dit_q8.safetensors", string textEncoder = "umt5_xxl_enc_q8.safetensors") => new()
     {
         Dit = dit, Vae = "wan22_vae_f16.safetensors", TextEncoder = textEncoder, Tokenizer = "google/umt5-xxl/tokenizer.json",
     };

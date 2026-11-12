@@ -50,6 +50,11 @@ var video = await pipe.GenerateAsync(new WanRequest { Prompt = "A red fox walkin
 byte[] rgba = video.GetFrameRgba(0);       // frames are floats in [-1, 1], channel-first; WanVideo.Latent is the denoised latent
 ```
 
+**Size.** The standard model degrades well below its native 1280x704 / 704x1280, and so does the reference: at 640x352 x9 frames the official implementation's own output
+is posterised, over-saturated and blotchy, and ours matches it (the parity gates; checked 2026-11-11 when SpawnGen asked whether its RX 590 output was a bug: the NVIDIA
+OpenCL latent was identical to the AMD one). Small sizes are fine for quick tests; for real clips use 1280x704 (on an 8 GB card: `TiledDecode` and the 4-bit or Turbo DiT,
+see Memory below).
+
 `WanRequest.ImageRgb` (+ `ImageWidth`, `ImageHeight`) makes it image to video; `InitialNoise` reproduces another implementation's starting noise; `Trace` logs the VAE stage times.
 
 ## Files
