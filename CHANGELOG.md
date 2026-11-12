@@ -8,8 +8,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   `Wan22Pipeline.LoadWeightsAsync` recognises ComfyUI's layout and rewrites it into ours on the device (`WanComfyFormat`): torch's [co, ci, k...] convolutions
   permuted to the gather layout [co, taps, ci], the fp16 RMS-norm gammas to fp32, the reference's latent mean / std added. Read from the file's header only.
   New gate `Wan_ComfyVae_LoadsAsOurExport` (CUDA, OpenCL): every fp16 tensor bit-identical to our export, the gammas within fp16 rounding, the latent constants
-  exact. The DiT (q / k / v unfused, fp16) and the umT5 (Hugging Face T5 names, an fp8-scaled variant) follow. `GpuWeights` gains internal load-time setters
-  (the displaced buffer is returned, disposed by the caller after the device is idle).
+  exact. **The DiT too** (`split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors`): q / k / v fused as our export fuses them, fp16 -> bf16 (the reference
+  runs bf16) one tensor at a time with its fp16 buffer freed after a device wait (peak: the fp16 model plus one tensor; the 10 GB file fits a 12 GB card), the
+  modulation / patch-embedding reshapes. Gate `Wan_ComfyDit_LoadsAsOurExport` (CUDA, OpenCL; our bf16 export read from disk tensor by tensor): every value
+  bit-identical or one bf16 step away. ComfyUI's fp16 was rounded from the reference's fp32 master (ours fp32 -> bf16 directly), so fp32 -> fp16 -> bf16 can
+  land one step off (found by the first strict version of the gate: bits BC73 vs BC74). The umT5 (Hugging Face T5 names, an fp8-scaled variant) follows.
+  `GpuWeights` gains internal load-time setters (the displaced buffer is returned, disposed by the caller after the device is idle). Both gates HeavyModel.
 
 ## 5.8.16 - 2026-11-12 (nuget.org) - Wan VAE attention 15x on AMD OpenCL; Wan building blocks public
 

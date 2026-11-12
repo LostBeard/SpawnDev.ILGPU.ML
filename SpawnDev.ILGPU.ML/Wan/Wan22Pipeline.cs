@@ -195,6 +195,7 @@ public sealed class Wan22Pipeline
         {
             // ComfyUI's repackaged files load as they are: rewritten into this library's layout on the device (WanComfyFormat)
             if (WanComfyFormat.IsComfyVae(w)) await WanComfyFormat.AdaptVaeAsync(accelerator, w);
+            else if (WanComfyFormat.IsComfyDit(w)) await WanComfyFormat.AdaptDitAsync(accelerator, w);
             return w;
         }
         catch { w.Dispose(); throw; }

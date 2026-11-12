@@ -14,6 +14,65 @@ namespace SpawnDev.ILGPU.ML.Wan;
 /// </summary>
 public static class WanComfyFormat
 {
+    // ---------------------------------------------------------------------------------------------------------------------------------------------------
+    // DiT (split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors): the reference's names with q / k / v unfused (our export fuses
+    // self_attn.qkv = cat(q, k, v) and cross_attn.kv = cat(k, v): tools/wan-harness/reference/export_dit_bf16.py), fp16 where ours is the reference's bf16,
+    // modulation [1, 6, C] / head.modulation [1, 2, C] / patch_embedding [C, 48, 1, 2, 2] where ours is [6, C] / [2, C] / [C, 192] (the same element order).
+    // ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+    /// <summary>True when <paramref name="w"/> is ComfyUI's Wan 2.2 DiT layout (unfused q / k / v) rather than ours.</summary>
+    public static bool IsComfyDit(GpuWeights w) => w.Has("blocks.0.self_attn.q.weight") && !w.Has("blocks.0.self_attn.qkv.weight");
+
+    private static Action<Index1D, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>? _toBf16;
+    private static Accelerator? _toBf16Acc;
+    // fp16 -> bf16 (ILGPU's (BFloat16)float cast rounds to nearest even; a bf16 value that went through fp16 comes back exactly unless fp16 made it subnormal)
+    private static void ToBf16Impl(Index1D i, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst) => dst[i] = (BFloat16)(float)src[i];
+    private static void ToBf16(Accelerator acc, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst)
+    {
+        if (!ReferenceEquals(_toBf16Acc, acc)) { _toBf16 = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(ToBf16Impl); _toBf16Acc = acc; }
+        _toBf16!((int)src.Length, src, dst);
+    }
+
+    /// <summary>
+    /// Rewrite ComfyUI's Wan 2.2 DiT layout into ours, in place: q / k / v fused, every tensor fp16 -> bf16, the three reshapes. One tensor at a time with a device
+    /// wait before its fp16 buffer is freed, so the peak is the fp16 model plus one tensor (the 10 GB file fits a 12 GB card).
+    /// </summary>
+    public static async Task AdaptDitAsync(Accelerator accelerator, GpuWeights w)
+    {
+        async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
+        int blocks = 0;
+        while (w.Has($"blocks.{blocks}.self_attn.q.weight")) blocks++;
+        for (int b = 0; b < blocks; b++)
+        {
+            foreach (var (fused, parts) in new[] { ("self_attn.qkv", new[] { "self_attn.q", "self_attn.k", "self_attn.v" }), ("cross_attn.kv", new[] { "cross_attn.k", "cross_attn.v" }) })
+                foreach (var suffix in new[] { ".weight", ".bias" })
+                {
+                    string p = $"blocks.{b}.";
+                    var names = parts.Select(x => p + x + suffix).ToArray();
+                    long total = names.Sum(n => w.F16(n).Length);
+                    var dst = accelerator.Allocate1D<BFloat16>(total);
+                    long off = 0;
+                    foreach (var n in names) { var src = w.F16(n); ToBf16(accelerator, src, dst.View.SubView(off, src.Length)); off += src.Length; }
+                    var s0 = w.Shape(names[0]);
+                    var shape = s0.Length == 2 ? new[] { s0[0] * names.Length, s0[1] } : new[] { (int)total };
+                    w.SetBF16(p + fused + suffix, dst, shape);
+                    foreach (var n in names) await Retire(w.Remove(n));
+                }
+        }
+        foreach (var name in w.Names.ToList())
+        {
+            if (!w.IsF16(name)) continue;
+            var s = w.Shape(name);
+            int[] shape = name.EndsWith("modulation", StringComparison.Ordinal) && s.Length == 3 && s[0] == 1 ? new[] { s[1], s[2] }
+                : name == "patch_embedding.weight" && s.Length == 5 ? new[] { s[0], s[1] * s[2] * s[3] * s[4] } : s;
+            var src = w.F16(name);
+            var dst = accelerator.Allocate1D<BFloat16>(src.Length);
+            ToBf16(accelerator, src, dst.View);
+            await Retire(w.SetBF16(name, dst, shape));
+        }
+        await accelerator.SynchronizeAsync();
+    }
+
     /// <summary>True when <paramref name="w"/> is ComfyUI's Wan 2.2 VAE layout (torch-shaped convolutions, no latent normalisation) rather than ours.</summary>
     public static bool IsComfyVae(GpuWeights w) => !w.Has("latents_mean") && w.Has("conv1.weight") && w.Shape("conv1.weight").Length == 5;
 
