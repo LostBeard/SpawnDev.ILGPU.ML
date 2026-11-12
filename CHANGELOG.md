@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased (master)
+
+- **Wan: ComfyUI's repackaged VAE file loads as it is** (Comfy-Org/Wan_2.2_ComfyUI_Repackaged `split_files/vae/wan2.2_vae.safetensors`, Apache-2.0):
+  `Wan22Pipeline.LoadWeightsAsync` recognises ComfyUI's layout and rewrites it into ours on the device (`WanComfyFormat`): torch's [co, ci, k...] convolutions
+  permuted to the gather layout [co, taps, ci], the fp16 RMS-norm gammas to fp32, the reference's latent mean / std added. Read from the file's header only.
+  New gate `Wan_ComfyVae_LoadsAsOurExport` (CUDA, OpenCL): every fp16 tensor bit-identical to our export, the gammas within fp16 rounding, the latent constants
+  exact. The DiT (q / k / v unfused, fp16) and the umT5 (Hugging Face T5 names, an fp8-scaled variant) follow. `GpuWeights` gains internal load-time setters
+  (the displaced buffer is returned, disposed by the caller after the device is idle).
+
 ## 5.8.16 - 2026-11-12 (nuget.org) - Wan VAE attention 15x on AMD OpenCL; Wan building blocks public
 
 - **On SpawnDev.ILGPU 5.4.29** (a CUDA miscompile: a chained narrowing conversion such as `(byte)(int)f` folded into one saturating float-to-8-bit convert;

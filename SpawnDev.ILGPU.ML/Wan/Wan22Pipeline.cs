@@ -182,7 +182,7 @@ public sealed class Wan22Pipeline
     // ---- the building blocks, for callers that run their own graph (SpawnGen's ComfyUI-style split Wan graph): the pipeline uses exactly these ----
 
     /// <summary>
-    /// One of the model files (<see cref="Wan22Paths"/>: the DiT, the VAE) as device weights, read from <paramref name="source"/> (the models host and its cache, OPFS, a
+    /// One of the model files (<see cref="Wan22Paths"/>: the DiT, the VAE; also ComfyUI's repackaged <c>wan2.2_vae.safetensors</c>: <see cref="WanComfyFormat"/>) as device weights, read from <paramref name="source"/> (the models host and its cache, OPFS, a
     /// local folder) as the pipeline reads it. The caller owns the result: build <c>new WanDiT(accelerator, new DiTKernels(accelerator), weights)</c> or
     /// <c>new WanVae(accelerator, weights)</c> over it and dispose the weights after them. The umT5 encoder loads itself: <see cref="UmT5Encoder.CreateAsync(Accelerator, IModelSource, string, string, CancellationToken)"/>.
     /// </summary>
@@ -190,7 +190,14 @@ public sealed class Wan22Pipeline
     {
         await using var stream = await source.OpenAsync(repo, file, ct);
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
-        return await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, file, cancellationToken: ct);
+        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, file, cancellationToken: ct);
+        try
+        {
+            // ComfyUI's repackaged files load as they are: rewritten into this library's layout on the device (WanComfyFormat)
+            if (WanComfyFormat.IsComfyVae(w)) await WanComfyFormat.AdaptVaeAsync(accelerator, w);
+            return w;
+        }
+        catch { w.Dispose(); throw; }
     }
 
     /// <summary>The umT5 tokenizer (<see cref="Wan22Paths.Tokenizer"/>, google/umt5-xxl's tokenizer.json) from <paramref name="source"/>.</summary>

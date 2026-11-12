@@ -185,6 +185,42 @@ public sealed class GpuWeights : IDisposable
     public bool IsF32(string name) => _f32.ContainsKey(name);
     public bool IsF16(string name) => _f16.ContainsKey(name);
 
+    // ---- load-time adapters (another export layout -> ours: Wan.WanComfyFormat). Each returns the buffer it displaced, NOT disposed: a kernel queued
+    // ---- on it may still be pending (WebGPU batches dispatches), so the caller disposes it after a SynchronizeAsync.
+    /// <summary>Put an fp16 tensor (replacing one of that name in any precision); returns the displaced buffer for the caller to dispose after the device is idle.</summary>
+    internal IDisposable? SetF16(string name, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense> buffer, int[] shape)
+    {
+        var old = Detach(name);
+        _f16[name] = buffer; _shapes[name] = shape;
+        return ReferenceEquals(old, buffer) ? null : old;
+    }
+    /// <summary>Put an fp32 tensor (replacing one of that name in any precision); returns the displaced buffer for the caller to dispose after the device is idle.</summary>
+    internal IDisposable? SetF32(string name, MemoryBuffer1D<float, Stride1D.Dense> buffer, int[] shape)
+    {
+        var old = Detach(name);
+        _f32[name] = buffer; _shapes[name] = shape;
+        return ReferenceEquals(old, buffer) ? null : old;
+    }
+    /// <summary>Put a bf16 tensor (replacing one of that name in any precision); returns the displaced buffer for the caller to dispose after the device is idle.</summary>
+    internal IDisposable? SetBF16(string name, MemoryBuffer1D<BFloat16, Stride1D.Dense> buffer, int[] shape)
+    {
+        var old = Detach(name);
+        _bf16[name] = buffer; _shapes[name] = shape;
+        return ReferenceEquals(old, buffer) ? null : old;
+    }
+    /// <summary>Drop a tensor from the set; returns its buffer for the caller to dispose after the device is idle.</summary>
+    internal IDisposable? Remove(string name) { var old = Detach(name); _shapes.Remove(name); return old; }
+    /// <summary>A new shape for the same elements in the same order (a reshape: no data moves).</summary>
+    internal void SetShape(string name, int[] shape) { if (!_shapes.ContainsKey(name)) throw new KeyNotFoundException(name); _shapes[name] = shape; }
+    private IDisposable? Detach(string name)
+    {
+        if (_bf16.Remove(name, out var a)) return a;
+        if (_f16.Remove(name, out var b)) return b;
+        if (_f32.Remove(name, out var c)) return c;
+        if (_u32.Remove(name, out var d)) return d;
+        return null;
+    }
+
     /// <summary>Total device bytes held.</summary>
     public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L) + _u32.Values.Sum(b => b.Length * 4L);
 
