@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.15</Version>
-		<PackageReleaseNotes>v5.8.15 - on SpawnDev.ILGPU 5.4.28. Much faster SHORT prompts on CUDA: qwen3:1.7b Q4_K_M on an RTX 4070 reaches the first token of a 29-token prompt at ~2,550 prompt tok/s with the default (5.8.14: ~930) and ~3,320 with the opt-in int8 mode (5.8.14: ~1,480; Ollama's own prompt-eval timer: ~3.4k). Three changes: (1) the batch decoder hands out a token read that has already completed before it queues the next step, so the first token no longer waits for the first decode step (env GGUF_HANDOUT_FIRST=0 is the A/B); (2) prompts of at most 64 tokens use new tensor-core GEMMs with a 32-row token tile (the 128-row tile computed mostly padding at short prompts; env GGUF_S8_M32_MAX / GGUF_KQ_M32_MAX / GGUF_F16_M32_MAX, 0 = off); (3) GEMMs whose grid is too small to fill the GPU split K into one wave of partial sums, reduced in a fixed order (deterministic; env GGUF_S8_SPLITK / GGUF_F16_SPLITK / GGUF_KQ_SPLITK = 0 are the A/Bs). Long prompts +2-3%, decode unchanged, the default path's numerics unchanged (the 32-row K-quant kernel is bit-identical to the 128-row one; split-K is held to the same error bound and was more accurate in the tests). FIX: Wan22Paths.InRepo() named a text encoder the models host does not serve (umt5 bf16, 404); it now defaults to the hosted 8-bit umT5, which is as faithful to the reference. Also: the int8 prefill GEMM spreads its per-tile scale work over all warps. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.16</Version>
+		<PackageReleaseNotes>v5.8.16 - on SpawnDev.ILGPU 5.4.29. Wan 2.2: the VAE's spatial attention runs on the register-blocked GEMM: the decoder middle went from ~12.4 s to ~0.79 s per latent frame on an AMD RX 590 (OpenCL, 1280x704; measured by SpawnGen) and 1.0 s to 0.26 s on an RTX 4070 (CUDA), same results (env WAN_ATTN_GEMM=0 is the A/B). The pipeline's building blocks are public for callers running their own graph (e.g. a ComfyUI-style split graph): Wan22Pipeline.LoadWeightsAsync, LoadTokenizerAsync, TokenizePrompt and WanVae.GetLatentNormalizationAsync (the latent mean and std; checked against ComfyUI's own Wan 2.2 VAE: 1.9e-4). WanRequest.Trace now also times every VAE convolution. SpawnDev.ILGPU 5.4.29 fixes a CUDA miscompile of chained narrowing conversions such as (byte)(int)f. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.28" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.29" />
 	</ItemGroup>
 
 	<ItemGroup>

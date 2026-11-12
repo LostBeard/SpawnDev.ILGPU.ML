@@ -91,6 +91,21 @@ public sealed class WanVae : IDisposable
         c.Frames = keep; c.Rep = false;
     }
 
+    /// <summary>
+    /// One convolution / pointwise layer, timed when <see cref="Trace"/> is on: device-synced before and after (true per-layer time on the desktop backends; on WebGPU
+    /// a synchronous Synchronize only flushes, so the browser numbers are dispatch times), printed as "[Wan] vae conv NAME rows x cin->cout xTAPS: ms, GFLOPS".
+    /// </summary>
+    private void TraceConv(string name, long rows, int cin, int cout, int taps, Action run)
+    {
+        if (!Trace) { run(); return; }
+        _acc.Synchronize();
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        run();
+        _acc.Synchronize();
+        double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        Console.WriteLine($"[Wan] vae conv {name} {rows} x {cin}->{cout} x{taps}: {ms:F1} ms, {2.0 * rows * cin * cout * taps / (ms * 1e6):F0} GFLOPS");
+    }
+
     /// <summary>CausalConv3d 3x3x3 with the feature cache: x [T*H*W, cin] -> [T*H*W, cout].</summary>
     private Buf ConvCausal(string name, Buf x, int T, int H, int W, int cin, int cout)
     {
@@ -100,7 +115,7 @@ public sealed class WanVae : IDisposable
         var xcat = Concat(c, cnt, x, T, hw, cin);
         if (_cacheEnabled) StoreCache(name, xcat, cnt + T, hw, cin);
         var y = Tmp((long)T * hw * cout);
-        _sk.ConvTaps(xcat.View, Table(0, T, H, W, cnt).View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), y.View, T * hw, cin, cout, 27);
+        TraceConv(name, (long)T * hw, cin, cout, 27, () => _sk.ConvTaps(xcat.View, Table(0, T, H, W, cnt).View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), y.View, T * hw, cin, cout, 27));
         if (!ReferenceEquals(xcat, x)) Drop(xcat);
         return y;
     }
@@ -108,7 +123,7 @@ public sealed class WanVae : IDisposable
     private Buf Pointwise(string name, Buf x, int M, int cin, int cout)
     {
         var y = Tmp((long)M * cout);
-        _sk.LinearF16(x.View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), y.View, M, cin, cout);
+        TraceConv(name, M, cin, cout, 1, () => _sk.LinearF16(x.View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), y.View, M, cin, cout));
         return y;
     }
 
@@ -181,7 +196,8 @@ public sealed class WanVae : IDisposable
                 // the new cache: the last two frames of the input; one frame is completed with the previous cache's last frame, or with zeros after "Rep"
                 var cat = Concat(c, cnt, x, T, hw, C);
                 var conv = Tmp((long)T * hw * 2 * C);
-                _sk.ConvTaps(cat.View, Table(1, T, H, W, cnt).View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), conv.View, T * hw, C, 2 * C, 3);
+                int Tl = T;                                                                  // a lambda cannot capture the ref parameter
+                TraceConv(name, (long)Tl * hw, C, 2 * C, 3, () => _sk.ConvTaps(cat.View, Table(1, Tl, H, W, cnt).View, _w.F16(name + ".weight"), _w.F16(name + ".bias"), conv.View, Tl * hw, C, 2 * C, 3));
                 if (T >= 2) StoreCache(name, x, T, hw, C);
                 else
                 {
@@ -200,7 +216,7 @@ public sealed class WanVae : IDisposable
             }
         }
         var y = Tmp((long)T2 * 4 * hw * C);
-        _sk.ConvTaps(cur.View, Table(2, T2, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T2 * 4 * hw, C, C, 9);
+        TraceConv(p + "resample.1", (long)T2 * 4 * hw, C, C, 9, () => _sk.ConvTaps(cur.View, Table(2, T2, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T2 * 4 * hw, C, C, 9));
         if (!ReferenceEquals(cur, x)) Drop(cur);
         T = T2;
         return y;
@@ -240,7 +256,7 @@ public sealed class WanVae : IDisposable
     private Buf Downsample(string p, Buf x, int T, int H, int W, int C)
     {
         var y = Tmp((long)T * (H / 2) * (W / 2) * C);
-        _sk.ConvTaps(x.View, Table(3, T, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T * (H / 2) * (W / 2), C, C, 9);
+        TraceConv(p + "resample.1", (long)T * (H / 2) * (W / 2), C, C, 9, () => _sk.ConvTaps(x.View, Table(3, T, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T * (H / 2) * (W / 2), C, C, 9));
         return y;
     }
 

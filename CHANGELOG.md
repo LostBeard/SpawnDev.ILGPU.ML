@@ -2,19 +2,26 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (master)
+## 5.8.16 - 2026-11-12 (nuget.org) - Wan VAE attention 15x on AMD OpenCL; Wan building blocks public
+
+- **On SpawnDev.ILGPU 5.4.29** (a CUDA miscompile: a chained narrowing conversion such as `(byte)(int)f` folded into one saturating float-to-8-bit convert;
+  ML's kernels have none: every float-to-byte conversion clamps first).
 
 - **Wan: the building blocks are public** (for a caller running its own graph, e.g. SpawnGen's ComfyUI-style split Wan graph; the pipeline now calls exactly these,
   so the Wan parity gates cover them): `Wan22Pipeline.LoadWeightsAsync(accelerator, source, repo, file)` (the DiT / VAE weights from any `IModelSource`, as the
   pipeline loads them), `Wan22Pipeline.LoadTokenizerAsync` + `Wan22Pipeline.TokenizePrompt` (the exact ids the pipeline feeds `UmT5Encoder`: cleaned, `</s>`,
   at most 512, no padding) and `WanVae.GetLatentNormalizationAsync()` (the 48 latent means and stds: the DiT and VAE work in `(z - mean) / std`, ComfyUI's
-  LATENT holds the raw `z * std + mean`). Docs/video.md: The building blocks.
+  LATENT holds the raw `z * std + mean`). Docs/video.md: The building blocks. Checked by SpawnGen against ComfyUI's own Wan 2.2 VAE (CPU fp32, 256x160 picture,
+  raw units via this normalisation): encode relRMS 1.9e-4 (max |diff| 6.6e-4), decode back mean |diff| 0.0026.
 - **Wan VAE: the spatial attention runs on the register-blocked GEMM** (`WanKernels.AttentionGemm`, env WAN_ATTN_GEMM=0 is the A/B): q, k^T, v packed dense, then
   scores = q k^T and o = scores v on `MatMulKernel`, with a softmax of one 256-thread group per row. The per-element kernels streamed two 1,024-float rows from
-  global memory for EVERY score: SpawnGen measured the decoder middle at ~13 s per latent frame at 1280x704 on an RX 590 (OpenCL). MEASURED (RTX 4070,
-  1280x704 x9, per latent frame): CUDA 1,001 -> 256 ms (3.9x); NVIDIA OpenCL 321 -> 368 ms (its caches hid the old kernel; the decode total 23 -> 24 s, noise).
+  global memory for EVERY score. MEASURED (1280x704 x9 Turbo, warm, per latent frame): AMD RX 590 on OpenCL (SpawnGen) 12.1-12.8 s -> 0.75-0.82 s (~15x),
+  its decode 167.5 -> 132.4 s and the whole clip 260 -> 225 s; RTX 4070 CUDA 1,001 -> 256 ms (3.9x); NVIDIA OpenCL 321 -> 368 ms (its caches hid the old
+  kernel; the decode total 23 -> 24 s, noise).
   Same results: the Wan parity gates on CUDA and OpenCL (decoder middle 1.6e-4, encoder middle 1.1e-4 to the reference, pipeline unchanged). The tiled decode
   costs 1.8x the untiled one here (the overlap's convolution area), not more.
+- `WanRequest.Trace` / `WanVae.Trace` also times every VAE convolution ("[Wan] vae conv NAME rows x cin->cout xTAPS: ms, GFLOPS", device-synced on the desktop
+  backends). MEASURED (RTX 4070 OpenCL, 1280x704 x9): 212 convolutions, 17.6 s of the ~24 s decode, the large 3x3x3 ones at 8.9-9.1 TFLOPS.
 - VideoGen.Console: `--trace` (the VAE stage times).
 
 ## 5.8.15 - 2026-11-12 (nuget.org) - short prompts: first token 2.7x (default) / 2.2x (int8) faster on CUDA
