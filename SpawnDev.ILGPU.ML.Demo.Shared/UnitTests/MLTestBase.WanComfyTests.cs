@@ -97,6 +97,198 @@ public abstract partial class MLTestBase
         return $"{a.Length} tensors, {values:N0} values: {values - oneStep - subnormal:N0} bit-identical, {oneStep:N0} one bf16 step away ({100.0 * oneStep / values:F3}%: the double rounding through fp16), {subnormal:N0} below fp16's normal range";
     });
 
+    // ---- umT5 (ComfyUI's umt5_xxl_fp16 / umt5_xxl_fp8_e4m3fn_scaled: Hugging Face T5 names; UmT5Encoder rewrites each layer as it streams) ----
+
+    // the F8_E4M3 value of a byte, written independently of the kernel (powers, not bit assembly); NaN for S.1111.111
+    private static float WanF8Reference(byte b)
+    {
+        int e = (b >> 3) & 15, m = b & 7;
+        if ((b & 0x7F) == 0x7F) return float.NaN;
+        double v = e == 0 ? m / 8.0 * Math.Pow(2, -6) : (1 + m / 8.0) * Math.Pow(2, e - 7);
+        return (float)((b & 0x80) != 0 ? -v : v);
+    }
+    // float -> bf16 bits, round to nearest even
+    private static ushort WanBf16Rne(float f) { uint u = BitConverter.SingleToUInt32Bits(f); return (ushort)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16); }
+
+    /// <summary>
+    /// The F8_E4M3 decode kernel (<see cref="WanComfyFormat.DecodeF8E4M3"/>): every byte value at every position of a word, times several scales, must be the bf16
+    /// rounding (to nearest even) of value * scale, bit for bit (the subnormals, both zeros, the largest value 448, NaN stays NaN). The count is not a multiple of 4.
+    /// Red check: the exponent bias off by one fails every normal value.
+    /// </summary>
+    [TestMethod]
+    public async Task Wan_F8E4M3_Decode_AllBytes_Exact() => await RunTest(async accelerator =>
+    {
+        const int N = 1027;
+        var bytes = new byte[(N + 3) / 4 * 4];
+        for (int i = 0; i < N; i++) bytes[i] = (byte)(i * 37 + 11 + (i >> 8));          // all 256 values in each run of 256, shifted by one per run: each value at each of the 4 word positions
+        using var packed = accelerator.Allocate1D(System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes).ToArray());
+        using var dst = accelerator.Allocate1D<BFloat16>(N);
+        int checkedValues = 0;
+        foreach (float scale in new[] { 1f, 0.0123456f, -3.7182817f, 1.0e-3f })
+        {
+            WanComfyFormat.DecodeF8E4M3(accelerator, packed.View, dst.View, scale);
+            await accelerator.SynchronizeAsync();
+            var got = System.Runtime.InteropServices.MemoryMarshal.Cast<BFloat16, ushort>(await dst.View.CopyToHostAsync()).ToArray();
+            for (int i = 0; i < N; i++)
+            {
+                float want = WanF8Reference(bytes[i]) * scale;
+                if (float.IsNaN(want))
+                {
+                    if (!((got[i] & 0x7F80) == 0x7F80 && (got[i] & 0x7F) != 0)) throw new Exception($"byte {bytes[i]:X2} x {scale}: NaN expected, got bits {got[i]:X4}");
+                }
+                else if (got[i] != WanBf16Rne(want)) throw new Exception($"byte {bytes[i]:X2} at {i} x {scale}: bits {got[i]:X4}, expected {WanBf16Rne(want):X4} ({want:E6})");
+                checkedValues++;
+            }
+        }
+        return $"{checkedValues} values (256 bytes x 4 word positions x 4 scales) bit-exact";
+    });
+
+    // the tensors of one layer (our names) of a umT5 file as bf16 device weights: our export as stored, or a Hugging Face layout file through WanComfyFormat
+    private static async Task<GpuWeights> WanT5LayerAsync(Accelerator accelerator, string path, Func<string, bool> oursFilter)
+    {
+        using var empty = System.Text.Json.JsonDocument.Parse("{}");
+        bool hf;
+        using (var r = SpawnDev.ILGPU.ML.SafeTensors.SafeTensorsFileReader.Open(path)) hf = WanComfyFormat.IsComfyT5(r.Tensors.Select(t => t.Name));
+        await using var stream = File.OpenRead(path);
+        if (!hf) return await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, path, oursFilter);
+        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, path, n => WanComfyFormat.T5OurName(n) is { } o && o != "token_embedding.weight" && oursFilter(o));
+        try { await WanComfyFormat.AdaptT5Async(accelerator, w); return w; }
+        catch { w.Dispose(); throw; }
+    }
+    private static IEnumerable<(string Label, Func<string, bool> Filter)> WanT5Layers()
+    {
+        for (int b = 0; b < UmT5Encoder.DefaultLayers; b++) { string p = $"blocks.{b}."; yield return (p, n => n.StartsWith(p, StringComparison.Ordinal)); }
+        yield return ("norm.weight", n => n == "norm.weight");
+    }
+
+    /// <summary>
+    /// ComfyUI's fp16 umT5 against our bf16 export of the reference's (bf16) encoder, layer by layer (all 24 and the final norm) and the whole embedding table: the same
+    /// names and shapes, q / k / v fused in that order, and every value bit-identical, one bf16 step away (when their fp16 was rounded from a wider master) or below
+    /// fp16's normal range (see <see cref="CompareBf16ThroughFp16"/>). The counts say which.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_ComfyUmT5_Fp16_LayersAsOurExport() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL))
+            throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        string comfyPath = Path.Combine(WanDir, "comfy", "umt5_xxl_fp16.safetensors"), oursPath = Path.Combine(WanDir, "umt5_xxl_enc_bf16.safetensors");
+        if (!File.Exists(comfyPath) || !File.Exists(oursPath)) throw new UnsupportedTestException($"needs {comfyPath} (ComfyUI's) and {oursPath} (ours)");
+        long values = 0, oneStep = 0, subnormal = 0; int tensors = 0;
+        foreach (var (label, filter) in WanT5Layers())
+        {
+            using var ours = await WanT5LayerAsync(accelerator, oursPath, filter);
+            using var comfy = await WanT5LayerAsync(accelerator, comfyPath, filter);
+            var a = ours.Names.OrderBy(n => n, StringComparer.Ordinal).ToArray();
+            var b = comfy.Names.OrderBy(n => n, StringComparer.Ordinal).ToArray();
+            if (a.Length == 0 || !a.SequenceEqual(b)) throw new Exception($"{label}: names differ: ours [{string.Join(", ", a)}]; ComfyUI's adapted [{string.Join(", ", b)}]");
+            foreach (var name in a)
+            {
+                if (!ours.Shape(name).SequenceEqual(comfy.Shape(name))) throw new Exception($"{name}: shape [{string.Join(",", ours.Shape(name))}] vs [{string.Join(",", comfy.Shape(name))}]");
+                var x = await ours.BF16(name).CopyToHostAsync(); var y = await comfy.BF16(name).CopyToHostAsync();
+                var (st, sub) = CompareBf16ThroughFp16(name, System.Runtime.InteropServices.MemoryMarshal.AsBytes(x.AsSpan()).ToArray(), y);
+                oneStep += st; subnormal += sub; values += x.Length; tensors++;
+            }
+        }
+        // the embedding table, straight from the two files (the encoder reads its rows from the file): fp16 rows rounded to bf16 against our bf16 rows
+        long rows = 0;
+        using (var ro = SpawnDev.ILGPU.ML.SafeTensors.SafeTensorsFileReader.Open(oursPath))
+        using (var rc = SpawnDev.ILGPU.ML.SafeTensors.SafeTensorsFileReader.Open(comfyPath))
+        {
+            var to = ro.Get("token_embedding.weight"); var tc = rc.Get("shared.weight");
+            if (!to.Shape.SequenceEqual(tc.Shape) || to.DType != "BF16" || tc.DType != "F16") throw new Exception($"embedding: ours {to.DType} [{string.Join(",", to.Shape)}], ComfyUI's {tc.DType} [{string.Join(",", tc.Shape)}]");
+            const int RowsPerChunk = 4096; int rowBytes = UmT5Encoder.Dim * 2;
+            var bo = new byte[RowsPerChunk * rowBytes]; var bc = new byte[RowsPerChunk * rowBytes];
+            for (long r = 0; r < to.Shape[0]; r += RowsPerChunk)
+            {
+                int n = (int)Math.Min(RowsPerChunk, to.Shape[0] - r);
+                var so = bo.AsSpan(0, n * rowBytes); var sc = bc.AsSpan(0, n * rowBytes);
+                ro.ReadBytes(to, r * rowBytes, so); rc.ReadBytes(tc, r * rowBytes, sc);
+                var h = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, System.Half>(sc);
+                var y = new BFloat16[h.Length];
+                var yb = System.Runtime.InteropServices.MemoryMarshal.Cast<BFloat16, ushort>(y.AsSpan());
+                for (int i = 0; i < h.Length; i++) yb[i] = WanBf16Rne((float)h[i]);
+                var (st, sub) = CompareBf16ThroughFp16($"embedding rows {r}..", so.ToArray(), y);
+                oneStep += st; subnormal += sub; values += h.Length; rows += n;
+            }
+        }
+        string report = $"{tensors} layer tensors + {rows:N0} embedding rows, {values:N0} values: {values - oneStep - subnormal:N0} bit-identical, {oneStep:N0} one bf16 step away ({100.0 * oneStep / values:F3}%), {subnormal:N0} below fp16's normal range";
+        Console.WriteLine("[Wan] ComfyUI fp16 umT5 vs our bf16 export: " + report);
+        return report;
+    });
+
+    /// <summary>
+    /// ComfyUI's scaled 8-bit float umT5 against its fp16 file, layer by layer: the norms and bias tables (fp16 in both) bit-identical, and every matrix
+    /// (value * scale_weight, decoded on the device) within the 8-bit format's rounding of the fp16 one, q, k and v each on their own (a scale paired with the wrong
+    /// matrix, or q / k / v fused out of order, is a relative error near 1, not a few percent).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_ComfyUmT5_Fp8Scaled_LayersNearFp16() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL))
+            throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        string p8 = Path.Combine(WanDir, "comfy", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"), p16 = Path.Combine(WanDir, "comfy", "umt5_xxl_fp16.safetensors");
+        if (!File.Exists(p8) || !File.Exists(p16)) throw new UnsupportedTestException($"needs {p8} and {p16} (ComfyUI's)");
+        double worst = 0, best = double.MaxValue; string worstName = ""; int matrices = 0, exact = 0;
+        foreach (var (label, filter) in WanT5Layers())
+        {
+            using var w16 = await WanT5LayerAsync(accelerator, p16, filter);
+            using var w8 = await WanT5LayerAsync(accelerator, p8, filter);
+            var a = w16.Names.OrderBy(n => n, StringComparer.Ordinal).ToArray();
+            var b = w8.Names.OrderBy(n => n, StringComparer.Ordinal).ToArray();
+            if (a.Length == 0 || !a.SequenceEqual(b)) throw new Exception($"{label}: names differ: fp16 [{string.Join(", ", a)}]; fp8 [{string.Join(", ", b)}]");
+            foreach (var name in a)
+            {
+                if (!w16.Shape(name).SequenceEqual(w8.Shape(name))) throw new Exception($"{name}: shape [{string.Join(",", w16.Shape(name))}] vs [{string.Join(",", w8.Shape(name))}]");
+                var x = System.Runtime.InteropServices.MemoryMarshal.Cast<BFloat16, ushort>(await w16.BF16(name).CopyToHostAsync()).ToArray();
+                var y = System.Runtime.InteropServices.MemoryMarshal.Cast<BFloat16, ushort>(await w8.BF16(name).CopyToHostAsync()).ToArray();
+                bool matrix = name.Contains(".attn.qkv.") || name.Contains(".attn.o.") || name.Contains(".ffn.");
+                if (!matrix)
+                {
+                    for (int i = 0; i < x.Length; i++) if (x[i] != y[i]) throw new Exception($"{name}[{i}]: bits {x[i]:X4} (fp16 file) vs {y[i]:X4} (fp8 file); fp16 in both files");
+                    exact++;
+                    continue;
+                }
+                int parts = name.Contains(".attn.qkv.") ? 3 : 1, len = x.Length / parts;
+                for (int part = 0; part < parts; part++)
+                {
+                    double se = 0, sr = 0;
+                    for (int i = part * len; i < (part + 1) * len; i++)
+                    {
+                        double xv = BitConverter.Int32BitsToSingle(x[i] << 16), yv = BitConverter.Int32BitsToSingle(y[i] << 16);
+                        se += (xv - yv) * (xv - yv); sr += xv * xv;
+                    }
+                    double rel = Math.Sqrt(se / sr);
+                    string id = parts == 3 ? $"{name} part {"qkv"[part]}" : name;
+                    if (!(rel < WanF8MatrixBound)) throw new Exception($"{id}: relRMS {rel:E2} against the fp16 file (bound {WanF8MatrixBound:E1})");
+                    if (rel > worst) { worst = rel; worstName = id; }
+                    best = Math.Min(best, rel); matrices++;
+                }
+            }
+        }
+        Console.WriteLine($"[Wan] ComfyUI fp8 scaled umT5 vs fp16: {matrices} matrices relRMS {best:E2} .. {worst:E2} (worst {worstName}); {exact} fp16 tensors bit-identical");
+        return $"{matrices} matrices relRMS {best:E2} .. {worst:E2} (worst {worstName}); {exact} norm / bias tensors bit-identical";
+    });
+    // F8_E4M3 keeps 4 significant bits. MEASURED on the host (numpy, 2026-11-12, blocks 0 / 11 / 23, all 7 matrices): value * scale against the fp16 file is
+    // 2.646e-2 .. 2.655e-2 relative RMS on every matrix; the bf16 rounding of both sides adds about 1.5e-3 in quadrature
+    private const double WanF8MatrixBound = 0.03;
+
+    /// <summary>
+    /// ComfyUI's fp16 umT5 through the encoder (its layers rewritten as they stream) against the reference's encoder outputs. Against the reference as it runs: the
+    /// bound of our own bf16 export (MEASURED 2026-11-12: 2.3e-2 to 3.2e-2, ours 2.1e-2 to 2.8e-2). Against exact math on the reference's bf16 weights the weights
+    /// themselves differ: ComfyUI's fp16 was rounded from a wider master (only 1 value in 8 is a bf16 value), so the embedding rows (read at fp16 precision) are
+    /// 1.7e-3 relative RMS from the reference's and 1 matrix weight in 16 lands one bf16 step away (the double rounding), which the 24 layers carry to
+    /// 7.8e-3 .. 1.57e-2 in the context (MEASURED, CUDA and OpenCL, three prompts; the 16-token prompt on OpenCL is the largest). A wrong mapping is near 1.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_ComfyUmT5_Fp16_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, Path.Combine("comfy", "umt5_xxl_fp16.safetensors"), 0.05, 0.03));
+
+    /// <summary>ComfyUI's scaled 8-bit float umT5 through the encoder against the reference's encoder outputs: the 8-bit format's error on top of the rounding.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_ComfyUmT5_Fp8Scaled_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, Path.Combine("comfy", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"), WanF8ContextBoundBf16, WanF8ContextBoundExact));
+    // MEASURED 2026-11-12 (CUDA and OpenCL, three prompts): 5.96e-2 .. 7.42e-2 against the reference as it runs, 5.50e-2 .. 6.87e-2 against exact math: the
+    // 8-bit floats (2.65e-2 per matrix) through 24 layers. For scale: our 8-bit block export (q8) is 2.6e-2 .. 3.4e-2 against the reference.
+    private const double WanF8ContextBoundBf16 = 0.09, WanF8ContextBoundExact = 0.085;
+
     // our bf16 bytes vs the adapted ComfyUI bf16 values: equal bits, one bf16 step apart with the same sign (the double rounding fp32 -> fp16 -> bf16), or below
     // fp16's normal range within its subnormal step; returns (one step, subnormal) counts
     private static (long OneStep, long Subnormal) CompareBf16ThroughFp16(string name, byte[] raw, BFloat16[] yArr)

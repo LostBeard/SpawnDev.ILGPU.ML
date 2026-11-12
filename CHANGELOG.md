@@ -14,6 +14,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   bit-identical or one bf16 step away. ComfyUI's fp16 was rounded from the reference's fp32 master (ours fp32 -> bf16 directly), so fp32 -> fp16 -> bf16 can
   land one step off (found by the first strict version of the gate: bits BC73 vs BC74). The umT5 (Hugging Face T5 names, an fp8-scaled variant) follows.
   `GpuWeights` gains internal load-time setters (the displaced buffer is returned, disposed by the caller after the device is idle). Both gates HeavyModel.
+- **Wan: ComfyUI's umT5 text encoder files load as they are** (`split_files/text_encoders/umt5_xxl_fp16.safetensors` and
+  `umt5_xxl_fp8_e4m3fn_scaled.safetensors`): `UmT5Encoder.CreateAsync` recognises the Hugging Face T5 names (`shared.weight`, `encoder.block.N.layer...`) and
+  rewrites each layer into ours as it streams (`WanComfyFormat.AdaptT5Async`: q / k / v fused, `wi_0` / `wi_1` / `wo` -> gate / fc1 / fc2, everything bf16), so
+  the encoder still holds one layer on the device. The embedding rows are read from the file at fp16 precision. With the VAE and the DiT above, all three files
+  of ComfyUI's Wan 2.2 5B template now load without a separate export. Read from the files' headers only.
+  - **`F8_E4M3` tensors** (ComfyUI's "scaled fp8": 8-bit floats with one fp32 `scale_weight` per matrix): `GpuWeights` loads the dtype (`IsF8`, `F8Words`),
+    `WanComfyFormat.DecodeF8E4M3` decodes value * scale to bf16 on the device. Gate `Wan_F8E4M3_Decode_AllBytes_Exact` (every backend): all 256 bytes at each
+    word position times 4 scales, bit-exact against an independent host decode; red-checked on all 7 backends (exponent bias off by one).
+  - **Measured** (RTX 4070, CUDA and OpenCL, the reference's three prompts; gates `Wan_ComfyUmT5_*`, HeavyModel):
+    fp16 file: 5,680,910,336 values (24 layers, final norm, the whole embedding table) against our bf16 export: 93.74% bit-identical, 6.257% one bf16 step away
+    (ComfyUI's fp16 was rounded from a wider master, so fp16 -> bf16 double-rounds 1 value in 16), 100,387 below fp16's normal range. Context against the
+    reference as it runs 2.3e-2 to 3.2e-2 (our own export: 2.1e-2 to 2.8e-2).
+    fp8 scaled file: every matrix 2.64e-2 to 2.70e-2 relative RMS from the fp16 file's (the 8-bit float's own rounding; the bf16 rounding of value * scale adds
+    0.2% to that in quadrature), the norms and bias tables bit-identical; context 6.0e-2 to 7.4e-2 against the reference. For scale, our 8-bit block export
+    (`umt5_xxl_enc_q8`, 6.4 GB) is 2.6e-2 to 3.4e-2: the hosted q8 file is the more accurate 8-bit encoder.
+    Red-checked: a scale paired with the wrong matrix (relRMS 0.90) and q / k / v fused in the wrong order both fail their gates.
 
 ## 5.8.16 - 2026-11-12 (nuget.org) - Wan VAE attention 15x on AMD OpenCL; Wan building blocks public
 

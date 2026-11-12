@@ -115,6 +115,144 @@ public static class WanComfyFormat
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------------------------------------------------
+    // umT5 text encoder (split_files/text_encoders/umt5_xxl_fp16.safetensors, umt5_xxl_fp8_e4m3fn_scaled.safetensors): the Hugging Face T5 names
+    //   shared.weight [256384, 4096]                                              -> token_embedding.weight (fp16 in both files; read row by row, never on the device)
+    //   encoder.block.N.layer.0.layer_norm.weight                                 -> blocks.N.norm1.weight
+    //   encoder.block.N.layer.0.SelfAttention.q / k / v.weight                    -> blocks.N.attn.qkv.weight (fused, rows q | k | v)
+    //   encoder.block.N.layer.0.SelfAttention.o.weight                            -> blocks.N.attn.o.weight
+    //   encoder.block.N.layer.0.SelfAttention.relative_attention_bias.weight      -> blocks.N.pos_embedding.embedding.weight
+    //   encoder.block.N.layer.1.layer_norm.weight                                 -> blocks.N.norm2.weight
+    //   encoder.block.N.layer.1.DenseReluDense.wi_0 / wi_1 / wo.weight            -> blocks.N.ffn.gate / ffn.fc1 / ffn.fc2.weight (wi_0 is the GELU branch)
+    //   encoder.final_layer_norm.weight                                           -> norm.weight
+    // fp16 file: every tensor fp16 (the reference's bf16 weights fit fp16 exactly unless fp16 makes them subnormal). fp8 file: the 7 matrices of a block are
+    // F8_E4M3 with one fp32 scalar each (<name>.scale_weight: the weight is value * scale), the norms / bias tables / embedding fp16. spiece_model (the
+    // SentencePiece model) and the empty scaled_fp8 marker are not weights. The layers are in name order (0, 1, 10, ...), the fp8 file grouped by dtype first.
+    // ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+    /// <summary>True when the tensor names are a Hugging Face layout T5 encoder (ComfyUI's umT5 files) rather than our export's.</summary>
+    public static bool IsComfyT5(IEnumerable<string> names)
+    {
+        bool shared = false, q = false;
+        foreach (var n in names)
+        {
+            if (n == "token_embedding.weight") return false;
+            shared |= n == "shared.weight";
+            q |= n == "encoder.block.0.layer.0.SelfAttention.q.weight";
+        }
+        return shared && q;
+    }
+
+    private static readonly (string Theirs, string Ours)[] T5BlockNames =
+    {
+        ("layer.0.layer_norm.weight", "norm1.weight"),
+        ("layer.0.SelfAttention.q.weight", "attn.qkv.weight"), ("layer.0.SelfAttention.k.weight", "attn.qkv.weight"), ("layer.0.SelfAttention.v.weight", "attn.qkv.weight"),
+        ("layer.0.SelfAttention.o.weight", "attn.o.weight"),
+        ("layer.0.SelfAttention.relative_attention_bias.weight", "pos_embedding.embedding.weight"),
+        ("layer.1.layer_norm.weight", "norm2.weight"),
+        ("layer.1.DenseReluDense.wi_0.weight", "ffn.gate.weight"), ("layer.1.DenseReluDense.wi_1.weight", "ffn.fc1.weight"), ("layer.1.DenseReluDense.wo.weight", "ffn.fc2.weight"),
+    };
+    private const string ScaleSuffix = ".scale_weight", WeightSuffix = ".weight";
+
+    /// <summary>
+    /// Our export's name for a tensor of a Hugging Face layout T5 encoder file (see <see cref="IsComfyT5"/>): the tensor it becomes, or becomes part of (q, k and v
+    /// map to the fused <c>attn.qkv</c>; a <c>scale_weight</c> maps to its matrix). Null for a tensor that is not a weight of the encoder (the SentencePiece blob, markers).
+    /// </summary>
+    public static string? T5OurName(string name)
+    {
+        if (name == "shared.weight") return "token_embedding.weight";
+        if (name == "encoder.final_layer_norm.weight") return "norm.weight";
+        const string Prefix = "encoder.block.";
+        if (!name.StartsWith(Prefix, StringComparison.Ordinal)) return null;
+        int dot = name.IndexOf('.', Prefix.Length);
+        if (dot < 0 || !int.TryParse(name.AsSpan(Prefix.Length, dot - Prefix.Length), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int block)) return null;
+        string rest = name[(dot + 1)..];
+        if (rest.EndsWith(ScaleSuffix, StringComparison.Ordinal)) rest = rest[..^ScaleSuffix.Length] + WeightSuffix;
+        foreach (var (theirs, ours) in T5BlockNames)
+            if (rest == theirs) return $"blocks.{block}.{ours}";
+        return null;
+    }
+
+    private static Action<Index1D, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, float>? _f8ToBf16;
+    private static Accelerator? _f8ToBf16Acc;
+    // F8_E4M3 (the "fn" variant: sign, 4 exponent bits biased by 7, 3 mantissa bits; no infinities, S.1111.111 is NaN; exponent 0 is subnormal, mantissa * 2^-9)
+    // times the tensor's scale, to bf16 (round to nearest even)
+    private static void F8ToBf16Impl(Index1D i, ArrayView1D<uint, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst, float scale)
+    {
+        uint b = (src[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
+        uint e = (b >> 3) & 15u, m = b & 7u;
+        float mag = Interop.IntAsFloat(((e + 120u) << 23) | (m << 20));
+        if (e == 0u) mag = m * 0.001953125f;
+        if ((b & 0x7Fu) == 0x7Fu) mag = float.NaN;
+        if ((b & 0x80u) != 0u) mag = -mag;
+        dst[i] = (BFloat16)(mag * scale);
+    }
+
+    /// <summary>
+    /// Decode F8_E4M3 values (stored four bytes to a word: <see cref="GpuWeights.F8Words"/>) times <paramref name="scale"/> into bf16, rounded to nearest even;
+    /// <paramref name="dst"/>'s length is the value count.
+    /// </summary>
+    public static void DecodeF8E4M3(Accelerator accelerator, ArrayView1D<uint, Stride1D.Dense> packed, ArrayView1D<BFloat16, Stride1D.Dense> dst, float scale)
+    {
+        if (packed.Length * 4 < dst.Length) throw new ArgumentException($"{dst.Length} values need {(dst.Length + 3) / 4} words, got {packed.Length}");
+        if (!ReferenceEquals(_f8ToBf16Acc, accelerator)) { _f8ToBf16 = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<uint, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, float>(F8ToBf16Impl); _f8ToBf16Acc = accelerator; }
+        _f8ToBf16!((int)dst.Length, packed, dst, scale);
+    }
+
+    /// <summary>
+    /// Rewrite the tensors of a Hugging Face layout T5 encoder held in <paramref name="w"/> (one layer of ComfyUI's umT5 file, or the final norm) into our export's
+    /// layout, in place: our names, q / k / v fused, everything bf16 (fp16 converted; F8_E4M3 decoded times its <c>scale_weight</c>). One matrix at a time with a
+    /// device wait before its source is freed.
+    /// The 8-bit matrices become bf16(value * scale): the engine's weight precision for this encoder (the reference's weights ARE bf16). MEASURED on the host
+    /// (2026-11-12, 21 matrices): value * scale is 2.65e-2 relative RMS from the fp16 file's weights (the 8-bit format's own rounding) and the bf16 rounding of
+    /// value * scale is 1.1e-3 to 1.9e-3, which adds 0.2% to that error in quadrature.
+    /// </summary>
+    public static async Task AdaptT5Async(Accelerator accelerator, GpuWeights w)
+    {
+        async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
+        // our name -> its source tensors in the fused order (the table's order: q, k, v)
+        var groups = new Dictionary<string, List<string>>();
+        var scales = new Dictionary<string, string>();                 // matrix name -> its scale_weight
+        foreach (var name in w.Names.ToList())
+        {
+            if (T5OurName(name) is not { } ours) continue;
+            if (name.EndsWith(ScaleSuffix, StringComparison.Ordinal)) { scales[name[..^ScaleSuffix.Length] + WeightSuffix] = name; continue; }
+            if (!groups.TryGetValue(ours, out var list)) groups[ours] = list = new List<string>();
+            list.Add(name);
+        }
+        int Order(string n) => Array.FindIndex(T5BlockNames, t => n.EndsWith("." + t.Theirs, StringComparison.Ordinal));
+        foreach (var (ours, sources) in groups)
+        {
+            sources.Sort((a, b) => Order(a).CompareTo(Order(b)));
+            if (ours.EndsWith("attn.qkv.weight", StringComparison.Ordinal) && sources.Count != 3) throw new InvalidDataException($"{ours}: needs q, k and v, got {string.Join(", ", sources)}");
+            long total = 0;
+            foreach (var n in sources) { long c = 1; foreach (int d in w.Shape(n)) c *= d; total += c; }
+            var dst = accelerator.Allocate1D<BFloat16>(total);
+            long off = 0;
+            foreach (var n in sources)
+            {
+                long c = 1; foreach (int d in w.Shape(n)) c *= d;
+                var part = dst.View.SubView(off, c);
+                if (w.IsF8(n))
+                {
+                    if (!scales.TryGetValue(n, out var sn) || !w.IsF32(sn)) throw new InvalidDataException($"{n}: an F8_E4M3 matrix without its fp32 scale_weight");
+                    float scale = (await w.F32(sn).CopyToHostAsync())[0];                       // one scalar
+                    DecodeF8E4M3(accelerator, w.F8Words(n), part, scale);
+                }
+                else if (w.IsF16(n)) ToBf16(accelerator, w.F16(n), part);
+                else if (w.IsBF16(n)) part.CopyFrom(w.BF16(n));
+                else throw new NotSupportedException($"{n}: expected fp16, bf16 or F8_E4M3");
+                off += c;
+            }
+            var s0 = w.Shape(sources[0]);
+            int[] shape = sources.Count == 1 ? s0 : new[] { s0[0] * sources.Count, s0[1] };
+            foreach (var n in sources) await Retire(w.Remove(n));
+            w.SetBF16(ours, dst, shape);
+        }
+        foreach (var sn in scales.Values) await Retire(w.Remove(sn));
+        await accelerator.SynchronizeAsync();
+    }
+
     // the reference Wan2_2_VAE's latent normalisation (decode: z * std + mean), as our export stores it (fp32, shortest round-trip literals)
     private static readonly float[] LatentsMean = { -0.2289f, -0.0052f, -0.1323f, -0.2339f, -0.2799f, 0.0174f, 0.1838f, 0.1557f, -0.1382f, 0.0542f, 0.2813f, 0.0891f, 0.157f, -0.0098f, 0.0375f, -0.1825f, -0.2246f, -0.1207f, -0.0698f, 0.5109f, 0.2665f, -0.2108f, -0.2158f, 0.2502f, -0.2055f, -0.0322f, 0.1109f, 0.1567f, -0.0729f, 0.0899f, -0.2799f, -0.123f, -0.0313f, -0.1649f, 0.0117f, 0.0723f, -0.2839f, -0.2083f, -0.052f, 0.3748f, 0.0152f, 0.1957f, 0.1433f, -0.2944f, 0.3573f, -0.0548f, -0.1681f, -0.0667f };
     private static readonly float[] LatentsStd = { 0.4765f, 1.0364f, 0.4514f, 1.1677f, 0.5313f, 0.499f, 0.4818f, 0.5013f, 0.8158f, 1.0344f, 0.5894f, 1.0901f, 0.6885f, 0.6165f, 0.8454f, 0.4978f, 0.5759f, 0.3523f, 0.7135f, 0.6804f, 0.5833f, 1.4146f, 0.8986f, 0.5659f, 0.7069f, 0.5338f, 0.4889f, 0.4917f, 0.4069f, 0.4999f, 0.6866f, 0.4093f, 0.5709f, 0.6065f, 0.6415f, 0.4944f, 0.5726f, 1.2042f, 0.5458f, 1.6887f, 0.3971f, 1.06f, 0.3943f, 0.5537f, 0.5444f, 0.4089f, 0.7468f, 0.7744f };

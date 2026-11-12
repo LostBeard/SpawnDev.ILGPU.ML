@@ -15,7 +15,8 @@ using IV = ArrayView1D<int, Stride1D.Dense>;
 /// x += o(softmax(q k^T + relative_bias) v) after an RMS norm and x += fc2(fc1(h) * gelu_tanh(gate(h))) after a second one (T5: no attention scaling, a bias table of
 /// 32 buckets x 64 heads per layer), then a final RMS norm. Batch 1 per prompt, only the REAL tokens (the reference pads to 512 and masks the padding out of the keys, which changes no
 /// row of the real tokens). Weights: the bf16 export of tools/wan-harness/reference/export_t5_bf16.py (11.4 GB) or its 8-bit blocks (quantize_streaming.py, 6.4 GB, the FLUX.2 block
-/// format; the matrices are dequantised one at a time into a bf16 scratch just before their GEMM), activations fp32.
+/// format; the matrices are dequantised one at a time into a bf16 scratch just before their GEMM), activations fp32. ComfyUI's repackaged files load as they are
+/// (umt5_xxl_fp16.safetensors, umt5_xxl_fp8_e4m3fn_scaled.safetensors: Hugging Face T5 names; each layer is rewritten into this layout as it streams, <see cref="WanComfyFormat"/>).
 /// Built for a tight device: the 2.1 GB embedding table is never loaded (the rows of the prompt are read from the file), and the layers STREAM: one layer's weights are
 /// uploaded, used and freed before the next, so the whole encoder runs in well under 1 GB of VRAM at about the time it takes to read the file. Several prompts (the prompt and
 /// the negative prompt) go through ONE pass over the layers (their rows are stacked for every matrix product), so the file is read once. The file comes from an
@@ -29,6 +30,8 @@ public sealed class UmT5Encoder : IDisposable
     private readonly Stream _embeddings;                         // kept open: the rows of the prompt are read from it
     private readonly SafeTensorInfo _embeddingInfo;
     private readonly bool _embeddingQuantized;
+    private readonly bool _embeddingF16;                         // fp16 rows (ComfyUI's files); otherwise bf16, or the 8-bit blocks
+    private readonly bool _hfLayout;                             // the file has the Hugging Face T5 names (ComfyUI's umT5 files): each layer is rewritten into ours as it loads (WanComfyFormat)
     private readonly DiTKernels _k;
     private readonly WanKernels _wk;
     public const int Dim = 4096, Heads = 64, HeadDim = 64, FfnDim = 10240, DefaultLayers = 24;
@@ -38,9 +41,10 @@ public sealed class UmT5Encoder : IDisposable
     /// <summary>Test hook: (stage name, activation view, element count), valid only during the call; names "embedding", "layer_N", "final" (the first sequence of a call).</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
-    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias)
+    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias, bool hfLayout = false)
     {
         _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers; _sharedBias = sharedBias;
+        _hfLayout = hfLayout; _embeddingF16 = info.DType == "F16";
         _k = new DiTKernels(accelerator); _wk = new WanKernels(accelerator);
     }
 
@@ -60,6 +64,17 @@ public sealed class UmT5Encoder : IDisposable
             await stream.ReadExactlyAsync(headerBytes, cancellationToken);
             long dataStart = 8 + headerSize;
             var (tensors, metadata) = SafeTensorsFileReader.ParseHeader(file, headerBytes, dataStart, stream.Length - dataStart);
+            if (WanComfyFormat.IsComfyT5(tensors.Select(t => t.Name)))
+            {
+                // ComfyUI's umT5 files (Hugging Face names, fp16 or scaled 8-bit floats, no metadata): the layer count and the bias-table layout come from the names
+                var names = tensors.Select(t => t.Name).ToHashSet();
+                var shared = tensors.First(t => t.Name == "shared.weight");
+                if (shared.DType is not ("F16" or "BF16") || shared.Shape.Length != 2 || shared.Shape[1] != Dim) throw new NotSupportedException($"'{file}': shared.weight is {shared.DType} [{string.Join(", ", shared.Shape)}]; expected fp16 or bf16 [vocab, {Dim}]");
+                int n = 0;
+                while (names.Contains($"encoder.block.{n}.layer.0.SelfAttention.q.weight")) n++;
+                bool oneBias = n > 1 && !names.Contains("encoder.block.1.layer.0.SelfAttention.relative_attention_bias.weight");
+                return new UmT5Encoder(accelerator, source, repo, file, stream, shared, false, n, oneBias, hfLayout: true);
+            }
             var info = tensors.FirstOrDefault(t => t.Name == "token_embedding.weight") ?? throw new InvalidDataException($"'{file}' has no token_embedding.weight");
             bool quantized = info.DType == "I32";
             if (quantized && !(metadata.GetValueOrDefault("quant") ?? "").StartsWith("q8", StringComparison.Ordinal)) throw new NotSupportedException("the quantised umT5 embedding table must be 8-bit blocks");
@@ -85,7 +100,9 @@ public sealed class UmT5Encoder : IDisposable
             _embeddings.Seek(_embeddingInfo.DataOffset + (long)id * rowBytes, SeekOrigin.Begin);
             await _embeddings.ReadExactlyAsync(row, ct);
             long o = (long)i * Dim;
-            if (!_embeddingQuantized)
+            if (_embeddingF16)
+                for (int c = 0; c < Dim; c++) x[o + c] = (float)BitConverter.ToHalf(row, 2 * c);                                          // fp16 -> float
+            else if (!_embeddingQuantized)
                 for (int c = 0; c < Dim; c++) x[o + c] = BitConverter.Int32BitsToSingle((row[2 * c] | (row[2 * c + 1] << 8)) << 16);     // bf16 -> float
             else
                 for (int b = 0; b < Dim / 32; b++)
@@ -104,7 +121,11 @@ public sealed class UmT5Encoder : IDisposable
     {
         await using var stream = await _source.OpenAsync(_repo, _file, ct);
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
-        return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, filter, ct);
+        if (!_hfLayout) return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, filter, ct);
+        // the Hugging Face names: load the tensors that make up the ones asked for (our names), then rewrite them into our layout on the device
+        var w = await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, name => WanComfyFormat.T5OurName(name) is { } ours && ours != "token_embedding.weight" && filter(ours), ct);
+        try { await WanComfyFormat.AdaptT5Async(_acc, w); return w; }
+        catch { w.Dispose(); throw; }
     }
 
     /// <summary>Encode the token ids to the text context [n, 4096] (float32) that the Wan DiT text embedding consumes.</summary>
