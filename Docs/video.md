@@ -73,6 +73,11 @@ var (mean, std) = await vae.GetLatentNormalizationAsync();                      
 
 The DiT and the VAE work in the NORMALISED latent `(z - mean) / std` (`EncodeImageAsync` returns it, `DecodeAsync` takes it); ComfyUI's LATENT for Wan 2.2 holds the raw one.
 
+**ComfyUI's repackaged Wan 2.2 files load as they are** (Comfy-Org/Wan_2.2_ComfyUI_Repackaged, `split_files`, no separate export): `wan2.2_vae.safetensors` and `wan2.2_ti2v_5B_fp16.safetensors` through `Wan22Pipeline.LoadWeightsAsync`, and
+`umt5_xxl_fp16.safetensors` (11.4 GB) / `umt5_xxl_fp8_e4m3fn_scaled.safetensors` (6.7 GB) through `UmT5Encoder.CreateAsync` (it recognises the Hugging Face T5 tensor names, rewrites each layer into the library's layout as it streams, and decodes the F8_E4M3 tensors on the device, `value * scale_weight`).
+The fp8 scaled encoder is less accurate than the hosted 8-bit export: context 6.0e-2 to 7.4e-2 relative RMS against the reference, versus 2.6e-2 to 3.4e-2 for `umt5_xxl_enc_q8` (the fp16 file: 2.3e-2 to 3.2e-2), so prefer the fp16 file or the hosted q8 when the choice is free.
+The tokenizer still comes from `google/umt5-xxl` `tokenizer.json`; the `spiece_model` blob inside ComfyUI's file is not read.
+
 ## Files
 
 Exported once from the reference checkpoints with `tools/wan-harness/reference` (`export_dit_bf16.py`, `quantize_streaming.py`, `export_vae_f16.py`, `export_t5_bf16.py`), SafeTensors:
