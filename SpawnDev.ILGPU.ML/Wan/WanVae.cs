@@ -26,7 +26,7 @@ public sealed class WanVae : IDisposable
     private readonly ActivationPool _pool;
     private readonly Dictionary<(int Kind, int T, int H, int W, int Cnt), MemoryBuffer1D<int, Stride1D.Dense>> _tables = new();
     private readonly Dictionary<string, Cache> _caches = new();
-    private Buf? _scores;
+    private Buf? _scores, _attnQ, _attnKT, _attnV;      // the attention's [N, N] scores and its GEMM path's packed q, k^T, v [N, C] (WanKernels.AttentionGemm)
     private bool _cacheEnabled = true;     // the encoder sees one frame: nothing to cache for a later chunk
 
     /// <summary>The last (up to) two input frames of a causal convolution, channel-last [frames * H * W, C]; <see cref="Rep"/> = the "Rep" marker of upsample3d's first call.</summary>
@@ -35,6 +35,13 @@ public sealed class WanVae : IDisposable
 
     /// <summary>Test hook: (stage name, activation view, frames, height, width, channels), called per chunk; valid only during the call.</summary>
     public Action<string, FV, int, int, int, int>? Tap { get; set; }
+
+    /// <summary>
+    /// The latent normalisation stored with the VAE weights (<c>latents_mean</c>, <c>latents_std</c>: 48 each). Encoding returns, and decoding takes, the NORMALISED latent
+    /// (z - mean) / std, the space the DiT works in; a caller keeping raw VAE latents (ComfyUI's LATENT for Wan 2.2) converts with these: raw = z * std + mean.
+    /// </summary>
+    public async Task<(float[] Mean, float[] Std)> GetLatentNormalizationAsync() =>
+        (await _w.F32("latents_mean").CopyToHostAsync(), await _w.F32("latents_std").CopyToHostAsync());
 
     public WanVae(Accelerator accelerator, GpuWeights weights)
     {
@@ -131,6 +138,8 @@ public sealed class WanVae : IDisposable
         return c2;
     }
 
+    private void GrowAttn(ref Buf? b, long n) { if (b == null || b.Length < n) { b?.Dispose(); b = _acc.Allocate1D<float>(n); } }
+
     private Buf Attention(string p, Buf x, int T, int H, int W, int C)
     {
         int hw = H * W, rows = T * hw;
@@ -140,9 +149,15 @@ public sealed class WanVae : IDisposable
         var qkv = Pointwise(p + "to_qkv", y, rows, C, 3 * C); Drop(y);
         _scores ??= _acc.Allocate1D<float>((long)hw * hw);
         if (_scores.Length < (long)hw * hw) { _scores.Dispose(); _scores = _acc.Allocate1D<float>((long)hw * hw); }
+        if (WanKernels.AttentionGemm)
+        {
+            long nd = (long)hw * C;
+            GrowAttn(ref _attnQ, nd); GrowAttn(ref _attnKT, nd); GrowAttn(ref _attnV, nd);
+        }
         var o = Tmp((long)rows * C);
         for (int f = 0; f < T; f++)
-            _wk.SpatialAttention(qkv.View.SubView((long)f * hw * 3 * C, (long)hw * 3 * C), _scores.View, o.View.SubView((long)f * hw * C, (long)hw * C), hw, C);
+            _wk.SpatialAttention(qkv.View.SubView((long)f * hw * 3 * C, (long)hw * 3 * C), _scores.View, o.View.SubView((long)f * hw * C, (long)hw * C), hw, C,
+                _attnQ?.View ?? default, _attnKT?.View ?? default, _attnV?.View ?? default);
         Drop(qkv);
         var proj = Pointwise(p + "proj", o, rows, C, C); Drop(o);
         _dk.GateResidual(proj.View, x.View, default, -1, rows * C, C);              // proj += x (identity)
@@ -550,6 +565,6 @@ public sealed class WanVae : IDisposable
         _tables.Clear();
         foreach (var c in _caches.Values) c.Packed?.Dispose();
         _caches.Clear();
-        _scores?.Dispose();
+        _scores?.Dispose(); _attnQ?.Dispose(); _attnKT?.Dispose(); _attnV?.Dispose();
     }
 }

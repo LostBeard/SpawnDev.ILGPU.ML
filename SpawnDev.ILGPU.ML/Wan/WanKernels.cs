@@ -307,9 +307,61 @@ public sealed class WanKernels
         for (int j = 0; j < N; j++) acc = float.MultiplyAddEstimate(p[pb + j], qkv[(long)j * 3 * D + vb], acc);
         o[idx] = acc;
     }
-    /// <summary>scores [N, N] scratch, o [N, D].</summary>
-    public void SpatialAttention(FV qkv, FV scores, FV o, int N, int D)
+    /// <summary>
+    /// The VAE's single-head spatial attention on the library's register-blocked GEMM (default; env WAN_ATTN_GEMM=0 is the A/B): q, kT, v packed dense from the
+    /// interleaved [N, 3D] qkv, scores = q kT, a softmax with one 256-thread group per row (coalesced; the scale applied inside), o = scores v. The per-element
+    /// kernels below streamed two 1,024-float rows from global memory for EVERY score and walked a strided V column for every output: SpawnGen measured the decoder
+    /// middle at ~13 s per latent frame at 1280x704 on an RX 590 (OpenCL; 88 x 160 = 14,080 positions, ~0.4 TFLOP of products per frame).
+    /// </summary>
+    public static bool AttentionGemm = Environment.GetEnvironmentVariable("WAN_ATTN_GEMM") != "0";
+    private MatMulKernel? _mm;
+    private Action<Index1D, FV, FV, FV, FV, int, int>? _packQkv;
+    private static void PackQkvImpl(Index1D idx, FV qkv, FV q, FV kT, FV v, int N, int D)
     {
+        int n = idx / D, d = idx % D;
+        long src = (long)n * 3 * D + d;
+        q[idx] = qkv[src];
+        kT[(long)d * N + n] = qkv[src + D];
+        v[idx] = qkv[src + 2 * D];
+    }
+    private Action<KernelConfig, FV, int, float>? _softmaxGroup;
+    // softmax(scale * s) over each row of N, one group per row: exp(scale (s - max s)) = exp(scale s - max(scale s)) for scale > 0
+    private static void SoftmaxRowsGroupImpl(FV s, int N, float scale)
+    {
+        int row = Grid.IdxX, t = Group.IdxX;
+        long b = (long)row * N;
+        var sh = SharedMemory.Allocate<float>(NormGroup);
+        float mx = float.NegativeInfinity;
+        for (int j = t; j < N; j += NormGroup) mx = MathF.Max(mx, s[b + j]);
+        sh[t] = mx;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] = MathF.Max(sh[t], sh[t + st]); Group.Barrier(); }
+        mx = sh[0];
+        Group.Barrier();
+        float sum = 0f;
+        for (int j = t; j < N; j += NormGroup) { float e = MathF.Exp((s[b + j] - mx) * scale); s[b + j] = e; sum += e; }
+        sh[t] = sum;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float inv = 1f / sh[0];
+        for (int j = t; j < N; j += NormGroup) s[b + j] *= inv;
+    }
+    /// <summary>scores [N, N] scratch, o [N, D]; <paramref name="q"/>, <paramref name="kT"/>, <paramref name="v"/>: [N * D] scratch each for the GEMM path (default views: the per-element kernels).</summary>
+    public void SpatialAttention(FV qkv, FV scores, FV o, int N, int D, FV q = default, FV kT = default, FV v = default)
+    {
+        long nd = (long)N * D;
+        if (AttentionGemm && q.Length >= nd && kT.Length >= nd && v.Length >= nd && _acc.MaxGroupSize.X >= NormGroup)
+        {
+            _packQkv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int>(PackQkvImpl);
+            _softmaxGroup ??= _acc.LoadStreamKernel<FV, int, float>(SoftmaxRowsGroupImpl);
+            _mm ??= new MatMulKernel(_acc);
+            _packQkv((int)nd, qkv, q.SubView(0, nd), kT.SubView(0, nd), v.SubView(0, nd), N, D);
+            var s = scores.SubView(0, (long)N * N);
+            _mm.MatMul(q.SubView(0, nd), kT.SubView(0, nd), s, N, D, N);
+            _softmaxGroup(new KernelConfig(N, NormGroup), s, N, 1f / MathF.Sqrt(D));
+            _mm.MatMul(s, v.SubView(0, nd), o.SubView(0, nd), N, N, D);
+            return;
+        }
         _attnScores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float>(AttnScoresImpl);
         _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
         _attnOut ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(AttnOutImpl);

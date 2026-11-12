@@ -170,20 +170,45 @@ public sealed class Wan22Pipeline
     /// <summary>Files on disk: <paramref name="paths"/> are file paths (<see cref="Wan22Paths.InFolder"/>).</summary>
     public Wan22Pipeline(Accelerator accelerator, Wan22Paths paths) : this(accelerator, new LocalFolderModelSource(""), "", paths) { }
 
-    private async Task<GpuWeights> LoadWeightsAsync(string file, CancellationToken ct)
-    {
-        await using var stream = await _source.OpenAsync(_repo, file, ct);
-        using var empty = System.Text.Json.JsonDocument.Parse("{}");
-        return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, file, cancellationToken: ct);
-    }
+    private Task<GpuWeights> LoadWeightsAsync(string file, CancellationToken ct) => LoadWeightsAsync(_acc, _source, _repo, file, ct);
 
     private async Task<int[]> TokenizeAsync(string text, CancellationToken ct)
     {
-        if (_tok == null) { using var ms = new MemoryStream(await _source.FetchBytesAsync(_repo, _paths.Tokenizer, ct)); _tok = UnigramTokenizer.FromTokenizerJson(ms); }
-        var ids = _tok.Encode(UnigramTokenizer.CleanWhitespace(text));
-        return ids.Length > WanDiT_TextLength ? ids[..WanDiT_TextLength] : ids;         // the reference truncates to 512 tokens
+        _tok ??= await LoadTokenizerAsync(_source, _repo, _paths.Tokenizer, ct);
+        return TokenizePrompt(_tok, text);
     }
     private const int WanDiT_TextLength = 512;
+
+    // ---- the building blocks, for callers that run their own graph (SpawnGen's ComfyUI-style split Wan graph): the pipeline uses exactly these ----
+
+    /// <summary>
+    /// One of the model files (<see cref="Wan22Paths"/>: the DiT, the VAE) as device weights, read from <paramref name="source"/> (the models host and its cache, OPFS, a
+    /// local folder) as the pipeline reads it. The caller owns the result: build <c>new WanDiT(accelerator, new DiTKernels(accelerator), weights)</c> or
+    /// <c>new WanVae(accelerator, weights)</c> over it and dispose the weights after them. The umT5 encoder loads itself: <see cref="UmT5Encoder.CreateAsync(Accelerator, IModelSource, string, string, CancellationToken)"/>.
+    /// </summary>
+    public static async Task<GpuWeights> LoadWeightsAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken ct = default)
+    {
+        await using var stream = await source.OpenAsync(repo, file, ct);
+        using var empty = System.Text.Json.JsonDocument.Parse("{}");
+        return await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, file, cancellationToken: ct);
+    }
+
+    /// <summary>The umT5 tokenizer (<see cref="Wan22Paths.Tokenizer"/>, google/umt5-xxl's tokenizer.json) from <paramref name="source"/>.</summary>
+    public static async Task<UnigramTokenizer> LoadTokenizerAsync(IModelSource source, string repo, string file, CancellationToken ct = default)
+    {
+        using var ms = new MemoryStream(await source.FetchBytesAsync(repo, file, ct));
+        return UnigramTokenizer.FromTokenizerJson(ms);
+    }
+
+    /// <summary>
+    /// The token ids the pipeline feeds <see cref="UmT5Encoder"/> for <paramref name="text"/>: the reference's whitespace clean-up, the Unigram ids with the trailing
+    /// end-of-sequence token, truncated to 512 tokens (the reference's text length). No padding: the encoder and <c>WanDiT.SetContext</c> take the true row count.
+    /// </summary>
+    public static int[] TokenizePrompt(UnigramTokenizer tokenizer, string text)
+    {
+        var ids = tokenizer.Encode(UnigramTokenizer.CleanWhitespace(text));
+        return ids.Length > WanDiT_TextLength ? ids[..WanDiT_TextLength] : ids;         // the reference truncates to 512 tokens
+    }
 
     /// <summary>Standard normal samples, seeded (<see cref="SeededNoise"/>): the starting noise [48, F, h, w]. Not torch's generator, so a seed here is not a seed there; <see cref="WanRequest.InitialNoise"/> takes another implementation's noise.</summary>
     public static float[] Gaussian(long count, long seed) => SeededNoise.Gaussian(count, seed);

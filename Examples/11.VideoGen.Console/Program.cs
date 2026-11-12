@@ -20,7 +20,7 @@
 //                  --upscale runs the model's two-pass recipe: 2/3 size, the x2 latent upscaler, 3 steps at twice that size, so 704x480 comes out at 896x576)
 //           --dit q8|q4|bf16|turbo_q8 (5.6 GB / 3.1 GB / 10 GB / 5.6 GB)  --sampler unipc|fewstep  --text q8|bf16 (6.4 GB / 11.4 GB; default q8, the hosted one: bf16 only with --models)  --models DIR (a local folder of the exports; else they
 //           download from the SpawnDev models host into the cache)  --cache DIR  --out DIR  --fps N  --no-frames (skip the PNG frames)
-//           --opencl (run on OpenCL even when CUDA is present: compare the two desktop paths on one GPU)
+//           --opencl (run on OpenCL even when CUDA is present: compare the two desktop paths on one GPU)  --trace (Wan: per-stage VAE decode times, device-synced)
 //
 //  Output: <out>/video.webp (animated), <out>/frame_0000.png ...  A bigger size or more frames costs memory: on a 12 GB card 640x352 with 17-49 frames is comfortable.
 //  The model gives good and bad clips by seed at small sizes: try another --seed before suspecting anything else.
@@ -71,6 +71,7 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--save-latent": o.SaveLatent = true; break;
         case "--opencl": o.OpenCL = true; break;
+        case "--trace": o.Trace = true; break;
         case "--end-image" when i + 1 < args.Length: o.EndImage = args[++i]; break;
         default: if (!args[i].StartsWith("--")) words.Add(args[i]); break;
     }
@@ -128,7 +129,7 @@ async Task<int> Run(string prompt, Options o)
     var request = new WanRequest
     {
         Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
-        TiledDecode = o.TiledVae, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
+        TiledDecode = o.TiledVae, Trace = o.Trace, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
     };
     if (o.Image != null)
     {
@@ -138,7 +139,7 @@ async Task<int> Run(string prompt, Options o)
         request = new WanRequest
         {
             Prompt = prompt, NegativePrompt = o.Negative, Width = o.Width, Height = o.Height, Frames = o.Frames, Steps = o.Steps, GuidanceScale = o.Guidance, Shift = o.Shift, Seed = o.Seed, Sampler = o.FewStep ? WanSampler.FewStep : WanSampler.UniPC,
-            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height, TiledDecode = o.TiledVae, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
+            ImageRgb = rgb, ImageWidth = img.Width, ImageHeight = img.Height, TiledDecode = o.TiledVae, Trace = o.Trace, MagCache = o.MagCache > 0 ? new SpawnDev.ILGPU.ML.Wan.WanMagCache(o.MagCache) : null,
         };
     }
 
@@ -226,7 +227,7 @@ int Save(WanVideo video, Options o)
 
 sealed class Options
 {
-    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae, SaveLatent, OpenCL;
+    public bool Ci, NoFrames, FewStep, Turbo, Ltx, Upscale, TiledVae, SaveLatent, OpenCL, Trace;
     public double MagCache;
     public int Width = 640, Height = 352, Frames = 17, Steps = 30, Fps = 24;
     public long Seed = 42;

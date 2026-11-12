@@ -57,6 +57,22 @@ see Memory below).
 
 `WanRequest.ImageRgb` (+ `ImageWidth`, `ImageHeight`) makes it image to video; `InitialNoise` reproduces another implementation's starting noise; `Trace` logs the VAE stage times.
 
+**The building blocks** (your own graph or sampler, e.g. a ComfyUI-style split graph; the pipeline uses exactly these):
+
+```csharp
+var paths = Wan22Paths.InRepo();                                                                     // or InFolder(dir) with a LocalFolderModelSource
+var tok = await Wan22Pipeline.LoadTokenizerAsync(source, repo, paths.Tokenizer);
+int[] ids = Wan22Pipeline.TokenizePrompt(tok, prompt);                                              // + </s>, truncated to 512, no padding
+using var enc = await UmT5Encoder.CreateAsync(accelerator, source, repo, paths.TextEncoder);        // the prompt's context rows for WanDiT.SetContext
+using var ditW = await Wan22Pipeline.LoadWeightsAsync(accelerator, source, repo, paths.Dit);        // the caller owns the weights: dispose after the model
+using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), ditW);                         // SetGrid, SetContext(slot, ...), Forward per step
+using var vaeW = await Wan22Pipeline.LoadWeightsAsync(accelerator, source, repo, paths.Vae);
+using var vae = new WanVae(accelerator, vaeW);
+var (mean, std) = await vae.GetLatentNormalizationAsync();                                          // 48 each: raw VAE latent = z * std + mean
+```
+
+The DiT and the VAE work in the NORMALISED latent `(z - mean) / std` (`EncodeImageAsync` returns it, `DecodeAsync` takes it); ComfyUI's LATENT for Wan 2.2 holds the raw one.
+
 ## Files
 
 Exported once from the reference checkpoints with `tools/wan-harness/reference` (`export_dit_bf16.py`, `quantize_streaming.py`, `export_vae_f16.py`, `export_t5_bf16.py`), SafeTensors:
