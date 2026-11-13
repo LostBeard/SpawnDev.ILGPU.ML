@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Preprocessing;
+using SpawnDev.ILGPU.ML.SafeTensors;
 using SpawnDev.ILGPU.ML.Trellis2;
 
 namespace SpawnDev.ILGPU.ML.Wan;
@@ -15,8 +16,19 @@ public sealed class Wan22Paths
     public required string Vae { get; init; }
     /// <summary><c>umt5_xxl_enc_q8.safetensors</c> (6.4 GB) or <c>umt5_xxl_enc_bf16.safetensors</c> (11.4 GB), streamed layer by layer.</summary>
     public required string TextEncoder { get; init; }
-    /// <summary>The umT5 <c>tokenizer.json</c>.</summary>
+    /// <summary>The umT5 <c>tokenizer.json</c>, or a umT5 <c>.safetensors</c> file that carries the SentencePiece model (ComfyUI's do).</summary>
     public required string Tokenizer { get; init; }
+
+    /// <summary>
+    /// ComfyUI's repackaged Wan 2.2 TI2V-5B files (Comfy-Org/Wan_2.2_ComfyUI_Repackaged) in a ComfyUI <c>models</c> folder: <c>diffusion_models/</c>, <c>vae/</c> and
+    /// <c>text_encoders/</c>. All three load as they are; the tokenizer is read from the umT5 file itself, so no google/umt5-xxl download is needed.
+    /// <paramref name="textEncoder"/> may be <c>umt5_xxl_fp8_e4m3fn_scaled.safetensors</c> (6.7 GB).
+    /// </summary>
+    public static Wan22Paths ComfyUI(string modelsFolder, string dit = "wan2.2_ti2v_5B_fp16.safetensors", string vae = "wan2.2_vae.safetensors", string textEncoder = "umt5_xxl_fp16.safetensors")
+    {
+        string te = Path.Combine(modelsFolder, "text_encoders", textEncoder);
+        return new() { Dit = Path.Combine(modelsFolder, "diffusion_models", dit), Vae = Path.Combine(modelsFolder, "vae", vae), TextEncoder = te, Tokenizer = te };
+    }
 
     /// <summary>
     /// The file names a model repo holds (relative, forward slashes). <see cref="Wan22Pipeline.DefaultRepo"/> on models.spawndev.com serves the 8-bit and 4-bit DiT, the VAE,
@@ -201,12 +213,38 @@ public sealed class Wan22Pipeline
         catch { w.Dispose(); throw; }
     }
 
-    /// <summary>The umT5 tokenizer (<see cref="Wan22Paths.Tokenizer"/>, google/umt5-xxl's tokenizer.json) from <paramref name="source"/>.</summary>
+    /// <summary>
+    /// The umT5 tokenizer (<see cref="Wan22Paths.Tokenizer"/>) from <paramref name="source"/>: google/umt5-xxl's tokenizer.json, or a <c>.safetensors</c> file that carries the
+    /// SentencePiece model as the U8 tensor <c>spiece_model</c> (ComfyUI's umT5 files do: <see cref="Wan22Paths.ComfyUI"/>), read by offset without the rest of the file.
+    /// Both give the same tokenizer (256,000 pieces with identical scores, plus google's 300 sentinel pieces; gate <c>Wan_Tokenizer_ComfySpiece_MatchesTokenizerJson</c>).
+    /// </summary>
     public static async Task<UnigramTokenizer> LoadTokenizerAsync(IModelSource source, string repo, string file, CancellationToken ct = default)
     {
+        if (file.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+        {
+            await using var stream = await source.OpenAsync(repo, file, ct);
+            if (!stream.CanSeek) throw new NotSupportedException($"'{file}': the tokenizer is read from the safetensors file by offset; the model source must give a seekable stream");
+            var lenBytes = new byte[8];
+            await stream.ReadExactlyAsync(lenBytes, ct);
+            long headerSize = BitConverter.ToInt64(lenBytes);
+            if (headerSize <= 0 || headerSize > 100_000_000) throw new InvalidDataException($"'{file}': invalid SafeTensors header size {headerSize}");
+            var headerBytes = new byte[headerSize];
+            await stream.ReadExactlyAsync(headerBytes, ct);
+            long dataStart = 8 + headerSize;
+            var (tensors, _) = SafeTensorsFileReader.ParseHeader(file, headerBytes, dataStart, stream.Length - dataStart);
+            var spm = tensors.FirstOrDefault(t => t.Name == "spiece_model") ?? throw new InvalidDataException($"'{file}' has no spiece_model tensor (the SentencePiece model); use google/umt5-xxl's tokenizer.json");
+            if (spm.DType != "U8" || spm.DataLength <= 0 || spm.DataLength > 64 << 20) throw new InvalidDataException($"'{file}': spiece_model is {spm.DType}, {spm.DataLength} bytes; expected U8 bytes of a SentencePiece model");
+            var bytes = new byte[spm.DataLength];
+            stream.Seek(spm.DataOffset, SeekOrigin.Begin);
+            await stream.ReadExactlyAsync(bytes, ct);
+            return UnigramTokenizer.FromSentencePieceModel(bytes, UmT5SentinelCount);
+        }
         using var ms = new MemoryStream(await source.FetchBytesAsync(repo, file, ct));
         return UnigramTokenizer.FromTokenizerJson(ms);
     }
+
+    /// <summary>The T5 sentinel pieces (<c>&lt;extra_id_N&gt;</c>) google/umt5-xxl's tokenizer appends after the SentencePiece model's pieces.</summary>
+    private const int UmT5SentinelCount = 300;
 
     /// <summary>
     /// The token ids the pipeline feeds <see cref="UmT5Encoder"/> for <paramref name="text"/>: the reference's whitespace clean-up, the Unigram ids with the trailing

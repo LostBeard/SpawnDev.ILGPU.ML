@@ -308,4 +308,57 @@ public abstract partial class MLTestBase
         }
         return (step, sub);
     }
+
+    /// <summary>
+    /// The tokenizer read from ComfyUI's umT5 files (the SentencePiece model in their U8 tensor <c>spiece_model</c>, <see cref="Wan22Pipeline.LoadTokenizerAsync"/>) against the one
+    /// from google/umt5-xxl's tokenizer.json: the same pieces with bit-identical scores (256,000 from the model plus the 300 sentinels), the same unknown and end-of-sequence ids, and
+    /// the same ids for the reference's three prompts (equal to the reference's own ids) and for edge cases (space runs, a character no piece covers, a sentinel, Chinese).
+    /// Host only. Red check: a sentinel count of 299 or a score read from the wrong field fails it.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Wan_Tokenizer_ComfySpiece_MatchesTokenizerJson() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU) throw new UnsupportedTestException("reads the files from disk");
+        string comfyDir = Path.Combine(WanDir, "comfy"), tokPath = Path.Combine(WanDir, "google", "umt5-xxl", "tokenizer.json");
+        var files = new[] { "umt5_xxl_fp16.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors" }.Where(f => File.Exists(Path.Combine(comfyDir, f))).ToArray();
+        if (files.Length == 0 || !File.Exists(tokPath)) throw new UnsupportedTestException($"needs ComfyUI's umT5 files in {comfyDir} and {tokPath}");
+        var json = await Wan22Pipeline.LoadTokenizerAsync(new LocalFolderModelSource(WanDir), "", "google/umt5-xxl/tokenizer.json");
+        var refTexts = new List<(string Text, int[] Ids)>();
+        foreach (var name in new[] { "0", "1", "neg" })
+        {
+            using var fx = System.IO.Compression.ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"t5_{name}.npz"));
+            var (ids, _) = WanNpz(fx, "ids"); var (mask, _) = WanNpz(fx, "mask");
+            var textEntry = fx.GetEntry("text.npy")!; using var ts = textEntry.Open(); using var tms = new MemoryStream(); ts.CopyTo(tms);
+            var raw = tms.ToArray(); int hlen = BitConverter.ToUInt16(raw, 8); var bytes = raw.AsSpan(10 + hlen);
+            var sb = new System.Text.StringBuilder(); for (int i = 0; i + 3 < bytes.Length; i += 4) { int cp = BitConverter.ToInt32(bytes.Slice(i, 4)); if (cp == 0) break; sb.Append(char.ConvertFromUtf32(cp)); }
+            refTexts.Add((sb.ToString(), ids.Take((int)mask.Sum()).Select(v => (int)v).ToArray()));
+        }
+        var edge = new[] { "", "a  b   c", "  leading and trailing  ", "\U0001F98A a fox in the snow \U0001F98A", "<extra_id_0> sentinel <extra_id_299>", "一只狐狸在雪地里奔跑，镜头缓缓推进。", "Ünïcödé façade naïve café", "x" };
+        var report = new List<string>();
+        foreach (var file in files)
+        {
+            var spm = await Wan22Pipeline.LoadTokenizerAsync(new LocalFolderModelSource(comfyDir), "", file);
+            if (spm.VocabSize != json.VocabSize || spm.EosId != json.EosId || spm.UnkId != json.UnkId)
+                throw new Exception($"{file}: vocab {spm.VocabSize} eos {spm.EosId} unk {spm.UnkId} vs tokenizer.json vocab {json.VocabSize} eos {json.EosId} unk {json.UnkId}");
+            for (int i = 0; i < json.VocabSize; i++)
+                if (spm.Piece(i) != json.Piece(i) || BitConverter.SingleToInt32Bits(spm.Score(i)) != BitConverter.SingleToInt32Bits(json.Score(i)))
+                    throw new Exception($"{file}: piece {i} '{spm.Piece(i)}' {spm.Score(i):R} vs tokenizer.json '{json.Piece(i)}' {json.Score(i):R}");
+            int tokens = 0;
+            foreach (var (text, want) in refTexts)
+            {
+                var got = Wan22Pipeline.TokenizePrompt(spm, text);
+                if (!got.SequenceEqual(want)) throw new Exception($"{file}: reference prompt differs at {Enumerable.Range(0, Math.Min(got.Length, want.Length)).FirstOrDefault(i => got[i] != want[i])} ({got.Length} vs {want.Length} tokens)");
+                tokens += got.Length;
+            }
+            foreach (var text in edge)
+            {
+                var a = spm.Encode(Preprocessing.UnigramTokenizer.CleanWhitespace(text)); var b = json.Encode(Preprocessing.UnigramTokenizer.CleanWhitespace(text));
+                if (!a.SequenceEqual(b)) throw new Exception($"{file}: '{text}': [{string.Join(",", a)}] vs tokenizer.json [{string.Join(",", b)}]");
+                tokens += a.Length;
+            }
+            report.Add($"{file}: {spm.VocabSize} pieces identical (scores bit-exact), eos {spm.EosId}, unk {spm.UnkId}; {refTexts.Count} reference prompts = the reference's ids, {edge.Length} edge cases = tokenizer.json's ({tokens} tokens)");
+        }
+        foreach (var line in report) Console.WriteLine("[Wan] ComfyUI spiece tokenizer: " + line);
+        return string.Join("; ", report);
+    });
 }

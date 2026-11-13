@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// SentencePiece UNIGRAM tokenizer as the Hugging Face <c>tokenizers</c> library runs it for <c>google/umt5-xxl</c> (the text encoder of Wan 2.2): the normalizer collapses runs of
 /// spaces, the Metaspace pre-tokenizer replaces spaces with U+2581 and prefixes one, the Unigram model picks the segmentation with the highest total log-probability (Viterbi over
 /// the lattice of every vocabulary piece that matches at every position; a character no piece covers becomes the unknown token with the score of the lowest piece minus 10, and
-/// consecutive unknowns fuse), and the post-processor appends the end-of-sequence token. Loaded from <c>tokenizer.json</c>; no byte fallback.
+/// consecutive unknowns fuse), and the post-processor appends the end-of-sequence token. Loaded from <c>tokenizer.json</c> or a SentencePiece model file; no byte fallback.
 /// (The greedy <see cref="SentencePieceTokenizer"/> is for the llama / gemma vocabularies and is not a Unigram implementation.)
 /// </summary>
 public sealed class UnigramTokenizer
@@ -57,6 +57,94 @@ public sealed class UnigramTokenizer
             && st.TryGetProperty("</s>", out var s) && s.TryGetProperty("ids", out var ids) && ids.GetArrayLength() > 0) eos = ids[0].GetInt32();
         return new UnigramTokenizer(pieces, scores, unk, eos);
     }
+
+    /// <summary>
+    /// Read a SentencePiece model file (<c>spiece.model</c>, a serialized <c>ModelProto</c>; ComfyUI's umT5 files carry one as the U8 tensor <c>spiece_model</c>): every piece and score in
+    /// order, the unknown and end-of-sequence ids from the trainer spec (protobuf defaults 0 and 2 when absent), then <paramref name="extraIds"/> T5 sentinel pieces
+    /// <c>&lt;extra_id_{extraIds-1}&gt;</c> down to <c>&lt;extra_id_0&gt;</c> with score 0, as Hugging Face's T5 tokenizers append them (google/umt5-xxl: 300, so its tokenizer.json
+    /// has 256,300 pieces to the model's 256,000). Encoding is the same as <see cref="FromTokenizerJson"/>'s: the model's own normalizer spec is not read (umT5's is "identity"),
+    /// space runs collapse as tokenizer.json's normalizer does.
+    /// </summary>
+    public static UnigramTokenizer FromSentencePieceModel(ReadOnlySpan<byte> model, int extraIds = 0)
+    {
+        var pieces = new List<string>(); var scores = new List<float>();
+        int unk = 0, eos = 2;                                                        // TrainerSpec defaults: unk_id = 0, eos_id = 2
+        int p = 0;
+        while (p < model.Length)
+        {
+            ulong key = ReadVarint(model, ref p);
+            int field = (int)(key >> 3), wire = (int)(key & 7);
+            if (field == 1 && wire == 2)                                             // repeated SentencePiece pieces = 1 { string piece = 1; float score = 2; Type type = 3; }
+            {
+                var msg = ReadBytes(model, ref p);
+                string piece = ""; float score = 0;
+                int q = 0;
+                while (q < msg.Length)
+                {
+                    ulong k = ReadVarint(msg, ref q);
+                    int f = (int)(k >> 3), w = (int)(k & 7);
+                    if (f == 1 && w == 2) piece = Encoding.UTF8.GetString(ReadBytes(msg, ref q));
+                    else if (f == 2 && w == 5) { score = BitConverter.ToSingle(msg.Slice(q, 4)); q += 4; }
+                    else Skip(msg, ref q, w);
+                }
+                pieces.Add(piece); scores.Add(score);
+            }
+            else if (field == 2 && wire == 2)                                        // TrainerSpec trainer_spec = 2 { int32 unk_id = 40; int32 eos_id = 42; ... }
+            {
+                var msg = ReadBytes(model, ref p);
+                int q = 0;
+                while (q < msg.Length)
+                {
+                    ulong k = ReadVarint(msg, ref q);
+                    int f = (int)(k >> 3), w = (int)(k & 7);
+                    if ((f == 40 || f == 42) && w == 0) { int v = (int)ReadVarint(msg, ref q); if (f == 40) unk = v; else eos = v; }
+                    else Skip(msg, ref q, w);
+                }
+            }
+            else Skip(model, ref p, wire);
+        }
+        if (pieces.Count == 0) throw new InvalidDataException("not a SentencePiece model: no pieces");
+        if ((uint)unk >= (uint)pieces.Count || (uint)eos >= (uint)pieces.Count) throw new InvalidDataException($"SentencePiece model: unk_id {unk} / eos_id {eos} outside the {pieces.Count} pieces");
+        for (int e = extraIds - 1; e >= 0; e--) { pieces.Add($"<extra_id_{e}>"); scores.Add(0f); }
+        return new UnigramTokenizer(pieces.ToArray(), scores.ToArray(), unk, eos);
+    }
+
+    private static ulong ReadVarint(ReadOnlySpan<byte> b, ref int p)
+    {
+        ulong r = 0;
+        for (int s = 0; s < 64; s += 7)
+        {
+            if (p >= b.Length) throw new InvalidDataException("SentencePiece model: truncated varint");
+            byte x = b[p++];
+            r |= (ulong)(x & 0x7F) << s;
+            if (x < 0x80) return r;
+        }
+        throw new InvalidDataException("SentencePiece model: varint longer than 10 bytes");
+    }
+
+    private static ReadOnlySpan<byte> ReadBytes(ReadOnlySpan<byte> b, ref int p)
+    {
+        ulong n = ReadVarint(b, ref p);
+        if (n > (ulong)(b.Length - p)) throw new InvalidDataException("SentencePiece model: a field runs past the end");
+        var s = b.Slice(p, (int)n); p += (int)n;
+        return s;
+    }
+
+    private static void Skip(ReadOnlySpan<byte> b, ref int p, int wire)
+    {
+        switch (wire)
+        {
+            case 0: ReadVarint(b, ref p); break;
+            case 1: p += 8; break;
+            case 2: ReadBytes(b, ref p); break;
+            case 5: p += 4; break;
+            default: throw new InvalidDataException($"SentencePiece model: wire type {wire}");
+        }
+        if (p > b.Length) throw new InvalidDataException("SentencePiece model: a field runs past the end");
+    }
+
+    /// <summary>The log-probability of piece <paramref name="id"/>.</summary>
+    public float Score(int id) => _scores[id];
 
     /// <summary>Token ids of <paramref name="text"/> (with the trailing end-of-sequence token when <paramref name="addEos"/>). The text is used as given, apart from the tokenizer's own normalizer.</summary>
     public int[] Encode(string text, bool addEos = true)
