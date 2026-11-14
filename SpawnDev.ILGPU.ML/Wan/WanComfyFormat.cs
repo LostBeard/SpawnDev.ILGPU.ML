@@ -235,8 +235,11 @@ public static class WanComfyFormat
                 var part = dst.View.SubView(off, c);
                 if (w.IsF8(n))
                 {
-                    if (!scales.TryGetValue(n, out var sn) || !w.IsF32(sn)) throw new InvalidDataException($"{n}: an F8_E4M3 matrix without its fp32 scale_weight");
-                    float scale = (await w.F32(sn).CopyToHostAsync())[0];                       // one scalar
+                    // ComfyUI's "scaled fp8" files carry one fp32 scale_weight per matrix; its all-in-one FLUX.1 checkpoints store plain 8-bit floats with no scale at all
+                    // (value * 1). A file that has scales must have this matrix's: a missing one is an error, not a silent 1.
+                    float scale = 1f;
+                    if (scales.TryGetValue(n, out var sn) && w.IsF32(sn)) scale = (await w.F32(sn).CopyToHostAsync())[0];      // one scalar
+                    else if (scales.Count > 0) throw new InvalidDataException($"{n}: an F8_E4M3 matrix without its fp32 scale_weight");
                     DecodeF8E4M3(accelerator, w.F8Words(n), part, scale);
                 }
                 else if (w.IsF16(n)) ToBf16(accelerator, w.F16(n), part);

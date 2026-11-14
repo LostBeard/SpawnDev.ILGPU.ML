@@ -218,6 +218,31 @@ public sealed partial class SdTextEncoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// The pooled embedding of a single-tower encoder (CLIP-L: FLUX.1's <c>y</c> vector): every layer, the final norm, the end token's row (the highest id), then the text projection when
+    /// <paramref name="project"/> (and the file has one). <paramref name="ids"/> as for <see cref="EncodeAsync(int[], int[], int?, CancellationToken)"/>; [Width] or [ProjectionWidth].
+    /// </summary>
+    public async Task<float[]> PooledAsync(int[] ids, bool project, CancellationToken cancellationToken = default)
+    {
+        if (_xl) throw new InvalidOperationException("SDXL's pooled embedding comes from EncodeAsync (the second tower)");
+        var tw = _towers[0];
+        int T = ids.Length, C = tw.Width;
+        if (T < 1 || T > MaxTokens) throw new ArgumentException($"a prompt chunk is 1 to {MaxTokens} tokens");
+        if (project && !tw.HasProjection) throw new InvalidOperationException("this text encoder file has no text projection");
+        using var idv = _acc.Allocate1D(ids);
+        var x = Slot(0, (long)T * C); var n = Slot(1, (long)T * C); var qkv = Slot(2, (long)T * 3 * C); var a = Slot(3, (long)T * C);
+        var hid = Slot(4, (long)T * C * 4);
+        _k.Embed(idv.View, _w[tw.P + "tok"], _w[tw.P + "pos"], x, T, C);
+        tw.Run(x, T, 0, tw.Layers, n, qkv, a, hid);
+        _k.Sparse.LayerNorm(x, n, _w[tw.P + "final_ln.weight"], _w[tw.P + "final_ln.bias"], T, C, 1e-5f);
+        int eot = 0; for (int t = 1; t < T; t++) if (ids[t] > ids[eot]) eot = t;
+        FV result;
+        if (project) { result = Slot(7, tw.ProjectionWidth); _k.Sparse.Linear(n.SubView((long)eot * C, C), _w[tw.P + "proj.weight"], null, result, 1, C, tw.ProjectionWidth); }
+        else result = n.SubView((long)eot * C, C);
+        await _acc.SynchronizeAsync();
+        return await result.CopyToHostAsync();
+    }
+
     public void Dispose()
     {
         foreach (var b in _slots.Values) b.Dispose();

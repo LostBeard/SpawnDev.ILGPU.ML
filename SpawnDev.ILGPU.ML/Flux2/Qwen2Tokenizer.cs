@@ -68,9 +68,15 @@ public sealed class Qwen2Tokenizer
     }
 
     /// <summary>The ids the pipeline feeds the encoder: the chat-templated prompt truncated and right-padded to <paramref name="length"/>; also the number of real tokens.</summary>
-    public (int[] Ids, int Real) EncodePadded(string prompt, int length = 512)
+    public (int[] Ids, int Real) EncodePadded(string prompt, int length = 512) => EncodePadded(prompt, ChatPrompt, length);
+
+    /// <summary>The user turn without the empty thinking block (Z-Image: ComfyUI's lumina2 text encode gives 8 tokens for the empty prompt, 15 for a 7-word one).</summary>
+    public static string ChatPromptNoThinking(string prompt) => "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+
+    /// <summary>The same with another template (<see cref="ChatPrompt"/> or <see cref="ChatPromptNoThinking"/>).</summary>
+    public (int[] Ids, int Real) EncodePadded(string prompt, Func<string, string> template, int length = 512)
     {
-        var ids = Encode(ChatPrompt(prompt));
+        var ids = Encode(template(prompt));
         int real = Math.Min(ids.Length, length);
         var o = new int[length];
         Array.Fill(o, PadId);

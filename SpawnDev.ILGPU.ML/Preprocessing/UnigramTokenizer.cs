@@ -149,8 +149,10 @@ public sealed class UnigramTokenizer
     /// <summary>Token ids of <paramref name="text"/> (with the trailing end-of-sequence token when <paramref name="addEos"/>). The text is used as given, apart from the tokenizer's own normalizer.</summary>
     public int[] Encode(string text, bool addEos = true)
     {
-        text = Spaces.Replace(text, " ").Replace(' ', '▁');
-        if (text.Length == 0 || text[0] != '▁') text = "▁" + text;         // Metaspace, add_prefix_space
+        // WhitespaceSplit (tokenizer.json) / remove_extra_whitespaces (SentencePiece): leading and trailing spaces go, so an empty or all-space text has no pieces, only the end token
+        text = Spaces.Replace(text, " ").Trim(' ');
+        if (text.Length == 0) return addEos ? new[] { _eos } : Array.Empty<int>();
+        text = "▁" + text.Replace(' ', '▁');                                          // Metaspace, prepend_scheme always
         // Viterbi over the code points (a surrogate pair is one position)
         var runes = new List<int>(text.Length);                                      // char offset of every rune start
         for (int c = 0; c < text.Length; c++) { runes.Add(c); if (char.IsHighSurrogate(text[c]) && c + 1 < text.Length) c++; }

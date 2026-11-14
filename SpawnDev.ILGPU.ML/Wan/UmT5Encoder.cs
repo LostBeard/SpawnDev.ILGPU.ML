@@ -32,6 +32,8 @@ public sealed class UmT5Encoder : IDisposable
     private readonly bool _embeddingQuantized;
     private readonly bool _embeddingF16;                         // fp16 rows (ComfyUI's files); otherwise bf16, or the 8-bit blocks
     private readonly bool _hfLayout;                             // the file has the Hugging Face T5 names (ComfyUI's umT5 files): each layer is rewritten into ours as it loads (WanComfyFormat)
+    private readonly bool _embeddingF8;                          // 8-bit float rows with no scale (ComfyUI's all-in-one FLUX.1 checkpoints)
+    private readonly string _prefix;                             // the T5's names inside an all-in-one checkpoint (FLUX.1: "text_encoders.t5xxl.transformer."); "" for a T5 file
     private readonly DiTKernels _k;
     private readonly WanKernels _wk;
     public const int Dim = 4096, Heads = 64, HeadDim = 64, FfnDim = 10240, DefaultLayers = 24;
@@ -41,10 +43,10 @@ public sealed class UmT5Encoder : IDisposable
     /// <summary>Test hook: (stage name, activation view, element count), valid only during the call; names "embedding", "layer_N", "final" (the first sequence of a call).</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
-    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias, bool hfLayout = false)
+    private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias, bool hfLayout = false, string prefix = "")
     {
         _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers; _sharedBias = sharedBias;
-        _hfLayout = hfLayout; _embeddingF16 = info.DType == "F16";
+        _hfLayout = hfLayout; _embeddingF16 = info.DType == "F16"; _embeddingF8 = info.DType == "F8_E4M3"; _prefix = prefix;
         _k = new DiTKernels(accelerator); _wk = new WanKernels(accelerator);
     }
 
@@ -64,16 +66,20 @@ public sealed class UmT5Encoder : IDisposable
             await stream.ReadExactlyAsync(headerBytes, cancellationToken);
             long dataStart = 8 + headerSize;
             var (tensors, metadata) = SafeTensorsFileReader.ParseHeader(file, headerBytes, dataStart, stream.Length - dataStart);
+            // an all-in-one checkpoint keeps the T5 under a prefix (ComfyUI's flux1-dev-fp8: "text_encoders.t5xxl.transformer."): the T5 is the tensors around its shared.weight
+            var sharedAny = tensors.FirstOrDefault(t => t.Name == "shared.weight") ?? tensors.FirstOrDefault(t => t.Name.EndsWith(".transformer.shared.weight", StringComparison.Ordinal));
+            string prefix = sharedAny == null ? "" : sharedAny.Name[..^"shared.weight".Length];
+            if (prefix.Length > 0) tensors = tensors.Where(t => t.Name.StartsWith(prefix, StringComparison.Ordinal)).Select(t => new SafeTensorInfo { Name = t.Name[prefix.Length..], DType = t.DType, Shape = t.Shape, DataOffset = t.DataOffset, DataLength = t.DataLength }).ToList();
             if (WanComfyFormat.IsComfyT5(tensors.Select(t => t.Name)))
             {
-                // ComfyUI's umT5 files (Hugging Face names, fp16 or scaled 8-bit floats, no metadata): the layer count and the bias-table layout come from the names
+                // ComfyUI's T5 files (Hugging Face names, fp16, scaled or unscaled 8-bit floats, no metadata): the layer count and the bias-table layout come from the names
                 var names = tensors.Select(t => t.Name).ToHashSet();
                 var shared = tensors.First(t => t.Name == "shared.weight");
-                if (shared.DType is not ("F16" or "BF16") || shared.Shape.Length != 2 || shared.Shape[1] != Dim) throw new NotSupportedException($"'{file}': shared.weight is {shared.DType} [{string.Join(", ", shared.Shape)}]; expected fp16 or bf16 [vocab, {Dim}]");
+                if (shared.DType is not ("F16" or "BF16" or "F8_E4M3") || shared.Shape.Length != 2 || shared.Shape[1] != Dim) throw new NotSupportedException($"'{file}': shared.weight is {shared.DType} [{string.Join(", ", shared.Shape)}]; expected fp16, bf16 or 8-bit float [vocab, {Dim}]");
                 int n = 0;
                 while (names.Contains($"encoder.block.{n}.layer.0.SelfAttention.q.weight")) n++;
                 bool oneBias = n > 1 && !names.Contains("encoder.block.1.layer.0.SelfAttention.relative_attention_bias.weight");
-                return new UmT5Encoder(accelerator, source, repo, file, stream, shared, false, n, oneBias, hfLayout: true);
+                return new UmT5Encoder(accelerator, source, repo, file, stream, shared, false, n, oneBias, hfLayout: true, prefix: prefix);
             }
             var info = tensors.FirstOrDefault(t => t.Name == "token_embedding.weight") ?? throw new InvalidDataException($"'{file}' has no token_embedding.weight");
             bool quantized = info.DType == "I32";
@@ -91,7 +97,7 @@ public sealed class UmT5Encoder : IDisposable
     private async Task<float[]> EmbedAsync(int[] ids, CancellationToken ct)
     {
         var x = new float[(long)ids.Length * Dim];
-        int rowBytes = _embeddingQuantized ? Dim / 32 * 9 * 4 : Dim * 2;
+        int rowBytes = _embeddingQuantized ? Dim / 32 * 9 * 4 : _embeddingF8 ? Dim : Dim * 2;
         var row = new byte[rowBytes];
         var first = new Dictionary<int, int>();                      // token id -> the first position that holds it: every distinct row is read once, in file order
         for (int i = 0; i < ids.Length; i++) first.TryAdd(ids[i], i);
@@ -102,6 +108,8 @@ public sealed class UmT5Encoder : IDisposable
             long o = (long)i * Dim;
             if (_embeddingF16)
                 for (int c = 0; c < Dim; c++) x[o + c] = (float)BitConverter.ToHalf(row, 2 * c);                                          // fp16 -> float
+            else if (_embeddingF8)
+                for (int c = 0; c < Dim; c++) x[o + c] = F8E4M3(row[c]);                                                                 // 8-bit float -> float (no scale)
             else if (!_embeddingQuantized)
                 for (int c = 0; c < Dim; c++) x[o + c] = BitConverter.Int32BitsToSingle((row[2 * c] | (row[2 * c + 1] << 8)) << 16);     // bf16 -> float
             else
@@ -116,6 +124,15 @@ public sealed class UmT5Encoder : IDisposable
         return x;
     }
 
+    /// <summary>An E4M3 8-bit float's value (sign, 4 exponent bits with bias 7, 3 mantissa bits; S.1111.111 is NaN).</summary>
+    private static float F8E4M3(byte b)
+    {
+        int e = (b >> 3) & 15, m = b & 7;
+        if ((b & 0x7F) == 0x7F) return float.NaN;
+        float v = e == 0 ? m * (1f / 512f) : (1f + m / 8f) * MathF.ScaleB(1f, e - 7);
+        return (b & 0x80) != 0 ? -v : v;
+    }
+
     /// <summary>Load the tensors of one layer (or the final norm) from the file, in file order.</summary>
     private async Task<GpuWeights> LoadLayerAsync(Func<string, bool> filter, CancellationToken ct)
     {
@@ -123,8 +140,14 @@ public sealed class UmT5Encoder : IDisposable
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
         if (!_hfLayout) return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, filter, ct);
         // the Hugging Face names: load the tensors that make up the ones asked for (our names), then rewrite them into our layout on the device
-        var w = await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, name => WanComfyFormat.T5OurName(name) is { } ours && ours != "token_embedding.weight" && filter(ours), ct);
-        try { await WanComfyFormat.AdaptT5Async(_acc, w); return w; }
+        var w = await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, name => name.StartsWith(_prefix, StringComparison.Ordinal)
+            && WanComfyFormat.T5OurName(name[_prefix.Length..]) is { } ours && ours != "token_embedding.weight" && filter(ours), ct);
+        try
+        {
+            if (_prefix.Length > 0) foreach (var n in w.Names.ToList()) w.Rename(n, n[_prefix.Length..]);
+            await WanComfyFormat.AdaptT5Async(_acc, w);
+            return w;
+        }
         catch { w.Dispose(); throw; }
     }
 

@@ -52,13 +52,16 @@ public static class Flux2ComfyFormat
     /// The load filter for a FLUX.2 stage file: in a Hugging Face Qwen3 file (<c>model.*</c> names) only the embedding and the first <see cref="Flux2TextEncoder.Layers"/> layers are
     /// read (the pipeline reads the hidden states after layers 9, 18 and 27: the last 9 layers, the final norm and any head never run). Every other name passes.
     /// </summary>
-    public static bool TextEncoderFilter(string name)
+    public static bool TextEncoderFilter(string name) => TextEncoderFilter(name, Flux2TextEncoder.Layers);
+
+    /// <summary>The load filter keeping the embedding and the first <paramref name="layers"/> layers of a Hugging Face Qwen3 file (Z-Image reads the state after layer 35).</summary>
+    public static bool TextEncoderFilter(string name, int layers)
     {
         if (!name.StartsWith("model.", StringComparison.Ordinal) && !name.StartsWith("lm_head.", StringComparison.Ordinal)) return true;
         if (name == "model.embed_tokens.weight") return true;
         if (!name.StartsWith("model.layers.", StringComparison.Ordinal)) return false;                   // model.norm, lm_head
         int end = name.IndexOf('.', "model.layers.".Length);
-        return end > 0 && int.TryParse(name.AsSpan("model.layers.".Length, end - "model.layers.".Length), out int l) && l < Flux2TextEncoder.Layers;
+        return end > 0 && int.TryParse(name.AsSpan("model.layers.".Length, end - "model.layers.".Length), out int l) && l < layers;
     }
 
     /// <summary>True when the text encoder's tensors carry Hugging Face Qwen3 names.</summary>
@@ -69,7 +72,7 @@ public static class Flux2ComfyFormat
     /// <c>mlp.gate_up_proj</c> (rows concatenated in that order, as our export does: export_flux2.py), the rest renamed. Each fused group is built and its sources freed before the next,
     /// so the peak is one group above the file.
     /// </summary>
-    public static async Task AdaptTextEncoderAsync(Accelerator accelerator, GpuWeights w)
+    public static async Task AdaptTextEncoderAsync(Accelerator accelerator, GpuWeights w, int layers = Flux2TextEncoder.Layers)
     {
         async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
         async Task Fuse(string ours, params string[] sources)
@@ -83,10 +86,10 @@ public static class Flux2ComfyFormat
             foreach (var s in sources) await Retire(w.Remove(s));
             await Retire(w.SetBF16(ours, dst, new[] { rows, cols }));
         }
-        for (int l = 0; l < Flux2TextEncoder.Layers; l++)
+        for (int l = 0; l < layers; l++)
         {
             string p = $"model.layers.{l}.", o = $"layers.{l}.";
-            if (!w.Has(p + "self_attn.q_proj.weight")) throw new InvalidDataException($"{p}: missing (the encoder needs layers 0 to {Flux2TextEncoder.Layers - 1})");
+            if (!w.Has(p + "self_attn.q_proj.weight")) throw new InvalidDataException($"{p}: missing (the encoder needs layers 0 to {layers - 1})");
             await Fuse(o + "self_attn.qkv_proj.weight", p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight");
             await Fuse(o + "mlp.gate_up_proj.weight", p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight");
         }

@@ -26,7 +26,13 @@ public sealed class Flux2TextEncoder : IDisposable
     public const float RopeTheta = 1_000_000f, RmsEps = 1e-6f;
     /// <summary>Width of the conditioning rows: three hidden states side by side.</summary>
     public const int EmbedWidth = 3 * Hidden;
-    private static readonly int[] TapAfterLayer = { 9, 18, 27 };
+    private readonly int[] _taps;
+    private readonly int _layers;
+
+    /// <summary>How many layers run (the last tap).</summary>
+    public int LayerCount => _layers;
+    /// <summary>Width of this encoder's conditioning rows: one <see cref="Hidden"/> slice per tap (FLUX.2: <see cref="EmbedWidth"/>).</summary>
+    public int Width => _taps.Length * Hidden;
 
     private readonly Accelerator _acc;
     private readonly Flux2Weights _w;
@@ -43,15 +49,22 @@ public sealed class Flux2TextEncoder : IDisposable
     /// </summary>
     public static bool RoundRopeToBf16 = false;
 
-    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights)
+    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights) : this(accelerator, weights, new[] { 9, 18, 27 }) { }
+
+    /// <summary>
+    /// The same Qwen3 stack reading the hidden states after the given layers (1-based, ascending), side by side: FLUX.2 { 9, 18, 27 }; Z-Image { 35 } (the reference's
+    /// <c>hidden_states[-2]</c> of the 36-layer model, no final norm). The weights must hold the first <c>tapAfterLayer[^1]</c> layers.
+    /// </summary>
+    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights, int[] tapAfterLayer)
     {
-        _acc = accelerator; _w = weights;
+        if (tapAfterLayer.Length == 0 || tapAfterLayer[0] < 1 || tapAfterLayer.Zip(tapAfterLayer.Skip(1)).Any(p => p.Second <= p.First)) throw new ArgumentException("taps: ascending 1-based layer numbers", nameof(tapAfterLayer));
+        _acc = accelerator; _w = weights; _taps = (int[])tapAfterLayer.Clone(); _layers = _taps[^1];
         _k = new DiTKernels(accelerator); _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator);
         long T = SeqLen;
         _h = Alloc<float>(T * Hidden); _hn = Alloc<float>(T * Hidden); _qkv = Alloc<float>(T * QkvCols); _attn = Alloc<float>(T * QCols);
         _proj = Alloc<float>(T * Hidden); _gateUp = Alloc<float>(T * 2 * Inter); _act = Alloc<float>(T * Inter);
         _scores = Alloc<float>((long)QHeads * T * T); _kc = Alloc<float>(T * KvCols); _vc = Alloc<float>(T * KvCols);
-        _dummy = Alloc<float>(1); _out = Alloc<float>(T * EmbedWidth); _ids = Alloc<int>(T);
+        _dummy = Alloc<float>(1); _out = Alloc<float>(T * Width); _ids = Alloc<int>(T);
         _invFreq = _acc.Allocate1D(RopeTable()); _owned.Add(_invFreq);
     }
 
@@ -65,7 +78,7 @@ public sealed class Flux2TextEncoder : IDisposable
 
     private MemoryBuffer1D<T, Stride1D.Dense> Alloc<T>(long n) where T : unmanaged { var b = _acc.Allocate1D<T>(Math.Max(1, n)); _owned.Add(b); return b; }
 
-    /// <summary>The conditioning rows of the last <see cref="Encode"/>, [512, 7680] on the device.</summary>
+    /// <summary>The conditioning rows of the last <see cref="Encode"/>, [512, <see cref="Width"/>] on the device.</summary>
     public FV Output => _out.View;
 
     /// <summary>Intermediate checkpoints for tests: called with the name and the device view after the embedding ("embed") and after every layer ("layer{n}", 1-based) with the live rows.</summary>
@@ -73,7 +86,7 @@ public sealed class Flux2TextEncoder : IDisposable
 
     /// <summary>
     /// Encode one padded prompt: <paramref name="ids"/> is 512 token ids, the first <paramref name="real"/> of them the prompt (the rest padding). Returns the conditioning matrix on the device
-    /// (also <see cref="Output"/>), [512, 7680] row-major.
+    /// (also <see cref="Output"/>), [512, <see cref="Width"/>] row-major.
     /// </summary>
     public FV Encode(int[] ids, int real)
     {
@@ -82,7 +95,7 @@ public sealed class Flux2TextEncoder : IDisposable
         _w.Embed(_ids.View, "embed_tokens.weight", _h.View, SeqLen, Hidden);
         Probe?.Invoke("embed", _h.View, SeqLen, Hidden);
         int tap = 0;
-        for (int l = 0; l < Layers; l++)
+        for (int l = 0; l < _layers; l++)
         {
             string b = $"layers.{l}.";
             _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), SeqLen, Hidden, RmsEps);
@@ -101,9 +114,9 @@ public sealed class Flux2TextEncoder : IDisposable
             _k.Linear(_act.View, _w.Matrix(b + "mlp.down_proj.weight"), null, _proj.View, SeqLen, Inter, Hidden);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, SeqLen * Hidden, Hidden);
             Probe?.Invoke($"layer{l + 1}", _h.View, SeqLen, Hidden);
-            if (tap < TapAfterLayer.Length && l + 1 == TapAfterLayer[tap])
+            if (tap < _taps.Length && l + 1 == _taps[tap])
             {
-                _f.CopyCols(_h.View, _out.View, SeqLen, Hidden, Hidden, EmbedWidth, tap * Hidden);
+                _f.CopyCols(_h.View, _out.View, SeqLen, Hidden, Hidden, Width, tap * Hidden);
                 tap++;
             }
         }

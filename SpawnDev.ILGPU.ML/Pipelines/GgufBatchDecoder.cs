@@ -561,15 +561,7 @@ public sealed class GgufBatchDecoder : IDisposable
             if (!FusedDequantMatMul.Accepts(t.Type)) throw new NotSupportedException($"{name}: {t.Type} is not a type the fused GEMM reads");
             _mats[name] = (Own(await UploadAsync(t, ct).ConfigureAwait(false)), t.Type);
         }
-        foreach (var name in vecs)
-        {
-            var t = Tensor(name);
-            if (t.Type != GGMLType.F32) throw new NotSupportedException($"{name}: {t.Type} (expected F32)");
-            var raw = await ReadAsync(t, ct).ConfigureAwait(false);
-            var f = new float[_model.GetTensorElementCount(t)];
-            Buffer.BlockCopy(raw, 0, f, 0, f.Length * 4);
-            _vecs[name] = Own(_acc.Allocate1D(f));
-        }
+        foreach (var name in vecs) _vecs[name] = Own(_acc.Allocate1D(await VecAsync(name, ct).ConfigureAwait(false)));
         // Q8_0 matrices regrouped in place for the faster GEMVs (GGMLType.Q8_0G; FusedDequantMatMul.RepackQ8_0Grouped). The joined q|k|v and gate|up read the
         // hidden width; every other matrix its own first dimension.
         if (GroupQ8)
@@ -622,15 +614,22 @@ public sealed class GgufBatchDecoder : IDisposable
     // a projection's bias, or zeros when the GGUF has none (qwen3, llama)
     private async Task<float[]> BiasAsync(string name, int length, CancellationToken ct) =>
         _model.Tensors.Any(t => t.Name == name) ? await VecAsync(name, ct).ConfigureAwait(false) : new float[length];
+    // a norm or bias vector as F32: stored F32, or F16 / BF16 (a safetensors model seen through GGUF.SafeTensorsGguf) widened on the host
     private async Task<float[]> VecAsync(string name, CancellationToken ct)
     {
         var t = Tensor(name);
-        if (t.Type != GGMLType.F32) throw new NotSupportedException($"{name}: {t.Type} (expected F32)");
+        if (!IsVectorType(t.Type)) throw new NotSupportedException($"{name}: {t.Type} (vectors are read as F32, F16 or BF16)");
         var raw = await ReadAsync(t, ct).ConfigureAwait(false);
         var f = new float[_model.GetTensorElementCount(t)];
-        Buffer.BlockCopy(raw, 0, f, 0, f.Length * 4);
+        switch (t.Type)
+        {
+            case GGMLType.F32: Buffer.BlockCopy(raw, 0, f, 0, f.Length * 4); break;
+            case GGMLType.F16: for (int i = 0; i < f.Length; i++) f[i] = (float)BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(raw, 2 * i)); break;
+            default: for (int i = 0; i < f.Length; i++) f[i] = BitConverter.Int32BitsToSingle(BitConverter.ToUInt16(raw, 2 * i) << 16); break;
+        }
         return f;
     }
+    private static bool IsVectorType(GGMLType t) => t is GGMLType.F32 or GGMLType.F16 or GGMLType.BF16;
     private bool[] _qkvAll = Array.Empty<bool>();
 
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _idBufs = new();
@@ -1310,7 +1309,7 @@ public sealed class GgufBatchDecoder : IDisposable
             bool block = t.Name.StartsWith("blk.", StringComparison.Ordinal), vec = t.Dimensions.Length == 1 || t.Name.EndsWith(".bias", StringComparison.Ordinal);
             bool head = t.Name is "output.weight" or "token_embd.weight";
             if (!(block || head)) continue;
-            if (vec) { if (t.Type != GGMLType.F32 && t.Name.EndsWith("norm.weight", StringComparison.Ordinal)) { reason = $"{t.Name}: {t.Type} (norms are read as F32)"; return false; } continue; }
+            if (vec) { if (!IsVectorType(t.Type)) { reason = $"{t.Name}: {t.Type} (vectors are read as F32, F16 or BF16)"; return false; } continue; }
             if (!FusedDequantMatMul.Accepts(t.Type)) { reason = $"{t.Name}: {t.Type} is not a type the fused GEMM reads"; return false; }
         }
         reason = "";

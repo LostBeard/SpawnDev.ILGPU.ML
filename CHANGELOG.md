@@ -4,6 +4,25 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **FLUX.1 dev from ComfyUI's files** (`Flux1Weights`, `Flux1Transformer`, Docs/flux1.md; requested by SpawnGen): the 12B transformer from the all-in-one
+  `flux1-dev-fp8.safetensors` (8-bit floats, no scales), its blocks streamed from the file past a residency budget (`StreamedModelWeights`, generic: 8-bit
+  matrices stay 8-bit on the device and are decoded just before their GEMM). MEASURED against ComfyUI's own model calls (SpawnGen's dumps, fp32 CPU): 4.71e-3 and
+  5.34e-3 relRMS on the denoised estimate (ComfyUI's call: timestep = sigma, output x - sigma * v); guidance 1 instead of 3.5 misses by 0.116 (control). The T5-XXL
+  and CLIP-L inside the same file load through `UmT5Encoder` (prefix + 8-bit embedding rows) and `SdTextEncoder.PooledAsync`: T5 6.13e-3 on the prompt rows, CLIP-L
+  pooled 3.33e-4.
+- **Fix: the T5 / umT5 tokenizer gave an empty prompt a stray space piece** (`UnigramTokenizer.Encode`): "" encoded as [3, 1] where the reference tokenizer's
+  whitespace split gives the end token alone [1]; trailing spaces also added a piece. ComfyUI's empty-prompt T5 conditioning was 1.46 relRMS off on its real row,
+  now 1.26e-3. Prompts that were cleaned first (Wan, LTX: `CleanWhitespace` strips) are unchanged. Gate `Flux1_T5Tokenizer_EmptyAndEdgeSpaces`.
+- **Z-Image Turbo from ComfyUI's files** (`ZImageTransformer`, ported from diffusers' `ZImageTransformer2DModel`, Apache-2.0): `z_image_turbo_bf16.safetensors`,
+  blocks streamed past the budget. MEASURED against ComfyUI's model calls: 5.62e-3 and 3.56e-3 with model time 1 - sigma and output x + sigma * out; the other three
+  conventions miss by 1.46 to 2.85 and the gate asserts they lose. Its text encoder is `qwen_3_4b.safetensors` through `Flux2TextEncoder`, now with a chosen layer
+  count and taps (Z-Image reads the state after layer 35; FLUX.2 keeps 9 / 18 / 27) and `Qwen2Tokenizer.ChatPromptNoThinking`: 3.84e-3 / 3.86e-3 against ComfyUI's
+  conditioning, the state after layer 34 misses by 0.19.
+- **ComfyUI's Generate Text on its own text-encoder files** (`SafeTensorsGguf.FromHfQwen3Async`): a Hugging Face Qwen3 safetensors file seen as a GGUF model over
+  the same bytes, so the GGUF batch decoder runs `qwen_3_4b.safetensors` with no conversion or copy (the batch decoder now also reads F16 / BF16 norm vectors).
+  MEASURED against SpawnGen's black-box token ids of ComfyUI's greedy run: prompt ids identical, generated tokens identical (23 of 23 then the end of the turn
+  with thinking off; 159 of 159 with thinking on). Gate `TextGenerate_ComfyQwen3_MatchesComfyUiTokens`.
+
 ## 5.8.17 - 2026-11-14 (nuget.org) - ComfyUI's Wan 2.2 / FLUX.2 / FLUX.1 files load as they are; the VAE decodes right on AMD OpenCL
 
 - **Fix: CUDA graph replays could read an input the caller had not finished writing.** `CudaGraphCapture.ReplayAsync` copied the new inputs on its own stream while

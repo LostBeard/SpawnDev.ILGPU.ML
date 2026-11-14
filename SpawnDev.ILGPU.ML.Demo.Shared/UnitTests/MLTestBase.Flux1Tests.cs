@@ -80,6 +80,142 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The FLUX.1 dev transformer from ComfyUI's all-in-one <c>flux1-dev-fp8.safetensors</c> (8-bit floats, no scales) against ComfyUI's own two model calls of a 2-step 256 px run
+    /// (SpawnGen's dumps, F1_DIR\comfy\comfyui-dumps\dev: ComfyUI ran the transformer in float32 on the CPU): the same T5 conditioning [256, 4096], pooled CLIP-L [768], guidance
+    /// 3.5, model-space input [16, 32, 32] and sigma give the denoised estimate x - sigma * v. Blocks beyond F1_RESIDENT_GB (default 7) are streamed from the file every call.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux1_Transformer_MatchesComfyUiCalls() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        var dir = Environment.GetEnvironmentVariable("F1_DIR") ?? "E:/spawndev-flux1";
+        string comfy = Path.Combine(dir, "comfy"), d = Path.Combine(comfy, "comfyui-dumps", "dev"), file = "flux1-dev-fp8.safetensors";
+        if (!File.Exists(Path.Combine(comfy, file)) || !Directory.Exists(d)) throw new UnsupportedTestException($"needs {comfy}\\{file} (Comfy-Org/flux1-dev) and SpawnGen's dumps in {d}");
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("F1_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 7.0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var w = await Flux1.Flux1Weights.OpenAsync(accelerator, new LocalFolderModelSource(comfy), "", file, (long)(residentGb * 1e9));
+        double loadS = sw.Elapsed.TotalSeconds;
+        const int T = 256, rows = 16, cols = 16;
+        using var tr = new Flux1.Flux1Transformer(accelerator, w, T, rows * cols);
+        tr.SetPositions(rows, cols);
+        var k = new Flux1.Flux1Kernels(accelerator);
+        using var txt = accelerator.Allocate1D(F2_Raw(Path.Combine(d, "flux1_cond_0_cond_f32_1x256x4096.raw"), 256L * 4096));
+        using var pooled = accelerator.Allocate1D(F2_Raw(Path.Combine(d, "flux1_call_0_c_y_f32_1x768.raw"), 768));
+        using var x = accelerator.Allocate1D<float>(16L * 32 * 32); using var tokens = accelerator.Allocate1D<float>(256L * 64); using var den = accelerator.Allocate1D<float>(16L * 32 * 32);
+        var report = new List<string> { $"weights: {w.ResidentBlocks} of 57 blocks resident, {w.ResidentBytes / 1e9:F2} GB on the device, {w.StreamedBytesPerForward / 1e9:F2} GB streamed per call; opened in {loadS:F1} s" };
+        double worst = 0, control = 0;
+        for (int c = 0; c < 2; c++)
+        {
+            float sigma = F2_Raw(Path.Combine(d, $"flux1_call_{c}_timestep_f32_1.raw"), 1)[0];
+            x.View.CopyFromCPU(F2_Raw(Path.Combine(d, $"flux1_call_{c}_input_f32_1x16x32x32.raw"), 16L * 32 * 32));
+            k.Patchify(x.View, tokens.View, rows, cols);
+            sw.Restart();
+            await tr.ForwardAsync(tokens.View, txt.View, pooled.View, sigma, 3.5f);
+            k.Denoised(x.View, tr.Output, den.View, sigma, rows, cols);
+            var got = await den.View.CopyToHostAsync();
+            double rel = F2_RelRms(got, F2_Raw(Path.Combine(d, $"flux1_call_{c}_output_f32_1x16x32x32.raw"), 16L * 32 * 32));
+            worst = Math.Max(worst, rel);
+            report.Add($"call {c} (sigma {sigma:G6}): denoised vs ComfyUI {rel:E2}, {sw.Elapsed.TotalSeconds:F1} s");
+            if (c == 1)
+            {
+                // control: the same call with guidance 1 instead of ComfyUI's 3.5 must not match (the guidance embedder is read)
+                await tr.ForwardAsync(tokens.View, txt.View, pooled.View, sigma, 1f);
+                k.Denoised(x.View, tr.Output, den.View, sigma, rows, cols);
+                control = F2_RelRms(await den.View.CopyToHostAsync(), F2_Raw(Path.Combine(d, $"flux1_call_{c}_output_f32_1x16x32x32.raw"), 16L * 32 * 32));
+                report.Add($"control, call {c} at guidance 1: {control:E2}");
+            }
+        }
+        foreach (var line in report) Console.WriteLine("[Flux1] transformer: " + line);
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): 4.71e-3 and 5.34e-3 (ComfyUI ran fp32 activations on the same 8-bit weights, exact in bf16; we run bf16 GEMMs)
+        Ur_Expect(worst < 0.01, string.Join("; ", report));
+        Ur_Expect(control > 4 * worst, "the guidance control must not match: " + string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// The T5-XXL inside ComfyUI's all-in-one <c>flux1-dev-fp8.safetensors</c> (under <c>text_encoders.t5xxl.transformer.</c>, plain 8-bit floats, the embedding table too) through
+    /// <see cref="Wan.UmT5Encoder"/> against ComfyUI's CLIPTextEncode conditioning (SpawnGen's dumps): [256, 4096], the prompt's tokens and the end token padded with the pad token (0)
+    /// to 256 rows. The real-token rows are reported apart from the padding rows.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux1_T5FromCheckpoint_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        var dir = Environment.GetEnvironmentVariable("F1_DIR") ?? "E:/spawndev-flux1";
+        string comfy = Path.Combine(dir, "comfy"), d = Path.Combine(comfy, "comfyui-dumps", "dev"), file = "flux1-dev-fp8.safetensors";
+        var tokPath = Environment.GetEnvironmentVariable("F1_T5_TOKENIZER") ?? "D:/Projects/ltx/google/t5-v1_1-xxl/tokenizer.json";
+        if (!File.Exists(Path.Combine(comfy, file)) || !Directory.Exists(d) || !File.Exists(tokPath)) throw new UnsupportedTestException($"needs {comfy}\\{file}, the dumps in {d} and the T5 tokenizer {tokPath}");
+        using var fs = File.OpenRead(tokPath);
+        var tok = Preprocessing.UnigramTokenizer.FromTokenizerJson(fs);
+        using var t5 = await Wan.UmT5Encoder.CreateAsync(accelerator, new LocalFolderModelSource(comfy), "", file);
+        var report = new List<string>();
+        double worst = 0, worstReal = 0;
+        foreach (var (prompt, dump) in new[] { ("a red apple on a wooden table", "flux1_cond_0_cond_f32_1x256x4096.raw"), ("", "flux1_cond_empty_0_cond_f32_1x256x4096.raw") })
+        {
+            var real = tok.Encode(Preprocessing.UnigramTokenizer.CleanWhitespace(prompt));
+            var ids = new int[256]; Array.Copy(real, ids, real.Length);                 // the pad token is 0
+            var ctx = await t5.EncodeAsync(ids);
+            var want = F2_Raw(Path.Combine(d, dump), 256L * 4096);
+            double all = F2_RelRms(ctx, want), realRows = F2_RelRms(ctx, want, real.Length * 4096), padRows = F2_RelRms(ctx, want, (256 - real.Length) * 4096, real.Length * 4096);
+            worst = Math.Max(worst, all); worstReal = Math.Max(worstReal, realRows);
+            report.Add($"'{prompt}' ({real.Length} tokens): all rows {all:E2}, real tokens {realRows:E2}, padding rows {padRows:E2}");
+        }
+        foreach (var line in report) Console.WriteLine("[Flux1] T5 from the checkpoint vs ComfyUI: " + line);
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): prompt real tokens 6.13e-3, all rows 1.28e-2; empty prompt (the end token alone) 1.26e-3, all rows 1.99e-2. The empty prompt
+        // read as a space piece + end token (the tokenizer before its whitespace fix) was 1.46 on the real rows: that is this gate's red-check.
+        Ur_Expect(worstReal < 0.015 && worst < 0.04, string.Join("; ", report));
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// The T5 tokenizer's whitespace handling against the HF tokenizer.json pipeline (WhitespaceSplit, then Metaspace): an empty or all-space prompt has no pieces, only the end token
+    /// (ComfyUI's empty-prompt conditioning is one <c>&lt;/s&gt;</c> row then padding), and leading / trailing spaces add nothing. Host only: no model weights.
+    /// </summary>
+    [TestMethod]
+    public async Task Flux1_T5Tokenizer_EmptyAndEdgeSpaces() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU)) throw new UnsupportedTestException("reads the tokenizer from disk: desktop");
+        var tokPath = Environment.GetEnvironmentVariable("F1_T5_TOKENIZER") ?? "D:/Projects/ltx/google/t5-v1_1-xxl/tokenizer.json";
+        if (!File.Exists(tokPath)) throw new UnsupportedTestException($"needs the T5 tokenizer {tokPath}");
+        using var fs = File.OpenRead(tokPath);
+        var tok = Preprocessing.UnigramTokenizer.FromTokenizerJson(fs);
+        string Ids(string s) => "[" + string.Join(",", tok.Encode(s)) + "]";
+        var report = $"'' {Ids("")}, '   ' {Ids("   ")}, 'apple' {Ids("apple")}, ' apple  ' {Ids(" apple  ")}";
+        Ur_Expect(Ids("") == "[1]" && Ids("   ") == "[1]", "an empty prompt is the end token alone: " + report);
+        Ur_Expect(Ids(" apple  ") == Ids("apple"), "edge spaces add no pieces: " + report);
+        Console.WriteLine("[Flux1] T5 tokenizer: " + report);
+        await Task.CompletedTask;
+        return report;
+    });
+
+    /// <summary>
+    /// The CLIP-L inside ComfyUI's <c>flux1-dev-fp8.safetensors</c> (under <c>text_encoders.clip_l.transformer.</c>, fp16) loaded by <see cref="StableDiffusion.SdTextEncoder"/>, and its pooled
+    /// vector against the <c>y</c> ComfyUI handed the FLUX.1 model (SpawnGen's dump of the model call): which reading ComfyUI uses (the final-norm end-token row, with or without the
+    /// text projection) is measured here, not assumed.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Flux1_ClipLFromCheckpoint_PooledMatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        var dir = Environment.GetEnvironmentVariable("F1_DIR") ?? "E:/spawndev-flux1";
+        string comfy = Path.Combine(dir, "comfy"), d = Path.Combine(comfy, "comfyui-dumps", "dev"), file = "flux1-dev-fp8.safetensors";
+        var tokPath = Path.Combine(SdDir, "tokenizer", "clip-vit-large-patch14", "tokenizer.json");
+        if (!File.Exists(Path.Combine(comfy, file)) || !Directory.Exists(d) || !File.Exists(tokPath)) throw new UnsupportedTestException($"needs {comfy}\\{file}, the dumps in {d} and the CLIP tokenizer {tokPath}");
+        var tok = Preprocessing.BPETokenizer.LoadFromTokenizerJson(await File.ReadAllTextAsync(tokPath));
+        using var clip = await StableDiffusion.SdTextEncoder.LoadAsync(accelerator, new LocalFolderModelSource(comfy), "", file);
+        var ids = tok.EncodeCLIP("a red apple on a wooden table");
+        var want = F2_Raw(Path.Combine(d, "flux1_call_0_c_y_f32_1x768.raw"), 768);
+        var plain = await clip.PooledAsync(ids, project: false);
+        var projected = await clip.PooledAsync(ids, project: true);
+        double ePlain = F2_RelRms(plain, want), eProj = F2_RelRms(projected, want);
+        var report = $"pooled CLIP-L vs ComfyUI's y: final-norm end-token row {ePlain:E2}, through text_projection {eProj:E2}";
+        Console.WriteLine("[Flux1] " + report);
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): 3.33e-4, the same for both readings (the final-norm end-token row, with or without text_projection)
+        Ur_Expect(Math.Min(ePlain, eProj) < 1e-3, report);
+        return report;
+    });
+
+    /// <summary>
     /// ComfyUI's own VAE Encode / Decode with ae.safetensors, measured by SpawnGen on the ComfyUI reference (float32, CPU; F1_DIR\comfy\comfyui-dumps, Lore's note there): LATENT is
     /// [16, H/8, W/8] channel-major, the RAW encoder mean (FLUX.1's scale 0.3611 / shift 0.1159 are applied on the way into the model, not in LATENT); a picture that is not a
     /// multiple of 8 is cut to its centred multiple. Checked: encode of A (256 x 192), B (200 x 120) and C (205 x 125 -> the centred 200 x 120), decode of ComfyUI's latent of A

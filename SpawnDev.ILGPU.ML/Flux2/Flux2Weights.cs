@@ -53,16 +53,20 @@ public sealed class Flux2Weights : IDisposable
     }
 
     /// <summary>Stream one stage's safetensors file from a model source (browser OPFS / hub, or HttpClient + a file store on desktop) onto the device.</summary>
-    public static async Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
+    public static Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
+        => LoadAsync(accelerator, source, repo, file, Flux2TextEncoder.Layers, cancellationToken);
+
+    /// <summary>The same, reading the first <paramref name="textEncoderLayers"/> layers of a Hugging Face Qwen3 text encoder (FLUX.2: 27; Z-Image: 35).</summary>
+    public static async Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, int textEncoderLayers, CancellationToken cancellationToken = default)
     {
         await using var stream = await source.OpenAsync(repo, file, cancellationToken);
         using var empty = JsonDocument.Parse("{}");
-        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", Flux2ComfyFormat.TextEncoderFilter, cancellationToken);
+        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", n => Flux2ComfyFormat.TextEncoderFilter(n, textEncoderLayers), cancellationToken);
         try
         {
             // ComfyUI's template files, rewritten into this library's layout as they land: a transformer in Black Forest Labs' layout (flux-2-klein, bf16 or 8-bit floats),
-            // a text encoder in Hugging Face Qwen3 names (qwen_3_4b; only its first 27 layers were read)
-            if (Flux2ComfyFormat.IsHfQwen3(w)) await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w);
+            // a text encoder in Hugging Face Qwen3 names (qwen_3_4b; only its first textEncoderLayers layers were read)
+            if (Flux2ComfyFormat.IsHfQwen3(w)) await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w, textEncoderLayers);
             var scales = Flux2ComfyFormat.IsBflTransformer(w) ? await Flux2ComfyFormat.AdaptTransformerAsync(accelerator, w) : null;
             return new Flux2Weights(accelerator, w, true, scales);
         }
