@@ -21,6 +21,46 @@ public sealed class Flux2VaeNorm
         Std = variance.Select(v => MathF.Sqrt(v + eps)).ToArray();
     }
 
+    /// <summary>The batch-norm epsilon of FLUX.2's VAE (diffusers <c>batch_norm_eps</c>); the weight files do not carry it.</summary>
+    public const float BatchNormEps = 1e-4f;
+
+    /// <summary>
+    /// Read the statistics from a FLUX.2 VAE weight file (<c>bn.running_mean</c>, <c>bn.running_var</c>, 128 each): ComfyUI's <c>flux2-vae.safetensors</c> (either naming) or the
+    /// diffusers <c>vae/diffusion_pytorch_model.safetensors</c>. Only the header and the two small tensors are read (by offset), with <see cref="BatchNormEps"/>.
+    /// </summary>
+    public static async Task<Flux2VaeNorm> FromSafeTensorsAsync(IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
+    {
+        await using var stream = await source.OpenAsync(repo, file, cancellationToken);
+        if (!stream.CanSeek) throw new NotSupportedException($"'{file}': the batch-norm statistics are read by offset; the model source must give a seekable stream");
+        var lenBytes = new byte[8];
+        await stream.ReadExactlyAsync(lenBytes, cancellationToken);
+        long headerSize = BitConverter.ToInt64(lenBytes);
+        if (headerSize <= 0 || headerSize > 100_000_000) throw new InvalidDataException($"'{file}': invalid SafeTensors header size {headerSize}");
+        var headerBytes = new byte[headerSize];
+        await stream.ReadExactlyAsync(headerBytes, cancellationToken);
+        long dataStart = 8 + headerSize;
+        var (tensors, _) = SafeTensors.SafeTensorsFileReader.ParseHeader(file, headerBytes, dataStart, stream.Length - dataStart);
+        async Task<float[]> Read(string name)
+        {
+            var t = tensors.FirstOrDefault(x => x.Name == name) ?? throw new InvalidDataException($"'{file}' has no {name}: not a FLUX.2 VAE file (its batch-norm statistics are missing)");
+            if (t.Shape.Length != 1 || t.Shape[0] != 128) throw new InvalidDataException($"'{file}': {name} is [{string.Join(", ", t.Shape)}]; expected [128]");
+            var raw = new byte[t.DataLength];
+            stream.Seek(t.DataOffset, SeekOrigin.Begin);
+            await stream.ReadExactlyAsync(raw, cancellationToken);
+            var v = new float[128];
+            for (int i = 0; i < 128; i++)
+                v[i] = t.DType switch
+                {
+                    "F32" => BitConverter.ToSingle(raw, 4 * i),
+                    "F16" => (float)BitConverter.ToHalf(raw, 2 * i),
+                    "BF16" => BitConverter.Int32BitsToSingle((raw[2 * i] | (raw[2 * i + 1] << 8)) << 16),
+                    _ => throw new NotSupportedException($"'{file}': {name} is {t.DType}"),
+                };
+            return v;
+        }
+        return new Flux2VaeNorm(await Read("bn.running_mean"), await Read("bn.running_var"), BatchNormEps);
+    }
+
     public static Flux2VaeNorm FromJson(string json)
     {
         using var doc = JsonDocument.Parse(json);

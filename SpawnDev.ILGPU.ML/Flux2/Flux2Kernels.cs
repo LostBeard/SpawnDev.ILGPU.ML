@@ -253,6 +253,54 @@ public sealed class Flux2Kernels
         _toVaeInput(32 * rows * 2 * columns * 2, packed, mean, std, o, rows * 2, columns * 2, columns);
     }
 
+    // ---- ComfyUI's FLUX.2 LATENT layout, MEASURED against ComfyUI's own VAE Encode (and the diffusers reference's ref_z): [128, rows, columns] channel-major, the VAE's
+    // ---- latent mean patchified 2 x 2 (channel c * 4 + py * 2 + px) AND batch-normalised with the VAE file's statistics. It is the transformer's tokens, transposed.
+
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _vaeLatent;     // one kernel both ways (dir)
+    private static void VaeLatentImpl(Index1D idx, FV raw, FV mean, FV std, FV latent, int rows, int cols, int dir)
+    {
+        // idx over the [128, rows, cols] grid; dir 0: raw [32, 2 rows, 2 cols] -> LATENT (patchify, normalise), 1: LATENT -> raw (un-normalise, unpatchify)
+        int x = idx % cols, rest = idx / cols, y = rest % rows, ch = rest / rows;
+        int c = ch / 4, py = (ch / 2) % 2, px = ch % 2;
+        int r = (c * (2 * rows) + 2 * y + py) * (2 * cols) + 2 * x + px;
+        if (dir == 0) latent[idx] = (raw[r] - mean[ch]) / std[ch]; else raw[r] = latent[idx] * std[ch] + mean[ch];
+    }
+    /// <summary>
+    /// The VAE encoder's latent mean [32, lh, lw] (lh, lw even) to ComfyUI's FLUX.2 LATENT [128, lh / 2, lw / 2]: patchify 2 x 2 and batch-normalise (<see cref="Flux2VaeNorm"/> mean / std
+    /// on the device). What ComfyUI's VAE Encode returns.
+    /// </summary>
+    public void VaeToLatent(FV raw, FV mean, FV std, FV latent, int lh, int lw)
+    {
+        _vaeLatent ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(VaeLatentImpl);
+        _vaeLatent(128 * (lh / 2) * (lw / 2), raw, mean, std, latent, lh / 2, lw / 2, 0);
+    }
+    /// <summary>ComfyUI's FLUX.2 LATENT [128, rows, columns] to the VAE decoder's input [32, 2 * rows, 2 * columns] (the inverse of <see cref="VaeToLatent"/>): what ComfyUI's VAE Decode feeds the decoder.</summary>
+    public void LatentToVae(FV latent, FV mean, FV std, FV raw, int rows, int columns)
+    {
+        _vaeLatent ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(VaeLatentImpl);
+        _vaeLatent(128 * rows * columns, raw, mean, std, latent, rows, columns, 1);
+    }
+
+    private Action<Index1D, FV, FV, int, int>? _latentTokens;                 // one kernel both ways (dir)
+    private static void LatentTokensImpl(Index1D idx, FV latent, FV tokens, int cells, int dir)
+    {
+        // idx over the tokens [cells, 128]; a transpose: both hold the same batch-normalised values
+        int cell = idx / 128, ch = idx % 128, l = ch * cells + cell;
+        if (dir == 0) tokens[idx] = latent[l]; else latent[l] = tokens[idx];
+    }
+    /// <summary>ComfyUI's FLUX.2 LATENT [128, rows, columns] to the transformer's tokens [rows * columns, 128] (a transpose).</summary>
+    public void LatentToTokens(FV latent, FV tokens, int rows, int columns)
+    {
+        _latentTokens ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(LatentTokensImpl);
+        _latentTokens(rows * columns * 128, latent, tokens, rows * columns, 0);
+    }
+    /// <summary>Transformer tokens [rows * columns, 128] to ComfyUI's FLUX.2 LATENT [128, rows, columns] (a transpose; the inverse of <see cref="LatentToTokens"/>).</summary>
+    public void TokensToLatent(FV tokens, FV latent, int rows, int columns)
+    {
+        _latentTokens ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(LatentTokensImpl);
+        _latentTokens(rows * columns * 128, latent, tokens, rows * columns, 1);
+    }
+
     private Action<Index1D, FV, FV, FV, FV, int, int, int>? _refTokens;
     private static void RefTokensImpl(Index1D idx, FV lat, FV mean, FV std, FV tokens, int lh, int lw, int cols)
     {

@@ -231,6 +231,19 @@ public sealed class GpuWeights : IDisposable
     }
     /// <summary>Drop a tensor from the set; returns its buffer for the caller to dispose after the device is idle.</summary>
     internal IDisposable? Remove(string name) { var old = Detach(name); _shapes.Remove(name); return old; }
+    /// <summary>Give tensor <paramref name="from"/> the name <paramref name="to"/> (the buffer moves, nothing is copied; <paramref name="to"/> must not exist).</summary>
+    internal void Rename(string from, string to)
+    {
+        if (from == to) return;
+        if (_shapes.ContainsKey(to)) throw new InvalidOperationException($"'{to}' already exists (renaming '{from}')");
+        if (!_shapes.Remove(from, out var shape)) throw new KeyNotFoundException(from);
+        _shapes[to] = shape;
+        if (_bf16.Remove(from, out var a)) _bf16[to] = a;
+        else if (_f16.Remove(from, out var b)) _f16[to] = b;
+        else if (_f32.Remove(from, out var c)) _f32[to] = c;
+        else if (_u32.Remove(from, out var d)) _u32[to] = d;
+        else if (_f8.Remove(from, out var e)) _f8[to] = e;
+    }
     /// <summary>A new shape for the same elements in the same order (a reshape: no data moves).</summary>
     internal void SetShape(string name, int[] shape) { if (!_shapes.ContainsKey(name)) throw new KeyNotFoundException(name); _shapes[name] = shape; }
     private IDisposable? Detach(string name)

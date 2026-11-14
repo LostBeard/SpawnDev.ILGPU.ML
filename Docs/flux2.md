@@ -71,3 +71,36 @@ FLUX.2 klein edits and composes pictures: up to 10 REFERENCE images go in next t
 `AssetGenerator.EditPictureAsync(picture, "give the knight a tall red plume on the helmet")` is the one-call form; the console's `--edit-instruction` chains it into the 3D region edits (`--edit-region`, `--edit-shape`): FLUX.2 edits the 2D picture, TRELLIS.2 applies it to the 3D model.
 
 Gate against diffusers (`golden_klein_edit.py`, `Flux2_ReferenceEncoder_MatchesTheReference`, `Flux2_ReferenceEdit_MatchesTheReference`, CUDA): preprocessed pixels equal the reference's, encoder latents relRMS 2.3e-2 (the reference encodes in bf16, the export is fp32), the whole edit **44.4 dB PSNR against the reference's edited picture** (mean difference 0.42 grey levels, 46 s with the bf16 weights). On the knight: "Add a tall red feather plume on top of the knight's helmet. Keep everything else exactly the same." returns the same knight with a red plume, about 33 s through the 4-bit weights in the console.
+
+## ComfyUI's files (2026-11-13)
+
+The files ComfyUI's FLUX.2 klein templates load (its split Load Diffusion Model / Load CLIP / Load VAE graph) load as they are, rewritten into this library's layout as they land:
+
+| ComfyUI file | load with | measured against our export |
+|---|---|---|
+| `flux2-vae.safetensors` (Comfy-Org/flux2-klein: Black Forest Labs' names; Comfy-Org/flux2-dev: diffusers names) | `SdVae.LoadAsync` (the native LDM VAE: encoder + decoder) and `Flux2VaeNorm.FromSafeTensorsAsync` (its batch-norm statistics) | the two namings: the same fp32 weights, bit-identical; they are the fp32 values our bf16 export was rounded from |
+| `flux-2-klein-4b.safetensors` (bf16) | `Flux2Weights.LoadAsync` | 149 tensors bit-identical (the final modulation's two halves exchanged: BFL's shift / scale order) |
+| `flux-2-klein-4b-fp8.safetensors` (black-forest-labs/FLUX.2-klein-4b-fp8: 8-bit floats, one scale per matrix) | `Flux2Weights.LoadAsync` | 80 matrices within 2.7e-2 relative RMS (the format's rounding), held as 8 bits on the device (4.24 GB) and decoded just before each GEMM |
+| `qwen_3_4b.safetensors` (Hugging Face Qwen3-4B names, 36 layers) | `Flux2Weights.LoadAsync` | the 27 layers the pipeline uses: 217 tensors bit-identical (q / k / v and gate / up fused at load); the other 9 layers are never read (6.23 GB on the device) |
+
+**ComfyUI's LATENT for FLUX.2** is `[128, H/16, W/16]` channel-major: the VAE encoder's mean, patchified 2 x 2 (channel `c * 4 + dy * 2 + dx`) and batch-normalised with the file's
+statistics, which is the transformer's tokens transposed. MEASURED against ComfyUI's own VAE Encode / Decode (SpawnGen's dumps, float32, CPU): encode 5.8e-4 and 9.3e-4 relative RMS
+(a picture not a multiple of 16 is cut to its centred multiple, as ComfyUI does), decode 1.1e-4; and against the diffusers reference's own latents 2.1e-2 (the reference runs bf16).
+The device kernels:
+
+```csharp
+var vae  = await SdVae.LoadAsync(accelerator, source, repo, "flux2-vae.safetensors");
+var norm = await Flux2VaeNorm.FromSafeTensorsAsync(source, repo, "flux2-vae.safetensors");      // eps Flux2VaeNorm.BatchNormEps (1e-4) is not in the file
+var k    = new Flux2Kernels(accelerator);
+await vae.EncodeAsync(pixels, H, W, mean32);                    // [3, H, W] in [-1, 1] -> [32, H/8, W/8]
+k.VaeToLatent(mean32, normMean, normStd, latent, H / 8, W / 8);  // -> LATENT [128, H/16, W/16]
+k.LatentToTokens(latent, tokens, H / 16, W / 16);                // -> transformer tokens [cells, 128] (a transpose); TokensToLatent is the inverse
+k.LatentToVae(latent, normMean, normStd, z32, H / 16, W / 16);   // LATENT -> the decoder's input
+await vae.DecodeAsync(z32, H / 8, W / 8, picture);               // -> [3, H, W] in [-1, 1]
+```
+
+The 8-bit float transformer costs picture quality: the whole pipeline lands 24.4 dB from the reference picture, against 29.3 dB for bf16 and 29.2 dB for this library's own 8-bit
+block export (0.5% per-matrix error against 2.7%). On a desktop GPU prefer the bf16 file or the hosted 8-bit export. Gates (CUDA, HeavyModel; files in F2_DIR\comfy):
+`Flux2_ComfyVae_BothNamingsLoad`, `Flux2_ComfyVae_MatchesTheReference`, `Flux2_ComfyVae_MatchesComfyUiLatents`, `Flux2_ComfyTransformer_Bf16_AsOurExport`,
+`Flux2_ComfyTransformer_Fp8_NearOurExport`, `Flux2_ComfyTransformer_Fp8_Pipeline`, `Flux2_ComfyTextEncoder_AsOurExport`. Red-checked: without the quant-convolution names,
+with dy and dx exchanged, without the halves exchange, and with k | q | v fused, each fails its gate.

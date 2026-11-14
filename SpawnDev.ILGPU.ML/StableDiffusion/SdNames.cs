@@ -224,6 +224,9 @@ internal static class SdNames
     {
         if (n.StartsWith("encoder.conv_norm_out.", StringComparison.Ordinal)) return "encoder.norm_out." + n["encoder.conv_norm_out.".Length..];
         if (n.StartsWith("decoder.conv_norm_out.", StringComparison.Ordinal)) return "decoder.norm_out." + n["decoder.conv_norm_out.".Length..];
+        // FLUX.2's VAE as Black Forest Labs ships it (ComfyUI's flux2-vae.safetensors from the klein repos) keeps the quant convolutions inside encoder / decoder
+        if (n.StartsWith("encoder.quant_conv.", StringComparison.Ordinal)) return n["encoder.".Length..];
+        if (n.StartsWith("decoder.post_quant_conv.", StringComparison.Ordinal)) return n["decoder.".Length..];
         var g = VEncDown.Match(n);
         if (g.Success)
         {

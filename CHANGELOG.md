@@ -4,6 +4,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **FLUX.2 klein: ComfyUI's files load as they are** (the split Load Diffusion Model / Load CLIP / Load VAE graph of ComfyUI's FLUX.2 templates; requested by SpawnGen;
+  read from the files' headers and measured outputs only). Docs/flux2.md "ComfyUI's files".
+  - **VAE** `flux2-vae.safetensors`, either naming (Comfy-Org/flux2-klein: Black Forest Labs' names, Comfy-Org/flux2-dev: diffusers names; the same fp32 weights) on the native
+    LDM VAE: `SdVae.LoadAsync` gains BFL's `encoder.quant_conv` / `decoder.post_quant_conv` names; `Flux2VaeNorm.FromSafeTensorsAsync` reads the batch-norm statistics from
+    the file (`Flux2VaeNorm.BatchNormEps` = 1e-4, which the file does not carry). Native decode vs our ONNX decoder on the same weights 4.5e-6.
+  - **ComfyUI's LATENT layout** `[128, H/16, W/16]` (patchified 2 x 2 AND batch-normalised: the tokens transposed), MEASURED against ComfyUI's own VAE Encode / Decode:
+    new `Flux2Kernels.VaeToLatent` / `LatentToVae` / `LatentToTokens` / `TokensToLatent`; encode 5.8e-4, decode 1.1e-4 from ComfyUI.
+  - **Transformer** `flux-2-klein-4b.safetensors` (bf16; 149 tensors bit-identical to our export) and black-forest-labs' `flux-2-klein-4b-fp8.safetensors` (8-bit floats,
+    one scale per matrix) through `Flux2Weights.LoadAsync` (`Flux2ComfyFormat`: names, the final modulation's halves exchanged). The 8-bit matrices stay 8-bit on the
+    device (4.24 GB) and are decoded into the dequantisation scratch just before each GEMM. Whole pipeline on them: 24.4 dB from the reference picture (bf16 29.3, our 8-bit
+    blocks 29.2: the format errs 2.7% per matrix).
+  - **Text encoder** `qwen_3_4b.safetensors` (Hugging Face Qwen3-4B names): only the 27 layers the pipeline uses are read, q / k / v and gate / up fused at load; 217 tensors
+    bit-identical to our export, 6.23 GB on the device. `GpuWeights` gains an internal zero-copy rename.
+  - Gates (CUDA, HeavyModel): `Flux2_ComfyVae_*` (3), `Flux2_ComfyTransformer_*` (3), `Flux2_ComfyTextEncoder_AsOurExport`; red-checked (quant-conv names, dy / dx,
+    the halves exchange, the q / k / v order each fail their gate).
+
 - **On SpawnDev.ILGPU 5.4.31** (5.4.30 and 5.4.31: two silent wrong-result fixes. Unsigned division by a constant power of two was emitted as a signed
   shift on every compiled backend; ML's IL has no such division (one `div.un` in the whole assembly, by a variable). On OpenCL, signed `+ - * <<` were
   undefined on overflow in the generated C; ML has one kernel that overflows by design: the int8 Q6_K unpack `Q6S8` (`(v | 0x80808080) - 0x20202020`,
