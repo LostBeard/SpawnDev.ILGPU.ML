@@ -104,3 +104,9 @@ block export (0.5% per-matrix error against 2.7%). On a desktop GPU prefer the b
 `Flux2_ComfyVae_BothNamingsLoad`, `Flux2_ComfyVae_MatchesTheReference`, `Flux2_ComfyVae_MatchesComfyUiLatents`, `Flux2_ComfyTransformer_Bf16_AsOurExport`,
 `Flux2_ComfyTransformer_Fp8_NearOurExport`, `Flux2_ComfyTransformer_Fp8_Pipeline`, `Flux2_ComfyTextEncoder_AsOurExport`. Red-checked: without the quant-convolution names,
 with dy and dx exchanged, without the halves exchange, and with k | q | v fused, each fails its gate.
+
+**ComfyUI's call contract for FLUX.2 klein** (MEASURED by SpawnGen against ComfyUI's own graphs, 2026-11-13), for a caller driving these blocks from a ComfyUI-style graph:
+the transformer gets the LATENT as it is (it already holds the batch-normalised tokens, transposed: `Flux2Kernels.LatentToTokens`), all 512 text rows with no mask,
+and timestep = sigma; BasicScheduler's shift for klein is a constant mu = 2.02; reference pictures (editing) come in as `ref_latents` (VAE Encode's LATENT) and sit at
+t = 10 + 10 i, as `Flux2Pipeline` places them (at t = 0 the edit falls to 14 dB). End to end on these blocks, on an AMD RX 590 over OpenCL with the 8-bit float transformer:
+the distilled text-to-image template 36.9 dB from ComfyUI's bf16 picture (text encoder 1.3e-6, VAE 1.1e-4 from ComfyUI), the distilled edit template 44.4 dB.

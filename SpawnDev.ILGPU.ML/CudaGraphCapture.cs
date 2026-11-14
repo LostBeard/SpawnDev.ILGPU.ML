@@ -467,6 +467,10 @@ public sealed class CudaGraphCapture : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> ReplayAsync(Dictionary<string, Tensor> newInputs)
     {
+        // The new inputs were written on the accelerator's DEFAULT stream (the caller's preprocessing kernels); the copies below run on _stream, which does not
+        // wait for it. Without this drain a copy could read an input the preprocessing had not finished writing: ML's YOLO graph-capture gate saw replayed
+        // detections drift run to run (car 0.7725 direct vs 0.7685 .. 0.7734 replayed, 2026-11-14) while the direct frame stayed stable.
+        await _accelerator.SynchronizeAsync();
         using (_accelerator.WithDefaultStream(_stream))   // order the input copies before the launch on _stream
         {
             foreach (var (name, t) in newInputs)
