@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **On SpawnDev.ILGPU 5.4.31** (5.4.30 and 5.4.31: two silent wrong-result fixes. Unsigned division by a constant power of two was emitted as a signed
+  shift on every compiled backend; ML's IL has no such division (one `div.un` in the whole assembly, by a variable). On OpenCL, signed `+ - * <<` were
+  undefined on overflow in the generated C; ML has one kernel that overflows by design: the int8 Q6_K unpack `Q6S8` (`(v | 0x80808080) - 0x20202020`,
+  a per-byte subtract that crosses INT_MIN), which is now defined wrap-around on OpenCL instead of relying on the compiler. CUDA: division and remainder
+  by a constant power of two are shifts now.)
 - **Wan: ComfyUI's repackaged VAE file loads as it is** (Comfy-Org/Wan_2.2_ComfyUI_Repackaged `split_files/vae/wan2.2_vae.safetensors`, Apache-2.0):
   `Wan22Pipeline.LoadWeightsAsync` recognises ComfyUI's layout and rewrites it into ours on the device (`WanComfyFormat`): torch's [co, ci, k...] convolutions
   permuted to the gather layout [co, taps, ci], the fp16 RMS-norm gammas to fp32, the reference's latent mean / std added. Read from the file's header only.
@@ -30,6 +35,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     0.2% to that in quadrature), the norms and bias tables bit-identical; context 6.0e-2 to 7.4e-2 against the reference. For scale, our 8-bit block export
     (`umt5_xxl_enc_q8`, 6.4 GB) is 2.6e-2 to 3.4e-2: the hosted q8 file is the more accurate 8-bit encoder.
     Red-checked: a scale paired with the wrong matrix (relRMS 0.90) and q / k / v fused in the wrong order both fail their gates.
+- **Wan: the tokenizer comes from ComfyUI's umT5 file too**, so a ComfyUI models folder is all the pipeline needs (no google/umt5-xxl download):
+  `Wan22Pipeline.LoadTokenizerAsync` accepts a `.safetensors` file and reads the SentencePiece model ComfyUI stores in it (the U8 tensor `spiece_model`,
+  4.5 MB, read by offset), through the new `UnigramTokenizer.FromSentencePieceModel` (a `ModelProto` reader: pieces, scores, unk / eos ids; the 300 T5
+  sentinels google's tokenizer.json appends are appended the same way). New `Wan22Paths.ComfyUI(modelsFolder)`: `diffusion_models/`, `vae/`, `text_encoders/`
+  with ComfyUI's file names, the tokenizer read from the text encoder file. `UnigramTokenizer.Score(id)` is public. Gate
+  `Wan_Tokenizer_ComfySpiece_MatchesTokenizerJson` (both ComfyUI umT5 files): all 256,300 pieces and their scores bit-identical to tokenizer.json's, the
+  reference's three prompts give the reference's ids, edge cases (space runs, emoji, sentinels, Chinese, accents) give tokenizer.json's ids.
 
 ## 5.8.16 - 2026-11-12 (nuget.org) - Wan VAE attention 15x on AMD OpenCL; Wan building blocks public
 
