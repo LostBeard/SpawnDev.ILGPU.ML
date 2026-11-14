@@ -229,6 +229,13 @@ public sealed class GpuWeights : IDisposable
         _bf16[name] = buffer; _shapes[name] = shape;
         return ReferenceEquals(old, buffer) ? null : old;
     }
+    /// <summary>Put an 8-bit float (F8_E4M3) tensor, its bytes four to a word as loaded (replacing one of that name in any precision); returns the displaced buffer for the caller to dispose after the device is idle.</summary>
+    internal IDisposable? SetF8(string name, MemoryBuffer1D<uint, Stride1D.Dense> words, int[] shape)
+    {
+        var old = Detach(name);
+        _f8[name] = words; _shapes[name] = shape;
+        return ReferenceEquals(old, words) ? null : old;
+    }
     /// <summary>Drop a tensor from the set; returns its buffer for the caller to dispose after the device is idle.</summary>
     internal IDisposable? Remove(string name) { var old = Detach(name); _shapes.Remove(name); return old; }
     /// <summary>Give tensor <paramref name="from"/> the name <paramref name="to"/> (the buffer moves, nothing is copied; <paramref name="to"/> must not exist).</summary>

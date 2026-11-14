@@ -4,6 +4,33 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **fp32-class activations on CUDA's tensor cores** (`DiTKernels.PreciseActivations`; found by SpawnGen: the same Z-Image calls matched ComfyUI to 1.9e-5 on an RX 590 and 5.6e-3
+  on CUDA). The tensor-core GEMM rounded every activation to bf16. The new `MmaGemm.KernelBf16x2Dense` stages each activation as bf16 hi + bf16 lo and runs both MMA passes into
+  the same fp32 accumulators (the bf16 weights are exact), and attention takes the fp32 flash kernel. MEASURED against ComfyUI's fp32 dumps (RTX 4070): FLUX.1 4.7e-3 -> 3.3e-5,
+  Z-Image 5.6e-3 -> 3.2e-5, Qwen-Image 4.3e-2 -> 2.4e-4; warm call times unchanged at 256 px. ON by default in `Flux1Transformer`, `ZImageTransformer`, `QwenImageTransformer`;
+  opt-in on `Flux2TextEncoder` (FLUX.2's reference is bf16) and anywhere else (env ML_PRECISE_ACT=1 for A/B runs). Other backends compute in fp32 already.
+- **The text encoders' precision on CUDA**: `UmT5Encoder.PreciseActivations` (T5-v1.1-XXL's outlier activations suffer most: FLUX.1's T5 against ComfyUI 6.1e-3 -> 3.2e-4 on the
+  prompt rows) and `SdTextEncoder.ExactActivations` (CLIP-L pooled 3.3e-4 -> 1.34e-6), both off by default (the Wan / LTX / SD gates were measured on the bf16 path).
+  ComfyUI's 8-bit scaled text-encoder matrices run exact in `Flux2TextEncoder` (`Flux2Weights.MatrixExact` + `ActivationScale`: the unscaled decode, the input times the scale):
+  Qwen-Image's encoder 3.1e-3 -> 4.5e-5.
+- **FLUX.1's split templates** (standalone `flux1-*-fp8_scaled` / bf16 transformer, `t5xxl_fp8_e4m3fn_scaled` or fp16, `clip_l`): gates against SpawnGen's dumps of ComfyUI's Krea graph
+  (`Flux1Split_*`); with no FluxGuidance node ComfyUI passes guidance 3.5. Standalone clip_l: 1.34e-6. The scaled T5 still folds its scales (4.1e-3 on the prompt rows). The Krea
+  fp8_scaled transformer runs 1.3e-3 from ComfyUI: its F16 biases are held exactly as bf16 hi + lo (`StreamedModelWeights`), but SpawnDev.ILGPU before 5.4.33 does not round a
+  float -> BFloat16 -> float round trip in GPU kernels (found here: lo all zero on CUDA / OpenCL / WebGPU / WebGL / Wasm; reported, fixed in 5.4.33), so one layer misses ComfyUI's
+  hooked output by 1.5e-4 where the exact arithmetic gives 5e-8 (SpawnGen measured ComfyUI's Linear). Its gates join with 5.4.33.
+- **Qwen-Image from ComfyUI's files** (Docs/flux1.md): `QwenImageTransformer` (20B, ported from diffusers' `QwenImageTransformer2DModel`, Apache-2.0; `qwen_image_fp8_e4m3fn`, blocks
+  streamed past the budget; per-call text length), the Qwen2.5-VL-7B text encoder through `Flux2TextEncoder` (now sized from its weights: biases, no q / k norms, unfused 8-bit
+  q / k / v, final norm; ComfyUI's fp8_scaled file kept 8-bit and decoded exact with the scale moved to the input; the vision tower is not read), and the Wan 2.1 VAE
+  (`WanVae` detects it: 16 channels, 8x, flat block list; `WanComfyFormat.AdaptVaeAsync` takes bf16 files and sets the 16-channel constants). MEASURED against ComfyUI: the two
+  cfg calls 2.4e-4 / 2.9e-4 (timestep = sigma, output x - sigma v), VAE encode 1.75e-4 (LATENT is raw) and decode 5.0e-5, text ids identical to ComfyUI's, ComfyUI's
+  whole 2-step cfg-4 run rebuilt on these blocks lands on its final LATENT at 5.5e-5 (the transformer works in the normalised latent: raw = model * std + mean).
+- **Per-call caption / text length**: `ZImageTransformer.ForwardAsync(..., captionTokens)` and `QwenImageTransformer.ForwardAsync(..., textTokens)` (open for the maximum): a prompt and
+  its negative under cfg share one open transformer (requested by SpawnGen). Gated: a call of another length between two equal calls leaves the second identical to the first.
+- **ComfyUI's fp8_scaled files in `StreamedModelWeights`** (FLUX.1's `flux1-dev-fp8_scaled` style): `scale_weight` becomes each 8-bit matrix's decode scale (it was ignored: every
+  matrix decoded at scale 1), `scale_input` and the `scaled_fp8` marker are skipped, and a scaled file with an unscaled 8-bit matrix is refused. No ComfyUI dump of such a file yet.
+- **Generate Text on 8 GB cards**: `GgufBatchDecoder.Float16MatrixLoad` converts 16-bit matrices to Q8_0 as they stream in, automatically past 75% of the device's memory
+  (ComfyUI's `qwen_3_4b.safetensors` is 8.05 GB of bf16). Against ComfyUI's greedy tokens: 13 of 23 with thinking off, 159 of 159 with thinking on (bf16: 23 / 23, 159 / 159).
+
 - **FLUX.1 dev from ComfyUI's files** (`Flux1Weights`, `Flux1Transformer`, Docs/flux1.md; requested by SpawnGen): the 12B transformer from the all-in-one
   `flux1-dev-fp8.safetensors` (8-bit floats, no scales), its blocks streamed from the file past a residency budget (`StreamedModelWeights`, generic: 8-bit
   matrices stay 8-bit on the device and are decoded just before their GEMM). MEASURED against ComfyUI's own model calls (SpawnGen's dumps, fp32 CPU): 4.71e-3 and

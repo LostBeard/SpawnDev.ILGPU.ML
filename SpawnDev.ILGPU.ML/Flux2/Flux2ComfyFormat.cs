@@ -52,13 +52,16 @@ public static class Flux2ComfyFormat
     /// The load filter for a FLUX.2 stage file: in a Hugging Face Qwen3 file (<c>model.*</c> names) only the embedding and the first <see cref="Flux2TextEncoder.Layers"/> layers are
     /// read (the pipeline reads the hidden states after layers 9, 18 and 27: the last 9 layers, the final norm and any head never run). Every other name passes.
     /// </summary>
-    public static bool TextEncoderFilter(string name) => TextEncoderFilter(name, Flux2TextEncoder.Layers);
+    public static bool TextEncoderFilter(string name) => TextEncoderFilter(name, Flux2TextEncoder.Layers, false);
 
     /// <summary>The load filter keeping the embedding and the first <paramref name="layers"/> layers of a Hugging Face Qwen3 file (Z-Image reads the state after layer 35).</summary>
-    public static bool TextEncoderFilter(string name, int layers)
+    public static bool TextEncoderFilter(string name, int layers, bool finalNorm = false)
     {
+        if (name.StartsWith("visual.", StringComparison.Ordinal)) return false;                         // a vision-language model's vision tower (Qwen2.5-VL): not a text encoder's
+        if (name == "scaled_fp8") return false;                                                          // ComfyUI's empty marker of an fp8_scaled file: not a weight
         if (!name.StartsWith("model.", StringComparison.Ordinal) && !name.StartsWith("lm_head.", StringComparison.Ordinal)) return true;
         if (name == "model.embed_tokens.weight") return true;
+        if (finalNorm && name == "model.norm.weight") return true;
         if (!name.StartsWith("model.layers.", StringComparison.Ordinal)) return false;                   // model.norm, lm_head
         int end = name.IndexOf('.', "model.layers.".Length);
         return end > 0 && int.TryParse(name.AsSpan("model.layers.".Length, end - "model.layers.".Length), out int l) && l < layers;
@@ -72,12 +75,29 @@ public static class Flux2ComfyFormat
     /// <c>mlp.gate_up_proj</c> (rows concatenated in that order, as our export does: export_flux2.py), the rest renamed. Each fused group is built and its sources freed before the next,
     /// so the peak is one group above the file.
     /// </summary>
-    public static async Task AdaptTextEncoderAsync(Accelerator accelerator, GpuWeights w, int layers = Flux2TextEncoder.Layers)
+    public static async Task<Dictionary<string, float>> AdaptTextEncoderAsync(Accelerator accelerator, GpuWeights w, int layers = Flux2TextEncoder.Layers)
     {
         async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
+        // ComfyUI's 8-bit "scaled" files: one fp32 scale_weight per 8-bit matrix (kept, by our name, for the decode) and a scale_input (activation scale for fp8 matmuls: not used, the
+        // activations stay fp32)
+        var scales = new Dictionary<string, float>();
+        foreach (var name in w.Names.ToList())
+        {
+            if (name.EndsWith(".scale_input", StringComparison.Ordinal)) { await Retire(w.Remove(name)); continue; }
+            if (!name.EndsWith(".scale_weight", StringComparison.Ordinal)) continue;
+            if (!w.IsF32(name)) throw new InvalidDataException($"{name}: expected an fp32 scalar");
+            string matrix = name[..^".scale_weight".Length] + ".weight";
+            scales[matrix.StartsWith("model.", StringComparison.Ordinal) ? matrix["model.".Length..] : matrix] = (await w.F32(name).CopyToHostAsync())[0];
+            await Retire(w.Remove(name));
+        }
+        foreach (var m in w.Names.Where(w.IsF8))
+            if (!scales.ContainsKey(m.StartsWith("model.", StringComparison.Ordinal) ? m["model.".Length..] : m)) throw new InvalidDataException($"{m}: an F8_E4M3 matrix without its scale_weight");
+        // q | k | v and gate | up fuse into one GEMM each for Qwen3 in bf16 (the layout Flux2TextEncoder's fused path reads); 8-bit parts (scales differ) and Qwen2.5 (biases, no q / k
+        // norms) keep their own matrices
+        bool fuse = w.Has("model.layers.0.self_attn.q_norm.weight") && w.IsBF16("model.layers.0.self_attn.q_proj.weight");
         async Task Fuse(string ours, params string[] sources)
         {
-            foreach (var s in sources) if (!w.IsBF16(s)) throw new NotSupportedException($"{s}: expected bf16 (the 8-bit Qwen files are not supported yet)");
+            foreach (var s in sources) if (!w.IsBF16(s)) throw new NotSupportedException($"{s}: expected bf16");
             long total = 0; foreach (var s in sources) total += (long)w.Shape(s)[0] * w.Shape(s)[1];
             var dst = accelerator.Allocate1D<BFloat16>(total);
             long off = 0; int rows = 0;
@@ -90,11 +110,13 @@ public static class Flux2ComfyFormat
         {
             string p = $"model.layers.{l}.", o = $"layers.{l}.";
             if (!w.Has(p + "self_attn.q_proj.weight")) throw new InvalidDataException($"{p}: missing (the encoder needs layers 0 to {layers - 1})");
+            if (!fuse) continue;
             await Fuse(o + "self_attn.qkv_proj.weight", p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight");
             await Fuse(o + "mlp.gate_up_proj.weight", p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight");
         }
         foreach (var name in w.Names.Where(n => n.StartsWith("model.", StringComparison.Ordinal)).ToList()) w.Rename(name, name["model.".Length..]);
         await accelerator.SynchronizeAsync();
+        return scales;
     }
 
     private const string WeightScale = ".weight_scale", InputScale = ".input_scale";

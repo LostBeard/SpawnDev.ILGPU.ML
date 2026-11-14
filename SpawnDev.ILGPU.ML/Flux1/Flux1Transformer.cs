@@ -38,12 +38,12 @@ public sealed class Flux1Transformer : IDisposable
     private readonly int _nTxt, _nImg, _n;
     private readonly List<IDisposable> _owned = new();
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _img, _txt, _normI, _normT, _qkv, _attn, _attnImg, _attnTxt, _proj, _mlp, _cat, _scores;
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _vec, _vecAct, _tproj, _hid, _part, _modImg, _modTxt, _modSingle, _modOut, _cosT, _sinT, _out;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _vec, _vecAct, _tproj, _hid, _part, _modImg, _modTxt, _modSingle, _modOut, _cosT, _sinT, _out, _xs;
 
     public Flux1Transformer(Accelerator accelerator, Flux1Weights weights, int textTokens, int imageTokens)
     {
         _acc = accelerator; _w = weights; _nTxt = textTokens; _nImg = imageTokens; _n = textTokens + imageTokens;
-        _k = new DiTKernels(accelerator); _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator); _f1 = new Flux1Kernels(accelerator);
+        _k = new DiTKernels(accelerator) { PreciseActivations = true }; _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator); _f1 = new Flux1Kernels(accelerator);
         long N = _n, I = _nImg, T = _nTxt;
         _img = Alloc(I * Dim); _txt = Alloc(T * Dim); _normI = Alloc(I * Dim); _normT = Alloc(T * Dim);
         _qkv = Alloc(N * 3 * Dim); _attn = Alloc(N * Dim); _attnImg = Alloc(I * Dim); _attnTxt = Alloc(T * Dim);
@@ -52,9 +52,17 @@ public sealed class Flux1Transformer : IDisposable
         _vec = Alloc(Dim); _vecAct = Alloc(Dim); _tproj = Alloc(TimeChannels); _hid = Alloc(Dim); _part = Alloc(Dim);
         _modImg = Alloc(6 * Dim); _modTxt = Alloc(6 * Dim); _modSingle = Alloc(3 * Dim); _modOut = Alloc(2 * Dim);
         _cosT = Alloc(N * HeadDim); _sinT = Alloc(N * HeadDim); _out = Alloc(I * InChannels);
+        _xs = Alloc(weights.HasScales ? N * (Dim + MlpHidden) : 1);                     // the widest scaled input: linear2's [rows, 3072 + 12288]
     }
 
     private MemoryBuffer1D<float, Stride1D.Dense> Alloc(long n) { var b = _acc.Allocate1D<float>(Math.Max(1, n)); _owned.Add(b); return b; }
+
+    /// <summary>
+    /// CUDA: fp32-class activations through the tensor cores (<see cref="DiTKernels.PreciseActivations"/>: split hi + lo bf16 GEMMs, fp32 flash attention). ON by default: this port is
+    /// checked against ComfyUI's fp32 runs, and bf16 activations cost ~5e-3 per call (FLUX.1 4.7e-3 -> 3.3e-5, Z-Image 5.6e-3 -> 3.2e-5, Qwen-Image 4.3e-2 -> 2.4e-4 measured on an
+    /// RTX 4070; no slower at 256 px). Other backends compute in fp32 either way.
+    /// </summary>
+    public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
 
     /// <summary>The velocity of the last <see cref="ForwardAsync"/>, [imageTokens, 64] (2 x 2 patches of the 16-channel latent).</summary>
     public FV Output => _out.View;
@@ -114,9 +122,33 @@ public sealed class Flux1Transformer : IDisposable
         return e;
     }
 
-    private void Gemv(GpuWeights w, FV x, string name, FV o, int K, int N) => _u.Gemv(x, _w.Matrix(w, name + ".weight"), w.BF16(name + ".bias"), o, K, N);
+
+    // an fp8_scaled file: the matrix runs on its exact unscaled decode with its input times the scale (StreamedModelWeights.MatrixExact); _xs holds the scaled input
+    private FV Scaled(GpuWeights w, string weight, FV x, long n)
+    {
+        float s = _w.ActivationScale(w, weight);
+        if (s == 1f) return x;
+        var xs = _xs.View.SubView(0, n);
+        _f.ScaleInto(x, xs, s, (int)n);
+        return xs;
+    }
+    private void Gemv(GpuWeights w, FV x, string name, FV o, int K, int N)
+    {
+        _u.Gemv(Scaled(w, name + ".weight", x, K), _w.MatrixExact(w, name + ".weight"), w.BF16(name + ".bias"), o, K, N);
+        if (w.Has(name + ".bias.lo")) _f1.AddRowVector(o, w.BF16(name + ".bias.lo"), 1, N, 0);              // an fp16 bias held exactly (hi + lo)
+    }
     private void Lin(GpuWeights w, FV x, string name, FV o, int rows, int K, int N, DiTKernels.Act act = DiTKernels.Act.None)
-        => _k.Linear(x, _w.Matrix(w, name + ".weight"), w.BF16(name + ".bias"), o, rows, K, N, act);
+    {
+        bool lo = w.Has(name + ".bias.lo");                                                  // an fp16 bias held exactly: the remainder goes in before the activation
+        _k.Linear(Scaled(w, name + ".weight", x, (long)rows * K), _w.MatrixExact(w, name + ".weight"), w.BF16(name + ".bias"), o, rows, K, N, lo ? DiTKernels.Act.None : act);
+        if (lo) _f1.AddRowVector(o, w.BF16(name + ".bias.lo"), rows, N, (int)act);
+    }
+    // q / k RMS norm per head; an fp16 scale held exactly (hi + lo) when the file had one
+    private void NormHeads(GpuWeights w, FV buf, string scale, int rows, int stride, int off)
+    {
+        if (w.Has(scale + ".lo")) _u.RmsNormHeads(buf, w.BF16(scale), w.BF16(scale + ".lo"), rows, stride, off, Heads, HeadDim, Eps);
+        else _u.RmsNormHeads(buf, w.BF16(scale), rows, stride, off, Heads, HeadDim, Eps);
+    }
 
     /// <summary>
     /// One model call: <paramref name="imageTokens"/> [imageTokens, 64] (the model-space latent's 2 x 2 patches: <see cref="Flux1Kernels.Patchify"/>), <paramref name="txt"/> the T5 output
@@ -178,10 +210,10 @@ public sealed class Flux1Transformer : IDisposable
         var qkvT = _qkv.View.SubView(0, (long)_nTxt * 3 * Dim); var qkvI = _qkv.View.SubView((long)_nTxt * 3 * Dim, (long)_nImg * 3 * Dim);
         Lin(w, _normT.View, b + "txt_attn.qkv", qkvT, _nTxt, Dim, 3 * Dim);
         Lin(w, _normI.View, b + "img_attn.qkv", qkvI, _nImg, Dim, 3 * Dim);
-        _u.RmsNormHeads(qkvT, w.BF16(b + "txt_attn.norm.query_norm.scale"), _nTxt, 3 * Dim, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvT, w.BF16(b + "txt_attn.norm.key_norm.scale"), _nTxt, 3 * Dim, Dim, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvI, w.BF16(b + "img_attn.norm.query_norm.scale"), _nImg, 3 * Dim, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(qkvI, w.BF16(b + "img_attn.norm.key_norm.scale"), _nImg, 3 * Dim, Dim, Heads, HeadDim, Eps);
+        NormHeads(w, qkvT, b + "txt_attn.norm.query_norm.scale", _nTxt, 3 * Dim, 0);
+        NormHeads(w, qkvT, b + "txt_attn.norm.key_norm.scale", _nTxt, 3 * Dim, Dim);
+        NormHeads(w, qkvI, b + "img_attn.norm.query_norm.scale", _nImg, 3 * Dim, 0);
+        NormHeads(w, qkvI, b + "img_attn.norm.key_norm.scale", _nImg, 3 * Dim, Dim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, 0, Heads, HeadDim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, Dim, Heads, HeadDim);
         _k.Attention(_qkv.View, 3 * Dim, 0, _qkv.View, 3 * Dim, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);
@@ -206,11 +238,19 @@ public sealed class Flux1Transformer : IDisposable
         Gemv(w, _vecAct.View, b + "modulation.lin", _modSingle.View, Dim, 3 * Dim);          // (shift, scale, gate)
         _k.LayerNormModulate(h, _attn.View, _modSingle.View, 0, Dim, _n, Dim, Eps);
         // linear1 = [q | k | v | mlp] rows of one matrix: two GEMMs on its row ranges (the MLP part with GELU tanh straight into its own buffer)
-        var w1 = _w.Matrix(w, b + "linear1.weight"); var b1 = w.BF16(b + "linear1.bias");
-        _k.Linear(_attn.View, w1.SubView(0, 3L * Dim * Dim), b1.SubView(0, 3 * Dim), _qkv.View, _n, Dim, 3 * Dim);
-        _k.Linear(_attn.View, w1.SubView(3L * Dim * Dim, (long)MlpHidden * Dim), b1.SubView(3 * Dim, MlpHidden), _mlp.View, _n, Dim, MlpHidden, DiTKernels.Act.GeluTanh);
-        _u.RmsNormHeads(_qkv.View, w.BF16(b + "norm.query_norm.scale"), _n, 3 * Dim, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(_qkv.View, w.BF16(b + "norm.key_norm.scale"), _n, 3 * Dim, Dim, Heads, HeadDim, Eps);
+        var x1 = Scaled(w, b + "linear1.weight", _attn.View, (long)_n * Dim);               // one matrix, one scale: both row ranges read the same scaled input
+        var w1 = _w.MatrixExact(w, b + "linear1.weight"); var b1 = w.BF16(b + "linear1.bias");
+        bool lo1 = w.Has(b + "linear1.bias.lo");
+        _k.Linear(x1, w1.SubView(0, 3L * Dim * Dim), b1.SubView(0, 3 * Dim), _qkv.View, _n, Dim, 3 * Dim);
+        _k.Linear(x1, w1.SubView(3L * Dim * Dim, (long)MlpHidden * Dim), b1.SubView(3 * Dim, MlpHidden), _mlp.View, _n, Dim, MlpHidden, lo1 ? DiTKernels.Act.None : DiTKernels.Act.GeluTanh);
+        if (lo1)
+        {
+            var b1lo = w.BF16(b + "linear1.bias.lo");
+            _f1.AddRowVector(_qkv.View, b1lo.SubView(0, 3 * Dim), _n, 3 * Dim, 0);
+            _f1.AddRowVector(_mlp.View, b1lo.SubView(3 * Dim, MlpHidden), _n, MlpHidden, (int)DiTKernels.Act.GeluTanh);
+        }
+        NormHeads(w, _qkv.View, b + "norm.query_norm.scale", _n, 3 * Dim, 0);
+        NormHeads(w, _qkv.View, b + "norm.key_norm.scale", _n, 3 * Dim, Dim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, 0, Heads, HeadDim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, Dim, Heads, HeadDim);
         _k.Attention(_qkv.View, 3 * Dim, 0, _qkv.View, 3 * Dim, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);

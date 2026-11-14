@@ -44,7 +44,17 @@ public sealed class DiTKernels
     /// reference does). TRELLIS2_MMA=0 forces the fp32 reference kernel: the A/B for any numerical question.
     /// </summary>
     public static bool EnableTensorCores = Environment.GetEnvironmentVariable("TRELLIS2_MMA") != "0";
-    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinear;
+    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>? _mmaLinear, _mmaLinearX2;
+
+    /// <summary>
+    /// fp32-class activations on CUDA's tensor-core paths, for models checked against an fp32-activation reference (ComfyUI's CPU runs: FLUX.1, Z-Image, Qwen-Image), where
+    /// bf16 activations cost ~5e-3 relRMS per model call. <see cref="Linear"/> runs the split-activation kernel (<c>MmaGemm.KernelBf16x2Dense</c>: every activation staged
+    /// as bf16 hi + bf16 lo, two MMA passes, ~16 mantissa bits instead of 8; the bf16 weights are exact) and <see cref="Attention"/> the portable fp32 flash kernel instead
+    /// of the bf16 tensor-core one. Only CUDA changes: the other backends compute in fp32 already. Default from ML_PRECISE_ACT (1 = on) for A/B runs; a model sets it on its own kernels.
+    /// </summary>
+    public bool PreciseActivations { get; set; } = DefaultPreciseActivations;
+    /// <summary>The default of <see cref="PreciseActivations"/> for new instances (env ML_PRECISE_ACT=1 turns it on).</summary>
+    public static bool DefaultPreciseActivations { get; set; } = Environment.GetEnvironmentVariable("ML_PRECISE_ACT") == "1";
     private MemoryBuffer1D<int, Stride1D.Dense>? _noNbr;   // placeholder for the gather operand of the dense kernels (never read)
 
     private bool UseMma(int M, int K, int N)
@@ -57,10 +67,12 @@ public sealed class DiTKernels
         var b = bias ?? _dummyB!.View;   // never read when hasBias == 0 (a separate buffer: WebGPU forbids binding w twice)
         if (UseMma(M, K, N))
         {
-            _mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelBf16Dense);
+            var kernel = PreciseActivations
+                ? (_mmaLinearX2 ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelBf16x2Dense))
+                : (_mmaLinear ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelBf16Dense));
             _noNbr ??= _acc.Allocate1D<int>(1);
             int tiles = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
-            _mmaLinear(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), w.Cast<BFloat16, U4>(), b, o, o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
+            kernel(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), w.Cast<BFloat16, U4>(), b, o, o, _noNbr.View, M, K, N, 0, bias.HasValue ? 1 : 0, (int)act, 0);
             return;
         }
         if (UseTiled(K) && TiledGemm.Fits(M, K, N))
@@ -441,7 +453,7 @@ public sealed class DiTKernels
     /// <summary>True when <see cref="Attention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core one or the portable one.</summary>
     public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesTiledAttention(headDim);
     private bool UsesMmaAttention(int headDim)
-        => EnableTensorCores && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && headDim == MmaAttention.HeadDim;    // sm_80 PTX (Kernels/CudaCaps)
+        => EnableTensorCores && !PreciseActivations && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && headDim == MmaAttention.HeadDim;    // sm_80 PTX (Kernels/CudaCaps); bf16 q / k / v
     /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
     private bool UsesTiledAttention(int headDim)
         => EnableTiled && TiledWidth(headDim) >= 0 && _acc.MaxNumThreadsPerGroup >= TiledAttention.Threads && _acc.WarpSize >= 4 && _acc.AcceleratorType != AcceleratorType.WebGL;

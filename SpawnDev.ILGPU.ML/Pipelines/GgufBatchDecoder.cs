@@ -450,6 +450,73 @@ public sealed class GgufBatchDecoder : IDisposable
         return d;
     }
 
+    /// <summary>How 16-bit float (BF16 / F16) matrices load: as stored, or converted to Q8_0 (8 bits + one fp16 scale per 32 weights, ggml's block) as they stream in.</summary>
+    public enum Float16Matrices
+    {
+        /// <summary>Keep them 16-bit unless they do not fit: when the matrices would take more than <see cref="AutoQ8Fraction"/> of the device's memory, Q8_0.</summary>
+        Auto,
+        /// <summary>Always as stored.</summary>
+        Keep,
+        /// <summary>Always Q8_0 (half the memory, the Q8 GEMV path; not bit-identical to the 16-bit model).</summary>
+        Q8,
+    }
+
+    /// <summary>
+    /// The load-time choice for 16-bit matrices (a safetensors model seen through <see cref="GGUF.SafeTensorsGguf"/>: ComfyUI's qwen_3_4b.safetensors is 8.05 GB of bf16, more
+    /// than an 8 GB card holds). Env ML_GGUF_F16_MATRICES=keep / q8 / auto. The decoder reports what it did in <see cref="ConvertedToQ8"/>.
+    /// </summary>
+    public static Float16Matrices Float16MatrixLoad { get; set; } = Environment.GetEnvironmentVariable("ML_GGUF_F16_MATRICES")?.ToLowerInvariant() switch
+    {
+        "keep" => Float16Matrices.Keep, "q8" => Float16Matrices.Q8, _ => Float16Matrices.Auto,
+    };
+    /// <summary>The share of the device's memory 16-bit matrices may take before <see cref="Float16Matrices.Auto"/> converts them (the rest is for the KV cache and activations).</summary>
+    public static double AutoQ8Fraction { get; set; } = 0.75;
+    /// <summary>True when this decoder converted its 16-bit matrices to Q8_0 at load (<see cref="Float16MatrixLoad"/>).</summary>
+    public bool ConvertedToQ8 { get; private set; }
+
+    // the type a matrix is held in on the device: its own, or Q8_0 when 16-bit matrices are converted (whole 32-value blocks along each row)
+    private GGMLType LoadType(GGUFTensorInfo t) =>
+        ConvertedToQ8 && t.Type is GGMLType.BF16 or GGMLType.F16 && t.Dimensions.Length == 2 && t.Dimensions[0] % 32 == 0 ? GGMLType.Q8_0 : t.Type;
+
+    private void ChooseFloat16Load(IEnumerable<string> matrices)
+    {
+        if (Float16MatrixLoad == Float16Matrices.Keep) return;
+        long bytes = matrices.Distinct().Select(Tensor).Where(t => t.Type is GGMLType.BF16 or GGMLType.F16).Sum(t => GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t)));
+        if (bytes == 0) return;
+        ConvertedToQ8 = Float16MatrixLoad == Float16Matrices.Q8 || bytes > AutoQ8Fraction * _acc.MemorySize;
+        if (ConvertedToQ8) Console.WriteLine($"[GgufBatchDecoder] 16-bit matrices ({bytes / 1e9:F2} GB) load as Q8_0 ({(Float16MatrixLoad == Float16Matrices.Q8 ? "requested" : $"more than {AutoQ8Fraction:P0} of the device's {_acc.MemorySize / 1e9:F2} GB")})");
+    }
+
+    // ggml's block_q8_0 of 16-bit values: per 32 values, d = max|x| / 127 (stored fp16) then round(x / d) as int8 (half away from zero, as roundf)
+    private static byte[] QuantizeQ8_0(byte[] raw, GGMLType type, long count)
+    {
+        long blocks = count / 32;
+        var o = new byte[(blocks * 34 + 3) / 4 * 4];
+        Parallel.For(0L, blocks, b =>
+        {
+            Span<float> v = stackalloc float[32];
+            float amax = 0f;
+            for (int i = 0; i < 32; i++)
+            {
+                ushort bits = BitConverter.ToUInt16(raw, (int)((b * 32 + i) * 2));
+                v[i] = type == GGMLType.BF16 ? BitConverter.Int32BitsToSingle(bits << 16) : (float)BitConverter.UInt16BitsToHalf(bits);
+                amax = Math.Max(amax, Math.Abs(v[i]));
+            }
+            float d = amax / 127f, id = d != 0f ? 1f / d : 0f;
+            long at = b * 34;
+            BitConverter.TryWriteBytes(o.AsSpan((int)at, 2), BitConverter.HalfToUInt16Bits((System.Half)d));
+            for (int i = 0; i < 32; i++) o[at + 2 + i] = (byte)(sbyte)MathF.Round(v[i] * id, MidpointRounding.AwayFromZero);
+        });
+        return o;
+    }
+
+    // a matrix's bytes as held on the device (LoadType): the stored bytes, or their Q8_0 conversion
+    private async Task<byte[]> ReadLoadedAsync(GGUFTensorInfo t, CancellationToken ct)
+    {
+        var raw = await ReadAsync(t, ct).ConfigureAwait(false);
+        return LoadType(t) == t.Type ? raw : QuantizeQ8_0(raw, t.Type, _model.GetTensorElementCount(t));
+    }
+
     // load progress: bytes read over the file's tensor bytes
     private Action<string, int>? _progress;
     private long _readBytes, _totalBytes;
@@ -471,6 +538,12 @@ public sealed class GgufBatchDecoder : IDisposable
     // Qwen2.5-0.5B's embedding alone). writeBuffer moves 4-byte words: the up to 3 trailing bytes of a size that is not a multiple of 4 go through one word.
     private async Task UploadAsync(GGUFTensorInfo t, ArrayView1D<byte, Stride1D.Dense> dst, CancellationToken ct)
     {
+        if (LoadType(t) != t.Type)
+        {
+            var q = await ReadLoadedAsync(t, ct).ConfigureAwait(false);                     // converted on the host as it streams in
+            dst.SubView(0, q.Length).CopyFromCPU(q);
+            return;
+        }
         long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
         _stream.Seek(_model.GetTensorDataOffset(t), SeekOrigin.Begin);
         long aligned = n & ~3L;
@@ -496,7 +569,7 @@ public sealed class GgufBatchDecoder : IDisposable
     // a tensor in its own device buffer (padded to 4 bytes: the GEMM reads the blocks as int words)
     private async Task<MemoryBuffer1D<byte, Stride1D.Dense>> UploadAsync(GGUFTensorInfo t, CancellationToken ct)
     {
-        long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
+        long n = GGMLTypes.TypeSize(LoadType(t), _model.GetTensorElementCount(t));
         var buf = _acc.Allocate1D<byte>((n + 3) / 4 * 4);
         try { await UploadAsync(t, buf.View, ct).ConfigureAwait(false); }
         catch { buf.Dispose(); throw; }
@@ -524,13 +597,14 @@ public sealed class GgufBatchDecoder : IDisposable
             for (int k = 0; k < inv.Length; k++) inv[k] = 1f / MathF.Pow(_theta, 2f * k / HeadDim) / factors[k];
             _invFreq.View.CopyFromCPU(inv);
         }
+        ChooseFloat16Load(_model.Tensors.Where(t => t.Dimensions.Length == 2 && (t.Name.StartsWith("blk.", StringComparison.Ordinal) || t.Name == _head || t.Name == "token_embd.weight")).Select(t => t.Name));
         var mats = new List<string> { _head, "token_embd.weight" };          // the embedding rows are gathered on the device (a tied head is the same blocks)
         var vecs = new List<string> { "output_norm.weight" };
         _qkvAll = new bool[Layers];
         for (int l = 0; l < Layers; l++)
         {
             string p = $"blk.{l}.";
-            var (tq, tk, tv) = (Tensor(p + "attn_q.weight").Type, Tensor(p + "attn_k.weight").Type, Tensor(p + "attn_v.weight").Type);
+            var (tq, tk, tv) = (LoadType(Tensor(p + "attn_q.weight")), LoadType(Tensor(p + "attn_k.weight")), LoadType(Tensor(p + "attn_v.weight")));
             // the projections that share a block type are joined into one matrix (one GEMV a step instead of two or three); v alone when it differs (Q4_K_M)
             if (JoinProjections && tq == tk)
             {
@@ -548,7 +622,7 @@ public sealed class GgufBatchDecoder : IDisposable
                 _vecs[p + "attn_k.bias"] = Own(_acc.Allocate1D(await BiasAsync(p + "attn_k.bias", kvC, ct)));
                 _vecs[p + "attn_v.bias"] = Own(_acc.Allocate1D(await BiasAsync(p + "attn_v.bias", kvC, ct)));
             }
-            if (JoinProjections && Tensor(p + "ffn_gate.weight").Type == Tensor(p + "ffn_up.weight").Type)
+            if (JoinProjections && LoadType(Tensor(p + "ffn_gate.weight")) == LoadType(Tensor(p + "ffn_up.weight")))
                 await JoinAsync(p + "ffn_gate_up", new[] { p + "ffn_gate.weight", p + "ffn_up.weight" }, ct).ConfigureAwait(false);
             else mats.AddRange(new[] { p + "ffn_gate.weight", p + "ffn_up.weight" });
             mats.AddRange(new[] { p + "attn_output.weight", p + "ffn_down.weight" });
@@ -558,8 +632,8 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var name in mats.Distinct())
         {
             var t = Tensor(name);
-            if (!FusedDequantMatMul.Accepts(t.Type)) throw new NotSupportedException($"{name}: {t.Type} is not a type the fused GEMM reads");
-            _mats[name] = (Own(await UploadAsync(t, ct).ConfigureAwait(false)), t.Type);
+            if (!FusedDequantMatMul.Accepts(LoadType(t))) throw new NotSupportedException($"{name}: {LoadType(t)} is not a type the fused GEMM reads");
+            _mats[name] = (Own(await UploadAsync(t, ct).ConfigureAwait(false)), LoadType(t));
         }
         foreach (var name in vecs) _vecs[name] = Own(_acc.Allocate1D(await VecAsync(name, ct).ConfigureAwait(false)));
         // Q8_0 matrices regrouped in place for the faster GEMVs (GGMLType.Q8_0G; FusedDequantMatMul.RepackQ8_0Grouped). The joined q|k|v and gate|up read the
@@ -585,9 +659,9 @@ public sealed class GgufBatchDecoder : IDisposable
     // matrices of one block type stacked along the output dimension: their rows (the blocks of each output) follow each other, so the bytes simply concatenate
     private async Task JoinAsync(string name, string[] parts, CancellationToken ct)
     {
-        var type = Tensor(parts[0]).Type;
+        var type = LoadType(Tensor(parts[0]));
         if (!FusedDequantMatMul.Accepts(type)) throw new NotSupportedException($"{parts[0]}: {type} is not a type the fused GEMM reads");
-        var sizes = parts.Select(n => GGMLTypes.TypeSize(Tensor(n).Type, _model.GetTensorElementCount(Tensor(n)))).ToArray();
+        var sizes = parts.Select(n => GGMLTypes.TypeSize(LoadType(Tensor(n)), _model.GetTensorElementCount(Tensor(n)))).ToArray();
         if (sizes.Take(sizes.Length - 1).All(z => z % 4 == 0))
         {
             // each part streamed into its place (the offsets stay word aligned)
@@ -602,8 +676,8 @@ public sealed class GgufBatchDecoder : IDisposable
         foreach (var part in parts)
         {
             var t = Tensor(part);
-            long n = GGMLTypes.TypeSize(t.Type, _model.GetTensorElementCount(t));
-            var raw = await ReadAsync(t, ct).ConfigureAwait(false);
+            long n = GGMLTypes.TypeSize(LoadType(t), _model.GetTensorElementCount(t));
+            var raw = await ReadLoadedAsync(t, ct).ConfigureAwait(false);
             chunks.Add(raw.AsSpan(0, (int)n).ToArray()); total += n;
         }
         var all = new byte[(total + 3) / 4 * 4];

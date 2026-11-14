@@ -17,7 +17,22 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task TextGenerate_ComfyQwen3_MatchesComfyUiTokens() => await RunTest(async accelerator =>
+    public async Task TextGenerate_ComfyQwen3_MatchesComfyUiTokens() => await RunTest(async accelerator => await Tg_RunAsync(accelerator, q8: false));
+
+    /// <summary>
+    /// The same with the 16-bit matrices converted to Q8_0 at load (<see cref="GgufBatchDecoder.Float16Matrices.Q8"/>: what an 8 GB card gets automatically): the prompt ids are still
+    /// ComfyUI's; the greedy tokens follow ComfyUI's bf16 run as far as 8-bit weights allow. The first divergence is reported, the bound below is measured.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task TextGenerate_ComfyQwen3_Q8_StaysCloseToComfyUi() => await RunTest(async accelerator =>
+    {
+        var before = GgufBatchDecoder.Float16MatrixLoad;
+        GgufBatchDecoder.Float16MatrixLoad = GgufBatchDecoder.Float16Matrices.Q8;
+        try { return await Tg_RunAsync(accelerator, q8: true); }
+        finally { GgufBatchDecoder.Float16MatrixLoad = before; }
+    });
+
+    private async Task<string> Tg_RunAsync(Accelerator accelerator, bool q8)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
         var dir = Environment.GetEnvironmentVariable("F2_DIR") ?? "E:/spawndev-flux2";
@@ -28,7 +43,10 @@ public abstract partial class MLTestBase
         var tok = SentencePieceTokenizer.FromGGUF(model) ?? throw new Exception("no tokenizer from the metadata");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using var gen = await GgufGenerator.CreateAsync(accelerator, fs, maxSeqLen: 512, model: model, engine: GgufEngine.BatchDecoder);
-        var report = new List<string> { $"{model.BlockCount} layers, engine {gen.Engine}, loaded in {sw.Elapsed.TotalSeconds:F1} s" };
+        var dec = gen.BatchDecoder!;
+        Ur_Expect(dec.ConvertedToQ8 == q8, $"the 16-bit matrices {(q8 ? "must" : "must not")} load as Q8_0 (ConvertedToQ8 {dec.ConvertedToQ8})");
+        var report = new List<string> { $"{model.BlockCount} layers, engine {gen.Engine}, matrices {(dec.ConvertedToQ8 ? "Q8_0" : "bf16")}, loaded in {sw.Elapsed.TotalSeconds:F1} s" };
+        var firstDiff = new List<int>();
         using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(refs));
         foreach (var r in doc.RootElement.GetProperty("references").EnumerateArray())
         {
@@ -44,10 +62,13 @@ public abstract partial class MLTestBase
             var got = res.GeneratedTokenIds;
             int same = 0; while (same < Math.Min(got.Length, wantFed.Length) && got[same] == wantFed[same]) same++;
             report.Add($"{name}: prompt {ids.Length} ids identical; {got.Length} tokens in {sw.Elapsed.TotalSeconds:F1} s, the first {same} of ComfyUI's {wantFed.Length} fed-back tokens identical; stop {res.Stop} ({res.StopTokenId})");
+            firstDiff.Add(same);
+            if (q8) continue;                                                    // the 8-bit run is bounded below, on what it measured
             Ur_Expect(same == wantFed.Length, $"{name}: diverged at token {same}: ours [{string.Join(",", got.Skip(Math.Max(0, same - 2)).Take(6))}] ComfyUI [{string.Join(",", wantFed.Skip(Math.Max(0, same - 2)).Take(6))}]; " + string.Join("; ", report));
             if (!thinking) Ur_Expect(got.Length == wantFed.Length && res.StopTokenId == 151645, $"{name}: ComfyUI's answer ends there (<|im_end|>): " + string.Join("; ", report));
         }
         foreach (var line in report) Console.WriteLine("[TextGenerate] " + line);
+        if (q8) Ur_Expect(firstDiff.All(d => d >= 8), "PROVISIONAL until measured: Q8_0 follows ComfyUI's greedy tokens for at least 8: " + string.Join("; ", report));
         return string.Join("; ", report);
-    });
+    }
 }

@@ -31,24 +31,27 @@ public sealed class ZImageTransformer : IDisposable
     private readonly Flux2Kernels _f;
     private readonly Flux1Kernels _f1;
     private readonly ZImageKernels _z;
-    private readonly int _nImg, _nImgPad, _nCap, _nCapPad, _n;
+    private readonly int _nImg, _nImgPad, _maxCap;
+    private int _nCap, _nCapPad, _n;                                                  // this call's caption length (a prompt and its negative differ)
     private readonly List<IDisposable> _owned = new();
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _norm, _qkv, _attn, _proj, _gateUp, _act, _scores, _cosT, _sinT, _out, _tproj, _thid, _c, _cAct, _mod, _modOut, _capIn;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _norm, _qkv, _attn, _proj, _gateUp, _act, _scores, _cosT, _sinT, _out, _tproj, _thid, _c, _cAct, _mod, _modOut, _capIn, _xs;
 
     private static int Padded(int n) => n + (-n % SeqMultiple + SeqMultiple) % SeqMultiple;
 
-    private ZImageTransformer(Accelerator acc, StreamedModelWeights w, int imageTokens, int captionTokens)
+    private ZImageTransformer(Accelerator acc, StreamedModelWeights w, int imageTokens, int maxCaptionTokens)
     {
         _acc = acc; _w = w;
-        _k = new DiTKernels(acc); _u = new SkinTokensKernels(acc); _f = new Flux2Kernels(acc); _f1 = new Flux1Kernels(acc); _z = new ZImageKernels(acc);
-        _nImg = imageTokens; _nImgPad = Padded(imageTokens); _nCap = captionTokens; _nCapPad = Padded(captionTokens); _n = _nImgPad + _nCapPad;
-        long N = _n;
+        _k = new DiTKernels(acc) { PreciseActivations = true }; _u = new SkinTokensKernels(acc); _f = new Flux2Kernels(acc); _f1 = new Flux1Kernels(acc); _z = new ZImageKernels(acc);
+        _nImg = imageTokens; _nImgPad = Padded(imageTokens); _maxCap = maxCaptionTokens;
+        _nCap = maxCaptionTokens; _nCapPad = Padded(maxCaptionTokens); _n = _nImgPad + _nCapPad;
+        long N = _n;                                                                        // every buffer holds the longest caption
         _h = Alloc(N * Dim); _norm = Alloc(N * Dim); _qkv = Alloc(N * 3 * Dim); _attn = Alloc(N * Dim); _proj = Alloc(N * Dim);
         _gateUp = Alloc(N * 2 * Ffn); _act = Alloc(N * Ffn);
         _scores = Alloc(_k.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * N * N);
         _cosT = Alloc(N * HeadDim); _sinT = Alloc(N * HeadDim); _out = Alloc(N * InChannels);
         _tproj = Alloc(TimeChannels); _thid = Alloc(1024); _c = Alloc(AdaDim); _cAct = Alloc(AdaDim); _mod = Alloc(4 * Dim); _modOut = Alloc(2 * Dim);
         _capIn = Alloc((long)_nCapPad * CapDim);
+        _xs = Alloc(w.HasScales ? N * Ffn : 1);                                                // the widest scaled input: w2's [rows, 10240]
         SetPositions();
     }
 
@@ -83,12 +86,13 @@ public sealed class ZImageTransformer : IDisposable
 
     /// <summary>
     /// Open the transformer from <paramref name="file"/> (ComfyUI's <c>z_image_turbo_bf16.safetensors</c>) for a picture of <paramref name="rows"/> x <paramref name="cols"/> tokens (latent / 2)
-    /// and <paramref name="captionTokens"/> caption rows; blocks beyond <paramref name="residentBytes"/> stream from the file every call.
+    /// and up to <paramref name="maxCaptionTokens"/> caption rows (each call passes its own count: a prompt and its negative may differ); blocks beyond <paramref name="residentBytes"/>
+    /// stream from the file every call.
     /// </summary>
-    public static async Task<ZImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int rows, int cols, int captionTokens, long residentBytes, CancellationToken ct = default)
+    public static async Task<ZImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int rows, int cols, int maxCaptionTokens, long residentBytes, CancellationToken ct = default)
     {
         var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, file, "layers.0.attention.qkv.weight", BlockOf, 2 * Refiners + Layers, residentBytes, w2 => FuseFfnAsync(accelerator, w2), ct);
-        try { var t = new ZImageTransformer(accelerator, w, rows * cols, captionTokens) { _rows = rows, _cols = cols }; t.SetPositions(); return t; }
+        try { var t = new ZImageTransformer(accelerator, w, rows * cols, maxCaptionTokens) { _rows = rows, _cols = cols }; t.SetPositions(); return t; }
         catch { w.Dispose(); throw; }
     }
     private int _rows, _cols;
@@ -96,6 +100,15 @@ public sealed class ZImageTransformer : IDisposable
     public long ResidentBytes => _w.ResidentBytes;
     public int ResidentBlocks => _w.ResidentBlocks;
     public long StreamedBytesPerForward => _w.StreamedBytesPerForward;
+    /// <summary>
+    /// CUDA: fp32-class activations through the tensor cores (<see cref="DiTKernels.PreciseActivations"/>: split hi + lo bf16 GEMMs, fp32 flash attention). ON by default: this port is
+    /// checked against ComfyUI's fp32 runs, and bf16 activations cost ~5e-3 per call (FLUX.1 4.7e-3 -> 3.3e-5, Z-Image 5.6e-3 -> 3.2e-5, Qwen-Image 4.3e-2 -> 2.4e-4 measured on an
+    /// RTX 4070; no slower at 256 px). Other backends compute in fp32 either way.
+    /// </summary>
+    public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
+
+    /// <summary>The longest caption this transformer was opened for.</summary>
+    public int MaxCaptionTokens => _maxCap;
     /// <summary>The last output [paddedImage + paddedCaption, 64]; the picture's tokens are the first rows.</summary>
     public FV Output => _out.View;
 
@@ -122,16 +135,30 @@ public sealed class ZImageTransformer : IDisposable
         _cosT.View.SubView(0, cos.Length).CopyFromCPU(cos); _sinT.View.SubView(0, sin.Length).CopyFromCPU(sin);
     }
 
+
+    // an fp8_scaled file: the matrix runs on its exact unscaled decode with its input times the scale (StreamedModelWeights.MatrixExact); _xs holds the scaled input
+    private FV Scaled(GpuWeights w, string weight, FV x, long n)
+    {
+        float s = _w.ActivationScale(w, weight);
+        if (s == 1f) return x;
+        var xs = _xs.View.SubView(0, n);
+        _f.ScaleInto(x, xs, s, (int)n);
+        return xs;
+    }
     private void Lin(GpuWeights w, FV x, string name, FV o, int rows, int K, int N, bool bias)
-        => _k.Linear(x, _w.Matrix(w, name + ".weight"), bias ? w.BF16(name + ".bias") : null, o, rows, K, N);
-    private void Gemv(GpuWeights w, FV x, string name, FV o, int K, int N) => _u.Gemv(x, _w.Matrix(w, name + ".weight"), w.BF16(name + ".bias"), o, K, N);
+        => _k.Linear(Scaled(w, name + ".weight", x, (long)rows * K), _w.MatrixExact(w, name + ".weight"), bias ? w.BF16(name + ".bias") : null, o, rows, K, N);
+    private void Gemv(GpuWeights w, FV x, string name, FV o, int K, int N) => _u.Gemv(Scaled(w, name + ".weight", x, K), _w.MatrixExact(w, name + ".weight"), w.BF16(name + ".bias"), o, K, N);
 
     /// <summary>
     /// One model call: <paramref name="latent"/> the model-space latent [16, 2 rows, 2 cols], <paramref name="caption"/> the text encoder's rows [captionTokens, 2560], <paramref name="modelTime"/>
-    /// the reference's model time (1 - sigma). The output tokens are left in <see cref="Output"/> (<see cref="ZImageKernels.Denoised"/> makes the denoised estimate).
+    /// the reference's model time (1 - sigma). <paramref name="captionTokens"/>: this call's caption rows, 1 to <see cref="MaxCaptionTokens"/> (-1: the maximum); the weights and buffers are
+    /// shared, only the rotary table is rebuilt when the length changes. The output tokens are left in <see cref="Output"/> (<see cref="ZImageKernels.Denoised"/> makes the denoised estimate).
     /// </summary>
-    public async Task ForwardAsync(FV latent, FV caption, float modelTime, CancellationToken ct = default)
+    public async Task ForwardAsync(FV latent, FV caption, float modelTime, int captionTokens = -1, CancellationToken ct = default)
     {
+        if (captionTokens < 0) captionTokens = _maxCap;
+        if (captionTokens < 1 || captionTokens > _maxCap) throw new ArgumentOutOfRangeException(nameof(captionTokens), $"1 to {_maxCap} (the transformer's MaxCaptionTokens)");
+        if (captionTokens != _nCap) { _nCap = captionTokens; _nCapPad = Padded(captionTokens); _n = _nImgPad + _nCapPad; SetPositions(); }
         var b0 = _w.Base;
         // timestep embedding: sinusoid(1000 t) -> 1024 -> silu -> 256
         var e = new float[TimeChannels];

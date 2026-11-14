@@ -204,6 +204,114 @@ for dtype in ("Bf16", "F16"):
         kernel(dtype, gather)
 
 
+def kernel_split():
+    """KernelBf16x2Dense (2026-11-14): the Bf16 dense kernel with the activations kept to ~16 mantissa bits instead of 8. Each fp32 activation is staged
+    as two bf16 values, hi = bf16(a) and lo = bf16(a - hi), and every k step runs the MMAs twice into the same fp32 accumulators (hi * W, then lo * W).
+    The weights are bf16 already (exact), so the product loses only lo's own rounding (~2^-16 relative) instead of bf16's 2^-8: ComfyUI-style fp32
+    activation references are matched to ~1e-5 where the single pass gives ~5e-3 (FLUX.1 / Z-Image gates, RTX 4070). Twice the MMAs and twice the A
+    tile in shared memory (30 KB per group); the global loads are the same."""
+    mma = "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+    w("    /// <summary>KernelBf16Dense with split activations (hi + lo bf16 halves, two MMA passes): near-fp32 activation accuracy on the tensor cores. Same grid / group / arguments.</summary>")
+    w("    public static void KernelBf16x2Dense(F4V A, U4V Wu, BV bias, FV C, FV res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes)")
+    w("    {")
+    w("        int numTilesN = (N + BN - 1) / BN;")
+    w("        int tileRow = Grid.IdxX / numTilesN;")
+    w("        int tileCol = Grid.IdxX % numTilesN;")
+    w("        int tid = Group.IdxX;")
+    w("        int warp = tid >> 5, lane = tid & 31;")
+    w("        int g = lane >> 2, t = lane & 3;")
+    w("        int wm = warp >> 2, wn = warp & 3;")
+    w("        var aS = SharedMemory.Allocate<uint>(BM * RowWords);")
+    w("        var aL = SharedMemory.Allocate<uint>(BM * RowWords);")
+    w("        var bS = SharedMemory.Allocate<uint>(BN * RowWords);")
+    for mt in range(MT):
+        for nt in range(NT):
+            w(f"        float c{mt}{nt}0 = 0f, c{mt}{nt}1 = 0f, c{mt}{nt}2 = 0f, c{mt}{nt}3 = 0f;")
+    w("        int arow = tid >> 3, a4 = tid & 7;")
+    w("        int brow = tid >> 2, b4 = tid & 3;")
+    for i in range(4):
+        w(f"        int aRg{i} = tileRow * BM + arow + {32 * i}; int aOk{i} = aRg{i} < M ? 1 : 0;")
+        w(f"        long aBase{i} = (long)aRg{i} * (K >> 2) + a4;")
+    for i in range(2):
+        w(f"        int bRg{i} = tileCol * BN + brow + {64 * i}; int bOk{i} = bRg{i} < N ? 1 : 0;")
+        w(f"        long bBase{i} = (long)bRg{i} * (K >> 3) + b4;")
+    w("        F4 pa0 = default, pa1 = default, pa2 = default, pa3 = default;")
+    w("        U4 pb0 = default, pb1 = default;")
+    def load(kt_expr):
+        lines = [f"pa{i} = aOk{i} != 0 ? A[aBase{i} + (({kt_expr}) >> 2)] : default(F4);" for i in range(4)]
+        lines += [f"pb{i} = bOk{i} != 0 ? Wu[bBase{i} + (({kt_expr}) >> 3)] : default(U4);" for i in range(2)]
+        return lines
+    w("        {")
+    for l in load("0"):
+        w("            " + l)
+    w("        }")
+    w("        for (int kt = 0; kt < K; kt += BK)")
+    w("        {")
+    for i in range(4):
+        for (half, x, y) in ((0, "X", "Y"), (1, "Z", "W")):
+            idx = f"(arow + {32 * i}) * RowWords + a4 * 2 + {half}"
+            w(f"            {{ uint h = PackBf16(pa{i}.{x}, pa{i}.{y}); aS[{idx}] = h; aL[{idx}] = PackBf16(pa{i}.{x} - Bf16Lo(h), pa{i}.{y} - Bf16Hi(h)); }}")
+    for i in range(2):
+        for j, c in enumerate("XYZW"):
+            w(f"            bS[(brow + {64 * i}) * RowWords + b4 * 4 + {j}] = pb{i}.{c};")
+    w("            Group.Barrier();")
+    w("            if (kt + BK < K)")
+    w("            {")
+    for l in load("kt + BK"):
+        w("                " + l)
+    w("            }")
+    w("            for (int s = 0; s < 2; s++)")
+    w("            {")
+    w("                int kw = s * 8;")
+    for nt in range(NT):
+        w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
+        w(f"                uint b{nt}0 = bS[br{nt}];")
+        w(f"                uint b{nt}1 = bS[br{nt} + 4];")
+    for src in ("aS", "aL"):                                   # the hi pass, then the lo pass into the same accumulators (fragments reloaded: same register count)
+        w("                {")
+        for mt in range(MT):
+            w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
+            w(f"                uint a{mt}0 = {src}[ar{mt}];")
+            w(f"                uint a{mt}1 = {src}[ar{mt} + 8 * RowWords];")
+            w(f"                uint a{mt}2 = {src}[ar{mt} + 4];")
+            w(f"                uint a{mt}3 = {src}[ar{mt} + 8 * RowWords + 4];")
+        for mt in range(MT):
+            for nt in range(NT):
+                w("                {")
+                w(f'                CudaAsm.Emit("{mma}",')
+                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
+                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
+                w("                }")
+        w("                }")
+    w("            }")
+    w("            Group.Barrier();")
+    w("        }")
+    for mt in range(MT):
+        for nt in range(NT):
+            w("        {")
+            w(f"            int m0 = tileRow * BM + wm * 64 + {mt * 16} + g, m1 = m0 + 8;")
+            w(f"            int n0 = tileCol * BN + wn * 32 + {nt * 8} + 2 * t, n1 = n0 + 1;")
+            w("            float bias0 = 0f, bias1 = 0f;")
+            w("            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }")
+            for (mrow, ci0, ci1) in (("m0", 0, 1), ("m1", 2, 3)):
+                w(f"            if ({mrow} < M)")
+                w("            {")
+                for (ncol, ci) in (("n0", ci0), ("n1", ci1)):
+                    b = "bias0" if ncol == "n0" else "bias1"
+                    w(f"                if ({ncol} < N) {{ float v = Activate(c{mt}{nt}{ci} + {b}, act); if (hasRes != 0) v += res[(long){mrow} * N + {ncol}]; C[(long){mrow} * N + {ncol}] = v; }}")
+                w("            }")
+            w("        }")
+    w("    }")
+    w("")
+    w("    // the two bf16 halves of a packed register as floats (bf16 is the top 16 bits of an fp32)")
+    w("    private static float Bf16Lo(uint packed) => Interop.IntAsFloat(packed << 16);")
+    w("    private static float Bf16Hi(uint packed) => Interop.IntAsFloat(packed & 0xFFFF0000u);")
+    w("")
+
+
+kernel_split()
+
+
 def kernel_sm75_scaled():
     """KernelF16Sm75Scaled (2026-11-05, training on Turing): C[M,N] = (A[M,K] * s) W[N,K]^T / s with s = sc[0] (a power of two the caller
     chose from max|A|, so small gradients do not underflow f16 and the scaling is exact). Dense A, no bias / activation / residual.

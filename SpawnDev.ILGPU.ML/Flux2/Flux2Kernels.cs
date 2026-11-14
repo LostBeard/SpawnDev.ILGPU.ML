@@ -70,6 +70,16 @@ public sealed class Flux2Kernels
         _pv(T * H * D, scores, vc, o, T, H, D, rep);
     }
 
+    // ───────────────────────────────────────────── scale ──────────────────────────
+    private Action<Index1D, FV, FV, float>? _scaleInto;
+    private static void ScaleIntoImpl(Index1D i, FV x, FV o, float s) => o[i] = x[i] * s;
+    /// <summary>o[i] = x[i] * s over n values (a scaled matrix's input: Flux2Weights.ActivationScale).</summary>
+    public void ScaleInto(FV x, FV o, float s, int n)
+    {
+        _scaleInto ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(ScaleIntoImpl);
+        _scaleInto(n, x, o, s);
+    }
+
     // ───────────────────────────────────────────── column copy ──────────────────────────
 
     private Action<Index1D, FV, FV, int, int, int, int>? _copyCols;

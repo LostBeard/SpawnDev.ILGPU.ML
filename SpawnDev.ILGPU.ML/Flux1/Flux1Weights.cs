@@ -50,5 +50,12 @@ public sealed class Flux1Weights : IDisposable
     /// <summary>A matrix [N, K] of <paramref name="w"/> as bf16 (8-bit floats decoded into the shared scratch, valid until the next call).</summary>
     public BV Matrix(GpuWeights w, string name) => _s.Matrix(w, name);
 
+    /// <summary>True for an fp8_scaled file (see <see cref="StreamedModelWeights.HasScales"/>).</summary>
+    public bool HasScales => _s.HasScales;
+    /// <summary><see cref="StreamedModelWeights.MatrixExact"/>: the unscaled exact decode, paired with <see cref="ActivationScale"/>.</summary>
+    public BV MatrixExact(GpuWeights w, string name) => _s.MatrixExact(w, name);
+    /// <summary><see cref="StreamedModelWeights.ActivationScale"/>.</summary>
+    public float ActivationScale(GpuWeights w, string name) => _s.ActivationScale(w, name);
+
     public void Dispose() => _s.Dispose();
 }

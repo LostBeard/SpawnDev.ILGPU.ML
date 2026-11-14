@@ -43,6 +43,13 @@ public sealed class UmT5Encoder : IDisposable
     /// <summary>Test hook: (stage name, activation view, element count), valid only during the call; names "embedding", "layer_N", "final" (the first sequence of a call).</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
+    /// <summary>
+    /// CUDA: fp32-class activations through the tensor-core GEMMs (<see cref="DiTKernels.PreciseActivations"/>). T5-v1.1-XXL's activations are huge with outliers, so bf16 activations
+    /// cost the most here (FLUX.1's T5 against ComfyUI's fp32 run: 6.1e-3 on CUDA's bf16 path, 8.3e-6 on SpawnGen's RX 590). Off by default (the Wan / LTX gates were measured
+    /// on the bf16 path); a ComfyUI-parity caller turns it on. Other backends compute in fp32 either way.
+    /// </summary>
+    public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
+
     private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias, bool hfLayout = false, string prefix = "")
     {
         _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers; _sharedBias = sharedBias;

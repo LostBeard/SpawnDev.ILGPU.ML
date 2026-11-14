@@ -54,26 +54,38 @@ public sealed class Flux2Weights : IDisposable
 
     /// <summary>Stream one stage's safetensors file from a model source (browser OPFS / hub, or HttpClient + a file store on desktop) onto the device.</summary>
     public static Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
-        => LoadAsync(accelerator, source, repo, file, Flux2TextEncoder.Layers, cancellationToken);
+        => LoadAsync(accelerator, source, repo, file, Flux2TextEncoder.Layers, false, cancellationToken);
 
     /// <summary>The same, reading the first <paramref name="textEncoderLayers"/> layers of a Hugging Face Qwen3 text encoder (FLUX.2: 27; Z-Image: 35).</summary>
-    public static async Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, int textEncoderLayers, CancellationToken cancellationToken = default)
+    public static Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, int textEncoderLayers, CancellationToken cancellationToken = default)
+        => LoadAsync(accelerator, source, repo, file, textEncoderLayers, false, cancellationToken);
+
+    /// <summary>
+    /// The same; <paramref name="finalNorm"/> also keeps the text encoder's final norm (<c>model.norm.weight</c>) for a model that reads the last hidden state after it (Qwen-Image's
+    /// Qwen2.5-VL-7B: all 28 layers and the norm). ComfyUI's 8-bit "scaled" text encoders (one <c>scale_weight</c> per matrix) stay 8-bit on the device; a vision tower is never read.
+    /// </summary>
+    public static async Task<Flux2Weights> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string file, int textEncoderLayers, bool finalNorm, CancellationToken cancellationToken = default)
     {
         await using var stream = await source.OpenAsync(repo, file, cancellationToken);
         using var empty = JsonDocument.Parse("{}");
-        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", n => Flux2ComfyFormat.TextEncoderFilter(n, textEncoderLayers), cancellationToken);
+        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", n => Flux2ComfyFormat.TextEncoderFilter(n, textEncoderLayers, finalNorm), cancellationToken);
         try
         {
             // ComfyUI's template files, rewritten into this library's layout as they land: a transformer in Black Forest Labs' layout (flux-2-klein, bf16 or 8-bit floats),
             // a text encoder in Hugging Face Qwen3 names (qwen_3_4b; only its first textEncoderLayers layers were read)
-            if (Flux2ComfyFormat.IsHfQwen3(w)) await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w, textEncoderLayers);
-            var scales = Flux2ComfyFormat.IsBflTransformer(w) ? await Flux2ComfyFormat.AdaptTransformerAsync(accelerator, w) : null;
+            Dictionary<string, float>? scales = null;
+            if (Flux2ComfyFormat.IsHfQwen3(w)) scales = await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w, textEncoderLayers);
+            else if (Flux2ComfyFormat.IsBflTransformer(w)) scales = await Flux2ComfyFormat.AdaptTransformerAsync(accelerator, w);
             return new Flux2Weights(accelerator, w, true, scales);
         }
         catch { w.Dispose(); throw; }
     }
 
     public bool IsQuantized(string name) => _w.IsU32(name);
+    /// <summary>Whether the stage holds tensor <paramref name="name"/>.</summary>
+    public bool Has(string name) => _w.Has(name);
+    /// <summary>Tensor <paramref name="name"/>'s shape.</summary>
+    public int[] Shape(string name) => _w.Shape(name);
     /// <summary>Device bytes held (weights plus the dequantisation scratch).</summary>
     public long Bytes => _w.Bytes + (_scratch?.Length ?? 0) * 4;
 
@@ -93,6 +105,23 @@ public sealed class Flux2Weights : IDisposable
         if (QuantBits == 8) _f.DequantQ8(_w.U32(name), _scratch!.View, n, k); else _f.DequantQ4(_w.U32(name), _scratch!.View, n, k);
         return _scratch.View.SubView(0, (long)n * k / 2).Cast<uint, BFloat16>();
     }
+
+    /// <summary>
+    /// An 8-bit float matrix decoded WITHOUT its scale (exact: every F8_E4M3 value is a bf16 value), paired with <see cref="ActivationScale"/>: the caller multiplies the matrix's input by
+    /// the scale instead (s (x W) = (s x) W, and the bias is added after), so no weight is rounded the way <see cref="Matrix"/>'s folded decode (f8 * scale rounded to bf16) rounds it. Matches
+    /// ComfyUI's fp32 "manual cast" of fp8_scaled files. Other matrices: <see cref="Matrix"/>. Valid until the next call.
+    /// </summary>
+    public BV MatrixExact(string name)
+    {
+        if (!_w.IsF8(name)) return Matrix(name);
+        long count = 1; foreach (int d in _w.Shape(name)) count *= d;
+        var dst = _scratch!.View.SubView(0, count / 2).Cast<uint, BFloat16>();
+        WanComfyFormat.DecodeF8E4M3(_acc, _w.F8Words(name), dst, 1f);
+        return dst;
+    }
+
+    /// <summary>The factor <see cref="MatrixExact"/> leaves to the input: an 8-bit matrix's decode scale, 1 for every other matrix.</summary>
+    public float ActivationScale(string name) => _w.IsF8(name) && _f8Scales != null && _f8Scales.TryGetValue(name, out var s) ? s : 1f;
 
     /// <summary>
     /// W8A8 (<see cref="Q8Linear"/>): 8-bit matrices multiply straight from their blocks with activations quantised to 8 bits per block of 32, on packed int8 dot products,

@@ -126,8 +126,8 @@ public abstract partial class MLTestBase
             }
         }
         foreach (var line in report) Console.WriteLine("[Flux1] transformer: " + line);
-        // MEASURED (RTX 4070, CUDA, 2026-11-14): 4.71e-3 and 5.34e-3 (ComfyUI ran fp32 activations on the same 8-bit weights, exact in bf16; we run bf16 GEMMs)
-        Ur_Expect(worst < 0.01, string.Join("; ", report));
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): 3.32e-5 and 5.49e-5 with the default precise activations (bf16 activations: 4.71e-3 / 5.34e-3; RX 590 OpenCL fp32: 4.7e-6 / 8.5e-6, SpawnGen)
+        Ur_Expect(worst < 2e-4, string.Join("; ", report));
         Ur_Expect(control > 4 * worst, "the guidance control must not match: " + string.Join("; ", report));
         return string.Join("; ", report);
     });
@@ -148,6 +148,7 @@ public abstract partial class MLTestBase
         using var fs = File.OpenRead(tokPath);
         var tok = Preprocessing.UnigramTokenizer.FromTokenizerJson(fs);
         using var t5 = await Wan.UmT5Encoder.CreateAsync(accelerator, new LocalFolderModelSource(comfy), "", file);
+        t5.PreciseActivations = true;                                            // ComfyUI ran it in fp32
         var report = new List<string>();
         double worst = 0, worstReal = 0;
         foreach (var (prompt, dump) in new[] { ("a red apple on a wooden table", "flux1_cond_0_cond_f32_1x256x4096.raw"), ("", "flux1_cond_empty_0_cond_f32_1x256x4096.raw") })
@@ -163,7 +164,8 @@ public abstract partial class MLTestBase
         foreach (var line in report) Console.WriteLine("[Flux1] T5 from the checkpoint vs ComfyUI: " + line);
         // MEASURED (RTX 4070, CUDA, 2026-11-14): prompt real tokens 6.13e-3, all rows 1.28e-2; empty prompt (the end token alone) 1.26e-3, all rows 1.99e-2. The empty prompt
         // read as a space piece + end token (the tokenizer before its whitespace fix) was 1.46 on the real rows: that is this gate's red-check.
-        Ur_Expect(worstReal < 0.015 && worst < 0.04, string.Join("; ", report));
+        // PreciseActivations (MEASURED 2026-11-14): prompt real tokens 3.17e-4, all rows 1.05e-3; empty prompt 5.6e-6 / 1.5e-4 (bf16 activations: 6.1e-3 / 1.3e-2; RX 590 OpenCL 8.3e-6 / 1.4e-5)
+        Ur_Expect(worstReal < 1e-3 && worst < 3e-3, string.Join("; ", report));
         return string.Join("; ", report);
     });
 
@@ -203,6 +205,7 @@ public abstract partial class MLTestBase
         if (!File.Exists(Path.Combine(comfy, file)) || !Directory.Exists(d) || !File.Exists(tokPath)) throw new UnsupportedTestException($"needs {comfy}\\{file}, the dumps in {d} and the CLIP tokenizer {tokPath}");
         var tok = Preprocessing.BPETokenizer.LoadFromTokenizerJson(await File.ReadAllTextAsync(tokPath));
         using var clip = await StableDiffusion.SdTextEncoder.LoadAsync(accelerator, new LocalFolderModelSource(comfy), "", file);
+        clip.ExactActivations = true;                                            // ComfyUI ran it in fp32
         var ids = tok.EncodeCLIP("a red apple on a wooden table");
         var want = F2_Raw(Path.Combine(d, "flux1_call_0_c_y_f32_1x768.raw"), 768);
         var plain = await clip.PooledAsync(ids, project: false);
@@ -210,8 +213,8 @@ public abstract partial class MLTestBase
         double ePlain = F2_RelRms(plain, want), eProj = F2_RelRms(projected, want);
         var report = $"pooled CLIP-L vs ComfyUI's y: final-norm end-token row {ePlain:E2}, through text_projection {eProj:E2}";
         Console.WriteLine("[Flux1] " + report);
-        // MEASURED (RTX 4070, CUDA, 2026-11-14): 3.33e-4, the same for both readings (the final-norm end-token row, with or without text_projection)
-        Ur_Expect(Math.Min(ePlain, eProj) < 1e-3, report);
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): 1.34e-6 with ExactActivations, the same for both readings (the final-norm end-token row, with or without text_projection); tensor cores 3.33e-4
+        Ur_Expect(Math.Min(ePlain, eProj) < 1e-5, report);
         return report;
     });
 

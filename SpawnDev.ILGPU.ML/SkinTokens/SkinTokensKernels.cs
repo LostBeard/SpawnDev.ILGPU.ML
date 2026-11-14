@@ -74,6 +74,22 @@ public sealed class SkinTokensKernels
         float inv = 1f / MathF.Sqrt(ss / D + eps);
         for (int d = 0; d < D; d++) buf[b + d] = buf[b + d] * inv * PrecisionConvert.ConvertToSingle(w[d]);
     }
+    private Action<Index1D, FV, BV, BV, int, int, int, int, float>? _rmsHeadsLo;
+    private static void RmsHeadsLoImpl(Index1D i, FV buf, BV w, BV wLo, int stride, int off, int H, int D, float eps)
+    {
+        int h = i % H, n = i / H;
+        long b = (long)n * stride + off + h * D;
+        float ss = 0f;
+        for (int d = 0; d < D; d++) { float v = buf[b + d]; ss += v * v; }
+        float inv = 1f / MathF.Sqrt(ss / D + eps);
+        for (int d = 0; d < D; d++) buf[b + d] = buf[b + d] * inv * (PrecisionConvert.ConvertToSingle(w[d]) + PrecisionConvert.ConvertToSingle(wLo[d]));
+    }
+    /// <summary><see cref="RmsNormHeads(FV, BV, int, int, int, int, int, float)"/> with the weight held as bf16 hi + lo (an fp16 weight kept exactly: StreamedModelWeights' name.lo).</summary>
+    public void RmsNormHeads(FV buf, BV w, BV wLo, int rows, int stride, int off, int H, int D, float eps)
+    {
+        _rmsHeadsLo ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, int, int, int, int, float>(RmsHeadsLoImpl);
+        _rmsHeadsLo(rows * H, buf, w, wLo, stride, off, H, D, eps);
+    }
     /// <summary>In place RMS norm of every D-wide head vector of rows [n, stride] starting at column off (Qwen3's q_norm / k_norm: one weight of D shared by all heads).</summary>
     public void RmsNormHeads(FV buf, BV w, int rows, int stride, int off, int H, int D, float eps)
     {

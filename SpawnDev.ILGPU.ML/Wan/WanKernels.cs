@@ -446,6 +446,23 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // Wan 2.1's VAE has no 2 x 2 patching: a picture [3, F, H, W] channel-first -> channel-last [F*H*W, 3], and the head's [F*H*W, 3] -> video [3, F, H, W] clamped to [-1, 1]
+    private Action<Index1D, FV, FV, int>? _toChannelLast, _toChannelFirstClamp;
+    private static void ToChannelLastImpl(Index1D i, FV src, FV dst, int pixels) { int c = i % 3; long p = i / 3; dst[i] = src[c * (long)pixels + p]; }
+    private static void ToChannelFirstClampImpl(Index1D i, FV src, FV dst, int pixels) { long p = i % pixels; int c = (int)(i / pixels); dst[i] = MathF.Max(-1f, MathF.Min(1f, src[p * 3 + c])); }
+    /// <summary>[3, pixels] channel-first (pixels = F*H*W) -> [pixels, 3] channel-last.</summary>
+    public void ToChannelLast3(FV src, FV dst, int pixels)
+    {
+        _toChannelLast ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(ToChannelLastImpl);
+        _toChannelLast(3 * pixels, src, dst, pixels);
+    }
+    /// <summary>[pixels, 3] channel-last -> [3, pixels] channel-first, clamped to [-1, 1] (Wan 2.1's decoder output).</summary>
+    public void ToChannelFirstClamp3(FV src, FV dst, int pixels)
+    {
+        _toChannelFirstClamp ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(ToChannelFirstClampImpl);
+        _toChannelFirstClamp(3 * pixels, src, dst, pixels);
+    }
+
     // ===================================================================================================
     // umT5 encoder kernels: attention WITHOUT the 1/sqrt(d) scaling, plus a per-head relative-position bias read from a bucket table
     // ===================================================================================================

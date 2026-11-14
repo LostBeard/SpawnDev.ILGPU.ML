@@ -46,7 +46,19 @@ public sealed class WanVae : IDisposable
     public WanVae(Accelerator accelerator, GpuWeights weights)
     {
         _acc = accelerator; _w = weights; _pool = new ActivationPool(accelerator); _sk = new SparseKernels(accelerator); _wk = new WanKernels(accelerator); _dk = new DiTKernels(accelerator);
+        _v21 = weights.Has("decoder.upsamples.0.residual.0.gamma");                     // Wan 2.1's flat block list (2.2 nests them: decoder.upsamples.i.upsamples.j)
     }
+
+    private readonly bool _v21;
+    /// <summary>
+    /// True for the Wan 2.1 VAE (16 latent channels, 8x spatial, no 2 x 2 patching; the VAE of Wan 2.1 / Wan 2.2 14B and Qwen-Image), false for the Wan 2.2 VAE (48 channels, 16x).
+    /// Told from the weights: the same methods run either.
+    /// </summary>
+    public bool IsWan21 => _v21;
+    /// <summary>Latent channels: 16 (Wan 2.1) or 48 (Wan 2.2).</summary>
+    public int LatentChannels => _v21 ? 16 : 48;
+    /// <summary>Pixels per latent position along each side: 8 (Wan 2.1) or 16 (Wan 2.2).</summary>
+    public int SpatialRatio => _v21 ? 8 : 16;
 
     // -----------------------------------------------------------------------------------------------------------------------------------
     // buffers: see ActivationPool (large activations recycled by size as soon as they are dropped, small ones freed together after a fence)
@@ -180,9 +192,10 @@ public sealed class WanVae : IDisposable
         return proj;
     }
 
-    /// <summary>Resample "upsample2d" / "upsample3d": the optional causal temporal doubling, then nearest x2 and a 3x3 convolution. Returns the new frame count.</summary>
-    private Buf Upsample(string p, Buf x, ref int T, int H, int W, int C, bool temporal)
+    /// <summary>Resample "upsample2d" / "upsample3d": the optional causal temporal doubling, then nearest x2 and a 3x3 convolution to <paramref name="cout"/> channels (-1: C; Wan 2.1 halves them). Returns the new frame count.</summary>
+    private Buf Upsample(string p, Buf x, ref int T, int H, int W, int C, bool temporal, int cout = -1)
     {
+        int co = cout < 0 ? C : cout;
         int hw = H * W;
         var cur = x; int T2 = T;
         if (temporal)
@@ -215,8 +228,8 @@ public sealed class WanVae : IDisposable
                 T2 = 2 * T;
             }
         }
-        var y = Tmp((long)T2 * 4 * hw * C);
-        TraceConv(p + "resample.1", (long)T2 * 4 * hw, C, C, 9, () => _sk.ConvTaps(cur.View, Table(2, T2, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T2 * 4 * hw, C, C, 9));
+        var y = Tmp((long)T2 * 4 * hw * co);
+        TraceConv(p + "resample.1", (long)T2 * 4 * hw, C, co, 9, () => _sk.ConvTaps(cur.View, Table(2, T2, H, W, 0).View, _w.F16(p + "resample.1.weight"), _w.F16(p + "resample.1.bias"), y.View, T2 * 4 * hw, C, co, 9));
         if (!ReferenceEquals(cur, x)) Drop(cur);
         T = T2;
         return y;
@@ -288,6 +301,7 @@ public sealed class WanVae : IDisposable
     /// </summary>
     public async Task<float[]> EncodeImageAsync(float[] image, int H, int W)
     {
+        if (_v21) return await EncodeImage21Async(image, H, W);                 // Wan 2.1: multiples of 8, [16, 1, H/8, W/8]
         if (H % 16 != 0 || W % 16 != 0) throw new ArgumentException("the picture size must be a multiple of 16");
         _caches.Clear(); _cacheEnabled = false;
         try
@@ -331,6 +345,7 @@ public sealed class WanVae : IDisposable
     /// </summary>
     public async Task<float[]> DecodeAsync(float[] z, int Fz, int h, int w)
     {
+        if (_v21) return await Decode21Async(z, Fz, h, w);                      // Wan 2.1: [16, Fz, h, w] -> [3, 4 Fz - 3, 8 h, 8 w]
         int H8 = h * 16, W8 = w * 16, totalFrames = 4 * Fz - 3;
         // the picture is assembled on the host chunk by chunk (a 720p, 121-frame video is 1.3 GB: it never exists on the device, which also keeps every device buffer small)
         var result = new float[3L * totalFrames * H8 * W8];
@@ -359,6 +374,27 @@ public sealed class WanVae : IDisposable
         int totalFrames = 4 * Fz - 3;
         var o = new List<byte[]>(totalFrames);
         var lk = new Ltx.LtxKernels(_acc);
+        if (_v21)
+        {
+            async Task Emit21Async(Buf head, int frames, int Hs, int Ws)
+            {
+                int pixels = Hs * Ws;
+                using var chunk = _acc.Allocate1D<float>(3L * frames * pixels);
+                _wk.ToChannelFirstClamp3(head.View, chunk.View, frames * pixels);
+                using var packed = _acc.Allocate1D<int>(pixels);
+                for (int f = 0; f < frames; f++)
+                {
+                    lk.FrameRgba(chunk.View, packed.View, frames, pixels, f);
+                    var ints = await packed.View.CopyToHostAsync();
+                    var frame = new byte[pixels * 4];
+                    Buffer.BlockCopy(ints, 0, frame, 0, frame.Length);
+                    o.Add(frame);
+                }
+            }
+            await DecodeCore21Async(z, Fz, h, w, Emit21Async);
+            if (o.Count != totalFrames) throw new InvalidOperationException($"decoded {o.Count} frames, expected {totalFrames}");
+            return o.ToArray();
+        }
         async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
         {
             int pixels = Hs * 2 * Ws * 2;
@@ -388,6 +424,7 @@ public sealed class WanVae : IDisposable
     /// </summary>
     public async Task<float[]> DecodeTiledAsync(float[] z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
     {
+        if (_v21) throw new NotSupportedException("tiled decoding is implemented for the Wan 2.2 VAE; decode Wan 2.1 latents with DecodeAsync");
         const int Z = 48, Ch = 12, P = 2, Ratio = 16;
         if (tileSample % Ratio != 0 || strideSample % Ratio != 0 || strideSample > tileSample) throw new ArgumentException("tile and stride must be multiples of 16, stride <= tile");
         int tl = tileSample / Ratio, ts = strideSample / Ratio;
@@ -563,6 +600,141 @@ public sealed class WanVae : IDisposable
         zIn.Dispose(); Drop(zBuf); Flush();
         foreach (var c in _caches.Values) c.Packed?.Dispose();
         _caches.Clear();
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+    // Wan 2.1: encoder / decoder as flat lists of residual blocks and resamples (the reference's Encoder3d / Decoder3d), channel counts read from the weights
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
+    private int ConvOut(string name) => _w.Shape(name + ".weight")[0];                                  // [co, taps, ci] after WanComfyFormat.AdaptVaeAsync
+    private int GammaChannels(string name) => _w.Shape(name)[0];
+
+    /// <summary>One flat stage list (<c>encoder.downsamples</c> or <c>decoder.upsamples</c>): residual blocks and resamples in order.</summary>
+    private async Task<Buf> Stages21Async(string list, Buf x, int T, int H, int W, int C, bool down, Action<int, Buf, int, int, int, int>? tap)
+    {
+        var cur = x;
+        for (int i = 0; ; i++)
+        {
+            string p = $"{list}.{i}.";
+            Buf next;
+            if (_w.Has(p + "residual.0.gamma"))
+            {
+                int cin = GammaChannels(p + "residual.0.gamma"), cout = ConvOut(p + "residual.2");
+                if (cin != C) throw new InvalidDataException($"{p}: {cin} input channels, the previous stage gives {C}");
+                next = ResBlock(p, cur, T, H, W, cin, cout); C = cout;
+            }
+            else if (_w.Has(p + "resample.1.weight"))
+            {
+                if (down) { next = Downsample(p, cur, T, H, W, C); H /= 2; W /= 2; }                   // downsample3d's temporal convolution is skipped for one frame (the first chunk)
+                else
+                {
+                    int cout = ConvOut(p + "resample.1");
+                    next = Upsample(p, cur, ref T, H, W, C, _w.Has(p + "time_conv.weight"), cout); H *= 2; W *= 2; C = cout;
+                }
+            }
+            else break;
+            if (!ReferenceEquals(cur, x)) Drop(cur);
+            cur = next;
+            tap?.Invoke(i, cur, T, H, W, C);
+            Flush(); await _acc.SynchronizeAsync();                              // a flush is not a wait: bound the queue (browser WebGPU loses the device when seconds of work are queued)
+        }
+        return cur;
+    }
+
+    /// <summary>Wan 2.1 <see cref="EncodeImageAsync"/>: [3, 1, H, W] in [-1, 1] (multiples of 8) -> the normalised latent mean [16, 1, H/8, W/8].</summary>
+    private async Task<float[]> EncodeImage21Async(float[] image, int H, int W)
+    {
+        if (H % 8 != 0 || W % 8 != 0) throw new ArgumentException("the picture size must be a multiple of 8");
+        _caches.Clear(); _cacheEnabled = false;
+        try
+        {
+            using var img = _acc.Allocate1D(image);
+            var x0 = Tmp((long)H * W * 3);
+            _wk.ToChannelLast3(img.View, x0.View, H * W);
+            int T = 1, c1 = ConvOut("encoder.conv1");
+            var cur = ConvCausal("encoder.conv1", x0, T, H, W, 3, c1); Drop(x0);
+            Tap?.Invoke("enc_conv1", cur.View, T, H, W, c1);
+            int Hc = H, Wc = W, C = c1;
+            var down = await Stages21Async("encoder.downsamples", cur, T, H, W, c1, true, (i, b, t, h, w, c) => { Hc = h; Wc = w; C = c; Tap?.Invoke($"enc_down{i}", b.View, t, h, w, c); });
+            if (!ReferenceEquals(down, cur)) Drop(cur);
+            var m0 = ResBlock("encoder.middle.0.", down, T, Hc, Wc, C, C); Drop(down);
+            var m1 = Attention("encoder.middle.1.", m0, T, Hc, Wc, C); Drop(m0);
+            var m2 = ResBlock("encoder.middle.2.", m1, T, Hc, Wc, C, C); Drop(m1);
+            Tap?.Invoke("enc_middle", m2.View, T, Hc, Wc, C);
+            var hn = NormSilu(m2, "encoder.head.0.gamma", T * Hc * Wc, C); Drop(m2);
+            int z2 = ConvOut("encoder.head.2");
+            var hc = ConvCausal("encoder.head.2", hn, T, Hc, Wc, C, z2); Drop(hn);
+            var moments = Pointwise("conv1", hc, T * Hc * Wc, z2, z2); Drop(hc);                     // quant_conv; the first half of the channels is mu
+            var host = await moments.View.CopyToHostAsync();
+            Drop(moments); Flush();
+            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+            int Z = z2 / 2, hw = Hc * Wc;
+            var z = new float[(long)Z * hw];
+            for (int c = 0; c < Z; c++) for (int p = 0; p < hw; p++) z[(long)c * hw + p] = (host[(long)p * z2 + c] - mean[c]) / std[c];
+            return z;
+        }
+        finally { _cacheEnabled = true; }
+    }
+
+    /// <summary>Wan 2.1's chunked causal decode: per latent frame, the head's [frames * H * W, 3] output goes to <paramref name="emit"/> in order (1 frame, then 4 per chunk).</summary>
+    private async Task DecodeCore21Async(float[] z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit)
+    {
+        int Z = LatentChannels, hw = h * w;
+        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+        var zc = new float[(long)Fz * hw * Z];
+        for (int c = 0; c < Z; c++)
+            for (int f = 0; f < Fz; f++)
+                for (int p = 0; p < hw; p++)
+                    zc[((long)f * hw + p) * Z + c] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+        _caches.Clear();
+        using var zIn = _acc.Allocate1D(zc);
+        var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);                                         // post_quant_conv
+        int Cm = ConvOut("decoder.conv1");
+        for (int i = 0; i < Fz; i++)
+        {
+            int T = 1;
+            var xi = Tmp((long)hw * Z);
+            xi.View.CopyFrom(zBuf.View.SubView((long)i * hw * Z, (long)hw * Z));
+            var y = ConvCausal("decoder.conv1", xi, T, h, w, Z, Cm); Drop(xi);
+            var m0 = ResBlock("decoder.middle.0.", y, T, h, w, Cm, Cm); Drop(y);
+            var m1 = Attention("decoder.middle.1.", m0, T, h, w, Cm); Drop(m0);
+            var m2 = ResBlock("decoder.middle.2.", m1, T, h, w, Cm, Cm); Drop(m1);
+            Tap?.Invoke("dec_middle", m2.View, T, h, w, Cm);
+            int Tc = T, Hc = h, Wc = w, C = Cm;
+            var up = await Stages21Async("decoder.upsamples", m2, T, h, w, Cm, false, (s, b, t, hh, ww, c) => { Tc = t; Hc = hh; Wc = ww; C = c; Tap?.Invoke($"dec_up{s}", b.View, t, hh, ww, c); });
+            if (!ReferenceEquals(up, m2)) Drop(m2);
+            var hn = NormSilu(up, "decoder.head.0.gamma", Tc * Hc * Wc, C); Drop(up);
+            var hc = ConvCausal("decoder.head.2", hn, Tc, Hc, Wc, C, 3); Drop(hn);
+            Tap?.Invoke("dec_head", hc.View, Tc, Hc, Wc, 3);
+            await _acc.SynchronizeAsync();
+            await emit(hc, Tc, Hc, Wc);
+            Drop(hc);
+            Flush(); await _acc.SynchronizeAsync();
+        }
+        Drop(zBuf); Flush();
+        foreach (var c in _caches.Values) c.Packed?.Dispose();
+        _caches.Clear();
+    }
+
+    /// <summary>Wan 2.1 <see cref="DecodeAsync"/>: [16, Fz, h, w] -> video [3, 4 Fz - 3, 8 h, 8 w] in [-1, 1].</summary>
+    private async Task<float[]> Decode21Async(float[] z, int Fz, int h, int w)
+    {
+        int H8 = h * 8, W8 = w * 8, totalFrames = 4 * Fz - 3;
+        var result = new float[3L * totalFrames * H8 * W8];
+        long plane = (long)totalFrames * H8 * W8;
+        int written = 0;
+        async Task EmitAsync(Buf head, int frames, int Hs, int Ws)
+        {
+            int pixels = frames * Hs * Ws;
+            using var chunk = _acc.Allocate1D<float>(3L * pixels);
+            _wk.ToChannelFirstClamp3(head.View, chunk.View, pixels);                                 // [3, frames, Hs, Ws]
+            var host = await chunk.View.CopyToHostAsync();
+            for (int c = 0; c < 3; c++) Array.Copy(host, (long)c * pixels, result, c * plane + (long)written * Hs * Ws, pixels);
+            written += frames;
+        }
+        await DecodeCore21Async(z, Fz, h, w, EmitAsync);
+        if (written != totalFrames) throw new InvalidOperationException($"decoded {written} frames, expected {totalFrames}");
+        return result;
     }
 
     /// <summary>Log the time of every decoder stage (each is awaited to completion, so the times are the device time): <c>[Wan] vae ...</c> lines on the console.</summary>

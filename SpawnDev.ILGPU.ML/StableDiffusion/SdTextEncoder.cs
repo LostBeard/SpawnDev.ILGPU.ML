@@ -32,6 +32,9 @@ internal sealed class SdClipTower
         Heads = Width / 64;
     }
 
+    /// <summary>fp32 activations through the linear layers (SdKernels.Linear exact: no tensor cores); attention is fp32 either way.</summary>
+    public bool Exact { get; set; }
+
     public bool HasProjection => _w.Has(P + "proj.weight");
     public int ProjectionWidth => _w.Shape(P + "proj.weight")[0];
 
@@ -45,14 +48,14 @@ internal sealed class SdClipTower
         {
             string p = $"{P}layers.{i}.";
             _k.Sparse.LayerNorm(x, n, _w[p + "ln1.weight"], _w[p + "ln1.bias"], T, C, 1e-5f);
-            _k.Linear(n, _w[p + "qkv.weight"], _w[p + "qkv.bias"], qkv, T, C, 3 * C);
+            _k.Linear(n, _w[p + "qkv.weight"], _w[p + "qkv.bias"], qkv, T, C, 3 * C, exact: Exact);
             _k.CausalAttention(qkv, a, T, Heads, C / Heads);
-            _k.Linear(a, _w[p + "out.weight"], _w[p + "out.bias"], x, T, C, C, 0, x);
+            _k.Linear(a, _w[p + "out.weight"], _w[p + "out.bias"], x, T, C, C, 0, x, Exact);
             _k.Sparse.LayerNorm(x, n, _w[p + "ln2.weight"], _w[p + "ln2.bias"], T, C, 1e-5f);
             int inner = _w.Shape(p + "fc1.weight")[0];
-            _k.Linear(n, _w[p + "fc1.weight"], _w[p + "fc1.bias"], hid, T, C, inner);
+            _k.Linear(n, _w[p + "fc1.weight"], _w[p + "fc1.bias"], hid, T, C, inner, exact: Exact);
             if (QuickGelu) _k.QuickGeluInPlace(hid, (long)T * inner); else _k.GeluInPlace(hid, (long)T * inner);
-            _k.Linear(hid, _w[p + "fc2.weight"], _w[p + "fc2.bias"], x, T, inner, C, 0, x);
+            _k.Linear(hid, _w[p + "fc2.weight"], _w[p + "fc2.bias"], x, T, inner, C, 0, x, Exact);
         }
     }
 }
@@ -129,6 +132,12 @@ public sealed partial class SdTextEncoder : IDisposable
     /// <summary>The token count of one prompt chunk (77).</summary>
     public int MaxTokens => _towers[0].MaxTokens;
     public bool IsXL => _xl;
+
+    /// <summary>
+    /// fp32 activations through the text towers' linear layers on CUDA (no tensor cores; other backends compute in fp32 either way). Off by default (the SD gates were measured on
+    /// the tensor-core path); a caller matching ComfyUI's fp32 runs turns it on (FLUX.1's CLIP-L pooled vector: 3.3e-4 with bf16 activations on CUDA, 1.4e-6 on SpawnGen's RX 590).
+    /// </summary>
+    public bool ExactActivations { get => _towers[0].Exact; set { foreach (var t in _towers) t.Exact = value; } }
 
     internal SdTextEncoder(Accelerator acc, SdWeights weights, SdFamily family)
     {

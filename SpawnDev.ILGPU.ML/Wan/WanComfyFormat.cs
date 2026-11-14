@@ -27,7 +27,21 @@ public static class WanComfyFormat
     private static Accelerator? _toBf16Acc;
     // fp16 -> bf16 (ILGPU's (BFloat16)float cast rounds to nearest even; a bf16 value that went through fp16 comes back exactly unless fp16 made it subnormal)
     private static void ToBf16Impl(Index1D i, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst) => dst[i] = (BFloat16)(float)src[i];
-    private static void ToBf16(Accelerator acc, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst)
+    private static Action<Index1D, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>? _toBf16HiLo;
+    private static Accelerator? _toBf16HiLoAcc;
+    private static void ToBf16HiLoImpl(Index1D i, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> hi, ArrayView1D<BFloat16, Stride1D.Dense> lo)
+    {
+        float v = (float)src[i];
+        var h = (BFloat16)v;
+        hi[i] = h; lo[i] = (BFloat16)(v - (float)h);
+    }
+    /// <summary>fp16 -> bf16 hi + bf16 lo with hi + lo = the fp16 value exactly (the remainder has at most 3 significant bits).</summary>
+    internal static void ToBf16HiLo(Accelerator acc, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> hi, ArrayView1D<BFloat16, Stride1D.Dense> lo)
+    {
+        if (!ReferenceEquals(_toBf16HiLoAcc, acc)) { _toBf16HiLo = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(ToBf16HiLoImpl); _toBf16HiLoAcc = acc; }
+        _toBf16HiLo!((int)src.Length, src, hi, lo);
+    }
+    internal static void ToBf16(Accelerator acc, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst)
     {
         if (!ReferenceEquals(_toBf16Acc, acc)) { _toBf16 = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(ToBf16Impl); _toBf16Acc = acc; }
         _toBf16!((int)src.Length, src, dst);
@@ -76,13 +90,30 @@ public static class WanComfyFormat
     /// <summary>True when <paramref name="w"/> is ComfyUI's Wan 2.2 VAE layout (torch-shaped convolutions, no latent normalisation) rather than ours.</summary>
     public static bool IsComfyVae(GpuWeights w) => !w.Has("latents_mean") && w.Has("conv1.weight") && w.Shape("conv1.weight").Length == 5;
 
-    /// <summary>Rewrite ComfyUI's Wan 2.2 VAE layout into ours, in place (see the class summary). Returns once the device has finished with the old buffers.</summary>
+    private static Action<Index1D, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>>? _toF16;
+    private static Accelerator? _toF16Acc;
+    // bf16 -> fp16 (exact for a VAE's weights: fp16 has 3 more mantissa bits; only values outside fp16's range or below its subnormals would change)
+    private static void ToF16Impl(Index1D i, ArrayView1D<BFloat16, Stride1D.Dense> src, ArrayView1D<global::ILGPU.Half, Stride1D.Dense> dst) => dst[i] = (global::ILGPU.Half)(float)src[i];
+
+    /// <summary>
+    /// Rewrite ComfyUI's Wan VAE layout into ours, in place (see the class summary): Wan 2.2's <c>wan2.2_vae.safetensors</c> (fp16, 48 latent channels) and the Wan 2.1 VAE
+    /// (16 channels: <c>wan_2.1_vae.safetensors</c>, Qwen-Image's <c>qwen_image_vae.safetensors</c>, bf16 tensors made fp16 first). The latent normalisation constants follow the channel
+    /// count. Returns once the device has finished with the old buffers.
+    /// </summary>
     public static async Task AdaptVaeAsync(Accelerator accelerator, GpuWeights w)
     {
         var sk = new SparseKernels(accelerator);
         var displaced = new List<IDisposable>();
         try
         {
+            foreach (var name in w.Names.Where(w.IsBF16).ToList())
+            {
+                if (!ReferenceEquals(_toF16Acc, accelerator)) { _toF16 = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>>(ToF16Impl); _toF16Acc = accelerator; }
+                var src = w.BF16(name);
+                var dst = accelerator.Allocate1D<global::ILGPU.Half>(src.Length);
+                _toF16!((int)src.Length, src, dst.View);
+                if (w.SetF16(name, dst, w.Shape(name)) is { } old) displaced.Add(old);
+            }
             foreach (var name in w.Names.ToList())
             {
                 var s = w.Shape(name);
@@ -105,8 +136,9 @@ public static class WanComfyFormat
                     if (w.SetF16(name, dst, new[] { co, taps, ci }) is { } old) displaced.Add(old);
                 }
             }
-            if (w.SetF32("latents_mean", accelerator.Allocate1D(LatentsMean), new[] { 48 }) is { } m) displaced.Add(m);
-            if (w.SetF32("latents_std", accelerator.Allocate1D(LatentsStd), new[] { 48 }) is { } d2) displaced.Add(d2);
+            bool v21 = w.Shape("conv2.weight")[0] == 16;                       // post_quant_conv: the latent's channels
+            if (w.SetF32("latents_mean", accelerator.Allocate1D(v21 ? LatentsMean21 : LatentsMean), new[] { v21 ? 16 : 48 }) is { } m) displaced.Add(m);
+            if (w.SetF32("latents_std", accelerator.Allocate1D(v21 ? LatentsStd21 : LatentsStd), new[] { v21 ? 16 : 48 }) is { } d2) displaced.Add(d2);
             await accelerator.SynchronizeAsync();        // the permutes have read the old buffers
         }
         finally
@@ -257,6 +289,9 @@ public static class WanComfyFormat
     }
 
     // the reference Wan2_2_VAE's latent normalisation (decode: z * std + mean), as our export stores it (fp32, shortest round-trip literals)
+    // the Wan 2.1 VAE's (Wan 2.1, Qwen-Image: diffusers' AutoencoderKLWan / AutoencoderKLQwenImage defaults)
+    private static readonly float[] LatentsMean21 = { -0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f, 0.9653f, -0.1517f, 1.5508f, 0.4134f, -0.0715f, 0.5517f, -0.3632f, -0.1922f, -0.9497f, 0.2503f, -0.2921f };
+    private static readonly float[] LatentsStd21 = { 2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f, 3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f };
     private static readonly float[] LatentsMean = { -0.2289f, -0.0052f, -0.1323f, -0.2339f, -0.2799f, 0.0174f, 0.1838f, 0.1557f, -0.1382f, 0.0542f, 0.2813f, 0.0891f, 0.157f, -0.0098f, 0.0375f, -0.1825f, -0.2246f, -0.1207f, -0.0698f, 0.5109f, 0.2665f, -0.2108f, -0.2158f, 0.2502f, -0.2055f, -0.0322f, 0.1109f, 0.1567f, -0.0729f, 0.0899f, -0.2799f, -0.123f, -0.0313f, -0.1649f, 0.0117f, 0.0723f, -0.2839f, -0.2083f, -0.052f, 0.3748f, 0.0152f, 0.1957f, 0.1433f, -0.2944f, 0.3573f, -0.0548f, -0.1681f, -0.0667f };
     private static readonly float[] LatentsStd = { 0.4765f, 1.0364f, 0.4514f, 1.1677f, 0.5313f, 0.499f, 0.4818f, 0.5013f, 0.8158f, 1.0344f, 0.5894f, 1.0901f, 0.6885f, 0.6165f, 0.8454f, 0.4978f, 0.5759f, 0.3523f, 0.7135f, 0.6804f, 0.5833f, 1.4146f, 0.8986f, 0.5659f, 0.7069f, 0.5338f, 0.4889f, 0.4917f, 0.4069f, 0.4999f, 0.6866f, 0.4093f, 0.5709f, 0.6065f, 0.6415f, 0.4944f, 0.5726f, 1.2042f, 0.5458f, 1.6887f, 0.3971f, 1.06f, 0.3943f, 0.5537f, 0.5444f, 0.4089f, 0.7468f, 0.7744f };
 }
