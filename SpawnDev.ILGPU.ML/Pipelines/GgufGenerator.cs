@@ -308,6 +308,8 @@ public sealed class GgufGenerator : IDisposable
         Func<string, Task>? onDelta = null,
         CancellationToken ct = default)
     {
+        if (_batch == null && config != null && (config.MinP > 0f || config.PresencePenalty != 0f || config.Strategy == "sample"))
+            throw new NotSupportedException("min-p, the presence penalty and the \"sample\" strategy run on the batch decoder engine (GgufEngine.BatchDecoder); this model runs on the session engine");
         if (_batch != null)
         {
             _batch.EnablePrefixCache = EnablePrefixCache;

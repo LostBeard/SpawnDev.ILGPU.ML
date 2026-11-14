@@ -172,6 +172,18 @@ public static class TextGenerationSampler
     }
 
     /// <summary>
+    /// Presence penalty (in place): subtract <paramref name="presence"/> from the logit of every DISTINCT token in <paramref name="previousTokens"/> (OpenAI's / llama.cpp's
+    /// presence penalty: once per token, however often it appeared). Applied after <see cref="ApplyRepetitionPenalty"/> on the same window.
+    /// </summary>
+    public static void ApplyPresencePenalty(float[] logits, int[] previousTokens, float presence)
+    {
+        if (presence == 0f) return;
+        var seen = new HashSet<int>();
+        foreach (int token in previousTokens)
+            if (token >= 0 && token < logits.Length && seen.Add(token)) logits[token] -= presence;
+    }
+
+    /// <summary>
     /// Apply temperature to logits (in-place). Lower temperature = more deterministic.
     /// </summary>
     public static void ApplyTemperature(float[] logits, float temperature)
@@ -228,7 +240,10 @@ public class GenerationConfig
     /// the config itself the source of truth for the token count.</summary>
     public int? MaxNewTokens { get; set; } = null;
 
-    /// <summary>Sampling strategy: "greedy", "top_k", "top_p".</summary>
+    /// <summary>
+    /// Sampling strategy: "greedy", "top_k", "top_p", or "sample" (every filter at once, as ComfyUI's TextGenerate sampling mode: temperature, then top-k when <see cref="TopK"/> &gt; 0,
+    /// then the nucleus of <see cref="TopP"/>, then <see cref="MinP"/>; GgufEngine.BatchDecoder).
+    /// </summary>
     public string Strategy { get; set; } = "greedy";
 
     /// <summary>Temperature for sampling (lower = more deterministic).</summary>
@@ -239,6 +254,15 @@ public class GenerationConfig
 
     /// <summary>P value for top-P (nucleus) sampling.</summary>
     public float TopP { get; set; } = 0.9f;
+
+    /// <summary>
+    /// Min-p (0 = off): after top-k and the nucleus, keep only the tokens whose probability is at least <see cref="MinP"/> times the best one's (Hugging Face's MinPLogitsWarper order;
+    /// the best token always stays). GgufEngine.BatchDecoder.
+    /// </summary>
+    public float MinP { get; set; } = 0f;
+
+    /// <summary>Presence penalty (0 = off): subtracted from the logit of every distinct token in the <see cref="RepeatLastN"/> window, after the repetition penalty. GgufEngine.BatchDecoder.</summary>
+    public float PresencePenalty { get; set; } = 0f;
 
     /// <summary>Repetition penalty (>1.0 reduces repetition).</summary>
     public float RepetitionPenalty { get; set; } = 1.0f;

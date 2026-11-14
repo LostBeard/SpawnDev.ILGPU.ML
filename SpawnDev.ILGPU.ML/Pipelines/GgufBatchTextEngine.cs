@@ -39,17 +39,19 @@ internal sealed class GgufBatchTextEngine : IDisposable
         int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 128;
         bool truncated;
         (promptIds, maxNew, truncated) = GenerationText.FitPrompt(promptIds, maxNew, _dec.MaxSeq);
-        // the strategy: greedy, top-k (k best, then all of their mass), top-p (the nucleus)
-        float T = config?.Temperature ?? 1f, topP = 1f;
+        // the strategy: greedy, top-k (k best, then all of their mass), top-p (the nucleus), or "sample" (top-k when TopK > 0, then the nucleus, then min-p: ComfyUI's
+        // TextGenerate sampling mode)
+        float T = config?.Temperature ?? 1f, topP = 1f, minP = 0f;
         int topK = 0;
         switch (config?.Strategy)
         {
-            case "top_k": topK = Math.Max(1, config.TopK); break;
-            case "top_p": topP = config.TopP; break;
+            case "top_k": topK = Math.Max(1, config.TopK); minP = config.MinP; break;
+            case "top_p": topP = config.TopP; minP = config.MinP; break;
+            case "sample": topK = Math.Max(0, config.TopK); topP = config.TopP > 0f && config.TopP <= 1f ? config.TopP : 1f; minP = config.MinP; break;
             default: T = 0f; break;
         }
-        if (!(T > 0f)) { T = 0f; topK = 0; topP = 1f; }
-        float penalty = config?.RepetitionPenalty ?? 1f;
+        if (!(T > 0f)) { T = 0f; topK = 0; topP = 1f; minP = 0f; }
+        float penalty = config?.RepetitionPenalty ?? 1f, presence = config?.PresencePenalty ?? 0f;
         int window = config?.RepeatLastN ?? 64;
         int seed = config?.Seed ?? Random.Shared.Next();
         var stops = new HashSet<int>(stopTokenIds ?? Array.Empty<int>());
@@ -62,7 +64,7 @@ internal sealed class GgufBatchTextEngine : IDisposable
         try
         {
             await _dec.GenerateAsync(promptIds, 1, maxNew, T, topP, seed, stops, ct: ct, repetitionPenalty: penalty, repeatLastN: window,
-                reusePrefix: EnablePrefixCache && !truncated, shouldContinue: (_, token) => { produced++; ids.Add(token); return text.PushAsync(token); }, topK: topK).ConfigureAwait(false);
+                reusePrefix: EnablePrefixCache && !truncated, shouldContinue: (_, token) => { produced++; ids.Add(token); return text.PushAsync(token); }, topK: topK, minP: minP, presencePenalty: presence).ConfigureAwait(false);
             int stopToken = _dec.LastStopTokens.Length > 0 ? _dec.LastStopTokens[0] : -1;
             if (stopToken >= 0 && !text.StoppedOnString) stopTokenId = stopToken;
             stop = text.StoppedOnString ? StopReason.StopString

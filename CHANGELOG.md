@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Min-p and the presence penalty** (`GenerationConfig.MinP`, `PresencePenalty`, strategy `"sample"`: ComfyUI's TextGenerate sampling mode, requested by SpawnGen), on the GGUF batch
+  decoder: min-p after top-k and the nucleus (Hugging Face's order: the tokens with logit >= max + T ln(min_p) stay, the best always), on the host sampler and in both device draw
+  paths (the candidates and the exact whole-row path); the presence penalty subtracted once per distinct token of the repetition window, after the repetition penalty. Gate
+  `GgufBatchDecoder_MinPAndPresence_MatchHostSampler`: device draws equal the host sampler 64 / 64 in six cases on CUDA, OpenCL, WebGPU and Wasm (each case changes 47 to 64
+  draws). The session engine refuses them (NotSupportedException) instead of ignoring them.
+- **Fix: the automatic Q8_0 load trusted the browser backends' memory estimate** (WebGL reports a fixed 256 MB): it now decides only on CUDA and OpenCL, which report their real
+  memory; elsewhere 16-bit matrices load as stored unless Q8 is asked for.
+
 - **SpawnDev.ILGPU 5.4.32.** Its float -> Half conversions round on every backend (5.4.31 left them unrounded in registers on Wasm and WebGL; OpenCL in some kernel shapes), its
   OpenCL division and sqrt are correctly rounded, and the Wasm backend emits structured control flow. Gate `Sd_HiLoSplit_RoundsOnEveryBackend` (light, every lane): the VAE loader's
   fp32 -> (hi, lo) fp16 split bit for bit against the host's IEEE halves, normal and subnormal lo halves and the conv-weight permutation; red on 5.4.31 Wasm and WebGL (every lo zero).
