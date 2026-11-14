@@ -78,7 +78,7 @@ public sealed class SdCheckpoint : IDisposable
 
         var unet = options.LoadUNet ? new SdWeights() : null;
         var text = options.LoadTextEncoder && HasTextEncoder(names, family) ? new SdWeights() : null;
-        var vae = options.LoadVae && names.Any(n => n.StartsWith("first_stage_model.", StringComparison.Ordinal)) ? new SdWeights() : null;
+        var vae = options.LoadVae && names.Any(n => n.StartsWith("first_stage_model.", StringComparison.Ordinal)) ? new SdWeights { KeepLowHalves = true } : null;
         try
         {
             SdTensorStreamer.Target? Route(string n)

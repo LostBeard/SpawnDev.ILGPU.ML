@@ -33,6 +33,13 @@ public abstract partial class MLTestBase
         using var vae = await SdVae.LoadAsync(accelerator, new LocalFolderModelSource(Path.Combine(dir, "comfy")), "", "ae.safetensors");
         Ur_Expect(vae.LatentChannels == 16 && vae.Levels == 4 && vae.HasEncoder && vae.HasDecoder, $"16 latent channels, 4 levels, encoder and decoder ({vae.LatentChannels}, {vae.Levels}, {vae.HasEncoder}, {vae.HasDecoder})");
         Ur_Expect(!vae.Weights.Has("quant_conv.weight") && !vae.Weights.Has("post_quant_conv.weight"), "FLUX.1's autoencoder has no quant convolutions");
+        // the file is fp32: every conv weight must carry its low fp16 half (SdWeights.KeepLowHalves), and the halves must hold the part fp16 dropped (not zeros)
+        var lo = vae.Weights.Lo("encoder.down.2.block.0.conv1.weight") ?? throw new Exception("no low half kept for an fp32 conv weight");
+        var loHost = await lo.CopyToHostAsync();
+        double loMax = 0; int loNonZero = 0;
+        foreach (var v in loHost) { double a = Math.Abs((float)v); if (a > 0) loNonZero++; loMax = Math.Max(loMax, a); }
+        Console.WriteLine($"[Flux1] ComfyUI ae: low halves of encoder.down.2.block.0.conv1.weight: {loNonZero} of {loHost.Length} non-zero, max |lo| {loMax:E2}");
+        Ur_Expect(loNonZero > loHost.Length / 2, $"the low halves are mostly zero ({loNonZero} of {loHost.Length} non-zero): the fp32 -> fp16 -> fp32 round trip did not round on this backend");
         var z = await vae.EncodeAsync(image, 512, 512);
         var back = await vae.DecodeAsync(z, 64, 64);
         double sq = 0; int n = 512 * 512;
@@ -261,8 +268,10 @@ public abstract partial class MLTestBase
         report.Add($"decode vs ComfyUI: latent of A {dA:E2}, synthetic {dS:E2}");
         foreach (var line in report) Console.WriteLine("[Flux1] ComfyUI ae: " + line);
         // bounds PROVISIONAL until measured: ComfyUI runs fp32 weights, this library fp16 weights with fp32 activations (FLUX.2's VAE: 5.8e-4 / 1.1e-4)
-        Ur_Expect(eA < 0.02 && eB < 0.02 && eC < 0.02, $"encode: A {eA:E2}, B {eB:E2}, C {eC:E2}");
-        Ur_Expect(dA < 0.02 && dS < 0.02, $"decode: A {dA:E2}, synthetic {dS:E2}");
+        // MEASURED (RTX 4070, 2026-11-14, SpawnDev.ILGPU 5.4.32, fp32 weights as fp16 hi + lo): CUDA A 2.81e-4, B 2.03e-5, C 7.95e-5; OpenCL 2.69e-4 / 1.96e-5 / 8.59e-5 (fp16 weights: up to 5e-3)
+        Ur_Expect(eA < 6e-4 && eB < 6e-5 && eC < 2e-4, $"encode: A {eA:E2}, B {eB:E2}, C {eC:E2}");
+        // MEASURED: decode of A 9.6e-7 (CUDA and OpenCL), synthetic 1.5e-5 / 1.8e-5
+        Ur_Expect(dA < 5e-6 && dS < 5e-5, $"decode: A {dA:E2}, synthetic {dS:E2}");
         Ur_Expect(cScaled > 0.1, $"the scaled reading must not match: {cScaled:E2}");
         return string.Join("; ", report);
     });

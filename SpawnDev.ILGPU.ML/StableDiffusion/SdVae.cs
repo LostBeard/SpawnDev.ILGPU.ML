@@ -90,10 +90,10 @@ public sealed partial class SdVae : IDisposable
     }
 
     private void Conv3(string name, FV x, FV y, int H, int W, int cin, int cout)
-        => _k.Conv(x, Table(H, W, H, W, 3, 1, 1, 1), _w[name + ".weight"], _w[name + ".bias"], y, H * W, cin, cout, 9, exact: true);
+        => _k.Conv(x, Table(H, W, H, W, 3, 1, 1, 1), _w[name + ".weight"], _w[name + ".bias"], y, H * W, cin, cout, 9, exact: true, _w.Lo(name + ".weight"), _w.Lo(name + ".bias"));
 
     private void Conv1(string name, FV x, FV y, int rows, int cin, int cout, int H, int W)
-        => _k.Conv(x, Table(H, W, H, W, 1, 1, 0, 1), _w[name + ".weight"], _w[name + ".bias"], y, rows, cin, cout, 1, exact: true);
+        => _k.Conv(x, Table(H, W, H, W, 1, 1, 0, 1), _w[name + ".weight"], _w[name + ".bias"], y, rows, cin, cout, 1, exact: true, _w.Lo(name + ".weight"), _w.Lo(name + ".bias"));
 
     private FV Other(FV cur)
     {
@@ -107,11 +107,11 @@ public sealed partial class SdVae : IDisposable
         int rows = H * W;
         var n = Slot(SlotNorm, (long)rows * Math.Max(cin, cout));
         var nIn = n.SubView(0, (long)rows * cin);
-        _k.GroupNorm(x, nIn, _w[p + "norm1.weight"], _w[p + "norm1.bias"], rows, cin, 32, 1e-6f, silu: true);
+        Gn(x, nIn, p + "norm1.", rows, cin, silu: true);
         var c1 = Slot(SlotT, (long)rows * cout);
         Conv3(p + "conv1", nIn, c1, H, W, cin, cout);
         var nOut = n.SubView(0, (long)rows * cout);
-        _k.GroupNorm(c1, nOut, _w[p + "norm2.weight"], _w[p + "norm2.bias"], rows, cout, 32, 1e-6f, silu: true);
+        Gn(c1, nOut, p + "norm2.", rows, cout, silu: true);
         Conv3(p + "conv2", nOut, dst, H, W, cout, cout);
         if (_w.Has(p + "nin_shortcut.weight"))
         {
@@ -127,7 +127,7 @@ public sealed partial class SdVae : IDisposable
     {
         int rows = H * W;
         var n = Slot(SlotNorm, (long)rows * C);
-        _k.GroupNorm(x, n, _w[p + "norm.weight"], _w[p + "norm.bias"], rows, C, 32, 1e-6f, silu: false);
+        Gn(x, n, p + "norm.", rows, C, silu: false);
         var qkv = Slot(SlotQkv, (long)rows * 3 * C);
         Conv1(p + "qkv", n, qkv, rows, C, 3 * C, H, W);
         // the score chunk: at most ~2^26 floats (256 MB) of scores per GEMM pair
@@ -136,6 +136,13 @@ public sealed partial class SdVae : IDisposable
         _k.SingleHeadAttention(qkv, a, rows, C, HSlot(0, (long)rows * C), HSlot(1, (long)rows * C), Slot(SlotQ, (long)chunk * C), Slot(SlotScores, (long)chunk * rows), chunk);
         Conv1(p + "proj_out", a, dst, rows, C, C, H, W);
         _k.AddInPlace(dst, x, (long)rows * C);
+    }
+
+    /// <summary>GroupNorm(32, eps 1e-6) with the full-precision parameters when the file stored them as fp32 (<see cref="SdWeights.F32"/>), the fp16 ones otherwise.</summary>
+    private void Gn(FV x, FV o, string p, int rows, int C, bool silu)
+    {
+        if (_w.F32(p + "weight") is { } g && _w.F32(p + "bias") is { } b) _k.GroupNorm(x, o, g, b, rows, C, 32, 1e-6f, silu);
+        else _k.GroupNorm(x, o, _w[p + "weight"], _w[p + "bias"], rows, C, 32, 1e-6f, silu);
     }
 
     private FV Mid(string p, FV cur, int H, int W, int C, long maxElems, string? tap = null)
@@ -209,7 +216,8 @@ public sealed partial class SdVae : IDisposable
             if (_w.Has($"decoder.up.{i}.upsample.conv.weight"))
             {
                 var dst = Other(cur).SubView(0, 4L * H * W * C);
-                _k.Conv(cur, Table(H, W, 2 * H, 2 * W, 3, 1, 1, 2), _w[$"decoder.up.{i}.upsample.conv.weight"], _w[$"decoder.up.{i}.upsample.conv.bias"], dst, 4 * H * W, C, C, 9, exact: true);
+                _k.Conv(cur, Table(H, W, 2 * H, 2 * W, 3, 1, 1, 2), _w[$"decoder.up.{i}.upsample.conv.weight"], _w[$"decoder.up.{i}.upsample.conv.bias"], dst, 4 * H * W, C, C, 9, exact: true,
+                    _w.Lo($"decoder.up.{i}.upsample.conv.weight"), _w.Lo($"decoder.up.{i}.upsample.conv.bias"));
                 cur = dst; H *= 2; W *= 2;
             }
             Tap?.Invoke($"dec_up_{k}", cur, H, W, C);
@@ -217,7 +225,7 @@ public sealed partial class SdVae : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
         }
         var n = Slot(SlotNorm, (long)H * W * C);
-        _k.GroupNorm(cur, n, _w["decoder.norm_out.weight"], _w["decoder.norm_out.bias"], H * W, C, 32, 1e-6f, silu: true);
+        Gn(cur, n, "decoder.norm_out.", H * W, C, silu: true);
         int outC = _w.Shape("decoder.conv_out.weight")[0];
         var o = Slot(SlotOut, (long)H * W * outC);
         Conv3("decoder.conv_out", n, o, H, W, C, outC);
@@ -281,7 +289,8 @@ public sealed partial class SdVae : IDisposable
                 // pad (0, 1, 0, 1) then a 3x3 convolution of stride 2 with no padding
                 int oh = Hc / 2, ow = Wc / 2;
                 var dst = Other(cur).SubView(0, (long)oh * ow * C);
-                _k.Conv(cur, Table(Hc, Wc, oh, ow, 3, 2, 0, 1), _w[$"encoder.down.{i}.downsample.conv.weight"], _w[$"encoder.down.{i}.downsample.conv.bias"], dst, oh * ow, C, C, 9, exact: true);
+                _k.Conv(cur, Table(Hc, Wc, oh, ow, 3, 2, 0, 1), _w[$"encoder.down.{i}.downsample.conv.weight"], _w[$"encoder.down.{i}.downsample.conv.bias"], dst, oh * ow, C, C, 9, exact: true,
+                    _w.Lo($"encoder.down.{i}.downsample.conv.weight"), _w.Lo($"encoder.down.{i}.downsample.conv.bias"));
                 cur = dst; Hc = oh; Wc = ow;
                 Tap?.Invoke($"enc_down_{i}_downsample", cur, Hc, Wc, C);
             }
@@ -289,7 +298,7 @@ public sealed partial class SdVae : IDisposable
         }
         cur = Mid("encoder.mid.", cur, Hc, Wc, C, maxElems, "enc_mid_");
         var n = Slot(SlotNorm, (long)Hc * Wc * C);
-        _k.GroupNorm(cur, n, _w["encoder.norm_out.weight"], _w["encoder.norm_out.bias"], Hc * Wc, C, 32, 1e-6f, silu: true);
+        Gn(cur, n, "encoder.norm_out.", Hc * Wc, C, silu: true);
         Tap?.Invoke("enc_norm_out_silu", n, Hc, Wc, C);                     // GroupNorm and SiLU fused: a hook on the reference's norm_out module sees it before the SiLU
         int momC = _w.Shape("encoder.conv_out.weight")[0];
         var mom = Slot(SlotT, (long)Hc * Wc * momC);

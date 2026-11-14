@@ -39,6 +39,31 @@ public sealed class SdWeights : IDisposable
     /// <summary>Device bytes held.</summary>
     public long Bytes => _t.Values.Sum(b => b.Length * 2L);
 
+    private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _f32 = new();
+
+    /// <summary>
+    /// Keep the full precision of a file's fp32 tensors (set for VAEs): each fp32 tensor is stored as its fp16 value plus <c>name.lo</c> = fp16(value - fp16(value)), the low
+    /// half, which the convolutions add in a second pass (22 bits of mantissa instead of 11; <see cref="Lo"/>), and 1-D tensors are also kept as fp32 (<see cref="F32"/>).
+    /// MEASURED (FLUX.1's ae encoder against the fp32 reference, 2026-11-14): fp16 weights put the latent 3e-3 to 5e-3 away with a few cells off by up to 0.6; the conv weights,
+    /// biases and norm parameters at full precision bring it to 1.5e-4 (the attention's fp16 weights change nothing measurable).
+    /// </summary>
+    public bool KeepLowHalves { get; init; }
+
+    /// <summary>The low fp16 half of an fp32 tensor (<see cref="KeepLowHalves"/>), or null.</summary>
+    public HV? Lo(string name) => _t.TryGetValue(name + ".lo", out var b) ? b.View : null;
+
+    /// <summary>
+    /// The fp32 copy of a 1-D tensor the file stored as fp32 (norm gammas / betas, biases), or null. MEASURED (FLUX.1's ae encoder, 2026-11-14): the fp16 rounding of the
+    /// GroupNorm parameters alone put the encode 4.6e-3 from the fp32 reference, with a few latent cells off by up to 0.6; fp32 norms bring it to 1.8e-3 and remove the spots.
+    /// </summary>
+    public ArrayView1D<float, Stride1D.Dense>? F32(string name) => _f32.TryGetValue(name, out var b) ? b.View : null;
+
+    internal void AddF32(string name, MemoryBuffer1D<float, Stride1D.Dense> buffer)
+    {
+        if (_f32.Remove(name, out var old)) old.Dispose();
+        _f32[name] = buffer;
+    }
+
     internal void Add(string name, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense> buffer, int[] shape)
     {
         if (_t.Remove(name, out var old)) old.Dispose();
@@ -108,14 +133,15 @@ public sealed class SdWeights : IDisposable
     internal IEnumerable<(string Source, string Tensor, int RowOffset, int Rows)> Sources()
     {
         var fused = new HashSet<string>(_fusedParts.Values.Select(f => f.Fused), StringComparer.Ordinal);
-        foreach (var n in _shapes.Keys) if (!fused.Contains(n)) yield return (n, n, 0, _shapes[n].Length == 0 ? 1 : _shapes[n][0]);
+        foreach (var n in _shapes.Keys) if (!fused.Contains(n) && !n.EndsWith(".lo", StringComparison.Ordinal)) yield return (n, n, 0, _shapes[n].Length == 0 ? 1 : _shapes[n][0]);   // low halves are not file tensors
         foreach (var (p, f) in _fusedParts) yield return (p, f.Fused, f.RowOffset, f.Rows);
     }
 
     public void Dispose()
     {
         foreach (var b in _t.Values) b.Dispose();
-        _t.Clear(); _shapes.Clear();
+        foreach (var b in _f32.Values) b.Dispose();
+        _t.Clear(); _shapes.Clear(); _f32.Clear();
     }
 }
 
@@ -152,6 +178,28 @@ internal sealed class SdTensorStreamer : IDisposable
     }
     private static void FromF32Impl(Index1D i, ArrayView1D<float, Stride1D.Dense> src, HV dst, int layout, int a, int b)
         => dst[i] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(src[SourceIndex(i, layout, a, b)]);
+    private static void FromF32LoImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> src, HV dst, int layout, int a, int b)
+    {
+        float v = src[SourceIndex(i, layout, a, b)];
+        float hi = PrecisionConvert.ConvertToSingle(PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(v));
+        dst[i] = PrecisionConvert.ConvertFromSingle<global::ILGPU.Half>(v - hi);         // the part fp16 dropped (exact: v - hi is representable in fp32)
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>? _fromF32Lo;
+
+    /// <summary>
+    /// The loader's fp32 -> (hi, lo) fp16 split on the device, as <see cref="KeepLowHalves"/> stores an fp32 weight: hi = fp16(v), lo = fp16(v - hi). For the gate that every
+    /// backend's float -> Half conversion rounds (an identity conversion leaves lo all zero: SpawnDev.ILGPU before 5.4.32 on OpenCL, Wasm and WebGL).
+    /// </summary>
+    /// <summary>The loader's source index for a destination element (for the split gate's host reference).</summary>
+    internal static int SourceIndexForTests(int i, int layout, int a, int b) => SourceIndex(i, layout, a, b);
+
+    internal static void SplitHiLo(Accelerator acc, ArrayView1D<float, Stride1D.Dense> src, HV hi, HV lo, int layout = 0, int a = 0, int b = 0)
+    {
+        var k = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>(FromF32Impl);
+        var kl = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>(FromF32LoImpl);
+        k((int)src.Length, src, hi, layout, a, b);
+        kl((int)src.Length, src, lo, layout, a, b);
+    }
     private static void FromF16Impl(Index1D i, HV src, HV dst, int layout, int a, int b)
         => dst[i] = src[SourceIndex(i, layout, a, b)];
     private static void FromBf16Impl(Index1D i, ArrayView1D<BFloat16, Stride1D.Dense> src, HV dst, int layout, int a, int b)
@@ -233,7 +281,18 @@ internal sealed class SdTensorStreamer : IDisposable
                     switch (t.DType)
                     {
                         case "F32":
-                            { var v = st.Cast<uint, float>().SubView(0, n); await Upload(stream, v, n * 4, ct); _fromF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>(FromF32Impl); _fromF32((int)n, v, dst.View, layout, a, b); break; }
+                            {
+                                var v = st.Cast<uint, float>().SubView(0, n); await Upload(stream, v, n * 4, ct); _fromF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>(FromF32Impl); _fromF32((int)n, v, dst.View, layout, a, b);
+                                if (tg.Store.KeepLowHalves)
+                                {
+                                    if (shape.Length == 1) { var keep = _acc.Allocate1D<float>(n); keep.View.CopyFrom(v); tg.Store.AddF32(tg.Name, keep); }   // vectors also kept as fp32 (SdWeights.F32)
+                                    var lo = _acc.Allocate1D<global::ILGPU.Half>(n);
+                                    _fromF32Lo ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, HV, int, int, int>(FromF32LoImpl);
+                                    _fromF32Lo((int)n, v, lo.View, layout, a, b);
+                                    tg.Store.Add(tg.Name + ".lo", lo, outShape);
+                                }
+                                break;
+                            }
                         case "F16":
                             { var v = st.Cast<uint, global::ILGPU.Half>().SubView(0, n); await Upload(stream, v, n * 2, ct); _fromF16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, HV, HV, int, int, int>(FromF16Impl); _fromF16((int)n, v, dst.View, layout, a, b); break; }
                         default:

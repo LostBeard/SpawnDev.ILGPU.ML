@@ -75,8 +75,35 @@ public sealed class SdKernels
         o[i] = v;
     }
 
+    private Action<Index1D, FV, FV, FV, FV, FV, int, int, int>? _gnApplyF32;
+    private static void GnApplyF32Impl(Index1D i, FV x, FV o, FV stats, FV gamma, FV beta, int C, int cg, int silu)
+    {
+        int c = (int)(i % C), g = c / cg;
+        float v = (x[i] - stats[2 * g]) * stats[2 * g + 1] * gamma[c] + beta[c];
+        if (silu != 0) v = v / (1f + MathF.Exp(-v));
+        o[i] = v;
+    }
+
+    /// <summary>GroupNorm with fp32 gamma / beta (a file's full-precision norm parameters: <see cref="SdWeights.F32"/>); otherwise as the fp16 overload.</summary>
+    public void GroupNorm(FV x, FV o, FV gamma, FV beta, int rows, int C, int groups, float eps, bool silu)
+    {
+        int cg = C / groups;
+        GnStats(x, rows, C, groups, eps);
+        _gnApplyF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, int, int, int>(GnApplyF32Impl);
+        _gnApplyF32((int)((long)rows * C), x, o, _stats!.View, gamma, beta, C, cg, silu ? 1 : 0);
+    }
+
     /// <summary>o = GroupNorm(x) * gamma + beta (then SiLU when <paramref name="silu"/>), x and o channel-last [rows, C]; <paramref name="o"/> may not alias <paramref name="x"/>.</summary>
     public void GroupNorm(FV x, FV o, HV gamma, HV beta, int rows, int C, int groups, float eps, bool silu)
+    {
+        int cg = C / groups;
+        GnStats(x, rows, C, groups, eps);
+        _gnApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, HV, HV, int, int, int>(GnApplyImpl);
+        _gnApply((int)((long)rows * C), x, o, _stats!.View, gamma, beta, C, cg, silu ? 1 : 0);
+    }
+
+    /// <summary>The per-group mean and inverse standard deviation of x [rows, C] into _stats (two chunked reductions: no cancellation).</summary>
+    private void GnStats(FV x, int rows, int C, int groups, float eps)
     {
         int cg = C / groups;
         int rowsPerChunk = Math.Max(1, GnChunkElems / cg);
@@ -86,7 +113,6 @@ public sealed class SdKernels
         if (_stats == null || _stats.Length < 2L * groups) { _acc.Fence(); _stats?.Dispose(); _stats = _acc.Allocate1D<float>(Math.Max(2L * groups, 256)); }
         _gnPartial ??= _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int>(GnPartialImpl);
         _gnFinal ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float, int>(GnFinalImpl);
-        _gnApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, HV, HV, int, int, int>(GnApplyImpl);
         int count = rows * cg;
         int threads = GnThreads;
         while (threads > _acc.MaxNumThreadsPerGroup) threads >>= 1;             // the CPU accelerator allows 64 threads per group
@@ -95,7 +121,6 @@ public sealed class SdKernels
         _gnFinal(groups, _partial.View, _stats.View, chunks, count, eps, 0);
         _gnPartial(cfg, x, _stats.View, _partial.View, C, cg, rows, rowsPerChunk, chunks, 1);
         _gnFinal(groups, _partial.View, _stats.View, chunks, count, eps, 1);
-        _gnApply((int)((long)rows * C), x, o, _stats.View, gamma, beta, C, cg, silu ? 1 : 0);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -152,7 +177,9 @@ public sealed class SdKernels
     /// <paramref name="exact"/> keeps the activations fp32 (the portable tiled GEMM, never the tensor cores, which round them to fp16): the VAE needs it (SDXL's
     /// VAE activations overflow fp16).
     /// </summary>
-    public void Conv(FV x, IV nbr, HV weight, HV bias, FV y, int M, int cin, int cout, int taps, bool exact = false)
+    /// <param name="weightLo">the low fp16 halves of an fp32 weight (<see cref="SdWeights.Lo"/>): added in a second pass, for the weight's full precision</param>
+    /// <param name="biasLo">the low half of the bias, added with <paramref name="weightLo"/></param>
+    public void Conv(FV x, IV nbr, HV weight, HV bias, FV y, int M, int cin, int cout, int taps, bool exact = false, HV? weightLo = null, HV? biasLo = null)
     {
         long perRow = 2L * taps * cin * cout;
         int chunk = (int)Math.Max(64, Math.Min(M, MaxFlopsPerDispatch / Math.Max(1, perRow)));
@@ -161,9 +188,38 @@ public sealed class SdKernels
             int rows = Math.Min(chunk, M - m0);
             var nb = nbr.SubView((long)m0 * 27, (long)rows * 27);
             var yo = y.SubView((long)m0 * cout, (long)rows * cout);
-            if (exact && _sk.ConvTapsExactOk(rows, taps, cin, cout, x.Length / cin)) _sk.ConvTapsExact(x, nb, weight, yo, rows, cin, cout, taps, false, bias);
-            else _sk.ConvTaps(x, nb, weight, bias, yo, rows, cin, cout, taps);
+            if (exact && _sk.ConvTapsExactOk(rows, taps, cin, cout, x.Length / cin))
+            {
+                _sk.ConvTapsExact(x, nb, weight, yo, rows, cin, cout, taps, false, bias);
+                if (weightLo.HasValue) _sk.ConvTapsExact(x, nb, weightLo.Value, yo, rows, cin, cout, taps, true, biasLo);   // + the low halves (and the bias's)
+            }
+            else
+            {
+                _sk.ConvTaps(x, nb, weight, bias, yo, rows, cin, cout, taps);
+                if (weightLo.HasValue) NaiveConvAdd(x, nb, weightLo.Value, biasLo, yo, rows, cin, cout, taps);
+            }
         }
+    }
+
+    private Action<Index1D, FV, HV, HV, FV, IV, int, int, int, int>? _naiveConvAdd;
+    private static void NaiveConvAddImpl(Index1D idx, FV x, HV w, HV bias, FV o, IV nbr, int cin, int cout, int hasBias, int taps)
+    {
+        int m = idx / cout, n = idx % cout;
+        float acc = hasBias != 0 ? PrecisionConvert.ConvertToSingle(bias[n]) : 0f;
+        for (int kk = 0; kk < taps; kk++)
+        {
+            int src = nbr[m * 27 + kk];
+            if (src < 0) continue;
+            long xb = (long)src * cin, wb = ((long)n * taps + kk) * cin;
+            for (int c = 0; c < cin; c++) acc = float.MultiplyAddEstimate(x[xb + c], PrecisionConvert.ConvertToSingle(w[wb + c]), acc);
+        }
+        o[idx] += acc;
+    }
+    /// <summary>y += conv(x) with <paramref name="w"/> (+ bias): the low-half pass of the naive convolution (the taps * cin not a multiple of the tiled GEMM's k step).</summary>
+    private void NaiveConvAdd(FV x, IV nbr, HV w, HV? bias, FV y, int M, int cin, int cout, int taps)
+    {
+        _naiveConvAdd ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, HV, HV, FV, IV, int, int, int, int>(NaiveConvAddImpl);
+        _naiveConvAdd(M * cout, x, w, bias ?? w, y, nbr, cin, cout, bias.HasValue ? 1 : 0, taps);
     }
 
     /// <summary>

@@ -107,7 +107,9 @@ public sealed partial class SdVae
     /// <summary>Load a standalone VAE file from a stream (read once, front to back).</summary>
     public static async Task<SdVae> LoadAsync(Accelerator accelerator, Stream stream, string name, Action<string, double>? onProgress = null, CancellationToken cancellationToken = default)
     {
-        var w = await SdComponentFile.LoadAsync(accelerator, stream, name, tensors =>
+        var store = new SdWeights { KeepLowHalves = true };                    // a VAE keeps an fp32 file's full precision (SdWeights.KeepLowHalves)
+        SdWeights w;
+        try { w = await SdComponentFile.LoadAsync(accelerator, stream, name, tensors =>
         {
             var names = tensors.Select(t => SdComponentFile.StripPrefix(t.Name, "first_stage_model.", "vae.")).ToList();
             int levels = 0;
@@ -122,7 +124,8 @@ public sealed partial class SdVae
                 var local = SdNames.DiffusersToLdmVae(s, levels);
                 return local == null ? null : (local, SdLayout.ConvGather);
             };
-        }, null, onProgress, cancellationToken);
+        }, store, onProgress, cancellationToken); }
+        catch { store.Dispose(); throw; }
         try
         {
             if (!w.Has("decoder.conv_in.weight") && !w.Has("encoder.conv_in.weight")) throw new InvalidDataException($"'{name}': no VAE tensors (encoder / decoder conv_in) in this file");

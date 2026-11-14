@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **SpawnDev.ILGPU 5.4.32.** Its float -> Half conversions round on every backend (5.4.31 left them unrounded in registers on Wasm and WebGL; OpenCL in some kernel shapes), its
+  OpenCL division and sqrt are correctly rounded, and the Wasm backend emits structured control flow. Gate `Sd_HiLoSplit_RoundsOnEveryBackend` (light, every lane): the VAE loader's
+  fp32 -> (hi, lo) fp16 split bit for bit against the host's IEEE halves, normal and subnormal lo halves and the conv-weight permutation; red on 5.4.31 Wasm and WebGL (every lo zero).
+- **fp32 VAEs keep their fp32 precision** (`SdWeights.KeepLowHalves`: every fp32 VAE file the SD-family loaders read; found against ComfyUI's FLUX.1 ae dumps). Weights were held as
+  fp16, which put a few latent cells of ComfyUI's encode 5e-3 off. An fp32 weight is now stored as fp16 hi + fp16 lo (lo = fp16(v - hi)) and each convolution runs a second pass on
+  the low halves; the GroupNorm parameters stay fp32. MEASURED against ComfyUI (CUDA): FLUX.1 ae encode 2.8e-4 / 2.0e-5 / 8.0e-5 (was up to 5e-3), decode 9.6e-7; FLUX.2 VAE encode
+  5.3e-5, decode 5.0e-6. fp16 / bf16 VAE files are unchanged (no low halves).
+
 - **fp32-class activations on CUDA's tensor cores** (`DiTKernels.PreciseActivations`; found by SpawnGen: the same Z-Image calls matched ComfyUI to 1.9e-5 on an RX 590 and 5.6e-3
   on CUDA). The tensor-core GEMM rounded every activation to bf16. The new `MmaGemm.KernelBf16x2Dense` stages each activation as bf16 hi + bf16 lo and runs both MMA passes into
   the same fp32 accumulators (the bf16 weights are exact), and attention takes the fp32 flash kernel. MEASURED against ComfyUI's fp32 dumps (RTX 4070): FLUX.1 4.7e-3 -> 3.3e-5,
