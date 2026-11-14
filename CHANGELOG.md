@@ -4,6 +4,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Fix: the VAE's upsampling went wrong on AMD OpenCL at sizes that are not powers of two** (found by SpawnGen on an RX 590 with the FLUX.2 VAE at 192 x 256:
+  0.27 relRMS from ComfyUI's picture). The nearest-upsample neighbour table (`SdKernels.BuildTable`, every native VAE and the SD UNet's resizes) divided
+  `(float)inH / outH` on the device; OpenCL allows fp32 division 2.5 ulp of error and the RX 590 returned 24 / 48 = 0.49999997, so `floor(2 * scale)` = 0 and
+  13,110 of 27,648 entries pointed at the wrong pixel. Power-of-two sizes divide exactly, which is why 512 px pictures never showed it. The scale is now divided on
+  the host and only multiplied on the device, as torch does. Found by comparing per-stage decoder taps from the RX 590 with CUDA's (first divergence: the first
+  upsample). New light gate `Sd_UpsampleTable_NonPowerOfTwo_MatchesHost` (every backend); NOT red on this machine's GPUs (NVIDIA and WebGPU happen to divide these
+  quotients so that the floor lands right), red on the RX 590. SpawnDev.ILGPU 5.4.32 also builds OpenCL programs with correctly rounded division (Data).
+- **Fix: the native VAE on the CPU accelerator**: GroupNorm launched 256-thread groups, the CPU accelerator allows 64 ("Invalid group dimensions"). The group is now
+  the largest power of two the accelerator allows (256 on every GPU: unchanged results). Gate `Flux2_ComfyVae_DecodesOnCpuAccelerator`: ComfyUI's latent decodes to
+  1.1e-4 of ComfyUI's picture on the CPU accelerator.
+- **FLUX.1's autoencoder** (ComfyUI's `ae.safetensors`, shared by the FLUX.1, Z-Image, HiDream and Lumina templates) loads through `SdVae.LoadAsync`: the quant
+  convolutions are optional (it has none), 16 latent channels. MEASURED against ComfyUI's own VAE Encode / Decode (SpawnGen's dumps): encode 5e-4 to 5e-3, decode
+  7.7e-5 relRMS; ComfyUI's LATENT holds the RAW latent [16, H/8, W/8] (the scaled / shifted reading is 0.64 off). Gates `Flux1_ComfyAe_RoundTrip` (36.1 dB),
+  `Flux1_ComfyAe_MatchesComfyUi`.
+
 - **FLUX.2 klein: ComfyUI's files load as they are** (the split Load Diffusion Model / Load CLIP / Load VAE graph of ComfyUI's FLUX.2 templates; requested by SpawnGen;
   read from the files' headers and measured outputs only). Docs/flux2.md "ComfyUI's files".
   - **VAE** `flux2-vae.safetensors`, either naming (Comfy-Org/flux2-klein: Black Forest Labs' names, Comfy-Org/flux2-dev: diffusers names; the same fp32 weights) on the native

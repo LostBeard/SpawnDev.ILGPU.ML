@@ -113,6 +113,74 @@ public abstract partial class MLTestBase
         return string.Join("; ", report);
     });
 
+    /// <summary>
+    /// The decoder's stage taps (post_quant_conv, dec_mid, dec_up_0..3, channel-last float32) for ComfyUI's latent of picture A, written to F2_DIR\comfy\taps\&lt;backend&gt;, plus the
+    /// final picture: the reference a device whose decode goes wrong (an AMD RX 590 on OpenCL, found by SpawnGen) is compared against, stage by stage.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Flux2_ComfyVae_DumpDecoderTaps() => await RunTest(async accelerator =>
+    {
+        var dir = F2_RequireComfyVae(accelerator); var d = Path.Combine(dir, "comfy", "comfyui-dumps");
+        if (!Directory.Exists(d)) throw new UnsupportedTestException($"ComfyUI's measured VAE dumps not found in {d}");
+        var src = new LocalFolderModelSource(Path.Combine(dir, "comfy"));
+        using var vae = await SdVae.LoadAsync(accelerator, src, "", "flux2-vae.safetensors");
+        var norm = await Flux2VaeNorm.FromSafeTensorsAsync(src, "", "flux2-vae.safetensors");
+        var k = new Flux2Kernels(accelerator);
+        using var mean = accelerator.Allocate1D(norm.Mean); using var std = accelerator.Allocate1D(norm.Std);
+        var lat = F2_Raw(Path.Combine(d, "enc_256x192_samples_f32_1x128x12x16.raw"), 128L * 12 * 16);
+        using var lb = accelerator.Allocate1D(lat); using var raw = accelerator.Allocate1D<float>(32L * 24 * 32);
+        k.LatentToVae(lb.View, mean.View, std.View, raw.View, 12, 16);
+        var z = await raw.View.CopyToHostAsync();
+        var outDir = Path.Combine(dir, "comfy", "taps", accelerator.AcceleratorType.ToString());
+        Directory.CreateDirectory(outDir);
+        static void Write(string path, float[] a) { var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(path, b); }
+        Write(Path.Combine(outDir, "z_32x24x32.raw"), z);
+        var names = new List<string>();
+        vae.Tap = (name, view, h, w, c) =>
+        {
+            accelerator.Synchronize();
+            var a = new float[(long)h * w * c]; view.SubView(0, a.Length).CopyToCPU(a);
+            Write(Path.Combine(outDir, $"tap_{name}_{h}x{w}x{c}.raw"), a); names.Add($"{name} {h}x{w}x{c}");
+        };
+        var pic = await vae.DecodeAsync(z, 24, 32);
+        vae.Tap = null;
+        Write(Path.Combine(outDir, "picture_3x192x256.raw"), pic);
+        var report = $"{names.Count} taps ({string.Join(", ", names)}) + z + picture -> {outDir}";
+        Console.WriteLine("[Flux2] decoder taps: " + report);
+        return report;
+    });
+
+    /// <summary>
+    /// The native VAE on the CPU accelerator (which allows 64 threads per group; GroupNorm launched 256-thread groups until 2026-11-13, found by SpawnGen): ComfyUI's latent of
+    /// picture A decodes to ComfyUI's picture.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Flux2_ComfyVae_DecodesOnCpuAccelerator() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.CPU) throw new UnsupportedTestException("the CPU accelerator's group limit is what this checks");
+        var dir = F2Dir() ?? throw new UnsupportedTestException("FLUX.2 fixtures not found (F2_DIR)");
+        var d = Path.Combine(dir, "comfy", "comfyui-dumps");
+        if (!File.Exists(Path.Combine(dir, "comfy", "flux2-vae.safetensors")) || !Directory.Exists(d)) throw new UnsupportedTestException("ComfyUI's flux2-vae.safetensors and the measured dumps are needed");
+        var src = new LocalFolderModelSource(Path.Combine(dir, "comfy"));
+        using var vae = await SdVae.LoadAsync(accelerator, src, "", "flux2-vae.safetensors");
+        var norm = await Flux2VaeNorm.FromSafeTensorsAsync(src, "", "flux2-vae.safetensors");
+        var k = new Flux2Kernels(accelerator);
+        using var mean = accelerator.Allocate1D(norm.Mean); using var std = accelerator.Allocate1D(norm.Std);
+        var lat = F2_Raw(Path.Combine(d, "enc_256x192_samples_f32_1x128x12x16.raw"), 128L * 12 * 16);
+        using var lb = accelerator.Allocate1D(lat); using var raw = accelerator.Allocate1D<float>(32L * 24 * 32);
+        k.LatentToVae(lb.View, mean.View, std.View, raw.View, 12, 16);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var pic = await vae.DecodeAsync(await raw.View.CopyToHostAsync(), 24, 32);
+        var want = F2_Raw(Path.Combine(d, "dec_of_enc_256x192_images_f32_1x192x256x3.raw"), 192L * 256 * 3);
+        var got = new float[want.Length];
+        for (int c = 0; c < 3; c++) for (int p = 0; p < 192 * 256; p++) got[p * 3 + c] = Math.Clamp((pic[c * 192 * 256 + p] + 1f) / 2f, 0f, 1f);
+        double rel = F2_RelRms(got, want);
+        var report = $"CPU accelerator decode of ComfyUI's latent of A: {rel:E2} from ComfyUI's picture, {sw.Elapsed.TotalSeconds:F1} s";
+        Console.WriteLine("[Flux2] " + report);
+        Ur_Expect(rel < 0.02, report);
+        return report;
+    });
+
     private static float[] F2_Raw(string path, long count)
     {
         var bytes = File.ReadAllBytes(path);

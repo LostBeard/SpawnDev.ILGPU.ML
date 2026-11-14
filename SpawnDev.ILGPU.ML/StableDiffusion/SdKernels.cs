@@ -40,13 +40,14 @@ public sealed class SdKernels
     private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int>? _gnPartial;
     private static void GnPartialImpl(FV x, FV stats, FV partial, int C, int cg, int rows, int rowsPerChunk, int chunks, int centred)
     {
-        int g = Grid.IdxX / chunks, chunk = Grid.IdxX - g * chunks, t = Group.IdxX;
+        // the group is GnThreads on the GPUs, fewer where the accelerator caps it (the CPU accelerator: 64); always a power of two
+        int g = Grid.IdxX / chunks, chunk = Grid.IdxX - g * chunks, t = Group.IdxX, threads = Group.DimX;
         var sh = SharedMemory.Allocate<float>(GnThreads);
         int r0 = chunk * rowsPerChunk, r1 = Math.Min(rows, r0 + rowsPerChunk);
         int n = (r1 - r0) * cg;
         float mean = centred != 0 ? stats[2 * g] : 0f;
         float s = 0f;
-        for (int i = t; i < n; i += GnThreads)
+        for (int i = t; i < n; i += threads)
         {
             int r = r0 + i / cg, c = g * cg + i % cg;
             float v = x[(long)r * C + c] - mean;
@@ -54,7 +55,7 @@ public sealed class SdKernels
         }
         sh[t] = s;
         Group.Barrier();
-        for (int st = GnThreads / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        for (int st = threads / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
         if (t == 0) partial[Grid.IdxX] = sh[0];
     }
     private Action<Index1D, FV, FV, int, int, float, int>? _gnFinal;
@@ -87,7 +88,9 @@ public sealed class SdKernels
         _gnFinal ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float, int>(GnFinalImpl);
         _gnApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, HV, HV, int, int, int>(GnApplyImpl);
         int count = rows * cg;
-        var cfg = new KernelConfig((int)need, GnThreads);
+        int threads = GnThreads;
+        while (threads > _acc.MaxNumThreadsPerGroup) threads >>= 1;             // the CPU accelerator allows 64 threads per group
+        var cfg = new KernelConfig((int)need, threads);
         _gnPartial(cfg, x, _stats.View, _partial.View, C, cg, rows, rowsPerChunk, chunks, 0);
         _gnFinal(groups, _partial.View, _stats.View, chunks, count, eps, 0);
         _gnPartial(cfg, x, _stats.View, _partial.View, C, cg, rows, rowsPerChunk, chunks, 1);
@@ -116,10 +119,13 @@ public sealed class SdKernels
     // convolution (the pixel (iy / 2, ix / 2) of the stored picture). Outside the picture: -1 (zero padding). padEnd = the padding on the bottom / right edge
     // (the VAE encoder's downsampler pads (0, 1, 0, 1) and convolves with no padding).
     // ---------------------------------------------------------------------------------------------------
-    private Action<Index1D, IV, int, int, int, int, int, int, int, int>? _table;
-    // up > 1: the convolution reads a nearest-upsampled image of the OUTPUT's size (outH, outW), source row floor(y * inH / outH) computed in fp32 as torch's
+    private Action<Index1D, IV, int, int, int, int, int, int, int, int, float, float>? _table;
+    // up > 1: the convolution reads a nearest-upsampled image of the OUTPUT's size (outH, outW), source row floor(y * scale) with scale = inH / outH in fp32, as torch's
     // F.interpolate(mode="nearest", size=...) does: 2x for the usual blocks (y / 2 exactly), any size for ComfyUI's Upsample(output_shape = the next skip's shape).
-    private static void TableImpl(Index1D idx, IV nbr, int inH, int inW, int outW, int k, int stride, int pad, int up, int outH)
+    // The scale is divided on the HOST (correctly rounded) and only multiplied here, as torch does: OpenCL lets a device's fp32 division be off by 2.5 ulp, and AMD's
+    // is (an RX 590 gave 24 / 48 just below 0.5, so floor(2 * scale) = 0 and rows came from the wrong pixel: the FLUX.2 VAE's 192 x 256 decode went wrong from its first
+    // upsample; power-of-two sizes divide exactly, which is why 512 px pictures never showed it). Multiplication is correctly rounded on every backend.
+    private static void TableImpl(Index1D idx, IV nbr, int inH, int inW, int outW, int k, int stride, int pad, int up, int outH, float scaleY, float scaleX)
     {
         int taps = k * k;
         int t = idx % taps, m = idx / taps;
@@ -128,16 +134,17 @@ public sealed class SdKernels
         int iy = oy * stride - pad + ky, ix = ox * stride - pad + kx;
         int H = up > 1 ? outH : inH, W = up > 1 ? outW : inW;
         bool inside = iy >= 0 && iy < H && ix >= 0 && ix < W;
-        int sy = up > 1 ? XMath.Min((int)XMath.Floor(iy * ((float)inH / H)), inH - 1) : iy;
-        int sx = up > 1 ? XMath.Min((int)XMath.Floor(ix * ((float)inW / W)), inW - 1) : ix;
+        int sy = up > 1 ? XMath.Min((int)XMath.Floor(iy * scaleY), inH - 1) : iy;
+        int sx = up > 1 ? XMath.Min((int)XMath.Floor(ix * scaleX), inW - 1) : ix;
         nbr[m * 27 + t] = inside ? sy * inW + sx : -1;
     }
 
     /// <summary>Fill a neighbour table for a k x k convolution (k = 1 or 3): output size (outH, outW) for an input of (inH, inW).</summary>
     public void BuildTable(IV nbr, int inH, int inW, int outH, int outW, int k, int stride, int pad, int up)
     {
-        _table ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int, int, int, int, int, int>(TableImpl);
-        _table(outH * outW * k * k, nbr, inH, inW, outW, k, stride, pad, up, outH);
+        _table ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, int, int, int, int, int, int, int, int, float, float>(TableImpl);
+        float scaleY = up > 1 ? (float)inH / outH : 0f, scaleX = up > 1 ? (float)inW / outW : 0f;      // on the host: correctly rounded
+        _table(outH * outW * k * k, nbr, inH, inW, outW, k, stride, pad, up, outH, scaleY, scaleX);
     }
 
     /// <summary>

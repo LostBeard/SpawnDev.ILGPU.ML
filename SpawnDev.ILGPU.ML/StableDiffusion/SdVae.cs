@@ -50,7 +50,7 @@ public sealed partial class SdVae : IDisposable
         _acc = accelerator; _w = weights; _k = new SdKernels(accelerator); _dk = new DiTKernels(accelerator);
         HasDecoder = weights.Has("decoder.conv_in.weight");
         HasEncoder = weights.Has("encoder.conv_in.weight");
-        LatentChannels = HasDecoder ? weights.Shape("decoder.conv_in.weight")[1] : weights.Shape("quant_conv.weight")[0] / 2;
+        LatentChannels = HasDecoder ? weights.Shape("decoder.conv_in.weight")[1] : weights.Shape("encoder.conv_out.weight")[0] / 2;   // the moments: mean | log-variance
         int levels = 0;
         while (weights.Has($"decoder.up.{levels}.block.0.conv1.weight") || weights.Has($"encoder.down.{levels}.block.0.conv1.weight")) levels++;
         Levels = levels;
@@ -177,8 +177,12 @@ public sealed partial class SdVae : IDisposable
         int rows = h * w;
         var zin = Slot(SlotIn, (long)rows * L);
         _dk.Transpose(latent, zin, L, rows);
-        var z = Slot(SlotT, (long)rows * L);
-        Conv1("post_quant_conv", zin, z, rows, L, L, h, w);
+        var z = zin;
+        if (_w.Has("post_quant_conv.weight"))                // FLUX.1's autoencoder has none (ae.safetensors): the latent goes straight into conv_in
+        {
+            z = Slot(SlotT, (long)rows * L);
+            Conv1("post_quant_conv", zin, z, rows, L, L, h, w);
+        }
         Tap?.Invoke("post_quant_conv", z, h, w, L);
         var cur = Slot(SlotA, (long)rows * topC);
         Conv3("decoder.conv_in", z, cur, h, w, L, topC);
@@ -283,8 +287,12 @@ public sealed partial class SdVae : IDisposable
         int momC = _w.Shape("encoder.conv_out.weight")[0];
         var mom = Slot(SlotT, (long)Hc * Wc * momC);
         Conv3("encoder.conv_out", n, mom, Hc, Wc, C, momC);
-        var q = Slot(SlotOut, (long)Hc * Wc * momC);
-        Conv1("quant_conv", mom, q, Hc * Wc, momC, momC, Hc, Wc);
+        var q = mom;
+        if (_w.Has("quant_conv.weight"))                     // FLUX.1's autoencoder has none: the moments are encoder.conv_out's output
+        {
+            q = Slot(SlotOut, (long)Hc * Wc * momC);
+            Conv1("quant_conv", mom, q, Hc * Wc, momC, momC, Hc, Wc);
+        }
         // the mean is the first half of the moments' channels: channel-last [rows, 2L] -> channel-first [2L, rows], whose first L rows are the mean
         var t = Slot(SlotQkv, (long)Hc * Wc * momC);
         _dk.Transpose(q, t, Hc * Wc, momC);

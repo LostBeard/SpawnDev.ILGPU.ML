@@ -61,6 +61,36 @@ public abstract partial class MLTestBase
     /// gathered convolution (cout = 3) and the bf16 Linear (N = 3) against a host reference on the same fp16 / bf16-rounded operands. Light, every backend.
     /// </summary>
     [TestMethod(Timeout = 120000)]
+    public async Task Sd_UpsampleTable_NonPowerOfTwo_MatchesHost() => await RunTest(async accelerator =>
+    {
+        // The nearest-upsample neighbour table at sizes whose ratio does not divide exactly in binary (24 -> 48 is 0.5, but 1 / 48 is not a short binary fraction) and at
+        // a non-integer ratio, against the host's exact integer formula. The device used to divide (float)inH / outH itself: an AMD RX 590 on OpenCL returned 24 / 48 =
+        // 0.49999997 (OpenCL allows 2.5 ulp for fp32 division) and 13,110 of 27,648 entries pointed at the wrong pixel, so FLUX.2's 192 x 256 VAE decode came out wrong.
+        // NVIDIA divides exactly, so this gate is red only on a device with inexact division; it keeps the division on the host for every backend. Light, every backend.
+        var k = new StableDiffusion.SdKernels(accelerator);
+        var report = new List<string>();
+        foreach (var (inH, inW, outH, outW) in new[] { (24, 32, 48, 64), (15, 25, 30, 50), (7, 12, 14, 24), (10, 6, 17, 13) })
+        {
+            using var t = accelerator.Allocate1D<int>((long)outH * outW * 27);
+            k.BuildTable(t.View, inH, inW, outH, outW, 3, 1, 1, 2);
+            var dev = await t.CopyToHostAsync();
+            float sy = (float)inH / outH, sx = (float)inW / outW;               // torch's nearest: floor(dst * (in / out)), the scale divided on the host
+            int bad = 0, first = -1;
+            for (int m = 0; m < outH * outW; m++)
+                for (int tap = 0; tap < 9; tap++)
+                {
+                    int oy = m / outW, ox = m % outW, iy = oy - 1 + tap / 3, ix = ox - 1 + tap % 3;
+                    bool inside = iy >= 0 && iy < outH && ix >= 0 && ix < outW;
+                    int want = inside ? Math.Min((int)MathF.Floor(iy * sy), inH - 1) * inW + Math.Min((int)MathF.Floor(ix * sx), inW - 1) : -1;
+                    if (dev[m * 27 + tap] != want) { bad++; if (first < 0) first = m * 27 + tap; }
+                }
+            report.Add($"{inH}x{inW} -> {outH}x{outW}: {bad} of {outH * outW * 9} wrong{(first >= 0 ? $" (first entry {first}: {dev[first]})" : "")}");
+            Ur_Expect(bad == 0, string.Join("; ", report));
+        }
+        return string.Join("; ", report);
+    });
+
+    [TestMethod(Timeout = 120000)]
     public async Task Sd_OddWidthBias_MatchesHost() => await RunTest(async accelerator =>
     {
         if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("the tiled GEMM needs shared memory");
