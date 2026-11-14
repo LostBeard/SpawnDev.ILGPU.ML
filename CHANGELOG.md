@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+## 5.8.17 - 2026-11-14 (nuget.org) - ComfyUI's Wan 2.2 / FLUX.2 / FLUX.1 files load as they are; the VAE decodes right on AMD OpenCL
+
+- **Fix: CUDA graph replays could read an input the caller had not finished writing.** `CudaGraphCapture.ReplayAsync` copied the new inputs on its own stream while
+  the caller's preprocessing wrote them on the default stream, with nothing ordering the two. Found by the 5.8.17 sweep: `Pipeline_YOLOv8_GraphCapture_MatchesDirect`
+  saw replayed detections drift run to run (car 0.7725 direct, 0.7685 to 0.7734 replayed); it failed 10 of 10 times alone, also on the 5.8.16 code (a latent race).
+  The replay now drains the default stream before the copies: 3 of 3 green, the CUDA capture gates 15 passed / 0 failed.
+
 - **Fix: the VAE's upsampling went wrong on AMD OpenCL at sizes that are not powers of two** (found by SpawnGen on an RX 590 with the FLUX.2 VAE at 192 x 256:
   0.27 relRMS from ComfyUI's picture). The nearest-upsample neighbour table (`SdKernels.BuildTable`, every native VAE and the SD UNet's resizes) divided
   `(float)inH / outH` on the device; OpenCL allows fp32 division 2.5 ulp of error and the RX 590 returned 24 / 48 = 0.49999997, so `floor(2 * scale)` = 0 and
