@@ -14,7 +14,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   ComfyUI's 8-bit scaled text-encoder matrices run exact in `Flux2TextEncoder` (`Flux2Weights.MatrixExact` + `ActivationScale`: the unscaled decode, the input times the scale):
   Qwen-Image's encoder 3.1e-3 -> 4.5e-5.
 - **FLUX.1's split templates** (standalone `flux1-*-fp8_scaled` / bf16 transformer, `t5xxl_fp8_e4m3fn_scaled` or fp16, `clip_l`): gates against SpawnGen's dumps of ComfyUI's Krea graph
-  (`Flux1Split_*`); with no FluxGuidance node ComfyUI passes guidance 3.5. Standalone clip_l: 1.34e-6. The scaled T5 still folds its scales (4.1e-3 on the prompt rows). The Krea
+  (`Flux1Split_*`); with no FluxGuidance node ComfyUI passes guidance 3.5. Standalone clip_l: 1.34e-6. The fp8_scaled T5 runs exact with `UmT5Encoder.PreciseActivations` (the
+  8-bit values unscaled, each scale applied to the input, or to its part's output columns in the fused q | k | v): 2.25e-4 on the prompt rows (folded into bf16: 4.1e-3). The Krea
   fp8_scaled transformer runs 1.3e-3 from ComfyUI: its F16 biases are held exactly as bf16 hi + lo (`StreamedModelWeights`), but SpawnDev.ILGPU before 5.4.33 does not round a
   float -> BFloat16 -> float round trip in GPU kernels (found here: lo all zero on CUDA / OpenCL / WebGPU / WebGL / Wasm; reported, fixed in 5.4.33), so one layer misses ComfyUI's
   hooked output by 1.5e-4 where the exact arithmetic gives 5e-8 (SpawnGen measured ComfyUI's Linear). Its gates join with 5.4.33.

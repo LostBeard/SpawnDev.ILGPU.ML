@@ -239,7 +239,14 @@ public static class WanComfyFormat
     /// (2026-11-12, 21 matrices): value * scale is 2.65e-2 relative RMS from the fp16 file's weights (the 8-bit format's own rounding) and the bf16 rounding of
     /// value * scale is 1.1e-3 to 1.9e-3, which adds 0.2% to that error in quadrature.
     /// </summary>
-    public static async Task AdaptT5Async(Accelerator accelerator, GpuWeights w)
+    public static Task AdaptT5Async(Accelerator accelerator, GpuWeights w) => AdaptT5Async(accelerator, w, null);
+
+    /// <summary>
+    /// The same; with <paramref name="exactScaled"/>, an 8-bit scaled file's matrices are NOT folded into bf16(f8 * scale): each fused group keeps its 8-bit values as they are (exact in bf16)
+    /// and <paramref name="exactScaled"/>[our name] lists its parts' (rows, scale) in order, for the caller to apply the scales exactly (UmT5Encoder: the input times the scale for one part,
+    /// the output columns of each part for a fused q | k | v).
+    /// </summary>
+    public static async Task AdaptT5Async(Accelerator accelerator, GpuWeights w, Dictionary<string, (int Rows, float Scale)[]>? exactScaled)
     {
         async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
         // our name -> its source tensors in the fused order (the table's order: q, k, v)
@@ -259,6 +266,24 @@ public static class WanComfyFormat
             if (ours.EndsWith("attn.qkv.weight", StringComparison.Ordinal) && sources.Count != 3) throw new InvalidDataException($"{ours}: needs q, k and v, got {string.Join(", ", sources)}");
             long total = 0;
             foreach (var n in sources) { long c = 1; foreach (int d in w.Shape(n)) c *= d; total += c; }
+            if (exactScaled != null && sources.All(w.IsF8) && sources.All(n => scales.ContainsKey(n)))
+            {
+                // exact: the 8-bit values fused as they are (four to a word: every part's count is a multiple of 4), the scales returned
+                var words = accelerator.Allocate1D<uint>(total / 4);
+                long woff = 0;
+                var parts = new (int Rows, float Scale)[sources.Count];
+                for (int i = 0; i < sources.Count; i++)
+                {
+                    var src = w.F8Words(sources[i]);
+                    words.View.SubView(woff, src.Length).CopyFrom(src); woff += src.Length;
+                    parts[i] = (w.Shape(sources[i])[0], (await w.F32(scales[sources[i]]).CopyToHostAsync())[0]);
+                }
+                var s0x = w.Shape(sources[0]);
+                foreach (var n in sources) await Retire(w.Remove(n));
+                await Retire(w.SetF8(ours, words, sources.Count == 1 ? s0x : new[] { s0x[0] * sources.Count, s0x[1] }));
+                exactScaled[ours] = parts;
+                continue;
+            }
             var dst = accelerator.Allocate1D<BFloat16>(total);
             long off = 0;
             foreach (var n in sources)

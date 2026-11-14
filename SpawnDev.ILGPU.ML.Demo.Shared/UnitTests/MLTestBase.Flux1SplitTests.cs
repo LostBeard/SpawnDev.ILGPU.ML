@@ -46,9 +46,9 @@ public abstract partial class MLTestBase
             report.Add($"'{prompt}' ({real.Length} tokens): all rows {all:E2}, real tokens {realRows:E2}");
         }
         foreach (var line in report) Console.WriteLine("[Flux1Split] fp8_scaled T5 vs ComfyUI: " + line);
-        // MEASURED (RTX 4070, CUDA, 2026-11-14): real tokens 4.12e-3 / 8.3e-4, all rows 4.8e-3 / 5.8e-3. The adapter folds each matrix's scale into a bf16 decode (and fuses q | k | v,
-        // whose scales differ): the checkpoint's unscaled T5 through the same encoder is 3.2e-4. Exact scaled T5 matrices are still to do.
-        Ur_Expect(worstReal < 5e-3 && worst < 1e-2, string.Join("; ", report));
+        // MEASURED (RTX 4070, CUDA, 2026-11-14): with PreciseActivations the scaled matrices run exact (WanComfyFormat.AdaptT5Async exactScaled: 8-bit values unscaled, the scale on the input
+        // or on each fused part's output columns): real tokens 2.25e-4 / 7.4e-6, all rows 6.0e-4 / 1.8e-4. Folded into bf16(f8 * scale) they were 4.1e-3 / 8.3e-4.
+        Ur_Expect(worstReal < 1e-3 && worst < 3e-3, string.Join("; ", report));
         return string.Join("; ", report);
     });
 

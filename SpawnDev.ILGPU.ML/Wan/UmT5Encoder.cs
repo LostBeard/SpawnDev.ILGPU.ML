@@ -35,6 +35,7 @@ public sealed class UmT5Encoder : IDisposable
     private readonly bool _embeddingF8;                          // 8-bit float rows with no scale (ComfyUI's all-in-one FLUX.1 checkpoints)
     private readonly string _prefix;                             // the T5's names inside an all-in-one checkpoint (FLUX.1: "text_encoders.t5xxl.transformer."); "" for a T5 file
     private readonly DiTKernels _k;
+    private readonly Flux2.Flux2Kernels _f2;
     private readonly WanKernels _wk;
     public const int Dim = 4096, Heads = 64, HeadDim = 64, FfnDim = 10240, DefaultLayers = 24;
     private readonly int _layers;
@@ -49,12 +50,32 @@ public sealed class UmT5Encoder : IDisposable
     /// on the bf16 path); a ComfyUI-parity caller turns it on. Other backends compute in fp32 either way.
     /// </summary>
     public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
+    // with PreciseActivations, an 8-bit scaled file's matrices stay exact (WanComfyFormat.AdaptT5Async): their parts' (rows, scale), refilled as each layer loads
+    private readonly Dictionary<string, (int Rows, float Scale)[]> _exactScaled = new();
+
+    // nn.Linear (no bias): an exact scaled 8-bit matrix runs on its unscaled decode with the input times its scale (one part, any activation after) or each part's output columns
+    // times its scale (a fused q | k | v; no activation); every other matrix as Flux2Weights.Linear runs it
+    private void Lin(Flux2Weights fw, FV x, string name, FV o, int M, int K, int N, FV xs, DiTKernels.Act act = DiTKernels.Act.None)
+    {
+        if (!_exactScaled.TryGetValue(name, out var parts)) { fw.Linear(_k, x, name, null, o, M, K, N, act, allowW8A8: false); return; }
+        if (parts.Length == 1)
+        {
+            var xv = xs.SubView(0, (long)M * K);
+            _f2.ScaleInto(x, xv, parts[0].Scale, M * K);
+            _k.Linear(xv, fw.MatrixExact(name), null, o, M, K, N, act);
+            return;
+        }
+        if (act != DiTKernels.Act.None) throw new NotSupportedException($"{name}: a fused scaled matrix with an activation");
+        _k.Linear(x, fw.MatrixExact(name), null, o, M, K, N);
+        int c0 = 0;
+        foreach (var (rows, scale) in parts) { _wk.ScaleColumnRange(o, M, N, c0, rows, scale); c0 += rows; }
+    }
 
     private UmT5Encoder(Accelerator accelerator, IModelSource source, string repo, string file, Stream embeddings, SafeTensorInfo info, bool quantized, int layers, bool sharedBias, bool hfLayout = false, string prefix = "")
     {
         _acc = accelerator; _source = source; _repo = repo; _file = file; _embeddings = embeddings; _embeddingInfo = info; _embeddingQuantized = quantized; _layers = layers; _sharedBias = sharedBias;
         _hfLayout = hfLayout; _embeddingF16 = info.DType == "F16"; _embeddingF8 = info.DType == "F8_E4M3"; _prefix = prefix;
-        _k = new DiTKernels(accelerator); _wk = new WanKernels(accelerator);
+        _k = new DiTKernels(accelerator); _wk = new WanKernels(accelerator); _f2 = new Flux2.Flux2Kernels(accelerator);
     }
 
     /// <summary>Open the encoder file from a model source: reads the header and keeps a stream on the embedding table.</summary>
@@ -152,7 +173,7 @@ public sealed class UmT5Encoder : IDisposable
         try
         {
             if (_prefix.Length > 0) foreach (var n in w.Names.ToList()) w.Rename(n, n[_prefix.Length..]);
-            await WanComfyFormat.AdaptT5Async(_acc, w);
+            await WanComfyFormat.AdaptT5Async(_acc, w, PreciseActivations ? _exactScaled : null);
             return w;
         }
         catch { w.Dispose(); throw; }
@@ -185,6 +206,7 @@ public sealed class UmT5Encoder : IDisposable
             using var gate = _acc.Allocate1D<float>((long)total * FfnDim);
             using var fc1 = _acc.Allocate1D<float>((long)total * FfnDim);
             using var scores = _acc.Allocate1D<float>((long)Heads * maxL * maxL);
+            using var xs = _acc.Allocate1D<float>(PreciseActivations ? (long)total * FfnDim : 1);   // an exact scaled matrix's scaled input (the widest: fc2's [rows, FfnDim])
             const string SharedBiasName = "blocks.0.pos_embedding.embedding.weight";
             using var sharedBias = _sharedBias ? await LoadLayerAsync(name => name == SharedBiasName, ct) : null;       // [32, 64] bf16, kept for every layer
             for (int b = 0; b < _layers; b++)
@@ -198,22 +220,22 @@ public sealed class UmT5Encoder : IDisposable
                 _wk.RowRmsNorm(hn.View, w.BF16(p + "norm1.weight"), total, Dim, 0, Dim, 1e-6f);
                 // the text encoders stay on the float GEMM, never W8A8: T5-v1.1-XXL's activations (huge, with outliers) made 8-bit activations unstable (MEASURED, LTX T5 prompt 0:
                 // 0.14 relRMS on CUDA, where fc2's float path rounds to bf16, 0.033 on OpenCL; umT5 doubled its error); it runs once per prompt and is cached, so W8A8 bought little
-                fw.Linear(_k, hn.View, p + "attn.qkv.weight", null, qkv.View, total, Dim, 3 * Dim, allowW8A8: false);
+                Lin(fw, hn.View, p + "attn.qkv.weight", qkv.View, total, Dim, 3 * Dim, xs.View);
                 for (int s = 0; s < count; s++)
                 {
                     int L = sequences[s].Length, off = offsets[s];
                     _wk.T5Attention(qkv.View.SubView((long)off * 3 * Dim, (long)L * 3 * Dim), _sharedBias ? sharedBias!.BF16(SharedBiasName) : w.BF16(p + "pos_embedding.embedding.weight"), buckets[s].View, scores.View,
                         att.View.SubView((long)off * Dim, (long)L * Dim), L, Heads, HeadDim);
                 }
-                fw.Linear(_k, att.View, p + "attn.o.weight", null, proj.View, total, Dim, Dim, allowW8A8: false);
+                Lin(fw, att.View, p + "attn.o.weight", proj.View, total, Dim, Dim, xs.View);
                 _k.GateResidual(xb.View, proj.View, default, -1, total * Dim, Dim);
                 // gated feed-forward
                 hn.View.CopyFrom(xb.View);
                 _wk.RowRmsNorm(hn.View, w.BF16(p + "norm2.weight"), total, Dim, 0, Dim, 1e-6f);
-                fw.Linear(_k, hn.View, p + "ffn.gate.weight", null, gate.View, total, Dim, FfnDim, DiTKernels.Act.GeluTanh, allowW8A8: false);
-                fw.Linear(_k, hn.View, p + "ffn.fc1.weight", null, fc1.View, total, Dim, FfnDim, allowW8A8: false);
+                Lin(fw, hn.View, p + "ffn.gate.weight", gate.View, total, Dim, FfnDim, xs.View, DiTKernels.Act.GeluTanh);
+                Lin(fw, hn.View, p + "ffn.fc1.weight", fc1.View, total, Dim, FfnDim, xs.View);
                 _wk.MulInPlace(fc1.View, gate.View, total * FfnDim);
-                fw.Linear(_k, fc1.View, p + "ffn.fc2.weight", null, proj.View, total, FfnDim, Dim, allowW8A8: false);
+                Lin(fw, fc1.View, p + "ffn.fc2.weight", proj.View, total, FfnDim, Dim, xs.View);
                 _k.GateResidual(xb.View, proj.View, default, -1, total * Dim, Dim);
                 await _acc.SynchronizeAsync();                                         // the layer's weights are freed when `w` goes out of scope
                 if (Tap != null && (b == 0 || b == _layers / 2 || b == _layers - 1)) Tap($"layer_{b}", xb.View, sequences[0].Length * Dim);

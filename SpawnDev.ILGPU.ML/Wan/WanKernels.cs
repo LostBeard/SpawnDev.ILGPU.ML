@@ -446,6 +446,15 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // o[r, c0 + c] *= s for c < n over rows [0, rows) of [rows, N] (one part of a fused matrix whose parts carry different scales)
+    private Action<Index1D, FV, int, int, int, float>? _scaleColRange;
+    private static void ScaleColRangeImpl(Index1D i, FV o, int N, int c0, int n, float s) { long r = i / n; int c = (int)(i % n); o[r * N + c0 + c] *= s; }
+    public void ScaleColumnRange(FV o, int rows, int N, int c0, int n, float s)
+    {
+        _scaleColRange ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int, int, int, float>(ScaleColRangeImpl);
+        _scaleColRange(rows * n, o, N, c0, n, s);
+    }
+
     // Wan 2.1's VAE has no 2 x 2 patching: a picture [3, F, H, W] channel-first -> channel-last [F*H*W, 3], and the head's [F*H*W, 3] -> video [3, F, H, W] clamped to [-1, 1]
     private Action<Index1D, FV, FV, int>? _toChannelLast, _toChannelFirstClamp;
     private static void ToChannelLastImpl(Index1D i, FV src, FV dst, int pixels) { int c = i % 3; long p = i / 3; dst[i] = src[c * (long)pixels + p]; }
