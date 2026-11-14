@@ -50,6 +50,36 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The encoder's stage taps (channel-last float32) for picture A through ComfyUI's ae.safetensors, written to F1_DIR\comfy\taps\&lt;backend&gt;: compared on the host with SpawnGen's
+    /// ComfyUI encoder dumps (_DevComms 2026-11-14-0700 ...-ae-encoder-spots) to find where a few latent cells of A and C part from ComfyUI's.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Flux1_ComfyAe_DumpEncoderTaps() => await RunTest(async accelerator =>
+    {
+        var dir = F1_RequireAe(accelerator); var d = Path.Combine(dir, "comfy", "comfyui-dumps");
+        if (!Directory.Exists(d)) throw new UnsupportedTestException($"ComfyUI's measured ae dumps not found in {d}");
+        using var vae = await SdVae.LoadAsync(accelerator, new LocalFolderModelSource(Path.Combine(dir, "comfy")), "", "ae.safetensors");
+        var outDir = Path.Combine(dir, "comfy", "taps", accelerator.AcceleratorType.ToString());
+        Directory.CreateDirectory(outDir);
+        static void Write(string path, float[] a) { var b = new byte[a.Length * 4]; Buffer.BlockCopy(a, 0, b, 0, b.Length); File.WriteAllBytes(path, b); }
+        var names = new List<string>();
+        vae.Tap = (name, view, h, w, c) =>
+        {
+            accelerator.Synchronize();
+            var a = new float[(long)h * w * c]; view.SubView(0, a.Length).CopyToCPU(a);
+            Write(Path.Combine(outDir, $"tap_{name}_{h}x{w}x{c}.raw"), a); names.Add(name);
+        };
+        var img = F2_Raw(Path.Combine(d, "f2_img_1x192x256x3.raw"), 192L * 256 * 3);
+        var z = await vae.EncodeAsync(F2_NhwcToChw(img, 192, 256), 192, 256);
+        vae.Tap = null;
+        Write(Path.Combine(outDir, "mean_16x24x32.raw"), z);
+        var report = $"{names.Count} encoder taps ({string.Join(", ", names)}) + the mean -> {outDir}";
+        Console.WriteLine("[Flux1] " + report);
+        Ur_Expect(names.Contains("enc_conv_out") && names.Contains("enc_mid_attn_1"), report);
+        return report;
+    });
+
+    /// <summary>
     /// ComfyUI's own VAE Encode / Decode with ae.safetensors, measured by SpawnGen on the ComfyUI reference (float32, CPU; F1_DIR\comfy\comfyui-dumps, Lore's note there): LATENT is
     /// [16, H/8, W/8] channel-major, the RAW encoder mean (FLUX.1's scale 0.3611 / shift 0.1159 are applied on the way into the model, not in LATENT); a picture that is not a
     /// multiple of 8 is cut to its centred multiple. Checked: encode of A (256 x 192), B (200 x 120) and C (205 x 125 -> the centred 200 x 120), decode of ComfyUI's latent of A

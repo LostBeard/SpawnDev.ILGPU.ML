@@ -33,7 +33,8 @@ public sealed partial class SdVae : IDisposable
     public bool HasDecoder { get; }
     public bool HasEncoder { get; }
 
-    /// <summary>Test hook: (stage name, activation view [pixels, C] channel-last, height, width, channels); valid only during the call.</summary>
+    /// <summary>Test hook: (stage name, activation view [pixels, C] channel-last, height, width, channels); valid only during the call. Decoder: post_quant_conv, dec_mid, dec_up_N;
+    /// encoder: enc_down_I_block_J, enc_down_I_downsample, enc_mid_block_1 / enc_mid_attn_1 / enc_mid_block_2, enc_norm_out_silu, enc_conv_out (the moments).</summary>
     public Action<string, FV, int, int, int>? Tap { get; set; }
 
     /// <summary>
@@ -137,14 +138,17 @@ public sealed partial class SdVae : IDisposable
         _k.AddInPlace(dst, x, (long)rows * C);
     }
 
-    private FV Mid(string p, FV cur, int H, int W, int C, long maxElems)
+    private FV Mid(string p, FV cur, int H, int W, int C, long maxElems, string? tap = null)
     {
         var d1 = Other(cur).SubView(0, (long)H * W * C);
         Resnet(p + "block_1.", cur, d1, H, W, C, C);
+        if (tap != null) Tap?.Invoke(tap + "block_1", d1, H, W, C);
         var d2 = Other(d1).SubView(0, (long)H * W * C);
         Attn(p + "attn_1.", d1, d2, H, W, C);
+        if (tap != null) Tap?.Invoke(tap + "attn_1", d2, H, W, C);
         var d3 = Other(d2).SubView(0, (long)H * W * C);
         Resnet(p + "block_2.", d2, d3, H, W, C, C);
+        if (tap != null) Tap?.Invoke(tap + "block_2", d3, H, W, C);
         return d3;
     }
 
@@ -269,6 +273,7 @@ public sealed partial class SdVae : IDisposable
                 var dst = Other(cur).SubView(0, (long)Hc * Wc * cout);
                 Resnet(p, cur, dst, Hc, Wc, C, cout);
                 cur = dst; C = cout;
+                Tap?.Invoke($"enc_down_{i}_block_{j}", cur, Hc, Wc, C);
                 if (_acc.IsBrowser()) await _acc.SynchronizeAsync();
             }
             if (_w.Has($"encoder.down.{i}.downsample.conv.weight"))
@@ -278,15 +283,18 @@ public sealed partial class SdVae : IDisposable
                 var dst = Other(cur).SubView(0, (long)oh * ow * C);
                 _k.Conv(cur, Table(Hc, Wc, oh, ow, 3, 2, 0, 1), _w[$"encoder.down.{i}.downsample.conv.weight"], _w[$"encoder.down.{i}.downsample.conv.bias"], dst, oh * ow, C, C, 9, exact: true);
                 cur = dst; Hc = oh; Wc = ow;
+                Tap?.Invoke($"enc_down_{i}_downsample", cur, Hc, Wc, C);
             }
             cancellationToken.ThrowIfCancellationRequested();
         }
-        cur = Mid("encoder.mid.", cur, Hc, Wc, C, maxElems);
+        cur = Mid("encoder.mid.", cur, Hc, Wc, C, maxElems, "enc_mid_");
         var n = Slot(SlotNorm, (long)Hc * Wc * C);
         _k.GroupNorm(cur, n, _w["encoder.norm_out.weight"], _w["encoder.norm_out.bias"], Hc * Wc, C, 32, 1e-6f, silu: true);
+        Tap?.Invoke("enc_norm_out_silu", n, Hc, Wc, C);                     // GroupNorm and SiLU fused: a hook on the reference's norm_out module sees it before the SiLU
         int momC = _w.Shape("encoder.conv_out.weight")[0];
         var mom = Slot(SlotT, (long)Hc * Wc * momC);
         Conv3("encoder.conv_out", n, mom, Hc, Wc, C, momC);
+        Tap?.Invoke("enc_conv_out", mom, Hc, Wc, momC);
         var q = mom;
         if (_w.Has("quant_conv.weight"))                     // FLUX.1's autoencoder has none: the moments are encoder.conv_out's output
         {
