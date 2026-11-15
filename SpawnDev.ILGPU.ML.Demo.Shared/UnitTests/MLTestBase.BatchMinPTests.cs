@@ -11,7 +11,8 @@ public abstract partial class MLTestBase
     /// (<see cref="TextGenerationSampler.ApplyRepetitionPenalty"/> + <see cref="TextGenerationSampler.ApplyPresencePenalty"/> on each row's window, then
     /// <see cref="GgufBatchDecoder.SampleLogits(float[], int, int, float, float, double, int, float)"/>), 64 rows of 50,003 tokens per case: min-p on the candidates path, the
     /// same with the whole-row path forced, a flat row whose nucleus is wider than the candidates (the whole-row path's own min-p cut), and penalties with min-p. Every case
-    /// must also change some draw against the same case without min-p / presence (it is exercised). ComfyUI's TextGenerate sampling mode has both (SpawnGen's ask).
+    /// must also change some draw against the same case without min-p / presence (it is exercised). ComfyUI's TextGenerate sampling mode has both (SpawnGen's ask). Min-p 1 (the top of
+    /// ComfyUI's range) must also equal the argmax on every row, on both paths.
     /// </summary>
     [TestMethod(Timeout = 300000)]
     public async Task GgufBatchDecoder_MinPAndPresence_MatchHostSampler() => await RunTest(async accelerator =>
@@ -23,7 +24,7 @@ public abstract partial class MLTestBase
         float[] Rows(float sigma) { var a = new float[R * V]; for (int i = 0; i < a.Length; i++) a[i] = sigma * Gauss(); return a; }
         var notes = new List<string>();
         bool ok = true;
-        async Task Case(string name, float[] lg, float T, float topP, float minP, bool force, int seed, int[][]? windows = null, float penalty = 1f, float presence = 0f)
+        async Task Case(string name, float[] lg, float T, float topP, float minP, bool force, int seed, int[][]? windows = null, float penalty = 1f, float presence = 0f, bool greedy = false)
         {
             var got = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force, windows, penalty, 0, 0, 0, minP, presence);
             var plain = await GgufBatchDecoder.DrawRowsAsync(accelerator, lg, R, V, T, topP, seed, Pos, force, windows, 1f, 0, 0, 0, 0f, 0f);
@@ -39,15 +40,19 @@ public abstract partial class MLTestBase
                     Array.Copy(row, 0, hl, (long)r * V, V);
                 }
             }
-            int eq = 0, changed = 0; var bad = new List<string>();
+            int eq = 0, changed = 0, argmax = 0; var bad = new List<string>();
             for (int r = 0; r < R; r++)
             {
                 double u = GgufBatchDecoder.DrawUniform(seed, r, Pos);
                 int want = GgufBatchDecoder.SampleLogits(hl, r, V, T, topP, u, 0, minP);
                 if (got[r] == want) eq++; else if (bad.Count < 3) bad.Add($"[row {r}: host {want}, device {got[r]}]");
                 if (got[r] != plain[r]) changed++;
+                int best = 0; long o = (long)r * V;
+                for (int i = 1; i < V; i++) if (hl[o + i] > hl[o + best]) best = i;
+                if (got[r] == best) argmax++;
             }
-            bool caseOk = eq == R && changed > 0;
+            bool caseOk = eq == R && changed > 0 && (!greedy || argmax == R);
+            if (greedy) name += $" ({argmax}/{R} = greedy)";
             ok &= caseOk;
             notes.Add($"{name}: {eq}/{R} equal, {changed} draws changed by min-p / presence" + (bad.Count > 0 ? " " + string.Join(" ", bad) : ""));
         }
@@ -55,6 +60,9 @@ public abstract partial class MLTestBase
         await Case("T 1, min-p 0.05 (candidates)", rnd, 1f, 1f, 0.05f, false, 31);
         await Case("same, whole row forced", rnd, 1f, 1f, 0.05f, true, 32);
         await Case("T 1, top-p 0.9 then min-p 0.3", rnd, 1f, 0.9f, 0.3f, false, 33);
+        // min-p 1 (ComfyUI's widget and HF's MinPLogitsWarper take [0, 1]; SpawnGen hit "[0, 1)" at 1): only the best token stays, so the draw is greedy on both paths
+        await Case("T 2, min-p 1 (candidates)", rnd, 2f, 1f, 1f, false, 37, greedy: true);
+        await Case("T 2, min-p 1, whole row forced", rnd, 2f, 1f, 1f, true, 38, greedy: true);
         var flat = Rows(1f);
         await Case("flat T 1.5, top-p 0.99 then min-p 0.5 (nucleus past the candidates)", flat, 1.5f, 0.99f, 0.5f, false, 34);
         // penalties: each row's window holds the row's 8 best tokens (so the penalties move the draw), repeated

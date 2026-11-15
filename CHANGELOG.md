@@ -8,7 +8,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   decoder: min-p after top-k and the nucleus (Hugging Face's order: the tokens with logit >= max + T ln(min_p) stay, the best always), on the host sampler and in both device draw
   paths (the candidates and the exact whole-row path); the presence penalty subtracted once per distinct token of the repetition window, after the repetition penalty. Gate
   `GgufBatchDecoder_MinPAndPresence_MatchHostSampler`: device draws equal the host sampler 64 / 64 in six cases on CUDA, OpenCL, WebGPU and Wasm (each case changes 47 to 64
-  draws). The session engine refuses them (NotSupportedException) instead of ignoring them.
+  draws). The session engine refuses them (NotSupportedException) instead of ignoring them. Min-p takes [0, 1] like ComfyUI's widget and Hugging Face's MinPLogitsWarper
+  (1 = only the best token and its ties; SpawnGen hit "[0, 1)" at 1): the floor is clamped to the best logit on every path, and both device draw entry points share one argument
+  check. Two more gate cases, min-p 1 at T 2, equal greedy on all 64 rows (red with the old "[0, 1)" check).
 - **Fix: the automatic Q8_0 load trusted the browser backends' memory estimate** (WebGL reports a fixed 256 MB): it now decides only on CUDA and OpenCL, which report their real
   memory; elsewhere 16-bit matrices load as stored unless Q8 is asked for.
 

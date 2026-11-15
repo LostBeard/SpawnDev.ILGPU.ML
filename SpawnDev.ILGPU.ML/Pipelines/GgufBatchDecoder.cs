@@ -1547,10 +1547,7 @@ public sealed class GgufBatchDecoder : IDisposable
     {
         if (_lastRows == 0) throw new InvalidOperationException("no forward to draw from");
         if (!SupportsDeviceDraws(_acc)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads ({_acc.AcceleratorType}): use SampleAsync");
-        if (!(topP > 0f && topP <= 1f)) throw new ArgumentOutOfRangeException(nameof(topP), "(0, 1]");
-        if (!(repetitionPenalty > 0f)) throw new ArgumentOutOfRangeException(nameof(repetitionPenalty), "above 0");
-        if (topK < 0) throw new ArgumentOutOfRangeException(nameof(topK), "0 (off) or more");
-        if (!(minP >= 0f && minP < 1f)) throw new ArgumentOutOfRangeException(nameof(minP), "[0, 1)");
+        ValidateDrawArgs(topP, repetitionPenalty, topK, minP);
         LoadKernels(); EnsureDrawBuffers();
         int window = repeatLastN > 0 ? repeatLastN : MaxSeq;
         EnsurePenaltyWindow(window);
@@ -1751,8 +1748,17 @@ public sealed class GgufBatchDecoder : IDisposable
     /// </summary>
     public static int SampleLogits(float[] logits, int row, int vocab, float temperature, float topP, double u, int topK) => SampleLogits(logits, row, vocab, temperature, topP, u, topK, 0f);
 
+    /// <summary>The draw arguments both device draw entry points accept (<see cref="Draw"/>, <see cref="DrawRowsAsync"/>): one check, so they cannot drift apart.</summary>
+    private static void ValidateDrawArgs(float topP, float repetitionPenalty, int topK, float minP)
+    {
+        if (!(topP > 0f && topP <= 1f)) throw new ArgumentOutOfRangeException(nameof(topP), "(0, 1]");
+        if (!(repetitionPenalty > 0f)) throw new ArgumentOutOfRangeException(nameof(repetitionPenalty), "above 0");
+        if (topK < 0) throw new ArgumentOutOfRangeException(nameof(topK), "0 (off) or more");
+        if (!(minP >= 0f && minP <= 1f)) throw new ArgumentOutOfRangeException(nameof(minP), "[0, 1]");   // 1 keeps only the best token (and its ties), as ComfyUI / HF allow
+    }
+
     /// <summary>The min-p floor at temperature <paramref name="T"/>: p / p_max &gt;= minP exactly when logit &gt;= max + T ln(minP) (the device computes the same float).</summary>
-    public static float MinPFloor(float max, float T, float minP) => minP > 0f ? max + T * MathF.Log(minP) : float.NegativeInfinity;
+    public static float MinPFloor(float max, float T, float minP) => minP > 0f ? MathF.Min(max, max + T * MathF.Log(minP)) : float.NegativeInfinity;   // min: never above the best (minP 1 = max even where log(1) is not exactly 0)
 
     /// <summary>
     /// <see cref="SampleLogits(float[], int, int, float, float, double, int)"/> then min-p: of the kept tokens, only those with logit at or above <see cref="MinPFloor"/> stay
@@ -1934,6 +1940,7 @@ public sealed class GgufBatchDecoder : IDisposable
         if (!SupportsDeviceDraws(accelerator)) throw new NotSupportedException($"device draws need groups of {DrawGroup} threads");
         if (logits.Length != (long)rows * vocab) throw new ArgumentException("rows x vocab logits");
         if (vocab >= 1 << 24) throw new NotSupportedException("candidate ids travel as floats (exact below 2^24)");
+        ValidateDrawArgs(topP, repetitionPenalty, topK, minP);
         int nch = (vocab + Chunk - 1) / Chunk, S = 2 * Candidates + 1 + nch;
         var acc = accelerator;
         using var lg = acc.Allocate1D(logits);
@@ -2057,7 +2064,7 @@ public sealed class GgufBatchDecoder : IDisposable
                     float minP = drawF[2];
                     if (minP > 0f)
                     {
-                        float minFloor = max + T * MathF.Log(minP);
+                        float minFloor = MathF.Min(max, max + T * MathF.Log(minP));   // never above the best: minP 1 keeps it on a backend whose log(1) is not exactly 0
                         while ((m > 1) && (cand[o + m - 1] < minFloor)) m--;
                         keep = 0f;
                         for (int j = 0; j < m; j++) keep += MathF.Exp((cand[o + j] - max) / T);
@@ -2161,7 +2168,7 @@ public sealed class GgufBatchDecoder : IDisposable
             // min-p (drawF[2]) after the nucleus: when its floor max + T ln(minP) lies above tau, the kept set ends at the lowest logit at or above the floor (all its ties,
             // the last of them by id); the mass is summed again over that set. The condition is uniform (Group.BarrierOr): the branch holds group reductions.
             float minPF = drawF[2];
-            float minFloorF = minPF > 0f ? max + T * MathF.Log(minPF) : float.NegativeInfinity;
+            float minFloorF = minPF > 0f ? MathF.Min(max, max + T * MathF.Log(minPF)) : float.NegativeInfinity;   // never above the best (else minP 1 could keep no token)
             bool cutMinP = Group.BarrierOr((minPF > 0f) & (minFloorF > tau));
             if (cutMinP)
             {

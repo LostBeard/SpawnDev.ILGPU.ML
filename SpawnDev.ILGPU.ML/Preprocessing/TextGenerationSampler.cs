@@ -256,7 +256,7 @@ public class GenerationConfig
     public float TopP { get; set; } = 0.9f;
 
     /// <summary>
-    /// Min-p (0 = off): after top-k and the nucleus, keep only the tokens whose probability is at least <see cref="MinP"/> times the best one's (Hugging Face's MinPLogitsWarper order;
+    /// Min-p in [0, 1] (0 = off, 1 = only the best token and its ties): after top-k and the nucleus, keep only the tokens whose probability is at least <see cref="MinP"/> times the best one's (Hugging Face's MinPLogitsWarper order;
     /// the best token always stays). GgufEngine.BatchDecoder.
     /// </summary>
     public float MinP { get; set; } = 0f;
