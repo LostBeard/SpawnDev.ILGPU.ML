@@ -11,10 +11,10 @@ diffusers 0.43.0 `pipelines/qwenimage/pipeline_qwenimage_edit_plus.py` + `models
 | Piece | State |
 |-------|-------|
 | Reference sources read | done 11-15 |
-| Lore's dumps (`_DevComms`, 2509 edit, 1 and 2 pictures) | Lore measuring (sampling calls on CPU) |
-| Vision tower `QwenVisionEncoder` (QwenImage/QwenVisionEncoder.cs; `Flux2Weights.LoadVisionAsync`, shared `Flux2ComfyFormat.TakeF8ScalesAsync`) | written 11-15, not built yet (machine busy), not gated |
-| M-RoPE for picture tokens in the Qwen2.5-VL text tower (`Flux2TextEncoder.Encode(ids, real, pictures)`, `MRopePositions`, `SkinTokensKernels.RopeAxes`) | written 11-15, not built, not gated |
-| Reference latents in `QwenImageTransformer` (`OpenAsync(.., references, ..)`, `Ids(text, pictures)`, `InputTokens`) | written 11-15, not built, not gated |
+| Lore's dumps (`_DevComms` 2026-11-15-1425 + 1450; fixtures F:/spawndev-qwenimage-edit/comfyui-dumps) | done |
+| Vision tower `QwenVisionEncoder` (QwenImage/QwenVisionEncoder.cs; `Flux2Weights.LoadVisionAsync`, shared `Flux2ComfyFormat.TakeF8ScalesAsync`) | GATED 11-15 vs ComfyUI: QwenEdit_VisionTower_MatchesComfyUi CUDA 6.1e-5 / OpenCL 2.5e-5 |
+| M-RoPE for picture tokens in the Qwen2.5-VL text tower (`Flux2TextEncoder.Encode(ids, real, pictures)`, `MRopePositions`, `SkinTokensKernels.RopeAxes`) | GATED 11-15 vs ComfyUI: QwenEdit_TextEncoderWithPictures_MatchesComfyUi CUDA 3.1e-4 / OpenCL 8.1e-5 (ComfyUI = transformers' get_rope_index) |
+| Reference latents in `QwenImageTransformer` (`OpenAsync(.., references, ..)`, `Ids(text, pictures)`, `InputTokens`) | written 11-15; gate waits the 2509 transformer file (downloading to F:) |
 | Qwen-Image Edit 2511 | later: diffusers' `zero_cond_t` (reference tokens modulated at timestep 0, `modulate_index`) |
 | Pipeline / node glue for SpawnGen | after the gates |
 
