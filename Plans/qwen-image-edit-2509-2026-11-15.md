@@ -69,3 +69,13 @@ calls are gated one by one, so this only matters for the end-to-end sampler gate
 CLIP vision ViT-H: `ClipVision/ClipVisionEncoder.cs`, gated (`ClipVisionH_MatchesComfyUi`: penultimate 4.5e-5 CUDA / 4.4e-5 OpenCL). The 14B model calls have no
 ComfyUI reference yet: ComfyUI's CPU load of the 14B fp8 file needs more than 36 GB of RAM (SpawnGen's box 32 GB, Yoda 15.7 GB). Encode-side dumps (umT5, WanImageToVideo) are in
 F:/spawndev-wan14b/comfyui-dumps.
+
+## ComfyUI's resize rules (measured by SpawnGen, 11-15; use these in the pipeline)
+
+- **Vision picture** (Qwen2.5-VL input): area-resize to round(side x sqrt(384^2 / (w h))), then bilinear (align_corners false) to the nearest multiples of 28,
+  no 8-bit step. Rebuilt from ComfyUI's patch rows: 1.3e-6 (256x192 -> 443x333 -> 448x336; 200x120 -> 496x297 -> 504x308).
+- **Reference latent picture**: area-resize to round(side x sqrt(1024^2 / (w h)) / 8) x 8, then VAE encode: 1.2e-6 / 1.4e-6 vs ComfyUI's reference latents
+  (bilinear / bicubic / lanczos 0.17-0.31 off, nearest-exact 0.09).
+- **Transformer input** (SpawnGen's img_in / pe_embedder taps, _DevComms 2026-11-15-1730): the reference latent as the call carries it (not normalised again), odd
+  sides wrapped (circular) to even, packed after the noise latent; rotary: noise latent frame 0, reference k frame k, both centred; TEXT STARTS AFTER THE NOISE
+  LATENT's max(rows/2, cols/2) (diffusers: after the largest picture). SpawnGen's 2509 encode side on ML local.7, RX 590: conditioning 4.4e-5 / 4.5e-5 / 7.3e-5.

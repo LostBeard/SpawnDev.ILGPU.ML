@@ -142,13 +142,19 @@ public sealed class QwenImageTransformer : IDisposable
     public static int[] Ids(int textTokens, int rows, int cols) => Ids(textTokens, new[] { (rows, cols) });
 
     /// <summary>
-    /// The position ids of text followed by several pictures (diffusers' <c>QwenEmbedRope</c> with <c>scale_rope</c>): picture k (0 = the noise latent, then the references) has frame
-    /// index k and its rows / columns centred as in <see cref="Ids(int, int, int)"/>; the text starts at the largest max(rows / 2, cols / 2) over all pictures.
+    /// The position ids of text followed by several pictures: picture k (0 = the noise latent, then the references) has frame index k and its rows / columns centred as in
+    /// <see cref="Ids(int, int, int)"/>. The text starts at max(rows / 2, cols / 2) of the NOISE LATENT: ComfyUI's layout, measured on its 2509 edit run (SpawnGen's pe_embedder tap:
+    /// text row 0 at (8, 8, 8) for a 12 x 16 latent with a 56 x 74 reference). <paramref name="textAfterAllPictures"/>: diffusers' <c>QwenEmbedRope</c> instead, the largest
+    /// max(rows / 2, cols / 2) over every picture (the same with no reference).
     /// </summary>
-    public static int[] Ids(int textTokens, IReadOnlyList<(int Rows, int Cols)> pictures)
+    public static int[] Ids(int textTokens, IReadOnlyList<(int Rows, int Cols)> pictures, bool textAfterAllPictures = false)
     {
         int total = textTokens, start = 0;
-        foreach (var (r, c) in pictures) { total += r * c; start = Math.Max(start, Math.Max(r / 2, c / 2)); }
+        for (int q = 0; q < pictures.Count; q++)
+        {
+            var (r, c) = pictures[q]; total += r * c;
+            if (q == 0 || textAfterAllPictures) start = Math.Max(start, Math.Max(r / 2, c / 2));
+        }
         var ids = new int[total * 3];
         for (int j = 0; j < textTokens; j++) { ids[j * 3] = ids[j * 3 + 1] = ids[j * 3 + 2] = start + j; }
         int row = textTokens;

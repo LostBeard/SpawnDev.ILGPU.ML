@@ -45,6 +45,31 @@ public sealed class Flux1Kernels
         _patchify(rows * cols * 64, latent, tokens, rows, cols);
     }
 
+    private Action<Index1D, FV, FV, int, int, int>? _patchifyWrap;
+    private static void PatchifyWrapImpl(Index1D idx, FV lat, FV tokens, int h, int w, int cols)
+    {
+        // as Patchify, for a latent [16, h, w] of ANY size: odd sides are padded by wrapping (row h is row 0, column w is column 0)
+        int ch = idx % 64, cell = idx / 64, y = cell / cols, x = cell % cols;
+        int c = ch / 4, py = (ch / 2) % 2, px = ch % 2;
+        int yy = 2 * y + py, xx = 2 * x + px;
+        if (yy >= h) yy -= h;
+        if (xx >= w) xx -= w;
+        tokens[idx] = lat[((long)c * h + yy) * w + xx];
+    }
+    /// <summary>
+    /// A latent [16, h, w] of any size to transformer tokens [ceil(h/2) * ceil(w/2), 64], an odd side padded by wrapping around: ComfyUI's packing of Qwen-Image Edit's reference
+    /// latents (111 x 148 -> 56 x 74 tokens; measured on SpawnGen's img_in tap, exact). <paramref name="tokens"/> may be a sub-view of the call's whole token buffer (the noise
+    /// latent first, then each reference). Returns the token grid.
+    /// </summary>
+    public (int Rows, int Cols) PatchifyWrap(FV latent, FV tokens, int h, int w)
+    {
+        int rows = (h + 1) / 2, cols = (w + 1) / 2;
+        if (latent.Length < 16L * h * w || tokens.Length < (long)rows * cols * 64) throw new ArgumentException($"latent [16, {h}, {w}] -> tokens [{rows * cols}, 64]");
+        _patchifyWrap ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(PatchifyWrapImpl);
+        _patchifyWrap(rows * cols * 64, latent, tokens, h, w, cols);
+        return (rows, cols);
+    }
+
     private Action<Index1D, FV, FV, FV, float, int, int>? _denoised;
     private static void DenoisedImpl(Index1D idx, FV x, FV velocity, FV o, float sigma, int rows, int cols)
     {

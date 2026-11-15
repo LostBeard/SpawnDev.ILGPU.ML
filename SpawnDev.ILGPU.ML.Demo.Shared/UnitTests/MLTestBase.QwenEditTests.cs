@@ -123,8 +123,12 @@ public abstract partial class MLTestBase
         }
         var layouts = new (string Name, bool All, bool FrameK)[] { ("text after all pictures, ref k on frame k (diffusers)", true, true), ("text after the noise latent, ref k on frame k", false, true),
             ("text after all pictures, refs on frame 0", true, false), ("text after the noise latent, refs on frame 0", false, false) };
-        const string Pad = "replicate"; const bool Norm = true;                                   // the 16:20 run's best reading of the reference format (all far off: the layout first)
+        // ComfyUI's reference format, measured on SpawnGen's img_in tap (_DevComms 2026-11-15-1730): the reference latent as the call carries it (not normalised again), odd sides
+        // wrapped (circular); 0.0 from ComfyUI's packed rows (zero padding 0.11, edge 0.20)
+        const string Pad = "circular"; const bool Norm = false;
         var one = new[] { (12, 16), (56, 74) }; var two = new[] { (12, 16), (56, 74), (50, 83) };
+        Ur_Expect(Layout(212, one, false, true).SequenceEqual(QwenImageTransformer.Ids(212, one)) && Layout(212, one, true, true).SequenceEqual(QwenImageTransformer.Ids(212, one, true)),
+            "the library's Ids must be the 'text after the noise latent, ref k on frame k' layout (and diffusers' with textAfterAllPictures)");
         (string Name, bool All, bool FrameK, double E) best;
         // 1 picture: the layout on call 0, then call 1 with the winner
         using (var tr = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 212, 12, 16, new[] { (56, 74) }, (long)(residentGb * 1e9)))
@@ -141,7 +145,8 @@ public abstract partial class MLTestBase
             best = readings.OrderBy(r => r.E).First();
             winner = best.Name; worst = best.E; control = readings.Where(r => r != best).Min(r => r.E);
             report.Add($"layout: '{best.Name}' wins ({best.E:E2}); the next best {control:E2}");
-            tr.UsePositionIds(Layout(204, one, best.All, best.FrameK), 204);
+            Ur_Expect(!best.All && best.FrameK, $"ComfyUI's layout (the library default) must win, '{best.Name}' did: " + string.Join("; ", report));
+            tr.ResetPositionIds();                                                                  // the library's own Ids from here on
             worst = Math.Max(worst, await Call(tr, "graph1", 1, 204, new List<float[]> { refA }, Pad, Norm));
         }
         // control: the noise latent alone (no reference) must miss
@@ -155,11 +160,23 @@ public abstract partial class MLTestBase
         using (var tr2 = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 417, 12, 16, new[] { (56, 74), (50, 83) }, (long)(residentGb * 1e9)))
         {
             report.Add($"2 pictures: {tr2.InputTokens} picture tokens");
-            foreach (var (call, n) in new[] { (0, 417), (1, 409) })
+            // which frame the SECOND reference sits on: k = 2 (the library default) or 1, like the first; measured on call 0
+            int[] RefsOnFrame1(int n)
             {
-                tr2.UsePositionIds(Layout(n, two, best.All, best.FrameK), n);
-                worst = Math.Max(worst, await Call(tr2, "graph2", call, n, new List<float[]> { refA, refB }, Pad, Norm));
+                var ids = QwenImageTransformer.Ids(n, two);
+                for (int row = n + 12 * 16 + 56 * 74; row < n + tr2.InputTokens; row++) ids[row * 3] = 1;
+                return ids;
             }
+            double eK = await Call(tr2, "graph2", 0, 417, new List<float[]> { refA, refB }, Pad, Norm);
+            report.Add("  2 pictures, reference k on frame k (1, 2)");
+            tr2.UsePositionIds(RefsOnFrame1(417), 417);
+            double e1 = await Call(tr2, "graph2", 0, 417, new List<float[]> { refA, refB }, Pad, Norm);
+            report.Add("  2 pictures, both references on frame 1");
+            tr2.ResetPositionIds();
+            report.Add($"second reference: frame 2 {eK:E2}, frame 1 {e1:E2}");
+            worst = Math.Max(worst, Math.Min(eK, e1)); control = Math.Min(control, Math.Max(eK, e1));
+            if (e1 < eK) tr2.UsePositionIds(RefsOnFrame1(409), 409);
+            worst = Math.Max(worst, await Call(tr2, "graph2", 1, 409, new List<float[]> { refA, refB }, Pad, Norm));
         }
         foreach (var line in report) Console.WriteLine("[QwenEdit] transformer vs ComfyUI: " + line);
         Ur_Expect(worst < 1e-3 && control > 10 * worst, string.Join("; ", report));             // bound to be pinned to the measurement
@@ -352,6 +369,34 @@ public abstract partial class MLTestBase
         var report = $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
         if (!ok) throw new Exception(report);
         return report;
+    });
+
+    /// <summary>
+    /// <see cref="Flux1.Flux1Kernels.PatchifyWrap"/> (the device packing of Qwen-Image Edit's reference latents) bit for bit against the host packing that reproduced ComfyUI's
+    /// img_in rows exactly (odd sides wrapped): latents of 111 x 148 (odd rows), 99 x 165 (both odd) and 24 x 32 (even, = <see cref="Flux1.Flux1Kernels.Patchify"/>), written at an
+    /// offset into one larger token buffer as a call packs them.
+    /// </summary>
+    [TestMethod]
+    public async Task QwenEdit_PatchifyWrap_MatchesComfyUiPacking() => await RunTest(async accelerator =>
+    {
+        var k = new Flux1.Flux1Kernels(accelerator);
+        var rng = new Random(3);
+        var notes = new List<string>();
+        foreach (var (h, w) in new[] { (111, 148), (99, 165), (24, 32) })
+        {
+            var lat = new float[16 * h * w]; for (int i = 0; i < lat.Length; i++) lat[i] = (float)(rng.NextDouble() * 8 - 4);
+            var (want, rows, cols) = Qe_Tokens(lat, h, w, "circular", null, null);
+            const int Offset = 192 * 64;                                                          // after a noise latent's 12 x 16 tokens
+            using var dLat = accelerator.Allocate1D(lat); using var dTok = accelerator.Allocate1D<float>(Offset + want.Length + 64);
+            dTok.MemSetToZero();
+            var (r, c) = k.PatchifyWrap(dLat.View, dTok.View.SubView(Offset, want.Length), h, w);
+            var got = await dTok.View.CopyToHostAsync();
+            int diff = 0; for (int i = 0; i < want.Length; i++) if (got[Offset + i] != want[i]) diff++;
+            bool untouched = got.Take(Offset).All(v => v == 0f) && got.Skip(Offset + want.Length).All(v => v == 0f);
+            if (r != rows || c != cols || diff != 0 || !untouched) throw new Exception($"{h} x {w}: grid {r} x {c} (want {rows} x {cols}), {diff} values differ, outside the slice untouched {untouched}");
+            notes.Add($"{h} x {w} -> {r} x {c} tokens: bit-identical");
+        }
+        return $"{accelerator.AcceleratorType}: " + string.Join("; ", notes);
     });
 
     /// <summary>
