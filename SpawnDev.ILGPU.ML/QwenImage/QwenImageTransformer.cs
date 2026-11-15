@@ -35,7 +35,8 @@ public sealed class QwenImageTransformer : IDisposable
     private readonly DiTKernels _k;
     private readonly SkinTokensKernels _u;
     private readonly Flux2Kernels _f;
-    private readonly int _maxTxt, _nImg, _rows, _cols;
+    private readonly int _maxTxt, _nImg, _nOut;                                      // _nImg: the noise latent's tokens plus every reference's; _nOut: the noise latent's
+    private readonly (int Rows, int Cols)[] _shapes;
     private int _nTxt, _n;                                                           // this call's text rows (a prompt and its negative differ)
     private readonly List<IDisposable> _owned = new();
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _img, _txt, _normI, _normT, _txtIn, _qkv, _attn, _attnImg, _attnTxt, _mlp, _scores;
@@ -44,14 +45,17 @@ public sealed class QwenImageTransformer : IDisposable
     public long ResidentBytes => _w.ResidentBytes;
     public int ResidentBlocks => _w.ResidentBlocks;
     public long StreamedBytesPerForward => _w.StreamedBytesPerForward;
-    /// <summary>The velocity of the last <see cref="ForwardAsync"/>, [imageTokens, 64] (2 x 2 patches of the 16-channel latent, channel c * 4 + dy * 2 + dx).</summary>
+    /// <summary>The velocity of the last <see cref="ForwardAsync"/>, [noise latent tokens, 64] (2 x 2 patches of the 16-channel latent, channel c * 4 + dy * 2 + dx).</summary>
     public FV Output => _out.View;
+    /// <summary>Tokens each call takes: the noise latent's plus every reference picture's (<see cref="ForwardAsync"/>'s imageTokens rows).</summary>
+    public int InputTokens => _nImg;
     /// <summary>Intermediate checkpoints for tests: name, device view, rows, columns.</summary>
     public Action<string, FV, int, int>? Probe;
 
-    private QwenImageTransformer(Accelerator acc, StreamedModelWeights w, int maxTextTokens, int rows, int cols)
+    private QwenImageTransformer(Accelerator acc, StreamedModelWeights w, int maxTextTokens, (int Rows, int Cols)[] shapes)
     {
-        _acc = acc; _w = w; _maxTxt = _nTxt = maxTextTokens; _rows = rows; _cols = cols; _nImg = rows * cols; _n = _nTxt + _nImg;   // every buffer holds the longest text
+        _acc = acc; _w = w; _maxTxt = _nTxt = maxTextTokens; _shapes = shapes;
+        _nOut = shapes[0].Rows * shapes[0].Cols; _nImg = shapes.Sum(s => s.Rows * s.Cols); _n = _nTxt + _nImg;   // every buffer holds the longest text
         _k = new DiTKernels(acc) { PreciseActivations = true }; _u = new SkinTokensKernels(acc); _f = new Flux2Kernels(acc);
         long N = _n, I = _nImg, T = _nTxt;
         _img = Alloc(I * Dim); _txt = Alloc(T * Dim); _normI = Alloc(I * Dim); _normT = Alloc(T * Dim); _txtIn = Alloc(T * TxtDim);
@@ -59,7 +63,7 @@ public sealed class QwenImageTransformer : IDisposable
         _scores = Alloc(_k.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * N * N);
         _temb = Alloc(Dim); _tembAct = Alloc(Dim); _tproj = Alloc(TimeChannels); _hid = Alloc(Dim);
         _modImg = Alloc(6 * Dim); _modTxt = Alloc(6 * Dim); _modOut = Alloc(2 * Dim);
-        _cosT = Alloc(N * HeadDim); _sinT = Alloc(N * HeadDim); _out = Alloc(I * InChannels);
+        _cosT = Alloc(N * HeadDim); _sinT = Alloc(N * HeadDim); _out = Alloc((long)_nOut * InChannels);
         _xs = Alloc(w.HasScales ? Math.Max(I, T) * MlpHidden : 1);                             // the widest scaled input: an MLP's second matrix [rows, 12288]
     }
 
@@ -76,10 +80,19 @@ public sealed class QwenImageTransformer : IDisposable
     /// Open the transformer from <paramref name="file"/> for up to <paramref name="maxTextTokens"/> conditioning rows (each call passes its own count) and a picture of
     /// <paramref name="rows"/> x <paramref name="cols"/> tokens (latent / 2); blocks beyond <paramref name="residentBytes"/> stream from the file every call.
     /// </summary>
-    public static async Task<QwenImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int maxTextTokens, int rows, int cols, long residentBytes, CancellationToken ct = default)
+    public static Task<QwenImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int maxTextTokens, int rows, int cols, long residentBytes, CancellationToken ct = default)
+        => OpenAsync(accelerator, source, repo, file, maxTextTokens, rows, cols, Array.Empty<(int, int)>(), residentBytes, ct);
+
+    /// <summary>
+    /// The same with reference pictures (Qwen-Image Edit: ComfyUI's <c>reference_latents</c>, diffusers' <c>image_latents</c>): <paramref name="references"/> are their token grids
+    /// (latent / 2). Each call then takes the noise latent's tokens followed by every reference's tokens, and the velocity is the noise latent's rows only.
+    /// </summary>
+    public static async Task<QwenImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int maxTextTokens, int rows, int cols,
+        IReadOnlyList<(int Rows, int Cols)> references, long residentBytes, CancellationToken ct = default)
     {
+        if (rows <= 0 || cols <= 0 || references.Any(r => r.Rows <= 0 || r.Cols <= 0)) throw new ArgumentException("token grids must be positive");
         var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, file, "transformer_blocks.0.attn.to_q.weight", BlockOf, Layers, residentBytes, w2 => FuseQkvAsync(accelerator, w2), ct);
-        try { var t = new QwenImageTransformer(accelerator, w, maxTextTokens, rows, cols); t.SetPositions(); return t; }
+        try { var t = new QwenImageTransformer(accelerator, w, maxTextTokens, new[] { (rows, cols) }.Concat(references).ToArray()); t.SetPositions(); return t; }
         catch { w.Dispose(); throw; }
     }
 
@@ -126,13 +139,25 @@ public sealed class QwenImageTransformer : IDisposable
     }
 
     /// <summary>The position ids [textTokens + rows * cols, 3] in the reference's order of the joint sequence: text first, then the picture (see the class summary).</summary>
-    public static int[] Ids(int textTokens, int rows, int cols)
+    public static int[] Ids(int textTokens, int rows, int cols) => Ids(textTokens, new[] { (rows, cols) });
+
+    /// <summary>
+    /// The position ids of text followed by several pictures (diffusers' <c>QwenEmbedRope</c> with <c>scale_rope</c>): picture k (0 = the noise latent, then the references) has frame
+    /// index k and its rows / columns centred as in <see cref="Ids(int, int, int)"/>; the text starts at the largest max(rows / 2, cols / 2) over all pictures.
+    /// </summary>
+    public static int[] Ids(int textTokens, IReadOnlyList<(int Rows, int Cols)> pictures)
     {
-        var ids = new int[(textTokens + rows * cols) * 3];
-        int start = Math.Max(rows / 2, cols / 2);
+        int total = textTokens, start = 0;
+        foreach (var (r, c) in pictures) { total += r * c; start = Math.Max(start, Math.Max(r / 2, c / 2)); }
+        var ids = new int[total * 3];
         for (int j = 0; j < textTokens; j++) { ids[j * 3] = ids[j * 3 + 1] = ids[j * 3 + 2] = start + j; }
-        int y0 = rows - rows / 2, x0 = cols - cols / 2;
-        for (int y = 0; y < rows; y++) for (int x = 0; x < cols; x++) { int r = textTokens + y * cols + x; ids[r * 3 + 1] = y - y0; ids[r * 3 + 2] = x - x0; }
+        int row = textTokens;
+        for (int k = 0; k < pictures.Count; k++)
+        {
+            var (rows, cols) = pictures[k];
+            int y0 = rows - rows / 2, x0 = cols - cols / 2;
+            for (int y = 0; y < rows; y++) for (int x = 0; x < cols; x++) { ids[row * 3] = k; ids[row * 3 + 1] = y - y0; ids[row * 3 + 2] = x - x0; row++; }
+        }
         return ids;
     }
 
@@ -148,7 +173,7 @@ public sealed class QwenImageTransformer : IDisposable
 
     private void SetPositions()
     {
-        var (cos, sin) = Flux1Transformer.RopeTables(Ids(_nTxt, _rows, _cols), _n);           // the same axes (16 / 56 / 56) and theta as FLUX.1
+        var (cos, sin) = Flux1Transformer.RopeTables(Ids(_nTxt, _shapes), _n);                 // the same axes (16 / 56 / 56) and theta as FLUX.1
         _cosT.View.SubView(0, cos.Length).CopyFromCPU(cos); _sinT.View.SubView(0, sin.Length).CopyFromCPU(sin);
     }
 
@@ -180,7 +205,8 @@ public sealed class QwenImageTransformer : IDisposable
         => _k.Linear(Scaled(w, name + ".weight", x, (long)rows * K), _w.MatrixExact(w, name + ".weight"), w.BF16(name + ".bias"), o, rows, K, N, act);
 
     /// <summary>
-    /// One model call: <paramref name="imageTokens"/> [imageTokens, 64] (the model-space latent's 2 x 2 patches, <see cref="Flux1Kernels.Patchify"/>), <paramref name="cond"/> the text
+    /// One model call: <paramref name="imageTokens"/> [<see cref="InputTokens"/>, 64] (the model-space latent's 2 x 2 patches, <see cref="Flux1Kernels.Patchify"/>, then each reference
+    /// latent's, in the order the transformer was opened with), <paramref name="cond"/> the text
     /// encoder's rows [textTokens, 3584], <paramref name="timestep"/> the model's time (how ComfyUI maps sigma to it is measured by the gate). <paramref name="textTokens"/>: this call's
     /// rows, 1 to <see cref="MaxTextTokens"/> (-1: the maximum); only the rotary table is rebuilt when it changes. The velocity is left in <see cref="Output"/>.
     /// </summary>
@@ -205,8 +231,8 @@ public sealed class QwenImageTransformer : IDisposable
             Probe?.Invoke($"block{k}_img", _img.View, _nImg, Dim);
         }
         Gemv(b0, _tembAct.View, "norm_out.linear", _modOut.View, Dim, 2 * Dim);       // (scale, shift)
-        _k.LayerNormModulate(_img.View, _normI.View, _modOut.View, Dim, 0, _nImg, Dim, Eps);
-        Lin(b0, _normI.View, "proj_out", _out.View, _nImg, Dim, InChannels);
+        _k.LayerNormModulate(_img.View, _normI.View, _modOut.View, Dim, 0, _nOut, Dim, Eps);   // the head runs per token: only the noise latent's rows are the prediction
+        Lin(b0, _normI.View, "proj_out", _out.View, _nOut, Dim, InChannels);
     }
 
     private void Block(GpuWeights w, string b)

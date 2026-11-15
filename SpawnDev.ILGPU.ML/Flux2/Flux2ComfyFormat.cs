@@ -67,6 +67,32 @@ public static class Flux2ComfyFormat
         return end > 0 && int.TryParse(name.AsSpan("model.layers.".Length, end - "model.layers.".Length), out int l) && l < layers;
     }
 
+    /// <summary>
+    /// ComfyUI's 8-bit "scaled" files: one fp32 <c>scale_weight</c> per 8-bit matrix (taken out and returned by the matrix's name, <paramref name="stripPrefix"/> removed, for
+    /// <see cref="Flux2Weights.MatrixExact"/> / <see cref="Flux2Weights.ActivationScale"/>) and a <c>scale_input</c> (an activation scale for fp8 matmuls: not used, the activations stay
+    /// fp32; dropped). Every F8_E4M3 matrix must have its scale. Shared by the text and vision loaders.
+    /// </summary>
+    public static async Task<Dictionary<string, float>> TakeF8ScalesAsync(Accelerator accelerator, GpuWeights w, string stripPrefix)
+    {
+        async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
+        string Ours(string n) => stripPrefix.Length > 0 && n.StartsWith(stripPrefix, StringComparison.Ordinal) ? n[stripPrefix.Length..] : n;
+        var scales = new Dictionary<string, float>();
+        foreach (var name in w.Names.ToList())
+        {
+            if (name.EndsWith(".scale_input", StringComparison.Ordinal)) { await Retire(w.Remove(name)); continue; }
+            if (!name.EndsWith(".scale_weight", StringComparison.Ordinal)) continue;
+            if (!w.IsF32(name)) throw new InvalidDataException($"{name}: expected an fp32 scalar");
+            scales[Ours(name[..^".scale_weight".Length] + ".weight")] = (await w.F32(name).CopyToHostAsync())[0];
+            await Retire(w.Remove(name));
+        }
+        foreach (var m in w.Names.Where(w.IsF8))
+            if (!scales.ContainsKey(Ours(m))) throw new InvalidDataException($"{m}: an F8_E4M3 matrix without its scale_weight");
+        return scales;
+    }
+
+    /// <summary>The load filter keeping only a Qwen2.5-VL file's vision tower (<c>visual.*</c>, with its 8-bit scales).</summary>
+    public static bool VisionFilter(string name) => name.StartsWith("visual.", StringComparison.Ordinal);
+
     /// <summary>True when the text encoder's tensors carry Hugging Face Qwen3 names.</summary>
     public static bool IsHfQwen3(GpuWeights w) => w.Has("model.embed_tokens.weight");
 
@@ -78,20 +104,7 @@ public static class Flux2ComfyFormat
     public static async Task<Dictionary<string, float>> AdaptTextEncoderAsync(Accelerator accelerator, GpuWeights w, int layers = Flux2TextEncoder.Layers)
     {
         async Task Retire(IDisposable? old) { if (old == null) return; await accelerator.SynchronizeAsync(); old.Dispose(); }
-        // ComfyUI's 8-bit "scaled" files: one fp32 scale_weight per 8-bit matrix (kept, by our name, for the decode) and a scale_input (activation scale for fp8 matmuls: not used, the
-        // activations stay fp32)
-        var scales = new Dictionary<string, float>();
-        foreach (var name in w.Names.ToList())
-        {
-            if (name.EndsWith(".scale_input", StringComparison.Ordinal)) { await Retire(w.Remove(name)); continue; }
-            if (!name.EndsWith(".scale_weight", StringComparison.Ordinal)) continue;
-            if (!w.IsF32(name)) throw new InvalidDataException($"{name}: expected an fp32 scalar");
-            string matrix = name[..^".scale_weight".Length] + ".weight";
-            scales[matrix.StartsWith("model.", StringComparison.Ordinal) ? matrix["model.".Length..] : matrix] = (await w.F32(name).CopyToHostAsync())[0];
-            await Retire(w.Remove(name));
-        }
-        foreach (var m in w.Names.Where(w.IsF8))
-            if (!scales.ContainsKey(m.StartsWith("model.", StringComparison.Ordinal) ? m["model.".Length..] : m)) throw new InvalidDataException($"{m}: an F8_E4M3 matrix without its scale_weight");
+        var scales = await TakeF8ScalesAsync(accelerator, w, "model.");
         // q | k | v and gate | up fuse into one GEMM each for Qwen3 in bf16 (the layout Flux2TextEncoder's fused path reads); 8-bit parts (scales differ) and Qwen2.5 (biases, no q / k
         // norms) keep their own matrices
         bool fuse = w.Has("model.layers.0.self_attn.q_norm.weight") && w.IsBF16("model.layers.0.self_attn.q_proj.weight");

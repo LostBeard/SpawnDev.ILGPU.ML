@@ -129,6 +129,52 @@ public sealed class SkinTokensKernels
         _rope(rows * H * (D / 2), buf, invFreq, stride, off, H, D, p0);
     }
 
+    private Action<Index1D, FV, FV, FV, int, int, int, int>? _ropeTables;
+    private static void RopeTablesImpl(Index1D i, FV buf, FV cos, FV sin, int stride, int off, int H, int D)
+    {
+        int half = D / 2;
+        int k = i % half, rest = i / half, h = rest % H, n = rest / H;
+        float c = cos[n * half + k], s = sin[n * half + k];
+        long b = (long)n * stride + off + h * D;
+        float x0 = buf[b + k], x1 = buf[b + half + k];                     // rotate_half pairs element k with element k + D/2
+        buf[b + k] = x0 * c - x1 * s;
+        buf[b + half + k] = x1 * c + x0 * s;
+    }
+    /// <summary>
+    /// In place rotary embedding (HF rotate_half convention) from per-row tables: row n's pair k turns by <c>cos[n * D/2 + k]</c>, <c>sin[..]</c> (<see cref="AxesRopeTables"/>).
+    /// The tables come from the host because GPU sin / cos are only accurate near zero (WebGPU / WebGL: 4e-5 off at angles of a few hundred radians, which text positions reach),
+    /// and the reference evaluates them accurately in float32.
+    /// </summary>
+    public void RopeTables(FV buf, FV cos, FV sin, int rows, int stride, int off, int H, int D)
+    {
+        if (cos.Length < (long)rows * (D / 2) || sin.Length < (long)rows * (D / 2)) throw new ArgumentException($"tables need rows x {D / 2} values");
+        _ropeTables ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int>(RopeTablesImpl);
+        _ropeTables(rows * H * (D / 2), buf, cos, sin, stride, off, H, D);
+    }
+
+    /// <summary>
+    /// The cos / sin tables [rows, invFreq.Length] for <see cref="RopeTables"/> with each row's position given per axis: row n has <paramref name="A"/> positions
+    /// <c>pos[n * A ..]</c>, and pair k turns by axis 0's position when k &lt; <paramref name="b1"/>, axis 1's when k &lt; <paramref name="b2"/>, else axis 2's. The angle is the
+    /// float32 product pos * invFreq[k] (as the reference computes it), its cos / sin evaluated accurately. Qwen2.5-VL's text M-RoPE: A = 3 (t, h, w), sections [16, 24, 24]
+    /// = b1 16, b2 40 (A = 1 or all axes equal: plain 1D RoPE). Its vision tower's 2D rope: A = 2 (h, w), head dim 80, <paramref name="invFreq"/> the 20 frequencies twice,
+    /// b1 = 20, b2 = 40. Fewer than 3 axes require the unused bounds at the table width.
+    /// </summary>
+    public static (float[] Cos, float[] Sin) AxesRopeTables(int[] pos, int rows, int A, float[] invFreq, int b1, int b2)
+    {
+        int half = invFreq.Length;
+        if (A < 1 || A > 3 || b1 < 0 || b2 < b1 || b2 > half || (A < 3 && b2 < half) || (A < 2 && b1 < half)) throw new ArgumentException("axes / section bounds");
+        if (pos.Length < rows * A) throw new ArgumentException($"positions: rows x {A} values");
+        var cos = new float[rows * half]; var sin = new float[rows * half];
+        for (int n = 0; n < rows; n++)
+            for (int k = 0; k < half; k++)
+            {
+                int axis = k < b1 ? 0 : (k < b2 ? 1 : 2);
+                float ang = pos[n * A + axis] * invFreq[k];
+                cos[n * half + k] = (float)Math.Cos(ang); sin[n * half + k] = (float)Math.Sin(ang);
+            }
+        return (cos, sin);
+    }
+
     // ───────────────────────────────────────────── grouped-query causal attention ─────────────────────────────────────────────
 
     private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, float>? _kvStore;

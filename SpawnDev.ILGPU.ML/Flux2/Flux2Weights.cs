@@ -81,6 +81,19 @@ public sealed class Flux2Weights : IDisposable
         catch { w.Dispose(); throw; }
     }
 
+    /// <summary>
+    /// Load only the vision tower (<c>visual.*</c>) of a Qwen2.5-VL file, such as ComfyUI's <c>qwen_2.5_vl_7b_fp8_scaled.safetensors</c> (for <see cref="QwenImage.QwenVisionEncoder"/>).
+    /// Names are kept as stored; an 8-bit scaled file's matrices stay 8-bit with their scales (<see cref="MatrixExact"/>).
+    /// </summary>
+    public static async Task<Flux2Weights> LoadVisionAsync(Accelerator accelerator, IModelSource source, string repo, string file, CancellationToken cancellationToken = default)
+    {
+        await using var stream = await source.OpenAsync(repo, file, cancellationToken);
+        using var empty = JsonDocument.Parse("{}");
+        var w = await GpuWeights.LoadAsync(accelerator, stream, empty.RootElement, $"{repo}/{file}", Flux2ComfyFormat.VisionFilter, cancellationToken);
+        try { return new Flux2Weights(accelerator, w, true, await Flux2ComfyFormat.TakeF8ScalesAsync(accelerator, w, "")); }
+        catch { w.Dispose(); throw; }
+    }
+
     public bool IsQuantized(string name) => _w.IsU32(name);
     /// <summary>Whether the stage holds tensor <paramref name="name"/>.</summary>
     public bool Has(string name) => _w.Has(name);

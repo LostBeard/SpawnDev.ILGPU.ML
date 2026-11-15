@@ -48,8 +48,10 @@ public sealed class Flux2TextEncoder : IDisposable
     private readonly SkinTokensKernels _u;
     private readonly Flux2Kernels _f;
     private readonly List<IDisposable> _owned = new();
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _hn, _qkv, _attn, _proj, _gateUp, _act, _scores, _kc, _vc, _dummy, _invFreq, _out, _part, _xs;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _hn, _qkv, _attn, _proj, _gateUp, _act, _scores, _kc, _vc, _dummy, _cos, _sin, _out, _part, _xs;
     private readonly MemoryBuffer1D<int, Stride1D.Dense> _ids;
+    private readonly float[] _invFreqHost;
+    private bool _plainTables;                                                          // the device tables hold the text-only (1D) positions
 
     /// <summary>
     /// Round the rotary table to bf16 as a model converted with <c>.to(bfloat16)</c> does. The reference loads the checkpoint with <c>dtype=bfloat16</c>; <see cref="RopeTable"/> tells which of the two
@@ -90,10 +92,12 @@ public sealed class Flux2TextEncoder : IDisposable
         _proj = Alloc<float>(T * _hidden); _gateUp = Alloc<float>(T * 2 * _inter); _act = Alloc<float>(T * _inter);
         _scores = Alloc<float>((long)_qHeads * T * T); _kc = Alloc<float>(T * _kvCols); _vc = Alloc<float>(T * _kvCols);
         _dummy = Alloc<float>(1); _out = Alloc<float>(T * Width); _ids = Alloc<int>(T);
+        _cos = Alloc<float>(T * (HeadDim / 2)); _sin = Alloc<float>(T * (HeadDim / 2));
         _part = Alloc<float>(_fusedQkv && _fusedGateUp ? 1 : T * Math.Max(_qCols, _inter));
         // a scaled 8-bit file (ComfyUI's fp8_scaled: Qwen-Image's Qwen2.5-VL) multiplies each matrix's input by the matrix's scale (Flux2Weights.MatrixExact): one buffer of the widest input
         _xs = Alloc<float>(_w.ActivationScale(_fusedQkv ? "layers.0.self_attn.qkv_proj.weight" : "layers.0.self_attn.q_proj.weight") != 1f ? T * Math.Max(Math.Max(_hidden, _qCols), _inter) : 1);
-        _invFreq = _acc.Allocate1D(RopeTable()); _owned.Add(_invFreq);
+        _invFreqHost = RopeTable();
+        UploadRope(MRopePositions(SeqLen, Array.Empty<(int, int, int)>())); _plainTables = true;
     }
 
     /// <summary>
@@ -120,6 +124,13 @@ public sealed class Flux2TextEncoder : IDisposable
 
     private MemoryBuffer1D<T, Stride1D.Dense> Alloc<T>(long n) where T : unmanaged { var b = _acc.Allocate1D<T>(Math.Max(1, n)); _owned.Add(b); return b; }
 
+    // the rotary tables for SeqLen rows at (t, h, w) positions (host cos / sin: GPU sin / cos are inexact at large angles on the browser backends)
+    private void UploadRope(int[] pos)
+    {
+        var (c, s) = SkinTokensKernels.AxesRopeTables(pos, SeqLen, 3, _invFreqHost, MRopeT, MRopeT + MRopeH);
+        _cos.View.CopyFromCPU(c); _sin.View.CopyFromCPU(s);
+    }
+
     /// <summary>The conditioning rows of the last <see cref="Encode"/>, [512, <see cref="Width"/>] on the device.</summary>
     public FV Output => _out.View;
 
@@ -138,12 +149,63 @@ public sealed class Flux2TextEncoder : IDisposable
     /// Encode one padded prompt: <paramref name="ids"/> is 512 token ids, the first <paramref name="real"/> of them the prompt (the rest padding). Returns the conditioning matrix on the device
     /// (also <see cref="Output"/>), [512, <see cref="Width"/>] row-major.
     /// </summary>
-    public FV Encode(int[] ids, int real)
+    public FV Encode(int[] ids, int real) => Encode(ids, real, null);
+
+    /// <summary>Qwen2.5-VL's M-RoPE sections: of the 64 rotary pairs, 0-15 turn by the temporal position, 16-39 by the row, 40-63 by the column.</summary>
+    public const int MRopeT = 16, MRopeH = 24, MRopeW = 24;
+
+    /// <summary>
+    /// Qwen2.5-VL's 3D positions (transformers' <c>get_rope_index</c>) for <paramref name="length"/> tokens with pictures in them: a text token has the running position p on all three
+    /// axes and p += 1; a picture of merged grid (rows, cols) starting at token <c>Start</c> gives its token (y, x) the positions (p, p + y, p + x), then p += max(rows, cols).
+    /// [length * 3] as (t, h, w) per token. Without pictures every axis is the token index (plain 1D RoPE).
+    /// </summary>
+    public static int[] MRopePositions(int length, IReadOnlyList<(int Start, int MergedRows, int MergedCols)> pictures)
+    {
+        var pos = new int[length * 3];
+        var byStart = pictures.OrderBy(q => q.Start).ToList();
+        int p = 0, i = 0, next = 0;
+        while (i < length)
+        {
+            if (next < byStart.Count && byStart[next].Start < i) throw new ArgumentException("pictures overlap");
+            if (next < byStart.Count && byStart[next].Start == i)
+            {
+                var (start, gh, gw) = byStart[next++];
+                if (gh <= 0 || gw <= 0 || start + gh * gw > length) throw new ArgumentException($"a picture at {start} of {gh} x {gw} runs past {length} tokens");
+                for (int y = 0; y < gh; y++) for (int x = 0; x < gw; x++) { int t = start + y * gw + x; pos[t * 3] = p; pos[t * 3 + 1] = p + y; pos[t * 3 + 2] = p + x; }
+                i += gh * gw; p += Math.Max(gh, gw);
+                continue;
+            }
+            pos[i * 3] = pos[i * 3 + 1] = pos[i * 3 + 2] = p++;
+            i++;
+        }
+        if (next < byStart.Count) throw new ArgumentException($"a picture starts at or past {length}");
+        return pos;
+    }
+
+    /// <summary>
+    /// Encode one padded prompt with pictures in it (Qwen-Image Edit's TextEncodeQwenImageEditPlus): <paramref name="ids"/> holds a placeholder id for every merged picture token
+    /// (Hugging Face expands <c>&lt;|image_pad|&gt;</c> the same way); after the embedding those rows are replaced by the picture's rows from <see cref="QwenImage.QwenVisionEncoder"/>
+    /// ([MergedRows * MergedCols, hidden] each), and the rotary positions are <see cref="MRopePositions"/>. Null or no pictures: the text-only path.
+    /// </summary>
+    public FV Encode(int[] ids, int real, IReadOnlyList<(int Start, FV Rows, int MergedRows, int MergedCols)>? pictures)
     {
         if (ids.Length != SeqLen) throw new ArgumentException($"{SeqLen} token ids expected");
         int H = _hidden, rep = _qHeads / _kvHeads;
+        bool mrope = pictures != null && pictures.Count > 0;
         _ids.View.CopyFromCPU(ids);
         _w.Embed(_ids.View, "embed_tokens.weight", _h.View, SeqLen, H);
+        if (mrope)
+        {
+            foreach (var (start, rows, gh, gw) in pictures!)
+            {
+                long count = (long)gh * gw;
+                if (start < 0 || start + count > real) throw new ArgumentException($"a picture at {start} of {gh} x {gw} tokens runs past the prompt's {real} tokens");
+                if (rows.Length < count * H) throw new ArgumentException($"picture rows: fewer than {count} x {H} values");
+                _h.View.SubView(start * (long)H, count * H).CopyFrom(rows.SubView(0, count * H));
+            }
+            UploadRope(MRopePositions(SeqLen, pictures!.Select(q => (q.Start, q.MergedRows, q.MergedCols)).ToList())); _plainTables = false;
+        }
+        else if (!_plainTables) { UploadRope(MRopePositions(SeqLen, Array.Empty<(int, int, int)>())); _plainTables = true; }
         Probe?.Invoke("embed", _h.View, SeqLen, H);
         int tap = 0;
         for (int l = 0; l < _layers; l++)
@@ -162,8 +224,8 @@ public sealed class Flux2TextEncoder : IDisposable
                 _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.q_norm.weight"), SeqLen, _qkvCols, 0, _qHeads, HeadDim, RmsEps);
                 _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.k_norm.weight"), SeqLen, _qkvCols, _qCols, _kvHeads, HeadDim, RmsEps);
             }
-            _u.Rope(_qkv.View, _invFreq.View, SeqLen, _qkvCols, 0, _qHeads, HeadDim, 0);
-            _u.Rope(_qkv.View, _invFreq.View, SeqLen, _qkvCols, _qCols, _kvHeads, HeadDim, 0);
+            _u.RopeTables(_qkv.View, _cos.View, _sin.View, SeqLen, _qkvCols, 0, _qHeads, HeadDim);
+            _u.RopeTables(_qkv.View, _cos.View, _sin.View, SeqLen, _qkvCols, _qCols, _kvHeads, HeadDim);
             _u.StoreKv(_qkv.View, _kc.View, _vc.View, 0, SeqLen, _qCols, _kvCols);
             _f.PaddedCausalGqa(_qkv.View, _kc.View, _vc.View, _scores.View, _attn.View, SeqLen, real, _qHeads, HeadDim, rep);
             Lin(_attn.View, b + "self_attn.o_proj.weight", null, _proj.View, _qCols, H);
