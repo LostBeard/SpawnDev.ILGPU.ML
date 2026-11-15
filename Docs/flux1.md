@@ -27,8 +27,8 @@ The 12B transformer does not fit most cards, so its blocks are split by `Streame
 the file on every call (RTX 4070, 7 GB budget: 22 of 57 blocks resident, 4.96 GB streamed per call, 1.8 s per call warm). 8-bit matrices stay 8-bit on the device and are
 decoded into one shared bf16 scratch just before their GEMM; an fp8_scaled file's `scale_weight` is each matrix's decode scale (a scaled file with an unscaled 8-bit matrix is refused).
 ComfyUI computes a scaled Linear as `x (f8 * scale_weight)^T + bias` in fp32 (SpawnGen hooked one in ComfyUI: reproduced to 5e-8; `scale_input` is unused); the 8-bit values decode
-exactly and the scale moves to the input. The Krea fp8_scaled file (F16 biases) is 1.3e-3 from ComfyUI until SpawnDev.ILGPU 5.4.33, which rounds the in-register BFloat16 round trip
-its exact-bias path needs.
+exactly and the scale moves to the input. The Krea fp8_scaled file (F16 biases) needs SpawnDev.ILGPU 5.4.33 or later, which rounds the in-register BFloat16 round trip
+its exact-bias path needs (5.4.32: 1.3e-3 from ComfyUI). On 5.4.33 (RTX 4070) its calls match ComfyUI to 2.5e-5 / 4.8e-5 on CUDA and 2.3e-6 / 2.8e-5 on OpenCL.
 
 The call ComfyUI's sampler makes, measured:
 

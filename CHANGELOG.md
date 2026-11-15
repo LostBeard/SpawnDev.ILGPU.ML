@@ -12,6 +12,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - **Fix: the automatic Q8_0 load trusted the browser backends' memory estimate** (WebGL reports a fixed 256 MB): it now decides only on CUDA and OpenCL, which report their real
   memory; elsewhere 16-bit matrices load as stored unless Q8 is asked for.
 
+- **SpawnDev.ILGPU 5.4.33.** A float -> BFloat16 -> float round trip inside a kernel now rounds on every GPU backend (5.4.32 kept the float, so `v - bf16(v)` came out zero).
+  Gate `Bf16HiLo_SplitsFp16Exactly` (light, every lane): `WanComfyFormat.ToBf16HiLo` (fp16 -> bf16 hi + bf16 lo, how `StreamedModelWeights` keeps an fp16 bias exactly) bit for bit
+  against the host; red on 5.4.32's five GPU backends. Full ML sweep on it: no outcome changes against 5.8.17, and Half / BF16 tests A/B'd against 5.4.32 run no slower.
 - **SpawnDev.ILGPU 5.4.32.** Its float -> Half conversions round on every backend (5.4.31 left them unrounded in registers on Wasm and WebGL; OpenCL in some kernel shapes), its
   OpenCL division and sqrt are correctly rounded, and the Wasm backend emits structured control flow. Gate `Sd_HiLoSplit_RoundsOnEveryBackend` (light, every lane): the VAE loader's
   fp32 -> (hi, lo) fp16 split bit for bit against the host's IEEE halves, normal and subnormal lo halves and the conv-weight permutation; red on 5.4.31 Wasm and WebGL (every lo zero).
@@ -32,9 +35,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - **FLUX.1's split templates** (standalone `flux1-*-fp8_scaled` / bf16 transformer, `t5xxl_fp8_e4m3fn_scaled` or fp16, `clip_l`): gates against SpawnGen's dumps of ComfyUI's Krea graph
   (`Flux1Split_*`); with no FluxGuidance node ComfyUI passes guidance 3.5. Standalone clip_l: 1.34e-6. The fp8_scaled T5 runs exact with `UmT5Encoder.PreciseActivations` (the
   8-bit values unscaled, each scale applied to the input, or to its part's output columns in the fused q | k | v): 2.25e-4 on the prompt rows (folded into bf16: 4.1e-3). The Krea
-  fp8_scaled transformer runs 1.3e-3 from ComfyUI: its F16 biases are held exactly as bf16 hi + lo (`StreamedModelWeights`), but SpawnDev.ILGPU before 5.4.33 does not round a
-  float -> BFloat16 -> float round trip in GPU kernels (found here: lo all zero on CUDA / OpenCL / WebGPU / WebGL / Wasm; reported, fixed in 5.4.33), so one layer misses ComfyUI's
-  hooked output by 1.5e-4 where the exact arithmetic gives 5e-8 (SpawnGen measured ComfyUI's Linear). Its gates join with 5.4.33.
+  fp8_scaled transformer holds its F16 biases exactly as bf16 hi + lo (`StreamedModelWeights`), which needs SpawnDev.ILGPU 5.4.33: before it, a float -> BFloat16 -> float round trip
+  in GPU kernels did not round (found here: lo all zero on CUDA / OpenCL / WebGPU / WebGL / Wasm; reported, fixed in 5.4.33) and the model was 1.3e-3 / 2.6e-3 from ComfyUI.
+  MEASURED on 5.4.33 (RTX 4070) against ComfyUI's calls: CUDA 2.50e-5 / 4.81e-5, OpenCL 2.27e-6 / 2.77e-5 (`Flux1Split_Fp8ScaledTransformer_MatchesComfyUiCalls`); one hooked
+  Linear CUDA 8.25e-6, OpenCL 8.55e-7, the host reference 1.49e-7 (`Flux1Split_ScaledLinear_MatchesComfyUiLayer`).
 - **Qwen-Image from ComfyUI's files** (Docs/flux1.md): `QwenImageTransformer` (20B, ported from diffusers' `QwenImageTransformer2DModel`, Apache-2.0; `qwen_image_fp8_e4m3fn`, blocks
   streamed past the budget; per-call text length), the Qwen2.5-VL-7B text encoder through `Flux2TextEncoder` (now sized from its weights: biases, no q / k norms, unfused 8-bit
   q / k / v, final norm; ComfyUI's fp8_scaled file kept 8-bit and decoded exact with the scale moved to the input; the vision tower is not read), and the Wan 2.1 VAE
