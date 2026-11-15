@@ -14,7 +14,7 @@ diffusers 0.43.0 `pipelines/qwenimage/pipeline_qwenimage_edit_plus.py` + `models
 | Lore's dumps (`_DevComms` 2026-11-15-1425 + 1450; fixtures F:/spawndev-qwenimage-edit/comfyui-dumps) | done |
 | Vision tower `QwenVisionEncoder` (QwenImage/QwenVisionEncoder.cs; `Flux2Weights.LoadVisionAsync`, shared `Flux2ComfyFormat.TakeF8ScalesAsync`) | GATED 11-15 vs ComfyUI: QwenEdit_VisionTower_MatchesComfyUi CUDA 6.1e-5 / OpenCL 2.5e-5 |
 | M-RoPE for picture tokens in the Qwen2.5-VL text tower (`Flux2TextEncoder.Encode(ids, real, pictures)`, `MRopePositions`, `SkinTokensKernels.RopeAxes`) | GATED 11-15 vs ComfyUI: QwenEdit_TextEncoderWithPictures_MatchesComfyUi CUDA 3.1e-4 / OpenCL 8.1e-5 (ComfyUI = transformers' get_rope_index) |
-| Reference latents in `QwenImageTransformer` (`OpenAsync(.., references, ..)`, `Ids(text, pictures)`, `InputTokens`) | written 11-15; gate waits the 2509 transformer file (downloading to F:) |
+| Reference latents in `QwenImageTransformer` (`OpenAsync(.., references, ..)`, `Ids(text, pictures)`, `InputTokens`) | OPEN 11-15: QwenEdit_Transformer_MatchesComfyUiCalls 0.22 (best of 4 rotary layouts x 6 pad/normalisation readings; no reference 0.60; negative calls ~0.8). The 2509 file = the base model's tensors (names, shapes, dtypes). Asked SpawnGen for ComfyUI module taps of one call (img_in in/out, positional embedder in/out, txt_in, block 0, time embedding) |
 | Qwen-Image Edit 2511 | later: diffusers' `zero_cond_t` (reference tokens modulated at timestep 0, `modulate_index`) |
 | Pipeline / node glue for SpawnGen | after the gates |
 
@@ -63,3 +63,9 @@ ALL pictures of max(h/2, w/2). ComfyUI's ref-latent positions may differ (Kontex
 
 diffusers' edit-plus rescales the CFG result to the conditional prediction's norm per token. ComfyUI's KSampler cfg does not (black box: compare on the dumps). The model
 calls are gated one by one, so this only matters for the end-to-end sampler gate.
+
+## Wan 2.1 i2v 14B (item 2 of the 0958 request)
+
+CLIP vision ViT-H: `ClipVision/ClipVisionEncoder.cs`, gated (`ClipVisionH_MatchesComfyUi`: penultimate 4.5e-5 CUDA / 4.4e-5 OpenCL). The 14B model calls have no
+ComfyUI reference yet: ComfyUI's CPU load of the 14B fp8 file needs more than 36 GB of RAM (SpawnGen's box 32 GB, Yoda 15.7 GB). Encode-side dumps (umT5, WanImageToVideo) are in
+F:/spawndev-wan14b/comfyui-dumps.

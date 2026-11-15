@@ -171,11 +171,29 @@ public sealed class QwenImageTransformer : IDisposable
     /// <summary>The longest text this transformer was opened for.</summary>
     public int MaxTextTokens => _maxTxt;
 
+    private int[]? _customIds;
+
     private void SetPositions()
     {
-        var (cos, sin) = Flux1Transformer.RopeTables(Ids(_nTxt, _shapes), _n);                 // the same axes (16 / 56 / 56) and theta as FLUX.1
+        var ids = _customIds ?? Ids(_nTxt, _shapes);
+        var (cos, sin) = Flux1Transformer.RopeTables(ids, _n);                                  // the same axes (16 / 56 / 56) and theta as FLUX.1
         _cosT.View.SubView(0, cos.Length).CopyFromCPU(cos); _sinT.View.SubView(0, sin.Length).CopyFromCPU(sin);
     }
+
+    /// <summary>
+    /// Use these position ids [(textTokens + <see cref="InputTokens"/>) * 3] (text first, then the pictures; (frame, row, column) per token) instead of <see cref="Ids(int, IReadOnlyList{ValueTuple{int, int}})"/>
+    /// for calls with <paramref name="textTokens"/> rows, until <see cref="ResetPositionIds"/>. For measuring a reference implementation's layout and for callers that place pictures
+    /// their own way.
+    /// </summary>
+    public void UsePositionIds(int[] ids, int textTokens)
+    {
+        if (textTokens < 1 || textTokens > _maxTxt) throw new ArgumentOutOfRangeException(nameof(textTokens), $"1 to {_maxTxt}");
+        if (ids.Length != (textTokens + _nImg) * 3) throw new ArgumentException($"{(textTokens + _nImg) * 3} ids (text {textTokens} + pictures {_nImg}, 3 each)");
+        _customIds = (int[])ids.Clone(); _nTxt = textTokens; _n = _nTxt + _nImg; SetPositions();
+    }
+
+    /// <summary>Back to <see cref="Ids(int, IReadOnlyList{ValueTuple{int, int}})"/>.</summary>
+    public void ResetPositionIds() { _customIds = null; SetPositions(); }
 
     private static float[] Sinusoid(float t)
     {

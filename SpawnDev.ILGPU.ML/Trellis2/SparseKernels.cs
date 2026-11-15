@@ -183,10 +183,16 @@ public sealed class SparseKernels
         o[idx] = acc;
     }
 
+    /// <summary>
+    /// <see cref="LinearF16"/> on CUDA: skip the fp16 tensor-core GEMM, which rounds every fp32 activation to fp16 on the way in (~5e-4), and run the fp32 tiled GEMM on the exact
+    /// fp16 weights instead. For models checked against fp32 references (ComfyUI's fp32 "manual cast": CLIP vision). Other backends compute in fp32 either way. Off by default.
+    /// </summary>
+    public bool PreciseActivations { get; set; }
+
     /// <summary>nn.Linear with fp16 weight [N, K] and fp16 bias [N]; x [M, K] fp32 -> o [M, N] fp32 (the pointwise convolutions of the Wan 2.2 VAE).</summary>
     public void LinearF16(FV x, HV weight, HV bias, FV o, int M, int K, int N)
     {
-        if (Cuda && K % MmaGemm.BK == 0 && N % 2 == 0 && M >= 16)
+        if (Cuda && !PreciseActivations && K % MmaGemm.BK == 0 && N % 2 == 0 && M >= 16)
         {
             _mmaLinearF16 ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, HV, FV, FV, IV, int, int, int, int, int, int, int>(MmaGemm.KernelF16Dense);
             _noRes ??= _acc.Allocate1D<float>(1); _noNbr ??= _acc.Allocate1D<int>(1);

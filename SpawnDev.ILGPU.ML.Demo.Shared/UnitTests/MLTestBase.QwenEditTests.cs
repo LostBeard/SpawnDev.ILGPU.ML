@@ -4,6 +4,7 @@ using SpawnDev.ILGPU.ML.Flux2;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.QwenImage;
 using SpawnDev.ILGPU.ML.SkinTokens;
+using SpawnDev.ILGPU.ML.Trellis2;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -25,6 +26,145 @@ public abstract partial class MLTestBase
         for (int i = 0; i < o.Length; i++) o[i] = checked((int)BitConverter.ToInt64(b, i * 8));
         return o;
     }
+
+    /// <summary>The 2509 edit transformer file (QE_DIR, default F:/spawndev-qwenimage-edit, Comfy-Org/Qwen-Image-Edit_ComfyUI's split_files layout under comfy).</summary>
+    private static string Qe_Transformer(Accelerator accelerator)
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop GPU");
+        var p = Path.Combine(Environment.GetEnvironmentVariable("QE_DIR") ?? "F:/spawndev-qwenimage-edit", "comfy", "split_files", "diffusion_models", "qwen_image_edit_2509_fp8_e4m3fn.safetensors");
+        if (!File.Exists(p)) throw new UnsupportedTestException($"{p} not found (QE_DIR)");
+        return p;
+    }
+
+    /// <summary>
+    /// A latent [16, h, w] as transformer tokens [(h'/2) (w'/2), 64] (column c * 4 + dy * 2 + dx, as <see cref="Flux1.Flux1Kernels.Patchify"/>), odd sides padded to even by
+    /// <paramref name="pad"/> ("zero", "replicate" = the edge row / column, "circular" = wrap to row / column 0), optionally normalised per channel ((v - mean) / std).
+    /// </summary>
+    private static (float[] Tokens, int Rows, int Cols) Qe_Tokens(float[] lat, int h, int w, string pad, float[]? mean, float[]? std)
+    {
+        int H = h + (h & 1), W = w + (w & 1), rows = H / 2, cols = W / 2;
+        var t = new float[(long)rows * cols * 64];
+        for (int c = 0; c < 16; c++)
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    int sy = y, sx = x; bool zero = false;
+                    if (y >= h) { if (pad == "zero") zero = true; else sy = pad == "replicate" ? h - 1 : y - h; }
+                    if (x >= w) { if (pad == "zero") zero = true; else sx = pad == "replicate" ? w - 1 : x - w; }
+                    float v = zero ? 0f : lat[(long)c * h * w + (long)sy * w + sx];
+                    if (mean != null && !zero) v = (v - mean[c]) / std![c];
+                    t[((long)(y / 2) * cols + x / 2) * 64 + c * 4 + (y & 1) * 2 + (x & 1)] = v;
+                }
+        return (t, rows, cols);
+    }
+
+    /// <summary>
+    /// Qwen-Image Edit 2509's transformer (qwen_image_edit_2509_fp8_e4m3fn: the base model's architecture, its own weights) with reference latents
+    /// (<see cref="QwenImageTransformer.OpenAsync(Accelerator, IModelSource, string, string, int, int, int, IReadOnlyList{ValueTuple{int, int}}, long, CancellationToken)"/>) against
+    /// ComfyUI's model calls (SpawnGen's dumps, float32 CPU, sigma 1, cfg 4): 1 picture (reference A [16, 111, 148], cond 212 / uncond 204 rows) and 2 pictures (A and B
+    /// [16, 99, 165], 417 / 409 rows). How ComfyUI feeds a reference is measured on call 0 of the 1-picture run: odd sides padded with zeros, the edge or by wrapping, and the raw VAE
+    /// latent or the model's normalised one; the winner then has to hold for the other three calls. Base model conventions (QwenImage_Transformer_MatchesComfyUiCalls): t = sigma,
+    /// the output is x - sigma v.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task QwenEdit_Transformer_MatchesComfyUiCalls() => await RunTest(async accelerator =>
+    {
+        var path = Qe_Transformer(accelerator); var d = Qe_Dumps();
+        var vaePath = Qi_Require(accelerator, Path.Combine("vae", "qwen_image_vae.safetensors"));
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("QI_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 6.0;
+        const int lat = 16 * 24 * 32;
+        float[] mean, std;
+        using (var vw = GpuWeights.LoadFile(accelerator, vaePath))
+        {
+            await Wan.WanComfyFormat.AdaptVaeAsync(accelerator, vw);
+            using var vae = new Wan.WanVae(accelerator, vw);
+            (mean, std) = await vae.GetLatentNormalizationAsync();
+        }
+        var refA = F2_Raw(Path.Combine(d, "qe_graph1_call_0_c_ref_latents_0_f32_1x16x1x111x148.raw"), 16L * 111 * 148);
+        var refB = F2_Raw(Path.Combine(d, "qe_graph2_call_0_c_ref_latents_1_f32_1x16x1x99x165.raw"), 16L * 99 * 165);
+        var k = new Flux1.Flux1Kernels(accelerator);
+        var report = new List<string>(); double worst = 0, control = double.MaxValue; string? winner = null;
+        var src = new LocalFolderModelSource(Path.GetDirectoryName(path)!);
+
+        async Task<double> Call(QwenImageTransformer tr, string run, int call, int n, List<float[]> refs, string pad, bool normalise)
+        {
+            var x = F2_Raw(Path.Combine(d, $"qe_{run}_call_{call}_input_f32_1x16x1x24x32.raw"), lat);
+            float sigma = F2_Raw(Path.Combine(d, $"qe_{run}_call_{call}_timestep_f32_1.raw"), 1)[0];
+            var parts = new List<float[]> { Qe_Tokens(x, 24, 32, "zero", null, null).Tokens };
+            int[] rh = { 111, 99 }, rw = { 148, 165 };
+            for (int r = 0; r < refs.Count; r++) parts.Add(Qe_Tokens(refs[r], rh[r], rw[r], pad, normalise ? mean : null, normalise ? std : null).Tokens);
+            var tokens = parts.SelectMany(p => p).ToArray();
+            Ur_Expect(tokens.Length == (long)tr.InputTokens * 64, $"{tokens.Length / 64} tokens, the transformer takes {tr.InputTokens}");
+            using var dTok = accelerator.Allocate1D(tokens); using var dX = accelerator.Allocate1D(x); using var den = accelerator.Allocate1D<float>(lat);
+            using var cond = accelerator.Allocate1D(F2_Raw(Path.Combine(d, $"qe_{run}_call_{call}_c_c_crossattn_f32_1x{n}x3584.raw"), (long)n * 3584));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await tr.ForwardAsync(dTok.View, cond.View, sigma, n);
+            k.Denoised(dX.View, tr.Output, den.View, sigma, 12, 16);
+            double e = F2_RelRms(await den.View.CopyToHostAsync(), F2_Raw(Path.Combine(d, $"qe_{run}_call_{call}_output_f32_1x16x1x24x32.raw"), lat));
+            report.Add($"{run} call {call} ({n} rows, {refs.Count} ref, pad {pad}, {(normalise ? "normalised" : "raw")}): {e:E2} ({sw.Elapsed.TotalSeconds:F1} s)");
+            return e;
+        }
+
+        // the rotary layout of text + pictures: where the text starts (after the largest of ALL pictures, diffusers; or after the noise latent alone) and which frame a
+        // reference sits on (k, diffusers' index; or 0); pictures centred as the base model
+        static int[] Layout(int nTxt, (int R, int C)[] pics, bool textAfterAll, bool refFrameK)
+        {
+            int start = 0;
+            foreach (var (r, c) in textAfterAll ? pics : pics.Take(1)) start = Math.Max(start, Math.Max(r / 2, c / 2));
+            var ids = new int[(nTxt + pics.Sum(p => p.R * p.C)) * 3];
+            for (int j = 0; j < nTxt; j++) ids[j * 3] = ids[j * 3 + 1] = ids[j * 3 + 2] = start + j;
+            int row = nTxt;
+            for (int q = 0; q < pics.Length; q++)
+            {
+                var (r, c) = pics[q]; int y0 = r - r / 2, x0 = c - c / 2;
+                for (int y = 0; y < r; y++) for (int x = 0; x < c; x++) { ids[row * 3] = refFrameK ? q : 0; ids[row * 3 + 1] = y - y0; ids[row * 3 + 2] = x - x0; row++; }
+            }
+            return ids;
+        }
+        var layouts = new (string Name, bool All, bool FrameK)[] { ("text after all pictures, ref k on frame k (diffusers)", true, true), ("text after the noise latent, ref k on frame k", false, true),
+            ("text after all pictures, refs on frame 0", true, false), ("text after the noise latent, refs on frame 0", false, false) };
+        const string Pad = "replicate"; const bool Norm = true;                                   // the 16:20 run's best reading of the reference format (all far off: the layout first)
+        var one = new[] { (12, 16), (56, 74) }; var two = new[] { (12, 16), (56, 74), (50, 83) };
+        (string Name, bool All, bool FrameK, double E) best;
+        // 1 picture: the layout on call 0, then call 1 with the winner
+        using (var tr = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 212, 12, 16, new[] { (56, 74) }, (long)(residentGb * 1e9)))
+        {
+            report.Add($"1 picture: {tr.ResidentBlocks} of 60 blocks resident, {tr.InputTokens} picture tokens");
+            var readings = new List<(string Name, bool All, bool FrameK, double E)>();
+            foreach (var (name, all, frameK) in layouts)
+            {
+                tr.UsePositionIds(Layout(212, one, all, frameK), 212);
+                double e = await Call(tr, "graph1", 0, 212, new List<float[]> { refA }, Pad, Norm);
+                report.Add($"  layout: {name}");
+                readings.Add((name, all, frameK, e));
+            }
+            best = readings.OrderBy(r => r.E).First();
+            winner = best.Name; worst = best.E; control = readings.Where(r => r != best).Min(r => r.E);
+            report.Add($"layout: '{best.Name}' wins ({best.E:E2}); the next best {control:E2}");
+            tr.UsePositionIds(Layout(204, one, best.All, best.FrameK), 204);
+            worst = Math.Max(worst, await Call(tr, "graph1", 1, 204, new List<float[]> { refA }, Pad, Norm));
+        }
+        // control: the noise latent alone (no reference) must miss
+        using (var tr0 = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 212, 12, 16, (long)(residentGb * 1e9)))
+        {
+            double e0 = await Call(tr0, "graph1", 0, 212, new List<float[]>(), Pad, Norm);
+            report.Add($"control, no reference latent: {e0:E2}");
+            control = Math.Min(control, e0);
+        }
+        // 2 pictures, the same layout
+        using (var tr2 = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 417, 12, 16, new[] { (56, 74), (50, 83) }, (long)(residentGb * 1e9)))
+        {
+            report.Add($"2 pictures: {tr2.InputTokens} picture tokens");
+            foreach (var (call, n) in new[] { (0, 417), (1, 409) })
+            {
+                tr2.UsePositionIds(Layout(n, two, best.All, best.FrameK), n);
+                worst = Math.Max(worst, await Call(tr2, "graph2", call, n, new List<float[]> { refA, refB }, Pad, Norm));
+            }
+        }
+        foreach (var line in report) Console.WriteLine("[QwenEdit] transformer vs ComfyUI: " + line);
+        Ur_Expect(worst < 1e-3 && control > 10 * worst, string.Join("; ", report));             // bound to be pinned to the measurement
+        return string.Join("; ", report);
+    });
 
     /// <summary>
     /// Qwen2.5-VL's vision tower (<see cref="QwenVisionEncoder"/>, the visual.* tensors of ComfyUI's qwen_2.5_vl_7b_fp8_scaled) against ComfyUI's TextEncodeQwenImageEditPlus run
@@ -136,9 +276,16 @@ public abstract partial class MLTestBase
             sw.Restart();
             double e = F2_RelRms(await te.Encode(padded, real, pics).SubView((long)Drop * Hd, (long)rows * Hd).CopyToHostAsync(), want);
             double t = sw.Elapsed.TotalSeconds;
+            var paddedRows = await te.Encode(padded, real, pics).SubView((long)Drop * Hd, (long)rows * Hd).CopyToHostAsync();
+            // the same prompt without padding (per-call length): the prompt's rows must not depend on the padding after it
+            sw.Restart();
+            var trimmed = await te.Encode(ids.ToArray(), real, pics).SubView((long)Drop * Hd, (long)rows * Hd).CopyToHostAsync();
+            double tTrim = sw.Elapsed.TotalSeconds;
+            double trimDiff = 0; for (int i = 0; i < trimmed.Length; i++) trimDiff = Math.Max(trimDiff, Math.Abs(trimmed[i] - paddedRows[i]));
             double c = F2_RelRms(await te.Encode(padded, real, strip).SubView((long)Drop * Hd, (long)rows * Hd).CopyToHostAsync(), want);
             worst = Math.Max(worst, e); controlBest = Math.Min(controlBest, c);
-            report.Add($"{run} ({starts.Count} picture(s), {real} rows, {t:F1} s): M-RoPE {e:E2}, 1 x N strip control {c:E2}");
+            report.Add($"{run} ({starts.Count} picture(s), {real} rows, {t:F1} s; unpadded {tTrim:F1} s, max |unpadded - padded| {trimDiff:E2}): M-RoPE {e:E2}, 1 x N strip control {c:E2}");
+            Ur_Expect(trimDiff <= 1e-5, $"{run}: unpadded rows differ from the padded run by {trimDiff:E2}");
         }
         foreach (var line in report) Console.WriteLine("[QwenEdit] text encoder with pictures vs ComfyUI: " + line);
         // MEASURED (RTX 4070, 2026-11-15): CUDA 1 picture 1.51e-4 / 1.55e-4 (negative), 2 pictures 3.08e-4 / 3.12e-4; OpenCL 4.67e-5 / 4.80e-5, 8.02e-5 / 8.14e-5;

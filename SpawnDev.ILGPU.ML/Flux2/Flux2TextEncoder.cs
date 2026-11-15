@@ -51,6 +51,8 @@ public sealed class Flux2TextEncoder : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _hn, _qkv, _attn, _proj, _gateUp, _act, _scores, _kc, _vc, _dummy, _cos, _sin, _out, _part, _xs;
     private readonly MemoryBuffer1D<int, Stride1D.Dense> _ids;
     private readonly float[] _invFreqHost;
+    private readonly int _maxTokens;
+    private int _n;                                                                     // this call's rows (ids.Length)
     private bool _plainTables;                                                          // the device tables hold the text-only (1D) positions
 
     /// <summary>
@@ -65,11 +67,14 @@ public sealed class Flux2TextEncoder : IDisposable
     /// The same stack reading the hidden states after the given layers (1-based, ascending), side by side: FLUX.2 { 9, 18, 27 }; Z-Image { 35 } (the reference's
     /// <c>hidden_states[-2]</c> of the 36-layer model, no final norm). The weights must hold the first <c>tapAfterLayer[^1]</c> layers. <paramref name="finalNorm"/>: the last tap
     /// goes through the model's final RMS norm (<c>norm.weight</c>), as Hugging Face's last hidden state does (Qwen-Image reads it after all 28 layers).
+    /// <paramref name="maxTokens"/>: the most ids one <see cref="Encode(int[], int)"/> takes (every buffer is sized for it; each call computes only its own ids). FLUX.2 / Z-Image pass a padded
+    /// <see cref="SeqLen"/>; Qwen-Image passes the prompt's own length (ComfyUI encodes any length), and Qwen-Image Edit the prompt plus its pictures' rows.
     /// </summary>
-    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights, int[] tapAfterLayer, bool finalNorm = false)
+    public Flux2TextEncoder(Accelerator accelerator, Flux2Weights weights, int[] tapAfterLayer, bool finalNorm = false, int maxTokens = SeqLen)
     {
         if (tapAfterLayer.Length == 0 || tapAfterLayer[0] < 1 || tapAfterLayer.Zip(tapAfterLayer.Skip(1)).Any(p => p.Second <= p.First)) throw new ArgumentException("taps: ascending 1-based layer numbers", nameof(tapAfterLayer));
-        _acc = accelerator; _w = weights; _taps = (int[])tapAfterLayer.Clone(); _layers = _taps[^1]; _finalNorm = finalNorm;
+        if (maxTokens < 1) throw new ArgumentOutOfRangeException(nameof(maxTokens), "at least 1");
+        _acc = accelerator; _w = weights; _taps = (int[])tapAfterLayer.Clone(); _layers = _taps[^1]; _finalNorm = finalNorm; _maxTokens = _n = maxTokens;
         // the dimensions, from layer 0's tensors (fused by the adapters when they could be: q | k | v and gate | up of one precision and scale)
         _fusedQkv = weights.Has("layers.0.self_attn.qkv_proj.weight"); _fusedGateUp = weights.Has("layers.0.mlp.gate_up_proj.weight");
         _hidden = weights.Shape("layers.0.input_layernorm.weight")[0];
@@ -87,7 +92,7 @@ public sealed class Flux2TextEncoder : IDisposable
         if (_finalNorm && !weights.Has("norm.weight")) throw new InvalidDataException("finalNorm: the weights hold no norm.weight");
 
         _k = new DiTKernels(accelerator); _u = new SkinTokensKernels(accelerator); _f = new Flux2Kernels(accelerator);
-        long T = SeqLen;
+        long T = _maxTokens;
         _h = Alloc<float>(T * _hidden); _hn = Alloc<float>(T * _hidden); _qkv = Alloc<float>(T * _qkvCols); _attn = Alloc<float>(T * _qCols);
         _proj = Alloc<float>(T * _hidden); _gateUp = Alloc<float>(T * 2 * _inter); _act = Alloc<float>(T * _inter);
         _scores = Alloc<float>((long)_qHeads * T * T); _kc = Alloc<float>(T * _kvCols); _vc = Alloc<float>(T * _kvCols);
@@ -97,7 +102,7 @@ public sealed class Flux2TextEncoder : IDisposable
         // a scaled 8-bit file (ComfyUI's fp8_scaled: Qwen-Image's Qwen2.5-VL) multiplies each matrix's input by the matrix's scale (Flux2Weights.MatrixExact): one buffer of the widest input
         _xs = Alloc<float>(_w.ActivationScale(_fusedQkv ? "layers.0.self_attn.qkv_proj.weight" : "layers.0.self_attn.q_proj.weight") != 1f ? T * Math.Max(Math.Max(_hidden, _qCols), _inter) : 1);
         _invFreqHost = RopeTable();
-        UploadRope(MRopePositions(SeqLen, Array.Empty<(int, int, int)>())); _plainTables = true;
+        UploadRope(MRopePositions(_maxTokens, Array.Empty<(int, int, int)>())); _plainTables = true;
     }
 
     /// <summary>
@@ -106,12 +111,12 @@ public sealed class Flux2TextEncoder : IDisposable
     /// </summary>
     public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
 
-    // nn.Linear over the 512 rows; an 8-bit scaled matrix runs exact: its unscaled decode, with the input times its scale
+    // nn.Linear over this call's rows; an 8-bit scaled matrix runs exact: its unscaled decode, with the input times its scale
     private void Lin(FV x, string weight, ArrayView1D<BFloat16, Stride1D.Dense>? bias, FV o, int K, int N)
     {
         float s = _w.ActivationScale(weight);
-        if (s != 1f) { var xs = _xs.View.SubView(0, (long)SeqLen * K); _f.ScaleInto(x, xs, s, SeqLen * K); x = xs; }
-        _k.Linear(x, _w.MatrixExact(weight), bias, o, SeqLen, K, N);
+        if (s != 1f) { var xs = _xs.View.SubView(0, (long)_n * K); _f.ScaleInto(x, xs, s, _n * K); x = xs; }
+        _k.Linear(x, _w.MatrixExact(weight), bias, o, _n, K, N);
     }
 
     private static float[] RopeTable()
@@ -124,15 +129,19 @@ public sealed class Flux2TextEncoder : IDisposable
 
     private MemoryBuffer1D<T, Stride1D.Dense> Alloc<T>(long n) where T : unmanaged { var b = _acc.Allocate1D<T>(Math.Max(1, n)); _owned.Add(b); return b; }
 
-    // the rotary tables for SeqLen rows at (t, h, w) positions (host cos / sin: GPU sin / cos are inexact at large angles on the browser backends)
+    // the rotary tables for pos.Length / 3 rows at (t, h, w) positions (host cos / sin: GPU sin / cos are inexact at large angles on the browser backends)
     private void UploadRope(int[] pos)
     {
-        var (c, s) = SkinTokensKernels.AxesRopeTables(pos, SeqLen, 3, _invFreqHost, MRopeT, MRopeT + MRopeH);
-        _cos.View.CopyFromCPU(c); _sin.View.CopyFromCPU(s);
+        int rows = pos.Length / 3;
+        var (c, s) = SkinTokensKernels.AxesRopeTables(pos, rows, 3, _invFreqHost, MRopeT, MRopeT + MRopeH);
+        _cos.View.SubView(0, c.Length).CopyFromCPU(c); _sin.View.SubView(0, s.Length).CopyFromCPU(s);
     }
 
-    /// <summary>The conditioning rows of the last <see cref="Encode"/>, [512, <see cref="Width"/>] on the device.</summary>
+    /// <summary>The conditioning rows of the last <see cref="Encode(int[], int)"/>: [ids.Length, <see cref="Width"/>] on the device (the buffer holds <see cref="MaxTokens"/> rows).</summary>
     public FV Output => _out.View;
+
+    /// <summary>The most ids one <see cref="Encode(int[], int)"/> takes (the constructor's maxTokens; FLUX.2's padded 512 by default).</summary>
+    public int MaxTokens => _maxTokens;
 
     /// <summary>Intermediate checkpoints for tests: called with the name and the device view after the embedding ("embed") and after every layer ("layer{n}", 1-based) with the live rows.</summary>
     public Action<string, FV, int, int>? Probe;
@@ -142,12 +151,13 @@ public sealed class Flux2TextEncoder : IDisposable
     {
         ArrayView1D<BFloat16, Stride1D.Dense>? bias = _w.Has(name + ".bias") ? _w.Vector(name + ".bias") : null;
         Lin(x, name + ".weight", bias, _part.View, K, N);
-        _f.CopyCols(_part.View, dst, SeqLen, N, N, dstStride, dstOff);
+        _f.CopyCols(_part.View, dst, _n, N, N, dstStride, dstOff);
     }
 
     /// <summary>
-    /// Encode one padded prompt: <paramref name="ids"/> is 512 token ids, the first <paramref name="real"/> of them the prompt (the rest padding). Returns the conditioning matrix on the device
-    /// (also <see cref="Output"/>), [512, <see cref="Width"/>] row-major.
+    /// Encode one prompt: <paramref name="ids"/> is 1 to <see cref="MaxTokens"/> token ids, the first <paramref name="real"/> of them the prompt and any after it padding (keys masked;
+    /// FLUX.2 reads its padded 512 rows, Qwen-Image passes just the prompt). Returns the conditioning matrix on the device (also <see cref="Output"/>), [ids.Length, <see cref="Width"/>]
+    /// row-major. The rows of the prompt do not depend on how much padding follows.
     /// </summary>
     public FV Encode(int[] ids, int real) => Encode(ids, real, null);
 
@@ -189,11 +199,14 @@ public sealed class Flux2TextEncoder : IDisposable
     /// </summary>
     public FV Encode(int[] ids, int real, IReadOnlyList<(int Start, FV Rows, int MergedRows, int MergedCols)>? pictures)
     {
-        if (ids.Length != SeqLen) throw new ArgumentException($"{SeqLen} token ids expected");
+        int n = ids.Length;
+        if (n < 1 || n > _maxTokens) throw new ArgumentException($"1 to {_maxTokens} token ids (this encoder's maxTokens), got {n}");
+        if (real < 1 || real > n) throw new ArgumentOutOfRangeException(nameof(real), $"1 to {n}");
+        _n = n;
         int H = _hidden, rep = _qHeads / _kvHeads;
         bool mrope = pictures != null && pictures.Count > 0;
-        _ids.View.CopyFromCPU(ids);
-        _w.Embed(_ids.View, "embed_tokens.weight", _h.View, SeqLen, H);
+        _ids.View.SubView(0, n).CopyFromCPU(ids);                                         // the buffer holds MaxTokens ids; this call uses the first n
+        _w.Embed(_ids.View, "embed_tokens.weight", _h.View, n, H);
         if (mrope)
         {
             foreach (var (start, rows, gh, gw) in pictures!)
@@ -203,15 +216,15 @@ public sealed class Flux2TextEncoder : IDisposable
                 if (rows.Length < count * H) throw new ArgumentException($"picture rows: fewer than {count} x {H} values");
                 _h.View.SubView(start * (long)H, count * H).CopyFrom(rows.SubView(0, count * H));
             }
-            UploadRope(MRopePositions(SeqLen, pictures!.Select(q => (q.Start, q.MergedRows, q.MergedCols)).ToList())); _plainTables = false;
+            UploadRope(MRopePositions(n, pictures!.Select(q => (q.Start, q.MergedRows, q.MergedCols)).ToList())); _plainTables = false;
         }
-        else if (!_plainTables) { UploadRope(MRopePositions(SeqLen, Array.Empty<(int, int, int)>())); _plainTables = true; }
-        Probe?.Invoke("embed", _h.View, SeqLen, H);
+        else if (!_plainTables) { UploadRope(MRopePositions(_maxTokens, Array.Empty<(int, int, int)>())); _plainTables = true; }   // the text-only table for every length: its first n rows
+        Probe?.Invoke("embed", _h.View, n, H);
         int tap = 0;
         for (int l = 0; l < _layers; l++)
         {
             string b = $"layers.{l}.";
-            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), SeqLen, H, RmsEps);
+            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), n, H, RmsEps);
             if (_fusedQkv) Lin(_hn.View, b + "self_attn.qkv_proj.weight", _qkvBias ? _w.Vector(b + "self_attn.qkv_proj.bias") : null, _qkv.View, H, _qkvCols);
             else
             {
@@ -221,31 +234,31 @@ public sealed class Flux2TextEncoder : IDisposable
             }
             if (_qkNorm)
             {
-                _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.q_norm.weight"), SeqLen, _qkvCols, 0, _qHeads, HeadDim, RmsEps);
-                _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.k_norm.weight"), SeqLen, _qkvCols, _qCols, _kvHeads, HeadDim, RmsEps);
+                _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.q_norm.weight"), n, _qkvCols, 0, _qHeads, HeadDim, RmsEps);
+                _u.RmsNormHeads(_qkv.View, _w.Vector(b + "self_attn.k_norm.weight"), n, _qkvCols, _qCols, _kvHeads, HeadDim, RmsEps);
             }
-            _u.RopeTables(_qkv.View, _cos.View, _sin.View, SeqLen, _qkvCols, 0, _qHeads, HeadDim);
-            _u.RopeTables(_qkv.View, _cos.View, _sin.View, SeqLen, _qkvCols, _qCols, _kvHeads, HeadDim);
-            _u.StoreKv(_qkv.View, _kc.View, _vc.View, 0, SeqLen, _qCols, _kvCols);
-            _f.PaddedCausalGqa(_qkv.View, _kc.View, _vc.View, _scores.View, _attn.View, SeqLen, real, _qHeads, HeadDim, rep);
+            _u.RopeTables(_qkv.View, _cos.View, _sin.View, n, _qkvCols, 0, _qHeads, HeadDim);
+            _u.RopeTables(_qkv.View, _cos.View, _sin.View, n, _qkvCols, _qCols, _kvHeads, HeadDim);
+            _u.StoreKv(_qkv.View, _kc.View, _vc.View, 0, n, _qCols, _kvCols);
+            _f.PaddedCausalGqa(_qkv.View, _kc.View, _vc.View, _scores.View, _attn.View, n, real, _qHeads, HeadDim, rep);
             Lin(_attn.View, b + "self_attn.o_proj.weight", null, _proj.View, _qCols, H);
-            _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, SeqLen * H, H);
-            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "post_attention_layernorm.weight"), SeqLen, H, RmsEps);
+            _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, n * H, H);
+            _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "post_attention_layernorm.weight"), n, H, RmsEps);
             if (_fusedGateUp) Lin(_hn.View, b + "mlp.gate_up_proj.weight", null, _gateUp.View, H, 2 * _inter);
             else
             {
                 LinearInto(_hn.View, b + "mlp.gate_proj", _gateUp.View, H, _inter, 2 * _inter, 0);
                 LinearInto(_hn.View, b + "mlp.up_proj", _gateUp.View, H, _inter, 2 * _inter, _inter);
             }
-            _u.Swiglu(_gateUp.View, _act.View, SeqLen, _inter);
+            _u.Swiglu(_gateUp.View, _act.View, n, _inter);
             Lin(_act.View, b + "mlp.down_proj.weight", null, _proj.View, _inter, H);
-            _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, SeqLen * H, H);
-            Probe?.Invoke($"layer{l + 1}", _h.View, SeqLen, H);
+            _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, n * H, H);
+            Probe?.Invoke($"layer{l + 1}", _h.View, n, H);
             if (tap < _taps.Length && l + 1 == _taps[tap])
             {
                 var src = _h.View;
-                if (_finalNorm && tap == _taps.Length - 1) { _u.RmsNorm(_h.View, _hn.View, _w.Vector("norm.weight"), SeqLen, H, RmsEps); src = _hn.View; }
-                _f.CopyCols(src, _out.View, SeqLen, H, H, Width, tap * H);
+                if (_finalNorm && tap == _taps.Length - 1) { _u.RmsNorm(_h.View, _hn.View, _w.Vector("norm.weight"), n, H, RmsEps); src = _hn.View; }
+                _f.CopyCols(src, _out.View, n, H, H, Width, tap * H);
                 tap++;
             }
         }
