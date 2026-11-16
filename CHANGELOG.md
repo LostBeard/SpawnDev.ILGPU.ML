@@ -2,7 +2,9 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased (master)
+## 5.8.18 - 2026-11-16 (nuget.org) - Qwen-Image Edit 2509, Qwen-Image and FLUX.1 Krea match ComfyUI; CLIP vision ViT-H; SpawnDev.ILGPU 5.4.34
+
+SpawnDev.Phonemizer 1.1.2 alongside (LICENSE only).
 
 - **SpawnDev.ILGPU 5.4.34.** WebGPU / WebGL MathF.Sin / Cos / Tan are now accurate at large arguments (Cody-Waite reduction; 5.4.33's D3D native functions were 2.7e-4 off at
   |x| = 2000), a double narrowed to Half / bf16 / FP8 rounds once, and the CPU accelerator launches faster. Gate `QwenEdit_InKernelRope_MatchesHostTables` (light, every lane):
