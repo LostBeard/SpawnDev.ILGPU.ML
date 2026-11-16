@@ -79,3 +79,12 @@ F:/spawndev-wan14b/comfyui-dumps.
 - **Transformer input** (SpawnGen's img_in / pe_embedder taps, _DevComms 2026-11-15-1730): the reference latent as the call carries it (not normalised again), odd
   sides wrapped (circular) to even, packed after the noise latent; rotary: noise latent frame 0, reference k frame k, both centred; TEXT STARTS AFTER THE NOISE
   LATENT's max(rows/2, cols/2) (diffusers: after the largest picture). SpawnGen's 2509 encode side on ML local.7, RX 590: conditioning 4.4e-5 / 4.5e-5 / 7.3e-5.
+
+## SpawnGen on local.8 (Lore, 11-15 evening)
+
+- RX 590 vs ComfyUI: 1 reference 2.5e-4 / 1.7e-4 (sigma 1), 3.9e-4 / 7.9e-4 (sigma 0.75); 2 references 1.9e-4 / 3.2e-4; whole 2509 graph 48.8 dB, final latent 9.1e-3.
+- **The reference latents reach the model NORMALISED like the noise: (raw - mean) / std** of the VAE's latent statistics (3e-7 against the conditioning's raw latents). "As the
+  call carries them" = these normalised values. The pipeline must normalise the VAE encode before `Flux1Kernels.PatchifyWrap` (TODO: say so in PatchifyWrap's / OpenAsync's docs).
+- The final latent's 9e-3 is input sensitivity, not a part: the negative-with-picture call at sigma 0.75 amplifies its input ~140x (our step-1 x2 is 3.3e-5 from ComfyUI's;
+  ComfyUI's x2 in gives 7.9e-4, ours 4.7e-3). Sigma-0.75 fixtures for all four graph1 calls: SpawnGen Fixtures/qwenedit (a possible extra gate).
+

@@ -58,8 +58,9 @@ public sealed class Flux1Kernels
     }
     /// <summary>
     /// A latent [16, h, w] of any size to transformer tokens [ceil(h/2) * ceil(w/2), 64], an odd side padded by wrapping around: ComfyUI's packing of Qwen-Image Edit's reference
-    /// latents (111 x 148 -> 56 x 74 tokens; measured on SpawnGen's img_in tap, exact). <paramref name="tokens"/> may be a sub-view of the call's whole token buffer (the noise
-    /// latent first, then each reference). Returns the token grid.
+    /// latents (111 x 148 -> 56 x 74 tokens; measured on SpawnGen's img_in tap, exact). The reference must already be in the MODEL's latent space, normalised like the noise:
+    /// (VAE encode - mean) / std per channel (ComfyUI normalises its conditioning's raw reference latents before the model; SpawnGen measured 3e-7). <paramref name="tokens"/> may be
+    /// a sub-view of the call's whole token buffer (the noise latent first, then each reference). Returns the token grid.
     /// </summary>
     public (int Rows, int Cols) PatchifyWrap(FV latent, FV tokens, int h, int w)
     {

@@ -85,7 +85,8 @@ public sealed class QwenImageTransformer : IDisposable
 
     /// <summary>
     /// The same with reference pictures (Qwen-Image Edit: ComfyUI's <c>reference_latents</c>, diffusers' <c>image_latents</c>): <paramref name="references"/> are their token grids
-    /// (latent / 2). Each call then takes the noise latent's tokens followed by every reference's tokens, and the velocity is the noise latent's rows only.
+    /// (ceil(latent / 2): odd sides are wrapped by <see cref="Flux1Kernels.PatchifyWrap"/>). Each call then takes the noise latent's tokens followed by every reference's tokens,
+    /// each reference NORMALISED like the noise ((VAE encode - mean) / std), and the velocity is the noise latent's rows only.
     /// </summary>
     public static async Task<QwenImageTransformer> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, int maxTextTokens, int rows, int cols,
         IReadOnlyList<(int Rows, int Cols)> references, long residentBytes, CancellationToken ct = default)
