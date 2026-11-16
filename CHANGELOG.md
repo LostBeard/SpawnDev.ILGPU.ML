@@ -15,7 +15,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   q | k | v only when the parts share one scale (2511's do not: they run as three GEMMs). Gate `StreamedWeights_Fp8Mixed_ScalesBlobsAndMarker` (light, every lane, in memory).
 - **Fix: 8-bit streamed weights on WebGPU / WebGL / Wasm.** `StreamedModelWeights.Matrix` / `MatrixExact` called the synchronous `Synchronize()` before the first decode
   scratch allocation, which browser backends refuse; a scratch too small is now retired and freed at the next async drain (`BlockAsync`) or `Dispose`.
-- `QwenImageTransformer.Probe` also reports each block's text stream, block attention outputs, norm_out and proj_out.
+- `QwenImageTransformer.Probe` also reports each block's text stream, block attention outputs, norm_out and proj_out. Gate `QwenEdit2511_Stages_MatchComfyUiTaps`
+  (SpawnGen's stage taps of one call): block 0 attention img 1.8e-3 / txt 1.5e-5, blocks 0 / 29 / 59 at 1.6e-4 - 6.9e-4, proj_out 4.2e-4. The 2511 calls' remaining ~1e-3 is
+  float32 conditioning of block 0's image attention, not a difference in the math: a float64 rebuild from the file's weights gives ComfyUI's text output to 7.7e-7, and the
+  same rebuild in float32 moves the image rows by 9.9e-4 (the image queries' softmax is that sharp).
 
 ## 5.8.18 - 2026-11-16 (nuget.org) - Qwen-Image Edit 2509, Qwen-Image and FLUX.1 Krea match ComfyUI; CLIP vision ViT-H; SpawnDev.ILGPU 5.4.34
 
