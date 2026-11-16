@@ -21,7 +21,7 @@ public sealed class StreamedModelWeights : IDisposable
     private readonly IModelSource _source;
     private readonly string _repo, _file, _prefix;
     private readonly Func<string, int> _blockOf;
-    private readonly Func<GpuWeights, Task>? _adapt;
+    private readonly Func<GpuWeights, IDictionary<string, float>, Task>? _adapt;                 // the model's per-load adapter, given the 8-bit scales by name (it may fuse parts that share one)
     private readonly GpuWeights _base;
     private readonly GpuWeights?[] _resident;
     private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _scratch;
@@ -37,8 +37,36 @@ public sealed class StreamedModelWeights : IDisposable
     public long StreamedBytesPerForward { get; private set; }
     /// <summary>The non-block tensors.</summary>
     public GpuWeights Base => _base;
+    /// <summary>
+    /// Every tensor name the file's header declares (prefix-free), including ones never loaded: ComfyUI's empty marker tensors (<c>__index_timestep_zero__</c> in Qwen-Image
+    /// Edit 2511 files) tell the model how to run.
+    /// </summary>
+    public IReadOnlySet<string> HeaderNames { get; private set; } = new HashSet<string>();
 
-    private StreamedModelWeights(Accelerator acc, IModelSource source, string repo, string file, string prefix, Func<string, int> blockOf, int blockCount, Func<GpuWeights, Task>? adapt, GpuWeights baseWeights,
+    // not weights: ComfyUI's empty markers (scaled_fp8, __index_timestep_zero__ ...) and the per-layer quantization json blobs (U8 "comfy_quant") of "fp8mixed" files
+    private static bool IsNotAWeight(string prefixFreeName)
+        => prefixFreeName == "scaled_fp8" || prefixFreeName.StartsWith("__", StringComparison.Ordinal) || prefixFreeName.EndsWith(".comfy_quant", StringComparison.Ordinal);
+
+    /// <summary>
+    /// ComfyUI's mixed-precision files carry <c>_quantization_metadata</c> ({"layers": {name: {"format", "full_precision_matrix_mult"}}}). This loader runs every 8-bit matrix as
+    /// value * weight_scale with full-precision activations, which is exactly "float8_e4m3fn" with full_precision_matrix_mult true; any other layer format is refused rather
+    /// than run differently from the reference.
+    /// </summary>
+    private static void CheckQuantization(string file, IReadOnlyDictionary<string, string> metadata)
+    {
+        if (!metadata.TryGetValue("_quantization_metadata", out var json)) return;
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("layers", out var layers)) return;
+        foreach (var layer in layers.EnumerateObject())
+        {
+            string format = layer.Value.TryGetProperty("format", out var f) ? f.GetString() ?? "" : "";
+            bool full = layer.Value.TryGetProperty("full_precision_matrix_mult", out var fp) && fp.ValueKind == JsonValueKind.True;
+            if (format != "float8_e4m3fn" || !full)
+                throw new NotSupportedException($"'{file}': layer {layer.Name} is quantized as '{format}' (full precision matmul: {full}); only float8_e4m3fn weights with full-precision activations are supported");
+        }
+    }
+
+    private StreamedModelWeights(Accelerator acc, IModelSource source, string repo, string file, string prefix, Func<string, int> blockOf, int blockCount, Func<GpuWeights, IDictionary<string, float>, Task>? adapt, GpuWeights baseWeights,
         System.Collections.Concurrent.ConcurrentDictionary<string, float> scales)
     {
         _acc = acc; _source = source; _repo = repo; _file = file; _prefix = prefix; _blockOf = blockOf; BlockCount = blockCount; _adapt = adapt; _base = baseWeights; _scales = scales;
@@ -49,10 +77,18 @@ public sealed class StreamedModelWeights : IDisposable
     /// Open <paramref name="file"/>: <paramref name="anchor"/> (a tensor name the model always has) finds the prefix; <paramref name="blockOf"/> maps a prefix-free name to its block
     /// (0 .. <paramref name="blockCount"/> - 1) or -1; blocks are kept in order while they fit in <paramref name="residentBytes"/> (as stored), the rest streamed.
     /// </summary>
-    public static async Task<StreamedModelWeights> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, string anchor, Func<string, int> blockOf, int blockCount,
+    public static Task<StreamedModelWeights> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string file, string anchor, Func<string, int> blockOf, int blockCount,
         long residentBytes, Func<GpuWeights, Task>? adapt = null, CancellationToken ct = default)
+        => OpenWithScalesAsync(accelerator, source, repo, file, anchor, blockOf, blockCount, residentBytes, adapt == null ? null : (w, _) => adapt(w), ct);
+
+    /// <summary>
+    /// The same with an adapter that also sees the 8-bit matrices' scales by name (filled before it runs) and may change them: a model fusing parts (q | k | v) may only fuse
+    /// 8-bit parts that share one scale, and then gives the fused matrix that scale.
+    /// </summary>
+    public static async Task<StreamedModelWeights> OpenWithScalesAsync(Accelerator accelerator, IModelSource source, string repo, string file, string anchor, Func<string, int> blockOf, int blockCount,
+        long residentBytes, Func<GpuWeights, IDictionary<string, float>, Task>? adapt, CancellationToken ct = default)
     {
-        string prefix; var blockBytes = new long[blockCount];
+        string prefix; var blockBytes = new long[blockCount]; var headerNames = new HashSet<string>();
         await using (var s = await source.OpenAsync(repo, file, ct))
         {
             if (!s.CanSeek) throw new NotSupportedException($"'{file}': the blocks are read by offset; the model source must give a seekable stream");
@@ -67,13 +103,15 @@ public sealed class StreamedModelWeights : IDisposable
             foreach (var t in tensors)
             {
                 if (!t.Name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                headerNames.Add(t.Name[prefix.Length..]);
+                if (IsNotAWeight(t.Name[prefix.Length..])) continue;
                 int k = blockOf(t.Name[prefix.Length..]);
                 if (k >= 0) blockBytes[k] += t.DataLength;
             }
         }
         var scales = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
         var baseW = await LoadAsync(accelerator, source, repo, file, prefix, n => blockOf(n) < 0, adapt, scales, ct);
-        var w = new StreamedModelWeights(accelerator, source, repo, file, prefix, blockOf, blockCount, adapt, baseW, scales);
+        var w = new StreamedModelWeights(accelerator, source, repo, file, prefix, blockOf, blockCount, adapt, baseW, scales) { HeaderNames = headerNames };
         try
         {
             long budget = residentBytes, streamed = 0;
@@ -88,26 +126,29 @@ public sealed class StreamedModelWeights : IDisposable
         catch { w.Dispose(); throw; }
     }
 
-    private static async Task<GpuWeights> LoadAsync(Accelerator acc, IModelSource source, string repo, string file, string prefix, Func<string, bool> keep, Func<GpuWeights, Task>? adapt,
+    private static async Task<GpuWeights> LoadAsync(Accelerator acc, IModelSource source, string repo, string file, string prefix, Func<string, bool> keep, Func<GpuWeights, IDictionary<string, float>, Task>? adapt,
         System.Collections.Concurrent.ConcurrentDictionary<string, float> scales, CancellationToken ct)
     {
         await using var stream = await source.OpenAsync(repo, file, ct);
         using var empty = JsonDocument.Parse("{}");
-        var w = await GpuWeights.LoadAsync(acc, stream, empty.RootElement, file, n => n.StartsWith(prefix, StringComparison.Ordinal) && n != prefix + "scaled_fp8" && keep(n[prefix.Length..]), ct);   // scaled_fp8: ComfyUI's empty marker
+        var w = await GpuWeights.LoadAsync(acc, stream, empty.RootElement, file, n => n.StartsWith(prefix, StringComparison.Ordinal) && !IsNotAWeight(n[prefix.Length..]) && keep(n[prefix.Length..]), ct);
         try
         {
+            CheckQuantization(file, w.Metadata);
             foreach (var n in w.Names.ToList())
             {
                 string to = n[prefix.Length..];
                 if (to != n) w.Rename(n, to);
             }
-            // fp8_scaled: scale_weight (fp32 scalar) becomes the matrix's decode scale; scale_input (an activation scale for fp8 matmuls) is not used, the activations stay fp32
+            // fp8_scaled: scale_weight (fp32 scalar) becomes the matrix's decode scale; scale_input (an activation scale for fp8 matmuls) is not used, the activations stay fp32.
+            // ComfyUI's mixed-precision ("fp8mixed") files name them weight_scale / input_scale (full-precision matmul, checked by CheckQuantization): the same meaning.
             foreach (var n in w.Names.ToList())
             {
-                if (n.EndsWith(".scale_input", StringComparison.Ordinal)) { await acc.SynchronizeAsync(); w.Remove(n)?.Dispose(); continue; }
-                if (!n.EndsWith(".scale_weight", StringComparison.Ordinal)) continue;
+                if (n.EndsWith(".scale_input", StringComparison.Ordinal) || n.EndsWith(".input_scale", StringComparison.Ordinal)) { await acc.SynchronizeAsync(); w.Remove(n)?.Dispose(); continue; }
+                string? suffix = n.EndsWith(".scale_weight", StringComparison.Ordinal) ? ".scale_weight" : n.EndsWith(".weight_scale", StringComparison.Ordinal) ? ".weight_scale" : null;
+                if (suffix == null) continue;
                 if (!w.IsF32(n)) throw new InvalidDataException($"'{file}': {n} is not an fp32 scale");
-                scales[n[..^".scale_weight".Length] + ".weight"] = (await w.F32(n).CopyToHostAsync())[0];
+                scales[n[..^suffix.Length] + ".weight"] = (await w.F32(n).CopyToHostAsync())[0];
                 await acc.SynchronizeAsync(); w.Remove(n)?.Dispose();
             }
             foreach (var to in w.Names.ToList())
@@ -131,7 +172,7 @@ public sealed class StreamedModelWeights : IDisposable
                     await acc.SynchronizeAsync(); old?.Dispose();
                 }
             }
-            if (adapt != null) await adapt(w);
+            if (adapt != null) await adapt(w, scales);
             // an 8-bit matrix without its scale in a file that has scales would decode silently wrong (an adapter that fused scaled parts, say)
             if (!scales.IsEmpty)
                 foreach (var m in w.Names.Where(w.IsF8))
@@ -144,6 +185,7 @@ public sealed class StreamedModelWeights : IDisposable
     /// <summary>Block <paramref name="k"/>'s tensors: the resident set, or a fresh load from the file that the caller disposes after the device has run it (<paramref name="streamed"/> true).</summary>
     public async Task<(GpuWeights Weights, bool Streamed)> BlockAsync(int k, CancellationToken ct = default)
     {
+        if (_retired.Count > 0) { await _acc.SynchronizeAsync(); foreach (var old in _retired) old.Dispose(); _retired.Clear(); }
         if (_resident[k] is { } r) return (r, false);
         return (await LoadAsync(_acc, _source, _repo, _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct), true);
     }
@@ -153,11 +195,23 @@ public sealed class StreamedModelWeights : IDisposable
     {
         if (!w.IsF8(name)) return w.BF16(name);
         long count = 1; foreach (int d in w.Shape(name)) count *= d;
-        if (_scratch == null || _scratch.Length < count) { _acc.Synchronize(); _scratch?.Dispose(); _scratch = _acc.Allocate1D<BFloat16>(count); }
-        var dst = _scratch.View.SubView(0, count);
+        var dst = Scratch(count);
         WanComfyFormat.DecodeF8E4M3(_acc, w.F8Words(name), dst, _scales.TryGetValue(name, out var sc) ? sc : 1f);      // unscaled 8-bit files (ComfyUI's e4m3fn checkpoints): 1
         return dst;
     }
+
+    // the shared bf16 decode scratch, at least count long. Matrix / MatrixExact are synchronous and their callers queue GEMMs on the scratch, so a scratch that is too small is
+    // retired, not disposed (work queued on it may still be pending: browser backends cannot drain synchronously), and freed at the next async drain (BlockAsync) or Dispose
+    private ArrayView1D<BFloat16, Stride1D.Dense> Scratch(long count)
+    {
+        if (_scratch == null || _scratch.Length < count)
+        {
+            if (_scratch != null) _retired.Add(_scratch);
+            _scratch = _acc.Allocate1D<BFloat16>(count);
+        }
+        return _scratch.View.SubView(0, count);
+    }
+    private readonly List<MemoryBuffer1D<BFloat16, Stride1D.Dense>> _retired = new();
 
     /// <summary>True when the file is fp8_scaled (its 8-bit matrices carry scales): <see cref="MatrixExact"/> + <see cref="ActivationScale"/> then matter.</summary>
     public bool HasScales => !_scales.IsEmpty;
@@ -172,8 +226,7 @@ public sealed class StreamedModelWeights : IDisposable
         if (FoldScales) return Matrix(w, name);
         if (!w.IsF8(name)) return w.BF16(name);
         long count = 1; foreach (int d in w.Shape(name)) count *= d;
-        if (_scratch == null || _scratch.Length < count) { _acc.Synchronize(); _scratch?.Dispose(); _scratch = _acc.Allocate1D<BFloat16>(count); }
-        var dst = _scratch.View.SubView(0, count);
+        var dst = Scratch(count);
         WanComfyFormat.DecodeF8E4M3(_acc, w.F8Words(name), dst, 1f);
         return dst;
     }
@@ -187,6 +240,7 @@ public sealed class StreamedModelWeights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
+        foreach (var r in _retired) r.Dispose(); _retired.Clear();
         foreach (var r in _resident) r?.Dispose();
         Array.Clear(_resident);
         _base.Dispose();

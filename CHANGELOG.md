@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased - Qwen-Image Edit 2511 matches ComfyUI; ComfyUI's fp8mixed files; fp8 streamed weights in the browser
+
+- **Qwen-Image Edit 2511** (ComfyUI's `qwen_image_edit_2511_fp8mixed`): `QwenImageTransformer.ReferencesAtTimestepZero` modulates the reference pictures' tokens with the
+  time embedding at t = 0 (noise tokens, text and norm_out keep the call's t: ComfyUI's "index_timestep_zero", diffusers' zero_cond_t). `OpenAsync` turns it on when the file
+  carries ComfyUI's `__index_timestep_zero__` marker. Against ComfyUI's calls (SpawnGen's dumps, float32 CPU): 1 picture at sigma 1 and 0.756, 2 pictures at sigma 1, worst
+  CUDA 1.01e-3 / OpenCL 9.8e-4; the references at the call's t (2509's way) miss at 0.61 (`QwenEdit2511_Transformer_MatchesComfyUiCalls`).
+- **ComfyUI's mixed-precision ("fp8mixed") safetensors** in `StreamedModelWeights`: per-layer `weight_scale` / `input_scale` (the same meaning as fp8_scaled's scale_weight /
+  scale_input), the U8 `comfy_quant` blobs and empty `__...__` markers are not loaded as weights, `HeaderNames` lists every header name, and `_quantization_metadata` is
+  checked: a layer other than float8_e4m3fn with full-precision matmul is refused, never run differently. ComfyUI's fp8mixed linear is exact f8 x scale in fp32 (its tap: 3e-7
+  vs exact, 1.2e-3 vs bf16-rounded weights), which `MatrixExact` + `ActivationScale` compute. `OpenWithScalesAsync` hands the per-load adapter the scales: Qwen-Image fuses
+  q | k | v only when the parts share one scale (2511's do not: they run as three GEMMs). Gate `StreamedWeights_Fp8Mixed_ScalesBlobsAndMarker` (light, every lane, in memory).
+- **Fix: 8-bit streamed weights on WebGPU / WebGL / Wasm.** `StreamedModelWeights.Matrix` / `MatrixExact` called the synchronous `Synchronize()` before the first decode
+  scratch allocation, which browser backends refuse; a scratch too small is now retired and freed at the next async drain (`BlockAsync`) or `Dispose`.
+- `QwenImageTransformer.Probe` also reports each block's text stream, block attention outputs, norm_out and proj_out.
+
 ## 5.8.18 - 2026-11-16 (nuget.org) - Qwen-Image Edit 2509, Qwen-Image and FLUX.1 Krea match ComfyUI; CLIP vision ViT-H; SpawnDev.ILGPU 5.4.34
 
 SpawnDev.Phonemizer 1.1.2 alongside (LICENSE only).

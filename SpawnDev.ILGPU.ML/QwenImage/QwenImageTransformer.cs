@@ -41,6 +41,15 @@ public sealed class QwenImageTransformer : IDisposable
     private readonly List<IDisposable> _owned = new();
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _img, _txt, _normI, _normT, _txtIn, _qkv, _attn, _attnImg, _attnTxt, _mlp, _scores;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _temb, _tembAct, _tproj, _hid, _modImg, _modTxt, _modOut, _cosT, _sinT, _out, _xs;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _temb0, _tembAct0, _modImg0;      // the timestep-zero modulation of the reference tokens (ReferencesAtTimestepZero)
+
+    /// <summary>
+    /// Qwen-Image Edit 2511 (ComfyUI's FluxKontextMultiReferenceLatentMethod "index_timestep_zero", diffusers' <c>zero_cond_t</c>): the reference tokens are modulated with the
+    /// time embedding of t = 0 while the noise latent's tokens and the text use the call's t (measured on SpawnGen's 2511 taps: img_mod [2, 3072] -> [2, 18432], txt_mod [1, ..]).
+    /// Off for 2509; <see cref="OpenAsync(Accelerator, IModelSource, string, string, int, int, int, IReadOnlyList{ValueTuple{int, int}}, long, CancellationToken)"/> turns it on when
+    /// the file carries ComfyUI's <c>__index_timestep_zero__</c> marker (its 2511 files do). No effect without reference pictures.
+    /// </summary>
+    public bool ReferencesAtTimestepZero { get; set; }
 
     public long ResidentBytes => _w.ResidentBytes;
     public int ResidentBlocks => _w.ResidentBlocks;
@@ -63,6 +72,7 @@ public sealed class QwenImageTransformer : IDisposable
         _scores = Alloc(_k.UsesFlashAttention(HeadDim) ? 1 : (long)Heads * N * N);
         _temb = Alloc(Dim); _tembAct = Alloc(Dim); _tproj = Alloc(TimeChannels); _hid = Alloc(Dim);
         _modImg = Alloc(6 * Dim); _modTxt = Alloc(6 * Dim); _modOut = Alloc(2 * Dim);
+        _temb0 = Alloc(Dim); _tembAct0 = Alloc(Dim); _modImg0 = Alloc(6 * Dim);
         _cosT = Alloc(N * HeadDim); _sinT = Alloc(N * HeadDim); _out = Alloc((long)_nOut * InChannels);
         _xs = Alloc(w.HasScales ? Math.Max(I, T) * MlpHidden : 1);                             // the widest scaled input: an MLP's second matrix [rows, 12288]
     }
@@ -92,29 +102,42 @@ public sealed class QwenImageTransformer : IDisposable
         IReadOnlyList<(int Rows, int Cols)> references, long residentBytes, CancellationToken ct = default)
     {
         if (rows <= 0 || cols <= 0 || references.Any(r => r.Rows <= 0 || r.Cols <= 0)) throw new ArgumentException("token grids must be positive");
-        var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, file, "transformer_blocks.0.attn.to_q.weight", BlockOf, Layers, residentBytes, w2 => FuseQkvAsync(accelerator, w2), ct);
-        try { var t = new QwenImageTransformer(accelerator, w, maxTextTokens, new[] { (rows, cols) }.Concat(references).ToArray()); t.SetPositions(); return t; }
+        var w = await StreamedModelWeights.OpenWithScalesAsync(accelerator, source, repo, file, "transformer_blocks.0.attn.to_q.weight", BlockOf, Layers, residentBytes,
+            (w2, scales) => FuseQkvAsync(accelerator, w2, scales), ct);
+        try
+        {
+            var t = new QwenImageTransformer(accelerator, w, maxTextTokens, new[] { (rows, cols) }.Concat(references).ToArray());
+            t.ReferencesAtTimestepZero = w.HeaderNames.Contains("__index_timestep_zero__");   // ComfyUI's marker in Qwen-Image Edit 2511 files
+            t.SetPositions(); return t;
+        }
         catch { w.Dispose(); throw; }
     }
 
-    /// <summary>to_q | to_k | to_v into attn.qkv and add_q_proj | add_k_proj | add_v_proj into attn.add_qkv (rows stacked; 8-bit matrices stay 8-bit, the bias vectors are bf16 by now).</summary>
-    private static async Task FuseQkvAsync(Accelerator acc, GpuWeights w)
+    /// <summary>
+    /// to_q | to_k | to_v into attn.qkv and add_q_proj | add_k_proj | add_v_proj into attn.add_qkv (rows stacked; 8-bit matrices stay 8-bit, the bias vectors are bf16 by now).
+    /// 8-bit parts fuse only when they share one decode scale (unscaled files, or equal scales), which the fused matrix then takes; parts with their own scales (ComfyUI's
+    /// fp8mixed 2511 file) stay separate and run as three GEMMs (<see cref="Qkv"/>): one matrix cannot carry three scales exactly.
+    /// </summary>
+    private static async Task FuseQkvAsync(Accelerator acc, GpuWeights w, IDictionary<string, float> scales)
     {
         foreach (var q in w.Names.Where(n => n.EndsWith(".attn.to_q.weight", StringComparison.Ordinal)).ToList())
         {
             string b = q[..^"to_q.weight".Length];
-            await FuseAsync(acc, w, b + "qkv", b + "to_q", b + "to_k", b + "to_v");
-            await FuseAsync(acc, w, b + "add_qkv", b + "add_q_proj", b + "add_k_proj", b + "add_v_proj");
+            await FuseAsync(acc, w, scales, b + "qkv", b + "to_q", b + "to_k", b + "to_v");
+            await FuseAsync(acc, w, scales, b + "add_qkv", b + "add_q_proj", b + "add_k_proj", b + "add_v_proj");
         }
     }
 
-    private static async Task FuseAsync(Accelerator acc, GpuWeights w, string to, params string[] parts)
+    private static async Task FuseAsync(Accelerator acc, GpuWeights w, IDictionary<string, float> scales, string to, params string[] parts)
     {
         var shapes = parts.Select(p => w.Shape(p + ".weight")).ToArray();
         int rowsOut = shapes.Sum(s => s[0]), cols = shapes[0][1];
         var retire = new List<IDisposable?>();
         if (parts.All(p => w.IsF8(p + ".weight")))
         {
+            var partScales = parts.Select(p => scales.TryGetValue(p + ".weight", out var s) ? s : (float?)null).ToArray();
+            if (partScales.Distinct().Count() > 1) return;                                  // different scales: leave the parts (Qkv runs them one by one)
+            if (partScales[0] is float shared) { foreach (var p in parts) scales.Remove(p + ".weight"); scales[to + ".weight"] = shared; }
             var words = acc.Allocate1D<uint>(parts.Sum(p => w.F8Words(p + ".weight").Length));
             long off = 0;
             foreach (var p in parts) { var src = w.F8Words(p + ".weight"); words.View.SubView(off, src.Length).CopyFrom(src); off += src.Length; }
@@ -246,6 +269,15 @@ public sealed class QwenImageTransformer : IDisposable
         Gemv(b0, _tproj.View, "time_text_embed.timestep_embedder.linear_1", _hid.View, TimeChannels, Dim); _k.Silu(_hid.View, _tembAct.View, Dim);
         Gemv(b0, _tembAct.View, "time_text_embed.timestep_embedder.linear_2", _temb.View, Dim, Dim);
         _k.Silu(_temb.View, _tembAct.View, Dim);                                     // every modulation reads silu(temb)
+        _zero = ReferencesAtTimestepZero && _nImg > _nOut;
+        if (_zero)
+        {
+            // the same time MLP at t = 0 (diffusers: timestep concatenated with timestep * 0)
+            _tproj.View.CopyFromCPU(Sinusoid(0f));
+            Gemv(b0, _tproj.View, "time_text_embed.timestep_embedder.linear_1", _hid.View, TimeChannels, Dim); _k.Silu(_hid.View, _tembAct0.View, Dim);
+            Gemv(b0, _tembAct0.View, "time_text_embed.timestep_embedder.linear_2", _temb0.View, Dim, Dim);
+            _k.Silu(_temb0.View, _tembAct0.View, Dim);
+        }
         Lin(b0, imageTokens, "img_in", _img.View, _nImg, InChannels, Dim);
         _u.RmsNorm(cond, _txtIn.View, b0.BF16("txt_norm.weight"), _nTxt, TxtDim, Eps);
         Lin(b0, _txtIn.View, "txt_in", _txt.View, _nTxt, TxtDim, Dim);
@@ -255,21 +287,55 @@ public sealed class QwenImageTransformer : IDisposable
             try { Block(w, $"transformer_blocks.{k}."); }
             finally { if (streamed) { await _acc.SynchronizeAsync(); w.Dispose(); } }
             Probe?.Invoke($"block{k}_img", _img.View, _nImg, Dim);
+            Probe?.Invoke($"block{k}_txt", _txt.View, _nTxt, Dim);
         }
-        Gemv(b0, _tembAct.View, "norm_out.linear", _modOut.View, Dim, 2 * Dim);       // (scale, shift)
+        Gemv(b0, _tembAct.View, "norm_out.linear", _modOut.View, Dim, 2 * Dim);       // (scale, shift): the call's t only, also in 2511 (ComfyUI's norm_out gets one [1, 3072] row)
         _k.LayerNormModulate(_img.View, _normI.View, _modOut.View, Dim, 0, _nOut, Dim, Eps);   // the head runs per token: only the noise latent's rows are the prediction
+        Probe?.Invoke("norm_out", _normI.View, _nOut, Dim);
         Lin(b0, _normI.View, "proj_out", _out.View, _nOut, Dim, InChannels);
+        Probe?.Invoke("proj_out", _out.View, _nOut, InChannels);
+    }
+
+    private bool _zero;                                                              // this call modulates the reference tokens at t = 0
+
+    // q | k | v into dst [rows, 3 Dim]: one GEMM when the load fused them (FuseQkvAsync), else each part's own GEMM (its own 8-bit scale) through tmp [rows, Dim], copied into its
+    // column range. tmp is the attention output buffer of the stream, free until the attention runs.
+    private void Qkv(GpuWeights w, FV x, string fused, string[] parts, FV dst, FV tmp, int rows)
+    {
+        if (w.Has(fused + ".weight")) { Lin(w, x, fused, dst, rows, Dim, 3 * Dim); return; }
+        for (int p = 0; p < 3; p++)
+        {
+            Lin(w, x, parts[p], tmp, rows, Dim, Dim);
+            _f.CopyCols(tmp, dst, rows, Dim, Dim, 3 * Dim, p * Dim);
+        }
+    }
+
+    // the image stream's modulate / gate: one modulation for every image token, or (ReferencesAtTimestepZero) the noise latent's rows with t and the reference rows with 0
+    private void ImgModulate(int shiftOff, int scaleOff)
+    {
+        if (!_zero) { _k.LayerNormModulate(_img.View, _normI.View, _modImg.View, shiftOff, scaleOff, _nImg, Dim, Eps); return; }
+        long split = (long)_nOut * Dim, rest = (long)(_nImg - _nOut) * Dim;
+        _k.LayerNormModulate(_img.View.SubView(0, split), _normI.View.SubView(0, split), _modImg.View, shiftOff, scaleOff, _nOut, Dim, Eps);
+        _k.LayerNormModulate(_img.View.SubView(split, rest), _normI.View.SubView(split, rest), _modImg0.View, shiftOff, scaleOff, _nImg - _nOut, Dim, Eps);
+    }
+    private void ImgGate(int gateOff)
+    {
+        if (!_zero) { _k.GateResidual(_img.View, _attnImg.View, _modImg.View, gateOff, _nImg * Dim, Dim); return; }
+        long split = (long)_nOut * Dim, rest = (long)(_nImg - _nOut) * Dim;
+        _k.GateResidual(_img.View.SubView(0, split), _attnImg.View.SubView(0, split), _modImg.View, gateOff, _nOut * Dim, Dim);
+        _k.GateResidual(_img.View.SubView(split, rest), _attnImg.View.SubView(split, rest), _modImg0.View, gateOff, (_nImg - _nOut) * Dim, Dim);
     }
 
     private void Block(GpuWeights w, string b)
     {
         Gemv(w, _tembAct.View, b + "img_mod.1", _modImg.View, Dim, 6 * Dim);           // (shift, scale, gate) for attention, then for the MLP
+        if (_zero) Gemv(w, _tembAct0.View, b + "img_mod.1", _modImg0.View, Dim, 6 * Dim);
         Gemv(w, _tembAct.View, b + "txt_mod.1", _modTxt.View, Dim, 6 * Dim);
-        _k.LayerNormModulate(_img.View, _normI.View, _modImg.View, 0, Dim, _nImg, Dim, Eps);
+        ImgModulate(0, Dim);
         _k.LayerNormModulate(_txt.View, _normT.View, _modTxt.View, 0, Dim, _nTxt, Dim, Eps);
         var qkvT = _qkv.View.SubView(0, (long)_nTxt * 3 * Dim); var qkvI = _qkv.View.SubView((long)_nTxt * 3 * Dim, (long)_nImg * 3 * Dim);
-        Lin(w, _normT.View, b + "attn.add_qkv", qkvT, _nTxt, Dim, 3 * Dim);
-        Lin(w, _normI.View, b + "attn.qkv", qkvI, _nImg, Dim, 3 * Dim);
+        Qkv(w, _normT.View, b + "attn.add_qkv", new[] { b + "attn.add_q_proj", b + "attn.add_k_proj", b + "attn.add_v_proj" }, qkvT, _attnTxt.View, _nTxt);
+        Qkv(w, _normI.View, b + "attn.qkv", new[] { b + "attn.to_q", b + "attn.to_k", b + "attn.to_v" }, qkvI, _attnImg.View, _nImg);
         _u.RmsNormHeads(qkvT, w.BF16(b + "attn.norm_added_q.weight"), _nTxt, 3 * Dim, 0, Heads, HeadDim, Eps);
         _u.RmsNormHeads(qkvT, w.BF16(b + "attn.norm_added_k.weight"), _nTxt, 3 * Dim, Dim, Heads, HeadDim, Eps);
         _u.RmsNormHeads(qkvI, w.BF16(b + "attn.norm_q.weight"), _nImg, 3 * Dim, 0, Heads, HeadDim, Eps);
@@ -279,12 +345,13 @@ public sealed class QwenImageTransformer : IDisposable
         _k.Attention(_qkv.View, 3 * Dim, 0, _qkv.View, 3 * Dim, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);
         Lin(w, _attn.View.SubView(0, (long)_nTxt * Dim), b + "attn.to_add_out", _attnTxt.View, _nTxt, Dim, Dim);
         Lin(w, _attn.View.SubView((long)_nTxt * Dim, (long)_nImg * Dim), b + "attn.to_out.0", _attnImg.View, _nImg, Dim, Dim);
-        _k.GateResidual(_img.View, _attnImg.View, _modImg.View, 2 * Dim, _nImg * Dim, Dim);
+        if (Probe != null) { Probe(b + "attn_img", _attnImg.View, _nImg, Dim); Probe(b + "attn_txt", _attnTxt.View, _nTxt, Dim); }
+        ImgGate(2 * Dim);
         _k.GateResidual(_txt.View, _attnTxt.View, _modTxt.View, 2 * Dim, _nTxt * Dim, Dim);
-        _k.LayerNormModulate(_img.View, _normI.View, _modImg.View, 3 * Dim, 4 * Dim, _nImg, Dim, Eps);
+        ImgModulate(3 * Dim, 4 * Dim);
         Lin(w, _normI.View, b + "img_mlp.net.0.proj", _mlp.View, _nImg, Dim, MlpHidden, DiTKernels.Act.GeluTanh);
         Lin(w, _mlp.View, b + "img_mlp.net.2", _attnImg.View, _nImg, MlpHidden, Dim);
-        _k.GateResidual(_img.View, _attnImg.View, _modImg.View, 5 * Dim, _nImg * Dim, Dim);
+        ImgGate(5 * Dim);
         _k.LayerNormModulate(_txt.View, _normT.View, _modTxt.View, 3 * Dim, 4 * Dim, _nTxt, Dim, Eps);
         Lin(w, _normT.View, b + "txt_mlp.net.0.proj", _mlp.View, _nTxt, Dim, MlpHidden, DiTKernels.Act.GeluTanh);
         Lin(w, _mlp.View, b + "txt_mlp.net.2", _attnTxt.View, _nTxt, MlpHidden, Dim);
