@@ -142,18 +142,19 @@ public sealed class QwenImageTransformer : IDisposable
     public static int[] Ids(int textTokens, int rows, int cols) => Ids(textTokens, new[] { (rows, cols) });
 
     /// <summary>
-    /// The position ids of text followed by several pictures: picture k (0 = the noise latent, then the references) has frame index k and its rows / columns centred as in
-    /// <see cref="Ids(int, int, int)"/>. The text starts at max(rows / 2, cols / 2) of the NOISE LATENT: ComfyUI's layout, measured on its 2509 edit run (SpawnGen's pe_embedder tap:
-    /// text row 0 at (8, 8, 8) for a 12 x 16 latent with a 56 x 74 reference). <paramref name="textAfterAllPictures"/>: diffusers' <c>QwenEmbedRope</c> instead, the largest
-    /// max(rows / 2, cols / 2) over every picture (the same with no reference).
+    /// The position ids of text followed by several pictures, ComfyUI's layout (measured on its 2509 edit runs, SpawnGen's pe_embedder taps): picture k (0 = the noise latent, then
+    /// the references) has frame index k; a grid of n rows (columns) runs from -(n / 2) to n - 1 - n / 2 (integer division: 83 columns -41..41); the text starts at
+    /// max(rows / 2, cols / 2) of the NOISE LATENT (text row 0 at (8, 8, 8) for a 12 x 16 latent with 56 x 74 and 50 x 83 references). <paramref name="diffusers"/>: diffusers'
+    /// <c>QwenEmbedRope</c> instead, which differs in two places: an odd grid runs from -(n - n / 2) (83 columns -42..40), and the text starts after the largest
+    /// max(rows / 2, cols / 2) over every picture. Both agree for one picture of even sides (the base model's gates).
     /// </summary>
-    public static int[] Ids(int textTokens, IReadOnlyList<(int Rows, int Cols)> pictures, bool textAfterAllPictures = false)
+    public static int[] Ids(int textTokens, IReadOnlyList<(int Rows, int Cols)> pictures, bool diffusers = false)
     {
         int total = textTokens, start = 0;
         for (int q = 0; q < pictures.Count; q++)
         {
             var (r, c) = pictures[q]; total += r * c;
-            if (q == 0 || textAfterAllPictures) start = Math.Max(start, Math.Max(r / 2, c / 2));
+            if (q == 0 || diffusers) start = Math.Max(start, Math.Max(r / 2, c / 2));
         }
         var ids = new int[total * 3];
         for (int j = 0; j < textTokens; j++) { ids[j * 3] = ids[j * 3 + 1] = ids[j * 3 + 2] = start + j; }
@@ -161,7 +162,7 @@ public sealed class QwenImageTransformer : IDisposable
         for (int k = 0; k < pictures.Count; k++)
         {
             var (rows, cols) = pictures[k];
-            int y0 = rows - rows / 2, x0 = cols - cols / 2;
+            int y0 = diffusers ? rows - rows / 2 : rows / 2, x0 = diffusers ? cols - cols / 2 : cols / 2;
             for (int y = 0; y < rows; y++) for (int x = 0; x < cols; x++) { ids[row * 3] = k; ids[row * 3 + 1] = y - y0; ids[row * 3 + 2] = x - x0; row++; }
         }
         return ids;

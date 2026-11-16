@@ -4,6 +4,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **Qwen-Image Edit 2509 (ComfyUI's TextEncodeQwenImageEditPlus), checked against ComfyUI** (SpawnGen's dumps and module taps; Plans/qwen-image-edit-2509-2026-11-15.md):
+  - `QwenVisionEncoder`: Qwen2.5-VL-7B's vision tower from `qwen_2.5_vl_7b_fp8_scaled` (`Flux2Weights.LoadVisionAsync`; 8-bit matrices exact): window attention, 2D rope, 2 x 2
+    merger. CUDA 6.1e-5 / OpenCL 2.5e-5 (`QwenEdit_VisionTower_MatchesComfyUi`); several pictures in one call give ComfyUI's per-picture rows.
+  - `Flux2TextEncoder.Encode(ids, real, pictures)`: picture rows spliced between vision_start / vision_end, M-RoPE (transformers' `get_rope_index`). 1 picture 1.5e-4, 2 pictures
+    3.1e-4 on CUDA (`QwenEdit_TextEncoderWithPictures_MatchesComfyUi`; a 1 x N strip control 0.10 - 0.38).
+  - `QwenImageTransformer.OpenAsync(.., references, ..)`: reference latents, packed as ComfyUI does (`Flux1Kernels.PatchifyWrap`: odd sides wrapped). `Ids` follows ComfyUI's
+    layout (text after the noise latent; reference k on frame k; odd grids centred -(n/2)..), exactly ComfyUI's pe_embedder input; `diffusers: true` gives diffusers'. Calls:
+    1 picture 3.2e-4 / 1.9e-4, 2 pictures 3.0e-4 / 3.3e-4 (`QwenEdit_Transformer_MatchesComfyUiCalls`; diffusers' layout 0.41). `UsePositionIds` for custom layouts.
+  - Rotary from host cos / sin tables (`SkinTokensKernels.AxesRopeTables` / `RopeTables`), also the text-only path.
+- **CLIP vision ViT-H** (`ClipVisionEncoder`, ComfyUI's `clip_vision_h.safetensors`, for Wan 2.1 i2v): penultimate_hidden_states 4.5e-5, image_embeds 2.2e-6 vs ComfyUI's
+  CLIPVisionEncode (`ClipVisionH_MatchesComfyUi`). `SparseKernels.PreciseActivations`: fp16-weight linears in fp32 on CUDA (no fp16 rounding of the activations).
+- **`Flux2TextEncoder` per-call length** (SpawnGen: ComfyUI encodes any length): `maxTokens` at construction, each `Encode` computes `ids.Length` rows; unpadded = padded bit for bit.
+
 - **Min-p and the presence penalty** (`GenerationConfig.MinP`, `PresencePenalty`, strategy `"sample"`: ComfyUI's TextGenerate sampling mode, requested by SpawnGen), on the GGUF batch
   decoder: min-p after top-k and the nucleus (Hugging Face's order: the tokens with logit >= max + T ln(min_p) stay, the best always), on the host sampler and in both device draw
   paths (the candidates and the exact whole-row path); the presence penalty subtracted once per distinct token of the repetition window, after the repetition penalty. Gate

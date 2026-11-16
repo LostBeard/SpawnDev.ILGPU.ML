@@ -62,9 +62,9 @@ public abstract partial class MLTestBase
     /// Qwen-Image Edit 2509's transformer (qwen_image_edit_2509_fp8_e4m3fn: the base model's architecture, its own weights) with reference latents
     /// (<see cref="QwenImageTransformer.OpenAsync(Accelerator, IModelSource, string, string, int, int, int, IReadOnlyList{ValueTuple{int, int}}, long, CancellationToken)"/>) against
     /// ComfyUI's model calls (SpawnGen's dumps, float32 CPU, sigma 1, cfg 4): 1 picture (reference A [16, 111, 148], cond 212 / uncond 204 rows) and 2 pictures (A and B
-    /// [16, 99, 165], 417 / 409 rows). How ComfyUI feeds a reference is measured on call 0 of the 1-picture run: odd sides padded with zeros, the edge or by wrapping, and the raw VAE
-    /// latent or the model's normalised one; the winner then has to hold for the other three calls. Base model conventions (QwenImage_Transformer_MatchesComfyUiCalls): t = sigma,
-    /// the output is x - sigma v.
+    /// [16, 99, 165], 417 / 409 rows). ComfyUI's input format comes from SpawnGen's module taps: the references packed as the call carries them with odd sides wrapped, and the
+    /// rotary ids of <see cref="QwenImageTransformer.Ids(int, IReadOnlyList{ValueTuple{int, int}}, bool)"/>, checked here exactly against ComfyUI's pe_embedder input; control:
+    /// diffusers' layout must miss. Base model conventions (QwenImage_Transformer_MatchesComfyUiCalls): t = sigma, the output is x - sigma v.
     /// </summary>
     [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
     public async Task QwenEdit_Transformer_MatchesComfyUiCalls() => await RunTest(async accelerator =>
@@ -83,7 +83,7 @@ public abstract partial class MLTestBase
         var refA = F2_Raw(Path.Combine(d, "qe_graph1_call_0_c_ref_latents_0_f32_1x16x1x111x148.raw"), 16L * 111 * 148);
         var refB = F2_Raw(Path.Combine(d, "qe_graph2_call_0_c_ref_latents_1_f32_1x16x1x99x165.raw"), 16L * 99 * 165);
         var k = new Flux1.Flux1Kernels(accelerator);
-        var report = new List<string>(); double worst = 0, control = double.MaxValue; string? winner = null;
+        var report = new List<string>(); double worst = 0, control = double.MaxValue;
         var src = new LocalFolderModelSource(Path.GetDirectoryName(path)!);
 
         async Task<double> Call(QwenImageTransformer tr, string run, int call, int n, List<float[]> refs, string pad, bool normalise)
@@ -105,81 +105,41 @@ public abstract partial class MLTestBase
             return e;
         }
 
-        // the rotary layout of text + pictures: where the text starts (after the largest of ALL pictures, diffusers; or after the noise latent alone) and which frame a
-        // reference sits on (k, diffusers' index; or 0); pictures centred as the base model
-        static int[] Layout(int nTxt, (int R, int C)[] pics, bool textAfterAll, bool refFrameK)
-        {
-            int start = 0;
-            foreach (var (r, c) in textAfterAll ? pics : pics.Take(1)) start = Math.Max(start, Math.Max(r / 2, c / 2));
-            var ids = new int[(nTxt + pics.Sum(p => p.R * p.C)) * 3];
-            for (int j = 0; j < nTxt; j++) ids[j * 3] = ids[j * 3 + 1] = ids[j * 3 + 2] = start + j;
-            int row = nTxt;
-            for (int q = 0; q < pics.Length; q++)
-            {
-                var (r, c) = pics[q]; int y0 = r - r / 2, x0 = c - c / 2;
-                for (int y = 0; y < r; y++) for (int x = 0; x < c; x++) { ids[row * 3] = refFrameK ? q : 0; ids[row * 3 + 1] = y - y0; ids[row * 3 + 2] = x - x0; row++; }
-            }
-            return ids;
-        }
-        var layouts = new (string Name, bool All, bool FrameK)[] { ("text after all pictures, ref k on frame k (diffusers)", true, true), ("text after the noise latent, ref k on frame k", false, true),
-            ("text after all pictures, refs on frame 0", true, false), ("text after the noise latent, refs on frame 0", false, false) };
-        // ComfyUI's reference format, measured on SpawnGen's img_in tap (_DevComms 2026-11-15-1730): the reference latent as the call carries it (not normalised again), odd sides
-        // wrapped (circular); 0.0 from ComfyUI's packed rows (zero padding 0.11, edge 0.20)
+        // ComfyUI's reference format, measured on SpawnGen's img_in taps (_DevComms 2026-11-15-1730 / 1840): the reference latent as the call carries it (not normalised again),
+        // odd sides wrapped (circular); 0.0 from ComfyUI's packed rows for both references (zero padding 0.11, edge 0.20)
         const string Pad = "circular"; const bool Norm = false;
         var one = new[] { (12, 16), (56, 74) }; var two = new[] { (12, 16), (56, 74), (50, 83) };
-        Ur_Expect(Layout(212, one, false, true).SequenceEqual(QwenImageTransformer.Ids(212, one)) && Layout(212, one, true, true).SequenceEqual(QwenImageTransformer.Ids(212, one, true)),
-            "the library's Ids must be the 'text after the noise latent, ref k on frame k' layout (and diffusers' with textAfterAllPictures)");
-        (string Name, bool All, bool FrameK, double E) best;
-        // 1 picture: the layout on call 0, then call 1 with the winner
+        // the library's ids against ComfyUI's own pe_embedder input (SpawnGen's taps of graph1 / graph2 call 0), exactly: text after the noise latent, reference k on frame k,
+        // odd grids centred -(n/2)..; the 16:20-17:53 runs measured the alternatives on the model (diffusers' layout 0.41, refs on frame 0 0.15 / 0.40, no reference 0.60)
+        foreach (var (file, n, pics) in new[] { ("qe_taps1_diffusion_model_pe_embedder_0_in0_f32_1x4548x3.raw", 212, one), ("qe_taps2_diffusion_model_pe_embedder_0_in0_f32_1x8903x3.raw", 417, two) })
+        {
+            var comfy = F2_Raw(Path.Combine(d, file), (n + pics.Sum(p => p.Item1 * p.Item2)) * 3L);
+            var ours = QwenImageTransformer.Ids(n, pics);
+            int bad = 0; for (int i = 0; i < ours.Length; i++) if (ours[i] != comfy[i]) bad++;
+            Ur_Expect(bad == 0, $"{file}: {bad} of {ours.Length} position ids differ from ComfyUI's");
+            report.Add($"position ids = ComfyUI's pe_embedder input ({pics.Length} pictures, {ours.Length / 3} rows): exact");
+        }
+        // 1 picture: both calls on the library's layout; control: diffusers' layout on call 0
         using (var tr = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 212, 12, 16, new[] { (56, 74) }, (long)(residentGb * 1e9)))
         {
             report.Add($"1 picture: {tr.ResidentBlocks} of 60 blocks resident, {tr.InputTokens} picture tokens");
-            var readings = new List<(string Name, bool All, bool FrameK, double E)>();
-            foreach (var (name, all, frameK) in layouts)
-            {
-                tr.UsePositionIds(Layout(212, one, all, frameK), 212);
-                double e = await Call(tr, "graph1", 0, 212, new List<float[]> { refA }, Pad, Norm);
-                report.Add($"  layout: {name}");
-                readings.Add((name, all, frameK, e));
-            }
-            best = readings.OrderBy(r => r.E).First();
-            winner = best.Name; worst = best.E; control = readings.Where(r => r != best).Min(r => r.E);
-            report.Add($"layout: '{best.Name}' wins ({best.E:E2}); the next best {control:E2}");
-            Ur_Expect(!best.All && best.FrameK, $"ComfyUI's layout (the library default) must win, '{best.Name}' did: " + string.Join("; ", report));
-            tr.ResetPositionIds();                                                                  // the library's own Ids from here on
+            worst = Math.Max(worst, await Call(tr, "graph1", 0, 212, new List<float[]> { refA }, Pad, Norm));
             worst = Math.Max(worst, await Call(tr, "graph1", 1, 204, new List<float[]> { refA }, Pad, Norm));
+            tr.UsePositionIds(QwenImageTransformer.Ids(212, one, diffusers: true), 212);
+            control = await Call(tr, "graph1", 0, 212, new List<float[]> { refA }, Pad, Norm);
+            report.Add("  (the last: control, diffusers' layout)");
         }
-        // control: the noise latent alone (no reference) must miss
-        using (var tr0 = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 212, 12, 16, (long)(residentGb * 1e9)))
-        {
-            double e0 = await Call(tr0, "graph1", 0, 212, new List<float[]>(), Pad, Norm);
-            report.Add($"control, no reference latent: {e0:E2}");
-            control = Math.Min(control, e0);
-        }
-        // 2 pictures, the same layout
+        // 2 pictures (B's 99 x 165 latent: both sides odd), both calls on the library's layout
         using (var tr2 = await QwenImageTransformer.OpenAsync(accelerator, src, "", Path.GetFileName(path), 417, 12, 16, new[] { (56, 74), (50, 83) }, (long)(residentGb * 1e9)))
         {
             report.Add($"2 pictures: {tr2.InputTokens} picture tokens");
-            // which frame the SECOND reference sits on: k = 2 (the library default) or 1, like the first; measured on call 0
-            int[] RefsOnFrame1(int n)
-            {
-                var ids = QwenImageTransformer.Ids(n, two);
-                for (int row = n + 12 * 16 + 56 * 74; row < n + tr2.InputTokens; row++) ids[row * 3] = 1;
-                return ids;
-            }
-            double eK = await Call(tr2, "graph2", 0, 417, new List<float[]> { refA, refB }, Pad, Norm);
-            report.Add("  2 pictures, reference k on frame k (1, 2)");
-            tr2.UsePositionIds(RefsOnFrame1(417), 417);
-            double e1 = await Call(tr2, "graph2", 0, 417, new List<float[]> { refA, refB }, Pad, Norm);
-            report.Add("  2 pictures, both references on frame 1");
-            tr2.ResetPositionIds();
-            report.Add($"second reference: frame 2 {eK:E2}, frame 1 {e1:E2}");
-            worst = Math.Max(worst, Math.Min(eK, e1)); control = Math.Min(control, Math.Max(eK, e1));
-            if (e1 < eK) tr2.UsePositionIds(RefsOnFrame1(409), 409);
-            worst = Math.Max(worst, await Call(tr2, "graph2", 1, 409, new List<float[]> { refA, refB }, Pad, Norm));
+            foreach (var (call, n) in new[] { (0, 417), (1, 409) })
+                worst = Math.Max(worst, await Call(tr2, "graph2", call, n, new List<float[]> { refA, refB }, Pad, Norm));
         }
         foreach (var line in report) Console.WriteLine("[QwenEdit] transformer vs ComfyUI: " + line);
-        Ur_Expect(worst < 1e-3 && control > 10 * worst, string.Join("; ", report));             // bound to be pinned to the measurement
+        // MEASURED (RTX 4070, CUDA, 2026-11-15): 1 picture 3.17e-4 / 1.89e-4 (positive / negative), 2 pictures 2.99e-4 / 3.31e-4; control (diffusers' layout) 0.409.
+        // The base model's calls (QwenImage_Transformer_MatchesComfyUiCalls) are 2.4e-4 / 2.9e-4 at the same precision.
+        Ur_Expect(worst < 1e-3 && control > 10 * worst, string.Join("; ", report));
         return string.Join("; ", report);
     });
 
