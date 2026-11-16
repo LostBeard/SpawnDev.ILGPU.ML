@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased (master)
 
+- **SpawnDev.ILGPU 5.4.34.** WebGPU / WebGL MathF.Sin / Cos / Tan are now accurate at large arguments (Cody-Waite reduction; 5.4.33's D3D native functions were 2.7e-4 off at
+  |x| = 2000), a double narrowed to Half / bf16 / FP8 rounds once, and the CPU accelerator launches faster. Gate `QwenEdit_InKernelRope_MatchesHostTables` (light, every lane):
+  the in-kernel rotary embedding vs host tables at positions to 600, under 2e-5 (5.4.33: 3.8e-5 on WebGPU / WebGL). Full ML sweep on 5.4.34-local.2: 7748 / 0 / 482, every
+  lane 0.94 - 0.97x the time of 5.4.33's.
+
 - **Qwen-Image Edit 2509 (ComfyUI's TextEncodeQwenImageEditPlus), checked against ComfyUI** (SpawnGen's dumps and module taps; Plans/qwen-image-edit-2509-2026-11-15.md):
   - `QwenVisionEncoder`: Qwen2.5-VL-7B's vision tower from `qwen_2.5_vl_7b_fp8_scaled` (`Flux2Weights.LoadVisionAsync`; 8-bit matrices exact): window attention, 2D rope, 2 x 2
     merger. CUDA 6.1e-5 / OpenCL 2.5e-5 (`QwenEdit_VisionTower_MatchesComfyUi`); several pictures in one call give ComfyUI's per-picture rows.
