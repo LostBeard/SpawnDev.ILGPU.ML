@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased - Qwen-Image Edit 2511 matches ComfyUI; ComfyUI's fp8mixed files; fp8 streamed weights in the browser
+## 5.8.19 - 2026-11-16 (nuget.org) - Qwen-Image Edit 2511 matches ComfyUI; ComfyUI's fp8mixed files; fp8 streamed weights in the browser
 
 - **Qwen-Image Edit 2511** (ComfyUI's `qwen_image_edit_2511_fp8mixed`): `QwenImageTransformer.ReferencesAtTimestepZero` modulates the reference pictures' tokens with the
   time embedding at t = 0 (noise tokens, text and norm_out keep the call's t: ComfyUI's "index_timestep_zero", diffusers' zero_cond_t). `OpenAsync` turns it on when the file
@@ -15,6 +15,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   q | k | v only when the parts share one scale (2511's do not: they run as three GEMMs). Gate `StreamedWeights_Fp8Mixed_ScalesBlobsAndMarker` (light, every lane, in memory).
 - **Fix: 8-bit streamed weights on WebGPU / WebGL / Wasm.** `StreamedModelWeights.Matrix` / `MatrixExact` called the synchronous `Synchronize()` before the first decode
   scratch allocation, which browser backends refuse; a scratch too small is now retired and freed at the next async drain (`BlockAsync`) or `Dispose`.
+- **Tests run on a fresh clone** (issue #2): the large gitignored demo models and DA3 references load from models.spawndev.com (LostBeard/spawndev-ilgpu-ml-demo-models,
+  the exact bytes the references were made from); `DirectOnnx_DistilGPT2_Cuda` runs for real and checks 12 greedy tokens against onnxruntime.
 - `QwenImageTransformer.Probe` also reports each block's text stream, block attention outputs, norm_out and proj_out. Gate `QwenEdit2511_Stages_MatchComfyUiTaps`
   (SpawnGen's stage taps of one call): block 0 attention img 1.8e-3 / txt 1.5e-5, blocks 0 / 29 / 59 at 1.6e-4 - 6.9e-4, proj_out 4.2e-4. The 2511 calls' remaining ~1e-3 is
   float32 conditioning of block 0's image attention, not a difference in the math: a float64 rebuild from the file's weights gives ComfyUI's text output to 7.7e-7, and the

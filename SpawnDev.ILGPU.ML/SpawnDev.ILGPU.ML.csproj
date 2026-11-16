@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.18</Version>
-		<PackageReleaseNotes>v5.8.18 - on SpawnDev.ILGPU 5.4.34 (accurate WebGPU / WebGL sin / cos; faster CPU accelerator launches). Checked against ComfyUI's own runs: FLUX.1 Krea fp8_scaled, Qwen-Image (text encoder, 20B transformer, VAE) and Qwen-Image Edit 2509 (TextEncodeQwenImageEditPlus: the Qwen2.5-VL vision tower QwenVisionEncoder, conditioning with pictures and M-RoPE, the transformer with reference latents in ComfyUI's layout). CLIP vision ViT-H (ClipVisionEncoder, ComfyUI's clip_vision_h). Flux2TextEncoder encodes any prompt length per call. GGUF batch decoder: min-p and the presence penalty (ComfyUI's TextGenerate sampling), min-p accepts 1.0. Rotary embeddings from host cos / sin tables. LICENSE names this package. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.19</Version>
+		<PackageReleaseNotes>v5.8.19 - Qwen-Image Edit 2511 checked against ComfyUI's own runs (ComfyUI's qwen_image_edit_2511_fp8mixed: reference pictures modulated at t = 0, switched on by the file's marker). StreamedModelWeights reads ComfyUI's mixed-precision fp8mixed safetensors (per-layer scales, quantization metadata checked: anything not computed exactly is refused). Fix: 8-bit streamed weights now run on WebGPU / WebGL / Wasm (a synchronous Synchronize() is gone). Tests load the large demo models from models.spawndev.com, so a fresh clone runs them. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
