@@ -1237,16 +1237,27 @@ public class IntegrationTests
         Console.WriteLine("[SafeTensors] PASS");
     }
 
-    /// <summary>DistilGPT-2 on CUDA — verifies transformer LayerNorm + attention produces non-zero logits.</summary>
+    /// <summary>
+    /// DistilGPT-2 on CUDA: greedy generation from "The cat sat on the" must match onnxruntime's greedy tokens
+    /// (<c>references/gpt2/distilgpt2_greedy.json</c>, made from this exact file: Xenova/distilgpt2 onnx/decoder_model.onnx).
+    /// </summary>
+    /// <remarks>
+    /// Until 2026-11-16 this read <c>wwwroot/models/distilgpt2/model.onnx</c>, which no PC had, so it always skipped and never ran.
+    /// Its old body hand-built float input_ids with a guessed sequence length and only checked "logits not all zero": when it
+    /// first ran, it threw IndexOutOfRange writing token 3 into a shorter array. It now runs the real pipeline against a real oracle.
+    /// </remarks>
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_DistilGPT2_Cuda()
     {
         var onnxPath = await ModelFileAsync(SpawnDev.ILGPU.ML.Hub.ModelsHost.GetUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"), "distilgpt2/model.onnx");
-        if (!File.Exists(onnxPath))
-            throw new UnsupportedTestException($"DistilGPT-2 model not found: {onnxPath}");
+        var tokenizerPath = await ModelFileAsync(SpawnDev.ILGPU.ML.Hub.ModelsHost.GetUrl("Xenova/distilgpt2", "tokenizer.json"), "distilgpt2/tokenizer.json");
+        var refPath = Path.Combine(Path.GetDirectoryName(FindModelsDir())!, "references", "gpt2", "distilgpt2_greedy.json");
+        using var refDoc = JsonDocument.Parse(await File.ReadAllTextAsync(refPath));
+        var promptIds = refDoc.RootElement.GetProperty("input_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        var expected = refDoc.RootElement.GetProperty("generated_ids").EnumerateArray().Select(e => e.GetInt32()).Skip(promptIds.Length).ToArray();
+        var prompt = refDoc.RootElement.GetProperty("prompt").GetString()!;
 
         var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
-
         var context = MLContext.CreateContext();
         Accelerator? accelerator = null;
         InferenceSession? session = null;
@@ -1256,65 +1267,22 @@ public class IntegrationTests
             if (cudaDevices.Count == 0)
                 throw new UnsupportedTestException("No CUDA devices found");
             accelerator = cudaDevices[0].CreateAccelerator(context);
-            Console.WriteLine($"[GPT2-CUDA] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+            Console.WriteLine($"[DistilGPT2-CUDA] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1048576.0:F1} MB");
 
-            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
-            Console.WriteLine($"[GPT2-CUDA] Session: {session}");
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, enableOptimization: false);
+            var pipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, accelerator);
+            pipeline.LoadTokenizer(await File.ReadAllTextAsync(tokenizerPath));
+            pipeline.MaxNewTokens = expected.Length;
+            var result = await pipeline.GenerateAsync(prompt);
 
-            // Simple input: "Hello" as token IDs [15496] padded
-            // DistilGPT-2 input_ids shape: [batch, seq_len]
-            var inputShape = session.InputShapes.Values.First();
-            int seqLen = inputShape.Length >= 2 ? inputShape[1] : 8;
-            if (seqLen <= 0 || seqLen > 512) seqLen = 8;
-
-            // Create input tokens: [Hello=15496, world=995, !=0] padded with 0
-            var tokenIds = new float[seqLen];
-            tokenIds[0] = 15496; // "Hello"
-            tokenIds[1] = 995;   // " world"
-            tokenIds[2] = 0;     // padding
-
-            using var inputBuf = accelerator.Allocate1D(tokenIds);
-            var inputTensor = new Tensor(inputBuf.View, inputShape);
-
-            // Build inputs (may need attention_mask too)
-            var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = inputTensor };
-
-            // Add attention mask if needed (all 1s for non-padding positions)
-            if (session.InputNames.Length > 1 && session.InputNames[1].Contains("attention_mask"))
-            {
-                var mask = new float[seqLen];
-                for (int i = 0; i < Math.Min(3, seqLen); i++) mask[i] = 1f;
-                using var maskBuf = accelerator.Allocate1D(mask);
-                inputs[session.InputNames[1]] = new Tensor(maskBuf.View, inputShape);
-            }
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var outputs = await session.RunAsync(inputs);
-            sw.Stop();
-
-            var output = outputs.Values.First();
-            Console.WriteLine($"[GPT2-CUDA] Output: shape=[{string.Join(",", output.Shape)}], elements={output.ElementCount}, time={sw.Elapsed.TotalSeconds:F1}s");
-
-            // Read first 100 logits to check for non-zero
-            int readCount = Math.Min(100, output.ElementCount);
-            using var readBuf = accelerator.Allocate1D<float>(readCount);
-            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
-            await accelerator.SynchronizeAsync();
-            var logits = await readBuf.CopyToHostAsync<float>(0, readCount);
-
-            float absMax = logits.Max(v => MathF.Abs(v));
-            float mean = logits.Average();
-            int nonZero = logits.Count(v => v != 0f);
-            bool hasNaN = logits.Any(v => float.IsNaN(v));
-
-            Console.WriteLine($"[GPT2-CUDA] Logits: absMax={absMax:F3}, mean={mean:F3}, nonZero={nonZero}/{readCount}, hasNaN={hasNaN}");
-
-            if (hasNaN)
-                throw new Exception("GPT-2 output contains NaN — LayerNorm Pow broadcast bug may still be present");
-            if (absMax < 0.001f)
-                throw new Exception($"GPT-2 output is all zeros: absMax={absMax}");
-
-            Console.WriteLine("[GPT2-CUDA] PASS");
+            var got = result.GeneratedTokenIds;
+            Console.WriteLine($"[DistilGPT2-CUDA] gen=[{string.Join(",", got)}] ref=[{string.Join(",", expected)}] text='{result.GeneratedText}'");
+            if (got.Length < expected.Length)
+                throw new Exception($"Generated {got.Length} tokens, expected {expected.Length}. text='{result.GeneratedText}'");
+            for (int i = 0; i < expected.Length; i++)
+                if (got[i] != expected[i])
+                    throw new Exception($"Token {i}: got {got[i]}, expected {expected[i]} (onnxruntime greedy). gen=[{string.Join(",", got)}] ref=[{string.Join(",", expected)}]");
+            Console.WriteLine($"[DistilGPT2-CUDA] PASS: all {expected.Length} greedy tokens match onnxruntime");
         }
         finally
         {
