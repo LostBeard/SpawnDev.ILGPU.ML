@@ -3,6 +3,7 @@ using ILGPU.Runtime;
 using ILGPU.Runtime.CPU;
 using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Operators;
 using SpawnDev.ILGPU.ML.Tensors;
@@ -862,7 +863,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_ParseAndCompile_DepthAnythingV2()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "depth-anything-v2-small", "model.onnx");
+        var onnxPath = await LargeModelFileAsync("depth-anything-v2-small/model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"DAv2 model not found: {onnxPath}");
 
@@ -909,7 +910,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 300000)]
     public async Task DirectOnnx_DepthAnythingV2_Cuda()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "depth-anything-v2-small", "model.onnx");
+        var onnxPath = await LargeModelFileAsync("depth-anything-v2-small/model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"DAv2 model not found: {onnxPath}");
 
@@ -1021,6 +1022,46 @@ public class IntegrationTests
             dir = Path.GetDirectoryName(dir) ?? dir;
         }
         throw new Exception("Could not find tools directory");
+    }
+
+    /// <summary>
+    /// The path of a demo model file that is too large for GitHub (see <see cref="DemoModelFiles"/>; <paramref name="file"/> is its path under
+    /// the demo's <c>wwwroot/models/</c>, e.g. <c>gpt2/model.onnx</c>). Those folders are gitignored, so a fresh clone does not have them: a
+    /// missing file is downloaded from the models host into the same place (still gitignored) and reused by later runs. Before 2026-11-16 these
+    /// tests threw <see cref="UnsupportedTestException"/> on such a PC, i.e. they silently never ran anywhere but the PC that held the files.
+    /// </summary>
+    private static Task<string> LargeModelFileAsync(string file) => ModelFileAsync(DemoModelFiles.Url(file), file);
+
+    /// <summary>
+    /// The path of <paramref name="file"/> under the demo's <c>wwwroot/models/</c> (a gitignored folder), downloaded from <paramref name="url"/>
+    /// first when this PC does not have it yet.
+    /// </summary>
+    private static async Task<string> ModelFileAsync(string url, string file)
+    {
+        var path = Path.Combine(FindModelsDir(), file.Replace('/', Path.DirectorySeparatorChar));
+        if (File.Exists(path)) return path;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var part = path + ".part";
+        // HttpClient.Timeout stops at the headers under ResponseHeadersRead: the token bounds the body too, so a stalled transfer fails instead of hanging.
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        using (var http = new HttpClient())
+        using (var res = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token))
+        {
+            res.EnsureSuccessStatusCode();
+            long expected = res.Content.Headers.ContentLength ?? -1;
+            Console.WriteLine($"[models] {file} not on this PC: downloading {expected / 1048576.0:F1} MB from {url}");
+            await using (var body = await res.Content.ReadAsStreamAsync(cts.Token))
+            await using (var dest = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, useAsync: true))
+                await body.CopyToAsync(dest, 16 << 20, cts.Token);
+            long got = new FileInfo(part).Length;
+            if (expected >= 0 && got != expected)
+            {
+                File.Delete(part);
+                throw new IOException($"{url}: downloaded {got} bytes, the host said {expected}");
+            }
+        }
+        File.Move(part, path, overwrite: true);
+        return path;
     }
 
     private static string FindModelsDir()
@@ -1200,7 +1241,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_DistilGPT2_Cuda()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "distilgpt2", "model.onnx");
+        var onnxPath = await ModelFileAsync(SpawnDev.ILGPU.ML.Hub.ModelsHost.GetUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"), "distilgpt2/model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"DistilGPT-2 model not found: {onnxPath}");
 
@@ -1287,7 +1328,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_WhisperEncoder_Cuda()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "whisper-tiny", "encoder_model.onnx");
+        var onnxPath = await LargeModelFileAsync("whisper-tiny/encoder_model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"Whisper encoder not found: {onnxPath}");
 
@@ -1575,7 +1616,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_DistilBERT_Sentiment_Cuda()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "distilbert-sst2", "model.onnx");
+        var onnxPath = await LargeModelFileAsync("distilbert-sst2/model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"DistilBERT model not found: {onnxPath}");
 
@@ -1640,7 +1681,7 @@ public class IntegrationTests
     [TestMethod(Timeout = 300000)]
     public async Task DirectOnnx_GPT2_Full_Cuda()
     {
-        var onnxPath = Path.Combine(FindModelsDir(), "gpt2", "model.onnx");
+        var onnxPath = await LargeModelFileAsync("gpt2/model.onnx");
         if (!File.Exists(onnxPath))
             throw new UnsupportedTestException($"GPT-2 model not found: {onnxPath}");
 
@@ -1725,8 +1766,8 @@ public class IntegrationTests
     [TestMethod(Timeout = 300000)]
     public async Task DirectOnnx_WhisperEncoderDecoder_Cuda()
     {
-        var encoderPath = Path.Combine(FindModelsDir(), "whisper-tiny", "encoder_model.onnx");
-        var decoderPath = Path.Combine(FindModelsDir(), "whisper-tiny", "decoder_model.onnx");
+        var encoderPath = await LargeModelFileAsync("whisper-tiny/encoder_model.onnx");
+        var decoderPath = await LargeModelFileAsync("whisper-tiny/decoder_model.onnx");
         if (!File.Exists(encoderPath) || !File.Exists(decoderPath))
             throw new UnsupportedTestException("Whisper models not found");
 

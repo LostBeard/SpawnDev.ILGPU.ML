@@ -57,7 +57,7 @@ public abstract partial class MLTestBase
         for (int v = 0; v < n; v++)
         {
             var d = Da3Ints(c.GetProperty("rgba")[v]);
-            var bytes = await http.GetByteArrayAsync($"test-refs/dav3/{name}.v{v}.rgba");
+            var bytes = await http.GetByteArrayAsync(DemoModelFiles.TestRefUrl($"dav3/{name}.v{v}.rgba"));
             var packed = new int[bytes.Length / 4];
             Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);
             frames.Add(packed); ws.Add(d[0]); hs.Add(d[1]);
@@ -68,9 +68,9 @@ public abstract partial class MLTestBase
         if (rect != (px, py, cw, ch))
             failures.Add($"ModelContentRect {rect} != reference letterbox ({px}, {py}, {cw}, {ch})");
 
-        var depthRef = await F32(http, $"test-refs/dav3/{name}.predicted_depth.f32");
-        var confRef = await F32(http, $"test-refs/dav3/{name}.confidence.f32");
-        var kRef = await F32(http, $"test-refs/dav3/{name}.intrinsics.f32");
+        var depthRef = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.predicted_depth.f32"));
+        var confRef = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.confidence.f32"));
+        var kRef = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.intrinsics.f32"));
 
         // Reference plane v, content rows only (rowShift = negative control).
         float[] Crop(float[] planes, int v, int rowShift)

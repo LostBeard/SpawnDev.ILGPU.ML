@@ -39,7 +39,7 @@ public abstract partial class MLTestBase
         {
             var c = manifest.GetProperty("cases").GetProperty(name);
             var shape = Da3Ints(c.GetProperty("input_shape"));
-            var input = await F32(http, $"test-refs/dav3/{name}.input.f32");
+            var input = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.input.f32"));
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = shape }, externalData: extBytes);
             using var inBuf = accelerator.Allocate1D(input);

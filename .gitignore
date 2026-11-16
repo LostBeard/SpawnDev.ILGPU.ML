@@ -372,7 +372,9 @@ sdturbo_*.bmp
 Examples/03.ImageGen.Console/*.bmp
 
 # ML model files — small models (<100MB) are self-hosted for instant demo loading.
-# Large models (>100MB) load from HuggingFace CDN at runtime.
+# Large models (>100MB) are NOT in git: tests and demos load them from the models host,
+# https://models.spawndev.com/LostBeard/spawndev-ilgpu-ml-demo-models/resolve/main/<folder>/<file>
+# (DemoModelFiles.Url in Demo.Shared/UnitTests). Never reference these folders by a relative models/ path.
 # Exclude only models that exceed GitHub's 100MB file size limit:
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/depth-anything-v2-small/
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/distilbert-sst2/
@@ -409,6 +411,8 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/*
 # Audio written by DemoConsole KOKOROSPEAK / ZipVoice runs, into whatever the working directory was
 kokoro-*.wav
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-base.en/
+# DemoConsole DirectOnnx_DistilGPT2_Cuda downloads Xenova/distilgpt2 onnx/decoder_model.onnx (314 MB) here from the models host
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/distilgpt2/
 
 PlaywrightMultiTest/WGSLDumps/
 

@@ -1,6 +1,7 @@
 using System.Text;
 using SpawnDev.SpawnJS.Toolbox;
 using Blob = SpawnDev.SpawnJS.JSObjects.Blob; // alias to avoid JSObjects.Array vs System.Array collision
+using SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.UnitTesting;
@@ -35,11 +36,11 @@ public class ModelInspectorTests
         "models/mobilenetv2/model.onnx",
         "models/movenet-lightning/model.onnx",
         "models/yolov8n/model.onnx",
-        "models/depth-anything-v2-small/model.onnx",
-        "models/distilbert-sst2/model.onnx",
-        "models/gpt2/model.onnx",
-        "models/whisper-tiny/encoder_model.onnx",
-        "models/whisper-tiny/decoder_model.onnx",
+        DemoModelFiles.Url("depth-anything-v2-small/model.onnx"),
+        DemoModelFiles.Url("distilbert-sst2/model.onnx"),
+        DemoModelFiles.Url("gpt2/model.onnx"),
+        DemoModelFiles.Url("whisper-tiny/encoder_model.onnx"),
+        DemoModelFiles.Url("whisper-tiny/decoder_model.onnx"),
         "models/super-resolution/model.onnx",
         "models/style-mosaic/model.onnx",
         "models/style-candy/model.onnx",
@@ -80,7 +81,7 @@ public class ModelInspectorTests
     [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_Onnx_Transformers_Inspect()
     {
-        foreach (var path in new[] { "models/gpt2/model.onnx", "models/distilbert-sst2/model.onnx" })
+        foreach (var path in new[] { DemoModelFiles.Url("gpt2/model.onnx"), DemoModelFiles.Url("distilbert-sst2/model.onnx") })
         {
             // RANGED, not GetStreamAsync: a forward-only response stream cannot Seek, so SkipAsync reads and
             // discards every weight blob - all ~880 MB crossed JS -> .NET only to be thrown away (and the test
@@ -177,7 +178,7 @@ public class ModelInspectorTests
         // reader had to READ all 623 MB of weights through the .NET heap to skip them: 46 s on a good run, over
         // the 120 s timeout in the 5.4.0, 5.5.0 and 5.6.0 release gates (2026-10-23: SqueezeNet + headers 0.6 s,
         // then the whole remaining two minutes in that read). SqueezeNet above still covers the stream path.
-        await using (var gpt2Stream = await ModelInspectorHelper.OpenUrlForInspectionAsync(_http, "models/gpt2/model.onnx"))
+        await using (var gpt2Stream = await ModelInspectorHelper.OpenUrlForInspectionAsync(_http, DemoModelFiles.Url("gpt2/model.onnx")))
         {
             Console.WriteLine($"[ModelInspector] compat GPT-2 opened at {sw.Elapsed.TotalSeconds:F1} s");
             var gpt2 = await ModelInspectorHelper.CheckCompatibilityAsync(gpt2Stream);
@@ -239,8 +240,8 @@ public class ModelInspectorTests
     // seek past weights, so this read-through cost is a non-seekable-source artifact, not a demo cost.
     private static readonly HashSet<string> BreadthSmokeSkip = new()
     {
-        "models/gpt2/model.onnx",
-        "models/distilbert-sst2/model.onnx",
+        DemoModelFiles.Url("gpt2/model.onnx"),
+        DemoModelFiles.Url("distilbert-sst2/model.onnx"),
     };
 
     /// <summary>

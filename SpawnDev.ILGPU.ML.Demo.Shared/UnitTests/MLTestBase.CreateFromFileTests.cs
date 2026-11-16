@@ -250,7 +250,7 @@ public abstract partial class MLTestBase
 
         Console.WriteLine("[CreateFromFile_Depth] Downloading Depth Anything V2 Small (95MB)...");
         using var session = await InferenceSession.CreateFromFileAsync(
-            accelerator, http, "models/depth-anything-v2-small/model.onnx",
+            accelerator, http, DemoModelFiles.Url("depth-anything-v2-small/model.onnx"),
             inputShapes: new Dictionary<string, int[]>
             {
                 ["pixel_values"] = new[] { 1, 3, 518, 518 }

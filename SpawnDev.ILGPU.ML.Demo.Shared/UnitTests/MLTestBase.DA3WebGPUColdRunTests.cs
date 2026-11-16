@@ -29,7 +29,7 @@ public abstract partial class MLTestBase
     /// Runs the DA3-5D forward on WebGPU with GraphExecutor.CapturedOutputs enabled and compares
     /// per-node sampled outputs against a CUDA reference capture fetched from the test server
     /// (produced by the offline console script da3-cuda-node-capture.cs into
-    /// Demo/wwwroot/test-refs/). Walks nodes in reference execution order and reports the FIRST
+    /// Demo/wwwroot/test-refs/, gitignored; read from the models host, <see cref="DemoModelFiles.TestRefUrl"/>). Walks nodes in reference execution order and reports the FIRST
     /// node whose samples diverge beyond float noise, plus the next few, with node metadata -
     /// naming the kernel/op for the focused WGSL A/B.
     /// </summary>
@@ -44,7 +44,7 @@ public abstract partial class MLTestBase
         System.Text.Json.JsonElement reference;
         try
         {
-            using var stream = await http.GetStreamAsync("test-refs/da3-cuda-node-capture.json");
+            using var stream = await http.GetStreamAsync(DemoModelFiles.TestRefUrl("da3-cuda-node-capture.json"));
             reference = (await System.Text.Json.JsonDocument.ParseAsync(stream)).RootElement;
         }
         catch (Exception ex)

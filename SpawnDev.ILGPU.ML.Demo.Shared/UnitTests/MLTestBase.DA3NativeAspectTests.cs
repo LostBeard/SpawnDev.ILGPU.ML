@@ -46,12 +46,12 @@ public abstract partial class MLTestBase
             var c = manifest.GetProperty("cases").GetProperty(name);
             var shape = Da3Ints(c.GetProperty("input_shape"));
             int h = shape[3], w = shape[4], chw = 3 * h * w;
-            var input = await F32(http, $"test-refs/dav3/{name}.input.f32");
+            var input = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.input.f32"));
             var dims = c.GetProperty("rgba").EnumerateArray().Select(d => Da3Ints(d)).ToArray();
             for (int v = 0; v < dims.Length; v++)
             {
                 int sw = dims[v][0], sh = dims[v][1];
-                var bytes = await http.GetByteArrayAsync($"test-refs/dav3/{name}.v{v}.rgba");
+                var bytes = await http.GetByteArrayAsync(DemoModelFiles.TestRefUrl($"dav3/{name}.v{v}.rgba"));
                 var packed = new int[bytes.Length / 4];
                 Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);
                 using var src = accelerator.Allocate1D(packed);
@@ -155,7 +155,7 @@ public abstract partial class MLTestBase
         async Task<(int[] packed, int w, int h)> Rgba(string name, int v, JsonElement c)
         {
             var d = Da3Ints(c.GetProperty("rgba")[v]);
-            var bytes = await http.GetByteArrayAsync($"test-refs/dav3/{name}.v{v}.rgba");
+            var bytes = await http.GetByteArrayAsync(DemoModelFiles.TestRefUrl($"dav3/{name}.v{v}.rgba"));
             var packed = new int[bytes.Length / 4];
             Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);
             return (packed, d[0], d[1]);
@@ -178,7 +178,7 @@ public abstract partial class MLTestBase
             var (packed, sw, sh) = await Rgba(name, 0, c);
             if (pipe.ModelInputSize(sw, sh) != (w, h))
                 failures.Add($"{name}: ModelInputSize {pipe.ModelInputSize(sw, sh)} != reference {w}x{h}");
-            var reference = await F32(http, $"test-refs/dav3/{name}.predicted_depth.f32");
+            var reference = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.predicted_depth.f32"));
             for (int pass = 0; pass < 2; pass++)   // pass 0 records the plan, pass 1 replays it
             {
                 var (raw, _, _, ow, oh) = await pipe.EstimateGpuRawAsync(packed, sw, sh, w, h);
@@ -199,7 +199,7 @@ public abstract partial class MLTestBase
             int n = shape[1], h = shape[3], w = shape[4];
             var frames = new List<int[]>(); var ws = new List<int>(); var hs = new List<int>();
             for (int v = 0; v < n; v++) { var (p, sw, sh) = await Rgba(name, v, c); frames.Add(p); ws.Add(sw); hs.Add(sh); }
-            var depthRef = await F32(http, $"test-refs/dav3/{name}.predicted_depth.f32");
+            var depthRef = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.predicted_depth.f32"));
             // Pass 0 runs direct; the joint path captures only when a shape REPEATS, so pass 1 records and
             // replays and pass 2 is a pure replay. All three must match onnxruntime.
             for (int pass = 0; pass < 3; pass++)
@@ -214,7 +214,7 @@ public abstract partial class MLTestBase
                 foreach (var (outName, per, got) in new[] { ("extrinsics", 12, mv.Extrinsics), ("intrinsics", 9, mv.ModelIntrinsics) })
                 {
                     if (got == null) { failures.Add($"{name}#{pass}: {outName} missing"); continue; }
-                    var r = await F32(http, $"test-refs/dav3/{name}.{outName}.f32");
+                    var r = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.{outName}.f32"));
                     double maxAbs = 0, refMax = 0;
                     for (int v = 0; v < n; v++)
                         for (int k = 0; k < per; k++)

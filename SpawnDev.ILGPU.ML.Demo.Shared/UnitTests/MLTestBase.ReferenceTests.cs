@@ -1060,7 +1060,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         using var session = await InferenceSession.CreateFromFileAsync(accelerator, http,
-            "models/whisper-tiny/encoder_model.onnx");
+            DemoModelFiles.Url("whisper-tiny/encoder_model.onnx"));
 
         // Load mel spectrogram reference
         var melBytes = await http.GetByteArrayAsync("references/whisper-tiny-onnx/tone_mel.bin");

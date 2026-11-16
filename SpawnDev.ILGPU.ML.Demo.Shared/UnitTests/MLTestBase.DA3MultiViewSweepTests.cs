@@ -33,7 +33,7 @@ public abstract partial class MLTestBase
             HuggingFaceClient.GetDownloadUrl(ModelHub.KnownModels.DepthAnythingV3Small, "onnx/model.onnx"));
         var extBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             HuggingFaceClient.GetDownloadUrl(ModelHub.KnownModels.DepthAnythingV3Small, "onnx/model.onnx_data"));
-        var all = await F32(http, "test-refs/dav3/mv6_temple_518.input.f32");   // [1,6,3,518,518]
+        var all = await F32(http, DemoModelFiles.TestRefUrl("dav3/mv6_temple_518.input.f32"));   // [1,6,3,518,518]
         const int S = 518; int chw = 3 * S * S;
         string backend = accelerator.AcceleratorType.ToString();
         var rows = new List<object>();

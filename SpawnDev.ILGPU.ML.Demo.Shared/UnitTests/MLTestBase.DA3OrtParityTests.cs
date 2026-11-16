@@ -19,7 +19,8 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// map or a camera pose against a reference, and SpawnScene uses all four.
 ///
 /// References: <c>python tools/dav3/dav3_reference.py</c> writes <c>test-refs/dav3/</c> (gitignored,
-/// ~130 MB) from native onnxruntime on the byte-identical model the hub serves. Our raw outputs
+/// ~230 MB; the tests read the copy on the models host, <see cref="DemoModelFiles.TestRefUrl"/>: upload a regenerated set there
+/// with models.spawndev.com\upload-folder.bat) from native onnxruntime on the byte-identical model the hub serves. Our raw outputs
 /// are POSTed to PMT's <c>__pmt/out/</c> sink (<c>_mldump/test-out/dav3/&lt;backend&gt;/</c>) so
 /// <c>tools/dav3/dav3_compare.py</c> can render the three engines side by side.
 /// </summary>
@@ -64,11 +65,11 @@ public abstract partial class MLTestBase
             var c = manifest.GetProperty("cases").GetProperty(name);
             var shape = Da3Ints(c.GetProperty("input_shape"));
             int side = shape[^1], chw = 3 * side * side;
-            var input = await F32(http, $"test-refs/dav3/{name}.input.f32");
+            var input = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.input.f32"));
             var dims = c.GetProperty("rgba").EnumerateArray().Select(d => Da3Ints(d)).ToArray();
             for (int v = 0; v < dims.Length; v++)
             {
-                var bytes = await http.GetByteArrayAsync($"test-refs/dav3/{name}.v{v}.rgba");
+                var bytes = await http.GetByteArrayAsync(DemoModelFiles.TestRefUrl($"dav3/{name}.v{v}.rgba"));
                 var packed = new int[bytes.Length / 4];
                 Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);   // R in the low byte, as the kernel reads
                 using var src = accelerator.Allocate1D(packed);
@@ -103,7 +104,7 @@ public abstract partial class MLTestBase
     {
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
         string json;
-        try { json = await http.GetStringAsync("test-refs/dav3/manifest.json"); }
+        try { json = await http.GetStringAsync(DemoModelFiles.TestRefUrl("dav3/manifest.json")); }
         catch (Exception ex)
         {
             throw new UnsupportedTestException(
@@ -137,7 +138,7 @@ public abstract partial class MLTestBase
         {
             var c = manifest.GetProperty("cases").GetProperty(name);
             var shape = Da3Ints(c.GetProperty("input_shape"));
-            var input = await F32(http, $"test-refs/dav3/{name}.input.f32");
+            var input = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.input.f32"));
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
@@ -173,7 +174,7 @@ public abstract partial class MLTestBase
                         failures.Add($"{name}{tag}.{o.Name}: shape [{string.Join(",", t.Shape)}] != ORT [{string.Join(",", refShape)}]");
                         continue;
                     }
-                    var reference = await F32(http, $"test-refs/dav3/{name}.{o.Name}.f32");
+                    var reference = await F32(http, DemoModelFiles.TestRefUrl($"dav3/{name}.{o.Name}.f32"));
                     var ours = await t.Data.SubView(0, t.ElementCount).CopyToHostAsync();
 
                     if (dump)
