@@ -48,10 +48,11 @@ public sealed class AceStepCodeLm : IDisposable
 
     /// <summary>
     /// Sample <paramref name="count"/> codes (5 per second of audio) for the positive / negative prompt ids. <paramref name="cfg"/>, <paramref name="temperature"/> and
-    /// <paramref name="topP"/> are ComfyUI's node inputs (its defaults 2, 0.85, 0.9); <paramref name="onCode"/> sees each code as it is chosen.
+    /// <paramref name="topP"/>, <paramref name="topK"/> and <paramref name="minP"/> are ComfyUI's node inputs (its defaults 2, 0.85, 0.9, 0, 0; 0 turns top-k / min-p off);
+    /// <paramref name="onCode"/> sees each code as it is chosen.
     /// </summary>
     public async Task<int[]> GenerateCodesAsync(int[] positivePrompt, int[] negativePrompt, int count, int seed, float cfg = 2f, float temperature = 0.85f, float topP = 0.9f,
-        Action<int, int>? onCode = null, CancellationToken ct = default)
+        Action<int, int>? onCode = null, CancellationToken ct = default, int topK = 0, float minP = 0f)
     {
         var rng = new Random(seed);
         var codes = new int[count];
@@ -62,15 +63,19 @@ public sealed class AceStepCodeLm : IDisposable
             ct.ThrowIfCancellationRequested();
             var lp = await _pos.Logits.CopyToHostAsync(); var ln = await _neg.Logits.CopyToHostAsync();
             for (int c = 0; c < CodeCount; c++) logits[c] = ln[c] + cfg * ((double)lp[c] - ln[c]);
-            int code = Sample(logits, temperature, topP, rng);
+            int code = Sample(logits, temperature, topP, rng, topK, minP);
             codes[i] = code; onCode?.Invoke(i, code);
             if (i + 1 < count) { _pos.Step(CodeToken0 + code); _neg.Step(CodeToken0 + code); }
         }
         return codes;
     }
 
-    /// <summary>Temperature, then nucleus sampling: the smallest set of the most likely codes whose probability reaches <paramref name="topP"/>, renormalised.</summary>
-    public static int Sample(double[] logits, float temperature, float topP, Random rng)
+    /// <summary>
+    /// Temperature, then (Hugging Face's warper order) top-k: the <paramref name="topK"/> most likely codes (0 = all); top-p: the smallest set of the most likely whose probability
+    /// reaches <paramref name="topP"/>; min-p: drop codes below <paramref name="minP"/> times the most likely one's probability (0 = off); renormalised, then one draw. The order
+    /// follows Hugging Face generate's; ComfyUI's draws come from torch's generator, so the sampler is checked for its distribution, not against ComfyUI's codes.
+    /// </summary>
+    public static int Sample(double[] logits, float temperature, float topP, Random rng, int topK = 0, float minP = 0f)
     {
         int n = logits.Length;
         if (temperature <= 0f) { int best = 0; for (int i = 1; i < n; i++) if (logits[i] > logits[best]) best = i; return best; }
@@ -79,8 +84,15 @@ public sealed class AceStepCodeLm : IDisposable
         for (int i = 0; i < n; i++) { p[i] = Math.Exp((logits[i] - max) / temperature); sum += p[i]; }
         var order = Enumerable.Range(0, n).ToArray();
         Array.Sort(order, (a, b) => p[b].CompareTo(p[a]));
+        int limit = topK > 0 ? Math.Min(topK, n) : n;
+        double sumK = 0; for (int i = 0; i < limit; i++) sumK += p[order[i]];
         int keep = 0; double cum = 0;
-        while (keep < n) { cum += p[order[keep]] / sum; keep++; if (cum >= topP) break; }
+        while (keep < limit) { cum += p[order[keep]] / sumK; keep++; if (topP < 1f && cum >= topP) break; }
+        if (minP > 0f)
+        {
+            double floor = minP * p[order[0]];                                                   // relative to the most likely code (min-p is scale free: before or after renormalising)
+            while (keep > 1 && p[order[keep - 1]] < floor) keep--;
+        }
         double kept = 0; for (int i = 0; i < keep; i++) kept += p[order[i]];
         double r = rng.NextDouble() * kept;
         for (int i = 0; i < keep; i++) { r -= p[order[i]]; if (r <= 0) return order[i]; }

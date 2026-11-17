@@ -57,7 +57,7 @@ public sealed class OobleckDecoder : IDisposable
                 for (int i = 1; i <= blocks.Count; i++)
                 {
                     await d._l.AddSnakeAsync(w, L($"{i}.layers.0"), $"b{i}.snake");
-                    await d._l.AddConvAsync(w, L($"{i}.layers.1"), $"b{i}.up");
+                    await d._l.AddConvAsync(w, L($"{i}.layers.1"), $"b{i}.up", transposed: true);
                     int ii = i;
                     await d._l.AddResidualUnitsAsync(w, r => L($"{ii}.layers.{r + 2}.layers."), $"b{i}");
                 }
@@ -76,25 +76,28 @@ public sealed class OobleckDecoder : IDisposable
     /// </summary>
     public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeAsync(FV latent, int frames, CancellationToken ct = default)
     {
-        long maxElems = (long)_l["in"].D0 * frames;
+        long maxElems = (long)_l["in"].OutC * frames;
         int len = frames;
-        foreach (var (s, _, outC) in _blocks) { len *= s; maxElems = Math.Max(maxElems, (long)outC * len); }
+        foreach (var (st, _, outC) in _blocks) { len *= st; maxElems = Math.Max(maxElems, (long)outC * len); }
         var a = _acc.Allocate1D<float>(maxElems); var b = _acc.Allocate1D<float>(maxElems); var c = _acc.Allocate1D<float>(maxElems);
         var output = _acc.Allocate1D<float>((long)AudioChannels * frames * HopLength);
         try
         {
+            // channel-last [L, C] inside; the latent comes channel-major [64, T] and the audio leaves channel-major [2, L]
             int L = frames, ch;
-            _l.Conv1d("in", latent, a.View, LatentChannels, L, 3); ch = _l["in"].D0;            // a: [2048, T]
+            _l.Transpose(latent.SubView(0, (long)LatentChannels * frames), c.View, LatentChannels, frames);
+            _l.Conv1d("in", c.View, a.View, L, 3); ch = _l["in"].OutC;                          // a: [T, 2048]
             for (int i = 0; i < _blocks.Length; i++)
             {
                 var (s, inC, outC) = _blocks[i];
                 _l.Snake($"b{i + 1}.snake", a.View, b.View, inC, L);
-                _l.Upsample($"b{i + 1}.up", b.View, a.View, inC, L, s);
+                _l.Upsample($"b{i + 1}.up", b.View, a.View, L, s);
                 L *= s; ch = outC;
                 _l.ResidualUnits($"b{i + 1}", a.View, b.View, c.View, ch, L);
             }
             _l.Snake("out.snake", a.View, b.View, ch, L);
-            _l.Conv1d("out", b.View, output.View, ch, L, 3);
+            _l.Conv1d("out", b.View, c.View, L, 3);                                               // c: [L, 2]
+            _l.Transpose(c.View, output.View, L, AudioChannels);
             await _acc.SynchronizeAsync();
             return output;
         }

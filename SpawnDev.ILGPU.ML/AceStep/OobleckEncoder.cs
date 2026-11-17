@@ -78,25 +78,28 @@ public sealed class OobleckEncoder : IDisposable
     public async Task<MemoryBuffer1D<float, Stride1D.Dense>> EncodeAsync(FV audio, int frames, CancellationToken ct = default)
     {
         int L = frames * HopLength;
-        long maxElems = (long)_l["in"].D0 * L;
-        foreach (var (s, inC, outC) in _blocks) { maxElems = Math.Max(maxElems, (long)inC * L); L /= s; maxElems = Math.Max(maxElems, (long)outC * L); }
+        long maxElems = (long)_l["in"].OutC * L;
+        foreach (var (st, inC, outC) in _blocks) { maxElems = Math.Max(maxElems, (long)inC * L); L /= st; maxElems = Math.Max(maxElems, (long)outC * L); }
         var a = _acc.Allocate1D<float>(maxElems); var b = _acc.Allocate1D<float>(maxElems); var c = _acc.Allocate1D<float>(maxElems);
         var output = _acc.Allocate1D<float>((long)2 * LatentChannels * frames);
         try
         {
             L = frames * HopLength;
-            _l.Conv1d("in", audio, a.View, AudioChannels, L, 3);
-            int ch = _l["in"].D0;
+            // the first conv (2 channels: too narrow for the GEMM) channel-major, then channel-last [L, C] inside
+            _l.Conv1dChannelMajor("in", audio, c.View, L, 3);
+            int ch = _l["in"].OutC;
+            _l.Transpose(c.View, a.View, ch, L);
             for (int i = 0; i < _blocks.Length; i++)
             {
                 var (s, inC, outC) = _blocks[i];
                 _l.ResidualUnits($"b{i + 1}", a.View, b.View, c.View, inC, L);
                 _l.Snake($"b{i + 1}.snake", a.View, b.View, inC, L);
-                _l.Conv1d($"b{i + 1}.down", b.View, a.View, inC, L, (s + 1) / 2, 1, s);
+                _l.Conv1d($"b{i + 1}.down", b.View, a.View, L, (s + 1) / 2, 1, s);
                 L /= s; ch = outC;
             }
             _l.Snake("out.snake", a.View, b.View, ch, L);
-            _l.Conv1d("out", b.View, output.View, ch, L, 1);
+            _l.Conv1d("out", b.View, c.View, L, 1);                                               // c: [T, 128]
+            _l.Transpose(c.View, output.View, L, 2 * LatentChannels);
             await _acc.SynchronizeAsync();
             return output;
         }

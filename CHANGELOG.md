@@ -14,6 +14,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     attention (`SlidingWindow = -1`; ACE-Step's own 128 window is the test's control, 0.47 off on the lyrics).
   - Caption conditioning: Qwen3-0.6B through `Flux2TextEncoder` with ComfyUI's padding rule (keys from the first <|endoftext|> on masked): 2.1e-5; lyrics are the embedding rows.
   - `AceStepGenerator`: the whole codes-off text-to-music graph (ids, noise, silence latent -> Euler steps -> latent -> audio): latent 1.8e-4, audio 3.9e-4 on a 2-step run.
+  - Codes on: `AceStepCodeLm` (the 1.7B code LM on a new `Qwen3KvDecoder`: KV cache, CFG with the negative prompt, temperature / top-p / top-k / min-p, seeded) matches
+    ComfyUI teacher-forced (prompt 5.8e-5, steps <= 9.2e-7); `AceStepCodeDecoder` (FSQ + detokenizer) 1.2e-5; the whole codes-on graph latent 3.4e-4, audio 8.7e-4.
+  - `AceStepPrompts`: ComfyUI's caption / lyric / LM prompts, re-encoding to its ids exactly on 6 measured runs. `OobleckEncoder` (VAE encode): posterior 3.0e-6.
+  - `AceStepSilenceLatent`: ACE-Step's MIT silence_latent.pt (ComfyUI's own silence table is not shipped: a whole run on the MIT one is 1.6e-2 from ComfyUI's).
+  - The Oobleck VAE runs its convolutions as implicit GEMMs (tiled GEMM, fp32 activations, hi / lo fp16 weight halves; polyphase transposed convs): 10 s of audio decodes in
+    1.4 s (was 10.5 s), parity unchanged (5.3e-6).
+- `Flux2.Qwen3KvDecoder`: a Qwen3 causal LM with a key / value cache for any size (exact host rotary tables); `Qwen2Tokenizer.Decode`.
 - `Flux2Weights.FusedQkvSplit`: the q | k | v split of a Hugging Face Qwen3 file is recorded before the adapter fuses it, so `Flux2TextEncoder` runs any Qwen3 size (it only accepted
   Qwen3-4B's fused layout). FLUX.2, Z-Image and Qwen-Image text encoder gates unchanged.
 

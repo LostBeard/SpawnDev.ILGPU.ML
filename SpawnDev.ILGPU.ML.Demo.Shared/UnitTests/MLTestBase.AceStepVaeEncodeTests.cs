@@ -9,6 +9,40 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     /// <summary>
+    /// <see cref="AceStepCodeLm.Sample"/> (host side, every lane): temperature 0, top-k 1, min-p 1 and a tiny top-p all collapse to the argmax; top-k 2 never leaves the two
+    /// most likely; with no filter the draw frequencies follow the softmax (5000 draws, within 3 standard errors per code); the same seed repeats the same draws.
+    /// </summary>
+    [TestMethod]
+    public async Task AceStep_CodeSampler_Filters() => await RunTest(async accelerator =>
+    {
+        double[] logits = { 1.0, 3.0, 2.0, 0.5, 2.5 };                                         // argmax 1, then 4
+        var rng = new Random(7);
+        for (int i = 0; i < 50; i++)
+        {
+            Ur_Expect(AceStepCodeLm.Sample(logits, 0f, 0.9f, rng) == 1, "temperature 0 must be the argmax");
+            Ur_Expect(AceStepCodeLm.Sample(logits, 1f, 1f, rng, topK: 1) == 1, "top-k 1 must be the argmax");
+            Ur_Expect(AceStepCodeLm.Sample(logits, 1f, 1f, rng, minP: 1f) == 1, "min-p 1 must be the argmax");
+            Ur_Expect(AceStepCodeLm.Sample(logits, 1f, 1e-6f, rng) == 1, "a tiny top-p must be the argmax");
+            int k2 = AceStepCodeLm.Sample(logits, 1f, 1f, rng, topK: 2);
+            Ur_Expect(k2 == 1 || k2 == 4, $"top-k 2 drew {k2}");
+        }
+        const int N = 5000;
+        var counts = new int[logits.Length];
+        for (int i = 0; i < N; i++) counts[AceStepCodeLm.Sample(logits, 1f, 1f, rng)]++;
+        double z = logits.Sum(Math.Exp);
+        for (int c = 0; c < logits.Length; c++)
+        {
+            double p = Math.Exp(logits[c]) / z, se = Math.Sqrt(p * (1 - p) / N);
+            Ur_Expect(Math.Abs(counts[c] / (double)N - p) < 3 * se + 1e-3, $"code {c}: {counts[c] / (double)N:F4} vs softmax {p:F4}");
+        }
+        var r1 = new Random(42); var r2 = new Random(42);
+        bool same = Enumerable.Range(0, 20).All(_ => AceStepCodeLm.Sample(logits, 0.85f, 0.9f, r1) == AceStepCodeLm.Sample(logits, 0.85f, 0.9f, r2));
+        Ur_Expect(same, "the same seed must repeat the draws");
+        await Task.CompletedTask;
+        return $"filters collapse as specified; free draws {string.Join(" ", counts)} of {N}";
+    });
+
+    /// <summary>
     /// <see cref="AceStepPrompts"/> + <see cref="Flux2.Qwen2Tokenizer"/> (ACE-Step's MIT tokenizer.json files, ACE_DIR/hf-acestep15) give ComfyUI's ids exactly: the tags,
     /// language and lyrics are recovered from ComfyUI's own ids (<see cref="Flux2.Qwen2Tokenizer.Decode"/>), the four prompts rebuilt and re-encoded, compared id for id
     /// (caption 127, lyrics 350, LM positive 478, LM negative 451 after its left padding).
