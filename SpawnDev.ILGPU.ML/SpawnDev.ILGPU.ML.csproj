@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.19</Version>
-		<PackageReleaseNotes>v5.8.19 - Qwen-Image Edit 2511 checked against ComfyUI's own runs (ComfyUI's qwen_image_edit_2511_fp8mixed: reference pictures modulated at t = 0, switched on by the file's marker). StreamedModelWeights reads ComfyUI's mixed-precision fp8mixed safetensors (per-layer scales, quantization metadata checked: anything not computed exactly is refused). Fix: 8-bit streamed weights now run on WebGPU / WebGL / Wasm (a synchronous Synchronize() is gone). Tests load the large demo models from models.spawndev.com, so a fresh clone runs them. See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.20</Version>
+		<PackageReleaseNotes>v5.8.20 - on SpawnDev.ILGPU 5.4.35. ACE-Step 1.5 text-to-music, checked against ComfyUI's own runs (audio_ace_step_1_5_split): AceStepGenerator (caption + lyrics, condition encoder, the diffusion transformer, the Oobleck VAE), the 1.7B audio-code LM with a KV cache (AceStepCodeLm: CFG, temperature, top-p / top-k / min-p), audio codes to hints (AceStepCodeDecoder), ComfyUI's prompt templates (AceStepPrompts), the VAE encoder, and ACE-Step's MIT silence latent. Qwen3KvDecoder (any Qwen3 size, KV cache); Flux2TextEncoder runs any Qwen3 size. The Oobleck VAE decodes 10 s of audio in 1.4 s (implicit-GEMM convolutions). See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

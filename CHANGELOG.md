@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased - ACE-Step 1.5 (music) against ComfyUI
+## 5.8.20 - 2026-11-17 (nuget.org) - ACE-Step 1.5 (music) against ComfyUI; SpawnDev.ILGPU 5.4.35
 
 - **SpawnDev.ILGPU 5.4.35.** Wasm: a disposed buffer's JS objects are released after the work queued before it finishes (was immediate: "RangeError: offset is out of
   bounds"). ML Wasm-lane gate on 5.4.35-local.1: 1101 / 0 / 62, identical to 5.4.34, time 1.003x; light precision gates on every lane green on the stable package.
