@@ -11,8 +11,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2TextConnectors`: the text projection and the video / audio connectors (registers, split RoPE): conditioning 3.2e-5 (`Ltx2_TextConnectors_MatchComfyUi`).
   - `Ltx2Transformer`: the 48-block audio-video DiT, the guidance pair batched through each streamed block: call 0's blocks 2e-5 to 6e-5, outputs 4.6e-5 / 1.3e-5
     (`Ltx2_Transformer_Call0_MatchesComfyUi`).
+  - `Ltx2VideoDecoder` (the checkpoint's BF16 vae.decoder: no timestep conditioning, REFLECT spatial padding): frames 9.4e-6 (`Ltx2_VideoDecode_MatchesComfyUi`).
+  - `Ltx2AudioDecoder` (audio VAE decoder, causal in time, + the HiFi-GAN vocoder, 24 kHz): spectrogram 5.9e-7, waveform 3.6e-5 (`Ltx2_AudioDecode_MatchesComfyUi`).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.
+- **Fixed: the tiled GEMM's gathered rows with BF16 weights.** `TiledGemm.Gemm`'s gather loop decodes F16 weights only, so BF16 weights through it were wrong
+  (2.1 relative). New `TiledGemm.GemmGatherBf16` (its own kernel: `Gemm` keeps three k-loops, no WebGPU cost) behind `SparseKernels.ConvTapsBf16Exact`: 3.6e-7 vs a host
+  loop (`Ltx2_ConvBf16Exact_MatchesHost`). No existing caller passed BF16 + gather.
 - **`StreamedModelWeights`**: NVFP4 matrices (U8 codes + fp8 block scales + fp32 second scale; `Matrix` / `MatrixExact` decode them), ComfyUI's per-layer `comfy_quant`
   tags validated at open (float8_e4m3fn or nvfp4; an explicit `full_precision_matrix_mult: false` is refused), and `HostOnly` tensors read on demand (`ReadRowsAsync`).
 - **NVFP4 weights** (`Kernels.Nvfp4`: ComfyUI's mixed fp4 checkpoints, e.g. gemma_3_12B_it_fp4_mixed): high nibble first, e2m1 codes, one fp8 e4m3 scale per 16 inputs in cuBLAS's

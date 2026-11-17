@@ -26,7 +26,7 @@ LD = 132          # shared row stride (floats): 132 % 32 = 4 -> the transposed s
 out = []
 w = out.append
 
-def kernel(name, BK):
+def kernel(name, BK, variants=((True, True), (True, False), (False, False)), summary=None):
     # ONE kernel for all three variants (bf16 / f16 weights, dense / gathered rows), chosen by the uniform `mode` argument: on WebGPU each
     # kernel costs ~7 s of IL -> WGSL compile in the browser's interpreted .NET runtime plus a shader compile, MEASURED per variant.
     NA = BM * BK // TH              # A floats per thread per k step
@@ -34,7 +34,7 @@ def kernel(name, BK):
     sa = BK.bit_length() - 1
     sb = (BK // 2).bit_length() - 1
     tail = BK > 8                   # K is a multiple of 8, not necessarily of BK: the last step is masked
-    w(f"    /// <summary>k step {BK}. mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]). grid = ceil(M/128) * ceil(N/128), group = {TH}, shared {2 * BK * LD * 4} bytes.</summary>")
+    w(summary or f"    /// <summary>k step {BK}. mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]) - gathered rows read F16 weights only (bf16 gathered: GemmGatherBf16). grid = ceil(M/128) * ceil(N/128), group = {TH}, shared {2 * BK * LD * 4} bytes.</summary>")
     w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)")
     w("    {")
     w("        bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;")
@@ -125,18 +125,24 @@ def kernel(name, BK):
             w(f"{sp}    }}")
         w(f"{sp}    Group.Barrier();")
         w(f"{sp}}}")
-    w("        if (gather)")
-    w("        {")
-    kloop(True, True, 12)
-    w("        }")
-    w("        else if (f16)")
-    w("        {")
-    kloop(True, False, 12)
-    w("        }")
-    w("        else")
-    w("        {")
-    kloop(False, False, 12)
-    w("        }")
+    if len(variants) == 1:
+        w("        {")
+        kloop(variants[0][0], variants[0][1], 12)
+        w("        }")
+    else:
+        assert tuple(variants) == ((True, True), (True, False), (False, False)), "the dispatch below is written for these three"
+        w("        if (gather)")
+        w("        {")
+        kloop(True, True, 12)
+        w("        }")
+        w("        else if (f16)")
+        w("        {")
+        kloop(True, False, 12)
+        w("        }")
+        w("        else")
+        w("        {")
+        kloop(False, False, 12)
+        w("        }")
     for j in range(8):
         w(f"        int n{j} = nBase + tx + {16 * j};")
         w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? Lo(Bias[n{j} >> 1], f16) : Hi(Bias[n{j} >> 1], f16)) : 0f;")
@@ -171,6 +177,9 @@ w("    /// <summary>The GEMM kernel every caller loads (one place to choose a va
 w("    /// kernel(name, 16), 17 KB shared, masked k tail) was SLOWER than 8 on WebGPU (7.0-7.4 vs 7.6-8.2 TFLOPS) and on OpenCL.</summary>")
 w("    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> For(Accelerator accelerator) => Gemm;")
 w("")
+w("    /// <summary>The gathered-rows GEMM with BF16 weights (<see cref=\"GemmGatherBf16\"/>): a kernel of its own, so <see cref=\"Gemm\"/> keeps three k-loops.</summary>")
+w("    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> ForGatherBf16(Accelerator accelerator) => GemmGatherBf16;")
+w("")
 w("    /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>")
 w("    /// <remarks>Dense A: A[m * K + k]. Gathered A (pass <paramref name=\"cin\"/>): A[nbr[m * 27 + tap] * cin + ci], so the activation bound is rowsA * cin, not M * K or rowsA * K (a 3x3x3 convolution on 225k voxels of 512 channels has M * K = 3.1e9 and is still exact).</remarks>")
 w("    public static bool Fits(long M, long K, long N, long rowsA = -1, long cin = 0) => M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (cin > 0 ? (rowsA < 0 ? M : rowsA) * cin < int.MaxValue : M * K < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue));")
@@ -198,6 +207,8 @@ w("        return src >= 0 ? A[src * cin + ci] : 0f;")
 w("    }")
 w("")
 kernel("Gemm", BK)
+kernel("GemmGatherBf16", BK, variants=((False, True),),
+       summary=f"    /// <summary>k step {BK}: gathered rows (A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]) with BF16 weights [N, K] (the LTX-2 VAE's exact convolutions). Pass mode = ModeBf16 | ModeGather (the bias is read as bf16). grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
 w("}")
 
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")

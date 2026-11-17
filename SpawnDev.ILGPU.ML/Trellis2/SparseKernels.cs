@@ -273,6 +273,28 @@ public sealed class SparseKernels
             M, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, addToOutput ? 2 : 0, TiledGemm.ModeF16 | TiledGemm.ModeGather);
     }
 
+    /// <summary>
+    /// <see cref="ConvTaps"/> with bf16 weights in the gather layout [cout][taps][cin] (and an optional bf16 bias) on the portable tiled GEMM: fp32 activations, every product
+    /// exact (no tensor cores, no fp16 rounding of the weight). The LTX-2 VAE decoder's checkpoint convolutions are bf16. Needs <see cref="ConvTapsBf16ExactOk"/>.
+    /// </summary>
+    public void ConvTapsBf16Exact(FV x, IV nbr, ArrayView1D<BFloat16, Stride1D.Dense> weight, ArrayView1D<BFloat16, Stride1D.Dense>? bias, FV o, int M, int cin, int cout, int taps)
+    {
+        if (!UseTiled(taps * cin)) throw new NotSupportedException($"{taps} x {cin} inputs: not a multiple of the tiled GEMM's k step (or no tiled GEMM on this backend)");
+        if ((((long)cout * taps * cin) & 1) != 0 || (((IContiguousArrayView)weight.BaseView).Index & 1) != 0) throw new ArgumentException("the bf16 weight is read as 32-bit pairs: an even count from an even start");
+        if (bias is { } b && ((b.Length & 1) != 0 || (((IContiguousArrayView)b.BaseView).Index & 1) != 0)) throw new ArgumentException("the bf16 bias is read as 32-bit pairs: an even count from an even start");
+        // its own kernel: TiledGemm.Gemm's gathered loop decodes F16 weights only (MEASURED 2026-11-17: bf16 weights through it came out 2.1 relative off; this kernel 3.6e-7, Ltx2_ConvBf16Exact_MatchesHost)
+        _tiledGatherBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.ForGatherBf16(_acc));
+        EnsureTiledDummies();
+        int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
+        _tiledGatherBf16(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<BFloat16, uint>(), bias.HasValue ? bias.Value.Cast<BFloat16, uint>() : _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
+            M, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, 0, TiledGemm.ModeBf16 | TiledGemm.ModeGather);
+    }
+
+    private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledGatherBf16;
+
+    /// <summary>True when <see cref="ConvTapsBf16Exact"/> can run for these sizes.</summary>
+    public bool ConvTapsBf16ExactOk(int M, int taps, int cin, int cout, long xRows) => UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
+
     /// <summary>True when <see cref="ConvTaps"/> would run a GEMM (tensor cores or the tiled kernel) for these sizes instead of its naive loop.</summary>
     public bool ConvTapsIsGemm(int M, int taps, int cin, int cout, long xRows)
         => (Cuda && cin % MmaGemm.BK == 0 && cout % 2 == 0) || (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin));
