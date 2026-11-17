@@ -81,5 +81,7 @@ implementation is what the template runs; this source is the port's reference, t
   The SkinTokens RoPE table rounds frequencies to bf16 (1.7e-2 off a float32 Qwen3): the decoder uses exact host tables. Left: prompt templates (caption / lyrics / LM).
 - 11-17: PROMPTS measured from ComfyUI's ids (decoded with ACE-Step's MIT tokenizer): `AceStepPrompts` (caption, lyrics, LM positive with the metas in <think>, LM negative
   with an empty <think>) + `Qwen2Tokenizer` re-encode to ComfyUI's ids EXACTLY (127 / 350 / 478 / 451). ComfyUI's instruction is "Generate audio semantic tokens based on the
-  given conditions:" in BOTH prompts (not ACE-Step's "Fill the audio semantic mask"). OPEN (asked Lore 11-17): where ComfyUI cuts long lyrics (mid-word, same cut in both
-  prompts), and how unset metas print.
+  given conditions:" in BOTH prompts (not ACE-Step's "Fill the audio semantic mask").
+- 11-17 (Lore's template runs): NO lyric cut (the split template's own lyrics end mid-word); lyric prompt = lyrics as given + <|endoftext|><|endoftext|>; the LM prompt
+  strips them; duration prints in the caption and LM; bpm / time signature / key are always set (no "none" in the node); language "unknown" prints on the lyric side only.
+  AceStep_Prompts_MatchComfyUiIds: all 24 id lists identical (6 runs x caption / lyrics / LM+ / LM-).

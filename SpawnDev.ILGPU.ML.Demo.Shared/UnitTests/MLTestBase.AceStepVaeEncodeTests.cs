@@ -21,30 +21,40 @@ public abstract partial class MLTestBase
         string Tok(string dir) { var p = Path.Combine(hf, dir, "tokenizer.json"); if (!File.Exists(p)) throw new UnsupportedTestException($"{p} not found (ACE-Step/Ace-Step1.5)"); return File.ReadAllText(p); }
         var te = new Flux2.Qwen2Tokenizer(Tok("Qwen3-Embedding-0.6B"));
         var lmTok = new Flux2.Qwen2Tokenizer(Tok("acestep-5Hz-lm-1.7B"));
-        using var idsDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(Ace_Dumps(), "ace_te_codes1_ids.json")));
-        var calls = idsDoc.RootElement.GetProperty("calls");
-        int[] Ids(int call)
-        {
-            var e = calls[call].GetProperty("ids");
-            static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
-            if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
-            return Flat(e).ToArray();
-        }
-        int[] caption = Ids(0), lyricIds = Ids(1), lmPos = Ids(2), lmNeg = AceStepCodeLm.StripLeftPadding(Ids(3));
         static string Between(string s, string a, string b) { int i = s.IndexOf(a, StringComparison.Ordinal) + a.Length; return s[i..s.IndexOf(b, i, StringComparison.Ordinal)]; }
-        string capText = te.Decode(caption), lyrText = te.Decode(lyricIds);
-        string tags = Between(capText, "# Caption\n", "\n\n# Metas"), language = Between(lyrText, "# Languages\n", "\n\n# Lyric"), lyrics = Between(lyrText, "# Lyric\n", "\n<|endoftext|>");
         var report = new List<string>(); bool all = true;
-        void Check(string name, int[] ours, int[] theirs)
+        // SpawnGen's runs: the original (10 s) and the template cases (durations 10 / 30 / 120, short lyrics, language "unknown"), each with the LM prompt (codes on)
+        foreach (var (file, duration) in new[] { ("ace_te_codes1_ids.json", 10), ("ace_tmpl_d10_codes1_ids.json", 10), ("ace_tmpl_d30_codes1_ids.json", 30),
+            ("ace_tmpl_d120_codes1_ids.json", 120), ("ace_tmpl_short_codes1_ids.json", 10), ("ace_tmpl_unknownlang_codes1_ids.json", 10) })
         {
-            bool same = ours.SequenceEqual(theirs); all &= same;
-            int first = Enumerable.Range(0, Math.Min(ours.Length, theirs.Length)).FirstOrDefault(i => ours[i] != theirs[i], -1);
-            report.Add($"{name}: {ours.Length} vs {theirs.Length} ids, {(same ? "identical" : $"first difference at {first}")}");
+            var path = Path.Combine(Ace_Dumps(), file);
+            if (!File.Exists(path)) { report.Add($"{file}: missing"); all = false; continue; }
+            using var idsDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            var calls = idsDoc.RootElement.GetProperty("calls");
+            int[] Ids(int call)
+            {
+                var e = calls[call].GetProperty("ids");
+                static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
+                if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
+                return Flat(e).ToArray();
+            }
+            int[] caption = Ids(0), lyricIds = Ids(1), lmPos = Ids(2), lmNeg = AceStepCodeLm.StripLeftPadding(Ids(3));
+            // the user's inputs, recovered from ComfyUI's ids: tags from the caption, language and lyrics (as given, trailing white space included) from the lyric side
+            string capText = te.Decode(caption), lyrText = te.Decode(lyricIds);
+            string tags = Between(capText, "# Caption\n", "\n\n# Metas"), language = Between(lyrText, "# Languages\n", "\n\n# Lyric"), lyrics = Between(lyrText, "# Lyric\n", "<|endoftext|>");
+            var parts = new List<string>();
+            void Check(string name, int[] ours, int[] theirs)
+            {
+                bool same = ours.SequenceEqual(theirs); all &= same;
+                int first = Enumerable.Range(0, Math.Min(ours.Length, theirs.Length)).FirstOrDefault(i => ours[i] != theirs[i], -1);
+                parts.Add(same ? $"{name} {theirs.Length} =" : $"{name} {ours.Length} vs {theirs.Length}, first difference at {first}");
+            }
+            Check("caption", te.Encode(AceStepPrompts.Caption(tags, 190, "4", "E minor", duration)), caption);
+            Check("lyrics", te.Encode(AceStepPrompts.Lyrics(language, lyrics)), lyricIds);
+            Check("LM+", lmTok.Encode(AceStepPrompts.LmPositive(tags, lyrics, 190, "4", "E minor", duration)), lmPos);
+            Check("LM-", lmTok.Encode(AceStepPrompts.LmNegative(tags, lyrics)), lmNeg);
+            report.Add($"{file} ({duration} s, {language}): {string.Join(", ", parts)}");
         }
-        Check("caption", te.Encode(AceStepPrompts.Caption(tags, 190, "4", "E minor", 10)), caption);
-        Check("lyrics", te.Encode(AceStepPrompts.Lyrics(language, lyrics)), lyricIds);
-        Check("LM positive", lmTok.Encode(AceStepPrompts.LmPositive(tags, lyrics, 190, "4", "E minor", 10)), lmPos);
-        Check("LM negative", lmTok.Encode(AceStepPrompts.LmNegative(tags, lyrics)), lmNeg);
         foreach (var line in report) Console.WriteLine("[AceStep] prompts vs ComfyUI ids: " + line);
         Ur_Expect(all, string.Join("; ", report));
         await Task.CompletedTask;

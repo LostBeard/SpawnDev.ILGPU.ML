@@ -6,7 +6,9 @@ namespace SpawnDev.ILGPU.ML.AceStep;
 /// The prompts ComfyUI's TextEncodeAceStepAudio1.5 builds, as measured from its token ids on SpawnGen's dumps (decoded with ACE-Step's own MIT tokenizer; re-encoded here they
 /// give ComfyUI's ids exactly: AceStep_Prompts_MatchComfyUiIds). Tokenise with <see cref="Flux2.Qwen2Tokenizer"/> on ACE-Step's tokenizer.json (Qwen3-Embedding-0.6B's for the
 /// caption and lyrics, acestep-5Hz-lm-1.7B's for the LM; the template text tokenises the same with either).
-/// <para>Measured so far on one run (bpm, time signature, key all set); how ComfyUI prints a missing value and where it cuts long lyrics are still to be measured.</para>
+/// <para>Measured over durations 10 / 30 / 120 s, short and long lyrics and language "unknown" (SpawnGen's template runs): the lyrics pass through whole (no cut; the
+/// split template's own lyrics simply end mid-word); the caption and LM prompt print the duration; bpm, time signature and key are always set in ComfyUI's node (no "none").
+/// The lyric prompt takes the lyrics as given; the LM prompt takes them stripped of surrounding white space (a trailing newline does not repeat before &lt;|im_end|&gt;).</para>
 /// </summary>
 public static class AceStepPrompts
 {
@@ -23,7 +25,7 @@ public static class AceStepPrompts
          + "<|endoftext|>\n<|endoftext|>";
 
     /// <summary>The lyric prompt (its tokens' embedding rows are the lyric conditioning).</summary>
-    public static string Lyrics(string language, string lyrics) => "# Languages\n" + language + "\n\n# Lyric\n" + lyrics + "\n<|endoftext|><|endoftext|>";
+    public static string Lyrics(string language, string lyrics) => "# Languages\n" + language + "\n\n# Lyric\n" + lyrics + "<|endoftext|><|endoftext|>";
 
     /// <summary>The code LM's positive prompt: the chat with the metas in the assistant's thinking block.</summary>
     public static string LmPositive(string tags, string lyrics, int bpm, string timeSignature, string keyScale, int durationSeconds)
@@ -38,5 +40,5 @@ public static class AceStepPrompts
     public static string LmNegative(string tags, string lyrics) => LmUser(tags, lyrics) + "<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n";
 
     private static string LmUser(string tags, string lyrics)
-        => "<|im_start|>system\n# Instruction\n" + Instruction + "\n\n<|im_end|>\n<|im_start|>user\n# Caption\n" + tags + "\n\n# Lyric\n" + lyrics + "\n<|im_end|>\n";
+        => "<|im_start|>system\n# Instruction\n" + Instruction + "\n\n<|im_end|>\n<|im_start|>user\n# Caption\n" + tags + "\n\n# Lyric\n" + lyrics.Trim() + "\n<|im_end|>\n";
 }
