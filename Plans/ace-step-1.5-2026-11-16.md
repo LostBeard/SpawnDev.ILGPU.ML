@@ -53,6 +53,12 @@ implementation is what the template runs; this source is the port's reference, t
   (acestep-v15-turbo, [64, 15000], downloaded to F:/spawndev-acestep/hf-acestep15) matches its first 4 frames to 4 decimals, but its later frames vary (mean within 0.009
   of the steady row). ComfyUI's table is never copied into the library: the generator takes the silence latent as an input. To match from MIT sources: port the Oobleck
   ENCODER, encode silence, round to 4 decimals, compare with ComfyUI's measured rows (also needed for audio-to-audio / covers).
+- 11-17: OobleckEncoder ported (shared OobleckLayers; the decoder unchanged, 3.1e-6). Encoding digital silence gives the right STRUCTURE (4 lead-in frames, then constant)
+  but is 2.5e-2 off ComfyUI's table (and off the MIT tensor's first frames, which equal ComfyUI's): either the encoder port differs or ACE-Step's silence latent was not
+  made from zeros. Asked Lore for ComfyUI VAEEncodeAudio of (a) zeros, (b) ace_g0_audio. Test MLTestBase.AceStepSilenceTests.cs stays uncommitted until then.
+- 11-17 CUDA: the 1.7B code LM (Flux2TextEncoder on qwen_1.7b_ace15) teacher-forced on ComfyUI's run: prompt pass 2.4e-5, the 11 tapped code steps 2.5e-6 .. 5.9e-6
+  (positive row; the CFG negative row is LEFT-padded with 151643: not run yet). Stage 5a done; next 5b: sampling (CFG 2 on logits, temperature 0.85, top-p 0.9 -
+  not bit-reproducible vs torch, so gated by teacher forcing) + codes -> FSQ -> detokenizer -> hints vs ComfyUI's detokenizer tap (ace_g1).
 
 ## Stages (each gated against SpawnGen's ComfyUI dumps, parity first)
 1. Files: the four ComfyUI files (models host mirror, standing go); read tensor names / shapes / dtypes; map to the facts above.

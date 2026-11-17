@@ -181,6 +181,51 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The 5 Hz audio-code LM (qwen_1.7b_ace15, Qwen3 1.7B, 28 layers) teacher-forced on ComfyUI's own run (SpawnGen's telogits2 dump): the positive prompt [478] then the
+    /// first 11 code tokens ComfyUI sampled, one causal pass; our final-norm rows against ComfyUI's model.norm taps (call 0: the prompt pass, rows 0 .. 477; call k: the step
+    /// that took code k - 1, our row 477 + k). The logits are these rows times the tied embedding table, so equal rows are equal logits.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_CodeLm_TeacherForced_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        var lmPath = Ace_Require(accelerator, Path.Combine("text_encoders", "qwen_1.7b_ace15.safetensors"));
+        var d = Ace_Dumps();
+        using var idsDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(d, "ace_tl_codes1_norm_ids.json")));
+        var calls = idsDoc.RootElement.GetProperty("calls");
+        int[] Ids(int call)
+        {
+            var e = calls[call].GetProperty("ids");
+            static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
+            if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
+            return Flat(e).ToArray();
+        }
+        var prompt = Ids(2);                                                                     // the positive LM prompt (call 3 is the CFG negative, left-padded)
+        const int Steps = 11, W = 2048;
+        var steps = Enumerable.Range(4, Steps).Select(c => Ids(c)[0]).ToArray();                 // the token fed at each step (both rows get the same)
+        var seq = prompt.Concat(steps).ToArray();
+        string Tap(int call, string shape) => Path.Combine(d, $"ace_tl_codes1_norm_qwen3_2b_transformer_model_norm_{call}_out0_f32_{shape}.raw");
+        var src = new LocalFolderModelSource(Path.GetDirectoryName(lmPath)!);
+        using var w = await Flux2.Flux2Weights.LoadAsync(accelerator, src, "", Path.GetFileName(lmPath), 28, finalNorm: true);
+        using var lm = new Flux2.Flux2TextEncoder(accelerator, w, new[] { 28 }, finalNorm: true, maxTokens: seq.Length) { PreciseActivations = true };
+        var ours = await lm.Encode(seq, seq.Length).SubView(0, (long)seq.Length * W).CopyToHostAsync();
+        var report = new List<string>(); double worst = 0;
+        var prompt0 = F2_Raw(Tap(0, "2x478x2048"), 2L * 478 * W)[..(478 * W)];                // the positive row of the prompt pass
+        double ep = F2_RelRms(ours[..(478 * W)], prompt0); worst = Math.Max(worst, ep);
+        report.Add($"prompt [478] {ep:E2} (last row {F2_RelRms(ours[(477 * W)..(478 * W)], prompt0[(477 * W)..]):E2})");
+        var stepErr = new List<string>();
+        for (int k = 1; k <= Steps; k++)
+        {
+            var tap = F2_Raw(Tap(k, "2x1x2048"), 2L * W)[..W];
+            double e = F2_RelRms(ours[((477 + k) * W)..((478 + k) * W)], tap); worst = Math.Max(worst, e);
+            stepErr.Add($"{e:E1}");
+        }
+        report.Add($"steps 1..{Steps}: {string.Join(" ", stepErr)}");
+        foreach (var line in report) Console.WriteLine("[AceStep] code LM teacher-forced vs ComfyUI: " + line);
+        Ur_Expect(worst < 1e-4, string.Join("; ", report));                                   // MEASURED 2026-11-17 CUDA: prompt 2.4e-5, steps 2.5e-6 .. 5.9e-6
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The Oobleck VAE decoder (<see cref="OobleckDecoder"/>, ace_1.5_vae) against ComfyUI's VAEDecodeAudio of the codes-off graph's final latent [1, 64, 250]:
     /// stereo [2, 480000] at 48 kHz (1920 samples per latent frame).
     /// </summary>
