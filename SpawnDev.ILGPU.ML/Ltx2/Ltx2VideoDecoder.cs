@@ -133,6 +133,36 @@ public sealed class Ltx2VideoDecoder : IDisposable
     /// </summary>
     public async Task<float[]> DecodeAsync(float[] z, int Fz, int h, int w)
     {
+        var video = await DecodeToDeviceAsync(z, Fz, h, w);
+        var result = await video.View.SubView(0, 3L * (8 * (Fz - 1) + 1) * 32 * h * 32 * w).CopyToHostAsync();
+        Drop(video); Flush();
+        return result;
+    }
+
+    /// <summary>
+    /// <see cref="DecodeAsync"/> to RGBA bytes, one array per frame (converted on the device and read back a frame at a time: no float array of the whole clip on the host;
+    /// a 768 x 512 x 121 clip is 566 MB of floats). The conversion is <see cref="Wan.WanVideo.GetFrameRgba"/>'s: round((v + 1) * 127.5) clamped.
+    /// </summary>
+    public async Task<byte[][]> DecodeRgbaFramesAsync(float[] z, int Fz, int h, int w)
+    {
+        var video = await DecodeToDeviceAsync(z, Fz, h, w);
+        int frames = 8 * (Fz - 1) + 1, pixels = 32 * h * 32 * w;                                    // 32 x 32 pixels per latent position (the 4 x 4 patch after three 2x upsamplers)
+        var o = new byte[frames][];
+        using var packed = _acc.Allocate1D<int>(pixels);
+        for (int f = 0; f < frames; f++)
+        {
+            _lk.FrameRgba(video.View, packed.View, frames, pixels, f);
+            var ints = await packed.View.CopyToHostAsync();
+            o[f] = new byte[pixels * 4];
+            Buffer.BlockCopy(ints, 0, o[f], 0, o[f].Length);
+        }
+        Drop(video); Flush();
+        return o;
+    }
+
+    // the decoded video [3, 8 (Fz - 1) + 1, 32 h, 32 w] channel-first on the device (a pooled buffer: the caller Drops it)
+    private async Task<Buf> DecodeToDeviceAsync(float[] z, int Fz, int h, int w)
+    {
         int T = Fz, H = h, W = w, vox = T * H * W;
         if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, Fz, h, w]");
         using var zIn = _acc.Allocate1D(z);
@@ -156,10 +186,9 @@ public sealed class Ltx2VideoDecoder : IDisposable
         var video = Tmp(3L * T * Patch * H * Patch * W);
         _lk.UnpatchifyVideo(head.View, video.View, T, H, W);
         Drop(head);
-        await _acc.SynchronizeAsync();
-        var result = await video.View.SubView(0, 3L * T * Patch * H * Patch * W).CopyToHostAsync();
-        Drop(video); Flush();
-        return result;
+        await _acc.SynchronizeAsync();                                                               // zIn is disposed on return: nothing queued may still read it
+        Flush();
+        return video;
     }
 
     public void Dispose()

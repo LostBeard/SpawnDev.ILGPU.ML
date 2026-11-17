@@ -562,6 +562,69 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="Ltx2Pipeline"/> end to end: a prompt to a clip with sound (Gemma 3 encode, connectors, the sampler, video and audio decode), written as PNG frames and a
+    /// WAV file to LTX2_PIPE_OUT (default: a folder in the temp directory) so a person can look at it. LTX2_PIPE_SIZE "width x height x frames" (default 768x512x121),
+    /// LTX2_PIPE_DISTILLED (default 1: the distilled LoRA, 8 steps, no guidance; 0: LTX2_PIPE_STEPS steps at cfg 4), LTX2_PIPE_PROMPT, LTX2_PIPE_SEED.
+    /// No reference for the whole run (every stage has its own ComfyUI gate): the checks are shape, finiteness, and that the frames are a moving picture
+    /// (not one colour, not one frame repeated). Prints "[Benchmark] Ltx2 pipeline ...".
+    /// </summary>
+    [TestMethod(Timeout = 10800000, Category = "HeavyModel")]
+    public async Task Ltx2_Pipeline_GeneratesClip() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var paths = Ltx2Paths.InFolder();
+        var src = new LocalFolderModelSource(Ltx2_Models());
+        if (!src.Exists(paths.Checkpoint) || !src.Exists(paths.TextEncoder)) throw new UnsupportedTestException($"needs {paths.Checkpoint} and {paths.TextEncoder} in {Ltx2_Models()}");
+        string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } v ? v : fallback;
+        var size = Env("LTX2_PIPE_SIZE", "768x512x121").Split('x').Select(int.Parse).ToArray();
+        bool distilled = Env("LTX2_PIPE_DISTILLED", "1") != "0";
+        if (distilled && !src.Exists(paths.DistilledLora!)) throw new UnsupportedTestException($"the distilled run needs {paths.DistilledLora}");
+        string prompt = Env("LTX2_PIPE_PROMPT", "A golden retriever puppy runs toward the camera through a sunlit meadow of tall grass and wildflowers, ears flapping, shallow depth of field, "
+            + "warm evening light, cinematic slow motion. Birds sing and a gentle breeze rustles the grass.");
+        string outDir = Env("LTX2_PIPE_OUT", Path.Combine(Path.GetTempPath(), "spawndev-ltx2-clip"));
+        Directory.CreateDirectory(outDir);
+        var req = new Ltx2Request
+        {
+            Prompt = prompt, NegativePrompt = "worst quality, inconsistent motion, blurry, jittery, distorted", Width = size[0], Height = size[1], Frames = size[2],
+            Distilled = distilled, Steps = int.Parse(Env("LTX2_PIPE_STEPS", "20")), Cfg = 4f, Seed = long.Parse(Env("LTX2_PIPE_SEED", "42")),
+        };
+        var pipe = new Ltx2Pipeline(accelerator, src, paths);
+        var stages = new List<string>();
+        var progress = new Progress<Wan.WanProgress>(p => { if (p.Fraction is 0.0 or 1.0) lock (stages) stages.Add($"{p.Stage}: {p.Message}"); });
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var clip = await pipe.GenerateAsync(req, progress);
+        double total = sw.Elapsed.TotalSeconds;
+        var frames = clip.Video.FramesRgba ?? throw new Exception("no RGBA frames");
+        int w = clip.Video.Width, h = clip.Video.Height, n = frames.Count;
+        Ur_Expect(n == req.Frames && w == req.Width && h == req.Height && frames.All(f => f.Length == 4 * w * h), $"{n} frames of {w} x {h}");
+        // a moving picture: the first frame has contrast, and the last differs from the first
+        static (double Mean, double Std) Luma(byte[] f) { double s = 0, s2 = 0; int c = f.Length / 4; for (int i = 0; i < f.Length; i += 4) { double y = 0.299 * f[i] + 0.587 * f[i + 1] + 0.114 * f[i + 2]; s += y; s2 += y * y; } double m = s / c; return (m, Math.Sqrt(Math.Max(0, s2 / c - m * m))); }
+        var (m0, sd0) = Luma(frames[0]); var (m1, sd1) = Luma(frames[n - 1]);
+        double moved = 0; for (int i = 0; i < frames[0].Length; i += 4) moved += Math.Abs(frames[0][i + 1] - frames[n - 1][i + 1]); moved /= w * h;
+        for (int i = 0; i < n; i++) await File.WriteAllBytesAsync(Path.Combine(outDir, $"frame_{i:D4}.png"), SpawnDev.ILGPU.ML.Preprocessing.PngEncoder.Encode(frames[i], w, h));
+        double audioRms = 0; string wavNote = "no audio";
+        if (clip.Audio is { } wav)
+        {
+            int samples = wav.Length / 2;
+            for (int i = 0; i < wav.Length; i++) { if (!float.IsFinite(wav[i])) throw new Exception($"non-finite audio sample at {i}"); audioRms += (double)wav[i] * wav[i]; }
+            audioRms = Math.Sqrt(audioRms / Math.Max(1, wav.Length));
+            // 16-bit PCM stereo WAV (interleaved from the channel-first waveform)
+            using var fs = File.Create(Path.Combine(outDir, "audio.wav")); using var bw = new BinaryWriter(fs);
+            int dataBytes = samples * 4, rate = clip.AudioSampleRate;
+            bw.Write("RIFF"u8.ToArray()); bw.Write(36 + dataBytes); bw.Write("WAVEfmt "u8.ToArray()); bw.Write(16); bw.Write((short)1); bw.Write((short)2); bw.Write(rate); bw.Write(rate * 4); bw.Write((short)4); bw.Write((short)16);
+            bw.Write("data"u8.ToArray()); bw.Write(dataBytes);
+            for (int i = 0; i < samples; i++) for (int c = 0; c < 2; c++) bw.Write((short)Math.Clamp((int)MathF.Round(wav[c * samples + i] * 32767f), -32768, 32767));
+            wavNote = $"{samples / (double)rate:F2} s of stereo at {rate} Hz, rms {audioRms:F4}";
+        }
+        string secs = string.Join(", ", clip.Seconds.Select(kv => $"{kv.Key} {kv.Value:F1} s"));
+        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1} | {wavNote} | {outDir}";
+        Console.WriteLine("[Benchmark] Ltx2 pipeline: " + line);
+        lock (stages) Console.WriteLine("[Ltx2] pipeline stages: " + string.Join(" | ", stages));
+        Ur_Expect(sd0 > 4 && sd1 > 4 && moved > 1, "the frames are flat or do not move: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// ComfyUI's whole guided sampling run (the same graph as <see cref="Ltx2_GuidedCall_MatchesComfyUi"/>: CFG 4, Euler over sigmas [1, 0.1, 0], strengths 1.0 and 0.6)
     /// through <see cref="Ltx2AvModel"/>'s guided SampleAsync:
     /// masked sampling (the model sees m x + (1 - m) latent, the step uses m D + (1 - m) latent). Against the latent entering call 1 and the final latent (guide frame
