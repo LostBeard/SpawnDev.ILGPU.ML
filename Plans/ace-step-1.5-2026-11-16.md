@@ -42,6 +42,11 @@ implementation is what the template runs; this source is the port's reference, t
   Qwen3 0.6B (28 layers, vocab 151669, width 1024) and 1.7B (28 layers, vocab 217204 = Qwen + audio codes, width 2048), both with per-head q/k norm.
   VAE decoder: ConvTranspose kernels 20 / 12 / 8 / 8 / 4 = strides 10 / 6 / 4 / 4 / 2 = 1920 samples per frame (Lore's audio: 480000 / 250).
 - 11-16 23:52 CUDA: `OobleckDecoder` vs ComfyUI's VAEDecodeAudio 3.1e-6 (peaks equal) (`AceStep_VaeDecode_MatchesComfyUi`). Stage 2 done.
+- 11-17 CUDA, codes off: `AceStepDiT` vs ComfyUI's decoder tap (call 0) 1.5e-4; `AceStepConditionEncoder` vs the encoder tap 6.3e-6 (lyrics 7.5e-5, timbre
+  2.2e-6, text 3.8e-6) - ONLY with FULL attention: ComfyUI's implementation runs no sliding window (ACE-Step's own |i - j| <= 128 puts the 350 lyric tokens 0.47 off),
+  so both default to SlidingWindow = -1. Text: the caption ids through Qwen3-0.6B (Flux2TextEncoder, last layer + final norm) 2.1e-5, with ComfyUI's padding rule: the
+  prompt is real up to its FIRST <|endoftext|> (151643), every key from there on is padding (rows still output); every key valid misses at 0.10 (numpy rebuild:
+  _tuvok-handoff/ace_qwen06_variants.py). Lyrics = the 0.6B's embed_tokens rows exactly (7.7e-9). Stages 3 and 4 done.
 
 ## Stages (each gated against SpawnGen's ComfyUI dumps, parity first)
 1. Files: the four ComfyUI files (models host mirror, standing go); read tensor names / shapes / dtypes; map to the facts above.

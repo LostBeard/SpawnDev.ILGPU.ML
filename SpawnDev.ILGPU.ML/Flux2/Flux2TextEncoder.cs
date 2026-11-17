@@ -80,9 +80,11 @@ public sealed class Flux2TextEncoder : IDisposable
         _hidden = weights.Shape("layers.0.input_layernorm.weight")[0];
         if (_fusedQkv)
         {
-            // the fused form is the Qwen3 adapter's (q | k | v of Qwen3-4B); its split follows from the head counts
-            if (_hidden != Hidden || weights.Shape("layers.0.self_attn.qkv_proj.weight")[0] != QkvCols) throw new NotSupportedException("a fused q|k|v of a model other than Qwen3-4B");
-            _qCols = QCols; _kvCols = KvCols;
+            // the fused form: the adapter's (it records the split it fused: any Qwen3 size) or our export's (Qwen3-4B)
+            int rows = weights.Shape("layers.0.self_attn.qkv_proj.weight")[0];
+            if (weights.FusedQkvSplit is (int q, int kv)) { if (q + 2 * kv != rows) throw new InvalidDataException($"fused q|k|v has {rows} rows, the recorded split {q} | {kv} | {kv}"); _qCols = q; _kvCols = kv; }
+            else if (_hidden == Hidden && rows == QkvCols) { _qCols = QCols; _kvCols = KvCols; }
+            else throw new NotSupportedException($"a fused q|k|v ({rows} rows, hidden {_hidden}) without a recorded split and not Qwen3-4B's");
         }
         else { _qCols = weights.Shape("layers.0.self_attn.q_proj.weight")[0]; _kvCols = weights.Shape("layers.0.self_attn.k_proj.weight")[0]; }
         _qkvCols = _qCols + 2 * _kvCols; _qHeads = _qCols / HeadDim; _kvHeads = _kvCols / HeadDim;

@@ -2,6 +2,18 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased - ACE-Step 1.5 (music) against ComfyUI
+
+- **ACE-Step 1.5** (ComfyUI's audio_ace_step_1_5_split: acestep_v1.5_turbo, qwen_0.6b_ace15, ace_1.5_vae; MIT source ace-step/ACE-Step-1.5; Plans/ace-step-1.5-2026-11-16.md),
+  each part on ComfyUI's own inputs (SpawnGen's float32 CPU dumps and module taps), CUDA:
+  - `OobleckDecoder`: the audio VAE's decoder, latent [64, T] at 25 fps to stereo 48 kHz (1920 samples per frame): 3.1e-6.
+  - `AceStepDiT`: the 24-layer diffusion transformer (GQA 16 / 8, adaLN, cross-attention, k2 / s2 conv in / out): 1.5e-4 on a model call.
+  - `AceStepConditionEncoder`: lyric encoder, timbre encoder, text projector, packed [lyrics | timbre | text]: 6.3e-6. ComfyUI runs no sliding window: both default to full
+    attention (`SlidingWindow = -1`; ACE-Step's own 128 window is the test's control, 0.47 off on the lyrics).
+  - Caption conditioning: Qwen3-0.6B through `Flux2TextEncoder` with ComfyUI's padding rule (keys from the first <|endoftext|> on masked): 2.1e-5; lyrics are the embedding rows.
+- `Flux2Weights.FusedQkvSplit`: the q | k | v split of a Hugging Face Qwen3 file is recorded before the adapter fuses it, so `Flux2TextEncoder` runs any Qwen3 size (it only accepted
+  Qwen3-4B's fused layout). FLUX.2, Z-Image and Qwen-Image text encoder gates unchanged.
+
 ## 5.8.19 - 2026-11-16 (nuget.org) - Qwen-Image Edit 2511 matches ComfyUI; ComfyUI's fp8mixed files; fp8 streamed weights in the browser
 
 - **Qwen-Image Edit 2511** (ComfyUI's `qwen_image_edit_2511_fp8mixed`): `QwenImageTransformer.ReferencesAtTimestepZero` modulates the reference pictures' tokens with the

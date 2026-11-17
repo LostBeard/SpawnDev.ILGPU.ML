@@ -73,10 +73,15 @@ public sealed class Flux2Weights : IDisposable
         {
             // ComfyUI's template files, rewritten into this library's layout as they land: a transformer in Black Forest Labs' layout (flux-2-klein, bf16 or 8-bit floats),
             // a text encoder in Hugging Face Qwen3 names (qwen_3_4b; only its first textEncoderLayers layers were read)
-            Dictionary<string, float>? scales = null;
-            if (Flux2ComfyFormat.IsHfQwen3(w)) scales = await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w, textEncoderLayers);
+            Dictionary<string, float>? scales = null; (int Q, int Kv)? split = null;
+            if (Flux2ComfyFormat.IsHfQwen3(w))
+            {
+                // the q | k | v split, read before the adapter fuses the three (any Qwen3 size: 0.6B 2048 | 1024 | 1024, 4B 4096 | 1024 | 1024, ...)
+                if (w.Has("model.layers.0.self_attn.q_proj.weight")) split = (w.Shape("model.layers.0.self_attn.q_proj.weight")[0], w.Shape("model.layers.0.self_attn.k_proj.weight")[0]);
+                scales = await Flux2ComfyFormat.AdaptTextEncoderAsync(accelerator, w, textEncoderLayers);
+            }
             else if (Flux2ComfyFormat.IsBflTransformer(w)) scales = await Flux2ComfyFormat.AdaptTransformerAsync(accelerator, w);
-            return new Flux2Weights(accelerator, w, true, scales);
+            return new Flux2Weights(accelerator, w, true, scales) { FusedQkvSplit = split };
         }
         catch { w.Dispose(); throw; }
     }
@@ -93,6 +98,12 @@ public sealed class Flux2Weights : IDisposable
         try { return new Flux2Weights(accelerator, w, true, await Flux2ComfyFormat.TakeF8ScalesAsync(accelerator, w, "")); }
         catch { w.Dispose(); throw; }
     }
+
+    /// <summary>
+    /// The rows of q and of each of k / v in a fused <c>self_attn.qkv_proj</c> when the adapter built it from a Hugging Face Qwen3 file (read before fusing); null for a file
+    /// fused by our own export (Qwen3-4B's split).
+    /// </summary>
+    public (int Q, int Kv)? FusedQkvSplit { get; init; }
 
     public bool IsQuantized(string name) => _w.IsU32(name);
     /// <summary>Whether the stage holds tensor <paramref name="name"/>.</summary>

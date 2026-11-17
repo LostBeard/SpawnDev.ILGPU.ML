@@ -24,6 +24,122 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// ComfyUI's ACE-Step 1.5 text conditioning with the audio codes off (TextEncodeAceStepAudio1.5, SpawnGen's te dump): the tags' 127 ids (ComfyUI's template
+    /// included, ids as dumped) through qwen_0.6b_ace15 (Qwen3, 28 layers: <see cref="Flux2.Flux2TextEncoder"/>) give cond [1, 127, 1024]; the lyrics' 350 ids give
+    /// conditioning_lyrics [1, 350, 1024] = the token embedding table alone (no layers). Both readings of the last layer are reported (with / without the final
+    /// norm); the one ComfyUI uses must match.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_TextConditioning_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        var tePath = Ace_Require(accelerator, Path.Combine("text_encoders", "qwen_0.6b_ace15.safetensors"));
+        var d = Ace_Dumps();
+        using var idsDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(d, "ace_te_codes0_ids.json")));
+        int[] Ids(int call)
+        {
+            var e = idsDoc.RootElement.GetProperty("calls")[call].GetProperty("ids");
+            if (e.ValueKind == System.Text.Json.JsonValueKind.String) using (var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!)) return Flat(inner.RootElement).ToArray();
+            return Flat(e).ToArray();
+            static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
+        }
+        int[] tags = Ids(0), lyrics = Ids(1);
+        Ur_Expect(tags.Length == 127 && lyrics.Length == 350, $"ids {tags.Length} / {lyrics.Length}");
+        var cond = F2_Raw(Path.Combine(d, "ace_te_codes0_cond_0_cond_f32_1x127x1024.raw"), 127L * 1024);
+        var lyr = F2_Raw(Path.Combine(d, "ace_te_codes0_cond_0_conditioning_lyrics_f32_1x350x1024.raw"), 350L * 1024);
+        var report = new List<string>();
+        var src = new LocalFolderModelSource(Path.GetDirectoryName(tePath)!);
+        using var w = await Flux2.Flux2Weights.LoadAsync(accelerator, src, "", Path.GetFileName(tePath), 28, finalNorm: true);
+        // ComfyUI's caption pass: the prompt is real up to its first <|endoftext|> (151643, Qwen's pad token); every key from there on is padding (causal + padding mask), while
+        // those rows still give outputs. MEASURED: keys masked from the first pad 2.2e-6 (numpy float64 rebuild, _tuvok-handoff/ace_qwen06_variants.py); pads masked only where
+        // they stand 9.0e-2; no mask (plain causal) 1.0e-1.
+        int real = Array.IndexOf(tags, 151643) is int first and >= 0 ? first : tags.Length;
+        double best = 0, control = 0;
+        using (var te = new Flux2.Flux2TextEncoder(accelerator, w, new[] { 28 }, finalNorm: true, maxTokens: 127) { PreciseActivations = true })
+        {
+            foreach (int r in new[] { real, tags.Length })                                    // ComfyUI's reading, then the control: every key valid must miss
+            {
+                var ours = await te.Encode(tags, r).SubView(0, 127L * 1024).CopyToHostAsync();
+                double e = F2_RelRms(ours, cond);
+                string Row(int i) => $"row {i} {F2_RelRms(ours[(i * 1024)..((i + 1) * 1024)], cond[(i * 1024)..((i + 1) * 1024)]):E1}";
+                report.Add($"tags -> layer 28 + final norm, keys valid below {r}: {e:E2} ({Row(0)}, {Row(real - 1)}, {Row(Math.Min(real, 126))}, {Row(126)})");
+                if (r == real) best = e; else control = e;
+            }
+        }
+        // the lyrics: the embedding table rows (bf16 in the file, exact in fp32)
+        var table = w.Vector("embed_tokens.weight");                                            // the bf16 table as stored (no decode scratch)
+        var rows = await table.SubView(0, (long)(lyrics.Max() + 1) * 1024).CopyToHostAsync();
+        var emb = lyrics.SelectMany(t => Enumerable.Range(0, 1024).Select(j => (float)rows[(long)t * 1024 + j])).ToArray();
+        double el = F2_RelRms(emb, lyr);
+        report.Add($"lyrics = embed_tokens[ids]: {el:E2}");
+        foreach (var line in report) Console.WriteLine("[AceStep] text conditioning vs ComfyUI: " + line);
+        Ur_Expect(best < 1e-4 && control > 100 * best && el < 1e-6, string.Join("; ", report));  // MEASURED 2026-11-17 CUDA: 2.1e-5 (control 0.104), lyrics 7.7e-9
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
+    /// The condition encoder (<see cref="AceStepConditionEncoder"/>, acestep_v1.5_turbo's encoder.*) on ComfyUI's own inputs of the codes-off graph's first call (SpawnGen's
+    /// encoder taps: caption states [127, 1024], lyric embeddings [350, 1024], reference latent [250, 64]) against its output [478, 2048] = [lyrics | timbre | text].
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_ConditionEncoder_MatchesComfyUiTap() => await RunTest(async accelerator =>
+    {
+        var path = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
+        var d = Ace_Dumps();
+        string T(string rest) => Path.Combine(d, "ace_g0_taps_diffusion_model_encoder_0_" + rest + ".raw");
+        var text = F2_Raw(T("in0_f32_1x127x1024"), 127L * 1024);
+        var lyrics = F2_Raw(T("in1_f32_1x350x1024"), 350L * 1024);
+        var refer = F2_Raw(T("in2_f32_1x250x64"), 250L * 64);
+        var expected = F2_Raw(T("out0_f32_1x478x2048"), 478L * 2048);
+        using var enc = await AceStepConditionEncoder.LoadAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 350);
+        using var dT = accelerator.Allocate1D(text); using var dL = accelerator.Allocate1D(lyrics); using var dR = accelerator.Allocate1D(refer);
+        using var outp = accelerator.Allocate1D<float>(478L * 2048);
+        var lines = new List<string>(); double best = double.MaxValue, control = 0;
+        Ur_Expect(enc.SlidingWindow == -1, "the default must be ComfyUI's full attention");
+        foreach (int window in new[] { -1, AceStepConditionEncoder.Window })                  // ComfyUI's full attention (default), then the control: ACE-Step's own window must miss
+        {
+            enc.SlidingWindow = window;
+            enc.Encode(dT.View, 127, dL.View, 350, dR.View, 250, outp.View);
+            var ours = await outp.View.CopyToHostAsync();
+            double all = F2_RelRms(ours, expected);
+            if (window < 0) best = all; else control = all;
+            double Part(int r0, int rows) => F2_RelRms(ours[(r0 * 2048)..((r0 + rows) * 2048)], expected[(r0 * 2048)..((r0 + rows) * 2048)]);
+            lines.Add($"window {(window < 0 ? "none" : window.ToString())}: [478, 2048] {all:E2} (lyrics {Part(0, 350):E2}, timbre {Part(350, 1):E2}, text {Part(351, 127):E2})");
+        }
+        foreach (var line in lines) Console.WriteLine("[AceStep] condition encoder vs ComfyUI: " + line);
+        string report = string.Join("; ", lines);
+        Ur_Expect(best < 5e-5 && control > 100 * best, report);                               // MEASURED 2026-11-17 CUDA: full attention 6.3e-6 (lyrics 7.5e-5), window 128: 3.1e-2
+        return report;
+    });
+
+    /// <summary>
+    /// The DiT (<see cref="AceStepDiT"/>, acestep_v1.5_turbo's decoder.*) on ComfyUI's own inputs of the codes-off graph's first model call (SpawnGen's decoder taps:
+    /// hidden_states [250, 64], timestep, timestep_r, encoder_hidden_states [478, 2048], context_latents [250, 128]) against the decoder's output [250, 64].
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_DiT_MatchesComfyUiDecoderTap() => await RunTest(async accelerator =>
+    {
+        var path = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
+        var d = Ace_Dumps();
+        string T(string rest) => Path.Combine(d, "ace_g0_taps_diffusion_model_decoder_0_" + rest + ".raw");
+        var x = F2_Raw(T("kw-hidden_states0_f32_1x250x64"), 250L * 64);
+        var ctx = F2_Raw(T("kw-context_latents0_f32_1x250x128"), 250L * 128);
+        var enc = F2_Raw(T("kw-encoder_hidden_states0_f32_1x478x2048"), 478L * 2048);
+        float t = F2_Raw(T("kw-timestep0_f32_1"), 1)[0], tr = F2_Raw(T("kw-timestep_r0_f32_1"), 1)[0];
+        var expected = F2_Raw(T("out0_f32_1x250x64"), 250L * 64);
+        using var dit = await AceStepDiT.LoadAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 250, 478);
+        using var dX = accelerator.Allocate1D(x); using var dC = accelerator.Allocate1D(ctx); using var dE = accelerator.Allocate1D(enc);
+        using var outp = accelerator.Allocate1D<float>(250L * 64);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dit.Forward(dX.View, dC.View, dE.View, 250, 478, t, tr, outp.View);
+        var ours = await outp.View.CopyToHostAsync();
+        double e = F2_RelRms(ours, expected);
+        string report = $"t {t:G6}, r {tr:G6}: velocity [250, 64] {e:E2} ({sw.Elapsed.TotalSeconds:F1} s)";
+        Console.WriteLine("[AceStep] DiT vs ComfyUI decoder tap: " + report);
+        Ur_Expect(e < 5e-4, report);                                                          // MEASURED 2026-11-17 CUDA: 1.50e-4 (t = r = 1; 125 patch tokens, inside the window)
+        return report;
+    });
+
+    /// <summary>
     /// The Oobleck VAE decoder (<see cref="OobleckDecoder"/>, ace_1.5_vae) against ComfyUI's VAEDecodeAudio of the codes-off graph's final latent [1, 64, 250]:
     /// stereo [2, 480000] at 48 kHz (1920 samples per latent frame).
     /// </summary>
