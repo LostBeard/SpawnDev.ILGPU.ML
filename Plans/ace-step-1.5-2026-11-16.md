@@ -67,3 +67,7 @@ implementation is what the template runs; this source is the port's reference, t
 4. DiT: the call-0 taps, then both calls of the 2-step graph.
 5. Codes on: the 1.7B LM teacher-forced on the recorded codes; FSQ + detokenizer -> hints.
 6. Sampler + whole graph vs ComfyUI's final latent and audio.
+- 11-17 CUDA: FSQ decode = digit scaled (d - (L - 1) / 2) / ((L - 1) / 2), mixed radix [8,8,8,5,5,5] first level fastest (5.9e-8 vs ComfyUI's detokenizer input; the
+  half-width reading is 0.13 off). `AceStepCodeDecoder` (FSQ, project_out, detokenizer: 5-token groups, positions 0..4) vs ComfyUI's detokenizer output 1.2e-5.
+  WHOLE codes-on graph (ComfyUI's 50 codes in; hints replace the silence latent as the source latents) vs ComfyUI: latent 3.4e-4, audio 8.7e-4. Stage 5b + 6 done;
+  left: the LM's SAMPLING loop (CFG 2 with the left-padded negative, temperature 0.85, top-p 0.9: own RNG, gated by teacher forcing + statistics), tokenizer + templates.

@@ -16,16 +16,16 @@ public sealed class AceStepKernels
     public AceStepKernels(Accelerator accelerator) => _acc = accelerator;
 
     // ───────────────────────── attention ─────────────────────────
-    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>? _scores;
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, int, float>? _scores;
     private Action<Index1D, FV, int>? _softmax;
     private Action<Index1D, FV, FV, FV, int, int, int, int, int, int>? _pv;
 
-    // scores[h, t, j] = q[t, h] . k[j, h / rep] * scale, or -inf outside the window
-    private static void ScoresImpl(Index1D i, FV q, FV k, FV s, int Nq, int Nk, int H, int D, int rep, int qStride, int kStride, int window, float scale)
+    // scores[h, t, j] = q[t, h] . k[j, h / rep] * scale, or -inf outside the window / outside the query's group
+    private static void ScoresImpl(Index1D i, FV q, FV k, FV s, int Nq, int Nk, int H, int D, int rep, int qStride, int kStride, int window, int group, float scale)
     {
         long ii = (int)i;
         int j = (int)(ii % Nk), t = (int)(ii / Nk % Nq), h = (int)(ii / ((long)Nk * Nq));
-        if (window >= 0 && (t - j > window || j - t > window)) { s[i] = float.NegativeInfinity; return; }
+        if ((window >= 0 && (t - j > window || j - t > window)) || (group > 0 && t / group != j / group)) { s[i] = float.NegativeInfinity; return; }
         long qo = (long)t * qStride + (long)h * D, ko = (long)j * kStride + (long)(h / rep) * D;
         float acc = 0f;
         for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(q[qo + d], k[ko + d], acc);
@@ -55,14 +55,15 @@ public sealed class AceStepKernels
 
     /// <summary>
     /// Bidirectional grouped-query attention: q [Nq, H D], k / v [Nk, (H / rep) D] (row strides given), o [Nq, H D]; <paramref name="window"/> &gt;= 0 keeps keys with
-    /// |t - j| &lt;= window, &lt; 0 keeps all. <paramref name="scores"/> holds H Nq Nk floats. Scale 1 / sqrt(D).
+    /// |t - j| &lt;= window, &lt; 0 keeps all; <paramref name="group"/> &gt; 0 keeps only keys of the query's own group of that many tokens (independent sequences packed
+    /// back to back: the detokenizer's 5-token groups). <paramref name="scores"/> holds H Nq Nk floats. Scale 1 / sqrt(D).
     /// </summary>
-    public void Gqa(FV q, int qStride, FV k, int kStride, FV v, int vStride, FV scores, FV o, int Nq, int Nk, int H, int D, int rep, int window)
+    public void Gqa(FV q, int qStride, FV k, int kStride, FV v, int vStride, FV scores, FV o, int Nq, int Nk, int H, int D, int rep, int window, int group = 0)
     {
-        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
+        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmax ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxImpl);
         _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);
-        _scores((int)((long)H * Nq * Nk), q, k, scores, Nq, Nk, H, D, rep, qStride, kStride, window, 1f / MathF.Sqrt(D));
+        _scores((int)((long)H * Nq * Nk), q, k, scores, Nq, Nk, H, D, rep, qStride, kStride, window, group, 1f / MathF.Sqrt(D));
         _softmax(H * Nq, scores, Nk);
         _pv(Nq * H * D, scores, v, o, Nq, Nk, H, D, rep, vStride);
     }
@@ -128,6 +129,19 @@ public sealed class AceStepKernels
     {
         _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
         _concat(rows * (ca + cb), a, b, o, ca, cb);
+    }
+
+    private Action<Index1D, FV, BV, FV, int, int>? _repeatAdd;
+    private static void RepeatAddImpl(Index1D i, FV e, BV special, FV o, int pool, int C)
+    {
+        int row = i / C, c = i % C;
+        o[i] = e[(long)(row / pool) * C + c] + (float)special[(long)(row % pool) * C + c];
+    }
+    /// <summary>o [n pool, C]: row r = e[r / pool] + special[r % pool] (the detokenizer's repeat of each code over its pool, plus the learned tokens).</summary>
+    public void RepeatAdd(FV e, BV special, FV o, int n, int pool, int C)
+    {
+        _repeatAdd ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, FV, int, int>(RepeatAddImpl);
+        _repeatAdd(n * pool * C, e, special, o, pool, C);
     }
 
     // ───────────────────────── the DiT's k2 / s2 input and output ─────────────────────────

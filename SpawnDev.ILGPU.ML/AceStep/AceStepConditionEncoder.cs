@@ -27,12 +27,10 @@ public sealed class AceStepConditionEncoder : IDisposable
 
     private readonly Accelerator _acc;
     private readonly GpuWeights _w;
-    private readonly DiTKernels _k;
+    private readonly AceStepEncoderLayers _layers;
     private readonly SkinTokensKernels _u;
-    private readonly AceStepKernels _a;
     private readonly int _maxTokens, _lyricLayers, _timbreLayers;
-    private readonly List<IDisposable> _buffers = new();
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _n, _q, _kk, _v, _att, _o, _g, _up, _gu, _scores, _cos, _sin;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _h, _cos, _sin;
 
     /// <summary>
     /// The even layers' bidirectional window: -1 (default) = full attention in every layer, as ComfyUI's implementation runs it (MEASURED 2026-11-17 on the 350 lyric tokens:
@@ -41,24 +39,15 @@ public sealed class AceStepConditionEncoder : IDisposable
     public int SlidingWindow { get; set; } = -1;
 
     /// <summary>CUDA: fp32-class activations through the tensor-core GEMMs; on by default (the reference is float32).</summary>
-    public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
+    public bool PreciseActivations { get => _layers.Kernels.PreciseActivations; set => _layers.Kernels.PreciseActivations = value; }
 
     private AceStepConditionEncoder(Accelerator acc, GpuWeights w, int maxTokens, int lyricLayers, int timbreLayers)
     {
         _acc = acc; _w = w; _maxTokens = maxTokens; _lyricLayers = lyricLayers; _timbreLayers = timbreLayers;
-        _k = new DiTKernels(acc) { PreciseActivations = true }; _u = new SkinTokensKernels(acc); _a = new AceStepKernels(acc);
-        MemoryBuffer1D<float, Stride1D.Dense> A(long n) { var b = acc.Allocate1D<float>(Math.Max(1, n)); _buffers.Add(b); return b; }
-        long N = maxTokens, kv = KvHeads * HeadDim;
-        _h = A(N * Dim); _n = A(N * Dim); _q = A(N * Dim); _kk = A(N * kv); _v = A(N * kv); _att = A(N * Dim); _o = A(N * Dim);
-        _g = A(N * Mlp); _up = A(N * Mlp); _gu = A(N * Mlp); _scores = A((long)Heads * N * N); _cos = A(N * HeadDim / 2); _sin = A(N * HeadDim / 2);
-        int half = HeadDim / 2;
-        var c = new float[N * half]; var s = new float[N * half];
-        for (int k = 0; k < half; k++)
-        {
-            float inv = 1f / MathF.Pow(RopeTheta, 2f * k / HeadDim);
-            for (int p = 0; p < N; p++) { float ang = p * inv; c[p * half + k] = (float)Math.Cos(ang); s[p * half + k] = (float)Math.Sin(ang); }
-        }
-        _cos.View.CopyFromCPU(c); _sin.View.CopyFromCPU(s);
+        _layers = new AceStepEncoderLayers(acc, w, maxTokens); _u = new SkinTokensKernels(acc);
+        _h = acc.Allocate1D<float>((long)maxTokens * Dim);
+        var (c, s) = AceStepEncoderLayers.RopeTables(Enumerable.Range(0, maxTokens).ToArray(), RopeTheta);
+        _cos = acc.Allocate1D(c); _sin = acc.Allocate1D(s);
     }
 
     /// <summary>Load the condition encoder from ComfyUI's acestep_v1.5_turbo file; buffers sized for sequences up to <paramref name="maxTokens"/> (the longer of lyrics and reference frames).</summary>
@@ -79,30 +68,8 @@ public sealed class AceStepConditionEncoder : IDisposable
     }
 
     private BV B(string name) => _w.BF16(name);
-    private void Lin(FV x, string name, FV o, int rows, int K, int N, bool bias = false) => _k.Linear(x, B(name + ".weight"), bias ? B(name + ".bias") : null, o, rows, K, N);
-
-    // one encoder layer on _h [L, D]
-    private void Layer(string b, int L, int index)
-    {
-        int D = Dim, kv = KvHeads * HeadDim;
-        _u.RmsNorm(_h.View, _n.View, B(b + "input_layernorm.weight"), L, D, Eps);
-        Lin(_n.View, b + "self_attn.q_proj", _q.View, L, D, D);
-        Lin(_n.View, b + "self_attn.k_proj", _kk.View, L, D, kv);
-        Lin(_n.View, b + "self_attn.v_proj", _v.View, L, D, kv);
-        _u.RmsNormHeads(_q.View, B(b + "self_attn.q_norm.weight"), L, D, 0, Heads, HeadDim, Eps);
-        _u.RmsNormHeads(_kk.View, B(b + "self_attn.k_norm.weight"), L, kv, 0, KvHeads, HeadDim, Eps);
-        _u.RopeTables(_q.View, _cos.View, _sin.View, L, D, 0, Heads, HeadDim);
-        _u.RopeTables(_kk.View, _cos.View, _sin.View, L, kv, 0, KvHeads, HeadDim);
-        _a.Gqa(_q.View, D, _kk.View, kv, _v.View, kv, _scores.View, _att.View, L, L, Heads, HeadDim, Heads / KvHeads, index % 2 == 0 ? SlidingWindow : -1);
-        Lin(_att.View, b + "self_attn.o_proj", _o.View, L, D, D);
-        _k.GateResidual(_h.View, _o.View, _o.View, -1, L * D, D);
-        _u.RmsNorm(_h.View, _n.View, B(b + "post_attention_layernorm.weight"), L, D, Eps);
-        Lin(_n.View, b + "mlp.gate_proj", _g.View, L, D, Mlp);
-        Lin(_n.View, b + "mlp.up_proj", _up.View, L, D, Mlp);
-        _a.SiluMul(_g.View, _up.View, _gu.View, L * Mlp);
-        Lin(_gu.View, b + "mlp.down_proj", _o.View, L, Mlp, D);
-        _k.GateResidual(_h.View, _o.View, _o.View, -1, L * D, D);
-    }
+    private void Lin(FV x, string name, FV o, int rows, int K, int N, bool bias = false) => _layers.Kernels.Linear(x, B(name + ".weight"), bias ? B(name + ".bias") : null, o, rows, K, N);
+    private void Layer(string b, int L, int index) => _layers.Run(b, _h.View, L, _cos.View, _sin.View, index % 2 == 0 ? SlidingWindow : -1);
 
     /// <summary>
     /// The DiT's condition tokens into <paramref name="output"/> [lyrics + 1 + textTokens, 2048]: lyric embeddings <paramref name="lyrics"/> [lyricTokens, 1024], the
@@ -126,8 +93,7 @@ public sealed class AceStepConditionEncoder : IDisposable
 
     public void Dispose()
     {
-        foreach (var b in _buffers) b.Dispose();
-        _buffers.Clear();
+        _layers.Dispose(); _h.Dispose(); _cos.Dispose(); _sin.Dispose();
         _w.Dispose();
     }
 }

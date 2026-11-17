@@ -32,6 +32,7 @@ public sealed class AceStepGenerator : IDisposable
     private readonly AceStepConditionEncoder _enc;
     private readonly AceStepDiT _dit;
     private readonly OobleckDecoder _vae;
+    private readonly AceStepCodeDecoder _codes;
     private readonly DiTKernels _k;
     private readonly SkinTokensKernels _u;
     private readonly AceStepKernels _a;
@@ -41,9 +42,9 @@ public sealed class AceStepGenerator : IDisposable
     public AceStepConditionEncoder ConditionEncoder => _enc;
     public OobleckDecoder Vae => _vae;
 
-    private AceStepGenerator(Accelerator acc, Flux2Weights teWeights, AceStepConditionEncoder enc, AceStepDiT dit, OobleckDecoder vae, int maxFrames, int maxCaption, int maxLyrics)
+    private AceStepGenerator(Accelerator acc, Flux2Weights teWeights, AceStepConditionEncoder enc, AceStepDiT dit, AceStepCodeDecoder codes, OobleckDecoder vae, int maxFrames, int maxCaption, int maxLyrics)
     {
-        _acc = acc; _teWeights = teWeights; _enc = enc; _dit = dit; _vae = vae; _maxFrames = maxFrames; _maxCaption = maxCaption; _maxLyrics = maxLyrics;
+        _acc = acc; _teWeights = teWeights; _enc = enc; _dit = dit; _codes = codes; _vae = vae; _maxFrames = maxFrames; _maxCaption = maxCaption; _maxLyrics = maxLyrics;
         _te = new Flux2TextEncoder(acc, teWeights, new[] { 28 }, finalNorm: true, maxTokens: maxCaption) { PreciseActivations = true };
         _k = new DiTKernels(acc); _u = new SkinTokensKernels(acc); _a = new AceStepKernels(acc);
     }
@@ -55,24 +56,28 @@ public sealed class AceStepGenerator : IDisposable
     public static async Task<AceStepGenerator> LoadAsync(Accelerator accelerator, IModelSource source, string repo, string ditFile, string textEncoderFile, string vaeFile,
         int maxFrames, int maxCaptionTokens = 256, int maxLyricTokens = 2048, CancellationToken ct = default)
     {
-        Flux2Weights? te = null; AceStepConditionEncoder? enc = null; AceStepDiT? dit = null; OobleckDecoder? vae = null;
+        Flux2Weights? te = null; AceStepConditionEncoder? enc = null; AceStepDiT? dit = null; AceStepCodeDecoder? codes = null; OobleckDecoder? vae = null;
         try
         {
             te = await Flux2Weights.LoadAsync(accelerator, source, repo, textEncoderFile, 28, finalNorm: true, ct);
             enc = await AceStepConditionEncoder.LoadAsync(accelerator, source, repo, ditFile, Math.Max(maxLyricTokens, maxFrames), ct);
             dit = await AceStepDiT.LoadAsync(accelerator, source, repo, ditFile, maxFrames, maxLyricTokens + 1 + maxCaptionTokens, ct);
+            codes = await AceStepCodeDecoder.LoadAsync(accelerator, source, repo, ditFile, (maxFrames + AceStepCodeDecoder.Pool - 1) / AceStepCodeDecoder.Pool, ct);
             vae = await OobleckDecoder.LoadAsync(accelerator, source, repo, vaeFile, ct: ct);
-            return new AceStepGenerator(accelerator, te, enc, dit, vae, maxFrames, maxCaptionTokens, maxLyricTokens);
+            return new AceStepGenerator(accelerator, te, enc, dit, codes, vae, maxFrames, maxCaptionTokens, maxLyricTokens);
         }
-        catch { vae?.Dispose(); dit?.Dispose(); enc?.Dispose(); te?.Dispose(); throw; }
+        catch { vae?.Dispose(); codes?.Dispose(); dit?.Dispose(); enc?.Dispose(); te?.Dispose(); throw; }
     }
 
     /// <summary>
     /// The latent [64, frames] (ComfyUI's layout) for the caption / lyric ids (ComfyUI's TextEncodeAceStepAudio1.5 ids, templates included), the starting noise
     /// <paramref name="noise"/> [64, frames] (ComfyUI's layout, sigma 1), the silence latent <paramref name="silence"/> [frames, 64] (time-major) and the sigma schedule
-    /// (descending, ending at 0). <paramref name="onStep"/> sees (step, sigma) before each model call.
+    /// (descending, ending at 0). <paramref name="audioCodes"/> (5 Hz, 0 .. 63999: the code LM's output) turn the codes on: their decoded hints replace the silence latent as the
+    /// DiT's source latents (cropped / padded with the silence latent to the frame count); the timbre reference stays the silence latent. <paramref name="onStep"/> sees
+    /// (step, sigma) before each model call.
     /// </summary>
-    public async Task<float[]> GenerateLatentAsync(int[] captionIds, int[] lyricIds, float[] noise, float[] silence, int frames, float[] sigmas, Action<int, float>? onStep = null, CancellationToken ct = default)
+    public async Task<float[]> GenerateLatentAsync(int[] captionIds, int[] lyricIds, float[] noise, float[] silence, int frames, float[] sigmas, IReadOnlyList<int>? audioCodes = null,
+        Action<int, float>? onStep = null, CancellationToken ct = default)
     {
         if (frames > _maxFrames || captionIds.Length > _maxCaption || lyricIds.Length > _maxLyrics) throw new ArgumentException("larger than the generator was loaded for");
         if (noise.Length != LatentChannels * frames || silence.Length != LatentChannels * frames) throw new ArgumentException("noise / silence: 64 x frames values each");
@@ -95,11 +100,21 @@ public sealed class AceStepGenerator : IDisposable
         var caption = _te.Encode(captionIds, real);
         _u.Embed(lyricIdBuf.View, _teWeights.Vector("embed_tokens.weight"), lyrics.View, nl, TextWidth);
         _enc.Encode(caption.SubView(0, (long)nc * TextWidth), nc, lyrics.View, nl, sil.View, frames, enc.View);
-        // context [frames, 128] = [silence | ones]
+        // context [frames, 128] = [source latents | ones]: the silence latent, or with codes their hints (the silence latent past the hints' end)
         var ones = new float[frames * LatentChannels]; Array.Fill(ones, 1f);
         using (var onesBuf = _acc.Allocate1D(ones))
+        using (var source = _acc.Allocate1D(silence))
         {
-            _a.Concat(sil.View, onesBuf.View, ctx.View, frames, LatentChannels, LatentChannels);
+            if (audioCodes is { Count: > 0 })
+            {
+                int hintFrames = audioCodes.Count * AceStepCodeDecoder.Pool;
+                using var hints = _acc.Allocate1D<float>((long)hintFrames * LatentChannels);
+                _codes.Decode(audioCodes, hints.View);
+                long copy = (long)Math.Min(hintFrames, frames) * LatentChannels;
+                source.View.SubView(0, copy).CopyFrom(hints.View.SubView(0, copy));
+                await _acc.SynchronizeAsync();
+            }
+            _a.Concat(source.View, onesBuf.View, ctx.View, frames, LatentChannels, LatentChannels);
             await _acc.SynchronizeAsync();
         }
         _k.Transpose(nz.View, x.View, LatentChannels, frames);                                   // [64, T] -> [T, 64]
@@ -127,6 +142,6 @@ public sealed class AceStepGenerator : IDisposable
 
     public void Dispose()
     {
-        _te.Dispose(); _teWeights.Dispose(); _enc.Dispose(); _dit.Dispose(); _vae.Dispose();
+        _te.Dispose(); _teWeights.Dispose(); _enc.Dispose(); _dit.Dispose(); _codes.Dispose(); _vae.Dispose();
     }
 }

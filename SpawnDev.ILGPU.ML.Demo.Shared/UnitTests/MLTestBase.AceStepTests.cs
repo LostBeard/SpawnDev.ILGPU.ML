@@ -29,7 +29,16 @@ public abstract partial class MLTestBase
     /// denoised x - sigma v and its step plain Euler (measured on the dumps: 2.6e-8 / 2.7e-8).
     /// </summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
-    public async Task AceStep_Graph_CodesOff_MatchesComfyUi() => await RunTest(async accelerator =>
+    public async Task AceStep_Graph_CodesOff_MatchesComfyUi() => await RunTest(accelerator => Ace_GraphAsync(accelerator, "ace_g0", false, 6e-4, 1.5e-3));   // MEASURED 2026-11-17 CUDA: latent 1.8e-4, audio 3.9e-4
+
+    /// <summary>
+    /// The whole codes-on graph: the same with ComfyUI's 50 audio codes (the code LM's choice, from the codes-on run), whose decoded hints replace the silence latent as the DiT's
+    /// source latents (<see cref="AceStepCodeDecoder"/>), against ComfyUI's final latent and audio.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_Graph_CodesOn_MatchesComfyUi() => await RunTest(accelerator => Ace_GraphAsync(accelerator, "ace_g1", true, 1e-3, 2.5e-3));       // MEASURED 2026-11-17 CUDA: latent 3.4e-4, audio 8.7e-4
+
+    private async Task<string> Ace_GraphAsync(Accelerator accelerator, string run, bool codesOn, double latentBound, double audioBound)
     {
         var dit = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
         var te = Ace_Require(accelerator, Path.Combine("text_encoders", "qwen_0.6b_ace15.safetensors"));
@@ -37,32 +46,38 @@ public abstract partial class MLTestBase
         var d = Ace_Dumps();
         int[] Ids(int call)
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(d, "ace_g0_ids.json")));
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(d, $"{run}_ids.json")));
             var e = doc.RootElement.GetProperty("calls")[call].GetProperty("ids");
             static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
             if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
             return Flat(e).ToArray();
         }
         const int frames = 250;
-        var noise = F2_Raw(Path.Combine(d, "ace_g0_call_0_input_f32_1x64x250.raw"), 64L * frames);
-        var referCm = F2_Raw(Path.Combine(d, "ace_g0_call_0_c_refer_audio_f32_1x64x250.raw"), 64L * frames);
+        var noise = F2_Raw(Path.Combine(d, $"{run}_call_0_input_f32_1x64x250.raw"), 64L * frames);
+        var referCm = F2_Raw(Path.Combine(d, $"{run}_call_0_c_refer_audio_f32_1x64x250.raw"), 64L * frames);
         var silence = new float[frames * 64];
         for (int c = 0; c < 64; c++) for (int t = 0; t < frames; t++) silence[t * 64 + c] = referCm[c * frames + t];
-        var expectedLatent = F2_Raw(Path.Combine(d, "ace_g0_out_samples_f32_1x64x250.raw"), 64L * frames);
-        var expectedAudio = F2_Raw(Path.Combine(d, "ace_g0_audio_waveform_f32_1x2x480000.raw"), 2L * 480000);
+        var expectedLatent = F2_Raw(Path.Combine(d, $"{run}_out_samples_f32_1x64x250.raw"), 64L * frames);
+        var expectedAudio = F2_Raw(Path.Combine(d, $"{run}_audio_waveform_f32_1x2x480000.raw"), 2L * 480000);
         var src = new LocalFolderModelSource(Path.Combine(Ace_Dir(), "comfy", "split_files"));
         using var gen = await AceStepGenerator.LoadAsync(accelerator, src, "", Path.Combine("diffusion_models", Path.GetFileName(dit)), Path.Combine("text_encoders", Path.GetFileName(te)),
             Path.Combine("vae", Path.GetFileName(vae)), frames, 256, 512);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var latent = await gen.GenerateLatentAsync(Ids(0), Ids(1), noise, silence, frames, new[] { 1f, 0.75f, 0f });
+        int[]? codes = null;
+        if (codesOn)
+        {
+            var codeBytes = File.ReadAllBytes(Path.Combine(d, $"{run}_taps_diffusion_model_0_kw-audio_codes0_i64_1x50.raw"));
+            codes = Enumerable.Range(0, codeBytes.Length / 8).Select(i => (int)BitConverter.ToInt64(codeBytes, i * 8)).ToArray();
+        }
+        var latent = await gen.GenerateLatentAsync(Ids(0), Ids(1), noise, silence, frames, new[] { 1f, 0.75f, 0f }, codes);
         double tl = sw.Elapsed.TotalSeconds;
         var audio = await gen.DecodeAsync(latent, frames);
         double el = F2_RelRms(latent, expectedLatent), ea = F2_RelRms(audio, expectedAudio);
         string report = $"latent [64, 250] {el:E2}, audio [2, 480000] {ea:E2} (2 steps {tl:F1} s, decode {sw.Elapsed.TotalSeconds - tl:F1} s)";
-        Console.WriteLine("[AceStep] codes-off graph vs ComfyUI: " + report);
-        Ur_Expect(el < 6e-4 && ea < 1.5e-3, report);                                          // MEASURED 2026-11-17 CUDA: latent 1.8e-4, audio 3.9e-4
+        Console.WriteLine($"[AceStep] codes-{(codesOn ? "on" : "off")} graph vs ComfyUI: " + report);
+        Ur_Expect(el < latentBound && ea < audioBound, report);
         return report;
-    });
+    }
 
     /// <summary>
     /// ComfyUI's ACE-Step 1.5 text conditioning with the audio codes off (TextEncodeAceStepAudio1.5, SpawnGen's te dump): the tags' 127 ids (ComfyUI's template
@@ -177,6 +192,28 @@ public abstract partial class MLTestBase
         string report = $"t {t:G6}, r {tr:G6}: velocity [250, 64] {e:E2} ({sw.Elapsed.TotalSeconds:F1} s)";
         Console.WriteLine("[AceStep] DiT vs ComfyUI decoder tap: " + report);
         Ur_Expect(e < 5e-4, report);                                                          // MEASURED 2026-11-17 CUDA: 1.50e-4 (t = r = 1; 125 patch tokens, inside the window)
+        return report;
+    });
+
+    /// <summary>
+    /// The audio codes to the DiT's hints (<see cref="AceStepCodeDecoder"/>: FSQ, project_out, the detokenizer) on ComfyUI's own 50 codes of the codes-on graph (SpawnGen's
+    /// taps) against its detokenizer output [250, 64].
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_CodeDecoder_MatchesComfyUiTap() => await RunTest(async accelerator =>
+    {
+        var path = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
+        var d = Ace_Dumps();
+        var codeBytes = File.ReadAllBytes(Path.Combine(d, "ace_g1_taps_diffusion_model_0_kw-audio_codes0_i64_1x50.raw"));
+        var codes = Enumerable.Range(0, 50).Select(i => (int)BitConverter.ToInt64(codeBytes, i * 8)).ToArray();
+        var expected = F2_Raw(Path.Combine(d, "ace_g1_taps_diffusion_model_detokenizer_0_out0_f32_1x250x64.raw"), 250L * 64);
+        using var dec = await AceStepCodeDecoder.LoadAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 50);
+        using var outp = accelerator.Allocate1D<float>(250L * 64);
+        dec.Decode(codes, outp.View);
+        double e = F2_RelRms(await outp.View.CopyToHostAsync(), expected);
+        string report = $"50 codes -> hints [250, 64] {e:E2}";
+        Console.WriteLine("[AceStep] code decoder vs ComfyUI: " + report);
+        Ur_Expect(e < 1e-4, report);                                                          // MEASURED 2026-11-17 CUDA: 1.19e-5
         return report;
     });
 
