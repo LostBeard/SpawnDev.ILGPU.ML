@@ -84,6 +84,32 @@ public sealed class Qwen2Tokenizer
         return (o, real);
     }
 
+    private Dictionary<int, string>? _inverse;
+    private static Dictionary<char, byte>? _charByte;
+
+    /// <summary>The text of <paramref name="ids"/>: added tokens literally, ordinary tokens through the byte map back to UTF-8 (the inverse of <see cref="Encode"/>).</summary>
+    public string Decode(IEnumerable<int> ids)
+    {
+        if (_inverse == null)
+        {
+            var inv = new Dictionary<int, string>(_vocab.Count + _added.Count);
+            foreach (var (k, v) in _vocab) inv[v] = k;
+            foreach (var (k, v) in _added) inv[v] = k;
+            _inverse = inv;
+        }
+        if (_charByte == null) { var m = new Dictionary<char, byte>(256); for (int b = 0; b < 256; b++) m[ByteChar[b][0]] = (byte)b; _charByte = m; }
+        var sb = new StringBuilder(); var bytes = new List<byte>();
+        void Flush() { if (bytes.Count > 0) { sb.Append(Encoding.UTF8.GetString(bytes.ToArray())); bytes.Clear(); } }
+        foreach (int id in ids)
+        {
+            if (!_inverse.TryGetValue(id, out var t)) throw new ArgumentOutOfRangeException(nameof(ids), $"token {id} is not in the vocabulary");
+            if (_added.ContainsKey(t) && _added[t] == id) { Flush(); sb.Append(t); continue; }
+            foreach (var ch in t) bytes.Add(_charByte[ch]);
+        }
+        Flush();
+        return sb.ToString();
+    }
+
     private void EncodeOrdinary(string text, List<int> ids)
     {
         foreach (Match m in Pre.Matches(text))

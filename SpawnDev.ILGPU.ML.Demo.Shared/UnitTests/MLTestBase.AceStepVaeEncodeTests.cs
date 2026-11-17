@@ -9,6 +9,49 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     /// <summary>
+    /// <see cref="AceStepPrompts"/> + <see cref="Flux2.Qwen2Tokenizer"/> (ACE-Step's MIT tokenizer.json files, ACE_DIR/hf-acestep15) give ComfyUI's ids exactly: the tags,
+    /// language and lyrics are recovered from ComfyUI's own ids (<see cref="Flux2.Qwen2Tokenizer.Decode"/>), the four prompts rebuilt and re-encoded, compared id for id
+    /// (caption 127, lyrics 350, LM positive 478, LM negative 451 after its left padding).
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task AceStep_Prompts_MatchComfyUiIds() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads the files from disk: a desktop lane");
+        var hf = Path.Combine(Ace_Dir(), "hf-acestep15");
+        string Tok(string dir) { var p = Path.Combine(hf, dir, "tokenizer.json"); if (!File.Exists(p)) throw new UnsupportedTestException($"{p} not found (ACE-Step/Ace-Step1.5)"); return File.ReadAllText(p); }
+        var te = new Flux2.Qwen2Tokenizer(Tok("Qwen3-Embedding-0.6B"));
+        var lmTok = new Flux2.Qwen2Tokenizer(Tok("acestep-5Hz-lm-1.7B"));
+        using var idsDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(Ace_Dumps(), "ace_te_codes1_ids.json")));
+        var calls = idsDoc.RootElement.GetProperty("calls");
+        int[] Ids(int call)
+        {
+            var e = calls[call].GetProperty("ids");
+            static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
+            if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
+            return Flat(e).ToArray();
+        }
+        int[] caption = Ids(0), lyricIds = Ids(1), lmPos = Ids(2), lmNeg = AceStepCodeLm.StripLeftPadding(Ids(3));
+        static string Between(string s, string a, string b) { int i = s.IndexOf(a, StringComparison.Ordinal) + a.Length; return s[i..s.IndexOf(b, i, StringComparison.Ordinal)]; }
+        string capText = te.Decode(caption), lyrText = te.Decode(lyricIds);
+        string tags = Between(capText, "# Caption\n", "\n\n# Metas"), language = Between(lyrText, "# Languages\n", "\n\n# Lyric"), lyrics = Between(lyrText, "# Lyric\n", "\n<|endoftext|>");
+        var report = new List<string>(); bool all = true;
+        void Check(string name, int[] ours, int[] theirs)
+        {
+            bool same = ours.SequenceEqual(theirs); all &= same;
+            int first = Enumerable.Range(0, Math.Min(ours.Length, theirs.Length)).FirstOrDefault(i => ours[i] != theirs[i], -1);
+            report.Add($"{name}: {ours.Length} vs {theirs.Length} ids, {(same ? "identical" : $"first difference at {first}")}");
+        }
+        Check("caption", te.Encode(AceStepPrompts.Caption(tags, 190, "4", "E minor", 10)), caption);
+        Check("lyrics", te.Encode(AceStepPrompts.Lyrics(language, lyrics)), lyricIds);
+        Check("LM positive", lmTok.Encode(AceStepPrompts.LmPositive(tags, lyrics, 190, "4", "E minor", 10)), lmPos);
+        Check("LM negative", lmTok.Encode(AceStepPrompts.LmNegative(tags, lyrics)), lmNeg);
+        foreach (var line in report) Console.WriteLine("[AceStep] prompts vs ComfyUI ids: " + line);
+        Ur_Expect(all, string.Join("; ", report));
+        await Task.CompletedTask;
+        return string.Join("; ", report);
+    });
+
+    /// <summary>
     /// The code LM's sampling path (<see cref="AceStepCodeLm"/>: two <see cref="Flux2.Qwen3KvDecoder"/> caches, prefill + single-token steps) teacher-forced on ComfyUI's run:
     /// the positive prompt and the NEGATIVE prompt with ComfyUI's left padding stripped, then ComfyUI's first 11 chosen codes; each step's final-norm state against
     /// ComfyUI's model.norm taps (both rows). Then a short seeded generation: every code in range, the same seed gives the same codes.

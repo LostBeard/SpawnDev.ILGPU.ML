@@ -79,3 +79,7 @@ implementation is what the template runs; this source is the port's reference, t
 - 11-17 CUDA: `AceStepCodeLm` (two `Qwen3KvDecoder` caches, logits over the 64000 code tokens = all the mass at every measured step, cfg / temperature / top-p with its own
   seeded RNG): teacher-forced through the KV path, prompt 5.8e-5 (negative 3.8e-5: ComfyUI's LEFT-padded negative = the unpadded one from position 0), steps <= 9.2e-7.
   The SkinTokens RoPE table rounds frequencies to bf16 (1.7e-2 off a float32 Qwen3): the decoder uses exact host tables. Left: prompt templates (caption / lyrics / LM).
+- 11-17: PROMPTS measured from ComfyUI's ids (decoded with ACE-Step's MIT tokenizer): `AceStepPrompts` (caption, lyrics, LM positive with the metas in <think>, LM negative
+  with an empty <think>) + `Qwen2Tokenizer` re-encode to ComfyUI's ids EXACTLY (127 / 350 / 478 / 451). ComfyUI's instruction is "Generate audio semantic tokens based on the
+  given conditions:" in BOTH prompts (not ACE-Step's "Fill the audio semantic mask"). OPEN (asked Lore 11-17): where ComfyUI cuts long lyrics (mid-word, same cut in both
+  prompts), and how unset metas print.
