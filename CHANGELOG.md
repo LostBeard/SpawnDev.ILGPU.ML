@@ -17,6 +17,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2AudioDecoder` (audio VAE decoder, causal in time, + the HiFi-GAN vocoder, 24 kHz): spectrogram 5.9e-7, waveform 3.6e-5 (`Ltx2_AudioDecode_MatchesComfyUi`).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.
+- **Fixed: the CUDA "precise activations" GEMM lost accuracy with long sums** (`DiTKernels.PreciseActivations`, MmaGemm.KernelBf16x2Dense: the parity path of FLUX.1,
+  Z-Image, Qwen-Image, ACE-Step, LTX-2). It accumulated inside the tensor cores, whose fp32 accumulation truncates: the error grew linearly with K, 5.7e-4 at K 188160 (2.2e-3
+  with positive data; `Ltx2_PreciseGemm_KSweep`). Each k step now runs from zero and is added to the accumulators with an ordinary fp32 add: 2.9e-6 / 1.5e-6 at K 188160,
+  flat in K and below the fp32 tiled GEMM (7.5e-6). Speed: 1.73x the single-pass bf16 GEMM on [1024, 3072] x [3072, 3072] (its floor is 2 MMA passes). LTX-2 vs ComfyUI
+  after: text projection 4.6e-4 -> 2.2e-6, Gemma features 1.1e-5 -> 2.3e-6, transformer output 4.6e-5 -> 1.2e-5; NVFP4 Gemma call 6.8e-6 -> 3.0e-6.
 - **Fixed: SentencePiece BPE tokenization** (`SentencePieceTokenizer`, llama / mistral / gemma vocabs; found by SpawnGen wiring LTX-2). `Encode` was a greedy longest match,
   which is not what SentencePiece does: "sways" came out "▁sway" + "s" where SentencePiece gives "▁s" + "ways". Now SentencePiece's own BPE: characters, user-defined
   pieces kept whole, the highest-scoring adjacent merge first (leftmost on ties), byte fallback for what is left. New `FromSentencePieceModel` reads a `tokenizer.model` /

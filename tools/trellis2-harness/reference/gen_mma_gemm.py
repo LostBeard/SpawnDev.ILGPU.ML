@@ -206,7 +206,8 @@ for dtype in ("Bf16", "F16"):
 
 def kernel_split():
     """KernelBf16x2Dense (2026-11-14): the Bf16 dense kernel with the activations kept to ~16 mantissa bits instead of 8. Each fp32 activation is staged
-    as two bf16 values, hi = bf16(a) and lo = bf16(a - hi), and every k step runs the MMAs twice into the same fp32 accumulators (hi * W, then lo * W).
+    as two bf16 values, hi = bf16(a) and lo = bf16(a - hi); every k16 step and tile runs hi * W from zero, lo * W on top, and adds that partial sum to
+    the fp32 accumulators with an ordinary add (2026-11-17: the tensor cores' own accumulation truncates, an error growing linearly with K).
     The weights are bf16 already (exact), so the product loses only lo's own rounding (~2^-16 relative) instead of bf16's 2^-8: ComfyUI-style fp32
     activation references are matched to ~1e-5 where the single pass gives ~5e-3 (FLUX.1 / Z-Image gates, RTX 4070). Twice the MMAs and twice the A
     tile in shared memory (30 KB per group); the global loads are the same."""
@@ -267,22 +268,26 @@ def kernel_split():
         w(f"                int br{nt} = (wn * 32 + {nt * 8} + g) * RowWords + kw + t;")
         w(f"                uint b{nt}0 = bS[br{nt}];")
         w(f"                uint b{nt}1 = bS[br{nt} + 4];")
-    for src in ("aS", "aL"):                                   # the hi pass, then the lo pass into the same accumulators (fragments reloaded: same register count)
-        w("                {")
-        for mt in range(MT):
-            w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
-            w(f"                uint a{mt}0 = {src}[ar{mt}];")
-            w(f"                uint a{mt}1 = {src}[ar{mt} + 8 * RowWords];")
-            w(f"                uint a{mt}2 = {src}[ar{mt} + 4];")
-            w(f"                uint a{mt}3 = {src}[ar{mt} + 8 * RowWords + 4];")
-        for mt in range(MT):
-            for nt in range(NT):
-                w("                {")
-                w(f'                CudaAsm.Emit("{mma}",')
-                w(f"                    out float d0, out float d1, out float d2, out float d3, a{mt}0, a{mt}1, a{mt}2, a{mt}3, b{nt}0, b{nt}1, c{mt}{nt}0, c{mt}{nt}1, c{mt}{nt}2, c{mt}{nt}3);")
-                w(f"                c{mt}{nt}0 = d0; c{mt}{nt}1 = d1; c{mt}{nt}2 = d2; c{mt}{nt}3 = d3;")
-                w("                }")
-        w("                }")
+    # Per k16 step and tile: the hi MMA from ZERO, the lo MMA on top of it, then an ordinary (round-to-nearest) fp32 add into the accumulators.
+    # MEASURED 2026-11-17 (Ltx2_PreciseGemm_KSweep, RTX 4070): accumulating INSIDE the MMA (C = the running sum) truncates: the error grew linearly
+    # with K, 5.7e-4 at K 188160 with signed data and 2.2e-3 with positive data, where the fp32 tiled GEMM stays at 8.7e-6. Both A halves are
+    # loaded up front (16 more registers) so each tile's partial sum lives only in d0..d3.
+    for mt in range(MT):
+        w(f"                int ar{mt} = (wm * 64 + {mt * 16} + g) * RowWords + kw + t;")
+        for (src, sfx) in (("aS", "h"), ("aL", "l")):
+            w(f"                uint a{sfx}{mt}0 = {src}[ar{mt}];")
+            w(f"                uint a{sfx}{mt}1 = {src}[ar{mt} + 8 * RowWords];")
+            w(f"                uint a{sfx}{mt}2 = {src}[ar{mt} + 4];")
+            w(f"                uint a{sfx}{mt}3 = {src}[ar{mt} + 8 * RowWords + 4];")
+    for mt in range(MT):
+        for nt in range(NT):
+            w("                {")
+            w(f'                CudaAsm.Emit("{mma}",')
+            w(f"                    out float e0, out float e1, out float e2, out float e3, ah{mt}0, ah{mt}1, ah{mt}2, ah{mt}3, b{nt}0, b{nt}1, 0f, 0f, 0f, 0f);")
+            w(f'                CudaAsm.Emit("{mma}",')
+            w(f"                    out float d0, out float d1, out float d2, out float d3, al{mt}0, al{mt}1, al{mt}2, al{mt}3, b{nt}0, b{nt}1, e0, e1, e2, e3);")
+            w(f"                c{mt}{nt}0 += d0; c{mt}{nt}1 += d1; c{mt}{nt}2 += d2; c{mt}{nt}3 += d3;")
+            w("                }")
     w("            }")
     w("            Group.Barrier();")
     w("        }")

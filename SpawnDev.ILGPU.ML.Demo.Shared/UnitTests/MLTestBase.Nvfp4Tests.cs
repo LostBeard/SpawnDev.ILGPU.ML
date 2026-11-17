@@ -80,7 +80,7 @@ public abstract partial class MLTestBase
             await Check("k_proj", N, host, w, scale);
         }
         foreach (var line in report) Console.WriteLine("[Nvfp4] Gemma layer 24 vs ComfyUI: " + line);
-        Ur_Expect(exact && worstCall < 3e-5, string.Join("; ", report));                      // MEASURED 2026-11-17 CUDA: weights bit-exact; calls 6.8e-6 (nvfp4) / 4.0e-6 (fp8)
+        Ur_Expect(exact && worstCall < 3e-5, string.Join("; ", report));                      // MEASURED 2026-11-17 CUDA: weights bit-exact; calls 3.0e-6 (nvfp4) / 1.3e-6 (fp8) (6.8e-6 / 4.0e-6 before the MMA accumulation fix)
         return string.Join("; ", report);
     });
 }

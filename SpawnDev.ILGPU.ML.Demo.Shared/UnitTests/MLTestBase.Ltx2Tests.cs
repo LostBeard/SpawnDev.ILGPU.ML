@@ -65,10 +65,76 @@ public abstract partial class MLTestBase
             var wts = te.Weights;
             string line = $"{string.Join("; ", report)} | open {open:F1} s, encode {encode:F1} s ({wts.ResidentBlocks} of 48 layers resident, {wts.StreamedBytesPerForward / 1e9:F1} GB streamed: read {wts.ReadSeconds:F1} s, upload {wts.UploadSeconds:F1} s)";
             Console.WriteLine("[Ltx2] Gemma 3 encode vs ComfyUI: " + line);
-            Ur_Expect(worst < 1e-4, line);   // MEASURED 2026-11-17 CUDA (tensor cores): layers 7e-6..1.3e-5, final norm 2.8e-5, features 1.1e-5 (bf16 1 + w; fp32 1 + w was 2e-3)
+            Ur_Expect(worst < 3e-5, line);   // MEASURED 2026-11-17 CUDA (tensor cores, rounded accumulation): layers 8e-7..1.9e-6, final norm 5.8e-6, features 2.3e-6 (bf16 1 + w; fp32 1 + w was 2e-3)
             return line;
         }
         finally { await accelerator.SynchronizeAsync(); foreach (var b in probes.Values) b.Dispose(); }
+    });
+
+    /// <summary>
+    /// Diagnostic for the tensor-core "precise" GEMM (<see cref="Trellis2.DiTKernels.PreciseActivations"/>: activations split into bf16 hi + lo) against the fp32 tiled GEMM and a
+    /// float64 host reference, over K from 1k to 188k (LTX-2's text projection), with random-sign and all-positive data. MEASURED 2026-11-17 RTX 4070: with the MMA accumulating
+    /// in place the error grew linearly with K (5.7e-4 signed / 2.2e-3 positive at 188160: the tensor cores truncate); with each k step's MMA from zero and an ordinary fp32
+    /// add, 2.9e-6 / 1.5e-6 (the tiled fp32 GEMM: 7.5e-6 / 8.7e-6). Both paths must stay below 2e-5.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task Ltx2_PreciseGemm_KSweep() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda) throw new UnsupportedTestException("the tensor-core path is CUDA's");
+        const int M = 16, N = 64;
+        var lines = new List<string>(); double worstTiled = 0, worstMma = 0;
+        var k = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true };
+        foreach (bool positive in new[] { false, true })
+            foreach (int K in new[] { 1024, 4096, 16384, 65536, 188160 })
+            {
+                var rng = new Random(K + (positive ? 1 : 0));
+                var x = new float[(long)M * K]; for (long i = 0; i < x.Length; i++) x[i] = positive ? (float)rng.NextDouble() : (float)(rng.NextDouble() * 2 - 1);
+                var wRaw = new ushort[(long)N * K];
+                for (long i = 0; i < wRaw.Length; i++) wRaw[i] = (ushort)(BitConverter.SingleToInt32Bits(positive ? (float)rng.NextDouble() * 0.01f : (float)(rng.NextDouble() * 2 - 1) * 0.01f) >> 16);
+                var want = new float[M * N];
+                for (int m = 0; m < M; m++)
+                    for (int n = 0; n < N; n++)
+                    {
+                        double acc = 0;
+                        for (int kk = 0; kk < K; kk++) acc += (double)x[(long)m * K + kk] * BitConverter.Int32BitsToSingle(wRaw[(long)n * K + kk] << 16);
+                        want[m * N + n] = (float)acc;
+                    }
+                using var xb = accelerator.Allocate1D(x); using var wb = accelerator.Allocate1D<BFloat16>(wRaw.Length); wb.View.Cast<BFloat16, ushort>().CopyFromCPU(wRaw);
+                using var o = accelerator.Allocate1D<float>(M * N);
+                bool saved = Trellis2.DiTKernels.EnableTensorCores;
+                try
+                {
+                    Trellis2.DiTKernels.EnableTensorCores = true;
+                    k.Linear(xb.View, wb.View, null, o.View, M, K, N);
+                    double eMma = F2_RelRms(await o.View.CopyToHostAsync(), want);
+                    Trellis2.DiTKernels.EnableTensorCores = false;
+                    k.Linear(xb.View, wb.View, null, o.View, M, K, N);
+                    double eTiled = F2_RelRms(await o.View.CopyToHostAsync(), want);
+                    worstTiled = Math.Max(worstTiled, eTiled); worstMma = Math.Max(worstMma, eMma);
+                    lines.Add($"{(positive ? "positive" : "signed")} K {K}: tensor cores x2 {eMma:E2}, tiled fp32 {eTiled:E2}");
+                }
+                finally { Trellis2.DiTKernels.EnableTensorCores = saved; }
+            }
+        // speed: the x2 (precise) kernel against the single-pass bf16 one on a DiT-sized GEMM [1024, 3072] x [3072, 3072]^T (two MMA passes: ~2x is its floor)
+        {
+            const int Mb = 1024, Kb = 3072, Nb = 3072, reps = 20;
+            using var xb = accelerator.Allocate1D<float>((long)Mb * Kb); using var wb = accelerator.Allocate1D<BFloat16>((long)Nb * Kb); using var o = accelerator.Allocate1D<float>((long)Mb * Nb);
+            xb.MemSetToZero(); wb.MemSetToZero();
+            double Time(bool precise)
+            {
+                var kk = new Trellis2.DiTKernels(accelerator) { PreciseActivations = precise };
+                kk.Linear(xb.View, wb.View, null, o.View, Mb, Kb, Nb); accelerator.Synchronize();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int r = 0; r < reps; r++) kk.Linear(xb.View, wb.View, null, o.View, Mb, Kb, Nb);
+                accelerator.Synchronize();
+                return sw.Elapsed.TotalMilliseconds / reps;
+            }
+            double single = Time(false), x2 = Time(true);
+            lines.Add($"speed [1024, 3072] x [3072, 3072]: bf16 {single:F3} ms ({2.0 * Mb * Kb * Nb / single / 1e9:F1} TFLOPS), x2 {x2:F3} ms ({x2 / single:F2}x)");
+        }
+        foreach (var l in lines) Console.WriteLine("[Ltx2] precise GEMM sweep: " + l);
+        Ur_Expect(worstTiled < 2e-5 && worstMma < 2e-5, string.Join("; ", lines));
+        return string.Join("; ", lines);
     });
 
     /// <summary>
@@ -295,7 +361,7 @@ public abstract partial class MLTestBase
             var wts = dit.Weights;
             string line = $"{string.Join("; ", report)} | open {open:F1} s, call {run:F1} s ({wts.ResidentBlocks} of 48 blocks resident, {wts.StreamedBytesPerForward / 1e9:F1} GB streamed: read {wts.ReadSeconds:F1} s, upload {wts.UploadSeconds:F1} s)";
             Console.WriteLine("[Ltx2] transformer call 0 vs ComfyUI: " + line);
-            Ur_Expect(worst < 2e-4, line);   // MEASURED 2026-11-17 CUDA (tensor cores): embedders 8e-7, blocks 2e-5..6.3e-5, outputs 4.6e-5 / 1.3e-5 (q/k eps 1e-5, v2a after a2v)
+            Ur_Expect(worst < 6e-5, line);   // MEASURED 2026-11-17 CUDA (tensor cores, rounded accumulation): embedders 8e-7, blocks 1.5e-6..8.3e-6, outputs 1.2e-5 / 3.4e-6 (q/k eps 1e-5, v2a after a2v)
             return line;
         }
         finally { await accelerator.SynchronizeAsync(); foreach (var b in probes.Values) b.Dispose(); }
@@ -372,7 +438,7 @@ public abstract partial class MLTestBase
             Cmp("conditioning [1024, 7680]", cond, F2_Raw(Ltx2_Tap(enc, "ltx2_te_pos_0_cond"), (long)T * 2 * C));
             string line = $"{string.Join("; ", report)} | open {open:F1} s, run {run:F2} s";
             Console.WriteLine("[Ltx2] text connectors vs ComfyUI: " + line);
-            Ur_Expect(worst < 1e-3, line);   // MEASURED 2026-11-17 CUDA: projection 4.6e-4 with tensor cores (fp32 GEMM 6.9e-6: open library issue), conditioning 3.2e-5
+            Ur_Expect(worst < 2e-5, line);   // MEASURED 2026-11-17 CUDA: projection 2.2e-6, conditioning 1.9e-6 (tensor cores with rounded accumulation; truncating accumulation gave 4.6e-4)
             return line;
         }
         finally { await accelerator.SynchronizeAsync(); foreach (var b in probes.Values) b.Dispose(); }
