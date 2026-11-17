@@ -76,3 +76,6 @@ implementation is what the template runs; this source is the port's reference, t
 - SILENCE LATENT, settled: all 7 official ACE-Step 1.5 checkpoints ship the SAME silence_latent.pt (md5 34809d60); ACE-Step's MIT source hard-codes no table; so ComfyUI's
   4-decimal table is ComfyUI's own data (GPL: never shipped here). `AceStepSilenceLatent` reads the MIT .pt (no torch). Whole codes-off run with it vs ComfyUI: latent
   1.6e-2, audio 3.4e-2 (vs 1.8e-4 / 3.9e-4 with ComfyUI's table): the 2.2e-3 input difference is amplified ~10x. That is the parity SpawnGen gets on MIT inputs.
+- 11-17 CUDA: `AceStepCodeLm` (two `Qwen3KvDecoder` caches, logits over the 64000 code tokens = all the mass at every measured step, cfg / temperature / top-p with its own
+  seeded RNG): teacher-forced through the KV path, prompt 5.8e-5 (negative 3.8e-5: ComfyUI's LEFT-padded negative = the unpadded one from position 0), steps <= 9.2e-7.
+  The SkinTokens RoPE table rounds frequencies to bf16 (1.7e-2 off a float32 Qwen3): the decoder uses exact host tables. Left: prompt templates (caption / lyrics / LM).
