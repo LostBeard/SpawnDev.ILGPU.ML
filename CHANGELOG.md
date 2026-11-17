@@ -11,6 +11,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2TextConnectors`: the text projection and the video / audio connectors (registers, split RoPE): conditioning 3.2e-5 (`Ltx2_TextConnectors_MatchComfyUi`).
   - `Ltx2Transformer`: the 48-block audio-video DiT, the guidance pair batched through each streamed block: call 0's blocks 2e-5 to 6e-5, outputs 4.6e-5 / 1.3e-5
     (`Ltx2_Transformer_Call0_MatchesComfyUi`).
+  - `Ltx2AvModel`: the model call in ComfyUI's form (packed [video [128, F, H, W] | audio [8, Ta, 16]] latents, sigma, context [B, 1024, 7680], fps -> denoised
+    x - sigma v) and the template's sampler (CFG on the denoised latents, Euler): the whole two-step run from ComfyUI's noise to 1.1e-4 (`Ltx2_Sample_MatchesComfyUi`).
   - `Ltx2VideoDecoder` (the checkpoint's BF16 vae.decoder: no timestep conditioning, REFLECT spatial padding): frames 9.4e-6 (`Ltx2_VideoDecode_MatchesComfyUi`).
   - `Ltx2AudioDecoder` (audio VAE decoder, causal in time, + the HiFi-GAN vocoder, 24 kHz): spectrogram 5.9e-7, waveform 3.6e-5 (`Ltx2_AudioDecode_MatchesComfyUi`).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms

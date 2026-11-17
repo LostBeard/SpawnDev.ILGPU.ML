@@ -252,6 +252,45 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The template's whole sampling run through <see cref="Ltx2AvModel"/> (ComfyUI's model-call form: packed latents, sigma, context [2, 1024, 7680], 25 fps): from ComfyUI's
+    /// noise and conditioning, CFG 4, Euler over sigmas [1, 0.1, 0], against ComfyUI's call-0 output (denoised, both rows), the latent entering call 1, and the final latents it decoded.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_Sample_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var path = Path.Combine(Ltx2_Models(), "lightricks", "ltx-2-19b-dev-fp8.safetensors");
+        string call = Path.Combine(Ltx2_Dumps(), "call"), dec = Path.Combine(Ltx2_Dumps(), "dec");
+        if (!File.Exists(path)) throw new UnsupportedTestException($"{path} not found");
+        if (!Directory.Exists(call) || !Directory.Exists(dec)) throw new UnsupportedTestException($"SpawnGen's LTX-2 call / decode taps not found in {Ltx2_Dumps()}");
+        const int P = 128 * 8 + 8 * 9 * 16, L = 1024;
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("LTX2_DIT_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 6.0;
+        float[] T(string dir, string prefix, long n) => F2_Raw(Ltx2_Tap(dir, prefix), n);
+        var in0 = T(call, "ltx2_tcall_0_input", 2L * P); var out0 = T(call, "ltx2_tcall_0_output", 2L * P); var in1 = T(call, "ltx2_tcall_1_input", 2L * P);
+        var sigmas = T(call, "ltx2_tcall_0_c_transformer_options_sample_sigmas", 3);
+        var final = T(dec, "ltx2_dec_video_latent_samples", 128L * 8).Concat(T(dec, "ltx2_dec_audio_latent_samples", 8L * 9 * 16)).ToArray();
+        using var ctx = accelerator.Allocate1D(T(call, "ltx2_tcall_0_c_c_crossattn", 2L * L * Ltx2AvModel.ContextWidth));   // [uncond, cond]
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var model = await Ltx2AvModel.OpenAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 2, 2, 2, 2, 9, L, (long)(residentGb * 1e9));
+        double open = sw.Elapsed.TotalSeconds;
+        var report = new List<string>(); double worst = 0;
+        void Cmp(string label, float[] mine, float[] gold) { double e = F2_RelRms(mine, gold); worst = Math.Max(worst, e); report.Add($"{label} {e:E2}"); }
+        sw.Restart();
+        Cmp("call 0 denoised [2, 2176]", await model.DenoiseAsync(in0, new[] { sigmas[0], sigmas[0] }, ctx.View, 25f), out0);
+        double call0 = sw.Elapsed.TotalSeconds;
+        float[]? afterStep0 = null;
+        sw.Restart();
+        var x = await model.SampleAsync(in0[P..], ctx.View, sigmas, 4f, 25f, (i, xi) => { if (i == 0) afterStep0 = (float[])xi.Clone(); });
+        double sample = sw.Elapsed.TotalSeconds;
+        Cmp("after step 0 (call 1's input)", afterStep0!, in1[P..]);
+        Cmp("final latent [2176]", x, final);
+        string line = $"{string.Join("; ", report)} | sigmas [{string.Join(", ", sigmas)}] | open {open:F1} s, one call {call0:F1} s, sampling {sample:F1} s";
+        Console.WriteLine("[Ltx2] sampling vs ComfyUI: " + line);
+        Ur_Expect(worst < 5e-4, line);   // MEASURED 2026-11-17 CUDA: call 0 4.6e-5, after step 0 1.1e-4, final 1.1e-4 (CFG 4 amplifies the call's error)
+        return line;
+    });
+
+    /// <summary>
     /// LTX-2's text projection and connectors (the checkpoint's BF16 weights) on ComfyUI's own features [116, 188160] (so Gemma's error is not in it), against ComfyUI's
     /// float32 taps: the projection [116, 3840], each connector's output [1024, 3840] (registers, two blocks, final norm), and the conditioning [1024, 7680].
     /// </summary>
