@@ -72,6 +72,56 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// SentencePiece BPE (<see cref="Preprocessing.SentencePieceTokenizer.FromSentencePieceModel"/>, the Gemma file's own <c>spiece_model</c>) against ComfyUI's ids for LTX-2's
+    /// template prompt (SpawnGen's encode tap): the text is the reference ids decoded (identity normalizer: exact), and encoding it must give the same ids. The greedy longest
+    /// match this replaced split "sways" as "▁sway" + "s" (SentencePiece: "▁s" + "ways"). Host only.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Ltx2_GemmaTokenizer_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.CPU)) throw new UnsupportedTestException("reads the model file from disk");
+        var path = Path.Combine(Ltx2_Models(), "comfy", "split_files", "text_encoders", "gemma_3_12B_it_fp4_mixed.safetensors");
+        var enc = Path.Combine(Ltx2_Dumps(), "enc");
+        if (!File.Exists(path) || !Directory.Exists(enc)) throw new UnsupportedTestException($"needs {path} and SpawnGen's taps in {enc}");
+        byte[] spm;
+        await using (var fs = File.OpenRead(path))
+        {
+            var lenBytes = new byte[8]; await fs.ReadExactlyAsync(lenBytes);
+            var header = new byte[BitConverter.ToInt64(lenBytes)]; await fs.ReadExactlyAsync(header);
+            using var doc = System.Text.Json.JsonDocument.Parse(header);
+            var offs = doc.RootElement.GetProperty("spiece_model").GetProperty("data_offsets");
+            long a = offs[0].GetInt64(), b = offs[1].GetInt64();
+            fs.Seek(8 + header.Length + a, SeekOrigin.Begin);
+            spm = new byte[b - a]; await fs.ReadExactlyAsync(spm);
+        }
+        var tok = Preprocessing.SentencePieceTokenizer.FromSentencePieceModel(spm);
+        var all = Ltx2_PromptIds(enc);
+        var ids = all[Array.FindIndex(all, id => id != 0)..];                                   // BOS 2, then the prompt
+        Ur_Expect(ids[0] == tok.BosId, $"BOS {tok.BosId}, ComfyUI's first id {ids[0]}");
+        var text = tok.Decode(ids[1..]);
+        var mine = tok.Encode(text);
+        int diff = Enumerable.Range(0, Math.Min(mine.Length, ids.Length - 1)).FirstOrDefault(i => mine[i] != ids[i + 1], -1);
+        string line = $"{ids.Length - 1} prompt ids, ours {mine.Length}, first difference at {diff} | add_dummy_prefix {tok.AddSpacePrefix}, text \"{(text.Length > 60 ? text[..60] + "..." : text)}\"";
+        Ur_Expect(mine.Length == ids.Length - 1 && diff < 0, line);
+        // the same vocabulary through the GGUF path (FromGGUF: Ollama's gemma3 270m blob, GEMMA3_GGUF to override; skipped when absent)
+        var gguf = Environment.GetEnvironmentVariable("GEMMA3_GGUF")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models", "blobs", "sha256-735af2139dc652bf01112746474883d79a52fa1c19038265d363e3d42556f7a2");
+        if (File.Exists(gguf))
+        {
+            await using var gs = File.OpenRead(gguf);
+            var gtok = Preprocessing.SentencePieceTokenizer.FromGGUF(await GGUF.GGUFParser.ParseHeaderAsync(gs))!;
+            var gids = gtok.Encode(text);
+            bool same = gids.SequenceEqual(ids[1..]);
+            line += $" | GGUF vocab (gemma3 270m, add_space_prefix {gtok.AddSpacePrefix}): {(same ? "identical ids" : $"{gids.Length} ids, DIFFERENT")}";
+            Ur_Expect(same, line);
+        }
+        else line += " | GGUF cross-check skipped (no gemma3 blob)";
+        Console.WriteLine("[Ltx2] Gemma tokenizer vs ComfyUI: " + line);
+        await Task.CompletedTask;
+        return line;
+    });
+
+    /// <summary>
     /// The exact bf16 gathered convolution the LTX-2 decoders use (<see cref="Trellis2.SparseKernels.ConvTapsBf16Exact"/> after <see cref="Ltx2Kernels.GatherLayoutBf16"/>, on
     /// <see cref="Ltx2Kernels.ReflectTable"/>'s neighbours) against a host loop: random activations, random bf16 weights in torch's [cout, cin, 3, 3, 3] layout, a bias.
     /// </summary>

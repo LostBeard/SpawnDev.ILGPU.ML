@@ -1,12 +1,12 @@
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
 /// <summary>
-/// SentencePiece BPE tokenizer for LLaMA/Mistral/Gemma models.
-/// Implements the Unigram/BPE algorithm used by SentencePiece:
-/// - Tokens are UTF-8 byte sequences with U+2581 (▁) as word-start marker
-/// - Merge priority determined by score (lower score = higher priority for Unigram,
-///   higher score = higher priority for BPE — we use score-based greedy matching)
-/// - Byte fallback: unknown characters encoded as &lt;0xHH&gt; byte tokens
+/// SentencePiece BPE tokenizer for LLaMA/Mistral/Gemma models (and byte-level BPE for GPT-2-style vocabs).
+/// SentencePiece BPE (sentencepiece's bpe_model): spaces become U+2581 (▁), the text is split into characters (user-defined pieces kept whole and never
+/// merged), then the adjacent pair whose merged piece has the HIGHEST score (a normal or user-defined piece; the leftmost on ties) is merged, repeatedly,
+/// until no pair forms a piece; a symbol left without a piece becomes byte pieces &lt;0xHH&gt; (byte fallback) or the unknown id.
+/// MEASURED 2026-11-17 (SpawnGen, LTX-2's Gemma 3 prompt): the greedy longest match this replaced split "sways" as "▁sway" + "s" where SentencePiece
+/// gives "▁s" + "ways"; this algorithm gives all 116 of ComfyUI's ids. Unigram models (T5, umT5) are <see cref="UnigramTokenizer"/>.
 ///
 /// Compatible with GGUF metadata format:
 ///   tokenizer.ggml.model = "llama"
@@ -56,6 +56,12 @@ public class SentencePieceTokenizer : ITokenizer
     /// the second answer ignored the question ("What is the capital of France?" -> "Hello! I'm happy to help..."; Ollama: "Paris").
     /// </summary>
     public bool AddSpacePrefix { get; set; } = true;
+
+    /// <summary>
+    /// SentencePiece's NormalizerSpec.remove_extra_whitespaces: leading, trailing and repeated spaces are removed before encoding. False for GGUF vocabs
+    /// (llama.cpp does not apply it); <see cref="FromSentencePieceModel"/> sets it from the model (Gemma 3: false).
+    /// </summary>
+    public bool RemoveExtraWhitespaces { get; set; }
 
     // GPT-2 byte-level maps (the standard bytes_to_unicode), built once. Forward: raw byte → vocab-string char
     // (for ENCODE); reverse: char → raw byte (for DECODE).
@@ -166,7 +172,9 @@ public class SentencePieceTokenizer : ITokenizer
         }
         else
         {
+            if (RemoveExtraWhitespaces) text = string.Join(' ', text.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             normalized = (AddSpacePrefix ? "\u2581" : "") + text.Replace(" ", "\u2581");
+            return EncodeSentencePieceBpe(normalized);
         }
 
         // Greedy forward tokenization with longest match
@@ -216,6 +224,160 @@ public class SentencePieceTokenizer : ITokenizer
         }
 
         return result.ToArray();
+    }
+
+    private Dictionary<char, string[]>? _userDefined;  // user-defined pieces by first char, longest first (kept whole, never merged)
+
+    private bool Mergeable(int id)
+    {
+        int t = id < _tokenTypes.Length ? _tokenTypes[id] : 0;
+        return t is 0 or TypeNormal or TypeUserDefined;                // sentencepiece: pieces_ holds normal / user-defined / unused, and BPE skips unused
+    }
+
+    /// <summary>SentencePiece BPE on the escaped text (see the class summary): priority queue of adjacent pairs by (score desc, left asc), linked symbols.</summary>
+    private int[] EncodeSentencePieceBpe(string s)
+    {
+        if (s.Length == 0) return Array.Empty<int>();
+        _userDefined ??= Enumerable.Range(0, _vocab.Length).Where(i => i < _tokenTypes.Length && _tokenTypes[i] == TypeUserDefined && _vocab[i].Length > 0)
+            .Select(i => _vocab[i]).GroupBy(v => v[0]).ToDictionary(g => g.Key, g => g.OrderByDescending(v => v.Length).ToArray());
+        var start = new List<int>(s.Length); var len = new List<int>(s.Length); var frozen = new List<bool>(s.Length);
+        for (int pos = 0; pos < s.Length;)
+        {
+            int ud = 0;
+            if (_userDefined.TryGetValue(s[pos], out var candidates))
+                foreach (var u in candidates)
+                    if (u.Length <= s.Length - pos && string.CompareOrdinal(s, pos, u, 0, u.Length) == 0) { ud = u.Length; break; }
+            if (ud > 0) { start.Add(pos); len.Add(ud); frozen.Add(true); pos += ud; continue; }
+            int cl = char.IsHighSurrogate(s[pos]) && pos + 1 < s.Length && char.IsLowSurrogate(s[pos + 1]) ? 2 : 1;
+            start.Add(pos); len.Add(cl); frozen.Add(false); pos += cl;
+        }
+        int n = start.Count;
+        var prev = new int[n]; var next = new int[n];
+        for (int i = 0; i < n; i++) { prev[i] = i - 1; next[i] = i + 1 < n ? i + 1 : -1; }
+        var queue = new PriorityQueue<(int L, int R, int Size), (float Score, int L)>(Comparer<(float Score, int L)>.Create((a, b) => a.Score != b.Score ? b.Score.CompareTo(a.Score) : a.L.CompareTo(b.L)));
+        void TryAdd(int l, int r)
+        {
+            if (l < 0 || r < 0 || frozen[l] || frozen[r]) return;
+            int size = len[l] + len[r];
+            if (_tokenToId.TryGetValue(s.Substring(start[l], size), out int id) && Mergeable(id))
+                queue.Enqueue((l, r, size), (id < _scores.Length ? _scores[id] : 0f, l));
+        }
+        for (int i = 0; i + 1 < n; i++) TryAdd(i, i + 1);
+        while (queue.TryDequeue(out var top, out _))
+        {
+            var (l, r, size) = top;
+            if (len[l] == 0 || len[r] == 0 || next[l] != r || len[l] + len[r] != size) continue;   // stale: a neighbour changed since it was queued
+            len[l] = size; len[r] = 0;
+            next[l] = next[r]; if (next[r] >= 0) prev[next[r]] = l;
+            TryAdd(prev[l], l); TryAdd(l, next[l]);
+        }
+        var result = new List<int>(n);
+        for (int i = 0; i >= 0; i = next[i])
+        {
+            string piece = s.Substring(start[i], len[i]);
+            if (_tokenToId.TryGetValue(piece, out int id) && (id >= _tokenTypes.Length || _tokenTypes[id] != TypeUnused)) { result.Add(id); continue; }
+            foreach (byte b in System.Text.Encoding.UTF8.GetBytes(piece))
+            {
+                if (_tokenToId.TryGetValue($"<0x{b:X2}>", out int byteId)) result.Add(byteId);
+                else if (_unkId >= 0) result.Add(_unkId);
+            }
+        }
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// Read a SentencePiece BPE model file (<c>tokenizer.model</c>, a serialized <c>ModelProto</c>; ComfyUI's Gemma text-encoder files carry one as the U8 tensor
+    /// <c>spiece_model</c>): pieces, scores and types, the special ids (trainer_spec unk / bos / eos), and the normalizer's add_dummy_prefix and
+    /// remove_extra_whitespaces (defaults true, as in the proto). Unigram models are <see cref="UnigramTokenizer.FromSentencePieceModel"/>; a normalizer other than
+    /// "identity" with a character map is refused (its rules are not applied here).
+    /// </summary>
+    public static SentencePieceTokenizer FromSentencePieceModel(ReadOnlySpan<byte> model)
+    {
+        var tokens = new List<string>(); var scores = new List<float>(); var types = new List<int>();
+        int modelType = 1, unk = -1, bos = -1, eos = -1; bool dummyPrefix = true, removeExtra = true; string normName = ""; int charsmap = 0;
+        int p = 0;
+        while (p < model.Length)
+        {
+            ulong key = SpVarint(model, ref p); int field = (int)(key >> 3), wire = (int)(key & 7);
+            if (wire != 2) { SpSkip(model, ref p, wire); continue; }
+            var msg = SpBytes(model, ref p);
+            int q = 0;
+            if (field == 1)
+            {
+                string piece = ""; float score = 0f; int type = TypeNormal;
+                while (q < msg.Length)
+                {
+                    ulong k = SpVarint(msg, ref q); int f = (int)(k >> 3), w = (int)(k & 7);
+                    if (f == 1 && w == 2) piece = System.Text.Encoding.UTF8.GetString(SpBytes(msg, ref q));
+                    else if (f == 2 && w == 5) { score = BitConverter.ToSingle(msg.Slice(q, 4)); q += 4; }
+                    else if (f == 3 && w == 0) type = (int)SpVarint(msg, ref q);
+                    else SpSkip(msg, ref q, w);
+                }
+                tokens.Add(piece); scores.Add(score); types.Add(type);
+            }
+            else if (field == 2)
+            {
+                while (q < msg.Length)
+                {
+                    ulong k = SpVarint(msg, ref q); int f = (int)(k >> 3), w = (int)(k & 7);
+                    if (w == 0 && f is 3 or 40 or 41 or 42)
+                    {
+                        int v = (int)SpVarint(msg, ref q);
+                        if (f == 3) modelType = v; else if (f == 40) unk = v; else if (f == 41) bos = v; else eos = v;
+                    }
+                    else SpSkip(msg, ref q, w);
+                }
+            }
+            else if (field == 3)
+            {
+                while (q < msg.Length)
+                {
+                    ulong k = SpVarint(msg, ref q); int f = (int)(k >> 3), w = (int)(k & 7);
+                    if (f == 1 && w == 2) normName = System.Text.Encoding.UTF8.GetString(SpBytes(msg, ref q));
+                    else if (f == 2 && w == 2) charsmap = SpBytes(msg, ref q).Length;
+                    else if (f == 3 && w == 0) dummyPrefix = SpVarint(msg, ref q) != 0;
+                    else if (f == 4 && w == 0) removeExtra = SpVarint(msg, ref q) != 0;
+                    else SpSkip(msg, ref q, w);
+                }
+            }
+        }
+        if (tokens.Count == 0) throw new InvalidDataException("SentencePiece model: no pieces");
+        if (modelType != 2) throw new NotSupportedException($"SentencePiece model type {modelType} (1 = Unigram: use UnigramTokenizer.FromSentencePieceModel); this tokenizer is BPE (2)");
+        if (charsmap > 0 && normName != "identity") throw new NotSupportedException($"SentencePiece normalizer '{normName}' with a character map: its rules are not applied here");
+        var tok = new SentencePieceTokenizer(tokens.ToArray(), scores.ToArray(), types.ToArray()) { AddSpacePrefix = dummyPrefix, RemoveExtraWhitespaces = removeExtra };
+        if (unk >= 0) tok._unkId = unk;
+        if (bos >= 0) tok._bosId = bos;
+        if (eos >= 0) tok._eosId = eos;
+        return tok;
+    }
+
+    private static ulong SpVarint(ReadOnlySpan<byte> b, ref int p)
+    {
+        ulong r = 0; int sh = 0;
+        while (true)
+        {
+            if (p >= b.Length || sh > 63) throw new InvalidDataException("SentencePiece model: a truncated varint");
+            byte x = b[p++]; r |= (ulong)(x & 0x7F) << sh; sh += 7;
+            if (x < 0x80) return r;
+        }
+    }
+    private static ReadOnlySpan<byte> SpBytes(ReadOnlySpan<byte> b, ref int p)
+    {
+        ulong n = SpVarint(b, ref p);
+        if (n > (ulong)(b.Length - p)) throw new InvalidDataException("SentencePiece model: a field runs past the end");
+        var o = b.Slice(p, (int)n); p += (int)n; return o;
+    }
+    private static void SpSkip(ReadOnlySpan<byte> b, ref int p, int wire)
+    {
+        switch (wire)
+        {
+            case 0: SpVarint(b, ref p); break;
+            case 1: p += 8; break;
+            case 2: SpBytes(b, ref p); break;
+            case 5: p += 4; break;
+            default: throw new InvalidDataException($"SentencePiece model: wire type {wire}");
+        }
+        if (p > b.Length) throw new InvalidDataException("SentencePiece model: a field runs past the end");
     }
 
     /// <summary>

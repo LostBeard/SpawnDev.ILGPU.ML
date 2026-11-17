@@ -17,6 +17,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2AudioDecoder` (audio VAE decoder, causal in time, + the HiFi-GAN vocoder, 24 kHz): spectrogram 5.9e-7, waveform 3.6e-5 (`Ltx2_AudioDecode_MatchesComfyUi`).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.
+- **Fixed: SentencePiece BPE tokenization** (`SentencePieceTokenizer`, llama / mistral / gemma vocabs; found by SpawnGen wiring LTX-2). `Encode` was a greedy longest match,
+  which is not what SentencePiece does: "sways" came out "▁sway" + "s" where SentencePiece gives "▁s" + "ways". Now SentencePiece's own BPE: characters, user-defined
+  pieces kept whole, the highest-scoring adjacent merge first (leftmost on ties), byte fallback for what is left. New `FromSentencePieceModel` reads a `tokenizer.model` /
+  ComfyUI's `spiece_model` (add_dummy_prefix, remove_extra_whitespaces and the special ids from the model). Gemma 3's prompt in LTX-2's template: all 115 ids equal
+  ComfyUI's, from the spiece model and from Ollama's gemma3 GGUF vocabulary alike (`Ltx2_GemmaTokenizer_MatchesComfyUi`). Every GGUF model on a SentencePiece vocab
+  now gets the ids its reference implementation produces. Byte-level BPE (qwen, llama 3, smollm) is unchanged.
 - **Fixed: the tiled GEMM's gathered rows with BF16 weights.** `TiledGemm.Gemm`'s gather loop decodes F16 weights only, so BF16 weights through it were wrong
   (2.1 relative). New `TiledGemm.GemmGatherBf16` (its own kernel: `Gemm` keeps three k-loops, no WebGPU cost) behind `SparseKernels.ConvTapsBf16Exact`: 3.6e-7 vs a host
   loop (`Ltx2_ConvBf16Exact_MatchesHost`). No existing caller passed BF16 + gather.

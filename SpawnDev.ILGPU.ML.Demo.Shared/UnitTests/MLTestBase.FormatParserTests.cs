@@ -392,10 +392,11 @@ public abstract partial class MLTestBase
     {
         // Gemma 2/3 GGUFs declare tokenizer.ggml.add_space_prefix = false. Chat templates encode each segment ("\n", "user\n...")
         // separately, so a dummy prefix the model does not use puts a stray "▁" token before every newline after a turn marker
-        // (gemma-3-270m-it then ignored the second question of a conversation). Vocab: "▁" (3), "\n" (4), "user" (5), "▁user" (6).
-        var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\n", "user", "\u2581user" };
-        var scores = new float[] { 0, 0, 0, -1, -1, -1, -1 };
-        var types = new int[] { 2, 3, 3, 0, 0, 0, 0 };
+        // (gemma-3-270m-it then ignored the second question of a conversation). Vocab: "▁" (3), "\n" (4), "user" (5), "▁user" (6), and the pieces
+        // SentencePiece BPE merges through on the way (a real BPE vocab holds every intermediate): u s e r, us, er (us + er = user, ▁ + user = ▁user).
+        var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\n", "user", "\u2581user", "u", "s", "e", "r", "us", "er" };
+        var scores = new float[] { 0, 0, 0, -1, -1, -2, -3, -5, -5, -5, -5, -1, -1 };
+        var types = new int[] { 2, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         var llama = new SentencePieceTokenizer(tokens, scores, types);              // default: the llama dummy prefix
         var gemma = new SentencePieceTokenizer(tokens, scores, types) { AddSpacePrefix = false };
         string Ids(int[] a) => string.Join(",", a);
@@ -410,20 +411,22 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task SentencePiece_EncodeAndDecode_RoundTrip() => await RunTest(async accelerator =>
     {
-        // Minimal SentencePiece vocab: special tokens + a few words
-        var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\u2581hello", "\u2581world", "h", "e", "l", "o" };
-        var scores = new float[] { 0, 0, 0, -1, -2, -2, -3, -3, -3, -3 };
-        var types = new int[] { 2, 3, 3, 0, 0, 0, 0, 0, 0, 0 }; // the GGUF enum: 2 = unknown, 3 = control (0 = undefined, read as normal)
+        // Minimal SentencePiece BPE vocab: special tokens, two words and the pieces BPE merges through to reach them (higher score merges first):
+        // he, ll, llo -> hello -> ▁hello; wo, rl, worl -> world -> ▁world
+        var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581", "\u2581hello", "\u2581world", "h", "e", "l", "o",
+            "w", "r", "d", "he", "ll", "llo", "hello", "wo", "rl", "worl", "world" };
+        var scores = new float[] { 0, 0, 0, -1, -1.4f, -1.9f, -3, -3, -3, -3, -3, -3, -3, -1, -1.1f, -1.2f, -1.3f, -1.5f, -1.6f, -1.7f, -1.8f };
+        var types = new int[tokens.Length]; types[0] = 2; types[1] = 3; types[2] = 3; // the GGUF enum: 2 = unknown, 3 = control (0 = undefined, read as normal)
 
         var sp = new SentencePieceTokenizer(tokens, scores, types);
 
-        if (sp.VocabSize != 10) throw new Exception($"VocabSize: expected 10, got {sp.VocabSize}");
+        if (sp.VocabSize != 21) throw new Exception($"VocabSize: expected 21, got {sp.VocabSize}");
         if (sp.BosId != 1) throw new Exception($"BosId: expected 1, got {sp.BosId}");
         if (sp.EosId != 2) throw new Exception($"EosId: expected 2, got {sp.EosId}");
 
-        // Encode "hello world"
+        // Encode "hello world": SentencePiece BPE reaches ▁hello (4) and ▁world (5)
         var encoded = sp.Encode("hello world");
-        if (encoded.Length == 0) throw new Exception("Encode returned empty");
+        if (string.Join(",", encoded) != "4,5") throw new Exception($"Encode(\"hello world\"): expected [4,5] (▁hello ▁world), got [{string.Join(",", encoded)}]");
 
         // Decode back
         var decoded = sp.Decode(encoded);
