@@ -13,6 +13,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `AceStepConditionEncoder`: lyric encoder, timbre encoder, text projector, packed [lyrics | timbre | text]: 6.3e-6. ComfyUI runs no sliding window: both default to full
     attention (`SlidingWindow = -1`; ACE-Step's own 128 window is the test's control, 0.47 off on the lyrics).
   - Caption conditioning: Qwen3-0.6B through `Flux2TextEncoder` with ComfyUI's padding rule (keys from the first <|endoftext|> on masked): 2.1e-5; lyrics are the embedding rows.
+  - `AceStepGenerator`: the whole codes-off text-to-music graph (ids, noise, silence latent -> Euler steps -> latent -> audio): latent 1.8e-4, audio 3.9e-4 on a 2-step run.
 - `Flux2Weights.FusedQkvSplit`: the q | k | v split of a Hugging Face Qwen3 file is recorded before the adapter fuses it, so `Flux2TextEncoder` runs any Qwen3 size (it only accepted
   Qwen3-4B's fused layout). FLUX.2, Z-Image and Qwen-Image text encoder gates unchanged.
 

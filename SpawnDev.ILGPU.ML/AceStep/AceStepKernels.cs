@@ -99,6 +99,37 @@ public sealed class AceStepKernels
         _add(n, a, b, o);
     }
 
+    private Action<Index1D, FV, FV, FV, float>? _axpy;
+    private static void AxpyImpl(Index1D i, FV x, FV v, FV o, float a) => o[i] = float.MultiplyAddEstimate(a, v[i], x[i]);
+    /// <summary>o = x + a v over n values (the denoised latent x - sigma v).</summary>
+    public void Axpy(FV x, FV v, FV o, float a, int n)
+    {
+        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(AxpyImpl);
+        _axpy(n, x, v, o, a);
+    }
+
+    private Action<Index1D, FV, FV, float>? _axpyInPlace;
+    private static void AxpyInPlaceImpl(Index1D i, FV x, FV v, float a) => x[i] = float.MultiplyAddEstimate(a, v[i], x[i]);
+    /// <summary>x += a v over n values (an Euler step), one binding per buffer (WebGPU).</summary>
+    public void AxpyInPlace(FV x, FV v, float a, int n)
+    {
+        _axpyInPlace ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyInPlaceImpl);
+        _axpyInPlace(n, x, v, a);
+    }
+
+    private Action<Index1D, FV, FV, FV, int, int>? _concat;
+    private static void ConcatImpl(Index1D i, FV a, FV b, FV o, int ca, int cb)
+    {
+        int w = ca + cb, r = i / w, c = i % w;
+        o[i] = c < ca ? a[(long)r * ca + c] : b[(long)r * cb + c - ca];
+    }
+    /// <summary>o [rows, ca + cb] = [a [rows, ca] | b [rows, cb]] (the DiT's context: source latents | chunk mask).</summary>
+    public void Concat(FV a, FV b, FV o, int rows, int ca, int cb)
+    {
+        _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
+        _concat(rows * (ca + cb), a, b, o, ca, cb);
+    }
+
     // ───────────────────────── the DiT's k2 / s2 input and output ─────────────────────────
     private Action<Index1D, FV, FV, FV, int, int, int>? _patchify;
     // P[p, c 2 + k] = X[2 p + k, c], X = [context (cc) | hidden (hc)] per frame, zero past T (ACE-Step pads the time to even)

@@ -24,6 +24,47 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// The whole codes-off graph (<see cref="AceStepGenerator"/>: caption + lyrics -> condition tokens -> 2 Euler steps of the DiT, sigmas 1, 0.75, 0 -> VAE) from ComfyUI's
+    /// own ids, starting noise (call 0's input) and silence latent (its refer_audio), against ComfyUI's final latent [64, 250] and audio [2, 480000]. ComfyUI's call output is the
+    /// denoised x - sigma v and its step plain Euler (measured on the dumps: 2.6e-8 / 2.7e-8).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_Graph_CodesOff_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        var dit = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
+        var te = Ace_Require(accelerator, Path.Combine("text_encoders", "qwen_0.6b_ace15.safetensors"));
+        var vae = Ace_Require(accelerator, Path.Combine("vae", "ace_1.5_vae.safetensors"));
+        var d = Ace_Dumps();
+        int[] Ids(int call)
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(d, "ace_g0_ids.json")));
+            var e = doc.RootElement.GetProperty("calls")[call].GetProperty("ids");
+            static IEnumerable<int> Flat(System.Text.Json.JsonElement x) => x.ValueKind == System.Text.Json.JsonValueKind.Array ? x.EnumerateArray().SelectMany(Flat) : new[] { x.GetInt32() };
+            if (e.ValueKind == System.Text.Json.JsonValueKind.String) { using var inner = System.Text.Json.JsonDocument.Parse(e.GetString()!); return Flat(inner.RootElement).ToArray(); }
+            return Flat(e).ToArray();
+        }
+        const int frames = 250;
+        var noise = F2_Raw(Path.Combine(d, "ace_g0_call_0_input_f32_1x64x250.raw"), 64L * frames);
+        var referCm = F2_Raw(Path.Combine(d, "ace_g0_call_0_c_refer_audio_f32_1x64x250.raw"), 64L * frames);
+        var silence = new float[frames * 64];
+        for (int c = 0; c < 64; c++) for (int t = 0; t < frames; t++) silence[t * 64 + c] = referCm[c * frames + t];
+        var expectedLatent = F2_Raw(Path.Combine(d, "ace_g0_out_samples_f32_1x64x250.raw"), 64L * frames);
+        var expectedAudio = F2_Raw(Path.Combine(d, "ace_g0_audio_waveform_f32_1x2x480000.raw"), 2L * 480000);
+        var src = new LocalFolderModelSource(Path.Combine(Ace_Dir(), "comfy", "split_files"));
+        using var gen = await AceStepGenerator.LoadAsync(accelerator, src, "", Path.Combine("diffusion_models", Path.GetFileName(dit)), Path.Combine("text_encoders", Path.GetFileName(te)),
+            Path.Combine("vae", Path.GetFileName(vae)), frames, 256, 512);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var latent = await gen.GenerateLatentAsync(Ids(0), Ids(1), noise, silence, frames, new[] { 1f, 0.75f, 0f });
+        double tl = sw.Elapsed.TotalSeconds;
+        var audio = await gen.DecodeAsync(latent, frames);
+        double el = F2_RelRms(latent, expectedLatent), ea = F2_RelRms(audio, expectedAudio);
+        string report = $"latent [64, 250] {el:E2}, audio [2, 480000] {ea:E2} (2 steps {tl:F1} s, decode {sw.Elapsed.TotalSeconds - tl:F1} s)";
+        Console.WriteLine("[AceStep] codes-off graph vs ComfyUI: " + report);
+        Ur_Expect(el < 6e-4 && ea < 1.5e-3, report);                                          // MEASURED 2026-11-17 CUDA: latent 1.8e-4, audio 3.9e-4
+        return report;
+    });
+
+    /// <summary>
     /// ComfyUI's ACE-Step 1.5 text conditioning with the audio codes off (TextEncodeAceStepAudio1.5, SpawnGen's te dump): the tags' 127 ids (ComfyUI's template
     /// included, ids as dumped) through qwen_0.6b_ace15 (Qwen3, 28 layers: <see cref="Flux2.Flux2TextEncoder"/>) give cond [1, 127, 1024]; the lyrics' 350 ids give
     /// conditioning_lyrics [1, 350, 1024] = the token embedding table alone (no layers). Both readings of the last layer are reported (with / without the final

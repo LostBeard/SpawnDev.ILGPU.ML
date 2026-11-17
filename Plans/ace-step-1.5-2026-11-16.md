@@ -47,6 +47,12 @@ implementation is what the template runs; this source is the port's reference, t
   so both default to SlidingWindow = -1. Text: the caption ids through Qwen3-0.6B (Flux2TextEncoder, last layer + final norm) 2.1e-5, with ComfyUI's padding rule: the
   prompt is real up to its FIRST <|endoftext|> (151643), every key from there on is padding (rows still output); every key valid misses at 0.10 (numpy rebuild:
   _tuvok-handoff/ace_qwen06_variants.py). Lyrics = the 0.6B's embed_tokens rows exactly (7.7e-9). Stages 3 and 4 done.
+- 11-17 CUDA: the WHOLE codes-off graph (`AceStepGenerator`: ComfyUI's ids, call-0 noise and silence latent in; 2 Euler steps 1 -> 0.75 -> 0; VAE) vs ComfyUI: latent
+  1.8e-4, audio 3.9e-4 (2 steps 2.8 s, decode 10.5 s for 10 s). ComfyUI's model call outputs the denoised x - sigma v; its step is plain Euler (no DCW).
+- SILENCE LATENT: ComfyUI's is 4 distinct frames then ONE steady row tiled, values exactly 4-decimal (a stored rounded table); ACE-Step's MIT silence_latent.pt
+  (acestep-v15-turbo, [64, 15000], downloaded to F:/spawndev-acestep/hf-acestep15) matches its first 4 frames to 4 decimals, but its later frames vary (mean within 0.009
+  of the steady row). ComfyUI's table is never copied into the library: the generator takes the silence latent as an input. To match from MIT sources: port the Oobleck
+  ENCODER, encode silence, round to 4 decimals, compare with ComfyUI's measured rows (also needed for audio-to-audio / covers).
 
 ## Stages (each gated against SpawnGen's ComfyUI dumps, parity first)
 1. Files: the four ComfyUI files (models host mirror, standing go); read tensor names / shapes / dtypes; map to the facts above.
