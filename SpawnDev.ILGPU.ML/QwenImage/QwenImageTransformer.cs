@@ -54,6 +54,8 @@ public sealed class QwenImageTransformer : IDisposable
     public long ResidentBytes => _w.ResidentBytes;
     public int ResidentBlocks => _w.ResidentBlocks;
     public long StreamedBytesPerForward => _w.StreamedBytesPerForward;
+    /// <summary>The weights (streaming statistics: <see cref="StreamedModelWeights.StreamSeconds"/>).</summary>
+    public StreamedModelWeights Weights => _w;
     /// <summary>The velocity of the last <see cref="ForwardAsync"/>, [noise latent tokens, 64] (2 x 2 patches of the 16-channel latent, channel c * 4 + dy * 2 + dx).</summary>
     public FV Output => _out.View;
     /// <summary>Tokens each call takes: the noise latent's plus every reference picture's (<see cref="ForwardAsync"/>'s imageTokens rows).</summary>

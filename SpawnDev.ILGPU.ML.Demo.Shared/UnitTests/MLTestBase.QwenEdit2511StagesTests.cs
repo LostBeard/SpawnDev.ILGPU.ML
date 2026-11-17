@@ -9,6 +9,38 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     /// <summary>
+    /// Streaming cost of a 20B transformer that does not fit the card (Qwen-Image Edit 2511, 17 of 60 blocks resident at 6 GB): the same model call (q11_1 call 0) three
+    /// times on one open transformer: (1) no read-ahead, no host cache; (2) read-ahead on, a host cache (QI_BENCH_CACHE_GB, default 6) filling; (3) the same with the cache warm.
+    /// Reports each pass's wall time and the part the caller waited on streaming; every pass must still match ComfyUI (the order of reads must not change the math).
+    /// MEASURED 2026-11-17 CUDA, the file on a USB 3.0 SATA drive (about 0.32 GB/s), 14.6 GB streamed per call, compute about 7 s: no read-ahead 52.1 s (45.1 s waiting),
+    /// read-ahead + cache filling 44.8 s (39.2), cache warm (5.8 GB) 31.7 s (26.1); all 1.01e-3 vs ComfyUI. The disk dominates: read-ahead hides one block behind ~7 s of
+    /// compute, the RAM tier removes its share of the reads.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task QwenEdit2511_Streaming_Benchmark() => await RunTest(async accelerator =>
+    {
+        var path = Qe_Transformer(accelerator, "qwen_image_edit_2511_fp8mixed.safetensors"); var d = Qe_Dumps();
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("QI_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 6.0;
+        double cacheGb = double.TryParse(Environment.GetEnvironmentVariable("QI_BENCH_CACHE_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var c) ? c : 6.0;
+        var k = new Flux1.Flux1Kernels(accelerator);
+        using var tr = await QwenImageTransformer.OpenAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 212, 12, 16, new[] { (56, 74) }, (long)(residentGb * 1e9));
+        var lines = new List<string> { $"{tr.ResidentBlocks} of 60 blocks resident, {tr.StreamedBytesPerForward / 1e9:F1} GB streamed per call, host cache {cacheGb} GB" };
+        double worst = 0;
+        foreach (var (label, prefetch, cache) in new[] { ("no read-ahead, no cache", false, 0.0), ("read-ahead + cache filling", true, cacheGb), ("read-ahead + cache warm", true, cacheGb) })
+        {
+            tr.Weights.Prefetch = prefetch; tr.Weights.HostCacheBytes = (long)(cache * 1e9);
+            var report = new List<string>();
+            double s0 = tr.Weights.StreamSeconds; var sw = System.Diagnostics.Stopwatch.StartNew();
+            double e = await Qe_CallAsync(accelerator, tr, k, d, "q11_1", 0, 212, 1, report);
+            worst = Math.Max(worst, e);
+            lines.Add($"{label}: {sw.Elapsed.TotalSeconds:F1} s (waited on streaming {tr.Weights.StreamSeconds - s0:F1} s), host cache {tr.Weights.HostCacheUsed / 1e9:F1} GB, vs ComfyUI {e:E2}");
+        }
+        foreach (var line in lines) Console.WriteLine("[QwenEdit] streaming benchmark: " + line);
+        Ur_Expect(worst < 1.5e-3, string.Join("; ", lines));                                  // the 2511 gate's bound: streaming changes the timing, never the result
+        return string.Join("; ", lines);
+    });
+
+    /// <summary>
     /// Where the 2511 transformer's residual difference to ComfyUI builds up: SpawnGen's taps of q11_1 call 0 (the positive at sigma 1, float32 CPU) at block 0's attention,
     /// blocks 0 / 29 / 59 (both streams), norm_out and proj_out, against <see cref="QwenImageTransformer.Probe"/> at the same points. Relative RMS per stage.
     /// MEASURED 2026-11-16, CUDA: block 0 attention img 1.83e-3 / txt 1.5e-5; block 0 img 1.6e-4 / txt 1.8e-5; block 29 2.6e-4 / 2.4e-4; block 59 2.7e-4 / 6.9e-4;

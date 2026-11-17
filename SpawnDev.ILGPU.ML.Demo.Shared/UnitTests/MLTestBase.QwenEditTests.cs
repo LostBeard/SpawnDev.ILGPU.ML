@@ -49,11 +49,16 @@ public abstract partial class MLTestBase
         Ur_Expect(tokens.Length == (long)tr.InputTokens * 64, $"{tokens.Length / 64} tokens, the transformer takes {tr.InputTokens}");
         using var dTok = accelerator.Allocate1D(tokens); using var dX = accelerator.Allocate1D(x); using var den = accelerator.Allocate1D<float>(lat);
         using var cond = accelerator.Allocate1D(F2_Raw(F($"c_c_crossattn_f32_1x{n}x3584"), (long)n * 3584));
+        // streaming A/B knobs (env): QI_PREFETCH=0 turns the read-ahead off, QI_HOST_CACHE_GB keeps streamed blocks in host RAM between calls
+        if (Environment.GetEnvironmentVariable("QI_PREFETCH") is string pf) tr.Weights.Prefetch = pf != "0";
+        if (double.TryParse(Environment.GetEnvironmentVariable("QI_HOST_CACHE_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cacheGb))
+            tr.Weights.HostCacheBytes = (long)(cacheGb * 1e9);
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        double s0 = tr.Weights.StreamSeconds;
         await tr.ForwardAsync(dTok.View, cond.View, sigma, n);
         k.Denoised(dX.View, tr.Output, den.View, sigma, 12, 16);
         double e = F2_RelRms(await den.View.CopyToHostAsync(), F2_Raw(F("output_f32_1x16x1x24x32"), lat));
-        report.Add($"{prefix} call {call} ({n} rows, {refCount} ref, sigma {sigma:G5}{(tr.ReferencesAtTimestepZero ? ", refs at t = 0" : "")}): {e:E2} ({sw.Elapsed.TotalSeconds:F1} s)");
+        report.Add($"{prefix} call {call} ({n} rows, {refCount} ref, sigma {sigma:G5}{(tr.ReferencesAtTimestepZero ? ", refs at t = 0" : "")}): {e:E2} ({sw.Elapsed.TotalSeconds:F1} s, of it streaming {tr.Weights.StreamSeconds - s0:F1} s, {tr.StreamedBytesPerForward / 1e9:F1} GB)");
         return e;
     }
 

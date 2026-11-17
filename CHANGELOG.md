@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **Streaming weights that do not fit the card** (`StreamedModelWeights`): `Prefetch` (on by default) reads the next streamed block while the GPU runs this one; `HostCacheBytes`
+  (default 0) keeps streamed blocks' file images in host RAM between calls; `StreamSeconds` reports the time a caller waits on streaming. Qwen-Image Edit 2511 (14.6 GB streamed
+  per call from a USB 3.0 drive): 52.1 s -> 44.8 s with read-ahead, 31.7 s with a warm 5.8 GB RAM tier, results identical (`QwenEdit2511_Streaming_Benchmark`).
+
 ## 5.8.20 - 2026-11-17 (nuget.org) - ACE-Step 1.5 (music) against ComfyUI; SpawnDev.ILGPU 5.4.35
 
 - **SpawnDev.ILGPU 5.4.35.** Wasm: a disposed buffer's JS objects are released after the work queued before it finishes (was immediate: "RangeError: offset is out of

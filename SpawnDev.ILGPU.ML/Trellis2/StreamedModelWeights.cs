@@ -37,6 +37,28 @@ public sealed class StreamedModelWeights : IDisposable
     public long StreamedBytesPerForward { get; private set; }
     /// <summary>The non-block tensors.</summary>
     public GpuWeights Base => _base;
+    /// <summary>Wall time the caller waited for streamed blocks (file read not hidden by the prefetch, plus the upload), and how many loads; for measuring the streaming cost.</summary>
+    public double StreamSeconds { get; set; }
+    public int StreamedLoads { get; set; }
+    /// <summary>
+    /// Read the next streamed block from the file while the caller's GPU work on this one runs (default on): the disk read hides behind the compute and only the upload
+    /// remains in the caller's path.
+    /// </summary>
+    public bool Prefetch { get; set; } = true;
+    /// <summary>
+    /// Host RAM (bytes) for keeping streamed blocks' file images between forward passes (default 0): a cached block skips the disk on every later pass (it is still uploaded).
+    /// Blocks are cached in order while the budget lasts.
+    /// </summary>
+    public long HostCacheBytes { get; set; }
+    /// <summary>Host RAM the cache holds now.</summary>
+    public long HostCacheUsed => _hostCacheUsed;
+
+    // per streamed block: its tensors in the file (names with the prefix, absolute offsets), the file's metadata (kept in every block image: the quantization check reads it)
+    private List<SafeTensors.SafeTensorInfo>[] _blockTensors = Array.Empty<List<SafeTensors.SafeTensorInfo>>();
+    private Dictionary<string, string> _metadata = new();
+    private readonly Dictionary<int, byte[]> _hostCache = new();
+    private long _hostCacheUsed;
+    private (int Block, Task<byte[]> Image)? _pending;
     /// <summary>
     /// Every tensor name the file's header declares (prefix-free), including ones never loaded: ComfyUI's empty marker tensors (<c>__index_timestep_zero__</c> in Qwen-Image
     /// Edit 2511 files) tell the model how to run.
@@ -89,6 +111,7 @@ public sealed class StreamedModelWeights : IDisposable
         long residentBytes, Func<GpuWeights, IDictionary<string, float>, Task>? adapt, CancellationToken ct = default)
     {
         string prefix; var blockBytes = new long[blockCount]; var headerNames = new HashSet<string>();
+        var blockTensors = new List<SafeTensors.SafeTensorInfo>[blockCount]; Dictionary<string, string> metadata;
         await using (var s = await source.OpenAsync(repo, file, ct))
         {
             if (!s.CanSeek) throw new NotSupportedException($"'{file}': the blocks are read by offset; the model source must give a seekable stream");
@@ -96,7 +119,9 @@ public sealed class StreamedModelWeights : IDisposable
             long headerSize = BitConverter.ToInt64(lenBytes);
             if (headerSize <= 0 || headerSize > 100_000_000) throw new InvalidDataException($"'{file}': invalid SafeTensors header size {headerSize}");
             var header = new byte[headerSize]; await s.ReadExactlyAsync(header, ct);
-            var (tensors, _) = SafeTensors.SafeTensorsFileReader.ParseHeader(file, header, 8 + headerSize, s.Length - 8 - headerSize);
+            var (tensors, meta) = SafeTensors.SafeTensorsFileReader.ParseHeader(file, header, 8 + headerSize, s.Length - 8 - headerSize);
+            metadata = meta;
+            for (int k = 0; k < blockCount; k++) blockTensors[k] = new List<SafeTensors.SafeTensorInfo>();
             var a = tensors.FirstOrDefault(t => t.Name == anchor || t.Name.EndsWith("." + anchor, StringComparison.Ordinal))
                 ?? throw new InvalidDataException($"'{file}' does not hold the expected model ({anchor})");
             prefix = a.Name[..^anchor.Length];
@@ -106,18 +131,19 @@ public sealed class StreamedModelWeights : IDisposable
                 headerNames.Add(t.Name[prefix.Length..]);
                 if (IsNotAWeight(t.Name[prefix.Length..])) continue;
                 int k = blockOf(t.Name[prefix.Length..]);
-                if (k >= 0) blockBytes[k] += t.DataLength;
+                if (k >= 0) { blockBytes[k] += t.DataLength; blockTensors[k].Add(t); }
             }
         }
         var scales = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-        var baseW = await LoadAsync(accelerator, source, repo, file, prefix, n => blockOf(n) < 0, adapt, scales, ct);
-        var w = new StreamedModelWeights(accelerator, source, repo, file, prefix, blockOf, blockCount, adapt, baseW, scales) { HeaderNames = headerNames };
+        Func<CancellationToken, Task<Stream>> open = c => source.OpenAsync(repo, file, c);
+        var baseW = await LoadAsync(accelerator, open, file, prefix, n => blockOf(n) < 0, adapt, scales, ct);
+        var w = new StreamedModelWeights(accelerator, source, repo, file, prefix, blockOf, blockCount, adapt, baseW, scales) { HeaderNames = headerNames, _blockTensors = blockTensors, _metadata = metadata };
         try
         {
             long budget = residentBytes, streamed = 0;
             for (int k = 0; k < blockCount; k++)
             {
-                if (blockBytes[k] <= budget) { int kk = k; w._resident[k] = await LoadAsync(accelerator, source, repo, file, prefix, n => blockOf(n) == kk, adapt, scales, ct); budget -= blockBytes[k]; }
+                if (blockBytes[k] <= budget) { int kk = k; w._resident[k] = await LoadAsync(accelerator, open, file, prefix, n => blockOf(n) == kk, adapt, scales, ct); budget -= blockBytes[k]; }
                 else { budget = 0; streamed += blockBytes[k]; }                       // the resident blocks are a prefix, the streamed ones the tail
             }
             w.StreamedBytesPerForward = streamed;
@@ -126,10 +152,10 @@ public sealed class StreamedModelWeights : IDisposable
         catch { w.Dispose(); throw; }
     }
 
-    private static async Task<GpuWeights> LoadAsync(Accelerator acc, IModelSource source, string repo, string file, string prefix, Func<string, bool> keep, Func<GpuWeights, IDictionary<string, float>, Task>? adapt,
+    private static async Task<GpuWeights> LoadAsync(Accelerator acc, Func<CancellationToken, Task<Stream>> open, string file, string prefix, Func<string, bool> keep, Func<GpuWeights, IDictionary<string, float>, Task>? adapt,
         System.Collections.Concurrent.ConcurrentDictionary<string, float> scales, CancellationToken ct)
     {
-        await using var stream = await source.OpenAsync(repo, file, ct);
+        await using var stream = await open(ct);
         using var empty = JsonDocument.Parse("{}");
         var w = await GpuWeights.LoadAsync(acc, stream, empty.RootElement, file, n => n.StartsWith(prefix, StringComparison.Ordinal) && !IsNotAWeight(n[prefix.Length..]) && keep(n[prefix.Length..]), ct);
         try
@@ -182,12 +208,81 @@ public sealed class StreamedModelWeights : IDisposable
         catch { w.Dispose(); throw; }
     }
 
+    // the streamed block after k in forward order, wrapping to the first streamed block (the next pass starts there); null when nothing streams
+    private int? NextStreamed(int k)
+    {
+        for (int i = 1; i <= BlockCount; i++) { int b = (k + i) % BlockCount; if (_resident[b] == null) return b; }
+        return null;
+    }
+
+    /// <summary>
+    /// Block <paramref name="k"/> as a self-contained safetensors image in host memory: a header naming its tensors (the file's own names and metadata) and their bytes,
+    /// read from the file by offset. The loader then runs on it exactly as on the file.
+    /// </summary>
+    private async Task<byte[]> ReadBlockImageAsync(int k, CancellationToken ct)
+    {
+        var list = _blockTensors[k];
+        // the header, written directly (trim-safe: no reflection serializer)
+        long off = 0;
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+        using (var jw = new Utf8JsonWriter(buffer))
+        {
+            jw.WriteStartObject();
+            if (_metadata.Count > 0)
+            {
+                jw.WriteStartObject("__metadata__");
+                foreach (var (mk, mv) in _metadata) jw.WriteString(mk, mv);
+                jw.WriteEndObject();
+            }
+            foreach (var t in list)
+            {
+                jw.WriteStartObject(t.Name);
+                jw.WriteString("dtype", t.DType);
+                jw.WriteStartArray("shape"); foreach (var d in t.Shape) jw.WriteNumberValue(d); jw.WriteEndArray();
+                jw.WriteStartArray("data_offsets"); jw.WriteNumberValue(off); jw.WriteNumberValue(off + t.DataLength); jw.WriteEndArray();
+                jw.WriteEndObject();
+                off += t.DataLength;
+            }
+            jw.WriteEndObject();
+        }
+        var json = buffer.WrittenSpan.ToArray();
+        int hlen = (json.Length + 7) / 8 * 8;
+        long total = 8 + hlen + off;
+        if (total > Array.MaxLength) throw new NotSupportedException($"'{_file}': block {k} is {total} bytes, larger than one host array");
+        var image = new byte[total];
+        BitConverter.TryWriteBytes(image.AsSpan(0, 8), (long)hlen);
+        json.CopyTo(image, 8);
+        for (int i = 8 + json.Length; i < 8 + hlen; i++) image[i] = (byte)' ';
+        await using var s = await _source.OpenAsync(_repo, _file, ct);
+        long pos = 8 + hlen;
+        foreach (var t in list)
+        {
+            s.Seek(t.DataOffset, SeekOrigin.Begin);
+            await s.ReadExactlyAsync(image.AsMemory((int)pos, (int)t.DataLength), ct);
+            pos += t.DataLength;
+        }
+        return image;
+    }
+
     /// <summary>Block <paramref name="k"/>'s tensors: the resident set, or a fresh load from the file that the caller disposes after the device has run it (<paramref name="streamed"/> true).</summary>
     public async Task<(GpuWeights Weights, bool Streamed)> BlockAsync(int k, CancellationToken ct = default)
     {
         if (_retired.Count > 0) { await _acc.SynchronizeAsync(); foreach (var old in _retired) old.Dispose(); _retired.Clear(); }
         if (_resident[k] is { } r) return (r, false);
-        return (await LoadAsync(_acc, _source, _repo, _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct), true);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        byte[] image;
+        if (_hostCache.TryGetValue(k, out var cached)) image = cached;
+        else if (_pending is { } p && p.Block == k) { image = await p.Image; _pending = null; }
+        else image = await ReadBlockImageAsync(k, ct);
+        if (!_hostCache.ContainsKey(k) && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; }
+        if (Prefetch && NextStreamed(k) is int next && next != k && !_hostCache.ContainsKey(next) && (_pending == null || _pending.Value.Block != next))
+        {
+            if (_pending is { } stale) _ = stale.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);   // a prefetch the caller skipped: observed, dropped
+            _pending = (next, Task.Run(() => ReadBlockImageAsync(next, CancellationToken.None)));
+        }
+        var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, writable: false)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
+        StreamSeconds += sw.Elapsed.TotalSeconds; StreamedLoads++;
+        return (loaded, true);
     }
 
     /// <summary>A matrix of <paramref name="w"/> as bf16: the stored tensor, or (8-bit floats) its decode into the shared scratch, valid until the next call.</summary>
@@ -240,6 +335,7 @@ public sealed class StreamedModelWeights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
+        _hostCache.Clear(); _hostCacheUsed = 0; _pending = null;
         foreach (var r in _retired) r.Dispose(); _retired.Clear();
         foreach (var r in _resident) r?.Dispose();
         Array.Clear(_resident);
