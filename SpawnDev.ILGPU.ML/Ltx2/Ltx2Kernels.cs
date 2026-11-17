@@ -66,48 +66,106 @@ public sealed class Ltx2Kernels
         _fill((int)((long)T * C), input, registers, o, n, C, R);
     }
 
-    // ───────────────────────── guided self-attention ─────────────────────────
+    // (the keyframe-guide self-attention bias runs in Trellis2.DiTKernels.BiasedAttention: the flash kernel with a two-group score bias)
 
-    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, float, float>? _groupAttn;
-    private static void GroupAttnImpl(Index1D i, FV q, FV kv, FV o, int qStride, int kvStride, int vOff, int N, int H, int D, int split, float scale, float bias)
+    // ───────────────────────── the model call's packing and the sampler, on the device ─────────────────────────
+    // packed [B, P]: per item the video latent [128, nv] row-major (nv = F H W tokens), then the audio latent [8, Ta, 16]; aOff = 128 nv
+
+    private Action<Index1D, FV, FV, int, int>? _unpackV;
+    private static void UnpackVideoImpl(Index1D i, FV packed, FV tok, int nv, int P)
     {
-        int h = i % H, t = i / H;
-        long qo = (long)t * qStride + h * D;
-        bool qGuide = t >= split;
-        float max = -1e30f, sum = 0f;
-        // online softmax over the keys: pass 1 the max, pass 2 the weighted sum (exact two-pass softmax, fp32)
-        for (int j = 0; j < N; j++)
-        {
-            long ko = (long)j * kvStride + h * D;
-            float s = 0f;
-            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(q[qo + d], kv[ko + d], s);
-            s = s * scale + ((j >= split) != qGuide ? bias : 0f);
-            max = MathF.Max(max, s);
-        }
-        long oo = (long)t * H * D + h * D;
-        for (int d = 0; d < D; d++) o[oo + d] = 0f;
-        for (int j = 0; j < N; j++)
-        {
-            long ko = (long)j * kvStride + h * D;
-            float s = 0f;
-            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(q[qo + d], kv[ko + d], s);
-            float p = MathF.Exp(s * scale + ((j >= split) != qGuide ? bias : 0f) - max);
-            sum += p;
-            for (int d = 0; d < D; d++) o[oo + d] = float.MultiplyAddEstimate(p, kv[ko + vOff + d], o[oo + d]);
-        }
-        float inv = 1f / sum;
-        for (int d = 0; d < D; d++) o[oo + d] *= inv;
+        int c = i % 128, r = i / 128, t = r % nv, b = r / nv;
+        tok[i] = packed[(long)b * P + (long)c * nv + t];
+    }
+    private Action<Index1D, FV, FV, int, int, int>? _unpackA;
+    private static void UnpackAudioImpl(Index1D i, FV packed, FV tok, int Ta, int P, int aOff)
+    {
+        int ch = i % 128, r = i / 128, f = r % Ta, b = r / Ta;
+        int c = ch / 16, m = ch % 16;
+        tok[i] = packed[(long)b * P + aOff + ((long)c * Ta + f) * 16 + m];
+    }
+    /// <summary>The packed latents [B, P] as the transformer's tokens: video [B nv, 128] (token t, feature = channel), audio [B Ta, 128] (token = frame, feature c 16 + bin).</summary>
+    public void UnpackTokens(FV packed, FV video, FV audio, int B, int nv, int Ta)
+    {
+        int P = 128 * nv + 128 * Ta;
+        _unpackV ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(UnpackVideoImpl);
+        _unpackA ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(UnpackAudioImpl);
+        _unpackV(B * nv * 128, packed, video, nv, P);
+        _unpackA(B * Ta * 128, packed, audio, Ta, P, 128 * nv);
+    }
+
+    private Action<Index1D, FV, FV, FV, FV, int, int>? _denV;
+    private static void DenoiseVideoImpl(Index1D i, FV packed, FV vel, FV sigma, FV den, int nv, int P)
+    {
+        int per = 128 * nv, b = i / per, r = i % per, c = r / nv, t = r % nv;
+        long p = (long)b * P + r;
+        den[p] = packed[p] - sigma[b] * vel[((long)b * nv + t) * 128 + c];
+    }
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _denA;
+    private static void DenoiseAudioImpl(Index1D i, FV packed, FV vel, FV sigma, FV den, int Ta, int P, int aOff)
+    {
+        int per = 128 * Ta, b = i / per, r = i % per, c = r / (Ta * 16), f = (r / 16) % Ta, m = r % 16;
+        long p = (long)b * P + aOff + r;
+        den[p] = packed[p] - sigma[b] * vel[((long)b * Ta + f) * 128 + c * 16 + m];
+    }
+    /// <summary>The denoised packed latents [B, P]: <c>x - sigma v</c> with the item's sigma (sigma [B]), from the transformer's velocities in token layout.</summary>
+    public void DenoisedPacked(FV packed, FV videoVel, FV audioVel, FV sigma, FV den, int B, int nv, int Ta)
+    {
+        int P = 128 * nv + 128 * Ta;
+        _denV ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int>(DenoiseVideoImpl);
+        _denA ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(DenoiseAudioImpl);
+        _denV(B * 128 * nv, packed, videoVel, sigma, den, nv, P);
+        _denA(B * 128 * Ta, packed, audioVel, sigma, den, Ta, P, 128 * nv);
+    }
+
+    private Action<Index1D, FV, FV, FV, FV, int, int, int, int>? _blend;
+    private static void BlendRowsImpl(Index1D i, FV x, FV clean, FV frameMask, FV o, int P, int nv, int hw, int videoLen)
+    {
+        int k = i % P;
+        float m = k < videoLen ? frameMask[(k % nv) / hw] : 1f;       // the audio latent is free (mask 1)
+        o[i] = m * x[k] + (1f - m) * clean[k];
     }
     /// <summary>
-    /// Self-attention of N tokens whose last N - <paramref name="split"/> are a keyframe guide (LTX-2's LTXVAddGuide), with ComfyUI's guide bias: <c>ln(strength)</c> added to
-    /// every score between a noisy token and a guide token (both directions; within a group none). MEASURED against ComfyUI's self_attention_mask (noisy_mask /
-    /// tracked_mask, strength 0.6: -0.5108 on exactly those pairs). q at q[t qStride + h D], k at kv[j kvStride + h D], v at kv[j kvStride + vOff + h D]; o [N, H D].
-    /// One thread per (token, head); exact two-pass softmax in fp32.
+    /// The model input of a masked sampling step, into every row of o [rows, P]: <c>m x + (1 - m) clean</c> with m the latent frame's denoise mask (frameMask [F]; audio 1).
+    /// MEASURED 2026-11-17 against ComfyUI's guided calls (strength 0.6: 5.7e-8): the sampler keeps its own state x and the model sees this blend.
     /// </summary>
-    public void GroupBiasAttention(FV q, int qStride, FV kv, int kvStride, int vOff, FV o, int N, int H, int D, int split, float bias)
+    public void BlendRows(FV x, FV clean, FV frameMask, FV o, int rows, int P, int nv, int hw)
     {
-        _groupAttn ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, float, float>(GroupAttnImpl);
-        _groupAttn(N * H, q, kv, o, qStride, kvStride, vOff, N, H, D, split, 1f / MathF.Sqrt(D), bias);
+        _blend ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int, int>(BlendRowsImpl);
+        _blend(rows * P, x, clean, frameMask, o, P, nv, hw, 128 * nv);
+    }
+
+    private Action<Index1D, FV, FV, int, int, float, float, float>? _euler;
+    private static void EulerCfgImpl(Index1D k, FV x, FV den, int P, int B, float cfg, float invSigma, float dt)
+    {
+        float u = den[k], c = den[(long)(B - 1) * P + k];              // one row: c = u, so d = u
+        float d = u + (c - u) * cfg;
+        x[k] = x[k] + (x[k] - d) * invSigma * dt;
+    }
+    private Action<Index1D, FV, FV, FV, FV, int, int, float, float, float, int, int, int>? _eulerMasked;
+    private static void EulerCfgMaskedImpl(Index1D k, FV x, FV den, FV clean, FV frameMask, int P, int B, float cfg, float invSigma, float dt, int nv, int hw, int videoLen)
+    {
+        float u = den[k], c = den[(long)(B - 1) * P + k];
+        float d = u + (c - u) * cfg;
+        float m = k < videoLen ? frameMask[(k % nv) / hw] : 1f;
+        d = m * d + (1f - m) * clean[k];
+        x[k] = x[k] + (x[k] - d) * invSigma * dt;
+    }
+    /// <summary>
+    /// One Euler step of the sampler's state x [P] on the guided denoised latent: <c>D = uncond + cfg (cond - uncond)</c> (den [B, P], rows [uncond, cond]; one row: D = den),
+    /// <c>x += (x - D) / sigma (sigma_next - sigma)</c> (invSigma = 1 / sigma, dt = sigma_next - sigma: divided on the host). With a mask (frameMask [F] not default):
+    /// <c>D = m D + (1 - m) clean</c> first (MEASURED against ComfyUI's guided run: the state after a step 1.3e-7, the final latent 4.5e-8).
+    /// </summary>
+    public void EulerCfgStep(FV x, FV den, int P, int B, float cfg, float invSigma, float dt, FV clean = default, FV frameMask = default, int nv = 0, int hw = 0)
+    {
+        if (frameMask.Length == 0)
+        {
+            _euler ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, float, float, float>(EulerCfgImpl);
+            _euler(P, x, den, P, B, cfg, invSigma, dt);
+            return;
+        }
+        _eulerMasked ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, float, float, float, int, int, int>(EulerCfgMaskedImpl);
+        _eulerMasked(P, x, den, clean, frameMask, P, B, cfg, invSigma, dt, nv, hw, 128 * nv);
     }
 
     // ───────────────────────── LoRA ─────────────────────────

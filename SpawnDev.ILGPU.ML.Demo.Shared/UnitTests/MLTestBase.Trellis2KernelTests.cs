@@ -464,6 +464,113 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="DiTKernels.BiasedAttention"/> (LTX-2's keyframe-guide self-attention: a per-token bias on the scores between the noisy and the guide tokens) against a
+    /// float64 host reference, on whichever kernel the backend runs (the biased flash kernel at head width 128, else the reference kernels) AND on the reference kernels
+    /// forced; the flash kernel also chunked into one-group dispatches (bit-identical: the query base moves with the chunk) and with an all-zero bias against the plain
+    /// flash kernel (bit-identical). The split sits off every tile / lane boundary; 150 tokens span two query groups. Bias patterns: one strength (ln 0.6), two guides
+    /// (ln 0.6 / ln 0.3), and a pixel mask (ln 0.6 with every other pair of guide tokens blocked).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Trellis2_BiasedAttention_MatchesHostReference() => await RunTest(async accelerator =>
+    {
+        const int H = 2, D = 128, C = H * D;
+        var report = new List<string>();
+        foreach (var (N, split, pattern, packed) in new[] { (150, 97, "one", false), (150, 97, "one", true), (150, 97, "two", false), (150, 97, "mask", true), (70, 41, "mask", false) })
+        {
+            var rng = new Random(N * 31 + split + (packed ? 7 : 0) + pattern.Length);
+            float[] Rand(int count) { var a = new float[count]; for (int i = 0; i < count; i++) a[i] = (float)(rng.NextDouble() * 4 - 2); return a; }
+            int qStride = packed ? 3 * C : C, kvStride = packed ? 3 * C : 2 * C, kOff = packed ? C : 0, vOff = packed ? 2 * C : C;
+            var qh = Rand(N * qStride);
+            var kvh = packed ? qh : Rand(N * kvStride);
+            var tb = new float[N];
+            for (int t = split; t < N; t++)
+            {
+                int g = t - split;
+                tb[t] = pattern switch
+                {
+                    "one" => MathF.Log(0.6f),
+                    "two" => g < (N - split) / 2 ? MathF.Log(0.6f) : MathF.Log(0.3f),
+                    _ => (g & 2) == 0 ? MathF.Log(0.6f) : DiTKernels.BlockedTokenBias,
+                };
+            }
+            using var qb = accelerator.Allocate1D(qh);
+            using var kvb = packed ? null : accelerator.Allocate1D(kvh);
+            using var scores = accelerator.Allocate1D<float>((long)H * N * N);
+            using var tbDev = accelerator.Allocate1D(tb);
+            using var zeroDev = accelerator.Allocate1D<float>(N); zeroDev.MemSetToZero();
+            // float64 host reference, with and without the bias (the bias must matter, or the comparison proves nothing)
+            var want = new double[N * C]; double effect = 0, scale = 1 / Math.Sqrt(D);
+            var p = new double[N]; var p0 = new double[N];
+            for (int h = 0; h < H; h++)
+                for (int i = 0; i < N; i++)
+                {
+                    double mx = double.MinValue, mx0 = double.MinValue;
+                    for (int j = 0; j < N; j++)
+                    {
+                        double s = 0;
+                        for (int d = 0; d < D; d++) s += (double)qh[i * qStride + h * D + d] * kvh[j * kvStride + kOff + h * D + d];
+                        p0[j] = s * scale; p[j] = p0[j] + ((i >= split) != (j >= split) ? (double)tb[i] + tb[j] : 0.0);
+                        mx = Math.Max(mx, p[j]); mx0 = Math.Max(mx0, p0[j]);
+                    }
+                    double sum = 0, sum0 = 0; for (int j = 0; j < N; j++) { p[j] = Math.Exp(p[j] - mx); sum += p[j]; p0[j] = Math.Exp(p0[j] - mx0); sum0 += p0[j]; }
+                    for (int d = 0; d < D; d++)
+                    {
+                        double acc = 0, acc0 = 0; for (int j = 0; j < N; j++) { double v = kvh[j * kvStride + vOff + h * D + d]; acc += p[j] * v; acc0 += p0[j] * v; }
+                        want[i * C + h * D + d] = acc / sum; effect = Math.Max(effect, Math.Abs(acc / sum - acc0 / sum0));
+                    }
+                }
+            if (effect < 1e-2) throw new Exception($"the bias barely changes this case ({effect:E2}): the test would not see a kernel that ignores it");
+            double MaxErr(float[] got) { double e = 0; for (int i = 0; i < got.Length; i++) e = Math.Max(e, Math.Abs(got[i] - want[i])); return e; }
+            async Task<float[]> Run(DiTKernels k, ArrayView1D<float, Stride1D.Dense> bias)
+            {
+                using var o = accelerator.Allocate1D<float>((long)N * C);
+                k.BiasedAttention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, scores.View, o.View, N, H, D, split, bias);
+                return await o.View.CopyToHostAsync();
+            }
+            string tag = $"{N} tokens, split {split}, {pattern}, {(packed ? "self" : "cross")}";
+            var dk = new DiTKernels(accelerator) { PreciseActivations = true };
+            bool flash = dk.UsesFlashBiasedAttention(D);
+            var got = await Run(dk, tbDev.View);
+            double err = MaxErr(got);
+            if (err > 1e-4) throw new Exception($"biased attention {tag} ({(flash ? "flash" : "reference")}) max |err| {err:E2} on {accelerator.AcceleratorType}");
+            string line = $"{tag}: {(flash ? "flash" : "reference")} {err:E1}, bias effect {effect:E1}";
+            if (flash)
+            {
+                long was = DiTKernels.MaxAttentionPairsPerDispatch;
+                DiTKernels.MaxAttentionPairsPerDispatch = 1;
+                try
+                {
+                    var got2 = await Run(dk, tbDev.View);
+                    for (int i = 0; i < got.Length; i++) if (got[i] != got2[i]) throw new Exception($"chunked biased attention {tag} differs at {i}: {got2[i]} vs {got[i]} on {accelerator.AcceleratorType}");
+                }
+                finally { DiTKernels.MaxAttentionPairsPerDispatch = was; }
+                // an all-zero bias = the plain portable flash kernel, bit for bit
+                var zero = await Run(dk, zeroDev.View);
+                using var o3 = accelerator.Allocate1D<float>((long)N * C);
+                dk.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o3.View, N, N, H, D);
+                var plain = await o3.View.CopyToHostAsync();
+                for (int i = 0; i < plain.Length; i++) if (zero[i] != plain[i]) throw new Exception($"biased attention with a zero bias {tag} differs from the plain kernel at {i}: {zero[i]} vs {plain[i]} on {accelerator.AcceleratorType}");
+                // the reference kernels, forced
+                bool tiled = DiTKernels.EnableTiled;
+                DiTKernels.EnableTiled = false;
+                try
+                {
+                    var dr = new DiTKernels(accelerator) { PreciseActivations = true };
+                    if (dr.UsesFlashBiasedAttention(D)) throw new Exception("EnableTiled = false did not select the reference kernels");
+                    double er = MaxErr(await Run(dr, tbDev.View));
+                    if (er > 1e-4) throw new Exception($"biased attention {tag} (reference kernels) max |err| {er:E2} on {accelerator.AcceleratorType}");
+                    line += $", reference {er:E1}, chunked == whole, zero bias == plain";
+                }
+                finally { DiTKernels.EnableTiled = tiled; }
+            }
+            report.Add(line);
+        }
+        string all = "biased attention: " + string.Join("; ", report);
+        Console.WriteLine("[Trellis2] " + all);
+        return all;
+    });
+
+    /// <summary>
     /// Where a cold session's kernel cost goes, for the two largest generated kernels: LoadStreamKernel (IL -> IR -> backend code; on the
     /// browser this runs in the interpreted .NET runtime) versus the first launch (WebGPU: shader module + pipeline creation) minus a warm launch.
     /// Prints "[Benchmark] Trellis2 compile ..." (PMT_CONSOLE_LOG=Trellis2).

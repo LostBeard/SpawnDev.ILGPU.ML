@@ -594,6 +594,99 @@ public sealed class DiTKernels
         ReferenceAttention(q, qStride, qOff, kv, kvStride, kOff, vOff, scores, o, Nq, Nk, H, D);
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // Two-group biased self-attention (LTX-2's keyframe guides): tokens from `split` on are group 1 (the guide tokens), the rest group 0; a score
+    // whose query and key are in different groups gets tokenBias[query] + tokenBias[key] before the softmax (tokenBias is 0 for group 0).
+    // ---------------------------------------------------------------------------------------------------
+    private Action<KernelConfig, FV, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>? _biasCross;
+    private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>? _biasSelf;
+    private Action<KernelConfig, FV, FV, FV, FV, int, int, int, int, int, int, int, int, int, int> BiasCrossKernel()
+    {
+        if (_biasCross != null) return _biasCross;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery || !global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc)) _shuffleOk = false;
+        if (_shuffleOk != false)
+        {
+            try { _biasCross = _acc.LoadStreamKernel<FV, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>(TiledAttention.CrossD128Bias); _shuffleOk = true; return _biasCross; }
+            catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
+        }
+        return _biasCross = _acc.LoadStreamKernel<FV, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>(TiledAttention.CrossD128BiasSmem);
+    }
+    private Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int, int, int> BiasSelfKernel()
+    {
+        if (_biasSelf != null) return _biasSelf;
+        if (_acc.WarpSize < TiledAttention.LanesPerQuery || !global::SpawnDev.ILGPU.AcceleratorRequirementsExtensions.SupportsWarpShuffle(_acc)) _shuffleOk = false;
+        if (_shuffleOk != false)
+        {
+            try { _biasSelf = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int, int, int>(TiledAttention.SelfD128Bias); _shuffleOk = true; return _biasSelf; }
+            catch (Exception ex) when (ex is global::ILGPU.InternalCompilerException || ex.InnerException is global::ILGPU.Backends.InvalidCodeGenerationException || ex is NotSupportedException) { _shuffleOk = false; }
+        }
+        return _biasSelf = _acc.LoadStreamKernel<FV, FV, FV, int, int, int, int, int, int, int, int, int, int>(TiledAttention.SelfD128BiasSmem);
+    }
+
+    private Action<Index1D, FV, FV, int, int>? _scoreBias;
+    private static void ScoreBiasImpl(Index1D idx, FV s, FV tokenBias, int N, int split)
+    {
+        int j = idx % N, i = (idx / N) % N;                          // scores [h][i][j]
+        bool g = i >= split;
+        float bl = g ? tokenBias[i] : 0f, bhm = g ? 0f : 1f;        // a guide query adds its own bias to noisy keys; a noisy query takes a guide key's
+        s[idx] += j >= split ? bhm * tokenBias[j] : bl;
+    }
+
+    /// <summary>The most negative token bias <see cref="BiasedAttention"/> takes (a fully blocked token: ln 0). Finite, so no infinity enters the softmax.</summary>
+    public const float BlockedTokenBias = -1e30f;
+
+    /// <summary>True when <see cref="BiasedAttention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default).</summary>
+    public bool UsesFlashBiasedAttention(int headDim) => headDim == 128 && UsesTiledAttention(headDim);
+
+    /// <summary>
+    /// Self-attention over <paramref name="N"/> tokens (as <see cref="Attention"/>; q and k / v may sit in one buffer or two) with a two-group additive score bias: tokens
+    /// from <paramref name="split"/> on are group 1, the rest group 0, and a score whose query and key are in different groups gets
+    /// <c>tokenBias[query] + tokenBias[key]</c> (<paramref name="tokenBias"/> [N]: 0 for group 0, at least <see cref="BlockedTokenBias"/>). LTX-2's keyframe guides:
+    /// tokenBias = ln(strength x mask) of a guide token, MEASURED on ComfyUI's attention masks (one guide, two guides at different strengths, a pixel mask: every entry).
+    /// Head width 128 runs the portable flash kernel in fp32 (the tensor-core kernel has no bias form), chunked like <see cref="Attention"/>; other widths and backends
+    /// without it run the reference kernels, which need <paramref name="scores"/> of H * N * N floats.
+    /// </summary>
+    public void BiasedAttention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int N, int H, int D, int split, FV tokenBias)
+    {
+        if (tokenBias.Length < N) throw new ArgumentException($"a bias per token: {N} values", nameof(tokenBias));
+        if (UsesFlashBiasedAttention(D))
+        {
+            IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;
+            bool self = qv.Buffer == kvv.Buffer;
+            if (self && qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
+            Action<KernelConfig, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>? selfK = null;
+            Action<KernelConfig, FV, FV, FV, FV, int, int, int, int, int, int, int, int, int, int>? crossK = null;
+            if (self) selfK = BiasSelfKernel(); else crossK = BiasCrossKernel();     // resolves _shuffleOk, which sets the queries per group
+            int qpg = _shuffleOk == true ? TiledAttention.QueriesPerGroup : TiledAttention.QueriesPerGroupSmem;
+            long perRow = Math.Max(1L, (long)N * H);
+            int chunk = (int)Math.Min(N, Math.Max(qpg, MaxAttentionPairsPerDispatch / perRow / qpg * qpg));   // no dispatch grows with the input (see Attention)
+            for (int r0 = 0; r0 < N; r0 += chunk)
+            {
+                int rows = Math.Min(chunk, N - r0);
+                var oc = r0 == 0 && rows == N ? o : o.SubView((long)r0 * H * D, (long)rows * H * D);
+                int qo = qOff + r0 * qStride;
+                // the kernel's query rows start at token r0 (its qBase); keys are absolute
+                if (self) selfK!(Cfg(rows, H), q, oc, tokenBias, rows, N, H, qStride, qo, kvStride, kOff, vOff, split, r0);
+                else crossK!(Cfg(rows, H), q, kv, oc, tokenBias, rows, N, H, qStride, qo, kvStride, kOff, vOff, split, r0);
+            }
+            return;
+        }
+        long need = (long)H * N * N;
+        if (scores.Length < need)
+            throw new ArgumentException($"reference biased attention needs scores of H * N * N = {need} elements, got {scores.Length}: no flash biased attention "
+                + $"path on {_acc.AcceleratorType} for head width {D} (see UsesFlashBiasedAttention)", nameof(scores));
+        if (need > int.MaxValue)
+            throw new ArgumentException($"reference biased attention over H * N * N = {need} scores exceeds the kernel's int index range", nameof(scores));
+        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
+        _scoreBias ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(ScoreBiasImpl);
+        _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
+        _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);
+        _scores((int)need, q, kv, scores, N, N, H, D, qStride, qOff, kvStride, kOff, 1f / MathF.Sqrt(D));
+        _scoreBias((int)need, scores, tokenBias, N, split);
+        _softmaxRows(H * N, scores, N);
+        _pv(N * H * D, scores, kv, o, N, N, H, D, kvStride, vOff);
+    }
+
     /// <summary>scores must hold H*Nq*Nk floats. o is [Nq, H*D].</summary>
     public void ReferenceAttention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
     {

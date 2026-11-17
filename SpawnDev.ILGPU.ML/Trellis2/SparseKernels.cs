@@ -284,10 +284,28 @@ public sealed class SparseKernels
         // its own kernel: TiledGemm.Gemm's gathered loop decodes F16 weights only (MEASURED 2026-11-17: bf16 weights through it came out 2.1 relative off; this kernel 3.6e-7, Ltx2_ConvBf16Exact_MatchesHost)
         _tiledGatherBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.ForGatherBf16(_acc));
         EnsureTiledDummies();
-        int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
-        _tiledGatherBf16(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<BFloat16, uint>(), bias.HasValue ? Bf16BiasWords(bias.Value) : _tiledDummyU!.View, o, _tiledDummyF!.View, nbr,
-            M, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, 0, TiledGemm.ModeBf16 | TiledGemm.ModeGather);
+        var wv = weight.Cast<BFloat16, uint>(); var bv = bias.HasValue ? Bf16BiasWords(bias.Value) : _tiledDummyU!.View;
+        // One dispatch costs M * taps * cin * cout multiply-adds: the last stage of a real clip's VAE decode (3M voxels, 3456 inputs, 128 outputs) is 1.3e12, seconds
+        // on the fp32 tiled kernel. The output rows are split into dispatches of at most MaxConvWorkPerDispatch each (whole row tiles); a row's result does not
+        // depend on which dispatch computes it (each reads the whole x through its own slice of the neighbour table, stride 27).
+        long perRow = Math.Max(1L, (long)taps * cin * cout);
+        int chunk = (int)Math.Min(M, Math.Max(TiledGemm.BM, MaxConvWorkPerDispatch / perRow / TiledGemm.BM * TiledGemm.BM));
+        for (int r0 = 0; r0 < M; r0 += chunk)
+        {
+            int rows = Math.Min(chunk, M - r0);
+            int tiles = ((rows + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
+            var oc = r0 == 0 && rows == M ? o : o.SubView((long)r0 * cout, (long)rows * cout);
+            var nc = r0 == 0 && rows == M ? nbr : nbr.SubView((long)r0 * 27, (long)rows * 27);
+            _tiledGatherBf16(new KernelConfig(tiles, TiledGemm.Threads), x, wv, bv, oc, _tiledDummyF!.View, nc,
+                rows, taps * cin, cout, cin, bias.HasValue ? 1 : 0, 0, 0, TiledGemm.ModeBf16 | TiledGemm.ModeGather);
+        }
     }
+
+    /// <summary>
+    /// The most multiply-adds (output rows x inputs x outputs) one exact-convolution dispatch covers (default 2^36 = 6.9e10: a fraction of a second on a slow GPU); larger
+    /// convolutions run as several dispatches over row ranges, with identical results. Settable for tests.
+    /// </summary>
+    public static long MaxConvWorkPerDispatch { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("ML_CONV_WORK"), out var cw) && cw > 0 ? cw : 1L << 36;
 
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledGatherBf16;
 

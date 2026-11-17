@@ -39,21 +39,29 @@ import os
 _cfg = [int(v) for v in os.environ.get("ATT_CFG", "8,4,8,16").split(",")]
 SP, SQT, SBKT128, SBKT64 = _cfg
 
-def kernel_shuffle(D, self_attn):
+# The *Bias variants (two-group additive score bias, self-attention over one token set): tokens from `split` on are group 1, the rest group 0; a score whose
+# query and key are in DIFFERENT groups gets TB[query] + TB[key] (TB: a bias per token, 0 for group 0), before the softmax. LTX-2's keyframe guides: TB =
+# ln(strength x mask) of a guide token (MEASURED on ComfyUI's masks: noisy -> guide key: the key's value; guide -> noisy key: the query's; guide <-> guide: 0).
+# The kernel's query rows start at token qBase (the caller chunks the queries); keys are absolute. Everything else is the unbiased kernel, line for line.
+BIAS_DOC = " Tokens from split on are group 1: a score across the groups gets TB[query] + TB[key] (query token = row + qBase)."
+BIAS_ARGS = ", int split, int qBase"
+
+def kernel_shuffle(D, self_attn, bias=False):
     P_, QT = SP, SQT
     BKT = SBKT128 if D == 128 else SBKT64 if D == 64 else (8 if D > 80 else 16)
     DT = D // P_
     LANES = TH // P_
     QG = LANES * QT                  # queries per group
     lg = P_.bit_length() - 1
-    name = f"{'Self' if self_attn else 'Cross'}D{D}"
+    name = f"{'Self' if self_attn else 'Cross'}D{D}{'Bias' if bias else ''}"
+    doc, args, tb = (BIAS_DOC, BIAS_ARGS, ", FV TB") if bias else ("", "", "")
     if self_attn:
-        w(f"    /// <summary>D = {D}, Q and K/V in one buffer. grid = ceil(Nq / {QG}) * H, group = {TH}.</summary>")
-        w(f"    public static void {name}(FV S, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        w(f"    /// <summary>D = {D}, Q and K/V in one buffer. grid = ceil(Nq / {QG}) * H, group = {TH}.{doc}</summary>")
+        w(f"    public static void {name}(FV S, FV O{tb}, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff{args})")
         Q = KV = "S"
     else:
-        w(f"    /// <summary>D = {D}, Q and K/V in separate buffers. grid = ceil(Nq / {QG}) * H, group = {TH}.</summary>")
-        w(f"    public static void {name}(FV Q, FV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        w(f"    /// <summary>D = {D}, Q and K/V in separate buffers. grid = ceil(Nq / {QG}) * H, group = {TH}.{doc}</summary>")
+        w(f"    public static void {name}(FV Q, FV KV, FV O{tb}, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff{args})")
         Q, KV = "Q", "KV"
     w("    {")
     w("        int qTile = Grid.IdxX / H, h = Grid.IdxX - qTile * H;")
@@ -69,6 +77,10 @@ def kernel_shuffle(D, self_attn):
             w(f"        float q{r}_{t} = ok{r} ? {Q}[qb{r} + {P_ * t}] * scale : 0f;")
         w("        " + " ".join(f"float o{r}_{t} = 0f;" for t in range(DT)))
         w(f"        float m{r} = -1e30f, l{r} = 0f;")
+        if bias:    # a group-1 query adds its own bias to group-0 keys (bl); a group-0 query takes a group-1 key's bias (bhm = 1)
+            w(f"        bool g{r} = row{r} + qBase >= split;")
+            w(f"        float bq{r} = TB[ok{r} ? row{r} + qBase : 0];")
+            w(f"        float bl{r} = g{r} ? bq{r} : 0f, bhm{r} = g{r} ? 0f : 1f;")
     loads = -(-BKT * D // TH)
     w(f"        for (int kb = 0; kb < Nk; kb += {BKT})")
     w("        {")
@@ -84,10 +96,14 @@ def kernel_shuffle(D, self_attn):
         w("            float " + ", ".join(f"s{r}_{j}" for j in range(BKT)) + ";")
     for j in range(BKT):
         w("            { " + " ".join(f"float k{t} = ks[{j * D + P_ * t} + p];" for t in range(DT)))
+        if bias:
+            w(f"              float bk = TB[kb + {j} < Nk ? kb + {j} : 0];")
         for r in range(QT):
             w(f"              s{r}_{j} = " + mac_chain((f"q{r}_{t}", f"k{t}") for t in range(DT)) + ";")
             for st in range(lg):
                 w(f"              s{r}_{j} += Warp.ShuffleXor(s{r}_{j}, {1 << st});")
+            if bias:
+                w(f"              s{r}_{j} += kb + {j} >= split ? bhm{r} * bk : bl{r};")
             w(f"              if (kb + {j} >= Nk) s{r}_{j} = -1e30f;")
         w("            }")
     for r in range(QT):
@@ -118,19 +134,20 @@ def kernel_shuffle(D, self_attn):
     w("    }")
     w("")
 
-def kernel(D, self_attn, shuffle):
+def kernel(D, self_attn, shuffle, bias=False):
     if shuffle:
-        return kernel_shuffle(D, self_attn)
+        return kernel_shuffle(D, self_attn, bias)
     BKT = 4 if D > 128 else 8   # D = 160: Ks + Vs + red = 2304 floats, inside 16 KB
     DT = D // P                 # dims per lane
-    name = f"{'Self' if self_attn else 'Cross'}D{D}{'' if shuffle else 'Smem'}"
+    name = f"{'Self' if self_attn else 'Cross'}D{D}{'Bias' if bias else ''}{'' if shuffle else 'Smem'}"
+    doc, args, tb = (BIAS_DOC, BIAS_ARGS, ", FV TB") if bias else ("", "", "")
     if self_attn:
-        w(f"    /// <summary>D = {D}, Q and K/V in one buffer. grid = ceil(Nq / {QPG}) * H, group = {TH}.</summary>")
-        w(f"    public static void {name}(FV S, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        w(f"    /// <summary>D = {D}, Q and K/V in one buffer. grid = ceil(Nq / {QPG}) * H, group = {TH}.{doc}</summary>")
+        w(f"    public static void {name}(FV S, FV O{tb}, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff{args})")
         Q = KV = "S"
     else:
-        w(f"    /// <summary>D = {D}, Q and K/V in separate buffers. grid = ceil(Nq / {QPG}) * H, group = {TH}.</summary>")
-        w(f"    public static void {name}(FV Q, FV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+        w(f"    /// <summary>D = {D}, Q and K/V in separate buffers. grid = ceil(Nq / {QPG}) * H, group = {TH}.{doc}</summary>")
+        w(f"    public static void {name}(FV Q, FV KV, FV O{tb}, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff{args})")
         Q, KV = "Q", "KV"
     w("    {")
     w("        int qTile = Grid.IdxX / H, h = Grid.IdxX - qTile * H;")
@@ -148,6 +165,10 @@ def kernel(D, self_attn, shuffle):
     for t in range(DT):
         w(f"        float o{t} = 0f;")
     w("        float m = -1e30f, l = 0f;")
+    if bias:    # a group-1 query adds its own bias to group-0 keys (bl); a group-0 query takes a group-1 key's bias (bhm = 1)
+        w("        bool g = row + qBase >= split;")
+        w("        float bq = TB[ok ? row + qBase : 0];")
+        w("        float bl = g ? bq : 0f, bhm = g ? 0f : 1f;")
     loads = -(-BKT * D // TH)
     w(f"        for (int kb = 0; kb < Nk; kb += {BKT})")
     w("        {")
@@ -171,6 +192,9 @@ def kernel(D, self_attn, shuffle):
         w("            Group.Barrier();")
         for j in range(BKT):
             w(f"            s{j} = " + " + ".join(f"red[ql + {QPG * (P * j + k)}]" for k in range(P)) + ";")
+    if bias:
+        for j in range(BKT):
+            w(f"            s{j} += kb + {j} >= split ? bhm * TB[kb + {j} < Nk ? kb + {j} : 0] : bl;")
     for j in range(BKT):
         w(f"            if (kb + {j} >= Nk) s{j} = -1e30f;")
     mx = "s0"
@@ -215,6 +239,9 @@ for D in (128, 64, 160, 80, 40):   # 160 / 80 / 40: the SD 1.x UNet's head width
     for sh in (True, False):
         kernel(D, False, sh)
         kernel(D, True, sh)
+for sh in (True, False):               # the two-group bias variants (D = 128: LTX-2's video self-attention with keyframe guides); appended, so the kernels above stay as they were
+    kernel(128, False, sh, bias=True)
+    kernel(128, True, sh, bias=True)
 w("}")
 
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
