@@ -4,6 +4,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **LTX-2 19B (audio + video), work in progress** (`Ltx2`: ported from Hugging Face diffusers' Apache-2.0 LTX-2 code and transformers' Gemma 3; Plans/ltx-2-19b-2026-11-17.md),
+  each part on ComfyUI's own inputs against SpawnGen's float32 taps, CUDA:
+  - `Gemma3TextEncoder`: Gemma 3 12B from ComfyUI's text-encoder files (gemma_3_12B_it_fp4_mixed: NVFP4 + fp8 layers), streamed per layer, the token table never uploaded;
+    the 49 hidden-state slots normalised into LTX-2's features: layers 1e-5, features 1.1e-5 (`Ltx2_Gemma3Encode_MatchesComfyUi`).
+  - `Ltx2TextConnectors`: the text projection and the video / audio connectors (registers, split RoPE): conditioning 3.2e-5 (`Ltx2_TextConnectors_MatchComfyUi`).
+  - `Ltx2Transformer`: the 48-block audio-video DiT, the guidance pair batched through each streamed block: call 0's blocks 2e-5 to 6e-5, outputs 4.6e-5 / 1.3e-5
+    (`Ltx2_Transformer_Call0_MatchesComfyUi`).
+  - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
+    use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.
+- **`StreamedModelWeights`**: NVFP4 matrices (U8 codes + fp8 block scales + fp32 second scale; `Matrix` / `MatrixExact` decode them), ComfyUI's per-layer `comfy_quant`
+  tags validated at open (float8_e4m3fn or nvfp4; an explicit `full_precision_matrix_mult: false` is refused), and `HostOnly` tensors read on demand (`ReadRowsAsync`).
 - **NVFP4 weights** (`Kernels.Nvfp4`: ComfyUI's mixed fp4 checkpoints, e.g. gemma_3_12B_it_fp4_mixed): high nibble first, e2m1 codes, one fp8 e4m3 scale per 16 inputs in cuBLAS's
   swizzled 128 x 4-tile layout, x weight_scale_2; decoded EXACTLY to bf16 (e2m1 x e4m3 fits), weight_scale_2 moved to the input. Against ComfyUI's own dequantisation of a
   Gemma 3 layer (SpawnGen's dump): weights bit-exact (nvfp4 and fp8), real calls 6.8e-6 / 4.0e-6 (`Nvfp4_GemmaLayer_MatchesComfyUi`).

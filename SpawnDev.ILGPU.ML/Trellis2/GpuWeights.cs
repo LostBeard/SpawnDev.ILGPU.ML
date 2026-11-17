@@ -16,6 +16,7 @@ public sealed class GpuWeights : IDisposable
     private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _f16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _f32 = new();
     private readonly Dictionary<string, MemoryBuffer1D<uint, Stride1D.Dense>> _u32 = new();   // I32 tensors: packed quantised blocks (FLUX.2 export), reinterpreted as 32-bit words
+    private readonly Dictionary<string, MemoryBuffer1D<uint, Stride1D.Dense>> _u8 = new();    // U8 tensors (packed sub-byte codes: NVFP4): the bytes as stored, four to a word, as _f8
     private readonly Dictionary<string, MemoryBuffer1D<uint, Stride1D.Dense>> _f8 = new();    // F8_E4M3 tensors: the bytes as stored, four to a word (byte j = bits 8 * (j & 3) of word j >> 2)
     private readonly Dictionary<string, int[]> _shapes = new();
 
@@ -124,10 +125,11 @@ public sealed class GpuWeights : IDisposable
                     case "F32": { var b = accelerator.Allocate1D<float>(n); w._f32[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
                     case "I32": { var b = accelerator.Allocate1D<uint>(n); w._u32[t.Name] = b; await UploadAsync(stream, b, n, cancellationToken); break; }
                     case "F8_E4M3":
+                    case "U8":
                         {
-                            // 8-bit floats (ComfyUI's "scaled fp8" files): kept as stored, packed four bytes to a word; Wan.WanComfyFormat decodes them on the device
+                            // 8-bit floats (ComfyUI's "scaled fp8" files) and bytes (NVFP4's packed codes, Kernels.Nvfp4): kept as stored, packed four bytes to a word; decoded on the device
                             var b = accelerator.Allocate1D<uint>(Math.Max(1, (n + 3) / 4));
-                            w._f8[t.Name] = b;
+                            (t.DType == "U8" ? w._u8 : w._f8)[t.Name] = b;
                             if (n % 4 == 0 && n > 0) await UploadAsync(stream, b, n / 4, cancellationToken);
                             else
                             {
@@ -137,7 +139,7 @@ public sealed class GpuWeights : IDisposable
                             }
                             break;
                         }
-                    default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32/I32/F8_E4M3 native only");
+                    default: throw new NotSupportedException($"'{name}': tensor '{t.Name}' is {t.DType}; this loader keeps BF16/F16/F32/I32/F8_E4M3/U8 native only");
                 }
                 pos += t.DataLength;
                 w._shapes[t.Name] = t.Shape;
@@ -200,6 +202,11 @@ public sealed class GpuWeights : IDisposable
         => _f8.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"8-bit float weight '{name}' not loaded");
     /// <summary>True when the tensor was stored (and is held) as 8-bit floats (F8_E4M3).</summary>
     public bool IsF8(string name) => _f8.ContainsKey(name);
+    /// <summary>The bytes of a U8 tensor as stored, four to a word (byte j = bits 8 * (j &amp; 3) of word j >> 2), e.g. NVFP4's packed 4-bit codes.</summary>
+    public ArrayView1D<uint, Stride1D.Dense> U8Words(string name)
+        => _u8.TryGetValue(name, out var b) ? b.View : throw new KeyNotFoundException($"byte weight '{name}' not loaded");
+    /// <summary>True when the tensor was stored (and is held) as bytes (U8).</summary>
+    public bool IsU8(string name) => _u8.ContainsKey(name);
     public bool IsBF16(string name) => _bf16.ContainsKey(name);
 
     /// <summary>True when the tensor was stored (and is held) as fp32.</summary>
@@ -250,6 +257,7 @@ public sealed class GpuWeights : IDisposable
         else if (_f32.Remove(from, out var c)) _f32[to] = c;
         else if (_u32.Remove(from, out var d)) _u32[to] = d;
         else if (_f8.Remove(from, out var e)) _f8[to] = e;
+        else if (_u8.Remove(from, out var f)) _u8[to] = f;
     }
     /// <summary>A new shape for the same elements in the same order (a reshape: no data moves).</summary>
     internal void SetShape(string name, int[] shape) { if (!_shapes.ContainsKey(name)) throw new KeyNotFoundException(name); _shapes[name] = shape; }
@@ -260,11 +268,12 @@ public sealed class GpuWeights : IDisposable
         if (_f32.Remove(name, out var c)) return c;
         if (_u32.Remove(name, out var d)) return d;
         if (_f8.Remove(name, out var e)) return e;
+        if (_u8.Remove(name, out var f)) return f;
         return null;
     }
 
     /// <summary>Total device bytes held.</summary>
-    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L) + _u32.Values.Sum(b => b.Length * 4L) + _f8.Values.Sum(b => b.Length * 4L);
+    public long Bytes => _bf16.Values.Sum(b => b.Length * 2L) + _f16.Values.Sum(b => b.Length * 2L) + _f32.Values.Sum(b => b.Length * 4L) + _u32.Values.Sum(b => b.Length * 4L) + _f8.Values.Sum(b => b.Length * 4L) + _u8.Values.Sum(b => b.Length * 4L);
 
     public void Dispose()
     {
@@ -273,6 +282,7 @@ public sealed class GpuWeights : IDisposable
         foreach (var b in _f32.Values) b.Dispose();
         foreach (var b in _u32.Values) b.Dispose();
         foreach (var b in _f8.Values) b.Dispose();
-        _bf16.Clear(); _f16.Clear(); _f32.Clear(); _u32.Clear(); _f8.Clear(); _shapes.Clear();
+        foreach (var b in _u8.Values) b.Dispose();
+        _bf16.Clear(); _f16.Clear(); _f32.Clear(); _u32.Clear(); _f8.Clear(); _u8.Clear(); _shapes.Clear();
     }
 }

@@ -49,7 +49,7 @@ public static class Nvfp4
 
     private static int ByteAt(UV words, long i) => (int)((words[i >> 2] >> (int)((i & 3) * 8)) & 0xFF);
 
-    private static void DecodeImpl(Index1D idx, UV packed, UV scales, BV dst, int K, int C)
+    private static void DecodeImpl(Index1D idx, UV packed, UV scales, BV dst, int K, int C, float scale)
     {
         long i = idx;
         int n = (int)(i / K), k = (int)(i % K);
@@ -58,20 +58,27 @@ public static class Nvfp4
         int j = k >> 4;
         long tile = (long)(n / 128) * C + j / 4;
         long si = tile * 512 + (n % 32) * 16 + (n % 128) / 32 * 4 + j % 4;
-        dst[i] = (BFloat16)(E2M1(code) * E4M3(ByteAt(scales, si)));
+        dst[i] = (BFloat16)(E2M1(code) * E4M3(ByteAt(scales, si)) * scale);
     }
 
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Accelerator, Action<Index1D, UV, UV, BV, int, int>> Kernels = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Accelerator, Action<Index1D, UV, UV, BV, int, int, float>> Kernels = new();
 
     /// <summary>
     /// dst [N, K] bf16 = e2m1 x block scale (weight_scale_2 NOT applied: pass it as the input's scale). <paramref name="packed"/>: the weight bytes as little-endian words
     /// (N K / 2 bytes); <paramref name="scales"/>: the swizzled fp8 scale bytes as words (<see cref="ScaleBytes"/>).
     /// </summary>
-    public static void DecodeExact(Accelerator accelerator, UV packed, UV scales, BV dst, int N, int K)
+    public static void DecodeExact(Accelerator accelerator, UV packed, UV scales, BV dst, int N, int K) => Decode(accelerator, packed, scales, dst, N, K, 1f);
+
+    /// <summary>
+    /// dst [N, K] bf16 = bf16(e2m1 x block scale x <paramref name="scale"/>): with weight_scale_2 the folded decode (each weight rounded to bf16 once); with 1 exactly
+    /// <see cref="DecodeExact"/>.
+    /// </summary>
+    public static void Decode(Accelerator accelerator, UV packed, UV scales, BV dst, int N, int K, float scale)
     {
-        if (K % 64 != 0 && K % 16 != 0) throw new ArgumentException($"K = {K}: NVFP4 blocks are 16 inputs");
-        var kernel = Kernels.GetValue(accelerator, a => a.LoadAutoGroupedStreamKernel<Index1D, UV, UV, BV, int, int>(DecodeImpl));
-        kernel((int)((long)N * K), packed, scales, dst, K, (K / 16 + 3) / 4);
+        if (K % 16 != 0) throw new ArgumentException($"K = {K}: NVFP4 blocks are 16 inputs");
+        if ((long)N * K > int.MaxValue) throw new ArgumentException($"[{N}, {K}]: more than {int.MaxValue} elements");
+        var kernel = Kernels.GetValue(accelerator, a => a.LoadAutoGroupedStreamKernel<Index1D, UV, UV, BV, int, int, float>(DecodeImpl));
+        kernel((int)((long)N * K), packed, scales, dst, K, (K / 16 + 3) / 4, scale);
     }
 
     /// <summary>The same decode on the host (reference for tests): float values e2m1 x block scale x <paramref name="scale2"/>.</summary>
