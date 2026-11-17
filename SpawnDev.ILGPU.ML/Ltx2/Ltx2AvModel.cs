@@ -12,6 +12,13 @@ namespace SpawnDev.ILGPU.ML.Ltx2;
 /// <para>Token layouts (MEASURED bit-exact against ComfyUI's patchify inputs by SpawnGen): video token f H W + h W + w, feature = channel; audio token = latent frame,
 /// feature c 16 + bin.</para>
 /// </summary>
+/// <summary>
+/// A keyframe guide on an LTX-2 call (ComfyUI's LTXVAddGuide): <paramref name="GuideFrames"/> latent frames appended after the video's own, <paramref name="KeyframeBoxes"/>
+/// keyframe_idxs [3, guide tokens, 2] (pixel-space [start, end) per axis t / h / w), <paramref name="Strength"/> the guide's strength, <paramref name="FrameMask"/> the
+/// denoise_mask per latent frame ([F] or [B, F]; the guide frames at 1 - strength).
+/// </summary>
+public sealed record Ltx2Guide(int GuideFrames, float[] KeyframeBoxes, float Strength, float[] FrameMask);
+
 public sealed class Ltx2AvModel : IDisposable
 {
     public const int Channels = 128, AudioChannels = 8, AudioBins = 16, ContextWidth = 2 * Ltx2Transformer.Caption;
@@ -51,7 +58,16 @@ public sealed class Ltx2AvModel : IDisposable
     /// One model call: <paramref name="packed"/> [B, PackedLength], <paramref name="sigmas"/> [B], <paramref name="context"/> [B, L, 7680] on the device. Returns the denoised packed
     /// latents [B, PackedLength] (x - sigma v).
     /// </summary>
-    public async Task<float[]> DenoiseAsync(float[] packed, IReadOnlyList<float> sigmas, FV context, float fps, CancellationToken ct = default)
+    public Task<float[]> DenoiseAsync(float[] packed, IReadOnlyList<float> sigmas, FV context, float fps, CancellationToken ct = default)
+        => DenoiseAsync(packed, sigmas, context, fps, null, ct);
+
+    /// <summary>
+    /// The model call with a keyframe guide (ComfyUI's LTXVAddGuide conditioning): the packed video latent holds <see cref="Ltx2Guide.GuideFrames"/> appended guide frames;
+    /// <see cref="Ltx2Guide.FrameMask"/> is ComfyUI's denoise_mask per latent frame (each frame's timestep is sigma x mask; MEASURED: the denoised output still uses the
+    /// global sigma, x - sigma v, exactly); <see cref="Ltx2Guide.KeyframeBoxes"/> is keyframe_idxs [3, guide tokens, 2] (the guide tokens' pixel boxes for RoPE);
+    /// <see cref="Ltx2Guide.Strength"/> &lt; 1 adds ln(strength) to the self-attention between noisy and guide tokens.
+    /// </summary>
+    public async Task<float[]> DenoiseAsync(float[] packed, IReadOnlyList<float> sigmas, FV context, float fps, Ltx2Guide? guide, CancellationToken ct = default)
     {
         int B = _B, P = PackedLength, nv = _F * _H * _W;
         if (packed.Length != (long)B * P) throw new ArgumentException($"packed: {B} x {P} values");
@@ -71,7 +87,23 @@ public sealed class Ltx2AvModel : IDisposable
         _f.CopyCols(context, _vctx.View, B * _L, Ltx2Transformer.Caption, ContextWidth, Ltx2Transformer.Caption, 0);
         _f.CopyCols(context.SubView(Ltx2Transformer.Caption, context.Length - Ltx2Transformer.Caption), _actx.View, B * _L, Ltx2Transformer.Caption, ContextWidth, Ltx2Transformer.Caption, 0);
         var ts = sigmas.Select(s => s * 1000f).ToArray();
-        var (vo, ao) = await _t.CallAsync(_video.View, _audio.View, _vctx.View, _actx.View, ts, _F, _H, _W, _Ta, fps, ct);
+        float[]? boxes = null; (int, float)? bias = null; IReadOnlyList<float>? mults = guide?.FrameMask;
+        if (guide != null)
+        {
+            int gf = guide.GuideFrames, hw = _H * _W, ng = gf * hw, grid = (_F - gf) * hw;
+            if (gf < 1 || gf >= _F) throw new ArgumentException($"guide frames {gf} of {_F} latent frames");
+            if (guide.KeyframeBoxes.Length != 3 * ng * 2) throw new ArgumentException($"keyframe boxes: [3, {ng}, 2] (the guide's tokens)");
+            boxes = new float[_F * hw * 6];
+            Array.Copy(Ltx2Transformer.GridBoxes(_F - gf, _H, _W), boxes, grid * 6);
+            for (int j = 0; j < ng; j++)
+                for (int ax = 0; ax < 3; ax++)
+                {
+                    boxes[(grid + j) * 6 + 2 * ax] = guide.KeyframeBoxes[(ax * ng + j) * 2];
+                    boxes[(grid + j) * 6 + 2 * ax + 1] = guide.KeyframeBoxes[(ax * ng + j) * 2 + 1];
+                }
+            if (guide.Strength < 1f) bias = (grid, MathF.Log(guide.Strength));
+        }
+        var (vo, ao) = await _t.CallAsync(_video.View, _audio.View, _vctx.View, _actx.View, ts, mults, boxes, bias, _F, _H, _W, _Ta, fps, ct);
         var vel = await vo.CopyToHostAsync(); var avel = await ao.CopyToHostAsync();
         var den = new float[packed.Length];
         for (int b = 0; b < B; b++)

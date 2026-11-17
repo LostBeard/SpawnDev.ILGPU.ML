@@ -66,6 +66,50 @@ public sealed class Ltx2Kernels
         _fill((int)((long)T * C), input, registers, o, n, C, R);
     }
 
+    // ───────────────────────── guided self-attention ─────────────────────────
+
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int, int, int, float, float>? _groupAttn;
+    private static void GroupAttnImpl(Index1D i, FV q, FV kv, FV o, int qStride, int kvStride, int vOff, int N, int H, int D, int split, float scale, float bias)
+    {
+        int h = i % H, t = i / H;
+        long qo = (long)t * qStride + h * D;
+        bool qGuide = t >= split;
+        float max = -1e30f, sum = 0f;
+        // online softmax over the keys: pass 1 the max, pass 2 the weighted sum (exact two-pass softmax, fp32)
+        for (int j = 0; j < N; j++)
+        {
+            long ko = (long)j * kvStride + h * D;
+            float s = 0f;
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(q[qo + d], kv[ko + d], s);
+            s = s * scale + ((j >= split) != qGuide ? bias : 0f);
+            max = MathF.Max(max, s);
+        }
+        long oo = (long)t * H * D + h * D;
+        for (int d = 0; d < D; d++) o[oo + d] = 0f;
+        for (int j = 0; j < N; j++)
+        {
+            long ko = (long)j * kvStride + h * D;
+            float s = 0f;
+            for (int d = 0; d < D; d++) s = float.MultiplyAddEstimate(q[qo + d], kv[ko + d], s);
+            float p = MathF.Exp(s * scale + ((j >= split) != qGuide ? bias : 0f) - max);
+            sum += p;
+            for (int d = 0; d < D; d++) o[oo + d] = float.MultiplyAddEstimate(p, kv[ko + vOff + d], o[oo + d]);
+        }
+        float inv = 1f / sum;
+        for (int d = 0; d < D; d++) o[oo + d] *= inv;
+    }
+    /// <summary>
+    /// Self-attention of N tokens whose last N - <paramref name="split"/> are a keyframe guide (LTX-2's LTXVAddGuide), with ComfyUI's guide bias: <c>ln(strength)</c> added to
+    /// every score between a noisy token and a guide token (both directions; within a group none). MEASURED against ComfyUI's self_attention_mask (noisy_mask /
+    /// tracked_mask, strength 0.6: -0.5108 on exactly those pairs). q at q[t qStride + h D], k at kv[j kvStride + h D], v at kv[j kvStride + vOff + h D]; o [N, H D].
+    /// One thread per (token, head); exact two-pass softmax in fp32.
+    /// </summary>
+    public void GroupBiasAttention(FV q, int qStride, FV kv, int kvStride, int vOff, FV o, int N, int H, int D, int split, float bias)
+    {
+        _groupAttn ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, float, float>(GroupAttnImpl);
+        _groupAttn(N * H, q, kv, o, qStride, kvStride, vOff, N, H, D, split, 1f / MathF.Sqrt(D), bias);
+    }
+
     // ───────────────────────── LoRA ─────────────────────────
 
     private Action<Index1D, FV, FV, float>? _axpy;

@@ -42,9 +42,14 @@ public sealed class Ltx2Transformer : IDisposable
     private readonly List<IDisposable> _owned = new();
     private readonly int _B, _nv, _na, _L;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _v, _a, _vn, _an, _vctx, _actx, _q, _kv, _part, _o, _hid, _scores, _xs;
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _sin256, _t1, _t1a, _temb, _tembS;
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _tV, _tVe, _tA, _tAe, _tCaV, _tCaA, _tGateV, _tGateA;     // the six embedders' outputs (mod rows, embedded timestep)
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _modV, _modA, _caV, _caA, _gateV, _gateA, _headV, _headA;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _sinA, _temb;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _tA, _tAe, _tCaA, _tGateA;                       // the audio embedders' outputs (per batch item)
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _modA, _caA, _gateA, _headA;
+    // the video embedders run per (batch item, frame group): a frame's tokens can carry their own timestep (LTXVAddGuide / image conditioning: sigma x the frame's
+    // denoise mask). One group per item when every frame shares the timestep (the plain call, exactly as before)
+    private MemoryBuffer1D<float, Stride1D.Dense> _sinV = null!, _t1 = null!, _tembS = null!, _tV = null!, _tVe = null!, _tCaV = null!, _tGateV = null!, _tembV = null!;
+    private MemoryBuffer1D<float, Stride1D.Dense> _modV = null!, _caV = null!, _gateV = null!, _headV = null!;
+    private int _gCap, _vg = 1, _rpg;                                                                        // group capacity, groups per item, token rows per group
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _ropeV, _ropeVs, _ropeA, _ropeAs, _ropeVx, _ropeVxs, _outV, _outA;
 
     /// <summary>Called with ("block{k}_video" [B nv, 4096] | "block{k}_audio" [B na, 2048] | "adaln" ... ) as a call goes.</summary>
@@ -86,15 +91,29 @@ public sealed class Ltx2Transformer : IDisposable
         _q = Alloc(B * rows * Dv); _kv = Alloc(B * rows * 2 * Dv); _part = Alloc(B * rows * Dv); _o = Alloc(B * rows * Dv);
         _hid = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Dv))); _xs = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Caption)));
         _scores = Alloc(Math.Max(Hv, Ha) * Math.Max(Math.Max(nv * nv, na * na), Math.Max(Math.Max(nv, na) * L, nv * na)));
-        _sin256 = Alloc(B * TimeChannels); _t1 = Alloc(B * Dv); _t1a = Alloc(B * Dv); _temb = Alloc(B * Dv); _tembS = Alloc(B * Dv);
-        _tV = Alloc(B * 6 * Dv); _tVe = Alloc(B * Dv); _tA = Alloc(B * 6 * Da); _tAe = Alloc(B * Da);
-        _tCaV = Alloc(B * 4 * Dv); _tCaA = Alloc(B * 4 * Da); _tGateV = Alloc(B * Dv); _tGateA = Alloc(B * Da);
-        _modV = Alloc(B * 6 * Dv); _modA = Alloc(B * 6 * Da); _caV = Alloc(B * 4 * Dv); _caA = Alloc(B * 4 * Da); _gateV = Alloc(B * Dv); _gateA = Alloc(B * Da); _headV = Alloc(B * 2 * Dv); _headA = Alloc(B * 2 * Da);
+        _sinA = Alloc(B * TimeChannels); _temb = Alloc(B * Dv);
+        _tA = Alloc(B * 6 * Da); _tAe = Alloc(B * Da); _tCaA = Alloc(B * 4 * Da); _tGateA = Alloc(B * Da);
+        _modA = Alloc(B * 6 * Da); _caA = Alloc(B * 4 * Da); _gateA = Alloc(B * Da); _headA = Alloc(B * 2 * Da);
+        AllocGroups(1);
         _ropeV = Alloc(nv * Dv / 2); _ropeVs = Alloc(nv * Dv / 2); _ropeA = Alloc(na * Da / 2); _ropeAs = Alloc(na * Da / 2); _ropeVx = Alloc(nv * Da / 2); _ropeVxs = Alloc(nv * Da / 2);
         _outV = Alloc(B * nv * InChannels); _outA = Alloc(B * na * InChannels);
     }
 
     private MemoryBuffer1D<float, Stride1D.Dense> Alloc(long n) { var b = _acc.Allocate1D<float>(Math.Max(1, n)); _owned.Add(b); return b; }
+
+    private readonly List<IDisposable> _groupOwned = new();
+    private MemoryBuffer1D<float, Stride1D.Dense> GAlloc(long n) { var b = _acc.Allocate1D<float>(Math.Max(1, n)); _groupOwned.Add(b); return b; }
+    // the per-group video buffers for g groups per item (B g rows)
+    private void AllocGroups(int g)
+    {
+        foreach (var o in _groupOwned) o.Dispose();
+        _groupOwned.Clear();
+        long r = (long)_B * g;
+        _sinV = GAlloc(r * TimeChannels); _t1 = GAlloc(Math.Max(r, _B) * Dv); _tembS = GAlloc(Math.Max(r, _B) * Dv);
+        _tV = GAlloc(r * 6 * Dv); _tVe = GAlloc(r * Dv); _tCaV = GAlloc(r * 4 * Dv); _tGateV = GAlloc(r * Dv); _tembV = GAlloc(r * Dv);
+        _modV = GAlloc(r * 6 * Dv); _caV = GAlloc(r * 4 * Dv); _gateV = GAlloc(r * Dv); _headV = GAlloc(r * 2 * Dv);
+        _gCap = g;
+    }
 
     /// <summary>
     /// Open the transformer of an LTX-2 checkpoint (any prefix: the original layout's <c>model.diffusion_model.</c>) for calls of <paramref name="batch"/> items of
@@ -167,31 +186,47 @@ public sealed class Ltx2Transformer : IDisposable
     }
 
     // one adaLN embedder: emb = linear_2(silu(linear_1(sinusoid))) [B, D]; mod = linear(silu(emb)) [B, N D]
-    private void Embedder(string name, int D, FV mod, FV emb)
+    private void Embedder(string name, int D, FV mod, FV emb, FV sin, int rows)
     {
         var b = _w.Base;
-        Lin(b, _sin256.View, name + ".emb.timestep_embedder.linear_1", _t1.View, _B, TimeChannels, D, DiTKernels.Act.Silu);
-        Lin(b, _t1.View, name + ".emb.timestep_embedder.linear_2", emb, _B, D, D);
-        _k.Silu(emb, _tembS.View, _B * D);
-        Lin(b, _tembS.View, name + ".linear", mod, _B, D, b.Shape(name + ".linear.weight")[0]);
+        Lin(b, sin, name + ".emb.timestep_embedder.linear_1", _t1.View, rows, TimeChannels, D, DiTKernels.Act.Silu);
+        Lin(b, _t1.View, name + ".emb.timestep_embedder.linear_2", emb, rows, D, D);
+        _k.Silu(emb, _tembS.View, rows * D);
+        Lin(b, _tembS.View, name + ".linear", mod, rows, D, b.Shape(name + ".linear.weight")[0]);
     }
 
     /// <summary>
     /// The RoPE tables of a call (MEASURED against ComfyUI's dumped tables, 6e-8): video tokens (f, h, w) of a [F, H, W] latent, audio tokens of <paramref name="audioFrames"/>
     /// latent frames, the video frame rate <paramref name="fps"/>.
     /// </summary>
-    private void UploadRope(int F, int H, int W, int audioFrames, float fps)
+    /// <summary>
+    /// The pixel-space boxes [t0, t1, h0, h1, w0, w1] of an F x H x W latent grid's tokens (f, h, w order): time [max(8 f - 7, 0), 8 f + 1) (causal: frame 0 is one pixel
+    /// frame), space 32-pixel cells. A guide's tokens use ComfyUI's keyframe_idxs boxes instead (the guided CallAsync overload's tokenBoxes).
+    /// </summary>
+    public static float[] GridBoxes(int F, int H, int W)
     {
-        int nv = F * H * W;
-        var tv = new float[nv]; var hv = new float[nv]; var wv = new float[nv];
+        var o = new float[F * H * W * 6];
         for (int f = 0, i = 0; f < F; f++)
             for (int h = 0; h < H; h++)
                 for (int x = 0; x < W; x++, i++)
                 {
-                    float t0 = Math.Max(TimeScale * f + 1 - TimeScale, 0), t1 = Math.Max(TimeScale * (f + 1) + 1 - TimeScale, 0);   // causal: frame 0 is one pixel frame
-                    tv[i] = (t0 + t1) / 2f / fps / MaxTime;
-                    hv[i] = (SpaceScale * h + SpaceScale / 2f) / MaxSpace; wv[i] = (SpaceScale * x + SpaceScale / 2f) / MaxSpace;
+                    o[6 * i] = Math.Max(TimeScale * f + 1 - TimeScale, 0); o[6 * i + 1] = Math.Max(TimeScale * (f + 1) + 1 - TimeScale, 0);
+                    o[6 * i + 2] = SpaceScale * h; o[6 * i + 3] = SpaceScale * (h + 1); o[6 * i + 4] = SpaceScale * x; o[6 * i + 5] = SpaceScale * (x + 1);
                 }
+        return o;
+    }
+
+    private void UploadRope(int F, int H, int W, int audioFrames, float fps, float[]? boxes = null)
+    {
+        int nv = F * H * W;
+        boxes ??= GridBoxes(F, H, W);
+        if (boxes.Length != nv * 6) throw new ArgumentException($"{nv} token boxes of 6 values");
+        var tv = new float[nv]; var hv = new float[nv]; var wv = new float[nv];
+        for (int i = 0; i < nv; i++)
+        {
+            tv[i] = (boxes[6 * i] + boxes[6 * i + 1]) / 2f / fps / MaxTime;                // the box midpoints (use_middle_indices_grid), normalised
+            hv[i] = (boxes[6 * i + 2] + boxes[6 * i + 3]) / 2f / MaxSpace; wv[i] = (boxes[6 * i + 4] + boxes[6 * i + 5]) / 2f / MaxSpace;
+        }
         // video self: 682 frequencies per axis, frequency-major with the axis fastest, 2 identity entries first
         int Fq = Dv / 6, pad = Dv / 2 - 3 * Fq;
         var (ct, st) = Ltx2Kernels.SplitRopeTables(tv, Fq, 0, RopeTheta); var (ch, sh) = Ltx2Kernels.SplitRopeTables(hv, Fq, 0, RopeTheta); var (cw, sw) = Ltx2Kernels.SplitRopeTables(wv, Fq, 0, RopeTheta);
@@ -227,22 +262,46 @@ public sealed class Ltx2Transformer : IDisposable
     /// <paramref name="audioContext"/> [B, L, 3840] (the connectors' outputs), the timesteps <paramref name="timesteps"/> (sigma x 1000) per item. Returns the velocities
     /// ([B, F H W, 128], [B, audioFrames, 128]) on the device, valid until the next call.
     /// </summary>
-    public async Task<(FV Video, FV Audio)> CallAsync(FV video, FV audio, FV videoContext, FV audioContext, IReadOnlyList<float> timesteps, int F, int H, int W, int audioFrames, float fps,
+    public Task<(FV Video, FV Audio)> CallAsync(FV video, FV audio, FV videoContext, FV audioContext, IReadOnlyList<float> timesteps, int F, int H, int W, int audioFrames, float fps,
         CancellationToken ct = default)
+        => CallAsync(video, audio, videoContext, audioContext, timesteps, null, null, null, F, H, W, audioFrames, fps, ct);
+
+    private (int Split, float Bias)? _guideBias;
+
+    /// <summary>
+    /// A call with per-frame video timesteps and guide tokens (ComfyUI's LTXVAddGuide / LTXVImgToVideo conditioning): <paramref name="frameMultipliers"/> [B F] or [F] scales
+    /// each latent frame's timestep (ComfyUI's denoise_mask per frame; null = all 1); <paramref name="tokenBoxes"/> [F H W, 6] pixel boxes [t0, t1, h0, h1, w0, w1] per
+    /// video token (null = <see cref="GridBoxes"/>; a guide's tokens take its keyframe_idxs boxes); <paramref name="guideBias"/> (the first guide token, ln(strength)): the
+    /// self-attention bias between noisy and guide tokens (null or bias 0: none). The audio timestep stays per item.
+    /// </summary>
+    public async Task<(FV Video, FV Audio)> CallAsync(FV video, FV audio, FV videoContext, FV audioContext, IReadOnlyList<float> timesteps, IReadOnlyList<float>? frameMultipliers,
+        float[]? tokenBoxes, (int Split, float Bias)? guideBias, int F, int H, int W, int audioFrames, float fps, CancellationToken ct = default)
     {
         if (F * H * W != _nv || audioFrames != _na) throw new ArgumentException($"this transformer was opened for {_nv} video / {_na} audio tokens");
         if (timesteps.Count != _B) throw new ArgumentException($"{_B} timesteps (one per batch item)");
+        if (frameMultipliers != null && frameMultipliers.Count != F && frameMultipliers.Count != _B * F) throw new ArgumentException($"frame multipliers: [{F}] or [{_B}, {F}]");
         int B = _B, nv = _nv, na = _na, L = _L;
         var b0 = _w.Base;
-        UploadRope(F, H, W, audioFrames, fps);
-        _sin256.View.SubView(0, B * TimeChannels).CopyFromCPU(Sinusoid(timesteps));
-        Embedder("adaln_single", Dv, _tV.View, _tVe.View);
-        Embedder("audio_adaln_single", Da, _tA.View, _tAe.View);
-        Embedder("av_ca_video_scale_shift_adaln_single", Dv, _tCaV.View, _temb.View);
-        Embedder("av_ca_audio_scale_shift_adaln_single", Da, _tCaA.View, _temb.View);
-        Embedder("av_ca_a2v_gate_adaln_single", Dv, _tGateV.View, _temb.View);
-        Embedder("av_ca_v2a_gate_adaln_single", Da, _tGateA.View, _temb.View);
-        Probe?.Invoke("adaln_video", _tV.View, B, 6 * Dv); Probe?.Invoke("adaln_video_emb", _tVe.View, B, Dv);
+        // frame groups: one per item when every frame of every item shares its timestep, else one per latent frame
+        float Mult(int b, int f) => frameMultipliers == null ? 1f : frameMultipliers.Count == F ? frameMultipliers[f] : frameMultipliers[b * F + f];
+        bool uniform = true;
+        for (int b = 0; b < B && uniform; b++) for (int f = 0; f < F; f++) if (Mult(b, f) != 1f) { uniform = false; break; }
+        _vg = uniform ? 1 : F; _rpg = uniform ? nv : H * W;
+        if (_vg > _gCap) { await _acc.SynchronizeAsync(); AllocGroups(_vg); }
+        _guideBias = guideBias is { } gb && gb.Bias != 0f ? gb : null;
+        UploadRope(F, H, W, audioFrames, fps, tokenBoxes);
+        var tvid = new float[B * _vg];
+        for (int b = 0; b < B; b++) for (int g = 0; g < _vg; g++) tvid[b * _vg + g] = timesteps[b] * (uniform ? 1f : Mult(b, g));
+        _sinV.View.SubView(0, (long)B * _vg * TimeChannels).CopyFromCPU(Sinusoid(tvid));
+        _sinA.View.SubView(0, B * TimeChannels).CopyFromCPU(Sinusoid(timesteps));
+        int rv = B * _vg;
+        Embedder("adaln_single", Dv, _tV.View, _tVe.View, _sinV.View, rv);
+        Embedder("audio_adaln_single", Da, _tA.View, _tAe.View, _sinA.View, B);
+        Embedder("av_ca_video_scale_shift_adaln_single", Dv, _tCaV.View, _tembV.View, _sinV.View, rv);
+        Embedder("av_ca_audio_scale_shift_adaln_single", Da, _tCaA.View, _temb.View, _sinA.View, B);
+        Embedder("av_ca_a2v_gate_adaln_single", Dv, _tGateV.View, _tembV.View, _sinV.View, rv);
+        Embedder("av_ca_v2a_gate_adaln_single", Da, _tGateA.View, _temb.View, _sinA.View, B);
+        Probe?.Invoke("adaln_video", _tV.View, rv, 6 * Dv); Probe?.Invoke("adaln_video_emb", _tVe.View, rv, Dv);
         Probe?.Invoke("adaln_audio", _tA.View, B, 6 * Da); Probe?.Invoke("adaln_audio_emb", _tAe.View, B, Da);
 
         // text: the caption projections (Linear, GELU-tanh, Linear)
@@ -275,12 +334,13 @@ public sealed class Ltx2Transformer : IDisposable
         // output heads: LayerNorm (no affine), (1 + scale) + shift with shift = table[0] + embedded timestep, scale = table[1] + embedded timestep
         for (int b = 0; b < B; b++)
         {
-            for (int j = 0; j < 2; j++)
+            for (int g = 0; g < _vg; g++)
             {
-                _x.Add(b0.F32("scale_shift_table").SubView(j * Dv, Dv), _tVe.View.SubView(b * Dv, Dv), _headV.View.SubView((2 * b + j) * Dv, Dv), Dv);
-                _x.Add(b0.F32("audio_scale_shift_table").SubView(j * Da, Da), _tAe.View.SubView(b * Da, Da), _headA.View.SubView((2 * b + j) * Da, Da), Da);
+                int r = b * _vg + g;
+                for (int j = 0; j < 2; j++) _x.Add(b0.F32("scale_shift_table").SubView(j * Dv, Dv), _tVe.View.SubView((long)r * Dv, Dv), _headV.View.SubView((long)(2 * r + j) * Dv, Dv), Dv);
+                _k.LayerNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _headV.View, 2 * r * Dv, (2 * r + 1) * Dv, _rpg, Dv, Eps);
             }
-            _k.LayerNormModulate(_v.View.SubView((long)b * nv * Dv, (long)nv * Dv), _vn.View.SubView((long)b * nv * Dv, (long)nv * Dv), _headV.View, 2 * b * Dv, (2 * b + 1) * Dv, nv, Dv, Eps);
+            for (int j = 0; j < 2; j++) _x.Add(b0.F32("audio_scale_shift_table").SubView(j * Da, Da), _tAe.View.SubView(b * Da, Da), _headA.View.SubView((2 * b + j) * Da, Da), Da);
             _k.LayerNormModulate(_a.View.SubView((long)b * na * Da, (long)na * Da), _an.View.SubView((long)b * na * Da, (long)na * Da), _headA.View, 2 * b * Da, (2 * b + 1) * Da, na, Da, Eps);
         }
         Lin(b0, _vn.View, "proj_out", _outV.View, B * nv, Dv, InChannels);
@@ -289,16 +349,20 @@ public sealed class Ltx2Transformer : IDisposable
     }
 
     // mod rows of one block: table [N, D] (fp32) + the embedder's [B, N D] (per item)
-    private void Mod(FV table, FV temb, FV mod, int N, int D, int tableRow0 = 0, int tembN = -1)
+    private void Mod(FV table, FV temb, FV mod, int N, int D, int tableRow0 = 0, int rows = -1)
     {
-        int tn = tembN < 0 ? N : tembN;
-        for (int b = 0; b < _B; b++)
-            _x.Add(table.SubView((long)tableRow0 * D, (long)N * D), temb.SubView((long)b * tn * D, (long)N * D), mod.SubView((long)b * N * D, (long)N * D), N * D);
+        int R = rows < 0 ? _B : rows;
+        for (int b = 0; b < R; b++)
+            _x.Add(table.SubView((long)tableRow0 * D, (long)N * D), temb.SubView((long)b * N * D, (long)N * D), mod.SubView((long)b * N * D, (long)N * D), N * D);
     }
+
+    // the token rows of video group g of item b ([_rpg, C]); its modulation row is b _vg + g
+    private FV VRows(MemoryBuffer1D<float, Stride1D.Dense> buf, int b, int g, int C) => buf.View.SubView(((long)b * _nv + (long)g * _rpg) * C, (long)_rpg * C);
+    private FV VPart(int b, int g) => _part.View.SubView(((long)b * _nv + (long)g * _rpg) * Dv, (long)_rpg * Dv);
 
     // self- or cross-attention of one stream: q from xq [B Nq, Dq-in], k / v from xkv [B Nk, Dkv-in]; heads H x D (inner H D); optional RoPE tables per side; out [B Nq, Dout] into o
     private void Attn(GpuWeights w, string p, FV xq, int Nq, int dq, FV xkv, int Nk, int dkv, int H, int D, int dout, FV o,
-        (FV Cos, FV Sin)? ropeQ, (FV Cos, FV Sin)? ropeK)
+        (FV Cos, FV Sin)? ropeQ, (FV Cos, FV Sin)? ropeK, (int Split, float Bias)? bias = null)
     {
         int B = _B, C = H * D;
         Lin(w, xq, p + "to_q", _q.View, B * Nq, dq, C);
@@ -311,7 +375,8 @@ public sealed class Ltx2Transformer : IDisposable
             var qb = _q.View.SubView((long)b * Nq * C, (long)Nq * C); var kvb = _kv.View.SubView((long)b * Nk * 2 * C, (long)Nk * 2 * C);
             if (ropeQ is { } rq) _l.RopeSplit(qb, rq.Cos, rq.Sin, Nq, C, 0, H, D);
             if (ropeK is { } rk) _l.RopeSplit(kvb, rk.Cos, rk.Sin, Nk, 2 * C, 0, H, D);
-            _k.Attention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, Nk, H, D);
+            if (bias is { } gb) _l.GroupBiasAttention(qb, C, kvb, 2 * C, C, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, H, D, gb.Split, gb.Bias);
+            else _k.Attention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, Nk, H, D);
         }
         Lin(w, _o.View, p + "to_out.0", o, B * Nq, C, dout);
     }
@@ -319,18 +384,19 @@ public sealed class Ltx2Transformer : IDisposable
     private void Block(GpuWeights w, string p)
     {
         int B = _B, nv = _nv, na = _na, L = _L;
-        Mod(w.F32(p + "scale_shift_table"), _tV.View, _modV.View, 6, Dv);
+        int G = _vg, rv = B * G;
+        Mod(w.F32(p + "scale_shift_table"), _tV.View, _modV.View, 6, Dv, 0, rv);
         Mod(w.F32(p + "audio_scale_shift_table"), _tA.View, _modA.View, 6, Da);
         // rows 0..3 of the per-block cross tables + the scale/shift embedders; row 4 + the gate embedders
-        Mod(w.F32(p + "scale_shift_table_a2v_ca_video"), _tCaV.View, _caV.View, 4, Dv);
+        Mod(w.F32(p + "scale_shift_table_a2v_ca_video"), _tCaV.View, _caV.View, 4, Dv, 0, rv);
         Mod(w.F32(p + "scale_shift_table_a2v_ca_audio"), _tCaA.View, _caA.View, 4, Da);
-        Mod(w.F32(p + "scale_shift_table_a2v_ca_video"), _tGateV.View, _gateV.View, 1, Dv, 4);
+        Mod(w.F32(p + "scale_shift_table_a2v_ca_video"), _tGateV.View, _gateV.View, 1, Dv, 4, rv);
         Mod(w.F32(p + "scale_shift_table_a2v_ca_audio"), _tGateA.View, _gateA.View, 1, Da, 4);
 
         // 1. self-attention (video, then audio): adaLN 0 shift, 1 scale, 2 gate
-        for (int b = 0; b < B; b++) _x.RmsNormModulate(Rows(_v, b, nv, Dv), Rows(_vn, b, nv, Dv), _modV.View, b * 6 * Dv, b * 6 * Dv + Dv, nv, Dv, Eps);
-        Attn(w, p + "attn1.", _vn.View, nv, Dv, _vn.View, nv, Dv, Hv, HeadV, Dv, _part.View, (_ropeV.View, _ropeVs.View), (_ropeV.View, _ropeVs.View));
-        for (int b = 0; b < B; b++) _k.GateResidual(Rows(_v, b, nv, Dv), _part.View.SubView((long)b * nv * Dv, (long)nv * Dv), _modV.View, b * 6 * Dv + 2 * Dv, nv * Dv, Dv);
+        for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _modV.View, r * 6 * Dv, r * 6 * Dv + Dv, _rpg, Dv, Eps); }
+        Attn(w, p + "attn1.", _vn.View, nv, Dv, _vn.View, nv, Dv, Hv, HeadV, Dv, _part.View, (_ropeV.View, _ropeVs.View), (_ropeV.View, _ropeVs.View), _guideBias);
+        for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _k.GateResidual(VRows(_v, b, g, Dv), VPart(b, g), _modV.View, r * 6 * Dv + 2 * Dv, _rpg * Dv, Dv); }
         for (int b = 0; b < B; b++) _x.RmsNormModulate(Rows(_a, b, na, Da), Rows(_an, b, na, Da), _modA.View, b * 6 * Da, b * 6 * Da + Da, na, Da, Eps);
         Attn(w, p + "audio_attn1.", _an.View, na, Da, _an.View, na, Da, Ha, HeadA, Da, _part.View, (_ropeA.View, _ropeAs.View), (_ropeA.View, _ropeAs.View));
         for (int b = 0; b < B; b++) _k.GateResidual(Rows(_a, b, na, Da), _part.View.SubView((long)b * na * Da, (long)na * Da), _modA.View, b * 6 * Da + 2 * Da, na * Da, Da);
@@ -349,25 +415,25 @@ public sealed class Ltx2Transformer : IDisposable
         // a2v: q = video modulated by its a2v pair, k / v = audio modulated by its a2v pair
         for (int b = 0; b < B; b++)
         {
-            _x.RmsNormModulate(Rows(_v, b, nv, Dv), Rows(_vn, b, nv, Dv), _caV.View, b * 4 * Dv + Dv, b * 4 * Dv, nv, Dv, Eps);
+            for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _caV.View, r * 4 * Dv + Dv, r * 4 * Dv, _rpg, Dv, Eps); }
             _x.RmsNormModulate(Rows(_a, b, na, Da), Rows(_an, b, na, Da), _caA.View, b * 4 * Da + Da, b * 4 * Da, na, Da, Eps);
         }
         Attn(w, p + "audio_to_video_attn.", _vn.View, nv, Dv, _an.View, na, Da, Ha, HeadA, Dv, _part.View, (_ropeVx.View, _ropeVxs.View), (_ropeA.View, _ropeAs.View));
-        for (int b = 0; b < B; b++) _k.GateResidual(Rows(_v, b, nv, Dv), _part.View.SubView((long)b * nv * Dv, (long)nv * Dv), _gateV.View, b * Dv, nv * Dv, Dv);
+        for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) _k.GateResidual(VRows(_v, b, g, Dv), VPart(b, g), _gateV.View, (b * G + g) * Dv, _rpg * Dv, Dv);
         // v2a: q = audio modulated by its v2a pair, k / v = the (a2v-updated) video modulated by its v2a pair
         for (int b = 0; b < B; b++)
         {
-            _x.RmsNormModulate(Rows(_v, b, nv, Dv), Rows(_vn, b, nv, Dv), _caV.View, b * 4 * Dv + 3 * Dv, b * 4 * Dv + 2 * Dv, nv, Dv, Eps);
+            for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _caV.View, r * 4 * Dv + 3 * Dv, r * 4 * Dv + 2 * Dv, _rpg, Dv, Eps); }
             _x.RmsNormModulate(Rows(_a, b, na, Da), Rows(_an, b, na, Da), _caA.View, b * 4 * Da + 3 * Da, b * 4 * Da + 2 * Da, na, Da, Eps);
         }
         Attn(w, p + "video_to_audio_attn.", _an.View, na, Da, _vn.View, nv, Dv, Ha, HeadA, Da, _part.View, (_ropeA.View, _ropeAs.View), (_ropeVx.View, _ropeVxs.View));
         for (int b = 0; b < B; b++) _k.GateResidual(Rows(_a, b, na, Da), _part.View.SubView((long)b * na * Da, (long)na * Da), _gateA.View, b * Da, na * Da, Da);
 
         // 4. feed-forwards: adaLN 3 shift, 4 scale, 5 gate
-        for (int b = 0; b < B; b++) _x.RmsNormModulate(Rows(_v, b, nv, Dv), Rows(_vn, b, nv, Dv), _modV.View, b * 6 * Dv + 3 * Dv, b * 6 * Dv + 4 * Dv, nv, Dv, Eps);
+        for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _modV.View, r * 6 * Dv + 3 * Dv, r * 6 * Dv + 4 * Dv, _rpg, Dv, Eps); }
         Lin(w, _vn.View, p + "ff.net.0.proj", _hid.View, B * nv, Dv, Fv, DiTKernels.Act.GeluTanh);
         Lin(w, _hid.View, p + "ff.net.2", _part.View, B * nv, Fv, Dv);
-        for (int b = 0; b < B; b++) _k.GateResidual(Rows(_v, b, nv, Dv), _part.View.SubView((long)b * nv * Dv, (long)nv * Dv), _modV.View, b * 6 * Dv + 5 * Dv, nv * Dv, Dv);
+        for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _k.GateResidual(VRows(_v, b, g, Dv), VPart(b, g), _modV.View, r * 6 * Dv + 5 * Dv, _rpg * Dv, Dv); }
         for (int b = 0; b < B; b++) _x.RmsNormModulate(Rows(_a, b, na, Da), Rows(_an, b, na, Da), _modA.View, b * 6 * Da + 3 * Da, b * 6 * Da + 4 * Da, na, Da, Eps);
         Lin(w, _an.View, p + "audio_ff.net.0.proj", _hid.View, B * na, Da, Fa, DiTKernels.Act.GeluTanh);
         Lin(w, _hid.View, p + "audio_ff.net.2", _part.View, B * na, Fa, Da);
@@ -381,6 +447,8 @@ public sealed class Ltx2Transformer : IDisposable
         foreach (var o in _owned) o.Dispose();
         _owned.Clear();
         _loraT?.Dispose(); _loraU?.Dispose(); _loraT = _loraU = null;
+        foreach (var o in _groupOwned) o.Dispose();
+        _groupOwned.Clear();
         _w.Dispose();
     }
 }

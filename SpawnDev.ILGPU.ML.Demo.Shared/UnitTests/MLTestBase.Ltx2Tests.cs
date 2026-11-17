@@ -330,6 +330,42 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// A keyframe-guided LTX-2 call (ComfyUI's LTXVAddGuide, flf2v-style: a picture guide at the last frame, 128 x 96 x 9 + audio, cfg 4; SpawnGen's taps _DevComms
+    /// 2026-11-18-0600) at strengths 1.0 and 0.6: per-frame timesteps from denoise_mask, the guide tokens' RoPE boxes from keyframe_idxs, ln(strength) on the
+    /// noisy / guide self-attention. Against ComfyUI's call-0 output (denoised, both rows).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_GuidedCall_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        var root = Path.Combine(Ltx2_Dumps(), "guided");
+        if (!Directory.Exists(root)) throw new UnsupportedTestException($"SpawnGen's guided-call taps not found in {root}");
+        const int B = 2, F = 3, H = 3, W = 4, Ta = 9, L = 1024, P = 128 * F * H * W + 8 * Ta * 16;
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("LTX2_DIT_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gb) ? gb : 6.0;
+        using var model = await Ltx2AvModel.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "ltx-2-19b-dev-fp8.safetensors", B, F, H, W, Ta, L, (long)(residentGb * 1e9));
+        var report = new List<string>(); double worst = 0;
+        foreach (var (folder, strength) in new[] { ("guidecall_s10", 1.0f), ("guidecall_s06", 0.6f) })
+        {
+            var d = Path.Combine(root, folder);
+            float[] T(string prefix, long n) => F2_Raw(Ltx2_Tap(d, prefix), n);
+            var sigma = T("guide_call_0_timestep", B);
+            var mask = T("guide_call_0_c_denoise_mask", (long)B * 128 * F * H * W);
+            var frameMask = new float[B * F];
+            for (int b = 0; b < B; b++) for (int f = 0; f < F; f++) frameMask[b * F + f] = mask[(((long)b * 128) * F + f) * H * W];
+            var kf = T("guide_call_0_c_keyframe_idxs", 2L * 3 * H * W * 2)[..(3 * H * W * 2)];                 // row 0 (both rows carry the same guide)
+            using var ctx = accelerator.Allocate1D(T("guide_call_0_c_c_crossattn", (long)B * L * Ltx2AvModel.ContextWidth));
+            var den = await model.DenoiseAsync(T("guide_call_0_input", (long)B * P), new[] { sigma[0], sigma[1] }, ctx.View, 25f, new Ltx2Guide(1, kf, strength, frameMask));
+            double e = F2_RelRms(den, T("guide_call_0_output", (long)B * P)); worst = Math.Max(worst, e);
+            report.Add($"strength {strength}: call 0 {e:E2} (frame mask [{string.Join(", ", frameMask[..F])}])");
+        }
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Ltx2] guided call vs ComfyUI: " + line);
+        Ur_Expect(worst < 1e-4, line);
+        return line;
+    });
+
+    /// <summary>
     /// LTX-2's x2 spatial latent upscaler (ltx-2-spatial-upscaler-x2-1.0, the checkpoint VAE's latent statistics) against ComfyUI's LTXVLatentUpsampler on the template run's
     /// video latent [128, 2, 2, 2] -> [128, 2, 4, 4] (SpawnGen's taps, _DevComms 2026-11-17-2300). Reports the result with and without AdaIN; the closer one must match.
     /// </summary>
