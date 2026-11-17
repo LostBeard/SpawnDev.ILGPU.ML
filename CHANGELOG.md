@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased - ACE-Step 1.5 (music) against ComfyUI
 
+- **SpawnDev.ILGPU 5.4.35.** Wasm: a disposed buffer's JS objects are released after the work queued before it finishes (was immediate: "RangeError: offset is out of
+  bounds"). ML Wasm-lane gate on 5.4.35-local.1: 1101 / 0 / 62, identical to 5.4.34, time 1.003x; light precision gates on every lane green on the stable package.
 - **ACE-Step 1.5** (ComfyUI's audio_ace_step_1_5_split: acestep_v1.5_turbo, qwen_0.6b_ace15, ace_1.5_vae; MIT source ace-step/ACE-Step-1.5; Plans/ace-step-1.5-2026-11-16.md),
   each part on ComfyUI's own inputs (SpawnGen's float32 CPU dumps and module taps), CUDA:
   - `OobleckDecoder`: the audio VAE's decoder, latent [64, T] at 25 fps to stereo 48 kHz (1920 samples per frame): 3.1e-6.
