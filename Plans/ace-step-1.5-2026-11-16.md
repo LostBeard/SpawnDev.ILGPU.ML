@@ -37,6 +37,12 @@ implementation is what the template runs; this source is the port's reference, t
   fuse; decoder Conv k7 64->2048, blocks, Snake, Conv k7 -> 2 ch, no bias). Stereo 48 kHz, 64 latent channels, no latent scale / shift. Hop: 1920
   per the handler vs 2048 from the MLX defaults: take the ratios from the VAE file. Peak-normalised after decode only if the peak exceeds 1.
 
+## Measured
+- Files verified against the facts: DiT 24 layers, GQA 16/8 x 128, SwiGLU 6144, time_embed + time_embed_r, proj_in Conv1d [2048, 192, 2]; FSQ project_in [6, 2048];
+  Qwen3 0.6B (28 layers, vocab 151669, width 1024) and 1.7B (28 layers, vocab 217204 = Qwen + audio codes, width 2048), both with per-head q/k norm.
+  VAE decoder: ConvTranspose kernels 20 / 12 / 8 / 8 / 4 = strides 10 / 6 / 4 / 4 / 2 = 1920 samples per frame (Lore's audio: 480000 / 250).
+- 11-16 23:52 CUDA: `OobleckDecoder` vs ComfyUI's VAEDecodeAudio 3.1e-6 (peaks equal) (`AceStep_VaeDecode_MatchesComfyUi`). Stage 2 done.
+
 ## Stages (each gated against SpawnGen's ComfyUI dumps, parity first)
 1. Files: the four ComfyUI files (models host mirror, standing go); read tensor names / shapes / dtypes; map to the facts above.
 2. VAE decode (smallest, independent): ComfyUI's latent in -> audio out.
