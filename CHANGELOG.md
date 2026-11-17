@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **SpawnDev.ILGPU 5.4.36** (Wasm buffers stay in the linear memory between dispatches). ML Wasm-lane gate on 5.4.36-local.1: 1105 / 0 / 64, no Pass -> Fail, time
+  0.982x of 5.4.35; the training / backward tests 1.6-2.05x faster.
 - **LTX-2 19B (audio + video), work in progress** (`Ltx2`: ported from Hugging Face diffusers' Apache-2.0 LTX-2 code and transformers' Gemma 3; Plans/ltx-2-19b-2026-11-17.md),
   each part on ComfyUI's own inputs against SpawnGen's float32 taps, CUDA:
   - `Gemma3TextEncoder`: Gemma 3 12B from ComfyUI's text-encoder files (gemma_3_12B_it_fp4_mixed: NVFP4 + fp8 layers), streamed per layer, the token table never uploaded;
@@ -15,6 +17,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     x - sigma v) and the template's sampler (CFG on the denoised latents, Euler): the whole two-step run from ComfyUI's noise to 1.1e-4 (`Ltx2_Sample_MatchesComfyUi`).
   - `Ltx2VideoDecoder` (the checkpoint's BF16 vae.decoder: no timestep conditioning, REFLECT spatial padding): frames 9.4e-6 (`Ltx2_VideoDecode_MatchesComfyUi`).
   - `Ltx2AudioDecoder` (audio VAE decoder, causal in time, + the HiFi-GAN vocoder, 24 kHz): spectrogram 5.9e-7, waveform 3.6e-5 (`Ltx2_AudioDecode_MatchesComfyUi`).
+  - `Ltx2LatentUpsampler` (ltx-2-spatial-upscaler-x2-1.0: the second pass's x2 latent upscale; ComfyUI's LTXVLatentUpsampler applies no AdaIN): 4.8e-6
+    (`Ltx2_LatentUpsample_MatchesComfyUi`).
+  - `Ltx2VideoEncoder` (the checkpoint's BF16 vae.encoder, for image-to-video): 4.9e-6 (`Ltx2_VideoEncode_MatchesComfyUi`).
+  - `Ltx2Lora` + `Ltx2Transformer.AddLora` (PEFT lora_A / lora_B, e.g. the distilled LoRA 384; applied on the fly as strength (x A^T) B^T, streamed per block): on bf16 layers,
+    where ComfyUI's patched weight is float32 W + B A, calls 5.5e-6 and the final latent 5.3e-6 (`Ltx2_Lora_Bf16Subset_MatchesComfyUi`). On fp8 layers ComfyUI re-rounds
+    W + B A into fp8 STOCHASTICALLY (seeded, repeatable), which this exact implementation does not imitate: 7.4e-3 from ComfyUI on block 1 against the LoRA's own 2.2e-2
+    (`Ltx2_Lora_Fp8Subset_DistanceFromComfyUi`, diagnostic; open decision).
+  - `Ltx2AvModel.SampleAsync` also runs batch 1 (cfg 1: the conditioned prompt only, the template's second pass).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.
 - **Fixed: the CUDA "precise activations" GEMM lost accuracy with long sums** (`DiTKernels.PreciseActivations`, MmaGemm.KernelBf16x2Dense: the parity path of FLUX.1,

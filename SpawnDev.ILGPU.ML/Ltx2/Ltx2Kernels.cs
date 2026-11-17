@@ -66,6 +66,26 @@ public sealed class Ltx2Kernels
         _fill((int)((long)T * C), input, registers, o, n, C, R);
     }
 
+    // ───────────────────────── LoRA ─────────────────────────
+
+    private Action<Index1D, FV, FV, float>? _axpy;
+    private static void AxpyImpl(Index1D i, FV x, FV y, float a) => x[i] = float.MultiplyAddEstimate(a, y[i], x[i]);
+    /// <summary>x += a y over count values (a LoRA's scaled update into a Linear's output).</summary>
+    public void AxpyInPlace(FV x, FV y, float a, int count)
+    {
+        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
+        _axpy(count, x, y, a);
+    }
+
+    private Action<Index1D, FV, int>? _act;
+    private static void ActImpl(Index1D i, FV x, int act) => x[i] = Trellis2.DiTKernels.Activate(x[i], act);
+    /// <summary>In place activation (<see cref="Trellis2.DiTKernels.Act"/>): the one a fused Linear would apply, after a LoRA update was added.</summary>
+    public void ActivateInPlace(FV x, int count, int act)
+    {
+        _act ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(ActImpl);
+        _act(count, x, act);
+    }
+
     // ───────────────────────── video VAE decoder ─────────────────────────
 
     // the 3x3x3 neighbour table of the LTX-2 decoder's (non-causal) convolutions: REFLECT padding in space (index -1 -> 1, H -> H - 2), REPLICATE in time, row stride 27

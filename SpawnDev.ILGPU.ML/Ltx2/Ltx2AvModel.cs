@@ -94,18 +94,20 @@ public sealed class Ltx2AvModel : IDisposable
     /// </summary>
     public async Task<float[]> SampleAsync(float[] noise, FV context, IReadOnlyList<float> sigmaSchedule, float cfg, float fps, Action<int, float[]>? onStep = null, CancellationToken ct = default)
     {
-        if (_B != 2) throw new InvalidOperationException("guidance needs a model opened with batch 2 ([uncond, cond])");
+        // batch 1: no guidance (cfg 1: ComfyUI calls the conditioned model only); batch 2: [uncond, cond]
+        if (_B is not (1 or 2)) throw new InvalidOperationException("a model opened with batch 1 (no guidance) or 2 ([uncond, cond])");
+        if (_B == 1 && cfg != 1f) throw new ArgumentException("guidance (cfg != 1) needs a model opened with batch 2");
         int P = PackedLength;
         if (noise.Length != P) throw new ArgumentException($"noise: {P} values");
         var x = (float[])noise.Clone();
         for (int i = 0; i + 1 < sigmaSchedule.Count; i++)
         {
             float s = sigmaSchedule[i], next = sigmaSchedule[i + 1];
-            var batch = new float[2 * P]; Array.Copy(x, 0, batch, 0, P); Array.Copy(x, 0, batch, P, P);
-            var d = await DenoiseAsync(batch, new[] { s, s }, context, fps, ct);
+            var batch = new float[_B * P]; for (int b = 0; b < _B; b++) Array.Copy(x, 0, batch, b * P, P);
+            var d = await DenoiseAsync(batch, _B == 1 ? new[] { s } : new[] { s, s }, context, fps, ct);
             for (int k = 0; k < P; k++)
             {
-                float den = d[k] + (d[P + k] - d[k]) * cfg;                         // ComfyUI's cfg: uncond + (cond - uncond) * cfg
+                float den = _B == 1 ? d[k] : d[k] + (d[P + k] - d[k]) * cfg;       // ComfyUI's cfg: uncond + (cond - uncond) * cfg
                 float slope = (x[k] - den) / s;                                       // its Euler: d = (x - denoised) / sigma; x = x + d (sigma_next - sigma)
                 x[k] = x[k] + slope * (next - s);
             }

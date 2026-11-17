@@ -247,6 +247,121 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The distilled LoRA (ltx-2-19b-distilled-lora-384, strength 1) on the LTX-2 transformer, restricted to the subset SpawnGen measured in ComfyUI (block 0 and every
+    /// top-level layer: bf16 base layers, where ComfyUI's patched weight is float32 W + B A exactly; _DevComms 2026-11-18-0000): the template's two calls at cfg 1 (batch 1,
+    /// the conditioned prompt) and the final latent, against ComfyUI's.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_Lora_Bf16Subset_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        var (line, worst, _) = await Ltx2_LoraSubset(accelerator, "bf16_block0_top", "ltx2_lora", n => !n.StartsWith("transformer_blocks.", StringComparison.Ordinal) || n.StartsWith("transformer_blocks.0.", StringComparison.Ordinal));
+        Console.WriteLine("[Ltx2] LoRA (bf16 subset) vs ComfyUI: " + line);
+        Ur_Expect(worst < 5e-5, line);   // MEASURED 2026-11-17 CUDA: calls 5.5e-6 / 5.5e-7, final latent 5.3e-6 (the LoRA's own effect 7.9e-2)
+        return line;
+    });
+
+    /// <summary>
+    /// The same LoRA on block 1 only (fp8 base layers): ComfyUI re-rounds W + B A into fp8 STOCHASTICALLY (seeded: byte-identical run to run, SpawnGen 11-18), which
+    /// nothing deterministic reproduces; this implementation keeps W + B A exact in float. Reports the distance from ComfyUI's calls / final latent next to the LoRA's own
+    /// effect (ComfyUI with the LoRA vs ComfyUI without it, same input). MEASURED 2026-11-17 CUDA: call 0 7.4e-3, call 1 7.6e-4, final 7.0e-3 against an effect of 2.2e-2:
+    /// ComfyUI's fp8 re-rounding noise (~4% per weight, 3 mantissa bits) is a third of the LoRA's effect from one block. Diagnostic until parity is decided (TJ).
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_Lora_Fp8Subset_DistanceFromComfyUi() => await RunTest(async accelerator =>
+    {
+        var (line, worst, effect) = await Ltx2_LoraSubset(accelerator, "fp8_block1_repeat", "ltx2_lora8", n => n.StartsWith("transformer_blocks.1.", StringComparison.Ordinal));
+        Console.WriteLine("[Ltx2] LoRA (fp8 subset) vs ComfyUI: " + line);
+        Ur_Expect(worst < effect, line);
+        return line;
+    });
+
+    // one LoRA subset against SpawnGen's taps in lora/<folder> (calls 0 / 1 at cfg 1 and the final latent); effect = ComfyUI's call 0 with the LoRA vs its call 0 without (the
+    // base run's conditioned row, same input and prompt)
+    private async Task<(string Line, double Worst, double Effect)> Ltx2_LoraSubset(Accelerator accelerator, string folder, string tap, Func<string, bool> include)
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        var d = Path.Combine(Ltx2_Dumps(), "lora", folder);
+        if (!File.Exists(Path.Combine(dir, "ltx-2-19b-distilled-lora-384.safetensors")) || !Directory.Exists(d)) throw new UnsupportedTestException($"needs the distilled LoRA in {dir} and SpawnGen's taps in {d}");
+        const int P = 128 * 8 + 8 * 9 * 16, L = 1024;
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("LTX2_DIT_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var g) ? g : 5.0;
+        float[] T(string prefix, long n) => F2_Raw(Ltx2_Tap(d, prefix), n);
+        var src = new LocalFolderModelSource(dir);
+        using var model = await Ltx2AvModel.OpenAsync(accelerator, src, "", "ltx-2-19b-dev-fp8.safetensors", 1, 2, 2, 2, 9, L, (long)(residentGb * 1e9));
+        using var lora = await Ltx2Lora.OpenAsync(accelerator, src, "", "ltx-2-19b-distilled-lora-384.safetensors", 1f, 1L << 30, include);
+        model.Transformer.AddLora(lora);
+        using var ctx = accelerator.Allocate1D(T($"{tap}_call_0_c_c_crossattn", (long)L * Ltx2AvModel.ContextWidth));
+        var sigmas = T($"{tap}_call_0_c_transformer_options_sample_sigmas", 3);
+        var report = new List<string>(); double worst = 0;
+        void Cmp(string label, float[] mine, float[] gold) { double e = F2_RelRms(mine, gold); worst = Math.Max(worst, e); report.Add($"{label} {e:E2}"); }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var out0 = T($"{tap}_call_0_output", P);
+        Cmp("call 0", await model.DenoiseAsync(T($"{tap}_call_0_input", P), new[] { sigmas[0] }, ctx.View, 25f), out0);
+        Cmp("call 1", await model.DenoiseAsync(T($"{tap}_call_1_input", P), new[] { sigmas[1] }, ctx.View, 25f), T($"{tap}_call_1_output", P));
+        var x = await model.SampleAsync(T($"{tap}_call_0_input", P), ctx.View, sigmas, 1f, 25f);
+        Cmp("final latent", x, T($"{tap}_out_samples_part0", 128L * 8).Concat(T($"{tap}_out_samples_part1", 8L * 9 * 16)).ToArray());
+        double effect = double.NaN;
+        var baseCall = Path.Combine(Ltx2_Dumps(), "call");
+        if (Directory.Exists(baseCall))
+        {
+            var baseOut = F2_Raw(Ltx2_Tap(baseCall, "ltx2_tcall_0_output"), 2L * P)[P..];              // the base run's row 1: the conditioned prompt, same noise
+            effect = F2_RelRms(out0, baseOut);
+        }
+        string line = $"{string.Join("; ", report)} | the LoRA's own effect on call 0 (ComfyUI with vs without) {effect:E2} | rank {lora.Rank}, {sw.Elapsed.TotalSeconds:F1} s";
+        return (line, worst, effect);
+    }
+
+    /// <summary>
+    /// LTX-2's x2 spatial latent upscaler (ltx-2-spatial-upscaler-x2-1.0, the checkpoint VAE's latent statistics) against ComfyUI's LTXVLatentUpsampler on the template run's
+    /// video latent [128, 2, 2, 2] -> [128, 2, 4, 4] (SpawnGen's taps, _DevComms 2026-11-17-2300). Reports the result with and without AdaIN; the closer one must match.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx2_LatentUpsample_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads model files from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        var up = Path.Combine(Ltx2_Dumps(), "upenc");
+        if (!File.Exists(Path.Combine(dir, "ltx-2-spatial-upscaler-x2-1.0.safetensors")) || !Directory.Exists(up)) throw new UnsupportedTestException($"needs the upscaler in {dir} and SpawnGen's taps in {up}");
+        using var u = await Ltx2LatentUpsampler.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "ltx-2-spatial-upscaler-x2-1.0.safetensors", "ltx-2-19b-dev-fp8.safetensors");
+        var z = F2_Raw(Ltx2_Tap(up, "ltx2_up_in_samples"), 128L * 2 * 2 * 2);
+        var gold = F2_Raw(Ltx2_Tap(up, "ltx2_up_out_samples"), 128L * 2 * 4 * 4);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        double e0 = F2_RelRms(await u.UpsampleAsync(z, 2, 2, 2, 0f), gold);
+        double run = sw.Elapsed.TotalSeconds;
+        double e1 = F2_RelRms(await u.UpsampleAsync(z, 2, 2, 2, 1f), gold);
+        string line = $"[128, 2, 4, 4]: without AdaIN {e0:E2}, with AdaIN {e1:E2} | {run:F2} s";
+        Console.WriteLine("[Ltx2] latent upsample vs ComfyUI: " + line);
+        Ur_Expect(e0 < 3e-5, line);   // MEASURED 2026-11-17 CUDA: ComfyUI's LTXVLatentUpsampler applies NO AdaIN: without 4.8e-6, with 0.44
+        return line;
+    });
+
+    /// <summary>
+    /// LTX-2's video VAE encoder (the checkpoint's BF16 vae.encoder) on a 192 x 256 picture (ComfyUI's IMAGE, NHWC in [0, 1]) against ComfyUI's VAEEncode latent [128, 1, 6, 8]
+    /// (SpawnGen's taps, _DevComms 2026-11-17-2300): the posterior mean, normalised with the checkpoint's latent statistics.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx2_VideoEncode_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a 27 GB checkpoint from disk: a desktop GPU");
+        var path = Path.Combine(Ltx2_Models(), "lightricks", "ltx-2-19b-dev-fp8.safetensors");
+        var up = Path.Combine(Ltx2_Dumps(), "upenc");
+        if (!File.Exists(path) || !Directory.Exists(up)) throw new UnsupportedTestException($"needs {path} and SpawnGen's taps in {up}");
+        const int Hp = 192, Wp = 256;
+        var img = F2_Raw(Ltx2_Tap(up, "venc_input_image"), (long)Hp * Wp * 3);                  // [H, W, 3] in [0, 1]
+        var video = new float[3L * Hp * Wp];
+        for (int c = 0; c < 3; c++) for (int y = 0; y < Hp; y++) for (int x = 0; x < Wp; x++) video[((long)c * Hp + y) * Wp + x] = img[((long)y * Wp + x) * 3 + c] * 2f - 1f;
+        using var enc = await Ltx2VideoEncoder.OpenAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var z = await enc.EncodeAsync(video, 1, Hp, Wp);
+        double run = sw.Elapsed.TotalSeconds;
+        double e = F2_RelRms(z, F2_Raw(Ltx2_Tap(up, "ltx2_venc_samples"), 128L * 6 * 8));
+        string line = $"latent [128, 1, 6, 8] {e:E2} | encode {run:F2} s";
+        Console.WriteLine("[Ltx2] video encode vs ComfyUI: " + line);
+        Ur_Expect(e < 1e-4, line);
+        return line;
+    });
+
+    /// <summary>
     /// LTX-2's video VAE decoder (the checkpoint's BF16 vae.decoder) on ComfyUI's final latent [128, 2, 2, 2], against ComfyUI's VAEDecode frames [9, 64, 64, 3] (images in
     /// [0, 1]: clamp((v + 1) / 2) of the decoder's output).
     /// </summary>

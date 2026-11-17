@@ -56,6 +56,26 @@ public sealed class Ltx2Transformer : IDisposable
     /// <summary>The streamed weights (timers, prefetch, host cache).</summary>
     public StreamedModelWeights Weights => _w;
 
+    private readonly List<Ltx2Lora> _loras = new();
+    private GpuWeights?[] _loraBlock = Array.Empty<GpuWeights?>();     // each LoRA's tensors of the block being run
+    private MemoryBuffer1D<float, Stride1D.Dense>? _loraT, _loraU;
+
+    /// <summary>The LoRAs applied to every call, in order (each: <c>+ strength (x A^T) B^T</c> on the Linears it covers). The caller owns and disposes them.</summary>
+    public IReadOnlyList<Ltx2Lora> Loras => _loras;
+
+    /// <summary>Apply <paramref name="lora"/> from the next call on (ComfyUI's LoraLoaderModelOnly; its <see cref="Ltx2Lora.Strength"/> is read at every call).</summary>
+    public void AddLora(Ltx2Lora lora)
+    {
+        _loras.Add(lora);
+        int rank = _loras.Max(l => l.Rank);
+        long rows = (long)_B * Math.Max(_nv, Math.Max(_na, _L));
+        if (_loraT == null || _loraT.Length < rows * rank) { _loraT?.Dispose(); _loraT = _acc.Allocate1D<float>(rows * rank); }
+        _loraU ??= _acc.Allocate1D<float>((long)_B * Math.Max((long)_nv * Fv, Math.Max((long)_na * Fa, (long)_L * Dv)));
+    }
+
+    /// <summary>Stop applying <paramref name="lora"/> (it stays open; the caller disposes it).</summary>
+    public bool RemoveLora(Ltx2Lora lora) => _loras.Remove(lora);
+
     private Ltx2Transformer(Accelerator accelerator, StreamedModelWeights weights, int batch, int videoTokens, int audioTokens, int contextTokens)
     {
         _acc = accelerator; _w = weights; _B = batch; _nv = videoTokens; _na = audioTokens; _L = contextTokens;
@@ -100,13 +120,35 @@ public sealed class Ltx2Transformer : IDisposable
         catch { w.Dispose(); throw; }
     }
 
-    // nn.Linear over M rows (+ bias when the checkpoint has one); an 8-bit matrix runs exact (its decode without the scale, the input times the scale)
+    // nn.Linear over M rows (+ bias when the checkpoint has one); an 8-bit matrix runs exact (its decode without the scale, the input times the scale).
+    // With LoRAs covering the Linear: + strength (x A^T) B^T for each, then the activation (ComfyUI patches the weight: x (W + strength B A)^T, then the activation)
     private void Lin(GpuWeights w, FV x, string name, FV o, int M, int K, int N, DiTKernels.Act act = DiTKernels.Act.None)
     {
+        var xin = x;
         float s = _w.ActivationScale(w, name + ".weight");
         if (s != 1f) { var xs = _xs.View.SubView(0, (long)M * K); _f.ScaleInto(x, xs, s, M * K); x = xs; }
         string bias = name + ".bias";
-        _k.Linear(x, _w.MatrixExact(w, name + ".weight"), w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, act);
+        bool block = name.StartsWith("transformer_blocks.", StringComparison.Ordinal);
+        bool patched = false;
+        for (int i = 0; i < _loras.Count; i++)
+        {
+            var lw = block ? _loraBlock[i] : _loras[i].Weights.Base;
+            if (lw != null && lw.Has(name + ".lora_A.weight")) { patched = true; break; }
+        }
+        _k.Linear(x, _w.MatrixExact(w, name + ".weight"), w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, patched ? DiTKernels.Act.None : act);
+        if (!patched) return;
+        for (int i = 0; i < _loras.Count; i++)
+        {
+            var lw = block ? _loraBlock[i] : _loras[i].Weights.Base;
+            if (lw == null || !lw.Has(name + ".lora_A.weight")) continue;
+            int r = lw.Shape(name + ".lora_A.weight")[0];
+            if (lw.Shape(name + ".lora_A.weight")[1] != K || lw.Shape(name + ".lora_B.weight")[0] != N) throw new InvalidDataException($"LoRA {name}: A [{string.Join(", ", lw.Shape(name + ".lora_A.weight"))}], B [{string.Join(", ", lw.Shape(name + ".lora_B.weight"))}] for a [{N}, {K}] Linear");
+            var t = _loraT!.View.SubView(0, (long)M * r); var u = _loraU!.View.SubView(0, (long)M * N);
+            _k.Linear(xin, lw.BF16(name + ".lora_A.weight"), null, t, M, K, r);
+            _k.Linear(t, lw.BF16(name + ".lora_B.weight"), null, u, M, r, N);
+            _l.AxpyInPlace(o, u, _loras[i].Strength, M * N);
+        }
+        if (act != DiTKernels.Act.None) _l.ActivateInPlace(o, M * N, (int)act);
     }
 
     /// <summary>The 256-wide sinusoid of each timestep (diffusers Timesteps(256, flip_sin_to_cos = True, shift 0): [cos | sin], frequency exp(-ln(1e4) i / 128)).</summary>
@@ -213,11 +255,19 @@ public sealed class Ltx2Transformer : IDisposable
         Lin(b0, audio, "audio_patchify_proj", _a.View, B * na, InChannels, Da);
         Probe?.Invoke("patchify_video", _v.View, B * nv, Dv); Probe?.Invoke("patchify_audio", _a.View, B * na, Da);
 
+        if (_loraBlock.Length != _loras.Count) _loraBlock = new GpuWeights?[_loras.Count];
+        var loraStreamed = new bool[_loras.Count];
         for (int k = 0; k < Layers; k++)
         {
             var (w, streamed) = await _w.BlockAsync(k, ct);
+            for (int i = 0; i < _loras.Count; i++) (_loraBlock[i], loraStreamed[i]) = await _loras[i].Weights.BlockAsync(k, ct);
             try { Block(w, $"transformer_blocks.{k}."); }
-            finally { if (streamed) { await _acc.SynchronizeAsync(); w.Dispose(); } }
+            finally
+            {
+                if (streamed || loraStreamed.Any(b => b)) await _acc.SynchronizeAsync();
+                if (streamed) w.Dispose();
+                for (int i = 0; i < _loras.Count; i++) { if (loraStreamed[i]) _loraBlock[i]!.Dispose(); _loraBlock[i] = null; }
+            }
             Probe?.Invoke($"block{k}_video", _v.View, B * nv, Dv);
             Probe?.Invoke($"block{k}_audio", _a.View, B * na, Da);
         }
@@ -330,6 +380,7 @@ public sealed class Ltx2Transformer : IDisposable
     {
         foreach (var o in _owned) o.Dispose();
         _owned.Clear();
+        _loraT?.Dispose(); _loraU?.Dispose(); _loraT = _loraU = null;
         _w.Dispose();
     }
 }
