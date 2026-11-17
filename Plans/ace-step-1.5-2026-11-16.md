@@ -71,3 +71,8 @@ implementation is what the template runs; this source is the port's reference, t
   half-width reading is 0.13 off). `AceStepCodeDecoder` (FSQ, project_out, detokenizer: 5-token groups, positions 0..4) vs ComfyUI's detokenizer output 1.2e-5.
   WHOLE codes-on graph (ComfyUI's 50 codes in; hints replace the silence latent as the source latents) vs ComfyUI: latent 3.4e-4, audio 8.7e-4. Stage 5b + 6 done;
   left: the LM's SAMPLING loop (CFG 2 with the left-padded negative, temperature 0.85, top-p 0.9: own RNG, gated by teacher forcing + statistics), tokenizer + templates.
+- 11-17 CUDA: `OobleckEncoder` vs ComfyUI's VAEEncodeAudio (Lore's dumps): posterior 3.0e-6 on decoded audio, 1.6e-6 on silence. ComfyUI SAMPLES the posterior (its latent
+  is 4e-4 .. 6e-4 from its own mean), and its silence table is NOT its own encode of zeros (3.6e-2 apart in ComfyUI itself).
+- SILENCE LATENT, settled: all 7 official ACE-Step 1.5 checkpoints ship the SAME silence_latent.pt (md5 34809d60); ACE-Step's MIT source hard-codes no table; so ComfyUI's
+  4-decimal table is ComfyUI's own data (GPL: never shipped here). `AceStepSilenceLatent` reads the MIT .pt (no torch). Whole codes-off run with it vs ComfyUI: latent
+  1.6e-2, audio 3.4e-2 (vs 1.8e-4 / 3.9e-4 with ComfyUI's table): the 2.2e-3 input difference is amplified ~10x. That is the parity SpawnGen gets on MIT inputs.

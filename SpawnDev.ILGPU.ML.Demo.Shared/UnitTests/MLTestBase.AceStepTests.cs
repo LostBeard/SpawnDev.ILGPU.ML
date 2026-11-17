@@ -38,7 +38,14 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task AceStep_Graph_CodesOn_MatchesComfyUi() => await RunTest(accelerator => Ace_GraphAsync(accelerator, "ace_g1", true, 1e-3, 2.5e-3));       // MEASURED 2026-11-17 CUDA: latent 3.4e-4, audio 8.7e-4
 
-    private async Task<string> Ace_GraphAsync(Accelerator accelerator, string run, bool codesOn, double latentBound, double audioBound)
+    /// <summary>
+    /// The codes-off graph with ACE-Step's MIT silence latent (<see cref="AceStepSilenceLatent"/>, silence_latent.pt; ACE_DIR/hf-acestep15) in place of ComfyUI's own table:
+    /// what the 2.2e-3 between the two does to the final latent and audio. The bound records the measurement (it is SpawnGen's to accept for ComfyUI parity).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task AceStep_Graph_MitSilence_VsComfyUi() => await RunTest(accelerator => Ace_GraphAsync(accelerator, "ace_g0", false, 3e-2, 6e-2, mitSilence: true));   // MEASURED 2026-11-17 CUDA: latent 1.63e-2, audio 3.38e-2 (input 2.16e-3 apart)
+
+    private async Task<string> Ace_GraphAsync(Accelerator accelerator, string run, bool codesOn, double latentBound, double audioBound, bool mitSilence = false)
     {
         var dit = Ace_Require(accelerator, Path.Combine("diffusion_models", "acestep_v1.5_turbo.safetensors"));
         var te = Ace_Require(accelerator, Path.Combine("text_encoders", "qwen_0.6b_ace15.safetensors"));
@@ -57,6 +64,16 @@ public abstract partial class MLTestBase
         var referCm = F2_Raw(Path.Combine(d, $"{run}_call_0_c_refer_audio_f32_1x64x250.raw"), 64L * frames);
         var silence = new float[frames * 64];
         for (int c = 0; c < 64; c++) for (int t = 0; t < frames; t++) silence[t * 64 + c] = referCm[c * frames + t];
+        if (mitSilence)
+        {
+            var pt = Path.Combine(Ace_Dir(), "hf-acestep15", "silence_latent.pt");
+            if (!File.Exists(pt)) throw new UnsupportedTestException($"{pt} not found (ACE-Step/Ace-Step1.5, acestep-v15-turbo/silence_latent.pt)");
+            using var f = File.OpenRead(pt);
+            var (values, total) = AceStepSilenceLatent.ReadPt(f);
+            var mit = AceStepSilenceLatent.TimeMajor(values, total, frames);
+            Console.WriteLine($"[AceStep] MIT silence latent ({total} frames) vs ComfyUI's table over {frames}: {F2_RelRms(mit, silence):E2}");
+            silence = mit;
+        }
         var expectedLatent = F2_Raw(Path.Combine(d, $"{run}_out_samples_f32_1x64x250.raw"), 64L * frames);
         var expectedAudio = F2_Raw(Path.Combine(d, $"{run}_audio_waveform_f32_1x2x480000.raw"), 2L * 480000);
         var src = new LocalFolderModelSource(Path.Combine(Ace_Dir(), "comfy", "split_files"));
@@ -74,7 +91,7 @@ public abstract partial class MLTestBase
         var audio = await gen.DecodeAsync(latent, frames);
         double el = F2_RelRms(latent, expectedLatent), ea = F2_RelRms(audio, expectedAudio);
         string report = $"latent [64, 250] {el:E2}, audio [2, 480000] {ea:E2} (2 steps {tl:F1} s, decode {sw.Elapsed.TotalSeconds - tl:F1} s)";
-        Console.WriteLine($"[AceStep] codes-{(codesOn ? "on" : "off")} graph vs ComfyUI: " + report);
+        Console.WriteLine($"[AceStep] codes-{(codesOn ? "on" : "off")}{(mitSilence ? " (MIT silence latent)" : "")} graph vs ComfyUI: " + report);
         Ur_Expect(el < latentBound && ea < audioBound, report);
         return report;
     }
