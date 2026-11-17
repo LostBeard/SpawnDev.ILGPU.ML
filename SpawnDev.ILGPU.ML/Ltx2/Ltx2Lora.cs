@@ -43,7 +43,9 @@ public sealed class Ltx2Lora : IDisposable
             if (n.StartsWith("transformer_blocks.", StringComparison.Ordinal)) { int dot = n.IndexOf('.', 19); return int.Parse(n.AsSpan(19, dot - 19)); }
             return -1;
         }
-        var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, file, "transformer_blocks.0.attn1.to_q.lora_A.weight", BlockOf, Ltx2Transformer.Layers, residentBytes, null, ct);
+        // the anchor (which finds the file's prefix) is any lora_A tensor: a LoRA may cover only some blocks, or none of block 0
+        var anchor = await AnchorAsync(source, repo, file, ct);
+        var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, file, anchor, BlockOf, Ltx2Transformer.Layers, residentBytes, null, ct);
         try
         {
             foreach (var n in w.HeaderNames)
@@ -52,7 +54,8 @@ public sealed class Ltx2Lora : IDisposable
             int rank = w.Base.Names.Where(n => n.EndsWith(".lora_A.weight", StringComparison.Ordinal)).Select(n => w.Base.Shape(n)[0]).DefaultIfEmpty(0).Max();
             for (int k = 0; k < Ltx2Transformer.Layers; k++)                                  // and the first applied block's (a few top-level layers use smaller ranks)
             {
-                if (!w.HeaderNames.Contains($"transformer_blocks.{k}.attn1.to_q.lora_A.weight") || (include != null && !include($"transformer_blocks.{k}.attn1.to_q.lora_A.weight"))) continue;
+                string bp = $"transformer_blocks.{k}.";
+                if (!w.HeaderNames.Any(n => n.StartsWith(bp, StringComparison.Ordinal) && n.EndsWith(".lora_A.weight", StringComparison.Ordinal) && (include == null || include(n)))) continue;
                 var (bk, streamed) = await w.BlockAsync(k, ct);
                 rank = Math.Max(rank, bk.Names.Where(n => n.EndsWith(".lora_A.weight", StringComparison.Ordinal)).Select(n => bk.Shape(n)[0]).DefaultIfEmpty(0).Max());
                 if (streamed) { await accelerator.SynchronizeAsync(); bk.Dispose(); }
@@ -61,6 +64,28 @@ public sealed class Ltx2Lora : IDisposable
             return new Ltx2Lora(w, strength, rank);
         }
         catch { w.Dispose(); throw; }
+    }
+
+    // a prefix-free lora_A name from the file's header: from "transformer_blocks." on, else what follows "diffusion_model.", else the name itself
+    private static async Task<string> AnchorAsync(IModelSource source, string repo, string file, CancellationToken ct)
+    {
+        await using var s = await source.OpenAsync(repo, file, ct);
+        var lenBytes = new byte[8]; await s.ReadExactlyAsync(lenBytes, ct);
+        long hl = BitConverter.ToInt64(lenBytes);
+        if (hl <= 0 || hl > 100_000_000) throw new InvalidDataException($"'{file}': invalid SafeTensors header size {hl}");
+        var header = new byte[hl]; await s.ReadExactlyAsync(header, ct);
+        using var doc = System.Text.Json.JsonDocument.Parse(header);
+        string? any = null;
+        foreach (var t in doc.RootElement.EnumerateObject())
+        {
+            if (!t.Name.EndsWith(".lora_A.weight", StringComparison.Ordinal)) continue;
+            int b = t.Name.IndexOf("transformer_blocks.", StringComparison.Ordinal);
+            if (b >= 0) return t.Name[b..];
+            any ??= t.Name;
+        }
+        if (any == null) throw new InvalidDataException($"'{file}' holds no lora_A tensor: not a PEFT LoRA");
+        int d = any.IndexOf("diffusion_model.", StringComparison.Ordinal);
+        return d >= 0 ? any[(d + "diffusion_model.".Length)..] : any;
     }
 
     public void Dispose() => Weights.Dispose();

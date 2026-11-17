@@ -48,11 +48,16 @@ public sealed class Ltx2LatentUpsampler : IDisposable
     /// Load the upscaler (<paramref name="upscalerFile"/>) and the latent statistics of the LTX-2 checkpoint's video VAE (<paramref name="checkpointFile"/>:
     /// <c>vae.per_channel_statistics.{mean,std}-of-means</c>; only those two vectors are read).
     /// </summary>
-    public static async Task<Ltx2LatentUpsampler> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string upscalerFile, string checkpointFile, CancellationToken ct = default)
+    public static Task<Ltx2LatentUpsampler> OpenAsync(Accelerator accelerator, IModelSource source, string repo, string upscalerFile, string checkpointFile, CancellationToken ct = default)
+        => OpenAsync(accelerator, source, repo, upscalerFile, source, repo, checkpointFile, ct);
+
+    /// <summary>The same with the upscaler and the checkpoint in different places (ComfyUI keeps latent_upscale_models and checkpoints apart).</summary>
+    public static async Task<Ltx2LatentUpsampler> OpenAsync(Accelerator accelerator, IModelSource upscalerSource, string upscalerRepo, string upscalerFile,
+        IModelSource checkpointSource, string checkpointRepo, string checkpointFile, CancellationToken ct = default)
     {
-        var mean = await ReadBf16VectorAsync(source, repo, checkpointFile, "vae.per_channel_statistics.mean-of-means", ct);
-        var std = await ReadBf16VectorAsync(source, repo, checkpointFile, "vae.per_channel_statistics.std-of-means", ct);
-        var w = await StreamedModelWeights.OpenAsync(accelerator, source, repo, upscalerFile, "initial_conv.weight", _ => -1, 0, 0, null, ct);
+        var mean = await ReadBf16VectorAsync(checkpointSource, checkpointRepo, checkpointFile, "vae.per_channel_statistics.mean-of-means", ct);
+        var std = await ReadBf16VectorAsync(checkpointSource, checkpointRepo, checkpointFile, "vae.per_channel_statistics.std-of-means", ct);
+        var w = await StreamedModelWeights.OpenAsync(accelerator, upscalerSource, upscalerRepo, upscalerFile, "initial_conv.weight", _ => -1, 0, 0, null, ct);
         try
         {
             var b = w.Base;

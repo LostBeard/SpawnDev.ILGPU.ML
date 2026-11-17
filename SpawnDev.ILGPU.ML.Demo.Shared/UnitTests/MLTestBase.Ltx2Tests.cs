@@ -275,6 +275,24 @@ public abstract partial class MLTestBase
         return line;
     });
 
+    /// <summary>
+    /// A LoRA that covers only some blocks (here block 1 alone, cut from the distilled LoRA: test-lora-block1-only.safetensors next to it) opens: the anchor is any lora_A
+    /// tensor, the rank comes from the first covered block, and only that block carries tensors (SpawnGen's request, 11-17).
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task Ltx2_Lora_OpensWithoutBlock0() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a LoRA file from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        if (!File.Exists(Path.Combine(dir, "test-lora-block1-only.safetensors"))) throw new UnsupportedTestException($"needs test-lora-block1-only.safetensors in {dir}");
+        using var lora = await Ltx2Lora.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "test-lora-block1-only.safetensors", 1f, 0);
+        var blocks = lora.Weights.HeaderNames.Select(n => n.Split('.')[1]).Distinct().ToArray();
+        string line = $"rank {lora.Rank}, blocks [{string.Join(", ", blocks)}], {lora.Weights.HeaderNames.Count} tensors";
+        Console.WriteLine("[Ltx2] LoRA without block 0: " + line);
+        Ur_Expect(lora.Rank == 384 && blocks.SequenceEqual(new[] { "1" }) && lora.Weights.HeaderNames.Count == 56, line);
+        return line;
+    });
+
     // one LoRA subset against SpawnGen's taps in lora/<folder> (calls 0 / 1 at cfg 1 and the final latent); effect = ComfyUI's call 0 with the LoRA vs its call 0 without (the
     // base run's conditioned row, same input and prompt)
     private async Task<(string Line, double Worst, double Effect)> Ltx2_LoraSubset(Accelerator accelerator, string folder, string tap, Func<string, bool> include)
