@@ -3,6 +3,11 @@
 TJ 2026-11-17: exact float W + B A stays the default; this is for an OPT-IN ComfyUI-compatible mode. Built from measurements only (never ComfyUI's GPL source).
 State and findings: Plans/ltx-2-19b-2026-11-17.md ("LoRA on fp8 layers", "HANDOFF"). Taps: F:/spawndev-ltx2/comfyui-dumps/lora/{fp8_block1,fp8_block1_repeat,fp8_rounding}.
 
+**SOLVED 2026-11-17 18:36.** The rule (verify_rule.py checks it on every element; 33 to 70 of 16,777,216 differ per tensor and strength, the last float32 bit of B A):
+w = W + s B A (float32); scale = max|w| / 448; y = float16(|w| / scale); frac = y's position between its e4m3 neighbours l, h;
+u_i = (MT19937(seed).word_i AND 0xFF) / 256, row-major, seed = crc32("diffusion_model.<tensor>.weight"); stored = sign(w) (h if frac + u >= 1 else l).
+The harness found seed 1881967891 for attn1.to_q as variant "bf16 low8 offset 0 1-u" three minutes into the row-major pass; keyhash (scratch) matched it to crc32 of the key.
+
 - fp8sr.py: per-element rounding direction vs fractional position (proves textbook stochastic rounding: P(up) = frac).
 - uintervals.py: per-element u intervals from SpawnGen's 10 LoRA strengths (u in [lo, hi) for "round up iff u < frac"); writes u_intervals.npy.
 - real.bin: the first 200 elements' intervals as float64 (lo[200] then hi[200]), the harness input.
