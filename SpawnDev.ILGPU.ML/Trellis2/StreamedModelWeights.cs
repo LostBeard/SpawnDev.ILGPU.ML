@@ -40,6 +40,9 @@ public sealed class StreamedModelWeights : IDisposable
     /// <summary>Wall time the caller waited for streamed blocks (file read not hidden by the prefetch, plus the upload), and how many loads; for measuring the streaming cost.</summary>
     public double StreamSeconds { get; set; }
     public int StreamedLoads { get; set; }
+    /// <summary>Time spent reading block images from the file (on the caller's path or the read-ahead's), and uploading them to the device, summed; for finding the bottleneck.</summary>
+    public double ReadSeconds { get; set; }
+    public double UploadSeconds { get; set; }
     /// <summary>
     /// Read the next streamed block from the file while the caller's GPU work on this one runs (default on): the disk read hides behind the compute and only the upload
     /// remains in the caller's path.
@@ -253,6 +256,7 @@ public sealed class StreamedModelWeights : IDisposable
         BitConverter.TryWriteBytes(image.AsSpan(0, 8), (long)hlen);
         json.CopyTo(image, 8);
         for (int i = 8 + json.Length; i < 8 + hlen; i++) image[i] = (byte)' ';
+        var rd = System.Diagnostics.Stopwatch.StartNew();
         await using var s = await _source.OpenAsync(_repo, _file, ct);
         long pos = 8 + hlen;
         foreach (var t in list)
@@ -261,6 +265,7 @@ public sealed class StreamedModelWeights : IDisposable
             await s.ReadExactlyAsync(image.AsMemory((int)pos, (int)t.DataLength), ct);
             pos += t.DataLength;
         }
+        lock (_hostCache) ReadSeconds += rd.Elapsed.TotalSeconds;
         return image;
     }
 
@@ -280,7 +285,10 @@ public sealed class StreamedModelWeights : IDisposable
             if (_pending is { } stale) _ = stale.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);   // a prefetch the caller skipped: observed, dropped
             _pending = (next, Task.Run(() => ReadBlockImageAsync(next, CancellationToken.None)));
         }
+        var up = System.Diagnostics.Stopwatch.StartNew();
         var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, writable: false)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
+        await _acc.SynchronizeAsync();                                                            // the upload's own time, not a later kernel's
+        UploadSeconds += up.Elapsed.TotalSeconds;
         StreamSeconds += sw.Elapsed.TotalSeconds; StreamedLoads++;
         return (loaded, true);
     }

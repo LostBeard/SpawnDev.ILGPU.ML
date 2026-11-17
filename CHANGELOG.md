@@ -4,6 +4,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **NVFP4 weights** (`Kernels.Nvfp4`: ComfyUI's mixed fp4 checkpoints, e.g. gemma_3_12B_it_fp4_mixed): high nibble first, e2m1 codes, one fp8 e4m3 scale per 16 inputs in cuBLAS's
+  swizzled 128 x 4-tile layout, x weight_scale_2; decoded EXACTLY to bf16 (e2m1 x e4m3 fits), weight_scale_2 moved to the input. Against ComfyUI's own dequantisation of a
+  Gemma 3 layer (SpawnGen's dump): weights bit-exact (nvfp4 and fp8), real calls 6.8e-6 / 4.0e-6 (`Nvfp4_GemmaLayer_MatchesComfyUi`).
 - **Streaming weights that do not fit the card** (`StreamedModelWeights`): `Prefetch` (on by default) reads the next streamed block while the GPU runs this one; `HostCacheBytes`
   (default 0) keeps streamed blocks' file images in host RAM between calls; `StreamSeconds` reports the time a caller waits on streaming. Qwen-Image Edit 2511 (14.6 GB streamed
   per call from a USB 3.0 drive): 52.1 s -> 44.8 s with read-ahead, 31.7 s with a warm 5.8 GB RAM tier, results identical (`QwenEdit2511_Streaming_Benchmark`).

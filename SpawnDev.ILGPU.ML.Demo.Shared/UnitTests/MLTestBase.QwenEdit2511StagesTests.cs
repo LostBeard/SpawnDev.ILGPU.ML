@@ -30,10 +30,10 @@ public abstract partial class MLTestBase
         {
             tr.Weights.Prefetch = prefetch; tr.Weights.HostCacheBytes = (long)(cache * 1e9);
             var report = new List<string>();
-            double s0 = tr.Weights.StreamSeconds; var sw = System.Diagnostics.Stopwatch.StartNew();
+            double s0 = tr.Weights.StreamSeconds, r0 = tr.Weights.ReadSeconds, u0 = tr.Weights.UploadSeconds; var sw = System.Diagnostics.Stopwatch.StartNew();
             double e = await Qe_CallAsync(accelerator, tr, k, d, "q11_1", 0, 212, 1, report);
             worst = Math.Max(worst, e);
-            lines.Add($"{label}: {sw.Elapsed.TotalSeconds:F1} s (waited on streaming {tr.Weights.StreamSeconds - s0:F1} s), host cache {tr.Weights.HostCacheUsed / 1e9:F1} GB, vs ComfyUI {e:E2}");
+            lines.Add($"{label}: {sw.Elapsed.TotalSeconds:F1} s (waited on streaming {tr.Weights.StreamSeconds - s0:F1} s; disk reads {tr.Weights.ReadSeconds - r0:F1} s, uploads {tr.Weights.UploadSeconds - u0:F1} s), host cache {tr.Weights.HostCacheUsed / 1e9:F1} GB, vs ComfyUI {e:E2}");
         }
         foreach (var line in lines) Console.WriteLine("[QwenEdit] streaming benchmark: " + line);
         Ur_Expect(worst < 1.5e-3, string.Join("; ", lines));                                  // the 2511 gate's bound: streaming changes the timing, never the result
