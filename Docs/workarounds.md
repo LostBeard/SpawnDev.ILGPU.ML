@@ -28,7 +28,18 @@ tracking issue, and carries a test that reports whether it is still needed.
 - The same code built with the hot-path compiler off (`<BlazorWebAssemblyJiterpreter>false</BlazorWebAssemblyJiterpreter>`) is right for every value.
 - The same code ahead-of-time compiled (`<RunAOTCompilation>true</RunAOTCompilation>`) is right for every value.
 
-So it is the code the runtime's hot-path compiler (the jiterpreter) generates for that overload. We have not read the runtime's source to say where.
+- The default build is affected the same way on .NET 9.0.22 and .NET 8.0.33, and with the runtime as shipped (no relinking by the `wasm-tools` workload).
+  The same cases as a desktop console program are right.
+
+So it is the code the runtime's hot-path compiler (the jiterpreter) generates for that overload. In the runtime's source
+(`src/mono/mono/mini/interp/interp-simd-intrins.def`) the interpreter's intrinsic for this overload lists WebAssembly opcode 102 (0x66,
+`i8x16.narrow_i16x8_u`, the saturating narrow) for the hot-path compiler, while the interpreter's own C function for it truncates.
+
+**The standalone app:** [LostBeard/dotnet-wasm-narrow-test](https://github.com/LostBeard/dotnet-wasm-narrow-test), with a page that runs it in your browser:
+<https://lostbeard.github.io/dotnet-wasm-narrow-test/>.
+
+**Upstream:** already reported to .NET by another project as [dotnet/runtime#136688](https://github.com/dotnet/runtime/issues/136688) (2026-10-30, open on
+2026-11-18). We found it independently and found that report afterwards.
 
 **Where it bit us.** `Ltx2Fp8Rounding.Low8`: the vectorized MT19937 byte stream of the opt-in ComfyUI-compatible LoRA mode
 (`Ltx2Transformer.ComfyCompatibleFp8Lora`). In the browser it returned `FF` for nearly every draw. The test that compares it with the plain generator
@@ -46,5 +57,5 @@ Two AND operations per 16 draws. The vectorized stream equals the plain one word
 **If you write SIMD code that runs in Blazor WebAssembly:** mask to the narrow type's range before `Vector128.Narrow`, and test the result against a scalar
 form in a loop that runs hundreds of thousands of times. The issue has a snippet you can paste into an app to check your own runtime.
 
-**Still to do:** publish the standalone repro (it exists and reproduces; a public repository with a page anyone can run is next) and report to dotnet/runtime
-(both will be linked from the issue), then remove the mask once the canary reads `equals the plain mix` in the browser.
+**Still to do:** remove the mask once [dotnet/runtime#136688](https://github.com/dotnet/runtime/issues/136688) is fixed in a runtime we ship on and the canary
+reads `equals the plain mix` in the browser.
