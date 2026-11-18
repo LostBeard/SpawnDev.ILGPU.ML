@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.22 - 2026-11-18 (nuget.org) - exact tensor-core attention by default; LTX-2 speed; fp8 LoRA compat weights match ComfyUI; SpawnDev.ILGPU 5.4.36
 
 - **`Ltx2Transformer.ComfyPatchedFp8WeightsAsync`**: the ComfyUI-compatible fp8 LoRA mode's patched 8-bit weights of one block, read back as F8_E4M3 bytes
   plus scale (the same device code the forward pass runs), and `Ltx2Fp8Rounding.ToE4M3`. Test `Ltx2_Fp8CompatWeights_MatchComfyUiDump` compares them with the
@@ -16,7 +16,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   on it). MEASURED 2026-11-18, RTX 4070:
   - Speed: LTX-2's video self-attention (6144 x 6144 tokens, 32 heads x 128) 140.4 -> 46.5 ms; the GPU work of a precise two-row call at 768 x 512 x 121
     34.2 -> 23.7 s. (The bf16 kernel of `PreciseActivations = false` takes 18.5 ms.)
-  - One attention against a float64 reference (relative RMS): fp32 kernel 3e-7, this kernel 4e-6 to 9e-6, bf16 kernel 2e-3 to 5e-3. It is NOT fp32-exact,
+  - One attention against a float64 reference (relative RMS): fp32 kernel 3e-7, this kernel 4e-6 to 9e-6, bf16 kernel 2e-3 to 5e-3. It is NOT fp32-exact.
     Whether it should be the default was settled by a test fixed before it ran: LTX-2 distilled clips (768 x 512 x 121) with seeds 42, 7 and 1234, mean
     |frame difference| (0..255) from the CUDA clip with the fp32 kernel: this kernel 0.0230 / 0.0075 / 0.0213 (mean 0.0173), the same exact path on OpenCL
     0.0205 / 0.0186 / 0.0221 (mean 0.0204). It moves a clip less than changing backend does, so it is the default; `PreciseActivations = false` for scale: 3.09.
