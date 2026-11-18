@@ -761,6 +761,27 @@ public abstract partial class MLTestBase
                 }
                 finally { model.Transformer.PreciseActivations = true; }
             }
+            // LTX2_REAL_PROFILE=1: one more call per mode with the block stages timed (a device synchronize after each stage: the call is slower than a plain one;
+            // the stage times are GPU time, the reads still run behind them)
+            if (Environment.GetEnvironmentVariable("LTX2_REAL_PROFILE") == "1")
+            {
+                foreach (bool precise in Environment.GetEnvironmentVariable("LTX2_REAL_FAST") == "1" ? new[] { true, false } : new[] { true })
+                {
+                    model.Transformer.PreciseActivations = precise;
+                    var stages = new Dictionary<string, double>();
+                    model.Transformer.StageSeconds = stages;
+                    try
+                    {
+                        sw.Restart();
+                        await model.DenoiseAsync(packed, new[] { 1f, 1f }, ctx.View, 25f);
+                        await accelerator.SynchronizeAsync();
+                        double t = sw.Elapsed.TotalSeconds, sum = stages.Values.Sum();
+                        Console.WriteLine($"[Benchmark] Ltx2 real size profile, {(precise ? "precise" : "PreciseActivations off")}: call {t:F1} s, stages {sum:F1} s: "
+                            + string.Join("; ", stages.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key} {kv.Value:F2} s ({100 * kv.Value / sum:F0}%)")));
+                    }
+                    finally { model.Transformer.StageSeconds = null; model.Transformer.PreciseActivations = true; }
+                }
+            }
         }
         var (rmsV, badV) = Stat(den.AsSpan(P, V)); var (rmsA, badA) = Stat(den.AsSpan(P + V, P - V));           // the conditioned row
         string line = $"{width}x{height}x{frames}: {nv} video + {Ta} audio tokens | open {open:F1} s, one call (batch 2) {callS:F1} s ({resident} of 48 blocks resident, read {read:F1} s, upload {upload:F1} s); denoised rms video {rmsV:F3} / audio {rmsA:F3}";

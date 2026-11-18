@@ -506,9 +506,12 @@ public sealed class Ltx2Transformer : IDisposable
         (FV Cos, FV Sin)? ropeQ, (FV Cos, FV Sin)? ropeK, int? biasSplit = null)
     {
         int B = _B, C = H * D;
+        string tag = StageSeconds != null ? p.Split('.')[^2] : "";
+        Stage("norm / gate");
         Lin(w, xq, p + "to_q", _q.View, B * Nq, dq, C);
         Lin(w, xkv, p + "to_k", _part.View, B * Nk, dkv, C); _f.CopyCols(_part.View, _kv.View, B * Nk, C, C, 2 * C, 0);
         Lin(w, xkv, p + "to_v", _part.View, B * Nk, dkv, C); _f.CopyCols(_part.View, _kv.View, B * Nk, C, C, 2 * C, C);
+        Stage(tag + ": q / k / v projections");
         _u.RmsNormHeads(_q.View, w.BF16(p + "q_norm.weight"), B * Nq, C, 0, 1, C, QkEps);               // over the whole inner dim, with weights
         _u.RmsNormHeads(_kv.View, w.BF16(p + "k_norm.weight"), B * Nk, 2 * C, 0, 1, C, QkEps);
         for (int b = 0; b < B; b++)
@@ -519,12 +522,30 @@ public sealed class Ltx2Transformer : IDisposable
             if (biasSplit is { } split) _k.BiasedAttention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, H, D, split, _tokBias.View);
             else _k.Attention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, Nk, H, D);
         }
+        Stage(tag + ": norms, RoPE, attention");
         Lin(w, _o.View, p + "to_out.0", o, B * Nq, C, dout);
+        Stage(tag + ": out projection");
+    }
+
+    /// <summary>
+    /// Set to a dictionary to time the stages of every block (seconds per stage, summed over the blocks and calls): the device is synchronized after each stage,
+    /// so this is for desktop backends and a profiled call is slower than a plain one. Null (default): no timing, no synchronizes.
+    /// </summary>
+    public Dictionary<string, double>? StageSeconds { get; set; }
+    private long _stageT0;
+    private void Stage(string name)
+    {
+        if (StageSeconds is not { } d) return;
+        _acc.Synchronize();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        d[name] = d.GetValueOrDefault(name) + (now - _stageT0) / (double)System.Diagnostics.Stopwatch.Frequency;
+        _stageT0 = now;
     }
 
     private void Block(GpuWeights w, string p)
     {
         int B = _B, nv = _nv, na = _na, L = _L;
+        if (StageSeconds != null) { _acc.Synchronize(); _stageT0 = System.Diagnostics.Stopwatch.GetTimestamp(); }
         int G = _vg, rv = B * G;
         Mod(w.F32(p + "scale_shift_table"), _tV.View, _modV.View, 6, Dv, 0, rv);
         Mod(w.F32(p + "audio_scale_shift_table"), _tA.View, _modA.View, 6, Da);
@@ -534,6 +555,7 @@ public sealed class Ltx2Transformer : IDisposable
         Mod(w.F32(p + "scale_shift_table_a2v_ca_video"), _tGateV.View, _gateV.View, 1, Dv, 4);          // per item: the gate has no frame groups (see CallAsync)
         Mod(w.F32(p + "scale_shift_table_a2v_ca_audio"), _tGateA.View, _gateA.View, 1, Da, 4);
 
+        Stage("modulation tables");
         // 1. self-attention (video, then audio): adaLN 0 shift, 1 scale, 2 gate
         for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _modV.View, r * 6 * Dv, r * 6 * Dv + Dv, _rpg, Dv, Eps); }
         Attn(w, p + "attn1.", _vn.View, nv, Dv, _vn.View, nv, Dv, Hv, HeadV, Dv, _part.View, (_ropeV.View, _ropeVs.View), (_ropeV.View, _ropeVs.View), _guideSplit);
@@ -542,6 +564,7 @@ public sealed class Ltx2Transformer : IDisposable
         Attn(w, p + "audio_attn1.", _an.View, na, Da, _an.View, na, Da, Ha, HeadA, Da, _part.View, (_ropeA.View, _ropeAs.View), (_ropeA.View, _ropeAs.View));
         for (int b = 0; b < B; b++) _k.GateResidual(Rows(_a, b, na, Da), _part.View.SubView((long)b * na * Da, (long)na * Da), _modA.View, b * 6 * Da + 2 * Da, na * Da, Da);
 
+        Stage("norm / gate");
         // 2. text cross-attention: plain RMS norm, no RoPE, ungated
         _l.RmsNormPlain(_v.View, _vn.View, B * nv, Dv, Eps);
         Attn(w, p + "attn2.", _vn.View, nv, Dv, _vctx.View, L, Dv, Hv, HeadV, Dv, _part.View, null, null);
@@ -550,6 +573,7 @@ public sealed class Ltx2Transformer : IDisposable
         Attn(w, p + "audio_attn2.", _an.View, na, Da, _actx.View, L, Da, Ha, HeadA, Da, _part.View, null, null);
         _k.GateResidual(_a.View, _part.View, _part.View, -1, B * na * Da, Da);
 
+        Stage("norm / gate");
         // 3. audio <-> video. a2v first; then v2a reads the video stream AFTER a2v's update (MEASURED 2026-11-17 against ComfyUI's block 0, float64 reference: the
         //    pre-update video, as diffusers' code reads it, leaves the audio stream 2.4e-4 off; the updated one 1.1e-7).
         //    video mods: 0 a2v scale, 1 a2v shift, 2 v2a scale, 3 v2a shift; audio the same
@@ -570,14 +594,20 @@ public sealed class Ltx2Transformer : IDisposable
         Attn(w, p + "video_to_audio_attn.", _an.View, na, Da, _vn.View, nv, Dv, Ha, HeadA, Da, _part.View, (_ropeA.View, _ropeAs.View), (_ropeVx.View, _ropeVxs.View));
         for (int b = 0; b < B; b++) _k.GateResidual(Rows(_a, b, na, Da), _part.View.SubView((long)b * na * Da, (long)na * Da), _gateA.View, b * Da, na * Da, Da);
 
+        Stage("norm / gate");
         // 4. feed-forwards: adaLN 3 shift, 4 scale, 5 gate
         for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _x.RmsNormModulate(VRows(_v, b, g, Dv), VRows(_vn, b, g, Dv), _modV.View, r * 6 * Dv + 3 * Dv, r * 6 * Dv + 4 * Dv, _rpg, Dv, Eps); }
+        Stage("norm / gate");
         Lin(w, _vn.View, p + "ff.net.0.proj", _hid.View, B * nv, Dv, Fv, DiTKernels.Act.GeluTanh);
+        Stage("video ff.0 (4096 -> 16384)");
         Lin(w, _hid.View, p + "ff.net.2", _part.View, B * nv, Fv, Dv);
+        Stage("video ff.2 (16384 -> 4096)");
         for (int b = 0; b < B; b++) for (int g = 0; g < G; g++) { int r = b * G + g; _k.GateResidual(VRows(_v, b, g, Dv), VPart(b, g), _modV.View, r * 6 * Dv + 5 * Dv, _rpg * Dv, Dv); }
         for (int b = 0; b < B; b++) _x.RmsNormModulate(Rows(_a, b, na, Da), Rows(_an, b, na, Da), _modA.View, b * 6 * Da + 3 * Da, b * 6 * Da + 4 * Da, na, Da, Eps);
+        Stage("norm / gate");
         Lin(w, _an.View, p + "audio_ff.net.0.proj", _hid.View, B * na, Da, Fa, DiTKernels.Act.GeluTanh);
         Lin(w, _hid.View, p + "audio_ff.net.2", _part.View, B * na, Fa, Da);
+        Stage("audio ff");
         for (int b = 0; b < B; b++) _k.GateResidual(Rows(_a, b, na, Da), _part.View.SubView((long)b * na * Da, (long)na * Da), _modA.View, b * 6 * Da + 5 * Da, na * Da, Da);
     }
 
