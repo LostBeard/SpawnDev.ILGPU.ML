@@ -371,8 +371,11 @@ public abstract partial class MLTestBase
         {
             using var dump = SafeTensors.SafeTensorsFileReader.Open(file);
             string Meta(string key, string dflt) => dump.Metadata.TryGetValue(key, out var v) ? v : dflt;
-            float strength = float.Parse(Meta("strength", "1"), System.Globalization.CultureInfo.InvariantCulture);
-            string loraFile = Path.GetFileName(Meta("lora", "ltx-2-19b-distilled-lora-384.safetensors"));
+            float strength = float.Parse(Meta("strength", Meta("strength_model", "1")), System.Globalization.CultureInfo.InvariantCulture);
+            // "lora": a file name, possibly a per-block cut of one ("...-block42.safetensors (the tensors of ... under ...)"): the cut holds that file's tensors of the
+            // block, which the include filter below selects from the whole file
+            var lm = System.Text.RegularExpressions.Regex.Match(Meta("lora", "ltx-2-19b-distilled-lora-384.safetensors"), @"^\s*(.*?)(-block\d+)?\.safetensors");
+            string loraFile = Path.GetFileName(lm.Success ? lm.Groups[1].Value + ".safetensors" : "ltx-2-19b-distilled-lora-384.safetensors");
             bool partial = Meta("partial", "0") == "1";
             var weights = dump.Tensors.Where(t => t.DType == "F8_E4M3" && t.Name.StartsWith(pre, StringComparison.Ordinal) && t.Name.EndsWith(wtail, StringComparison.Ordinal)).ToDictionary(t => t.Name[pre.Length..^wtail.Length]);
             var blocks = weights.Keys.Select(n => n.StartsWith("transformer_blocks.", StringComparison.Ordinal) ? int.Parse(n.Split('.')[1]) : -1).Distinct().ToArray();
