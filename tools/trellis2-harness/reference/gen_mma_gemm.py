@@ -1,4 +1,4 @@
-"""Generates SpawnDev.ILGPU.ML/Trellis2/MmaGemm.Generated.cs.
+"""Generates SpawnDev.ILGPU.ML.Kernels/Trellis2/MmaGemm.Generated.cs.
 
 EDIT THIS FILE, NOT THE OUTPUT (a fix made only in the generated .cs is lost the next time it is regenerated).
 

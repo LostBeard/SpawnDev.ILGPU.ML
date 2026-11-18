@@ -1,7 +1,7 @@
-"""Generates SpawnDev.ILGPU.ML/Kernels/MmaFlashPrefill.Generated.cs.
+"""Generates SpawnDev.ILGPU.ML.Kernels/Kernels/MmaFlashPrefill.Generated.cs.
 
 EDIT THIS FILE, NOT THE OUTPUT:
-    py -3.13 tools/llm-bench/gen_mma_flash_prefill.py SpawnDev.ILGPU.ML/Kernels/MmaFlashPrefill.Generated.cs
+    py -3.13 tools/llm-bench/gen_mma_flash_prefill.py SpawnDev.ILGPU.ML.Kernels/Kernels/MmaFlashPrefill.Generated.cs
 
 Causal flash attention for a GGUF prefill on f16 tensor cores (CUDA sm_80+), head dim 128, grouped-query (2026-11-02). Built from
 tools/trellis2-harness/reference/gen_mma_attention.py (Trellis2's non-causal bf16 kernel, FlashAttention-2 mapping); what differs:

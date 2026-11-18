@@ -181,7 +181,7 @@ public sealed class Ltx2Kernels
     }
 
     private Action<Index1D, FV, int>? _act;
-    private static void ActImpl(Index1D i, FV x, int act) => x[i] = Trellis2.DiTKernels.Activate(x[i], act);
+    private static void ActImpl(Index1D i, FV x, int act) => x[i] = Trellis2.KernelMath.Activate(x[i], act);
     /// <summary>In place activation (<see cref="Trellis2.DiTKernels.Act"/>): the one a fused Linear would apply, after a LoRA update was added.</summary>
     public void ActivateInPlace(FV x, int count, int act)
     {

@@ -1,0 +1,12 @@
+<Project>
+	<!--
+	  Browser AOT: leave SpawnDev.ILGPU.ML.Kernels (the generated GPU kernels) to the interpreter. In a browser those methods never run as .NET code:
+	  SpawnDev.ILGPU compiles kernels from their IL (kept: an interpreted assembly is never stripped). AOT-compiling them cost most of the build and most of
+	  the library's machine code (MEASURED 2026-11-18 on the ML demo: 83% of the 58-minute clang step of SpawnDev.ILGPU.ML.dll, 74% of its code).
+	  An app that runs a CPUAccelerator in the browser and wants those kernels compiled sets SpawnDevMLAotKernels=true.
+	  _AOT_InternalForceInterpretAssemblies is the Wasm SDK's per-assembly opt-out (WasmApp.Common.targets, "Skip known-huge assemblies"; verified on 10.0.14).
+	-->
+	<ItemGroup Condition="'$(SpawnDevMLAotKernels)' != 'true'">
+		<_AOT_InternalForceInterpretAssemblies Include="SpawnDev.ILGPU.ML.Kernels.dll" />
+	</ItemGroup>
+</Project>

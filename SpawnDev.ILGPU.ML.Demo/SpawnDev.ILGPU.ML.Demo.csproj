@@ -72,4 +72,6 @@
 		<TrimmerRootAssembly Include="SpawnDev.ILGPU.ML.Demo" />
 		<TrimmerRootAssembly Include="SpawnDev.ILGPU.ML.Demo.Shared" />
 	</ItemGroup>
+	<!-- a ProjectReference gets no buildTransitive: import what the package gives its consumers (the kernel assembly left to the interpreter under AOT) -->
+	<Import Project="..\SpawnDev.ILGPU.ML\buildTransitive\SpawnDev.ILGPU.ML.targets" />
 </Project>

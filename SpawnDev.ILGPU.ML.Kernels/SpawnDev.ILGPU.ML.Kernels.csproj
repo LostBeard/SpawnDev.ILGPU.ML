@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!--
+	  SpawnDev.ILGPU.ML's GENERATED GPU kernels (the tiled / tensor-core GEMMs and attentions: *.Generated.cs, written by the gen_*.py scripts under tools/).
+	  Their own assembly so a browser AOT build can leave them to the interpreter (buildTransitive/SpawnDev.ILGPU.ML.targets lists it in
+	  _AOT_InternalForceInterpretAssemblies). In a browser these methods never run as .NET code: SpawnDev.ILGPU compiles kernels from their IL to WGSL / GLSL /
+	  its own wasm. Only a CPUAccelerator created in a browser would execute them, interpreted. MEASURED 2026-11-18 (Bones, ML demo AOT publish, clang -O2 on
+	  SpawnDev.ILGPU.ML.dll.bc on one core): kernel methods were 83% of a 58-minute compile (TiledAttention alone 36 minutes: functions of 15K-40K basic blocks
+	  through the wasm backend's register-stackify and irreducible-control-flow passes) and 74% of the library's machine code (33.4 of 45.0 MB).
+
+	  Not a package of its own: SpawnDev.ILGPU.ML ProjectReferences it with PrivateAssets="all" and packs the DLL and its XML into its own lib folder, so
+	  consumers see one package. The classes keep their namespaces; they are internal, visible to SpawnDev.ILGPU.ML (and the test host) only.
+	  A kernel class moves here only WHOLE: no host code, nothing that references SpawnDev.ILGPU.ML (this assembly sits below it).
+	-->
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<EmbedAllSources>true</EmbedAllSources>
+		<DebugType>Embedded</DebugType>
+		<IsPackable>false</IsPackable>
+		<IsTrimmable>true</IsTrimmable>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
+		<!-- generated code: the doc-comment rule does not apply to its many internal members -->
+		<NoWarn>$(NoWarn);CS1591</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.36" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<InternalsVisibleTo Include="SpawnDev.ILGPU.ML" />
+		<InternalsVisibleTo Include="SpawnDev.ILGPU.ML.Demo.Shared" />
+	</ItemGroup>
+
+</Project>

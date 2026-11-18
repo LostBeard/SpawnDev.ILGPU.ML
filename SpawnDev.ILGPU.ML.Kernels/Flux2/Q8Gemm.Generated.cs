@@ -318,59 +318,59 @@ internal static class Q8Gemm
         int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
         if (gr0 + 0 < rows)
         { long ob = (long)(m0 + gr0 + 0) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
         }
         if (gr0 + 1 < rows)
         { long ob = (long)(m0 + gr0 + 1) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
         }
         if (gr0 + 2 < rows)
         { long ob = (long)(m0 + gr0 + 2) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
         }
         if (gr0 + 3 < rows)
         { long ob = (long)(m0 + gr0 + 3) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
         }
         if (gr0 + 4 < rows)
         { long ob = (long)(m0 + gr0 + 4) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
         }
         if (gr0 + 5 < rows)
         { long ob = (long)(m0 + gr0 + 5) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
         }
         if (gr0 + 6 < rows)
         { long ob = (long)(m0 + gr0 + 6) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
         }
         if (gr0 + 7 < rows)
         { long ob = (long)(m0 + gr0 + 7) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
         }
     }
 
@@ -572,59 +572,59 @@ internal static class Q8Gemm
         int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
         if (gr0 + 0 < rows)
         { long ob = (long)(m0 + gr0 + 0) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
         }
         if (gr0 + 1 < rows)
         { long ob = (long)(m0 + gr0 + 1) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
         }
         if (gr0 + 2 < rows)
         { long ob = (long)(m0 + gr0 + 2) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
         }
         if (gr0 + 3 < rows)
         { long ob = (long)(m0 + gr0 + 3) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
         }
         if (gr0 + 4 < rows)
         { long ob = (long)(m0 + gr0 + 4) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
         }
         if (gr0 + 5 < rows)
         { long ob = (long)(m0 + gr0 + 5) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
         }
         if (gr0 + 6 < rows)
         { long ob = (long)(m0 + gr0 + 6) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
         }
         if (gr0 + 7 < rows)
         { long ob = (long)(m0 + gr0 + 7) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
         }
     }
 
@@ -880,59 +880,59 @@ internal static class Q8Gemm
         int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
         if (gr0 + 0 < rows)
         { long ob = (long)(m0 + gr0 + 0) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
         }
         if (gr0 + 1 < rows)
         { long ob = (long)(m0 + gr0 + 1) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
         }
         if (gr0 + 2 < rows)
         { long ob = (long)(m0 + gr0 + 2) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
         }
         if (gr0 + 3 < rows)
         { long ob = (long)(m0 + gr0 + 3) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
         }
         if (gr0 + 4 < rows)
         { long ob = (long)(m0 + gr0 + 4) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
         }
         if (gr0 + 5 < rows)
         { long ob = (long)(m0 + gr0 + 5) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
         }
         if (gr0 + 6 < rows)
         { long ob = (long)(m0 + gr0 + 6) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
         }
         if (gr0 + 7 < rows)
         { long ob = (long)(m0 + gr0 + 7) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
         }
     }
 
@@ -1373,59 +1373,59 @@ internal static class Q8Gemm
         int gr0 = tm * 128 + r0, gc0 = tn * 64 + c0;
         if (gr0 + 0 < rows)
         { long ob = (long)(m0 + gr0 + 0) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f0_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f0_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f0_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f0_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f0_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f0_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f0_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f0_3, act);
         }
         if (gr0 + 1 < rows)
         { long ob = (long)(m0 + gr0 + 1) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f1_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f1_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f1_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f1_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f1_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f1_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f1_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f1_3, act);
         }
         if (gr0 + 2 < rows)
         { long ob = (long)(m0 + gr0 + 2) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f2_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f2_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f2_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f2_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f2_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f2_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f2_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f2_3, act);
         }
         if (gr0 + 3 < rows)
         { long ob = (long)(m0 + gr0 + 3) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f3_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f3_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f3_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f3_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f3_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f3_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f3_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f3_3, act);
         }
         if (gr0 + 4 < rows)
         { long ob = (long)(m0 + gr0 + 4) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f4_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f4_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f4_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f4_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f4_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f4_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f4_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f4_3, act);
         }
         if (gr0 + 5 < rows)
         { long ob = (long)(m0 + gr0 + 5) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f5_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f5_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f5_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f5_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f5_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f5_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f5_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f5_3, act);
         }
         if (gr0 + 6 < rows)
         { long ob = (long)(m0 + gr0 + 6) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f6_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f6_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f6_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f6_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f6_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f6_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f6_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f6_3, act);
         }
         if (gr0 + 7 < rows)
         { long ob = (long)(m0 + gr0 + 7) * N;
-          if (gc0 + 0 < N) o[ob + gc0 + 0] = DiTKernels.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
-          if (gc0 + 1 < N) o[ob + gc0 + 1] = DiTKernels.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
-          if (gc0 + 2 < N) o[ob + gc0 + 2] = DiTKernels.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
-          if (gc0 + 3 < N) o[ob + gc0 + 3] = DiTKernels.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
+          if (gc0 + 0 < N) o[ob + gc0 + 0] = KernelMath.Activate(hasBias != 0 ? f7_0 + PrecisionConvert.ConvertToSingle(bias[gc0 + 0]) : f7_0, act);
+          if (gc0 + 1 < N) o[ob + gc0 + 1] = KernelMath.Activate(hasBias != 0 ? f7_1 + PrecisionConvert.ConvertToSingle(bias[gc0 + 1]) : f7_1, act);
+          if (gc0 + 2 < N) o[ob + gc0 + 2] = KernelMath.Activate(hasBias != 0 ? f7_2 + PrecisionConvert.ConvertToSingle(bias[gc0 + 2]) : f7_2, act);
+          if (gc0 + 3 < N) o[ob + gc0 + 3] = KernelMath.Activate(hasBias != 0 ? f7_3 + PrecisionConvert.ConvertToSingle(bias[gc0 + 3]) : f7_3, act);
         }
     }
 }

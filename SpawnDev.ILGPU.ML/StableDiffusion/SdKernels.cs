@@ -130,7 +130,7 @@ public sealed class SdKernels
     private static void GegluImpl(Index1D i, FV h, FV o, int F)
     {
         long r = i / F, f = i % F;
-        o[i] = h[r * 2 * F + f] * DiTKernels.Activate(h[r * 2 * F + F + f], 3);
+        o[i] = h[r * 2 * F + f] * KernelMath.Activate(h[r * 2 * F + F + f], 3);
     }
     public void Geglu(FV h, FV o, int rows, int F)
     {
@@ -813,7 +813,7 @@ public sealed class SdKernels
 
     // exact GELU in place (OpenCLIP)
     private Action<Index1D, FV>? _gelu;
-    private static void GeluImpl(Index1D i, FV x) => x[i] = DiTKernels.Activate(x[i], 3);
+    private static void GeluImpl(Index1D i, FV x) => x[i] = KernelMath.Activate(x[i], 3);
     public void GeluInPlace(FV x, long count)
     {
         _gelu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV>(GeluImpl);

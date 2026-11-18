@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **The generated GPU kernels are in their own assembly, `SpawnDev.ILGPU.ML.Kernels`, shipped inside this package** (lib/net10.0, next to
+  SpawnDev.ILGPU.ML.dll; no new package dependency). A browser AOT build now leaves them to the interpreter: the package's
+  `buildTransitive/SpawnDev.ILGPU.ML.targets` lists the assembly in the Wasm SDK's `_AOT_InternalForceInterpretAssemblies`. In a browser these
+  methods never run as .NET code (SpawnDev.ILGPU compiles kernels from their IL, which an interpreted assembly keeps); AOT-compiling them was most of
+  the cost. MEASURED 2026-11-18 (Bones, the demo's AOT publish, clang -O2 on SpawnDev.ILGPU.ML.dll.bc): kernel methods were 83% of a 58-minute
+  compile (TiledAttention alone 36 minutes) and 74% of the library's machine code (33.4 of 45.0 MB). An app that runs a CPUAccelerator in the
+  browser and wants these kernels compiled sets `SpawnDevMLAotKernels=true`.
+  - Stage 1 moves the six self-contained generated classes: TiledAttention, TiledGemm, MmaGemm, MmaAttention, MmaFlashPrefill, Q8Gemm (namespaces
+    unchanged, still internal). `DiTKernels.Activate` moved with them as `KernelMath.Activate` (same body, still not inlined). MmaKQuantGemm, MmaS8Gemm
+    and MmaFlashAttnBwd follow once the public nested types they use (FusedDequantMatMul.W16, Vec4LoadMatMul.F4, BackwardKernels.AttnDims) move down.
+  - Verified: the generators reproduce the moved files byte for byte (only the Activate rename differs); scoped PMT over every moved class on all
+    lanes: every outcome equal to the 5.8.22 release sweep.
+
 ## 5.8.22 - 2026-11-18 (nuget.org) - exact tensor-core attention by default; LTX-2 speed; fp8 LoRA compat weights match ComfyUI; SpawnDev.ILGPU 5.4.36
 
 - **`Ltx2Transformer.ComfyPatchedFp8WeightsAsync`**: the ComfyUI-compatible fp8 LoRA mode's patched 8-bit weights of one block, read back as F8_E4M3 bytes

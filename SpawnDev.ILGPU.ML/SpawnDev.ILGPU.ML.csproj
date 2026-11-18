@@ -62,6 +62,28 @@
     <ProjectReference Include="..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!--
+      The generated GPU kernels, in their own assembly so a browser AOT build can leave them to the interpreter (see that project and
+      buildTransitive/SpawnDev.ILGPU.ML.targets). PrivateAssets="all": not a package dependency; its DLL and XML ship in THIS package's lib folder
+      (PackKernelsAssembly below), so consumers see one package.
+    -->
+    <ProjectReference Include="..\SpawnDev.ILGPU.ML.Kernels\SpawnDev.ILGPU.ML.Kernels.csproj" PrivateAssets="all" />
+    <None Include="buildTransitive\SpawnDev.ILGPU.ML.targets" Pack="true" PackagePath="buildTransitive\" />
+  </ItemGroup>
+  <PropertyGroup>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackKernelsAssembly</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+  <Target Name="PackKernelsAssembly" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <_MlKernelsDll Include="@(ReferenceCopyLocalPaths->WithMetadataValue('Filename', 'SpawnDev.ILGPU.ML.Kernels')->WithMetadataValue('Extension', '.dll'))" />
+      <!-- the XML from beside the DLL in that project's output (it is not in ReferenceCopyLocalPaths at this point) -->
+      <_MlKernelsXml Include="@(_MlKernelsDll->'%(RootDir)%(Directory)%(Filename).xml')" />
+      <BuildOutputInPackage Include="@(_MlKernelsDll);@(_MlKernelsXml)" />
+    </ItemGroup>
+    <Error Condition="'@(_MlKernelsDll)' == ''" Text="SpawnDev.ILGPU.ML.Kernels.dll was not found to pack into SpawnDev.ILGPU.ML" />
+    <Error Condition="!Exists('@(_MlKernelsXml)')" Text="SpawnDev.ILGPU.ML.Kernels.xml was not found beside @(_MlKernelsDll)" />
+  </Target>
+  <ItemGroup>
     <!-- FaceDetectionPipeline.DetectBothWaysAsync: GPU decode vs the managed reference, for the parity test only -->
     <InternalsVisibleTo Include="SpawnDev.ILGPU.ML.Demo.Shared" />
   </ItemGroup>

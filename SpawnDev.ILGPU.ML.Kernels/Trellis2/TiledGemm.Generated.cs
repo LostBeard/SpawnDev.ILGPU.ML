@@ -271,105 +271,105 @@ internal static class TiledGemm
         if (m0 < M)
         {
             int rb = m0 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c03 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c04 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c05 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c06 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c07 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c03 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c04 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c05 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c06 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c07 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m1 = mBase + ty + 16;
         if (m1 < M)
         {
             int rb = m1 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c13 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c14 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c15 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c16 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c17 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c13 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c14 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c15 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c16 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c17 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m2 = mBase + ty + 32;
         if (m2 < M)
         {
             int rb = m2 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c23 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c24 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c25 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c26 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c27 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c23 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c24 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c25 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c26 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c27 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m3 = mBase + ty + 48;
         if (m3 < M)
         {
             int rb = m3 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c33 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c34 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c35 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c36 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c37 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c33 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c34 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c35 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c36 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c37 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m4 = mBase + ty + 64;
         if (m4 < M)
         {
             int rb = m4 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c43 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c44 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c45 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c46 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c47 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c43 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c44 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c45 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c46 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c47 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m5 = mBase + ty + 80;
         if (m5 < M)
         {
             int rb = m5 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c53 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c54 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c55 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c56 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c57 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c53 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c54 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c55 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c56 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c57 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m6 = mBase + ty + 96;
         if (m6 < M)
         {
             int rb = m6 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c63 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c64 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c65 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c66 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c67 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c63 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c64 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c65 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c66 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c67 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m7 = mBase + ty + 112;
         if (m7 < M)
         {
             int rb = m7 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c73 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c74 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c75 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c76 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c77 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c73 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c74 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c75 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c76 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c77 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
     }
 
@@ -480,105 +480,105 @@ internal static class TiledGemm
         if (m0 < M)
         {
             int rb = m0 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c03 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c04 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c05 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c06 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c07 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c00 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c01 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c02 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c03 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c04 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c05 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c06 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c07 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m1 = mBase + ty + 16;
         if (m1 < M)
         {
             int rb = m1 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c13 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c14 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c15 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c16 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c17 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c10 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c11 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c12 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c13 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c14 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c15 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c16 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c17 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m2 = mBase + ty + 32;
         if (m2 < M)
         {
             int rb = m2 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c23 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c24 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c25 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c26 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c27 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c20 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c21 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c22 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c23 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c24 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c25 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c26 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c27 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m3 = mBase + ty + 48;
         if (m3 < M)
         {
             int rb = m3 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c33 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c34 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c35 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c36 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c37 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c30 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c31 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c32 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c33 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c34 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c35 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c36 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c37 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m4 = mBase + ty + 64;
         if (m4 < M)
         {
             int rb = m4 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c43 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c44 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c45 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c46 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c47 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c40 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c41 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c42 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c43 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c44 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c45 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c46 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c47 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m5 = mBase + ty + 80;
         if (m5 < M)
         {
             int rb = m5 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c53 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c54 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c55 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c56 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c57 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c50 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c51 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c52 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c53 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c54 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c55 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c56 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c57 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m6 = mBase + ty + 96;
         if (m6 < M)
         {
             int rb = m6 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c63 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c64 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c65 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c66 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c67 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c60 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c61 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c62 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c63 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c64 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c65 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c66 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c67 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
         int m7 = mBase + ty + 112;
         if (m7 < M)
         {
             int rb = m7 * N;
-            if (n0 < N) { float v = DiTKernels.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
-            if (n1 < N) { float v = DiTKernels.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
-            if (n2 < N) { float v = DiTKernels.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
-            if (n3 < N) { float v = DiTKernels.Activate(c73 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
-            if (n4 < N) { float v = DiTKernels.Activate(c74 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
-            if (n5 < N) { float v = DiTKernels.Activate(c75 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
-            if (n6 < N) { float v = DiTKernels.Activate(c76 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
-            if (n7 < N) { float v = DiTKernels.Activate(c77 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+            if (n0 < N) { float v = KernelMath.Activate(c70 + bias0, act); if (hasRes == 1) v += Res[rb + n0]; else if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c71 + bias1, act); if (hasRes == 1) v += Res[rb + n1]; else if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c72 + bias2, act); if (hasRes == 1) v += Res[rb + n2]; else if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c73 + bias3, act); if (hasRes == 1) v += Res[rb + n3]; else if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c74 + bias4, act); if (hasRes == 1) v += Res[rb + n4]; else if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c75 + bias5, act); if (hasRes == 1) v += Res[rb + n5]; else if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c76 + bias6, act); if (hasRes == 1) v += Res[rb + n6]; else if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c77 + bias7, act); if (hasRes == 1) v += Res[rb + n7]; else if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
         }
     }
 

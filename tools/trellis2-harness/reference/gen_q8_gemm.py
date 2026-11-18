@@ -1,4 +1,4 @@
-"""Generates SpawnDev.ILGPU.ML/Flux2/Q8Gemm.Generated.cs.
+"""Generates SpawnDev.ILGPU.ML.Kernels/Flux2/Q8Gemm.Generated.cs.
 
 EDIT THIS FILE, NOT THE OUTPUT.
 
@@ -113,7 +113,7 @@ def kernel(AB, KB):
         w(f"        if (gr0 + {i} < rows)")
         w(f"        {{ long ob = (long)(m0 + gr0 + {i}) * N;")
         for j in range(TN):
-            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = DiTKernels.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
+            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = KernelMath.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
         w("        }")
     w("    }")
 
@@ -192,7 +192,7 @@ def kernel_two_level(KB=2):
         w(f"        if (gr0 + {i} < rows)")
         w(f"        {{ long ob = (long)(m0 + gr0 + {i}) * N;")
         for j in range(TN):
-            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = DiTKernels.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
+            w(f"          if (gc0 + {j} < N) o[ob + gc0 + {j}] = KernelMath.Activate(hasBias != 0 ? f{i}_{j} + PrecisionConvert.ConvertToSingle(bias[gc0 + {j}]) : f{i}_{j}, act);")
         w("        }")
     w("    }")
 

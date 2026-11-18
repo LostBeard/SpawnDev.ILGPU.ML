@@ -1,4 +1,4 @@
-"""Generates SpawnDev.ILGPU.ML/Trellis2/MmaAttention.Generated.cs.
+"""Generates SpawnDev.ILGPU.ML.Kernels/Trellis2/MmaAttention.Generated.cs.
 
 EDIT THIS FILE, NOT THE OUTPUT.
 

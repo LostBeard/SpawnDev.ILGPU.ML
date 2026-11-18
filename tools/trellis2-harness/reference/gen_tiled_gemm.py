@@ -1,4 +1,4 @@
-"""Generates SpawnDev.ILGPU.ML/Trellis2/TiledGemm.Generated.cs.
+"""Generates SpawnDev.ILGPU.ML.Kernels/Trellis2/TiledGemm.Generated.cs.
 
 EDIT THIS FILE, NOT THE OUTPUT.
 
@@ -152,7 +152,7 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
         w("        {")
         w(f"            int rb = m{i} * N;")
         for j in range(8):
-            w(f"            if (n{j} < N) {{ float v = DiTKernels.Activate(c{i}{j} + bias{j}, act); if (hasRes == 1) v += Res[rb + n{j}]; else if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
+            w(f"            if (n{j} < N) {{ float v = KernelMath.Activate(c{i}{j} + bias{j}, act); if (hasRes == 1) v += Res[rb + n{j}]; else if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
         w("        }")
     w("    }")
     w("")

@@ -22,7 +22,7 @@ public sealed class Flux1Kernels
 
     private Action<Index1D, FV, ArrayView1D<BFloat16, Stride1D.Dense>, int, int>? _addRowVector;
     private static void AddRowVectorImpl(Index1D i, FV o, ArrayView1D<BFloat16, Stride1D.Dense> v, int N, int act)
-        => o[i] = Trellis2.DiTKernels.Activate(o[i] + PrecisionConvert.ConvertToSingle(v[(int)(i % N)]), act);
+        => o[i] = Trellis2.KernelMath.Activate(o[i] + PrecisionConvert.ConvertToSingle(v[(int)(i % N)]), act);
     /// <summary>o[r, c] = act(o[r, c] + v[c]) over [rows, N] (a bias's bf16 remainder, before the layer's activation: StreamedModelWeights keeps fp16 biases as hi + lo; act 0 = none).</summary>
     public void AddRowVector(FV o, ArrayView1D<BFloat16, Stride1D.Dense> v, int rows, int N, int act)
     {
