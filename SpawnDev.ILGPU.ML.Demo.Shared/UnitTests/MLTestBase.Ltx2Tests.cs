@@ -817,6 +817,46 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The attention kernels at the LTX-2 transformer's real size, alone (no model files): the video self-attention (6144 tokens, 32 heads x 128, q and k / v in
+    /// separate buffers as the transformer passes them) and the text cross-attention (6144 queries x 1024 keys), on the kernel the exact path runs
+    /// (<see cref="Trellis2.DiTKernels.PreciseActivations"/>: the portable fp32 flash kernel) and on the one the fast path runs (the tensor-core flash kernel where the
+    /// card has it). Milliseconds (best of 3 after a compile call), TFLOPS = 4 Nq Nk H D / time, and the distance between the two results.
+    /// LTX2_ATTN_TOKENS overrides the token count. Prints "[Benchmark] Ltx2 attention kernels ...".
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Ltx2_AttentionKernels_Benchmark() => await RunTest(async accelerator =>
+    {
+        const int H = 32, D = 128, C = H * D, L = 1024;
+        int N = int.TryParse(Environment.GetEnvironmentVariable("LTX2_ATTN_TOKENS"), out var nt) ? nt : 6144;
+        var precise = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true };
+        var fast = new Trellis2.DiTKernels(accelerator);
+        if (!precise.UsesFlashAttention(D)) throw new UnsupportedTestException($"{accelerator.AcceleratorType}: no flash attention for head width {D}");
+        var rng = new Random(5);
+        float[] Rand(long count) { var a = new float[count]; for (long i = 0; i < count; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
+        using var q = accelerator.Allocate1D(Rand((long)N * C)); using var kv = accelerator.Allocate1D(Rand((long)N * 2 * C)); using var ctx = accelerator.Allocate1D(Rand((long)L * 2 * C));
+        using var oP = accelerator.Allocate1D<float>((long)N * C); using var oF = accelerator.Allocate1D<float>((long)N * C);
+        var report = new List<string>();
+        async Task<double> Time(Action op)
+        {
+            op(); await accelerator.SynchronizeAsync();
+            double best = double.MaxValue;
+            for (int r = 0; r < 3; r++) { var sw = System.Diagnostics.Stopwatch.StartNew(); op(); await accelerator.SynchronizeAsync(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds); }
+            return best;
+        }
+        foreach (var (label, Nk, keys) in new[] { ("self", N, kv), ("text cross", L, ctx) })
+        {
+            double flops = 4.0 * N * Nk * H * D;
+            double tp = await Time(() => precise.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oP.View, N, Nk, H, D));
+            double tf = await Time(() => fast.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oF.View, N, Nk, H, D));
+            double dist = F2_RelRms(await oF.View.CopyToHostAsync(), await oP.View.CopyToHostAsync());
+            report.Add($"{label} {N} x {Nk}: exact path {tp:F1} ms ({flops / tp / 1e9:F1} TFLOPS, portable kernel: {precise.TiledAttentionKind}), fast path {tf:F1} ms ({flops / tf / 1e9:F1} TFLOPS), {tp / tf:F1}x; fast vs exact {dist:E2}");
+        }
+        string line = $"{accelerator.AcceleratorType}, {H} heads x {D}: " + string.Join(" | ", report);
+        Console.WriteLine("[Benchmark] Ltx2 attention kernels: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="Ltx2Pipeline"/> end to end: a prompt to a clip with sound (Gemma 3 encode, connectors, the sampler, video and audio decode), written as PNG frames and a
     /// WAV file to LTX2_PIPE_OUT (default: a folder in the temp directory) so a person can look at it. LTX2_PIPE_SIZE "width x height x frames" (default 768x512x121),
     /// LTX2_PIPE_DISTILLED (default 1: the distilled LoRA, 8 steps, no guidance; 0: LTX2_PIPE_STEPS steps at cfg 4), LTX2_PIPE_PROMPT, LTX2_PIPE_SEED.
