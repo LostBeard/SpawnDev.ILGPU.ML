@@ -583,8 +583,24 @@ public abstract partial class MLTestBase
             + "warm evening light, cinematic slow motion. Birds sing and a gentle breeze rustles the grass.");
         string outDir = Env("LTX2_PIPE_OUT", Path.Combine(Path.GetTempPath(), "spawndev-ltx2-clip"));
         Directory.CreateDirectory(outDir);
+        // LTX2_PIPE_KEYFRAME: a PNG at the clip's size to guide by (image-to-video), at pixel frame LTX2_PIPE_KEYFRAME_INDEX (default 0), strength LTX2_PIPE_KEYFRAME_STRENGTH (default 1)
+        string keyPath = Env("LTX2_PIPE_KEYFRAME", "");
+        int keyIndex = int.Parse(Env("LTX2_PIPE_KEYFRAME_INDEX", "0"));
+        float keyStrength = float.Parse(Env("LTX2_PIPE_KEYFRAME_STRENGTH", "1"), System.Globalization.CultureInfo.InvariantCulture);
+        byte[]? keyRgba = null; List<Ltx2Keyframe>? keyframes = null;
+        if (keyPath != "")
+        {
+            var png = await File.ReadAllBytesAsync(keyPath);
+            var (kw, kh) = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.GetDimensions(png);
+            Ur_Expect(kw == size[0] && kh == size[1], $"the keyframe is {kw} x {kh}, the clip {size[0]} x {size[1]}");
+            keyRgba = SpawnDev.ILGPU.ML.Preprocessing.PngDecoder.DecodePixels(png) ?? throw new Exception($"{keyPath}: not an 8-bit non-interlaced PNG");
+            var rgb = new byte[3 * kw * kh];
+            for (int i = 0; i < kw * kh; i++) { rgb[3 * i] = keyRgba[4 * i]; rgb[3 * i + 1] = keyRgba[4 * i + 1]; rgb[3 * i + 2] = keyRgba[4 * i + 2]; }
+            keyframes = new List<Ltx2Keyframe> { Ltx2Keyframe.FromRgb(rgb, kw, kh, keyIndex, keyStrength) };
+        }
         var req = new Ltx2Request
         {
+            Keyframes = keyframes,
             Prompt = prompt, NegativePrompt = "worst quality, inconsistent motion, blurry, jittery, distorted", Width = size[0], Height = size[1], Frames = size[2],
             Distilled = distilled, Steps = int.Parse(Env("LTX2_PIPE_STEPS", "20")), Cfg = 4f, Seed = long.Parse(Env("LTX2_PIPE_SEED", "42")),
         };
@@ -601,6 +617,21 @@ public abstract partial class MLTestBase
         static (double Mean, double Std) Luma(byte[] f) { double s = 0, s2 = 0; int c = f.Length / 4; for (int i = 0; i < f.Length; i += 4) { double y = 0.299 * f[i] + 0.587 * f[i + 1] + 0.114 * f[i + 2]; s += y; s2 += y * y; } double m = s / c; return (m, Math.Sqrt(Math.Max(0, s2 / c - m * m))); }
         var (m0, sd0) = Luma(frames[0]); var (m1, sd1) = Luma(frames[n - 1]);
         double moved = 0; for (int i = 0; i < frames[0].Length; i += 4) moved += Math.Abs(frames[0][i + 1] - frames[n - 1][i + 1]); moved /= w * h;
+        string keyNote = "";
+        if (keyRgba != null)
+        {
+            // the guided frame against the keyframe: luma correlation and mean absolute difference (0..255)
+            var gf = frames[keyIndex >= 0 ? keyIndex : n + keyIndex];
+            double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, mad = 0; int px = w * h;
+            for (int i = 0; i < 4 * px; i += 4)
+            {
+                double a = 0.299 * gf[i] + 0.587 * gf[i + 1] + 0.114 * gf[i + 2], b = 0.299 * keyRgba[i] + 0.587 * keyRgba[i + 1] + 0.114 * keyRgba[i + 2];
+                sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b; mad += Math.Abs(a - b);
+            }
+            double corr = (sab / px - sa / px * sb / px) / Math.Sqrt(Math.Max(1e-9, (saa / px - sa / px * sa / px) * (sbb / px - sb / px * sb / px)));
+            keyNote = $" | keyframe at {keyIndex} strength {keyStrength}: guided frame vs the picture luma correlation {corr:F3}, mean |diff| {mad / px:F1}";
+            Ur_Expect(corr > 0.5, "the guided frame does not resemble the keyframe:" + keyNote);
+        }
         for (int i = 0; i < n; i++) await File.WriteAllBytesAsync(Path.Combine(outDir, $"frame_{i:D4}.png"), SpawnDev.ILGPU.ML.Preprocessing.PngEncoder.Encode(frames[i], w, h));
         double audioRms = 0; string wavNote = "no audio";
         if (clip.Audio is { } wav)
@@ -617,7 +648,7 @@ public abstract partial class MLTestBase
             wavNote = $"{samples / (double)rate:F2} s of stereo at {rate} Hz, rms {audioRms:F4}";
         }
         string secs = string.Join(", ", clip.Seconds.Select(kv => $"{kv.Key} {kv.Value:F1} s"));
-        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1} | {wavNote} | {outDir}";
+        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1}{keyNote} | {wavNote} | {outDir}";
         Console.WriteLine("[Benchmark] Ltx2 pipeline: " + line);
         lock (stages) Console.WriteLine("[Ltx2] pipeline stages: " + string.Join(" | ", stages));
         Ur_Expect(sd0 > 4 && sd1 > 4 && moved > 1, "the frames are flat or do not move: " + line);
