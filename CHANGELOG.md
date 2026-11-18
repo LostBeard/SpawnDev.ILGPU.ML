@@ -31,6 +31,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     form) and generated on the thread pool per block (`Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads`). Use it to reproduce a ComfyUI render; leave it off otherwise.
   - Fixed: `Ltx2Transformer`'s input-scale scratch was smaller than the text cross-attention's k / v input, so an fp8 checkpoint WITH per-tensor scales would have
     failed in that Linear at small video sizes.
+  - First run of the LTX-2 kernel tests on the browser and CPU lanes (they had only run on CUDA / OpenCL) found and fixed:
+    - `SparseKernels.ConvTapsBf16Exact` threw NotSupportedException where the tiled GEMM does not run (CPU, Velocity, WebGL): the LTX-2 VAEs' convolutions now
+      fall back to a plain exact kernel there (3.6e-7 against the host, the tiled kernel's figure), in row ranges like the tiled path.
+    - `DiTKernels.ReferenceAttention` / `BiasedAttention` on the reference kernels with q and k / v in ONE buffer bound it twice, which WebGPU refuses
+      ("Storage buffer aliasing"): a single-binding scores kernel for that case.
+    - `Ltx2Kernels.ReflectTable` wrote a voxel's 27 neighbours from one thread, which WebGL's transform feedback cannot capture: one table entry a thread.
+    - The vectorized stream of the ComfyUI-compatible mode returned wrong bytes in the browser: **in Blazor WebAssembly (.NET 10) `Vector128.Narrow` saturates once
+      its loop is hot** (it truncates on desktop and while cold): right for 342 rounds, then FF for every word above 255. The generator masks to the low byte before
+      it narrows (a marked workaround for a runtime bug; the test carries a hot-loop canary that reports the runtime's behaviour on every run).
+    `Ltx2_Fp8CompatRounding_MatchesHostRule` passes on all seven lanes (the division and half-precision rounding on the device are exact on WebGPU, WebGL and Wasm too).
+    `Trellis2_BiasedAttention_MatchesHostReference` is gated on WebGL like `Trellis2_FlashAttention` (the attention kernels need shared memory or a row of stores).
   - `Ltx2AvModel.SampleAsync` also runs batch 1 (cfg 1: the conditioned prompt only, the template's second pass).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.

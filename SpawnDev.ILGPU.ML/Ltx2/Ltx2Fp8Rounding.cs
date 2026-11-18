@@ -66,7 +66,7 @@ public static class Ltx2Fp8Rounding
         for (int i = 1; i < N; i++) mt[i] = 1812433253u * (mt[i - 1] ^ (mt[i - 1] >> 30)) + (uint)i;
         Span<byte> tail = stackalloc byte[N];
         var upper = Vector256.Create(0x80000000u); var lower = Vector256.Create(0x7FFFFFFFu); var matrix = Vector256.Create(0x9908B0DFu); var one = Vector256.Create(1u);
-        var tb = Vector256.Create(0x9D2C5680u); var tc = Vector256.Create(0xEFC60000u);
+        var tb = Vector256.Create(0x9D2C5680u); var tc = Vector256.Create(0xEFC60000u); var low8 = Vector256.Create(0xFFu);
         ref uint s = ref MemoryMarshal.GetReference(mt);
         for (long done = 0; done < count; done += N)
         {
@@ -95,6 +95,12 @@ public static class Ltx2Fp8Rounding
                 var v0 = Vector256.LoadUnsafe(ref s, (nuint)j); var v1 = Vector256.LoadUnsafe(ref s, (nuint)(j + 8));
                 v0 ^= v0 >>> 11; v0 ^= (v0 << 7) & tb; v0 ^= (v0 << 15) & tc; v0 ^= v0 >>> 18;
                 v1 ^= v1 >>> 11; v1 ^= (v1 << 7) & tb; v1 ^= (v1 << 15) & tc; v1 ^= v1 >>> 18;
+                // WORKAROUND (a .NET runtime bug, not ours; needs an upstream report): the low byte is masked out BEFORE the narrowing, so a narrowing that
+                // SATURATES gives the same bytes as one that truncates. Vector128.Narrow must truncate, and does on desktop and in the browser's interpreter, but
+                // once this loop is hot the browser runtime (Mono WebAssembly, .NET 10: its hot-path compiler) returns saturated values: FF for every word above
+                // 255. MEASURED 2026-11-17 on all three browser lanes: the unmasked form is right for 342 rounds, then 4,756,832 of the next 4.8 M bytes are FF
+                // (the canary in Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads reports it on every run: drop the mask when it says "equals the plain mix").
+                v0 &= low8; v1 &= low8;
                 Vector128.Narrow(Vector128.Narrow(v0.GetLower(), v0.GetUpper()), Vector128.Narrow(v1.GetLower(), v1.GetUpper())).StoreUnsafe(ref d, (nuint)j);
             }
             if (left < N) tail[..(int)left].CopyTo(bytes.Slice((int)done, (int)left));

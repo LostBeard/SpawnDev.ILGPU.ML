@@ -415,6 +415,31 @@ public sealed class DiTKernels
         for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(q[qb + d], k[kb + d], acc);
         s[idx] = acc * scale;
     }
+    // q and k as slices of ONE buffer (packed self-attention): one binding. WebGPU refuses the same buffer on two storage bindings ("Storage buffer aliasing
+    // detected in kernel 'ScoresImpl'": Trellis2_BiasedAttention's packed case on the reference kernels, first WebGPU run 2026-11-17).
+    private Action<Index1D, FV, FV, int, int, int, int, int, int, int, int, float>? _scoresSelf;
+    private static void ScoresSelfImpl(Index1D idx, FV qk, FV s, int Nq, int Nk, int H, int D, int qStride, int qOff, int kStride, int kOff, float scale)
+    {
+        long jj = idx % Nk; long rest = idx / Nk; int i = (int)(rest % Nq); int h = (int)(rest / Nq);
+        long qb = (long)i * qStride + qOff + h * D, kb = jj * kStride + kOff + h * D;
+        float acc = 0f;
+        for (int d = 0; d < D; d++) acc = float.MultiplyAddEstimate(qk[qb + d], qk[kb + d], acc);
+        s[idx] = acc * scale;
+    }
+    // the reference kernels' scores, on the kernel that fits how q and k / v were passed
+    private void Scores(int count, FV q, FV kv, FV scores, int Nq, int Nk, int H, int D, int qStride, int qOff, int kvStride, int kOff, float scale)
+    {
+        IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;
+        if (qv.Buffer == kvv.Buffer)
+        {
+            if (qv.Index != kvv.Index) throw new ArgumentException("q and kv share a buffer but start at different offsets; pass the same view with offsets");
+            _scoresSelf ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresSelfImpl);
+            _scoresSelf(count, q, scores, Nq, Nk, H, D, qStride, qOff, kvStride, kOff, scale);
+            return;
+        }
+        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
+        _scores(count, q, kv, scores, Nq, Nk, H, D, qStride, qOff, kvStride, kOff, scale);
+    }
     private Action<Index1D, FV, int>? _softmaxRows;
     private static void SoftmaxRowsImpl(Index1D row, FV s, int Nk)
     {
@@ -677,11 +702,10 @@ public sealed class DiTKernels
                 + $"path on {_acc.AcceleratorType} for head width {D} (see UsesFlashBiasedAttention)", nameof(scores));
         if (need > int.MaxValue)
             throw new ArgumentException($"reference biased attention over H * N * N = {need} scores exceeds the kernel's int index range", nameof(scores));
-        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _scoreBias ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(ScoreBiasImpl);
         _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
         _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);
-        _scores((int)need, q, kv, scores, N, N, H, D, qStride, qOff, kvStride, kOff, 1f / MathF.Sqrt(D));
+        Scores((int)need, q, kv, scores, N, N, H, D, qStride, qOff, kvStride, kOff, 1f / MathF.Sqrt(D));
         _scoreBias((int)need, scores, tokenBias, N, split);
         _softmaxRows(H * N, scores, N);
         _pv(N * H * D, scores, kv, o, N, N, H, D, kvStride, vOff);
@@ -699,11 +723,10 @@ public sealed class DiTKernels
                 + $"path on {_acc.AcceleratorType} for head width {D} (see UsesFlashAttention)", nameof(scores));
         if (need > int.MaxValue)
             throw new ArgumentException($"reference attention over H * Nq * Nk = {need} scores exceeds the kernel's int index range", nameof(scores));
-        _scores ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int, int, int, float>(ScoresImpl);
         _softmaxRows ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(SoftmaxRowsImpl);
         _pv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int, int>(PvImpl);
         float scale = 1f / MathF.Sqrt(D);
-        _scores((int)((long)H * Nq * Nk), q, kv, scores, Nq, Nk, H, D, qStride, qOff, kvStride, kOff, scale);
+        Scores((int)((long)H * Nq * Nk), q, kv, scores, Nq, Nk, H, D, qStride, qOff, kvStride, kOff, scale);
         _softmaxRows(H * Nq, scores, Nk);
         _pv(Nq * H * D, scores, kv, o, Nq, Nk, H, D, kvStride, vOff);
     }

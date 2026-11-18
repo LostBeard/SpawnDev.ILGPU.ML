@@ -3,6 +3,7 @@ using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Ltx2;
 using SpawnDev.UnitTesting;
+using System.Runtime.Intrinsics;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -297,7 +298,7 @@ public abstract partial class MLTestBase
             double moved = 0;
             for (int i = 0; i < a.Length; i++) { if (a[i] != b2[i]) throw new Exception($"the split convolution differs at {i} (row {i / cout}): {b2[i]} vs {a[i]} on {accelerator.AcceleratorType}"); moved += Math.Abs(a[i]); }
             Ur_Expect(moved / a.Length > 0.1, $"the {M2}-row convolution's output is near zero ({moved / a.Length:E2}): nothing was compared");
-            line += $"; {M2} rows split into {(M2 + 127) / 128} dispatches == whole";
+            line += $"; {M2} rows split into the smallest dispatches (a row tile on the tiled GEMM, a row on the plain kernel) == whole";
             Console.WriteLine("[Ltx2] conv split: " + line);
         }
         return line;
@@ -458,6 +459,37 @@ public abstract partial class MLTestBase
     {
         bool big = accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL;
         var report = new List<string>();
+        // what this runtime's Vector128.Narrow does with values above the narrow type's range (reported, not asserted: Low8 masks before it narrows)
+        var narIn = new uint[8]; for (int i = 0; i < 8; i++) narIn[i] = i < 4 ? 0x12345678u + (uint)report.Count : 0x9ABCDEF0u;   // run-time values: nothing to fold
+        var nar = System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector128.Create(narIn, 0), System.Runtime.Intrinsics.Vector128.Create(narIn, 4));
+        var narIn16 = new ushort[16]; for (int i = 0; i < 16; i++) narIn16[i] = (ushort)((i < 8 ? 0x12ACu : 0xFE37u) + (uint)report.Count);
+        var nar8 = System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector128.Create(narIn16, 0), System.Runtime.Intrinsics.Vector128.Create(narIn16, 8));
+        report.Add($"runtime: Vector128 accelerated {System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated}, Narrow 32 to 16 bits (12345678, 9ABCDEF0) = {nar[0]:X4}, {nar[4]:X4} ({(nar[0] == 0x5678 && nar[4] == 0xDEF0 ? "truncates" : "DOES NOT truncate")}), "
+            + $"16 to 8 bits (12AC, FE37) = {nar8[0]:X2}, {nar8[8]:X2} ({(nar8[0] == 0xAC && nar8[8] == 0x37 ? "truncates" : "DOES NOT truncate")})");
+        // the form Low8 had before it masked: two 256-bit vectors, each narrowed half by half to 16 bits, the pair narrowed to bytes
+        var n256a = System.Runtime.Intrinsics.Vector256.Create(narIn, 0); var n256b = System.Runtime.Intrinsics.Vector256.Create(0x0BADF00Du + (uint)report.Count - 1u);
+        var nested = System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector256.GetLower(n256a), System.Runtime.Intrinsics.Vector256.GetUpper(n256a)), System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector256.GetLower(n256b), System.Runtime.Intrinsics.Vector256.GetUpper(n256b)));
+        report.Add($"nested 256-bit narrow to bytes (12345678 x 4, 9ABCDEF0 x 4, 0BADF00D x 8) = {nested[0]:X2}, {nested[4]:X2}, {nested[8]:X2} ({(nested[0] == 0x78 && nested[4] == 0xF0 && nested[8] == 0x0D ? "truncates" : "DOES NOT truncate")})");
+        // the generator's output mix exactly as Low8 runs it but WITHOUT the mask before the narrowing, against the plain mix (reported, not asserted)
+        {
+            // run HOT (300,000 rounds): the browser runtime compiles hot loops separately, and the library's loop was hot when it returned wrong bytes
+            var mixIn = new uint[16];
+            static uint Mix(uint v) { v ^= v >> 11; v ^= (v << 7) & 0x9D2C5680u; v ^= (v << 15) & 0xEFC60000u; v ^= v >> 18; return v; }
+            var mb = System.Runtime.Intrinsics.Vector256.Create(0x9D2C5680u); var mc = System.Runtime.Intrinsics.Vector256.Create(0xEFC60000u);
+            long mixBad = 0; int firstBadRound = -1; byte gotByte = 0, wantByte = 0; var mixOut = new byte[16];
+            for (int round = 0; round < 300000; round++)
+            {
+                for (int i = 0; i < 16; i++) mixIn[i] = 2567483615u * (uint)(i + 1 + round) + 12345u;
+                var m0 = System.Runtime.Intrinsics.Vector256.Create(mixIn, 0); var m1 = System.Runtime.Intrinsics.Vector256.Create(mixIn, 8);
+                m0 ^= m0 >>> 11; m0 ^= (m0 << 7) & mb; m0 ^= (m0 << 15) & mc; m0 ^= m0 >>> 18;
+                m1 ^= m1 >>> 11; m1 ^= (m1 << 7) & mb; m1 ^= (m1 << 15) & mc; m1 ^= m1 >>> 18;
+                System.Runtime.Intrinsics.Vector128.Narrow(
+                    System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector256.GetLower(m0), System.Runtime.Intrinsics.Vector256.GetUpper(m0)),
+                    System.Runtime.Intrinsics.Vector128.Narrow(System.Runtime.Intrinsics.Vector256.GetLower(m1), System.Runtime.Intrinsics.Vector256.GetUpper(m1))).CopyTo(mixOut);
+                for (int i = 0; i < 16; i++) if (mixOut[i] != (byte)Mix(mixIn[i])) { if (mixBad++ == 0) { firstBadRound = round; gotByte = mixOut[i]; wantByte = (byte)Mix(mixIn[i]); } }
+            }
+            report.Add($"unmasked output mix, 300000 hot rounds of 16 words: {(mixBad == 0 ? "equals the plain mix" : $"{mixBad} bytes WRONG from round {firstBadRound} on (first {gotByte:X2}, plain {wantByte:X2})")}");
+        }
         foreach (int count in new[] { 1, 3, 4, 15, 16, 17, 623, 624, 625, 640, 1247, 1248, 1249, 2000003 })
             foreach (uint seed in new[] { 0u, 5489u, 1881967891u, 0xFFFFFFFFu })
             {

@@ -276,10 +276,27 @@ public sealed class SparseKernels
     /// <summary>
     /// <see cref="ConvTaps"/> with bf16 weights in the gather layout [cout][taps][cin] (and an optional bf16 bias) on the portable tiled GEMM: fp32 activations, every product
     /// exact (no tensor cores, no fp16 rounding of the weight). The LTX-2 VAE decoder's checkpoint convolutions are bf16. Needs <see cref="ConvTapsBf16ExactOk"/>.
+    /// Where the tiled GEMM does not run (the CPU accelerators, WebGL, an input count off its k step) the plain kernel does the same sum, one output element a thread.
     /// </summary>
     public void ConvTapsBf16Exact(FV x, IV nbr, ArrayView1D<BFloat16, Stride1D.Dense> weight, ArrayView1D<BFloat16, Stride1D.Dense>? bias, FV o, int M, int cin, int cout, int taps)
     {
-        if (!UseTiled(taps * cin)) throw new NotSupportedException($"{taps} x {cin} inputs: not a multiple of the tiled GEMM's k step (or no tiled GEMM on this backend)");
+        if (!UseTiled(taps * cin))
+        {
+            // threw NotSupportedException here until 2026-11-17: the LTX-2 decoders could not run on CPU / Velocity / WebGL at all (Ltx2_ConvBf16Exact_MatchesHost,
+            // first run on those lanes). Row ranges per dispatch as below, so no dispatch grows with the input.
+            _naiveConvBf16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, FV, IV, int, int, int, int>(NaiveConvBf16Impl);
+            _noBiasBf16 ??= _acc.Allocate1D<BFloat16>(1);
+            long work = Math.Max(1L, (long)taps * cin * cout);
+            int step = (int)Math.Min(M, Math.Max(1, MaxConvWorkPerDispatch / work));
+            for (int r0 = 0; r0 < M; r0 += step)
+            {
+                int rows = Math.Min(step, M - r0);
+                var oc = r0 == 0 && rows == M ? o : o.SubView((long)r0 * cout, (long)rows * cout);
+                var nc = r0 == 0 && rows == M ? nbr : nbr.SubView((long)r0 * 27, (long)rows * 27);
+                _naiveConvBf16(rows * cout, x, weight, bias ?? _noBiasBf16.View, oc, nc, cin, cout, bias.HasValue ? 1 : 0, taps);
+            }
+            return;
+        }
         if ((((long)cout * taps * cin) & 1) != 0 || (((IContiguousArrayView)weight.BaseView).Index & 1) != 0) throw new ArgumentException("the bf16 weight is read as 32-bit pairs: an even count from an even start");
         // its own kernel: TiledGemm.Gemm's gathered loop decodes F16 weights only (MEASURED 2026-11-17: bf16 weights through it came out 2.1 relative off; this kernel 3.6e-7, Ltx2_ConvBf16Exact_MatchesHost)
         _tiledGatherBf16 ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.ForGatherBf16(_acc));
@@ -308,6 +325,22 @@ public sealed class SparseKernels
     public static long MaxConvWorkPerDispatch { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("ML_CONV_WORK"), out var cw) && cw > 0 ? cw : 1L << 36;
 
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledGatherBf16;
+    private Action<Index1D, FV, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, FV, IV, int, int, int, int>? _naiveConvBf16;
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _noBiasBf16;
+    // out[m, n] = bias[n] + sum over taps and inputs of x[nbr[m, tap], c] * W[n, tap, c], bf16 weights as they are (NaiveConvImpl's bf16 twin)
+    private static void NaiveConvBf16Impl(Index1D idx, FV x, ArrayView1D<BFloat16, Stride1D.Dense> w, ArrayView1D<BFloat16, Stride1D.Dense> bias, FV o, IV nbr, int cin, int cout, int hasBias, int taps)
+    {
+        int m = idx / cout, n = idx % cout;
+        float acc = hasBias != 0 ? PrecisionConvert.ConvertToSingle(bias[n]) : 0f;
+        for (int kk = 0; kk < taps; kk++)
+        {
+            int src = nbr[m * 27 + kk];
+            if (src < 0) continue;
+            long xb = (long)src * cin, wb = ((long)n * taps + kk) * cin;
+            for (int c = 0; c < cin; c++) acc = float.MultiplyAddEstimate(x[xb + c], PrecisionConvert.ConvertToSingle(w[wb + c]), acc);
+        }
+        o[idx] = acc;
+    }
 
     // a bf16 bias as 32-bit words: an odd length or start (the LTX-2 encoder's 129-channel conv_out) gets a zero-padded copy, made once per bias and kept (as BiasWords for fp16)
     private readonly Dictionary<(object, long, long), MemoryBuffer1D<BFloat16, Stride1D.Dense>> _paddedBf16Bias = new();
@@ -326,8 +359,8 @@ public sealed class SparseKernels
         return padded.View.Cast<BFloat16, uint>();
     }
 
-    /// <summary>True when <see cref="ConvTapsBf16Exact"/> can run for these sizes.</summary>
-    public bool ConvTapsBf16ExactOk(int M, int taps, int cin, int cout, long xRows) => UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
+    /// <summary>True when <see cref="ConvTapsBf16Exact"/> can run for these sizes: every flat index fits an int (the tiled GEMM's bound; the plain kernel's too).</summary>
+    public bool ConvTapsBf16ExactOk(int M, int taps, int cin, int cout, long xRows) => TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
 
     /// <summary>True when <see cref="ConvTaps"/> would run a GEMM (tensor cores or the tiled kernel) for these sizes instead of its naive loop.</summary>
     public bool ConvTapsIsGemm(int M, int taps, int cin, int cout, long xRows)

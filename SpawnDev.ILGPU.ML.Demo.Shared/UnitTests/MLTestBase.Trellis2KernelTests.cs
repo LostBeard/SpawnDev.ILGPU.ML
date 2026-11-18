@@ -473,6 +473,9 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task Trellis2_BiasedAttention_MatchesHostReference() => await RunTest(async accelerator =>
     {
+        // WebGL: the flash kernels need shared memory, and the reference softmax writes a whole row from one thread (transform feedback captures one element per
+        // thread: "a store site ... wrote two different elements in one thread", first WebGL run 2026-11-17). Same ground as Trellis2_FlashAttention's gate.
+        if (accelerator.AcceleratorType == AcceleratorType.WebGL) throw new UnsupportedTestException("attention kernels need shared memory or a row of stores per thread: not WebGL");
         const int H = 2, D = 128, C = H * D;
         var report = new List<string>();
         foreach (var (N, split, pattern, packed) in new[] { (150, 97, "one", false), (150, 97, "one", true), (150, 97, "two", false), (150, 97, "mask", true), (70, 41, "mask", false) })

@@ -327,24 +327,24 @@ public sealed class Ltx2Kernels
 
     // the 3x3x3 neighbour table of the LTX-2 decoder's (non-causal) convolutions: REFLECT padding in space (index -1 -> 1, H -> H - 2), REPLICATE in time, row stride 27
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, int, int, int>? _reflect;
-    private static void ReflectTableImpl(Index1D m, ArrayView1D<int, Stride1D.Dense> nbr, int T, int H, int W)
+    // One table ENTRY a thread (not one voxel writing its 27): WebGL captures one element per store site per thread, and a voxel-per-thread loop failed there with
+    // "a store site ... wrote two different elements in one thread" (Ltx2_ConvBf16Exact_MatchesHost, first WebGL run 2026-11-17). Same work, same table.
+    private static void ReflectTableImpl(Index1D idx, ArrayView1D<int, Stride1D.Dense> nbr, int T, int H, int W)
     {
+        int m = idx / 27, kk = idx % 27;
         int hw = H * W, t = m / hw, p = m % hw, h = p / W, w = p % W;
-        for (int kk = 0; kk < 27; kk++)
-        {
-            int tt = t + kk / 9 - 1, hh = h + (kk / 3) % 3 - 1, ww = w + kk % 3 - 1;
-            tt = tt < 0 ? 0 : (tt >= T ? T - 1 : tt);
-            hh = hh < 0 ? -hh : (hh >= H ? 2 * H - 2 - hh : hh);
-            ww = ww < 0 ? -ww : (ww >= W ? 2 * W - 2 - ww : ww);
-            nbr[m * 27 + kk] = (tt * H + hh) * W + ww;
-        }
+        int tt = t + kk / 9 - 1, hh = h + (kk / 3) % 3 - 1, ww = w + kk % 3 - 1;
+        tt = tt < 0 ? 0 : (tt >= T ? T - 1 : tt);
+        hh = hh < 0 ? -hh : (hh >= H ? 2 * H - 2 - hh : hh);
+        ww = ww < 0 ? -ww : (ww >= W ? 2 * W - 2 - ww : ww);
+        nbr[idx] = (tt * H + hh) * W + ww;
     }
     /// <summary>The neighbour table [T H W, 27] for 3x3x3 convolutions with reflect padding in space and replicate padding in time (diffusers' LTX-2 decoder, causal = false). H, W &gt;= 2.</summary>
     public void ReflectTable(ArrayView1D<int, Stride1D.Dense> nbr, int T, int H, int W)
     {
         if (H < 2 || W < 2) throw new ArgumentException($"reflect padding needs at least 2 x 2 positions, got {H} x {W}");
         _reflect ??= _acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, int, int, int>(ReflectTableImpl);
-        _reflect(T * H * W, nbr, T, H, W);
+        _reflect(checked(T * H * W * 27), nbr, T, H, W);
     }
 
     private Action<Index1D, BV, BV, int, int>? _gatherBf16;
