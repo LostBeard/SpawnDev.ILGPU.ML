@@ -93,9 +93,17 @@ namespace PlaywrightMultiTest
             catch { /* best-effort cleanup; never block the build on it */ }
         }
 
-        private static async Task<int> RunDotnetAsync(string args, string workingDir, int timeoutMs = 300000)
+        /// <summary>
+        /// Runs dotnet and waits for it. A run is killed when it has printed NOTHING for <c>PMT_DOTNET_IDLE_SECONDS</c> (default 600: hung), or
+        /// past <c>PMT_DOTNET_MAX_SECONDS</c> in all (default 3600). It used to be killed after a flat 300 s, which killed healthy work: a cold first
+        /// publish of the demo in a fresh clone (restoring every package) ran past 300 s while still progressing, and PMT then refused the whole
+        /// sweep with "no browser page" (Lore, 2026-11-18; the second publish took 35 s).
+        /// </summary>
+        private static async Task<int> RunDotnetAsync(string args, string workingDir)
         {
-            LogStatus($"RunDotnetAsync: dotnet {args.Split(' ')[0]} (timeout={timeoutMs/1000}s)");
+            int idleSeconds = int.TryParse(Environment.GetEnvironmentVariable("PMT_DOTNET_IDLE_SECONDS"), out var idl) && idl > 0 ? idl : 600;
+            int maxSeconds = int.TryParse(Environment.GetEnvironmentVariable("PMT_DOTNET_MAX_SECONDS"), out var mx) && mx > 0 ? mx : 3600;
+            LogStatus($"RunDotnetAsync: dotnet {args.Split(' ')[0]} (killed after {idleSeconds}s without output or {maxSeconds}s in all)");
             var startInfo = new ProcessStartInfo("dotnet", args)
             {
                 WorkingDirectory = workingDir,
@@ -108,9 +116,10 @@ namespace PlaywrightMultiTest
             p.StartInfo = startInfo;
             p.EnableRaisingEvents = true;
 
-            // Use event-based async reads to avoid pipe buffer deadlocks
-            p.OutputDataReceived += (_, _) => { };
-            p.ErrorDataReceived += (_, _) => { };
+            // Use event-based async reads to avoid pipe buffer deadlocks; every line resets the idle clock.
+            long lastOutputTicks = Environment.TickCount64;
+            p.OutputDataReceived += (_, e) => { if (e.Data != null) Interlocked.Exchange(ref lastOutputTicks, Environment.TickCount64); };
+            p.ErrorDataReceived += (_, e) => { if (e.Data != null) Interlocked.Exchange(ref lastOutputTicks, Environment.TickCount64); };
 
             var exitTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             p.Exited += (_, _) => exitTcs.TrySetResult(true);
@@ -120,10 +129,20 @@ namespace PlaywrightMultiTest
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
 
-            // Wait for exit or timeout
-            using var cts = new CancellationTokenSource(timeoutMs);
-            using var reg = cts.Token.Register(() => exitTcs.TrySetResult(false));
-            var exited = await exitTcs.Task.ConfigureAwait(false);
+            // Wait for exit, a silence of idleSeconds (hung) or maxSeconds in all
+            long startTicks = Environment.TickCount64;
+            string? killReason = null;
+            bool exited = false;
+            while (!exited)
+            {
+                var done = await Task.WhenAny(exitTcs.Task, Task.Delay(1000)).ConfigureAwait(false);
+                if (done == exitTcs.Task) { exited = true; break; }
+                long now = Environment.TickCount64;
+                long idleMs = now - Interlocked.Read(ref lastOutputTicks);
+                if (idleMs >= idleSeconds * 1000L) killReason = $"no output for {idleMs / 1000}s";
+                else if (now - startTicks >= maxSeconds * 1000L) killReason = $"{(now - startTicks) / 1000}s in all";
+                if (killReason != null) break;
+            }
 
             if (exited)
             {
@@ -135,7 +154,8 @@ namespace PlaywrightMultiTest
             }
             else
             {
-                LogStatus($"RunDotnetAsync: TIMEOUT after {timeoutMs / 1000}s, killing PID={p.Id}...");
+                LogStatus($"RunDotnetAsync: TIMEOUT ({killReason}), killing PID={p.Id}...");
+                Console.WriteLine($"[PMT] dotnet {args.Split(' ')[0]} killed: {killReason} (PMT_DOTNET_IDLE_SECONDS / PMT_DOTNET_MAX_SECONDS)");
                 try { p.Kill(entireProcessTree: true); } catch { }
                 return -1;
             }

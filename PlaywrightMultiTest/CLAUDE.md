@@ -40,7 +40,7 @@ Execution runs in `ProjectRunner.StartUp` (NUnit `OneTimeSetUp`) as backend **la
 **⚠ `--filter` GOTCHA:** with the scheduler ON, `dotnet test --filter` does NOT scope EXECUTION — the NUnit adapter consumes `--filter` before it reaches this testhost, and the scheduler already ran the full enumerated set in `StartUp`. `--filter` only narrows what NUnit *reports*. **Use `PMT_FILTER` for scoped runs.**
 
 ## Key Constraints
-- **Blazor WASM publish** takes under 2 minutes — anything longer means it's hung
+- **Blazor WASM publish** takes under 2 minutes warm; a cold first publish in a fresh clone (package restore) can take well over 5. PMT kills a `dotnet` publish only when it prints nothing for `PMT_DOTNET_IDLE_SECONDS` (default 600) or runs past `PMT_DOTNET_MAX_SECONDS` (default 3600); the reason is in `init_status.log` ("TIMEOUT (no output for ...)"). It was a flat 300 s until 2026-11-18, which killed healthy cold publishes and then refused the whole sweep ("NO BROWSER PAGE").
 - **Subprocess output capture**: `ProcessRunner.Run` waits for stream-EOF sentinels before reading output (SpawnDev.UnitTesting 2.5.3+). Without that, concurrent desktop runs can lose the final `TEST: {json}` line.
 - **Blazor error detection**: checks `#blazor-error-ui` before/after each test
 - **Console capture**: browser console errors/warnings via Playwright `page.Console` event
