@@ -4,7 +4,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
-- **SpawnDev.ILGPU 5.4.37** (local.1 until its stable). Its CUDA page-lock now binds the context on any thread, so:
+- **SpawnDev.ILGPU 5.4.37** (stable, 2026-11-18; ML gate on its local.1: 7,812 / 0 / 495, no Pass -> Fail). Its CUDA page-lock now binds the context on any thread, so:
 - **Streamed block images are page-locked on CUDA** (`StreamedModelWeights.PageLockImages`, env `ML_STREAM_PAGELOCK=0` turns it off): uploads are a straight DMA.
   MEASURED 2026-11-18, LTX-2 768 x 512 x 121 two-row calls from an NVMe drive, alternating A/B, 6 calls each way: upload 5.8 -> 4.5 s a call, the call 0.5 to
   1.7 s faster (from a SATA drive the reads set the pace). Every registration is released when the weights are disposed: the read-ahead test counts them,
