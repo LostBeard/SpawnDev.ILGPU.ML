@@ -89,10 +89,53 @@ public sealed class StreamedModelWeights : IDisposable
         }
         return o;
     }
-    private readonly Dictionary<int, byte[]> _hostCache = new();
+    private readonly Dictionary<int, BlockImage> _hostCache = new();
     private long _hostCacheUsed;
     // the read-ahead: the next streamed blocks in forward order (wrapping into the next pass), each read after the one before it (one reader: one disk)
-    private readonly List<(int Block, Task<byte[]> Image, long Bytes)> _ahead = new();
+    private readonly List<(int Block, Task<BlockImage> Image, long Bytes)> _ahead = new();
+
+    // A block image in host memory: Length bytes of a REUSED buffer. Buffers come from and go back to a small pool: a fresh 0.4 GB array per streamed load was
+    // 54 to 278 gen-2 collections per LTX-2 clip (MEASURED 2026-11-18; 22 with the pool).
+    // NOT page-locked yet. On CUDA, buffers from accelerator.AllocatePageLocked1D upload faster (MEASURED the same night, LTX-2, 16.2 GB a call: upload 7.5 -> 5.8 s
+    // exact, 5.2 -> 3.4 s on the tensor cores, bit-identical), but ILGPU's CudaPageLockScope registers the range WITHOUT binding the accelerator's context to the
+    // calling thread, and these buffers are rented on thread-pool threads: "CudaException: invalid device context at MemHostRegister" whenever the context is
+    // not current there (it failed 2 of 3 runs). That is ILGPU's to fix (note to Data, _DevComms 2026-11-18); then RentImage can allocate them page-locked.
+    private sealed class BlockImage
+    {
+        public required byte[] Bytes;
+        public int Length;
+    }
+    private readonly List<BlockImage> _freeImages = new();
+    private const int MaxFreeImages = 2;                                                           // the one being uploaded + the one being read: what was live before the pool
+    private long _maxBlockBytes = -1;
+    private bool _disposed;
+
+    private BlockImage RentImage(long total)
+    {
+        lock (_freeImages)
+        {
+            for (int i = 0; i < _freeImages.Count; i++)
+                if (_freeImages[i].Bytes.Length >= total) { var im = _freeImages[i]; _freeImages.RemoveAt(i); im.Length = (int)total; return im; }
+            if (_maxBlockBytes < 0) for (int k = 0; k < BlockCount; k++) if (_resident[k] == null) _maxBlockBytes = Math.Max(_maxBlockBytes, BlockBytes(k));
+        }
+        // room for the largest streamed block and its header, so one buffer serves every block
+        long cap = Math.Min(Array.MaxLength, Math.Max(total, _maxBlockBytes + (1 << 20)));
+        return new BlockImage { Bytes = GC.AllocateUninitializedArray<byte>((int)cap), Length = (int)total };
+    }
+
+    private void ReturnImage(BlockImage image)
+    {
+        lock (_freeImages)
+        {
+            // as many spare buffers as the read-ahead can have in flight; one beyond that is left to the collector
+            int spare = Math.Max(MaxFreeImages, (int)(ReadAheadBytes / Math.Max(1, _maxBlockBytes)) + 2);
+            if (!_disposed && _freeImages.Count < spare) _freeImages.Add(image);
+        }
+    }
+
+    // a read nobody will consume: its buffer goes back once the read has finished
+    private void DropRead(Task<BlockImage> read)
+        => _ = read.ContinueWith(t => { if (t.Status == TaskStatus.RanToCompletion) ReturnImage(t.Result); else _ = t.Exception; }, TaskScheduler.Default);
 
     /// <summary>
     /// Host RAM (bytes) the read-ahead may hold in block images (default 0: the next block only, whatever its size). With a budget the reader keeps reading the
@@ -131,11 +174,11 @@ public sealed class StreamedModelWeights : IDisposable
     }
 
     // block k's image from the read-ahead when it is queued (everything queued before it was skipped by the caller: observed and dropped)
-    private async Task<byte[]?> TakeReadAheadAsync(int k)
+    private async Task<BlockImage?> TakeReadAheadAsync(int k)
     {
         int at = _ahead.FindIndex(a => a.Block == k);   // by block, never "the first queued": out of order that hands out another block's image (red-check)
         if (at < 0) return null;
-        for (int i = 0; i < at; i++) _ = _ahead[i].Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+        for (int i = 0; i < at; i++) DropRead(_ahead[i].Image);
         var image = _ahead[at].Image;
         _ahead.RemoveRange(0, at + 1);
         return await image;
@@ -327,7 +370,7 @@ public sealed class StreamedModelWeights : IDisposable
     /// Block <paramref name="k"/> as a self-contained safetensors image in host memory: a header naming its tensors (the file's own names and metadata) and their bytes,
     /// read from the file by offset. The loader then runs on it exactly as on the file.
     /// </summary>
-    private async Task<byte[]> ReadBlockImageAsync(int k, CancellationToken ct)
+    private async Task<BlockImage> ReadBlockImageAsync(int k, CancellationToken ct)
     {
         var list = _blockTensors[k];
         // the header, written directly (trim-safe: no reflection serializer)
@@ -357,21 +400,26 @@ public sealed class StreamedModelWeights : IDisposable
         int hlen = (json.Length + 7) / 8 * 8;
         long total = 8 + hlen + off;
         if (total > Array.MaxLength) throw new NotSupportedException($"'{_file}': block {k} is {total} bytes, larger than one host array");
-        var image = new byte[total];
-        BitConverter.TryWriteBytes(image.AsSpan(0, 8), (long)hlen);
-        json.CopyTo(image, 8);
-        for (int i = 8 + json.Length; i < 8 + hlen; i++) image[i] = (byte)' ';
-        var rd = System.Diagnostics.Stopwatch.StartNew();
-        await using var s = await _source.OpenAsync(_repo, _file, ct);
-        long pos = 8 + hlen;
-        foreach (var t in list)
+        var rented = RentImage(total);                                                      // every byte of [0, total) is written below: the buffer comes as it is
+        try
         {
-            s.Seek(t.DataOffset, SeekOrigin.Begin);
-            await s.ReadExactlyAsync(image.AsMemory((int)pos, (int)t.DataLength), ct);
-            pos += t.DataLength;
+            var image = rented.Bytes;
+            BitConverter.TryWriteBytes(image.AsSpan(0, 8), (long)hlen);
+            json.CopyTo(image, 8);
+            for (int i = 8 + json.Length; i < 8 + hlen; i++) image[i] = (byte)' ';
+            var rd = System.Diagnostics.Stopwatch.StartNew();
+            await using var s = await _source.OpenAsync(_repo, _file, ct);
+            long pos = 8 + hlen;
+            foreach (var t in list)
+            {
+                s.Seek(t.DataOffset, SeekOrigin.Begin);
+                await s.ReadExactlyAsync(image.AsMemory((int)pos, (int)t.DataLength), ct);
+                pos += t.DataLength;
+            }
+            lock (_hostCache) ReadSeconds += rd.Elapsed.TotalSeconds;
+            return rented;
         }
-        lock (_hostCache) ReadSeconds += rd.Elapsed.TotalSeconds;
-        return image;
+        catch { ReturnImage(rented); throw; }
     }
 
     /// <summary>Block <paramref name="k"/>'s tensors: the resident set, or a fresh load from the file that the caller disposes after the device has run it (<paramref name="streamed"/> true).</summary>
@@ -380,22 +428,27 @@ public sealed class StreamedModelWeights : IDisposable
         if (_retired.Count > 0) { await _acc.SynchronizeAsync(); foreach (var old in _retired) old.Dispose(); _retired.Clear(); }
         if (_resident[k] is { } r) return (r, false);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        byte[] image;
-        if (_hostCache.TryGetValue(k, out var cached)) image = cached;
+        BlockImage image; bool kept = false;                                                      // kept: the host cache holds it, it does not go back to the pool
+        if (_hostCache.TryGetValue(k, out var cached)) { image = cached; kept = true; }
         else if (await TakeReadAheadAsync(k) is { } ahead) image = ahead;
         else
         {
             // not what the read-ahead expected (the caller left the forward order): its queue is of no use, drop it and read this block now
-            foreach (var a in _ahead) _ = a.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+            foreach (var a in _ahead) DropRead(a.Image);
             _ahead.Clear();
             image = await ReadBlockImageAsync(k, ct);
         }
-        if (!_hostCache.ContainsKey(k) && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; }
+        if (!kept && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; kept = true; }
         if (Prefetch) TopUpReadAhead(k);
-        var up = System.Diagnostics.Stopwatch.StartNew();
-        var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, 0, image.Length, writable: false, publiclyVisible: true)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
-        await _acc.SynchronizeAsync();                                                            // the upload's own time, not a later kernel's
-        UploadSeconds += up.Elapsed.TotalSeconds;
+        GpuWeights loaded;
+        try
+        {
+            var up = System.Diagnostics.Stopwatch.StartNew();
+            loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image.Bytes, 0, image.Length, writable: false, publiclyVisible: true)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
+            await _acc.SynchronizeAsync();                                                        // the upload's own time, not a later kernel's; and nothing reads the image after it
+            UploadSeconds += up.Elapsed.TotalSeconds;
+        }
+        finally { if (!kept) ReturnImage(image); }
         StreamSeconds += sw.Elapsed.TotalSeconds; StreamedLoads++;
         return (loaded, true);
     }
@@ -461,8 +514,9 @@ public sealed class StreamedModelWeights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
+        lock (_freeImages) { _disposed = true; _freeImages.Clear(); }
         _hostCache.Clear(); _hostCacheUsed = 0;
-        foreach (var a in _ahead) _ = a.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);   // reads still in flight: observed, dropped
+        foreach (var a in _ahead) DropRead(a.Image);                                              // reads still in flight: their buffers are released when they finish
         _ahead.Clear();
         foreach (var r in _retired) r.Dispose(); _retired.Clear();
         foreach (var r in _resident) r?.Dispose();

@@ -16,6 +16,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - **Streamed blocks upload straight from their host image** (`GpuWeights`: a block image is already an array, so its tensors go array to device instead of
     through the stream copy's chunk buffer; desktop backends; every model on `StreamedModelWeights`). LTX-2, 16.2 GB a call: about 1 s a call less (uploads
     8.4 -> 7.5 s exact, 6.2 -> 5.1 s on the tensor cores; a two-row call from the NVMe drive 20.9 -> 19.9 s), outputs bit-identical.
+  - **Block images are reused** (`StreamedModelWeights`: a pool of two buffers instead of a fresh array of the block's size per streamed load): LTX-2, another
+    0.5 to 1 s a call (NVMe, tensor cores: 19.9 -> 19.3 s) and 12 gen-2 collections in a benchmark run where there were 54 to 278 in a clip. Page-locked buffers
+    upload faster still on CUDA (5.8 / 3.5 s against 6.9 / 4.5 s, measured) but need a fix in SpawnDev.ILGPU first (its CUDA page-lock scope does not bind the
+    device context: it fails off the thread that holds it).
   - Regression set after the read-ahead change, CUDA: LTX-2 call / sample / Gemma / LoRA, FLUX.1 (plain and fp8 scaled), Z-Image, Qwen-Image, Qwen-Image Edit 2509
     and 2511 transformer gates all pass at their usual times.
 
