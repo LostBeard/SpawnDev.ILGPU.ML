@@ -1,7 +1,7 @@
 # Video generation
 
 Two video models run in this library, on the desktop and in a browser tab: **LTX-Video 2B 0.9.8 distilled** (`LtxPipeline`, 7 steps, small and fast; [below](#video-generation-ltx-video-2b-098-distilled))
-and **Wan 2.2 TI2V-5B** (`Wan22Pipeline`, the 4-step Turbo or the standard 50-step model with MagCache; [below](#video-generation-wan-22-ti2v-5b)). The `/video` page puts both behind one studio.
+and **Wan 2.2 TI2V-5B** (`Wan22Pipeline`, the 4-step Turbo or the standard 50-step model with MagCache; [below](#video-generation-wan-22-ti2v-5b)). The `/video` page puts both behind one studio. A third, **LTX-2 19B** (`Ltx2Pipeline`: video WITH sound from one model, desktop GPUs, ComfyUI's own files), is [at the end](#audio--video-generation-ltx-2-19b).
 
 ## The /video studio
 
@@ -246,3 +246,89 @@ with the pixels; the denoise stages grow with the token count. Not yet verified 
 ## Licence
 
 The weights are under the LTXV Open Weights License 0.X (Lightricks, 2025-04-15; it covers every LTXV release since 0.9.6, so 0.9.8): free use under its use-based restrictions (Attachment A); redistribution of the model or of modified files only with a copy of the licence, the Attachment A restrictions passed on as enforceable terms, prominent notices on changed files and the original notices kept (its section 3). Entities with annual revenues of at least $10,000,000 must obtain a paid commercial licence from Lightricks (its section 2). The x2 latent upscaler (`ltxv-spatial-upscaler-0.9.8`) carries the same terms in a version dated 2025-05-05, hosted beside it as LICENSE-spatial-upscaler.txt. The T5-v1.1-XXL encoder is Apache 2.0.
+
+
+# Audio + video generation: LTX-2 19B
+
+`Ltx2Pipeline` (`SpawnDev.ILGPU.ML.Ltx2`): a prompt (and optional keyframe pictures) to a clip WITH sound, from Lightricks' LTX-2 19B: one 48-block transformer over a video
+stream (width 4096) and an audio stream (width 2048) that attend to each other, the Gemma 3 12B text encoder, the video VAE (32 x 32 x 8), the audio VAE and its vocoder
+(stereo, 24 kHz). It reads **ComfyUI's own files as they are** (the fp8 checkpoint, the NVFP4 / fp8 Gemma file, the distilled LoRA) and is checked stage by stage against
+ComfyUI's own runs. Desktop GPUs for now (CUDA, OpenCL): the 27 GB checkpoint is streamed from disk block by block, so the transformer runs on a 12 GB card.
+
+```csharp
+using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Ltx2;
+
+// ComfyUI's layout under one folder: lightricks/ltx-2-19b-dev-fp8.safetensors, lightricks/ltx-2-19b-distilled-lora-384.safetensors,
+// comfy/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors
+var pipeline = new Ltx2Pipeline(accelerator, new LocalFolderModelSource("D:/models/ltx2"), Ltx2Paths.InFolder());
+var clip = await pipeline.GenerateAsync(new Ltx2Request
+{
+    Prompt = "A golden retriever puppy runs toward the camera through a sunlit meadow. Birds sing.",
+    Width = 768, Height = 512, Frames = 121,      // multiples of 32; frames 8 n + 1
+    Distilled = true,                             // the distilled LoRA: 8 steps, no guidance. false: Steps (20) at Cfg (4) with NegativePrompt
+    Seed = 42,
+});
+// clip.Video.FramesRgba: one RGBA byte array per frame; clip.Audio: stereo [2, samples] channel-first at clip.AudioSampleRate (24 kHz);
+// clip.Seconds: the time of each stage
+```
+
+**Keyframes** (`Ltx2Request.Keyframes`, ComfyUI's LTXVAddGuide): `Ltx2Keyframe.FromRgb(rgb, width, height, frameIndex, strength)`. Frame 0 is image to video; a negative
+index counts from the end. Strength 1 keeps the picture; below 1 it is denoised from (1 - strength) and pulls the other frames less. Several keyframes and per-token
+attention masks are supported by the model call (`Ltx2Guide`).
+
+**LoRA on the 8-bit layers, two modes.** ComfyUI adds a LoRA to an fp8 weight and then re-rounds the sum to 8 bits with a seeded random rounding, which costs about a
+third of a one-block LoRA's effect in noise. The default here keeps the sum exact in float32 (the LoRA's full effect). `Ltx2Request.ComfyCompatibleFp8Lora = true`
+reproduces ComfyUI's rounding exactly (measured from its outputs, never read from its source): use it to reproduce a ComfyUI render.
+
+**The stages on their own:** `Gemma3TextEncoder`, `Ltx2TextConnectors`, `Ltx2Transformer` / `Ltx2AvModel` (the model call and the sampler in ComfyUI's form),
+`Ltx2Schedule` (LTXVScheduler), `Ltx2VideoDecoder`, `Ltx2VideoEncoder`, `Ltx2AudioDecoder`, `Ltx2LatentUpsampler` (the x2 latent upscaler), `Ltx2Lora`.
+
+## Parity with ComfyUI (its own inputs, float32 taps from SpawnGen; relative RMS; `MLTestBase.Ltx2Tests.cs`)
+
+| Stage | CUDA |
+|---|---|
+| Gemma 3 12B features (NVFP4 + fp8 layers) | 2.3e-6 |
+| Text connectors | 1.9e-6 |
+| Transformer, one call (48 blocks) | 1.2e-5 |
+| Sampler run (2 steps, CFG) | 5.5e-5 |
+| Keyframe-guided call (strength 1 / 0.6 / pixel mask / two guides) | 3.5e-6 / 6.6e-6 / 1.7e-5 / 1.0e-5 |
+| Keyframe-guided sampling, final latent | 4.6e-5 |
+| Video decode, frames | 9.4e-6 |
+| Video encode (keyframe latents) | 4.9e-6 |
+| Audio decode + vocoder, waveform | 3.6e-5 |
+| x2 latent upscaler | 4.8e-6 |
+| Distilled LoRA on bf16 layers | 5.3e-6 |
+| Distilled LoRA on fp8 layers, ComfyUI-compatible mode (block 1) | 3.3e-5 (OpenCL 3.2e-5) |
+| The same, exact mode (the distance IS ComfyUI's rounding noise) | 7.4e-3 |
+
+SpawnGen runs the same stages on an AMD RX 590 through OpenCL. There is no whole-clip reference: every stage has its own gate, and the pipeline test checks that the result
+is a moving picture with sound and, with a keyframe, that the guided frame is the picture (luma correlation 0.997).
+
+## Measured (RTX 4070 12 GB, CUDA, the checkpoint on a SATA drive, 768 x 512, 121 frames + 4.8 s of stereo sound)
+
+| Run | Total | Text encode | Sampling | Video decode | Audio decode |
+|---|---|---|---|---|---|
+| Distilled, 8 steps (text to video) | 458 s | 26 s | 419 s (52 s a step) | 12 s | 0.9 s |
+| Distilled, 8 steps, a keyframe at frame 0 | 471 s | 26 s | 432 s | 12 s | 0.9 s |
+| Distilled, 8 steps, ComfyUI-compatible LoRA rounding | 464 s | 25 s | 426 s | 12 s | 0.8 s |
+| Full recipe, 20 steps at CFG 4 with the negative prompt (two model rows a step) | 946 s | 29 s | 904 s (45 s a step) | 12 s | 0.9 s |
+
+Sampling is bound by the disk: at this size one two-row model call takes 48.5 s, of which 37.6 s is reading the streamed blocks from the SATA drive and 7.6 s uploading
+them (`Ltx2_RealSize_Benchmark`). `Ltx2Pipeline.TransformerResidentBytes` sets how much of the transformer stays on the device between calls (default 5 GB: 11 of the 48
+blocks on this card). Host memory after a clip: about 1.0 to 1.4 GB committed.
+
+## Limits
+
+- Desktop GPUs only (CUDA and OpenCL are tested). Nothing here has run in a browser: the checkpoint is 27 GB.
+- The pipeline has run at 768 x 512 x 121; the model call is also gated at 128 x 96 x 9 and 384 x 256 x 25 against ComfyUI. Other sizes are not measured.
+- The two-pass recipe (the x2 latent upscaler, then a second pass) is not wired into `Ltx2Pipeline`; `Ltx2LatentUpsampler` and the batch-1 second-pass sampler are there
+  and gated on their own.
+- The ComfyUI-compatible LoRA mode is verified against ComfyUI on one block's taps (block 1; every element of the rounding against the rule); a whole-render comparison
+  against ComfyUI is still to be measured.
+- There is no whole-clip reference run: the gates are per stage.
+
+## Licence
+
+The code is ported from Hugging Face diffusers' LTX-2 implementation and transformers' Gemma 3 (both Apache-2.0). The weights are not hosted or redistributed by this
+project: you download Lightricks' LTX-2 files and the Gemma 3 text encoder yourself, under their own licences; read them before use, they are not the library's licence.

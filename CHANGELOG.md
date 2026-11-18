@@ -2,11 +2,11 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.21 - 2026-11-17 (nuget.org) - LTX-2 19B (video with sound) against ComfyUI, on ComfyUI's own files; SpawnDev.ILGPU 5.4.36
 
 - **SpawnDev.ILGPU 5.4.36** (Wasm buffers stay in the linear memory between dispatches). ML Wasm-lane gate on 5.4.36-local.1: 1105 / 0 / 64, no Pass -> Fail, time
   0.982x of 5.4.35; the training / backward tests 1.6-2.05x faster.
-- **LTX-2 19B (audio + video), work in progress** (`Ltx2`: ported from Hugging Face diffusers' Apache-2.0 LTX-2 code and transformers' Gemma 3; Plans/ltx-2-19b-2026-11-17.md),
+- **LTX-2 19B (audio + video) on desktop GPUs** (`Ltx2`; [Docs/video.md](Docs/video.md): ported from Hugging Face diffusers' Apache-2.0 LTX-2 code and transformers' Gemma 3; Plans/ltx-2-19b-2026-11-17.md),
   each part on ComfyUI's own inputs against SpawnGen's float32 taps, CUDA:
   - `Gemma3TextEncoder`: Gemma 3 12B from ComfyUI's text-encoder files (gemma_3_12B_it_fp4_mixed: NVFP4 + fp8 layers), streamed per layer, the token table never uploaded;
     the 49 hidden-state slots normalised into LTX-2's features: layers 1e-5, features 1.1e-5 (`Ltx2_Gemma3Encode_MatchesComfyUi`).
@@ -20,6 +20,18 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2LatentUpsampler` (ltx-2-spatial-upscaler-x2-1.0: the second pass's x2 latent upscale; ComfyUI's LTXVLatentUpsampler applies no AdaIN): 4.8e-6
     (`Ltx2_LatentUpsample_MatchesComfyUi`).
   - `Ltx2VideoEncoder` (the checkpoint's BF16 vae.encoder, for image-to-video): 4.9e-6 (`Ltx2_VideoEncode_MatchesComfyUi`).
+  - **`Ltx2Pipeline.GenerateAsync`: a prompt to a clip with sound in one call** (`Ltx2Request` / `Ltx2Clip` / `Ltx2Paths`): Gemma encode, connectors, the sampler on
+    the device (LTXVScheduler sigmas with CFG, or the distilled LoRA's 8 steps), video and audio decode; the stages open one after another, so one large model is on
+    the device at a time. MEASURED, RTX 4070, 768 x 512 x 121 frames + 4.8 s of stereo: distilled 458 s (encode 26, sampling 419 = 52 s a step, bound by reading the
+    streamed blocks from a SATA drive, video decode 12, audio 0.9); the full recipe, 20 steps at CFG 4 with the negative prompt, 946 s (sampling 904 = 45 s a step);
+    the frames are a coherent clip of the prompt (`Ltx2_Pipeline_GeneratesClip`).
+  - **Keyframe guides** (ComfyUI's LTXVAddGuide; `Ltx2Request.Keyframes` / `Ltx2Keyframe`, `Ltx2Guide` on the model call): per-frame timesteps, the guide tokens' RoPE
+    boxes, ln(strength x mask) on the attention between noisy and guide tokens (`DiTKernels.BiasedAttention`, a biased flash kernel), ComfyUI's masked sampling.
+    Against ComfyUI: guided calls 3.5e-6 (strength 1), 6.6e-6 (0.6), 1.7e-5 (pixel mask), 1.0e-5 (two guides); 384 x 256 x 25 call 1.0e-5; guided sampling 4.6e-5
+    (`Ltx2_GuidedCall*`, `Ltx2_GuidedSample_MatchesComfyUi`). Image to video through the pipeline: the guided frame against the picture, luma correlation 0.997; 471 s.
+  - `Ltx2Schedule`: ComfyUI's LTXVScheduler in float32 (worst 8.9e-7 over 37 ComfyUI schedules) and the distilled lists (`Ltx2_Schedule_MatchesComfyUi`).
+  - The model call and the sampler run on the device (the latent crosses to the host once, at the end); every LTX-2 VAE / upscaler convolution splits its rows into
+    bounded dispatches (`SparseKernels.MaxConvWorkPerDispatch`), bit-identical to one dispatch, so a real clip's decode has no multi-second dispatch.
   - `Ltx2Lora` + `Ltx2Transformer.AddLora` (PEFT lora_A / lora_B, e.g. the distilled LoRA 384; applied on the fly as strength (x A^T) B^T, streamed per block): on bf16 layers,
     where ComfyUI's patched weight is float32 W + B A, calls 5.5e-6 and the final latent 5.3e-6 (`Ltx2_Lora_Bf16Subset_MatchesComfyUi`). On fp8 layers ComfyUI re-rounds
     W + B A into fp8 STOCHASTICALLY (seeded, repeatable); the default here keeps W + B A exact (the LoRA's full effect): 7.4e-3 from ComfyUI on block 1 against the

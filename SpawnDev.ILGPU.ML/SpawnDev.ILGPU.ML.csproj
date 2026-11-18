@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.20</Version>
-		<PackageReleaseNotes>v5.8.20 - on SpawnDev.ILGPU 5.4.35. ACE-Step 1.5 text-to-music, checked against ComfyUI's own runs (audio_ace_step_1_5_split): AceStepGenerator (caption + lyrics, condition encoder, the diffusion transformer, the Oobleck VAE), the 1.7B audio-code LM with a KV cache (AceStepCodeLm: CFG, temperature, top-p / top-k / min-p), audio codes to hints (AceStepCodeDecoder), ComfyUI's prompt templates (AceStepPrompts), the VAE encoder, and ACE-Step's MIT silence latent. Qwen3KvDecoder (any Qwen3 size, KV cache); Flux2TextEncoder runs any Qwen3 size. The Oobleck VAE decodes 10 s of audio in 1.4 s (implicit-GEMM convolutions). See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.21</Version>
+		<PackageReleaseNotes>v5.8.21 - on SpawnDev.ILGPU 5.4.36. LTX-2 19B, video WITH sound from one model, on desktop GPUs, reading ComfyUI's own files (the fp8 checkpoint streamed block by block, the NVFP4 / fp8 Gemma 3 12B, the distilled LoRA) and checked stage by stage against ComfyUI's own runs: Ltx2Pipeline (prompt to clip with sound; the distilled 8 steps or 20 steps with CFG), keyframe guides (image to video, several keyframes, strengths, masks), Gemma3TextEncoder, Ltx2Transformer / Ltx2AvModel, Ltx2Schedule, the video and audio VAEs, the vocoder, the x2 latent upscaler, Ltx2Lora with an opt-in mode that reproduces ComfyUI's seeded fp8 re-rounding of LoRA-patched weights. NVFP4 weights; streamed weights prefetch the next block. Fixes: SentencePiece BPE now applies real merges (Gemma / llama / mistral vocabularies), the CUDA precise-activation GEMM no longer loses accuracy with long sums, the tiled GEMM's gathered rows with BF16 weights. See CHANGELOG.md.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
