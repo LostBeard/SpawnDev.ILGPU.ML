@@ -5,15 +5,18 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 ## Unreleased
 
 - **Attention on the tensor cores at near-fp32 accuracy** (`DiTKernels.ExactTensorCoreAttention`, `Ltx2Pipeline.ExactTensorCoreAttention`,
-  `Ltx2Transformer.ExactTensorCoreAttention`; env `TRELLIS2_MMA_EXACT_ATTN=1` for every model on `DiTKernels`; CUDA cards with tensor cores, head width 128;
-  **off by default**). With `PreciseActivations` on, attention ran the portable fp32 flash kernel, the slowest stage of an LTX-2 call. The new kernel
+  `Ltx2Transformer.ExactTensorCoreAttention`, `DiTKernels.DefaultExactTensorCoreAttention`; env `TRELLIS2_MMA_EXACT_ATTN=0` turns it off for every model on
+  `DiTKernels`; CUDA cards with tensor cores, head width 128; **on by default wherever `PreciseActivations` is on**). With `PreciseActivations` on, attention ran the portable fp32 flash kernel, the slowest stage of an LTX-2 call. The new kernel
   (`MmaAttention.KernelExact`) keeps q, k, v and the probabilities as two bf16 values each (hi + lo), runs three tensor-core passes per product, adds the partial
   sums in fp32, and centres the keys first (the mean key is subtracted: a softmax does not see a term common to all keys, but the split would spend its bits
   on it). MEASURED 2026-11-18, RTX 4070:
   - Speed: LTX-2's video self-attention (6144 x 6144 tokens, 32 heads x 128) 140.4 -> 46.5 ms; the GPU work of a precise two-row call at 768 x 512 x 121
     34.2 -> 23.7 s. (The bf16 kernel of `PreciseActivations = false` takes 18.5 ms.)
   - One attention against a float64 reference (relative RMS): fp32 kernel 3e-7, this kernel 4e-6 to 9e-6, bf16 kernel 2e-3 to 5e-3. It is NOT fp32-exact,
-    which is why it is opt-in.
+    Whether it should be the default was settled by a test fixed before it ran: LTX-2 distilled clips (768 x 512 x 121) with seeds 42, 7 and 1234, mean
+    |frame difference| (0..255) from the CUDA clip with the fp32 kernel: this kernel 0.0230 / 0.0075 / 0.0213 (mean 0.0173), the same exact path on OpenCL
+    0.0205 / 0.0186 / 0.0221 (mean 0.0204). It moves a clip less than changing backend does, so it is the default; `PreciseActivations = false` for scale: 3.09.
+    Models whose precise path it now runs: LTX-2 (transformer, text connectors), FLUX.1, Qwen-Image, Z-Image, ACE-Step (DiT, condition encoder, code LM).
   - Against ComfyUI's float32 references, with it on / with the fp32 kernel: LTX-2 final projection 5.9e-6 / 1.2e-5; LTX-2 LoRA final latent 9.3e-6 / 5.3e-6;
     FLUX.1 calls 9.9e-6, 2.0e-5 / 5.6e-6, 2.3e-5; Qwen-Image calls 2.4e-4, 1.3e-4 / 1.8e-4, 1.8e-4; Z-Image passes its gate either way.
   - Why the centring: Qwen-Image's first block has keys whose common part is 4.5 times their variation and scores up to 3.5e4. Without centring the kernel was

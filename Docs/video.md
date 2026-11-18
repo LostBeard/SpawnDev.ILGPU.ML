@@ -320,15 +320,15 @@ Where a step's time goes, MEASURED on this card (`Ltx2_RealSize_Benchmark`, repe
 8 s uploading the 16.2 GB of streamed blocks; the disk reads (34 s from the SATA drive, 0.43 GB/s) run behind the GPU work, so the call waits on them about 5 s. A distilled step computes one row but streams 6.7 GB of LoRA blocks more: 22.9 GB, about 53 s of reading against its 52 s, so there the disk sets the pace. `Ltx2Pipeline.TransformerResidentBytes` sets how much of the transformer stays on the device between calls (default 5 GB: 11 of the 48
 blocks on this card). Host memory after a clip: about 1.0 to 1.4 GB committed.
 
-**Four switches on `Ltx2Pipeline` trade memory or exactness for time** (all off by default; the two memory ones do not change the result by a bit):
+**Four switches on `Ltx2Pipeline` trade memory or exactness for time** (the two memory ones do not change the result by a bit):
 
 - `PreciseActivations = false`: the transformer's GEMMs and attention on the tensor cores with bf16 activations. About half the GPU work; the result of one call
   moves 5.8e-3 (relative RMS) from the exact one. It pays when the drive keeps up: a two-row call 38.8 -> 20.9 s from the NVMe drive, 44.0 -> 39.7 s from the SATA one.
-- `ExactTensorCoreAttention = true` (with `PreciseActivations` left on; CUDA cards with tensor cores): the attentions on the tensor cores with every value
+- `ExactTensorCoreAttention` (on by default; with `PreciseActivations` on, CUDA cards with tensor cores): the attentions on the tensor cores with every value
   kept as two bf16 halves. The GPU work of a two-row call 34.2 -> 23.7 s (measured 2026-11-18; the video self-attention alone 14.3 -> 5.1 s). One attention is
   4e-6 to 9e-6 (relative RMS) from an exact one, where the default fp32 kernel is 3e-7 and the bf16 kernel 3e-3; against ComfyUI's float32 references the
-  transformer is as close with it as without (5.9e-6 and 1.2e-5 at the final projection). The middle setting: most of the exact path's accuracy, a third
-  less GPU work.
+  transformer is as close with it as without (5.9e-6 and 1.2e-5 at the final projection). Over three seeds of the distilled clip it moved the frames less
+  (mean |difference| 0.0173 of 255) than running the fp32 kernel on OpenCL instead of CUDA does (0.0204), so it is the default; `false` runs the fp32 kernel.
 - `HostCacheBytes`: host RAM that keeps streamed blocks between steps. It pays where the disk sets the pace: with 6 GB the distilled clip from the SATA drive
   went 458 -> 424 s; the GPU-bound two-row call did not change.
 - `ReadAheadBytes`: how far the reader runs ahead of the device. With 2 GB from the SATA drive: a two-row call 44.0 -> 40.6 s, the distilled clip 458 -> 439 s;

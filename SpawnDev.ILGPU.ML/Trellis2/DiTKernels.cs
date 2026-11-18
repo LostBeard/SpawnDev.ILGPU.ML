@@ -485,9 +485,14 @@ public sealed class DiTKernels
     /// <summary>
     /// With <see cref="PreciseActivations"/> on a tensor-core card: run head-width-128 attention on <see cref="MmaAttention.KernelExact"/> (q, k, v and the
     /// probabilities as hi + lo bf16 halves, three MMAs per product, fp32 sums: near-fp32 results) instead of the portable fp32 kernel.
-    /// Env TRELLIS2_MMA_EXACT_ATTN=1 turns it on for new instances.
+    /// On by default (<see cref="DefaultExactTensorCoreAttention"/>; env TRELLIS2_MMA_EXACT_ATTN=0 turns it off for new instances). DECIDED 2026-11-18 by a
+    /// pre-registered test: LTX-2 distilled 768 x 512 x 121 clips, seeds 42 / 7 / 1234, mean |frame difference| (0..255) from the CUDA fp32-kernel clip:
+    /// this kernel 0.0230 / 0.0075 / 0.0213 (mean 0.0173), the OpenCL fp32 path 0.0205 / 0.0186 / 0.0221 (mean 0.0204): inside the spread the precise path
+    /// already has between backends. (PreciseActivations = false, for scale: 3.09.)
     /// </summary>
-    public bool ExactTensorCoreAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_EXACT_ATTN") == "1";
+    public bool ExactTensorCoreAttention { get; set; } = DefaultExactTensorCoreAttention;
+    /// <summary>The default of <see cref="ExactTensorCoreAttention"/> for new instances: true unless env TRELLIS2_MMA_EXACT_ATTN=0. Settable (an app's setting).</summary>
+    public static bool DefaultExactTensorCoreAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_EXACT_ATTN") != "0";
     /// <summary>False: the exact tensor-core attention does not centre its keys (tests use it to show what the centring is worth; env TRELLIS2_ATTN_CENTER=0).</summary>
     public static bool CenterAttentionKeys { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_ATTN_CENTER") != "0";
     private bool UsesMmaExactAttention(int headDim)

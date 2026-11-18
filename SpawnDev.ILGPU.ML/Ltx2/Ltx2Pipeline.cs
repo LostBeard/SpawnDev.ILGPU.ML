@@ -150,9 +150,10 @@ public sealed class Ltx2Pipeline
     /// two bf16 halves each (three passes per product, fp32 sums, keys centred). MEASURED 2026-11-18, RTX 4070, 768 x 512 x 121: the GPU work of a two-row call
     /// 34.2 s -> 23.7 s (video self-attention 14.3 s -> 5.1 s); one attention is 4e-6 to 9e-6 (relative RMS) from float64 where the fp32 kernel is 3e-7 and the
     /// bf16 one 3e-3; the transformer against ComfyUI's float32 taps is 5.9e-6 at the final projection (1.2e-5 with the fp32 attention kernel: both inside
-    /// the reference's own rounding). False by default: it is a little less precise per attention, so it is yours to turn on.
+    /// the reference's own rounding). True by default (<see cref="Trellis2.DiTKernels.DefaultExactTensorCoreAttention"/>): over three seeds of the distilled clip it moved
+    /// the frames less (mean |difference| 0.0173 of 255) than running the same exact path on OpenCL instead of CUDA does (0.0204). False: the fp32 kernel.
     /// </summary>
-    public bool ExactTensorCoreAttention { get; set; }
+    public bool ExactTensorCoreAttention { get; set; } = Trellis2.DiTKernels.DefaultExactTensorCoreAttention;
 
     public Ltx2Pipeline(Accelerator accelerator, IModelSource source, Ltx2Paths paths)
     {
@@ -292,7 +293,7 @@ public sealed class Ltx2Pipeline
             model.Transformer.Weights.HostCacheBytes = cacheForBlocks;
             model.Transformer.Weights.ReadAheadBytes = ReadAheadBytes;
             model.Transformer.PreciseActivations = PreciseActivations;
-            if (ExactTensorCoreAttention) model.Transformer.ExactTensorCoreAttention = true;      // otherwise the kernels' own default (env TRELLIS2_MMA_EXACT_ATTN)
+            model.Transformer.ExactTensorCoreAttention = ExactTensorCoreAttention;
             try
             {
                 if (req.Distilled)
