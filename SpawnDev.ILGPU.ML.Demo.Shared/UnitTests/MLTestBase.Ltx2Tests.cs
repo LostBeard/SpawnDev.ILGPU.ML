@@ -351,8 +351,11 @@ public abstract partial class MLTestBase
     /// LTX2_FP8_DUMPS (default &lt;LTX2_DUMPS&gt;/lora/fp8_weights; one safetensors per block, SpawnGen's layout: <c>diffusion_model.transformer_blocks.N.&lt;linear&gt;.weight</c>
     /// F8_E4M3 + <c>.weight_scale</c>, metadata <c>strength</c>, <c>lora</c>, <c>partial</c>). Runs <see cref="Ltx2Transformer.ComfyPatchedFp8WeightsAsync"/>, the
     /// code the forward pass uses. Bitwise equality is NOT the bar: B A's last float32 bit depends on summation order, so a few elements per tensor land one F8 step
-    /// apart (MEASURED 2026-11-17, attn1.to_q / to_k: 33 to 70 of 16,777,216); a wrong key or seed rule moves tens of percent. So each tensor must have at most 1e-4 of
-    /// its elements differ, by one step, and the same scale within 1e-6. A whole block in the dump is held to every 8-bit Linear the LoRA covers there.
+    /// apart (MEASURED 2026-11-17, attn1.to_q / to_k: 33 to 70 of 16,777,216); a wrong key or seed rule moves tens of percent. So the test asks WHY an element differs:
+    /// every differing element must be one F8 step apart AND a tie by our own float32 weight (<see cref="Ltx2Fp8Rounding.RoundsTo"/>: ComfyUI's value is what the rule gives
+    /// for a half value within 2 steps of ours; the only elements a summation-order change of W + B A can flip; a wrong draw disagrees anywhere). Plus the same scale within 1e-6 and, as a sanity cap, at most 1e-3 of a
+    /// tensor's elements. A whole block in the dump is held to every 8-bit Linear the LoRA covers there. (A fixed 1e-4 rate bar was the first form: Lore's run over
+    /// all 42 fp8 blocks, 2026-11-18, found audio_to_video_attn.to_q at 1.1e-4 to 1.2e-4 in blocks 17 / 35 / 40, every difference one step: more ties, not a rule.)
     /// </summary>
     [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
     public async Task Ltx2_Fp8CompatWeights_MatchComfyUiDump() => await RunTest(async accelerator =>
@@ -367,6 +370,7 @@ public abstract partial class MLTestBase
         using var tr = await Ltx2Transformer.OpenAsync(accelerator, src, "", "ltx-2-19b-dev-fp8.safetensors", 1, 1, 1, 1, 0);
         var report = new List<string>(); var failures = new List<string>();
         long allElems = 0, allDiff = 0; int tensors = 0;
+        var tieAll = new long[4];                                                                    // differing elements explained at 0 / 1 / 2 half steps, or not
         foreach (var file in files)
         {
             using var dump = SafeTensors.SafeTensorsFileReader.Open(file);
@@ -388,7 +392,7 @@ public abstract partial class MLTestBase
             {
                 var seen = new List<string>(); int ours = 0; long blockDiff = 0, blockElems = 0; string worst = "";
                 double worstFrac = -1;
-                await tr.ComfyPatchedFp8WeightsAsync(k, (name, mine, scale, N, K) =>
+                await tr.ComfyPatchedFp8WeightsAsync(k, (name, mine, patched, scale, N, K) =>
                 {
                     ours++;
                     if (!weights.TryGetValue(name, out var t)) { if (!partial) failures.Add($"block {k}: {name} is patched here but not in the dump"); return; }
@@ -399,7 +403,9 @@ public abstract partial class MLTestBase
                     var sKey = pre + name + ".weight_scale";
                     var sb = new byte[4]; float theirScale = float.NaN;
                     if (dump.Has(sKey)) { dump.ReadBytes(dump.Get(sKey), 0, sb); theirScale = BitConverter.ToSingle(sb); }
-                    long diff = 0, zeroSign = 0, bigStep = 0; int maxStep = 0; long firstAt = -1;
+                    long diff = 0, zeroSign = 0, bigStep = 0, notTie = 0; int maxStep = 0; long firstAt = -1, firstNotTie = -1;
+                    var draws = new uint[(mine.Length + 3) / 4];
+                    Ltx2Fp8Rounding.Low8(Ltx2Fp8Rounding.Seed(name), draws, mine.Length);
                     for (long i = 0; i < mine.Length; i++)
                     {
                         byte a = mine[i], b = theirs[i];
@@ -409,12 +415,20 @@ public abstract partial class MLTestBase
                         // magnitude codes are monotonic in |value|; a sign flip of a non-zero value counts as a big step
                         int step = (a & 0x80) == (b & 0x80) || (a & 0x7F) == 0 || (b & 0x7F) == 0 ? Math.Abs((a & 0x7F) - (b & 0x7F)) : 255;
                         maxStep = Math.Max(maxStep, step); if (step > 1) bigStep++;
+                        // our own float32 weight: does the rule give ComfyUI's value for a half value 0, 1 or 2 steps from ours? (a tie: the only kind of
+                        // element a summation-order change of W + B A can flip)
+                        int draw = (int)((draws[i >> 2] >> (int)((i & 3) << 3)) & 0xFFu);
+                        float theirsV = Ltx2Fp8Rounding.FromE4M3(b);
+                        int at = Ltx2Fp8Rounding.RoundsTo(patched[i], scale, draw, theirsV, 0) ? 0 : Ltx2Fp8Rounding.RoundsTo(patched[i], scale, draw, theirsV, 1) ? 1
+                            : Ltx2Fp8Rounding.RoundsTo(patched[i], scale, draw, theirsV, 2) ? 2 : 3;
+                        tieAll[at]++;
+                        if (at > 2) { notTie++; if (firstNotTie < 0) { firstNotTie = i; Console.WriteLine($"[Ltx2] fp8 not-a-tie {name}[{i}]: w {patched[i]:R} (bits 0x{BitConverter.SingleToUInt32Bits(patched[i]):X8}), scale {scale:R}, y half 0x{BitConverter.HalfToUInt16Bits((System.Half)(MathF.Abs(patched[i]) / scale)):X4} = {(float)(System.Half)(MathF.Abs(patched[i]) / scale):R}, draw {draw}, here 0x{a:X2} = {Ltx2Fp8Rounding.FromE4M3(a):R}, ComfyUI 0x{b:X2} = {theirsV:R}, host Round {Ltx2Fp8Rounding.Round(patched[i], scale, draw):R}"); } }
                     }
                     double frac = (double)diff / mine.Length, scaleRel = Math.Abs(scale - theirScale) / Math.Abs(theirScale);
                     blockDiff += diff; blockElems += mine.Length; tensors++;
-                    if (frac > worstFrac) { worstFrac = frac; worst = $"{name[(name.IndexOf('.', 19) + 1)..]} {diff} of {mine.Length} (max step {maxStep}, scale {scale:R} vs {theirScale:R})"; }
-                    if (frac > 1e-4 || maxStep > 1 || !(scaleRel <= 1e-6))
-                        failures.Add($"{name}: {diff} of {mine.Length} differ ({frac:E2}; {bigStep} by more than one step, max {maxStep}; first at {firstAt}: here 0x{(firstAt >= 0 ? mine[firstAt] : 0):X2} ComfyUI 0x{(firstAt >= 0 ? theirs[firstAt] : 0):X2}), {zeroSign} zeros of the other sign, scale {scale:R} vs {theirScale:R}");
+                    if (frac > worstFrac) { worstFrac = frac; worst = $"{name[(name.IndexOf('.', 19) + 1)..]} {diff} of {mine.Length} (max step {maxStep}, all ties: {notTie == 0}, scale {scale:R} vs {theirScale:R})"; }
+                    if (notTie > 0 || frac > 1e-3 || maxStep > 1 || !(scaleRel <= 1e-6))
+                        failures.Add($"{name}: {diff} of {mine.Length} differ ({frac:E2}; {notTie} NOT a tie within 2 half steps (first at {firstNotTie}); {bigStep} by more than one step, max {maxStep}; first at {firstAt}: here 0x{(firstAt >= 0 ? mine[firstAt] : 0):X2} ComfyUI 0x{(firstAt >= 0 ? theirs[firstAt] : 0):X2}), {zeroSign} zeros of the other sign, scale {scale:R} vs {theirScale:R}");
                 });
                 foreach (var n in weights.Keys.Except(seen)) failures.Add($"block {k}: {n} is in the dump but not patched here (no LoRA tensor or not 8-bit)");
                 if (seen.Count == 0) failures.Add($"block {k}: nothing compared");
@@ -424,7 +438,7 @@ public abstract partial class MLTestBase
             }
             finally { tr.RemoveLora(lora); }
         }
-        string line = $"{tensors} tensors in {files.Length} dump(s), {allDiff} of {allElems} elements differ ({(allElems > 0 ? (double)allDiff / allElems : 0):E2}) | " + string.Join(" | ", report)
+        string line = $"{tensors} tensors in {files.Length} dump(s), {allDiff} of {allElems} elements differ ({(allElems > 0 ? (double)allDiff / allElems : 0):E2}), explained at 0 / 1 / 2 half steps / not at all: {string.Join(" / ", tieAll)} | " + string.Join(" | ", report)
             + (failures.Count > 0 ? $" | {failures.Count} FAILURES: " + string.Join("; ", failures.Take(8)) : "");
         Console.WriteLine("[Ltx2] fp8 compat weights vs ComfyUI: " + line);
         Ur_Expect(failures.Count == 0 && tensors > 0, line);

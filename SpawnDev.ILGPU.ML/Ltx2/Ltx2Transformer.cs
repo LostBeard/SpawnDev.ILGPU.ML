@@ -215,10 +215,11 @@ public sealed class Ltx2Transformer : IDisposable
     /// <summary>
     /// The ComfyUI-compatible patched 8-bit weights of block <paramref name="block"/>: for every 8-bit Linear of the block a LoRA covers, the F8_E4M3 bytes (row-major
     /// [N, K]) and the scale that <see cref="ComfyCompatibleFp8Lora"/> computes on the device before that Linear (the same code), read back and handed to
-    /// <paramref name="sink"/> (name without a prefix, bytes, scale, N, K) one Linear at a time. For comparing with the weights ComfyUI stores after patching
-    /// (a test sink: it reads every matrix back to the host).
+    /// <paramref name="sink"/> (name without a prefix, bytes, the float32 patched weight W + strength B A they were rounded from, scale, N, K) one Linear at a
+    /// time. For comparing with the weights ComfyUI stores after patching: the float32 weight lets a test show that an element rounded differently sat on the
+    /// rounding's threshold (a test sink: it reads every matrix back to the host).
     /// </summary>
-    public async Task ComfyPatchedFp8WeightsAsync(int block, Action<string, byte[], float, int, int> sink, CancellationToken ct = default)
+    public async Task ComfyPatchedFp8WeightsAsync(int block, Action<string, byte[], float[], float, int, int> sink, CancellationToken ct = default)
     {
         if (_loras.Count == 0) throw new InvalidOperationException("no LoRA is attached");
         if (block < 0 || block >= Layers) throw new ArgumentOutOfRangeException(nameof(block));
@@ -248,9 +249,10 @@ public sealed class Ltx2Transformer : IDisposable
                 var cq = PatchFp8Compat(w, name, N, K, block: true);
                 var q = await cq.Cast<BFloat16, ushort>().CopyToHostAsync();
                 var sc = await _cScale!.View.SubView(0, 1).CopyToHostAsync();
+                var patched = await _cw!.View.SubView(0, (long)N * K).CopyToHostAsync();               // the rounding reads it, leaves it
                 var bytes = new byte[q.Length];
                 for (int i = 0; i < q.Length; i++) bytes[i] = Ltx2Fp8Rounding.ToE4M3(BitConverter.Int32BitsToSingle(q[i] << 16));
-                sink(name, bytes, sc[0], N, K);
+                sink(name, bytes, patched, sc[0], N, K);
             }
         }
         finally

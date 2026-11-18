@@ -87,7 +87,7 @@ public abstract partial class MLTestBase
         foreach (var (label, prefetch, ahead, cache) in new[] { ("no prefetch", false, 0L, 0L), ("one block ahead", true, 0L, 0L), ("everything ahead", true, 1L << 20, 0L),
             ("about two blocks ahead", true, 700L, 0L), ("everything ahead + two blocks cached", true, 1L << 20, 700L), ("one ahead + all cached", true, 0L, 1L << 20) })
         {
-            using var w = await StreamedModelWeights.OpenAsync(accelerator, new Fp8MixedSource(file), "", "m.safetensors", "blocks.0.w",
+            var w = await StreamedModelWeights.OpenAsync(accelerator, new Fp8MixedSource(file), "", "m.safetensors", "blocks.0.w",
                 n => n.StartsWith("blocks.", StringComparison.Ordinal) ? int.Parse(n.Split('.')[1]) : -1, Blocks, 2 * N);
             w.Prefetch = prefetch; w.ReadAheadBytes = ahead; w.HostCacheBytes = cache;
             Ur_Expect(w.ResidentBlocks == 1, $"{label}: {w.ResidentBlocks} resident blocks, built for 1");
@@ -106,7 +106,16 @@ public abstract partial class MLTestBase
             for (int k = 0; k < Blocks; k++) await Check(k, "back in order");
             Ur_Expect(w.HostCacheUsed <= cache, $"{label}: the host cache holds {w.HostCacheUsed} bytes of a {cache} budget");
             if (cache >= (1L << 20)) Ur_Expect(w.HostCacheUsed > 5 * 2 * N, $"{label}: only {w.HostCacheUsed} bytes cached, five streamed blocks expected");
-            report.Add($"{label}: {loads} streamed loads right, cache {w.HostCacheUsed} bytes");
+            // CUDA: the block images are page-locked (StreamedModelWeights.PageLockImages); every registration must be released once the weights are disposed
+            // and their reads have finished (a read still in flight releases its buffer when it ends)
+            bool locked = accelerator.AcceleratorType == AcceleratorType.Cuda && StreamedModelWeights.PageLockImages;
+            int liveOpen = StreamedModelWeights.LiveImageLocks;
+            w.Dispose();
+            var settle = System.Diagnostics.Stopwatch.StartNew();
+            while (StreamedModelWeights.LiveImageLocks != 0 && settle.ElapsedMilliseconds < 10000) await Task.Delay(20);
+            if (locked) Ur_Expect(liveOpen > 0, $"{label}: no page-locked block image while open on CUDA");
+            Ur_Expect(StreamedModelWeights.LiveImageLocks == 0, $"{label}: {StreamedModelWeights.LiveImageLocks} page-locked block images still registered after Dispose");
+            report.Add($"{label}: {loads} streamed loads right, cache {w.HostCacheUsed} bytes{(locked ? $", {liveOpen} page-locked images while open, 0 after" : "")}");
         }
         return string.Join("; ", report);
     });

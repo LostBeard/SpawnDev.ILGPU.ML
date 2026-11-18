@@ -4,6 +4,18 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **SpawnDev.ILGPU 5.4.37** (local.1 until its stable). Its CUDA page-lock now binds the context on any thread, so:
+- **Streamed block images are page-locked on CUDA** (`StreamedModelWeights.PageLockImages`, env `ML_STREAM_PAGELOCK=0` turns it off): uploads are a straight DMA.
+  MEASURED 2026-11-18, LTX-2 768 x 512 x 121 two-row calls from an NVMe drive, alternating A/B, 6 calls each way: upload 5.8 -> 4.5 s a call, the call 0.5 to
+  1.7 s faster (from a SATA drive the reads set the pace). Every registration is released when the weights are disposed: the read-ahead test counts them,
+  red-checked (a pool that forgets them fails it).
+- **The ComfyUI-compatible fp8 LoRA rounding is now exact to ComfyUI's arithmetic** (`Ltx2Transformer.ComfyCompatibleFp8Lora`). Checked against ComfyUI's
+  own patched weights (SpawnGen dumps, every tensor of every fp8 block), two half-precision steps were missing from the 11-17 rule: the exponent is
+  floor(half(log2 y)) (just below a power of two that reaches the next integer, so the step there is the upper binade's), and frac + u is rounded to half
+  before the comparison with 1 (it matters below 2^-6). MEASURED, blocks 1 and 42 (56 tensors, CUDA): 2,830 -> 327 of 771,751,936 elements differ, every one
+  a one-step tie of float32 summation order; the block-1 LoRA gate against ComfyUI's calls 3.2e-5 -> 8.0e-6 (call 0), 2.9e-5 -> 7.3e-6 (final latent).
+  `Ltx2_Fp8CompatWeights_MatchComfyUiDump` now requires every differing element to be such a tie (`Ltx2Fp8Rounding.RoundsTo`: the rule gives ComfyUI's value
+  for a half value within 2 steps of ours), red-checked with a wrong seed key (33.6% differ, nearly all not ties).
 - **The generated GPU kernels are in their own assembly, `SpawnDev.ILGPU.ML.Kernels`, shipped inside this package** (lib/net10.0, next to
   SpawnDev.ILGPU.ML.dll; no new package dependency). A browser AOT build now leaves them to the interpreter: the package's
   `buildTransitive/SpawnDev.ILGPU.ML.targets` lists the assembly in the Wasm SDK's `_AOT_InternalForceInterpretAssemblies`. In a browser these

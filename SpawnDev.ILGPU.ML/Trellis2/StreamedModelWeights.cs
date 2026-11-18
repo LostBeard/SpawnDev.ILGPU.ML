@@ -96,15 +96,31 @@ public sealed class StreamedModelWeights : IDisposable
 
     // A block image in host memory: Length bytes of a REUSED buffer. Buffers come from and go back to a small pool: a fresh 0.4 GB array per streamed load was
     // 54 to 278 gen-2 collections per LTX-2 clip (MEASURED 2026-11-18; 22 with the pool).
-    // NOT page-locked yet. On CUDA, buffers from accelerator.AllocatePageLocked1D upload faster (MEASURED the same night, LTX-2, 16.2 GB a call: upload 7.5 -> 5.8 s
-    // exact, 5.2 -> 3.4 s on the tensor cores, bit-identical), but ILGPU's CudaPageLockScope registers the range WITHOUT binding the accelerator's context to the
-    // calling thread, and these buffers are rented on thread-pool threads: "CudaException: invalid device context at MemHostRegister" whenever the context is
-    // not current there (it failed 2 of 3 runs). That is ILGPU's to fix (note to Data, _DevComms 2026-11-18); then RentImage can allocate them page-locked.
+    // PAGE-LOCKED on CUDA (PageLockImages): the upload from a registered buffer is a straight DMA (MEASURED 2026-11-18 with a first version, LTX-2, 16.2 GB a call:
+    // upload 7.5 -> 5.8 s exact, 5.2 -> 3.4 s on the tensor cores, bit-identical). It waited on SpawnDev.ILGPU 5.4.37: before it the page-lock registered the range
+    // without binding the accelerator's context, and these buffers are rented on thread-pool threads ("invalid device context at MemHostRegister", 2 of 3 runs).
+    // A page-locked image's registration is released (Lock.Dispose) wherever the image leaves the pool for good: ReturnImage past the pool's size, and Dispose.
     private sealed class BlockImage
     {
         public required byte[] Bytes;
         public int Length;
+        public PageLockedArray1D<byte>? Lock;                                                      // the registration behind Bytes (null: a plain array)
     }
+
+    /// <summary>
+    /// CUDA: streamed block images are page-locked host buffers (faster uploads; host memory pinned while the weights are open: the pool's two or three buffers of the
+    /// largest block's size). Env ML_STREAM_PAGELOCK=0 turns it off for new instances (an A/B switch). Other backends always use plain arrays.
+    /// </summary>
+    public static bool PageLockImages { get; set; } = Environment.GetEnvironmentVariable("ML_STREAM_PAGELOCK") != "0";
+
+    private static void ReleaseImage(BlockImage image)
+    {
+        if (image.Lock is { } l) { l.Dispose(); Interlocked.Decrement(ref _liveImageLocks); }
+        image.Lock = null;
+    }
+    private static int _liveImageLocks;
+    /// <summary>Page-locked block images not yet released, across every instance (tests: back to 0 once the weights are disposed and their reads have finished).</summary>
+    internal static int LiveImageLocks => Volatile.Read(ref _liveImageLocks);
     private readonly List<BlockImage> _freeImages = new();
     private const int MaxFreeImages = 2;                                                           // the one being uploaded + the one being read: what was live before the pool
     private long _maxBlockBytes = -1;
@@ -120,6 +136,12 @@ public sealed class StreamedModelWeights : IDisposable
         }
         // room for the largest streamed block and its header, so one buffer serves every block
         long cap = Math.Min(Array.MaxLength, Math.Max(total, _maxBlockBytes + (1 << 20)));
+        if (PageLockImages && _acc.AcceleratorType == AcceleratorType.Cuda)
+        {
+            var pl = _acc.AllocatePageLocked1D<byte>(cap, uninitialized: true);              // binds the context itself (SpawnDev.ILGPU 5.4.37): any thread
+            Interlocked.Increment(ref _liveImageLocks);
+            return new BlockImage { Bytes = pl.GetArray(), Length = (int)total, Lock = pl };
+        }
         return new BlockImage { Bytes = GC.AllocateUninitializedArray<byte>((int)cap), Length = (int)total };
     }
 
@@ -127,10 +149,11 @@ public sealed class StreamedModelWeights : IDisposable
     {
         lock (_freeImages)
         {
-            // as many spare buffers as the read-ahead can have in flight; one beyond that is left to the collector
+            // as many spare buffers as the read-ahead can have in flight; one beyond that is left to the collector (its page-lock released first)
             int spare = Math.Max(MaxFreeImages, (int)(ReadAheadBytes / Math.Max(1, _maxBlockBytes)) + 2);
-            if (!_disposed && _freeImages.Count < spare) _freeImages.Add(image);
+            if (!_disposed && _freeImages.Count < spare) { _freeImages.Add(image); return; }
         }
+        ReleaseImage(image);
     }
 
     // a read nobody will consume: its buffer goes back once the read has finished
@@ -514,7 +537,8 @@ public sealed class StreamedModelWeights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
-        lock (_freeImages) { _disposed = true; _freeImages.Clear(); }
+        lock (_freeImages) { _disposed = true; foreach (var im in _freeImages) ReleaseImage(im); _freeImages.Clear(); }
+        foreach (var im in _hostCache.Values) ReleaseImage(im);
         _hostCache.Clear(); _hostCacheUsed = 0;
         foreach (var a in _ahead) DropRead(a.Image);                                              // reads still in flight: their buffers are released when they finish
         _ahead.Clear();

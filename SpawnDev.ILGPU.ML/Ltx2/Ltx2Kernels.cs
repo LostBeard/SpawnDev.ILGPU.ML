@@ -285,20 +285,18 @@ public sealed class Ltx2Kernels
             if (more | (tie & odd)) t += 1f;
             y16 = t * 5.9604644775390625e-08f;
         }
-        // its F8_E4M3 neighbours l <= y16 < h and the position between them
-        float l = 0f, h = 0f, fr = 0f;
-        if (y16 >= 0.015625f)
-        {
-            uint b = (uint)Interop.FloatAsInt(y16), lb = b & 0xFFF00000u;
-            l = Interop.IntAsFloat(lb); h = Interop.IntAsFloat(lb + 0x100000u); fr = (b & 0xFFFFFu) * 9.5367431640625e-07f;
-        }
-        else
-        {
-            float sc = y16 * 512f, t = MathF.Floor(sc);
-            fr = sc - t; l = t * 0.001953125f; h = (t + 1f) * 0.001953125f;
-        }
+        // ComfyUI's arithmetic, in HALF precision (Ltx2Fp8Rounding.RoundY, the host form): e = floor(half(log2 y)), at least -6; step = 2^(e-3);
+        // x = y / step, l = floor(x) * step, stored = l + step when half(frac + u) >= 1. A multiply by 2^(3-e), never a division (an inexact fp32 division
+        // would move it on some backends).
+        float lg = y16 > 0f ? global::ILGPU.Algorithms.XMath.Log2(y16) : -6f;                   // MathF.Log2 has no remap in ILGPU yet (Data: 5.4.38)
+        if (MathF.Abs(lg) >= 6.103515625e-05f) { uint gb = (uint)Interop.FloatAsInt(lg); lg = Interop.IntAsFloat((gb + 0xFFFu + ((gb >> 13) & 1u)) & 0xFFFFE000u); }
+        int e = (int)MathF.Floor(lg);
+        if (e < -6) e = -6;
         uint draw = (rnd[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
-        float q = fr * 256f + draw >= 256f ? h : l;                                       // ">" here: 0.38% of the elements differ from the rule (red-check, and ComfyUI)
+        float x = y16 * Interop.IntAsFloat((uint)((3 - e + 127) << 23)), fl = MathF.Floor(x);   // exact
+        float r = x - fl + draw * 0.00390625f;                                                  // frac + u, exact in float32
+        if (r >= 6.103515625e-05f) { uint rb = (uint)Interop.FloatAsInt(r); r = Interop.IntAsFloat((rb + 0xFFFu + ((rb >> 13) & 1u)) & 0xFFFFE000u); }   // to half (below: far from 1 either way)
+        float q = (r >= 1f ? fl + 1f : fl) * Interop.IntAsFloat((uint)((e - 3 + 127) << 23));
         o[i] = (BFloat16)(v < 0f ? -q : q);
     }
     /// <summary>

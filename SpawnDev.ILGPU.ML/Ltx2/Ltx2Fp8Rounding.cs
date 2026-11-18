@@ -10,10 +10,11 @@ namespace SpawnDev.ILGPU.ML.Ltx2;
 /// <list type="number">
 /// <item>w = W + strength x (B A) in float32; the new scale = max|w| / 448;</item>
 /// <item>y = float16(|w| / scale): the scaled weight passes through half precision;</item>
-/// <item>l &lt;= y &lt; h the F8_E4M3 neighbours, frac = (y - l) / (h - l);</item>
+/// <item>e = floor(float16(log2 y)), at least -6; step = 2^(e-3) (the neighbours l, h = l + step around y, frac = (y - l) / step, except just below a
+/// power of two where the half-precision log2 reaches the next integer and the step is the upper binade's);</item>
 /// <item>u_i = (word_i AND 0xFF) / 256 for element i in row-major order, the words from MT19937 seeded (init_genrand) with the CRC-32 of the UTF-8 key
 /// <c>diffusion_model.&lt;tensor&gt;.weight</c>;</item>
-/// <item>stored = sign(w) x (h if frac + u &gt;= 1 else l).</item>
+/// <item>stored = sign(w) x (h if float16(frac + u) &gt;= 1 else l): the sum rounds to half precision first (it matters only below 2^-6, where frac is finer).</item>
 /// </list>
 /// MEASURED 2026-11-17 on every element of two 4096 x 4096 tensors (attn1.to_q at ten LoRA strengths, attn1.to_k): 33 to 70 of 16,777,216 elements differ (the last
 /// float32 bit of B A, by summation order). The device side is <see cref="Ltx2Kernels.Fp8StochasticRound"/>.
@@ -146,16 +147,54 @@ public static class Ltx2Fp8Rounding
     /// </summary>
     public static float Round(float w, float scale, int draw)
     {
-        float y = (float)(Half)(MathF.Abs(w) / scale);                                    // float32 division, then round to nearest even into half precision
-        float l, h, frac;
-        if (y >= 0.015625f)                                                               // normal F8_E4M3: 1.mmm x 2^e
-        {
-            uint b = BitConverter.SingleToUInt32Bits(y), lb = b & 0xFFF00000u;
-            l = BitConverter.UInt32BitsToSingle(lb); h = BitConverter.UInt32BitsToSingle(lb + 0x100000u); frac = (b & 0xFFFFFu) * (1f / 1048576f);
-        }
-        else { float sc = y * 512f, t = MathF.Floor(sc); frac = sc - t; l = t * 0.001953125f; h = (t + 1f) * 0.001953125f; }   // below 2^-6: steps of 2^-9 from 0
-        float q = frac * 256f + draw >= 256f ? h : l;
+        float q = RoundY((float)(Half)(MathF.Abs(w) / scale), draw);                   // float32 division, then round to nearest even into half precision
         return w < 0f ? -q : q;
+    }
+
+    /// <summary>
+    /// True when the rule gives <paramref name="stored"/> (an F8_E4M3 value) for the patched weight <paramref name="w"/> with the draw <paramref name="draw"/> after
+    /// moving its half-precision value y by at most <paramref name="halfSteps"/> steps either way. Two exact implementations whose W + B A differ only in summation order
+    /// (a few float32 ulps) round an element differently only where that holds for a step or two: at frac + u = 1, or where y sits on an F8_E4M3 value (a weight a
+    /// hair lower falls in the cell below, at frac near 1). MEASURED 2026-11-18 against ComfyUI on LTX-2 blocks 1 and 42: every differing element within 2 steps. A
+    /// wrong draw (seed, key, order) disagrees on elements anywhere.
+    /// </summary>
+    public static bool RoundsTo(float w, float scale, int draw, float stored, int halfSteps)
+    {
+        ushort y0 = BitConverter.HalfToUInt16Bits((Half)(MathF.Abs(w) / scale));               // positive: its bits order like its value
+        for (int s = -halfSteps; s <= halfSteps; s++)
+        {
+            int yb = y0 + s;
+            if (yb < 0 || yb > 0x7BFF) continue;                                                // below 0 or past the largest finite half
+            float q = RoundY((float)BitConverter.UInt16BitsToHalf((ushort)yb), draw);
+            if ((w < 0f ? -q : q) == stored || (q == 0f && stored == 0f)) return true;
+        }
+        return false;
+    }
+
+    // ComfyUI's arithmetic, in HALF precision (derived black box 2026-11-18 from its stored LTX-2 weights; the check: Ltx2_Fp8CompatWeights_MatchComfyUiDump):
+    //   e = floor(half(log2 y)), at least -6 (E4M3's smallest normal exponent); step = 2^(e-3); x = y / step, l = floor(x) * step, frac = x - floor(x);
+    //   stored = l + step when half(frac + u) >= 1, else l (u = draw / 256).
+    // Two places differ from "h when frac + u >= 1": (1) log2 rounded to half reaches the next integer 1 to 5 half steps below a power of two, so the step
+    // there is the UPPER binade's (y = 0.12494 with draw 0 stores 0.109375, not 0.1171875); (2) the sum rounds to half before the floor, so a sum within half
+    // a half-step below 1 counts as 1 (y * 512 = 0.07794 + 236/256 = 0.99982 -> 1.0: stores 2^-9, not 0). In the normal range frac is a multiple of 2^-7, so
+    // frac + u is exact in half and (2) changes nothing there; only the subnormal range's finer frac sees it. (Rounding y / step + u to half instead, a coarser
+    // grid, made 3.9e-3 of the elements differ: wrong.)
+    // The magnitude stored for the half value y (= half(|w| / scale)) with the draw. The one place the host rule computes it.
+    private static float RoundY(float y, int draw)
+    {
+        int e = y > 0f ? (int)MathF.Floor((float)(Half)MathF.Log2(y)) : -6;
+        if (e < -6) e = -6;
+        float x = y * MathF.ScaleB(1f, 3 - e), fl = MathF.Floor(x);                       // exact: a power-of-two scale
+        float r = (float)(Half)(x - fl + draw * (1f / 256f));                               // frac + u exact in float32, then half
+        return (r >= 1f ? fl + 1f : fl) * MathF.ScaleB(1f, e - 3);
+    }
+
+    /// <summary>The value of an F8_E4M3 byte (0x7F / 0xFF, NaN, decode as NaN).</summary>
+    public static float FromE4M3(byte b)
+    {
+        int e = (b >> 3) & 15, m = b & 7;
+        float v = (b & 0x7F) == 0x7F ? float.NaN : e == 0 ? m * 0.001953125f : (1f + m * 0.125f) * MathF.ScaleB(1f, e - 7);
+        return (b & 0x80) != 0 ? -v : v;
     }
 
     /// <summary>
