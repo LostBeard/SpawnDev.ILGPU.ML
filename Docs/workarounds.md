@@ -6,7 +6,7 @@ tracking issue, and carries a test that reports whether it is still needed.
 
 | # | What is wrong, and where | Since | The workaround | Tracking | How we know when to remove it |
 |---|--------------------------|-------|----------------|----------|-------------------------------|
-| 1 | **`Vector128.Narrow` saturates in Blazor WebAssembly once its loop is hot** (.NET 10 browser runtime). It must truncate, and does on desktop and while the code is cold. | 5.8.21 | `Ltx2Fp8Rounding.Low8` masks each word to its low byte before narrowing, so truncating and saturating give the same byte. | [Issue #3](https://github.com/LostBeard/SpawnDev.ILGPU.ML/issues/3); report to dotnet/runtime not yet filed | `Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads` prints `unmasked output mix, 300000 hot rounds of 16 words: equals the plain mix` on the WebGPU, WebGL and Wasm lanes |
+| 1 | **`Vector128.Narrow` (16 bits to bytes, unsigned) saturates in Blazor WebAssembly once its loop is hot** (.NET 10 browser runtime, default build: not with the hot-path compiler off, not ahead-of-time compiled). It must truncate, and does on desktop and while the code is cold. | 5.8.21 | `Ltx2Fp8Rounding.Low8` masks each word to its low byte before narrowing, so truncating and saturating give the same byte. | [Issue #3](https://github.com/LostBeard/SpawnDev.ILGPU.ML/issues/3); report to dotnet/runtime not yet filed | `Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads` prints `unmasked output mix, 300000 hot rounds of 16 words: equals the plain mix` on the WebGPU, WebGL and Wasm lanes |
 
 ## 1. `Vector128.Narrow` saturates in Blazor WebAssembly once the loop is hot
 
@@ -20,8 +20,15 @@ tracking issue, and carries a test that reports whether it is still needed.
 - Run once, each narrowing is right in the browser too (32 to 16 bits, 16 to 8 bits, and the nested form). Three one-shot probes said "truncates" while the hot
   loop was wrong: a probe of this has to run hot.
 
-Right while cold and wrong once hot suggests the runtime's hot-path compiler emits WebAssembly's saturating narrow. That is our reading of the measurements, not
-something we confirmed in the runtime's source.
+**Narrowed down 2026-11-18 with a standalone app** (plain .NET, no SpawnDev code; .NET 10.0.14, headless Chromium 153 and Chrome 157, identical on every run):
+
+- Only one overload is wrong: `Vector128.Narrow(Vector128<ushort>, Vector128<ushort>)`, 16 bits to bytes: 1,582,016 of 1,600,000 values from round 343 on.
+  `0xADDB` comes back `00` and values above 255 come back `FF`: the result of WebAssembly's `i8x16.narrow_i16x8_u`, which reads its input as signed and saturates.
+  The 32 to 16 bit, signed 16 to 8 bit and 64 to 32 bit overloads are right; the 32 to 8 bit loops fail because their second step is that overload.
+- The same code built with the hot-path compiler off (`<BlazorWebAssemblyJiterpreter>false</BlazorWebAssemblyJiterpreter>`) is right for every value.
+- The same code ahead-of-time compiled (`<RunAOTCompilation>true</RunAOTCompilation>`) is right for every value.
+
+So it is the code the runtime's hot-path compiler (the jiterpreter) generates for that overload. We have not read the runtime's source to say where.
 
 **Where it bit us.** `Ltx2Fp8Rounding.Low8`: the vectorized MT19937 byte stream of the opt-in ComfyUI-compatible LoRA mode
 (`Ltx2Transformer.ComfyCompatibleFp8Lora`). In the browser it returned `FF` for nearly every draw. The test that compares it with the plain generator
@@ -39,5 +46,5 @@ Two AND operations per 16 draws. The vectorized stream equals the plain one word
 **If you write SIMD code that runs in Blazor WebAssembly:** mask to the narrow type's range before `Vector128.Narrow`, and test the result against a scalar
 form in a loop that runs hundreds of thousands of times. The issue has a snippet you can paste into an app to check your own runtime.
 
-**Still to do:** a standalone repro project and the report to dotnet/runtime (both will be linked from the issue), then removal of the mask once the canary reads
-`equals the plain mix` in the browser.
+**Still to do:** publish the standalone repro (it exists and reproduces; a public repository with a page anyone can run is next) and report to dotnet/runtime
+(both will be linked from the issue), then remove the mask once the canary reads `equals the plain mix` in the browser.
