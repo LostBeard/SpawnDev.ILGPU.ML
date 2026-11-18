@@ -157,4 +157,25 @@ public static class Ltx2Fp8Rounding
         float q = frac * 256f + draw >= 256f ? h : l;
         return w < 0f ? -q : q;
     }
+
+    /// <summary>
+    /// The F8_E4M3 byte of <paramref name="v"/>, a value ON the E4M3 grid (what <see cref="Round"/> and the device rounding produce: |v| &lt;= 448, normal 1.mmm x 2^e
+    /// with e in -6..8 or a multiple of 2^-9 below 2^-6); the sign bit follows the float's, so -0 is 0x80. Throws for a value off the grid.
+    /// </summary>
+    public static byte ToE4M3(float v)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(v), sign = (bits >> 24) & 0x80u;
+        float a = MathF.Abs(v);
+        if (a == 0f) return (byte)sign;
+        if (a < 0.015625f)
+        {
+            float m = a * 512f;                                                               // subnormal E4M3: m x 2^-9, m = 1..7
+            if (m != MathF.Floor(m) || m < 1f || m > 7f) throw new ArgumentException($"{v:R} is not an F8_E4M3 value");
+            return (byte)(sign | (uint)m);
+        }
+        uint ab = bits & 0x7FFFFFFFu;
+        int e = (int)(ab >> 23) - 127 + 7;
+        if ((ab & 0xFFFFFu) != 0 || e < 1 || e > 15 || (e == 15 && ((ab >> 20) & 7u) == 7u)) throw new ArgumentException($"{v:R} is not an F8_E4M3 value");
+        return (byte)(sign | ((uint)e << 3) | ((ab >> 20) & 7u));
+    }
 }

@@ -4,6 +4,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **`Ltx2Transformer.ComfyPatchedFp8WeightsAsync`**: the ComfyUI-compatible fp8 LoRA mode's patched 8-bit weights of one block, read back as F8_E4M3 bytes
+  plus scale (the same device code the forward pass runs), and `Ltx2Fp8Rounding.ToE4M3`. Test `Ltx2_Fp8CompatWeights_MatchComfyUiDump` compares them with the
+  weights ComfyUI stores after patching, per tensor, for every block dumped (LTX2_FP8_DUMPS). MEASURED 2026-11-18, block 1 attn1.to_q / to_k, CUDA:
+  109 of 33,554,432 elements differ (3.3e-6, each by one fp8 step: the last float32 bit of B A), scales bit-equal; with a wrong seed key 33.7% differ.
 - **Attention on the tensor cores at near-fp32 accuracy** (`DiTKernels.ExactTensorCoreAttention`, `Ltx2Pipeline.ExactTensorCoreAttention`,
   `Ltx2Transformer.ExactTensorCoreAttention`, `DiTKernels.DefaultExactTensorCoreAttention`; env `TRELLIS2_MMA_EXACT_ATTN=0` turns it off for every model on
   `DiTKernels`; CUDA cards with tensor cores, head width 128; **on by default wherever `PreciseActivations` is on**). With `PreciseActivations` on, attention ran the portable fp32 flash kernel, the slowest stage of an LTX-2 call. The new kernel

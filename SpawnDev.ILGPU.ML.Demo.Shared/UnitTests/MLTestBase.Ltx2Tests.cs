@@ -347,6 +347,88 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The ComfyUI-compatible mode's patched 8-bit WEIGHTS against the weights ComfyUI stores after patching, tensor by tensor, for every block in the dump folder
+    /// LTX2_FP8_DUMPS (default &lt;LTX2_DUMPS&gt;/lora/fp8_weights; one safetensors per block, SpawnGen's layout: <c>diffusion_model.transformer_blocks.N.&lt;linear&gt;.weight</c>
+    /// F8_E4M3 + <c>.weight_scale</c>, metadata <c>strength</c>, <c>lora</c>, <c>partial</c>). Runs <see cref="Ltx2Transformer.ComfyPatchedFp8WeightsAsync"/>, the
+    /// code the forward pass uses. Bitwise equality is NOT the bar: B A's last float32 bit depends on summation order, so a few elements per tensor land one F8 step
+    /// apart (MEASURED 2026-11-17, attn1.to_q / to_k: 33 to 70 of 16,777,216); a wrong key or seed rule moves tens of percent. So each tensor must have at most 1e-4 of
+    /// its elements differ, by one step, and the same scale within 1e-6. A whole block in the dump is held to every 8-bit Linear the LoRA covers there.
+    /// </summary>
+    [TestMethod(Timeout = 7200000, Category = "HeavyModel")]
+    public async Task Ltx2_Fp8CompatWeights_MatchComfyUiDump() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        string dumps = Environment.GetEnvironmentVariable("LTX2_FP8_DUMPS") ?? Path.Combine(Ltx2_Dumps(), "lora", "fp8_weights");
+        var files = File.Exists(dumps) ? new[] { dumps } : Directory.Exists(dumps) ? Directory.GetFiles(dumps, "*.safetensors").OrderBy(f => f, StringComparer.Ordinal).ToArray() : Array.Empty<string>();
+        if (files.Length == 0 || !File.Exists(Path.Combine(dir, "ltx-2-19b-dev-fp8.safetensors"))) throw new UnsupportedTestException($"needs per-block dumps in {dumps} (LTX2_FP8_DUMPS) and the checkpoint in {dir}");
+        const string pre = "diffusion_model.", wtail = ".weight";
+        var src = new LocalFolderModelSource(dir);
+        using var tr = await Ltx2Transformer.OpenAsync(accelerator, src, "", "ltx-2-19b-dev-fp8.safetensors", 1, 1, 1, 1, 0);
+        var report = new List<string>(); var failures = new List<string>();
+        long allElems = 0, allDiff = 0; int tensors = 0;
+        foreach (var file in files)
+        {
+            using var dump = SafeTensors.SafeTensorsFileReader.Open(file);
+            string Meta(string key, string dflt) => dump.Metadata.TryGetValue(key, out var v) ? v : dflt;
+            float strength = float.Parse(Meta("strength", "1"), System.Globalization.CultureInfo.InvariantCulture);
+            string loraFile = Path.GetFileName(Meta("lora", "ltx-2-19b-distilled-lora-384.safetensors"));
+            bool partial = Meta("partial", "0") == "1";
+            var weights = dump.Tensors.Where(t => t.DType == "F8_E4M3" && t.Name.StartsWith(pre, StringComparison.Ordinal) && t.Name.EndsWith(wtail, StringComparison.Ordinal)).ToDictionary(t => t.Name[pre.Length..^wtail.Length]);
+            var blocks = weights.Keys.Select(n => n.StartsWith("transformer_blocks.", StringComparison.Ordinal) ? int.Parse(n.Split('.')[1]) : -1).Distinct().ToArray();
+            if (blocks.Length != 1 || blocks[0] < 0) { failures.Add($"{Path.GetFileName(file)}: F8 weights of blocks [{string.Join(", ", blocks)}], one transformer block per file"); continue; }
+            int k = blocks[0];
+            if (!File.Exists(Path.Combine(dir, loraFile))) throw new UnsupportedTestException($"{Path.GetFileName(file)} was made with {loraFile}, not in {dir}");
+            using var lora = await Ltx2Lora.OpenAsync(accelerator, src, "", loraFile, strength, 0, n => n.StartsWith($"transformer_blocks.{k}.", StringComparison.Ordinal));
+            tr.AddLora(lora);
+            try
+            {
+                var seen = new List<string>(); int ours = 0; long blockDiff = 0, blockElems = 0; string worst = "";
+                double worstFrac = -1;
+                await tr.ComfyPatchedFp8WeightsAsync(k, (name, mine, scale, N, K) =>
+                {
+                    ours++;
+                    if (!weights.TryGetValue(name, out var t)) { if (!partial) failures.Add($"block {k}: {name} is patched here but not in the dump"); return; }
+                    seen.Add(name);
+                    if (t.Shape.Length != 2 || t.Shape[0] != N || t.Shape[1] != K) { failures.Add($"{name}: dump [{string.Join(", ", t.Shape)}], here [{N}, {K}]"); return; }
+                    var theirs = new byte[mine.Length];
+                    dump.ReadBytes(t, 0, theirs);
+                    var sKey = pre + name + ".weight_scale";
+                    var sb = new byte[4]; float theirScale = float.NaN;
+                    if (dump.Has(sKey)) { dump.ReadBytes(dump.Get(sKey), 0, sb); theirScale = BitConverter.ToSingle(sb); }
+                    long diff = 0, zeroSign = 0, bigStep = 0; int maxStep = 0; long firstAt = -1;
+                    for (long i = 0; i < mine.Length; i++)
+                    {
+                        byte a = mine[i], b = theirs[i];
+                        if (a == b) continue;
+                        if ((a & 0x7F) == 0 && (b & 0x7F) == 0) { zeroSign++; continue; }            // +0 against -0: the same weight
+                        diff++; if (firstAt < 0) firstAt = i;
+                        // magnitude codes are monotonic in |value|; a sign flip of a non-zero value counts as a big step
+                        int step = (a & 0x80) == (b & 0x80) || (a & 0x7F) == 0 || (b & 0x7F) == 0 ? Math.Abs((a & 0x7F) - (b & 0x7F)) : 255;
+                        maxStep = Math.Max(maxStep, step); if (step > 1) bigStep++;
+                    }
+                    double frac = (double)diff / mine.Length, scaleRel = Math.Abs(scale - theirScale) / Math.Abs(theirScale);
+                    blockDiff += diff; blockElems += mine.Length; tensors++;
+                    if (frac > worstFrac) { worstFrac = frac; worst = $"{name[(name.IndexOf('.', 19) + 1)..]} {diff} of {mine.Length} (max step {maxStep}, scale {scale:R} vs {theirScale:R})"; }
+                    if (frac > 1e-4 || maxStep > 1 || !(scaleRel <= 1e-6))
+                        failures.Add($"{name}: {diff} of {mine.Length} differ ({frac:E2}; {bigStep} by more than one step, max {maxStep}; first at {firstAt}: here 0x{(firstAt >= 0 ? mine[firstAt] : 0):X2} ComfyUI 0x{(firstAt >= 0 ? theirs[firstAt] : 0):X2}), {zeroSign} zeros of the other sign, scale {scale:R} vs {theirScale:R}");
+                });
+                foreach (var n in weights.Keys.Except(seen)) failures.Add($"block {k}: {n} is in the dump but not patched here (no LoRA tensor or not 8-bit)");
+                if (seen.Count == 0) failures.Add($"block {k}: nothing compared");
+                allDiff += blockDiff; allElems += blockElems;
+                report.Add($"block {k}: {seen.Count} of {ours} patched Linears compared{(partial ? " (partial dump)" : "")}, {blockDiff} of {blockElems} elements differ ({(blockElems > 0 ? (double)blockDiff / blockElems : 0):E2}); worst {worst}");
+                Console.WriteLine($"[Ltx2] fp8 compat weights vs ComfyUI: {report[^1]}");
+            }
+            finally { tr.RemoveLora(lora); }
+        }
+        string line = $"{tensors} tensors in {files.Length} dump(s), {allDiff} of {allElems} elements differ ({(allElems > 0 ? (double)allDiff / allElems : 0):E2}) | " + string.Join(" | ", report)
+            + (failures.Count > 0 ? $" | {failures.Count} FAILURES: " + string.Join("; ", failures.Take(8)) : "");
+        Console.WriteLine("[Ltx2] fp8 compat weights vs ComfyUI: " + line);
+        Ur_Expect(failures.Count == 0 && tensors > 0, line);
+        return line;
+    });
+
+    /// <summary>
     /// The parts of the ComfyUI-compatible fp8 LoRA mode (<see cref="Ltx2Fp8Rounding"/>). Host: the stream's seed and draws against values produced OUTSIDE this code
     /// (zlib's crc32 of the key; numpy's MT19937 seeded with it, the low 8 bits of words 0..7, 622..627 and 1246..1251: either side of the generator's first two state
     /// refills). Device: the whole chain (W x scale + two scaled LoRA products, max / 448, the seeded rounding) against the host rule on every element, bitwise. The

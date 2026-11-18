@@ -167,6 +167,18 @@ public sealed class Ltx2Transformer : IDisposable
     // seeded 8-bit stream, then the Linear on the rounded matrix (its scale on the input, as for the checkpoint's own 8-bit matrices)
     private void LinFp8Compat(GpuWeights w, FV x, string name, FV o, int M, int K, int N, DiTKernels.Act act, bool block)
     {
+        var cq = PatchFp8Compat(w, name, N, K, block);
+        var xs = _xs.View.SubView(0, (long)M * K);
+        _l.ScaleBy(x, _cScale!.View, xs, M * K);
+        string bias = name + ".bias";
+        _k.Linear(xs, cq, w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, act);
+    }
+
+    // the patched weight ComfyUI's way, on the device: w = W + sum strength B A (float32), re-rounded to F8_E4M3 at scale max|w| / 448 with the tensor's seeded 8-bit
+    // stream. Returns the rounded matrix [N, K] (F8_E4M3 values without the scale, as bf16: exact) in _cq; the scale is in _cScale. LinFp8Compat and
+    // ComfyPatchedFp8WeightsAsync both run THIS, so the comparison with ComfyUI's stored weights checks what the forward uses.
+    private ArrayView1D<BFloat16, Stride1D.Dense> PatchFp8Compat(GpuWeights w, string name, int N, int K, bool block)
+    {
         int cnt = checked(N * K), words = (cnt + 3) / 4;
         if (cnt > _cw!.Length) throw new InvalidOperationException($"{name}: [{N}, {K}] is larger than the compatible mode's scratch");
         var cw = _cw.View.SubView(0, cnt); var cba = _cba!.View.SubView(0, cnt); var cq = _cq!.View.SubView(0, cnt);
@@ -197,10 +209,56 @@ public sealed class Ltx2Transformer : IDisposable
         var rnd = _cRnd!.View.SubView(0, words);
         rnd.CopyFromCPU(ref host[offset], (long)words);                                      // has taken the words when it returns: the host arrays are reused
         _l.Fp8StochasticRound(cw, rnd, _cScale.View, cq, cnt);
-        var xs = _xs.View.SubView(0, (long)M * K);
-        _l.ScaleBy(x, _cScale.View, xs, M * K);
-        string bias = name + ".bias";
-        _k.Linear(xs, cq, w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, act);
+        return cq;
+    }
+
+    /// <summary>
+    /// The ComfyUI-compatible patched 8-bit weights of block <paramref name="block"/>: for every 8-bit Linear of the block a LoRA covers, the F8_E4M3 bytes (row-major
+    /// [N, K]) and the scale that <see cref="ComfyCompatibleFp8Lora"/> computes on the device before that Linear (the same code), read back and handed to
+    /// <paramref name="sink"/> (name without a prefix, bytes, scale, N, K) one Linear at a time. For comparing with the weights ComfyUI stores after patching
+    /// (a test sink: it reads every matrix back to the host).
+    /// </summary>
+    public async Task ComfyPatchedFp8WeightsAsync(int block, Action<string, byte[], float, int, int> sink, CancellationToken ct = default)
+    {
+        if (_loras.Count == 0) throw new InvalidOperationException("no LoRA is attached");
+        if (block < 0 || block >= Layers) throw new ArgumentOutOfRangeException(nameof(block));
+        await EnsureCompatAsync();
+        if (_loraBlock.Length != _loras.Count) _loraBlock = new GpuWeights?[_loras.Count];
+        var loraStreamed = new bool[_loras.Count];
+        var (w, streamed) = await _w.BlockAsync(block, ct);
+        for (int i = 0; i < _loras.Count; i++) (_loraBlock[i], loraStreamed[i]) = await _loras[i].Weights.BlockAsync(block, ct);
+        try
+        {
+            var names = new List<string>();
+            for (int i = 0; i < _loras.Count; i++)
+            {
+                if (_loraBlock[i] is not { } lw) continue;
+                foreach (var n in lw.Names)
+                {
+                    const string tail = ".lora_A.weight";
+                    if (!n.EndsWith(tail, StringComparison.Ordinal)) continue;
+                    string name = n[..^tail.Length];
+                    if (w.Has(name + ".weight") && w.IsF8(name + ".weight") && !names.Contains(name)) names.Add(name);
+                }
+            }
+            foreach (var name in names)
+            {
+                var shape = w.Shape(name + ".weight");
+                int N = shape[0], K = shape[1];
+                var cq = PatchFp8Compat(w, name, N, K, block: true);
+                var q = await cq.Cast<BFloat16, ushort>().CopyToHostAsync();
+                var sc = await _cScale!.View.SubView(0, 1).CopyToHostAsync();
+                var bytes = new byte[q.Length];
+                for (int i = 0; i < q.Length; i++) bytes[i] = Ltx2Fp8Rounding.ToE4M3(BitConverter.Int32BitsToSingle(q[i] << 16));
+                sink(name, bytes, sc[0], N, K);
+            }
+        }
+        finally
+        {
+            if (streamed || loraStreamed.Any(b => b)) await _acc.SynchronizeAsync();
+            if (streamed) w.Dispose();
+            for (int i = 0; i < _loras.Count; i++) { if (loraStreamed[i]) _loraBlock[i]!.Dispose(); _loraBlock[i] = null; }
+        }
     }
 
     private Ltx2Transformer(Accelerator accelerator, StreamedModelWeights weights, int batch, int videoTokens, int audioTokens, int contextTokens)
