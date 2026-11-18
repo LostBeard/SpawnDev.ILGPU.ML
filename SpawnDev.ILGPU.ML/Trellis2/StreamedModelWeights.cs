@@ -393,7 +393,7 @@ public sealed class StreamedModelWeights : IDisposable
         if (!_hostCache.ContainsKey(k) && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; }
         if (Prefetch) TopUpReadAhead(k);
         var up = System.Diagnostics.Stopwatch.StartNew();
-        var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, writable: false)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
+        var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, 0, image.Length, writable: false, publiclyVisible: true)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
         await _acc.SynchronizeAsync();                                                            // the upload's own time, not a later kernel's
         UploadSeconds += up.Elapsed.TotalSeconds;
         StreamSeconds += sw.Elapsed.TotalSeconds; StreamedLoads++;

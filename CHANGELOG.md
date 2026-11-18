@@ -13,6 +13,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `ReadAheadBytes` (`StreamedModelWeights.ReadAheadBytes`: the one-block prefetch became a read-ahead queue with a byte budget; default one block, as before):
     with 2 GB from the SATA drive a two-row call 44.0 -> 40.6 s, the distilled clip 458 -> 439 s, bit-identical; 2.0 to 5.3 GB of host memory committed.
   - The drive matters most: the distilled clip takes 458 s with the files on the SATA drive, 240 s on the NVMe drive, 169 s there with the tensor cores too.
+  - **Streamed blocks upload straight from their host image** (`GpuWeights`: a block image is already an array, so its tensors go array to device instead of
+    through the stream copy's chunk buffer; desktop backends; every model on `StreamedModelWeights`). LTX-2, 16.2 GB a call: about 1 s a call less (uploads
+    8.4 -> 7.5 s exact, 6.2 -> 5.1 s on the tensor cores; a two-row call from the NVMe drive 20.9 -> 19.9 s), outputs bit-identical.
   - Regression set after the read-ahead change, CUDA: LTX-2 call / sample / Gemma / LoRA, FLUX.1 (plain and fp8 scaled), Z-Image, Qwen-Image, Qwen-Image Edit 2509
     and 2511 transformer gates all pass at their usual times.
 

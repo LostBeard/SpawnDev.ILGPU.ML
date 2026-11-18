@@ -154,6 +154,15 @@ public sealed class GpuWeights : IDisposable
         }
     }
 
+    // desktop only: a browser buffer's writes go through JS (the stream copy has that path); the array must be exposed (MemoryStream publiclyVisible)
+    private static bool TryUploadFromArray<T>(Stream stream, MemoryBuffer1D<T, Stride1D.Dense> dst, long count, long bytes) where T : unmanaged
+    {
+        if (count <= 0 || bytes > int.MaxValue || OperatingSystem.IsBrowser() || stream is not MemoryStream ms || !ms.TryGetBuffer(out var seg) || ms.Length - ms.Position < bytes) return false;
+        var src = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, T>(seg.AsSpan((int)ms.Position, (int)bytes));
+        dst.View.CopyFromCPU(ref src[0], count);
+        ms.Position += bytes;
+        return true;
+    }
     private static async Task UploadAsync<T>(Stream stream, MemoryBuffer1D<T, Stride1D.Dense> dst, long count, CancellationToken ct) where T : unmanaged
     {
         int es = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
@@ -161,6 +170,9 @@ public sealed class GpuWeights : IDisposable
         // SpawnDev.ILGPU's stream copy: on a browser buffer fed by a JS-backed stream (OPFS cache, fetch ranges) each chunk goes JS -> GPU
         // (queue.writeBuffer) and never through the .NET heap; elsewhere it is a chunked host copy. writeBuffer needs 4-byte multiples, so a
         // tensor whose byte size is not one takes the managed loop below.
+        // A source that is ALREADY a host array (StreamedModelWeights' block images): one copy, array to device. The stream copy below would move every byte
+        // through a chunk buffer first: 16 GB of extra host copies per LTX-2 model call.
+        if (TryUploadFromArray(stream, dst, count, bytes)) return;
         if (bytes % 4 == 0)
         {
             await dst.View.CopyFromStreamAsync(stream, cancellationToken: ct);
