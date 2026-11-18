@@ -61,7 +61,7 @@ The [live demo](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) is a Blazor WebA
 | [Model inspector](https://lostbeard.github.io/SpawnDev.ILGPU.ML/inspector) | Drop any model file (or paste a URL) for its architecture and an operator compatibility check, streaming only the header | any supported format |
 | [Benchmark](https://lostbeard.github.io/SpawnDev.ILGPU.ML/benchmark), [train](https://lostbeard.github.io/SpawnDev.ILGPU.ML/train), [snake](https://lostbeard.github.io/SpawnDev.ILGPU.ML/snake) | Throughput on your device, on-device training, a small decision-head demo | n/a |
 
-Not every page is finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) lists each demo and model as verified, partial or work in progress, with the test that proves it. If a statement here disagrees with that file, that file wins.
+Not every page is finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) lists each demo and model as verified, partial or work in progress, with the test that proves it. Workarounds for bugs outside this library (there is one, in the .NET browser runtime) are listed with their tracking issues in [Docs/workarounds.md](Docs/workarounds.md). If a statement here disagrees with that file, that file wins.
 
 ## Install
 

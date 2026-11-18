@@ -95,7 +95,8 @@ public static class Ltx2Fp8Rounding
                 var v0 = Vector256.LoadUnsafe(ref s, (nuint)j); var v1 = Vector256.LoadUnsafe(ref s, (nuint)(j + 8));
                 v0 ^= v0 >>> 11; v0 ^= (v0 << 7) & tb; v0 ^= (v0 << 15) & tc; v0 ^= v0 >>> 18;
                 v1 ^= v1 >>> 11; v1 ^= (v1 << 7) & tb; v1 ^= (v1 << 15) & tc; v1 ^= v1 >>> 18;
-                // WORKAROUND (a .NET runtime bug, not ours; needs an upstream report): the low byte is masked out BEFORE the narrowing, so a narrowing that
+                // WORKAROUND, tracked publicly: https://github.com/LostBeard/SpawnDev.ILGPU.ML/issues/3 and Docs/workarounds.md (approved by TJ 2026-11-18).
+                // A .NET runtime bug, not ours (upstream report still to be filed): the low byte is masked out BEFORE the narrowing, so a narrowing that
                 // SATURATES gives the same bytes as one that truncates. Vector128.Narrow must truncate, and does on desktop and in the browser's interpreter, but
                 // once this loop is hot the browser runtime (Mono WebAssembly, .NET 10: its hot-path compiler) returns saturated values: FF for every word above
                 // 255. MEASURED 2026-11-17 on all three browser lanes: the unmasked form is right for 342 rounds, then 4,756,832 of the next 4.8 M bytes are FF

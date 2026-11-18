@@ -73,7 +73,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     - `Ltx2Kernels.ReflectTable` wrote a voxel's 27 neighbours from one thread, which WebGL's transform feedback cannot capture: one table entry a thread.
     - The vectorized stream of the ComfyUI-compatible mode returned wrong bytes in the browser: **in Blazor WebAssembly (.NET 10) `Vector128.Narrow` saturates once
       its loop is hot** (it truncates on desktop and while cold): right for 342 rounds, then FF for every word above 255. The generator masks to the low byte before
-      it narrows (a marked workaround for a runtime bug; the test carries a hot-loop canary that reports the runtime's behaviour on every run).
+      it narrows (a marked workaround for a runtime bug; the test carries a hot-loop canary that reports the runtime's behaviour on every run). Tracked in
+      [issue #3](https://github.com/LostBeard/SpawnDev.ILGPU.ML/issues/3) and [Docs/workarounds.md](Docs/workarounds.md).
     `Ltx2_Fp8CompatRounding_MatchesHostRule` passes on all seven lanes (the division and half-precision rounding on the device are exact on WebGPU, WebGL and Wasm too).
     `Trellis2_BiasedAttention_MatchesHostReference` is gated on WebGL like `Trellis2_FlashAttention` (the attention kernels need shared memory or a row of stores).
   - `Ltx2AvModel.SampleAsync` also runs batch 1 (cfg 1: the conditioned prompt only, the template's second pass).

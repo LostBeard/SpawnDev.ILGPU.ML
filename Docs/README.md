@@ -21,6 +21,7 @@ Native GPU neural-network inference for .NET / Blazor WebAssembly, built on Spaw
 | [**flux1.md**](flux1.md) | **FLUX.1 dev, Z-Image Turbo and Generate Text from ComfyUI's files**: the transformer calls, text encoders and qwen_3_4b as a language model, each gated against ComfyUI |
 | [**rigging.md**](rigging.md) | **Auto-rigging and animation** (Kimodo moves on a rigged humanoid: `HumanoidRetargeter`, `AnimatedGlb`) — `SkinTokensRigger` (learned skeleton + skin weights, VAST AI SkinTokens, MIT) and `UniRigRigger`: the pipeline, measured accuracy against the PyTorch reference and speed on CUDA / WebGPU, the weights, the two quirks of the published model, tests, licences |
 | [**system-one.md**](system-one.md) | **System One decision heads** — package API (choice/score/noul, masks, weights) + Classic Snake **demo** reference (`SnakeSystemOneSpec` is not NuGet) |
+| [**workarounds.md**](workarounds.md) | **Workarounds for bugs outside this library**: each one with what was measured, where it sits in the code, its public tracking issue and the test that says when it can go. Today: `Vector128.Narrow` saturating in Blazor WebAssembly once a loop is hot (.NET 10) |
 | [`../README.md`](../README.md) | Project overview, quick start, API, supported backends |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | Release-accurate fixes per version (often the most candid record) |
 | [`../Plans/`](../Plans/) | Engineering roadmaps and design notes |
