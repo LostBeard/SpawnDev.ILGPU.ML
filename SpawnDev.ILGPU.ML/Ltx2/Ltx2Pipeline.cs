@@ -122,6 +122,28 @@ public sealed class Ltx2Pipeline
     public long TransformerResidentBytes { get; set; } = 5_000_000_000;
     /// <summary>Gemma layers kept on the device during the encode: default 4 GB.</summary>
     public long TextEncoderResidentBytes { get; set; } = 4_000_000_000;
+    /// <summary>
+    /// Host RAM (bytes) for keeping streamed block images between sampling steps: the transformer's blocks first, what is left for the distilled LoRA's. A cached
+    /// block is read from the disk once per clip instead of once per step (it is still uploaded every step). Default 0: every step re-reads everything it streams
+    /// (at 768 x 512 x 121 on a 12 GB card: 16.2 GB of checkpoint blocks, plus 6.7 GB of LoRA blocks in the distilled recipe). It pays where the disk sets the pace:
+    /// MEASURED 2026-11-18 from a SATA drive with 6 GB, a distilled clip 458 -> 424 s; a two-row call (GPU-bound there) does not change.
+    /// </summary>
+    public long HostCacheBytes { get; set; }
+    /// <summary>
+    /// Host RAM (bytes) the sampler's read-ahead may hold in streamed block images (the transformer's; the distilled LoRA's read-ahead gets half as much): the reader
+    /// runs that far ahead of the device instead of one block (<see cref="StreamedModelWeights.ReadAheadBytes"/>). Default 0: one block ahead. For a slow drive.
+    /// MEASURED 2026-11-18, RTX 4070, 768 x 512 x 121 from a SATA drive with 2 GB: a two-row call 44.0 -> 40.6 s, a distilled clip 458 -> 439 s, the same output bit
+    /// for bit; from an NVMe drive it changes nothing. It costs host memory: 3.1 to 5.3 GB committed after a clip against 1.1 to 1.3 GB (each block image is a
+    /// fresh large array), which is why it is not the default.
+    /// </summary>
+    public long ReadAheadBytes { get; set; }
+    /// <summary>
+    /// True (default): the transformer computes with float32-exact products (what the ComfyUI float32 gates are held to). False: its GEMMs and attention run on the
+    /// tensor cores with bf16 activations where the card has them: about half the GPU work, a result 5.8e-3 (relative RMS, one call) from the exact one. MEASURED
+    /// 2026-11-18, RTX 4070, 768 x 512 x 121, files on an NVMe drive: a two-row call 38.8 s exact against 20.9 s; a distilled clip 240 s against 169 s. From a SATA
+    /// drive the disk hides most of it (a two-row call 44.0 against 39.7 s): the fast call needs its 16 GB of streamed blocks faster than that drive reads them.
+    /// </summary>
+    public bool PreciseActivations { get; set; } = true;
 
     public Ltx2Pipeline(Accelerator accelerator, IModelSource source, Ltx2Paths paths)
     {
@@ -257,11 +279,17 @@ public sealed class Ltx2Pipeline
         using (var model = await Ltx2AvModel.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, B, Fall, H, W, Ta, ContextTokens, TransformerResidentBytes, ct))
         {
             Ltx2Lora? lora = null;
+            long cacheForBlocks = Math.Min(HostCacheBytes, model.Transformer.Weights.StreamedBytesPerForward);
+            model.Transformer.Weights.HostCacheBytes = cacheForBlocks;
+            model.Transformer.Weights.ReadAheadBytes = ReadAheadBytes;
+            model.Transformer.PreciseActivations = PreciseActivations;
             try
             {
                 if (req.Distilled)
                 {
                     lora = await Ltx2Lora.OpenAsync(_acc, _source, _paths.Repo, _paths.DistilledLora!, req.LoraStrength, 1L << 30, ct);
+                    lora.Weights.HostCacheBytes = HostCacheBytes - cacheForBlocks;
+                    lora.Weights.ReadAheadBytes = ReadAheadBytes / 2;
                     model.Transformer.AddLora(lora);
                     model.Transformer.ComfyCompatibleFp8Lora = req.ComfyCompatibleFp8Lora;
                 }

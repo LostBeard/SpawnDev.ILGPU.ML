@@ -722,10 +722,45 @@ public abstract partial class MLTestBase
         using (var model = await Ltx2AvModel.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", file, B, F, H, W, Ta, L, (long)(residentGb * 1e9)))
         {
             open = sw.Elapsed.TotalSeconds; sw.Restart();
+            // LTX2_REAL_HOSTCACHE_GB: host RAM for streamed block images (StreamedModelWeights.HostCacheBytes); LTX2_REAL_CALLS: more calls after the first, each timed
+            // (the cache fills on the first call and pays from the second)
+            var wts = model.Transformer.Weights;
+            wts.HostCacheBytes = (long)((double.TryParse(Environment.GetEnvironmentVariable("LTX2_REAL_HOSTCACHE_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var hc) ? hc : 0.0) * 1e9);
+            wts.ReadAheadBytes = (long)((double.TryParse(Environment.GetEnvironmentVariable("LTX2_REAL_READAHEAD_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ra) ? ra : 0.0) * 1e9);
             den = await model.DenoiseAsync(packed, new[] { 1f, 1f }, ctx.View, 25f);
             callS = sw.Elapsed.TotalSeconds;
-            var wts = model.Transformer.Weights; read = wts.ReadSeconds; upload = wts.UploadSeconds; resident = wts.ResidentBlocks;
+            read = wts.ReadSeconds; upload = wts.UploadSeconds; resident = wts.ResidentBlocks;
             await accelerator.SynchronizeAsync();
+            int calls = int.TryParse(Environment.GetEnvironmentVariable("LTX2_REAL_CALLS"), out var nc) ? nc : 1;
+            for (int c = 1; c < calls; c++)
+            {
+                double r0 = wts.ReadSeconds, u0 = wts.UploadSeconds, s0 = wts.StreamSeconds; sw.Restart();
+                var again = await model.DenoiseAsync(packed, new[] { 1f, 1f }, ctx.View, 25f);
+                await accelerator.SynchronizeAsync();
+                double t = sw.Elapsed.TotalSeconds; int same = 0; for (int i = 0; i < den.Length; i++) if (again[i] == den[i]) same++;
+                Console.WriteLine($"[Benchmark] Ltx2 real size call {c + 1} of {calls}: {t:F1} s (read {wts.ReadSeconds - r0:F1} s, upload {wts.UploadSeconds - u0:F1} s, waited on streamed blocks {wts.StreamSeconds - s0:F1} s); "
+                    + $"host cache {wts.HostCacheUsed / 1e9:F2} of {wts.HostCacheBytes / 1e9:F1} GB, {wts.StreamedBytesPerForward / 1e9:F1} GB streamed a call; {(same == den.Length ? "identical to call 1" : $"{den.Length - same} of {den.Length} values differ from call 1")}");
+                Ur_Expect(same == den.Length, $"call {c + 1} differs from call 1 in {den.Length - same} of {den.Length} values (the same input: a cached block is not the block that was read?)");
+            }
+            // LTX2_REAL_FAST=1: the same call with PreciseActivations off (bf16 tensor-core GEMM in one pass, the tensor-core flash attention): its time (second call:
+            // the first compiles its kernels) and its distance from the precise result
+            if (Environment.GetEnvironmentVariable("LTX2_REAL_FAST") == "1")
+            {
+                model.Transformer.PreciseActivations = false;
+                try
+                {
+                    for (int c = 0; c < 2; c++)
+                    {
+                        double s0 = wts.StreamSeconds, u0 = wts.UploadSeconds; sw.Restart();
+                        var fast = await model.DenoiseAsync(packed, new[] { 1f, 1f }, ctx.View, 25f);
+                        await accelerator.SynchronizeAsync();
+                        double t = sw.Elapsed.TotalSeconds;
+                        Console.WriteLine($"[Benchmark] Ltx2 real size call, PreciseActivations off, run {c + 1} of 2: {t:F1} s (upload {wts.UploadSeconds - u0:F1} s, waited on streamed blocks {wts.StreamSeconds - s0:F1} s); "
+                            + $"vs the precise call: video {F2_RelRms(fast.AsSpan(P, V).ToArray(), den.AsSpan(P, V).ToArray()):E2}, audio {F2_RelRms(fast.AsSpan(P + V, P - V).ToArray(), den.AsSpan(P + V, P - V).ToArray()):E2}");
+                    }
+                }
+                finally { model.Transformer.PreciseActivations = true; }
+            }
         }
         var (rmsV, badV) = Stat(den.AsSpan(P, V)); var (rmsA, badA) = Stat(den.AsSpan(P + V, P - V));           // the conditioned row
         string line = $"{width}x{height}x{frames}: {nv} video + {Ta} audio tokens | open {open:F1} s, one call (batch 2) {callS:F1} s ({resident} of 48 blocks resident, read {read:F1} s, upload {upload:F1} s); denoised rms video {rmsV:F3} / audio {rmsA:F3}";
@@ -805,6 +840,12 @@ public abstract partial class MLTestBase
             Distilled = distilled, Steps = int.Parse(Env("LTX2_PIPE_STEPS", "20")), Cfg = 4f, Seed = long.Parse(Env("LTX2_PIPE_SEED", "42")),
         };
         var pipe = new Ltx2Pipeline(accelerator, src, paths);
+        // LTX2_PIPE_HOSTCACHE_GB: host RAM for streamed block images between steps (Ltx2Pipeline.HostCacheBytes; default 0)
+        pipe.HostCacheBytes = (long)(double.Parse(Env("LTX2_PIPE_HOSTCACHE_GB", "0"), System.Globalization.CultureInfo.InvariantCulture) * 1e9);
+        // LTX2_PIPE_READAHEAD_GB: host RAM for the read-ahead of streamed blocks (Ltx2Pipeline.ReadAheadBytes; unset = the pipeline's default, 0 = one block);
+        // LTX2_PIPE_FAST=1: Ltx2Pipeline.PreciseActivations off (the transformer on the tensor cores with bf16 activations)
+        if (Env("LTX2_PIPE_READAHEAD_GB", "") is { Length: > 0 } raGb) pipe.ReadAheadBytes = (long)(double.Parse(raGb, System.Globalization.CultureInfo.InvariantCulture) * 1e9);
+        pipe.PreciseActivations = Env("LTX2_PIPE_FAST", "0") != "1";
         var stages = new List<string>();
         var progress = new Progress<Wan.WanProgress>(p => { if (p.Fraction is 0.0 or 1.0) lock (stages) stages.Add($"{p.Stage}: {p.Message}"); });
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -848,7 +889,7 @@ public abstract partial class MLTestBase
             wavNote = $"{samples / (double)rate:F2} s of stereo at {rate} Hz, rms {audioRms:F4}";
         }
         string secs = string.Join(", ", clip.Seconds.Select(kv => $"{kv.Key} {kv.Value:F1} s"));
-        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}{(req.ComfyCompatibleFp8Lora ? ", ComfyUI-compatible fp8 LoRA" : "")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1}{keyNote} | {wavNote} | {outDir}";
+        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}{(req.ComfyCompatibleFp8Lora ? ", ComfyUI-compatible fp8 LoRA" : "")}{(pipe.HostCacheBytes > 0 ? $", host cache {pipe.HostCacheBytes / 1e9:F1} GB" : "")}, read-ahead {pipe.ReadAheadBytes / 1e9:F1} GB{(pipe.PreciseActivations ? "" : ", tensor-core activations")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1}{keyNote} | {wavNote} | {outDir}";
         Console.WriteLine("[Benchmark] Ltx2 pipeline: " + line);
         lock (stages) Console.WriteLine("[Ltx2] pipeline stages: " + string.Join(" | ", stages));
         Ur_Expect(sd0 > 4 && sd1 > 4 && moved > 1, "the frames are flat or do not move: " + line);

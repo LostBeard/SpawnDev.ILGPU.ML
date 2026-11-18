@@ -313,10 +313,23 @@ is a moving picture with sound and, with a keyframe, that the guided frame is th
 | Distilled, 8 steps, a keyframe at frame 0 | 471 s | 26 s | 432 s | 12 s | 0.9 s |
 | Distilled, 8 steps, ComfyUI-compatible LoRA rounding | 464 s | 25 s | 426 s | 12 s | 0.8 s |
 | Full recipe, 20 steps at CFG 4 with the negative prompt (two model rows a step) | 946 s | 29 s | 904 s (45 s a step) | 12 s | 0.9 s |
+| Distilled, 8 steps, every file on an NVMe drive (run with a 2 GB read-ahead) | 240 s | 8.5 s | 221 s (28 s a step) | 10 s | 0.6 s |
+| Distilled, 8 steps, NVMe (2 GB read-ahead), `PreciseActivations = false` (tensor cores) | 169 s | 8.5 s | 149 s (19 s a step) | 11 s | 0.6 s |
 
-Sampling is bound by the disk: at this size one two-row model call takes 48.5 s, of which 37.6 s is reading the streamed blocks from the SATA drive and 7.6 s uploading
-them (`Ltx2_RealSize_Benchmark`). `Ltx2Pipeline.TransformerResidentBytes` sets how much of the transformer stays on the device between calls (default 5 GB: 11 of the 48
+Where a step's time goes, MEASURED on this card (`Ltx2_RealSize_Benchmark`, repeated calls): a two-row model call (the CFG recipe) takes 44 s: about 30 s of GPU work and
+8 s uploading the 16.2 GB of streamed blocks; the disk reads (34 s from the SATA drive, 0.43 GB/s) run behind the GPU work, so the call waits on them about 5 s. A distilled step computes one row but streams 6.7 GB of LoRA blocks more: 22.9 GB, about 53 s of reading against its 52 s, so there the disk sets the pace. `Ltx2Pipeline.TransformerResidentBytes` sets how much of the transformer stays on the device between calls (default 5 GB: 11 of the 48
 blocks on this card). Host memory after a clip: about 1.0 to 1.4 GB committed.
+
+**Three switches on `Ltx2Pipeline` trade memory or exactness for time** (all off by default; the two memory ones do not change the result by a bit):
+
+- `PreciseActivations = false`: the transformer's GEMMs and attention on the tensor cores with bf16 activations. About half the GPU work; the result of one call
+  moves 5.8e-3 (relative RMS) from the exact one. It pays when the drive keeps up: a two-row call 38.8 -> 20.9 s from the NVMe drive, 44.0 -> 39.7 s from the SATA one.
+- `HostCacheBytes`: host RAM that keeps streamed blocks between steps. It pays where the disk sets the pace: with 6 GB the distilled clip from the SATA drive
+  went 458 -> 424 s; the GPU-bound two-row call did not change.
+- `ReadAheadBytes`: how far the reader runs ahead of the device. With 2 GB from the SATA drive: a two-row call 44.0 -> 40.6 s, the distilled clip 458 -> 439 s;
+  from the NVMe drive a call has no read wait left to remove. It costs host memory: 2.0 to 5.3 GB committed after a clip against 1.0 to 1.4 GB.
+
+The drive matters most: the same distilled clip takes 458 s with the files on the SATA drive and 240 s on the NVMe one, 169 s with the tensor cores as well.
 
 ## Limits
 

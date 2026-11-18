@@ -91,7 +91,55 @@ public sealed class StreamedModelWeights : IDisposable
     }
     private readonly Dictionary<int, byte[]> _hostCache = new();
     private long _hostCacheUsed;
-    private (int Block, Task<byte[]> Image)? _pending;
+    // the read-ahead: the next streamed blocks in forward order (wrapping into the next pass), each read after the one before it (one reader: one disk)
+    private readonly List<(int Block, Task<byte[]> Image, long Bytes)> _ahead = new();
+
+    /// <summary>
+    /// Host RAM (bytes) the read-ahead may hold in block images (default 0: the next block only, whatever its size). With a budget the reader keeps reading the
+    /// following streamed blocks while the device works, so the disk does not idle through a run of resident or host-cached blocks and catch up later with the
+    /// caller waiting. Needs <see cref="Prefetch"/>.
+    /// </summary>
+    public long ReadAheadBytes { get; set; }
+
+    private long BlockBytes(int k) { long n = 0; foreach (var t in _blockTensors[k]) n += t.DataLength; return n; }
+
+    // after block k was handed out: queue reads of the streamed, uncached blocks that follow, one beyond the last queued while the budget lasts (always at least one)
+    private void TopUpReadAhead(int k)
+    {
+        long held = 0; foreach (var a in _ahead) held += a.Bytes;
+        int last = _ahead.Count > 0 ? _ahead[^1].Block : k;
+        for (int guard = 0; guard < BlockCount; guard++)
+        {
+            int? next = null;
+            for (int i = 1; i <= BlockCount; i++)                                            // the streamed block after `last` that the host cache does not hold
+            {
+                int b = (last + i) % BlockCount;
+                if (b == k) break;                                                           // a whole pass is queued: nothing more to read ahead
+                if (_resident[b] == null && !_hostCache.ContainsKey(b)) { next = b; break; }
+            }
+            if (next is not int nb || _ahead.Any(a => a.Block == nb)) return;
+            long bytes = BlockBytes(nb);
+            if (_ahead.Count > 0 && held + bytes > ReadAheadBytes) return;
+            var prev = _ahead.Count > 0 ? _ahead[^1].Image : null;
+            _ahead.Add((nb, Task.Run(async () =>
+            {
+                if (prev != null) { try { await prev; } catch { } }                          // one read at a time, in order; a failed read does not stop the next
+                return await ReadBlockImageAsync(nb, CancellationToken.None);
+            }), bytes));
+            held += bytes; last = nb;
+        }
+    }
+
+    // block k's image from the read-ahead when it is queued (everything queued before it was skipped by the caller: observed and dropped)
+    private async Task<byte[]?> TakeReadAheadAsync(int k)
+    {
+        int at = _ahead.FindIndex(a => a.Block == k);   // by block, never "the first queued": out of order that hands out another block's image (red-check)
+        if (at < 0) return null;
+        for (int i = 0; i < at; i++) _ = _ahead[i].Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+        var image = _ahead[at].Image;
+        _ahead.RemoveRange(0, at + 1);
+        return await image;
+    }
     /// <summary>
     /// Every tensor name the file's header declares (prefix-free), including ones never loaded: ComfyUI's empty marker tensors (<c>__index_timestep_zero__</c> in Qwen-Image
     /// Edit 2511 files) tell the model how to run.
@@ -275,13 +323,6 @@ public sealed class StreamedModelWeights : IDisposable
         catch { w.Dispose(); throw; }
     }
 
-    // the streamed block after k in forward order, wrapping to the first streamed block (the next pass starts there); null when nothing streams
-    private int? NextStreamed(int k)
-    {
-        for (int i = 1; i <= BlockCount; i++) { int b = (k + i) % BlockCount; if (_resident[b] == null) return b; }
-        return null;
-    }
-
     /// <summary>
     /// Block <paramref name="k"/> as a self-contained safetensors image in host memory: a header naming its tensors (the file's own names and metadata) and their bytes,
     /// read from the file by offset. The loader then runs on it exactly as on the file.
@@ -341,14 +382,16 @@ public sealed class StreamedModelWeights : IDisposable
         var sw = System.Diagnostics.Stopwatch.StartNew();
         byte[] image;
         if (_hostCache.TryGetValue(k, out var cached)) image = cached;
-        else if (_pending is { } p && p.Block == k) { image = await p.Image; _pending = null; }
-        else image = await ReadBlockImageAsync(k, ct);
-        if (!_hostCache.ContainsKey(k) && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; }
-        if (Prefetch && NextStreamed(k) is int next && next != k && !_hostCache.ContainsKey(next) && (_pending == null || _pending.Value.Block != next))
+        else if (await TakeReadAheadAsync(k) is { } ahead) image = ahead;
+        else
         {
-            if (_pending is { } stale) _ = stale.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);   // a prefetch the caller skipped: observed, dropped
-            _pending = (next, Task.Run(() => ReadBlockImageAsync(next, CancellationToken.None)));
+            // not what the read-ahead expected (the caller left the forward order): its queue is of no use, drop it and read this block now
+            foreach (var a in _ahead) _ = a.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+            _ahead.Clear();
+            image = await ReadBlockImageAsync(k, ct);
         }
+        if (!_hostCache.ContainsKey(k) && _hostCacheUsed + image.Length <= HostCacheBytes) { _hostCache[k] = image; _hostCacheUsed += image.Length; }
+        if (Prefetch) TopUpReadAhead(k);
         var up = System.Diagnostics.Stopwatch.StartNew();
         var loaded = await LoadAsync(_acc, _ => Task.FromResult<Stream>(new MemoryStream(image, writable: false)), _file, _prefix, n => _blockOf(n) == k, _adapt, _scales, ct);
         await _acc.SynchronizeAsync();                                                            // the upload's own time, not a later kernel's
@@ -418,7 +461,9 @@ public sealed class StreamedModelWeights : IDisposable
     public void Dispose()
     {
         _scratch?.Dispose(); _scratch = null;
-        _hostCache.Clear(); _hostCacheUsed = 0; _pending = null;
+        _hostCache.Clear(); _hostCacheUsed = 0;
+        foreach (var a in _ahead) _ = a.Image.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);   // reads still in flight: observed, dropped
+        _ahead.Clear();
         foreach (var r in _retired) r.Dispose(); _retired.Clear();
         foreach (var r in _resident) r?.Dispose();
         Array.Clear(_resident);

@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **LTX-2 speed, measured where the time goes** (RTX 4070, 768 x 512 x 121; `Ltx2_RealSize_Benchmark` with repeated calls). A two-row model call is 44 s from a SATA
+  drive: about 30 s of GPU work, 8 s of upload, 5 s waiting on reads (the reads run behind the GPU work; an earlier note here called the sampling disk-bound, which
+  was wrong for this recipe). Three opt-in switches on `Ltx2Pipeline`, all off by default (the pipeline's behaviour is unchanged):
+  - `PreciseActivations = false`: the transformer on the tensor cores with bf16 activations: about half the GPU work, one call 5.8e-3 (relative RMS) from the exact
+    result. A two-row call 38.8 -> 20.9 s with the files on an NVMe drive (44.0 -> 39.7 s on the SATA drive, where the disk then sets the pace).
+  - `HostCacheBytes`: host RAM that keeps streamed transformer / LoRA blocks between steps. The distilled clip from the SATA drive with 6 GB: 458 -> 424 s.
+  - `ReadAheadBytes` (`StreamedModelWeights.ReadAheadBytes`: the one-block prefetch became a read-ahead queue with a byte budget; default one block, as before):
+    with 2 GB from the SATA drive a two-row call 44.0 -> 40.6 s, the distilled clip 458 -> 439 s, bit-identical; 2.0 to 5.3 GB of host memory committed.
+  - The drive matters most: the distilled clip takes 458 s with the files on the SATA drive, 240 s on the NVMe drive, 169 s there with the tensor cores too.
+  - Regression set after the read-ahead change, CUDA: LTX-2 call / sample / Gemma / LoRA, FLUX.1 (plain and fp8 scaled), Z-Image, Qwen-Image, Qwen-Image Edit 2509
+    and 2511 transformer gates all pass at their usual times.
+
 ## 5.8.21 - 2026-11-17 (nuget.org) - LTX-2 19B (video with sound) against ComfyUI, on ComfyUI's own files; SpawnDev.ILGPU 5.4.36
 
 - **SpawnDev.ILGPU 5.4.36** (Wasm buffers stay in the linear memory between dispatches). ML Wasm-lane gate on 5.4.36-local.1: 1105 / 0 / 64, no Pass -> Fail, time
@@ -22,8 +36,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2VideoEncoder` (the checkpoint's BF16 vae.encoder, for image-to-video): 4.9e-6 (`Ltx2_VideoEncode_MatchesComfyUi`).
   - **`Ltx2Pipeline.GenerateAsync`: a prompt to a clip with sound in one call** (`Ltx2Request` / `Ltx2Clip` / `Ltx2Paths`): Gemma encode, connectors, the sampler on
     the device (LTXVScheduler sigmas with CFG, or the distilled LoRA's 8 steps), video and audio decode; the stages open one after another, so one large model is on
-    the device at a time. MEASURED, RTX 4070, 768 x 512 x 121 frames + 4.8 s of stereo: distilled 458 s (encode 26, sampling 419 = 52 s a step, bound by reading the
-    streamed blocks from a SATA drive, video decode 12, audio 0.9); the full recipe, 20 steps at CFG 4 with the negative prompt, 946 s (sampling 904 = 45 s a step);
+    the device at a time. MEASURED, RTX 4070, 768 x 512 x 121 frames + 4.8 s of stereo: distilled 458 s (encode 26, sampling 419 = 52 s a step: a step
+    streams 16.2 GB of checkpoint blocks and 6.7 GB of LoRA blocks, about that long to read from a SATA drive at 0.43 GB/s; video decode 12, audio 0.9); the full recipe,
+    20 steps at CFG 4 with the negative prompt, 946 s (sampling 904 = 45 s a step: a two-row call is about 30 s of GPU work and 8 s of upload, the reads run behind it);
     the frames are a coherent clip of the prompt (`Ltx2_Pipeline_GeneratesClip`).
   - **Keyframe guides** (ComfyUI's LTXVAddGuide; `Ltx2Request.Keyframes` / `Ltx2Keyframe`, `Ltx2Guide` on the model call): per-frame timesteps, the guide tokens' RoPE
     boxes, ln(strength x mask) on the attention between noisy and guide tokens (`DiTKernels.BiasedAttention`, a biased flash kernel), ComfyUI's masked sampling.
