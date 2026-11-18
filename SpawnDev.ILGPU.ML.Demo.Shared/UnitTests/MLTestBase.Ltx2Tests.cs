@@ -828,7 +828,7 @@ public abstract partial class MLTestBase
     {
         const int H = 32, D = 128, C = H * D, L = 1024;
         int N = int.TryParse(Environment.GetEnvironmentVariable("LTX2_ATTN_TOKENS"), out var nt) ? nt : 6144;
-        var precise = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true };
+        var precise = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };   // the portable fp32 kernel, whatever the env says
         var fast = new Trellis2.DiTKernels(accelerator);
         if (!precise.UsesFlashAttention(D)) throw new UnsupportedTestException($"{accelerator.AcceleratorType}: no flash attention for head width {D}");
         var rng = new Random(5);
@@ -848,11 +848,97 @@ public abstract partial class MLTestBase
             double flops = 4.0 * N * Nk * H * D;
             double tp = await Time(() => precise.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oP.View, N, Nk, H, D));
             double tf = await Time(() => fast.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oF.View, N, Nk, H, D));
-            double dist = F2_RelRms(await oF.View.CopyToHostAsync(), await oP.View.CopyToHostAsync());
+            var hostP = await oP.View.CopyToHostAsync();
+            double dist = F2_RelRms(await oF.View.CopyToHostAsync(), hostP);
             report.Add($"{label} {N} x {Nk}: exact path {tp:F1} ms ({flops / tp / 1e9:F1} TFLOPS, portable kernel: {precise.TiledAttentionKind}), fast path {tf:F1} ms ({flops / tf / 1e9:F1} TFLOPS), {tp / tf:F1}x; fast vs exact {dist:E2}");
+            // the exact attention on the tensor cores (hi + lo bf16 halves), where the card has them
+            var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true };
+            double tx = await Time(() => exactTc.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oF.View, N, Nk, H, D));
+            double distX = F2_RelRms(await oF.View.CopyToHostAsync(), hostP);
+            report.Add($"{label} exact on tensor cores {tx:F1} ms ({flops / tx / 1e9:F1} TFLOPS), {tp / tx:F1}x the portable kernel; vs the portable kernel {distX:E2}");
         }
         string line = $"{accelerator.AcceleratorType}, {H} heads x {D}: " + string.Join(" | ", report);
         Console.WriteLine("[Benchmark] Ltx2 attention kernels: " + line);
+        return line;
+    });
+
+    /// <summary>
+    /// Every flash attention kernel this backend has at head width 128 against a float64 host reference (softmax(q k^T / sqrt(D)) v), at sizes that are not
+    /// multiples of the kernels' tiles (300 queries, 150 keys, 3 heads) and with scores spread enough for a peaked softmax: the portable fp32 kernel, the exact
+    /// tensor-core kernel (<see cref="Trellis2.DiTKernels.ExactTensorCoreAttention"/>: hi + lo bf16 halves) and the fast bf16 one. The two exact paths must sit at
+    /// fp32 rounding (2e-5 relative RMS); the fast one is reported. Three passes: that one, the same scores with q scaled by 37 and k, v by 1 / 37 (the bf16
+    /// halves must not depend on the magnitude), scores four times as large (a strongly peaked softmax), and keys with a large part common to all of them
+    /// (the exact tensor-core kernel centres its keys; the pass also runs it without the centring and expects that to be at least ten times worse).
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Ltx2_ExactAttentionKernels_MatchFloat64() => await RunTest(async accelerator =>
+    {
+        const int H = 3, D = 128, C = H * D, Nq = 300, Nk = 150;
+        var portable = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };
+        var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true };
+        var fast = new Trellis2.DiTKernels(accelerator) { PreciseActivations = false };
+        if (!portable.UsesFlashAttention(D)) throw new UnsupportedTestException($"{accelerator.AcceleratorType}: no flash attention for head width {D}");
+        var report = new List<string>();
+        var worst = (portable: 0.0, exact: 0.0);
+        // (q scale, k scale, v scale, k common): moderately peaked; the same scores with q, k and v at other magnitudes; strongly peaked (scores four times as
+        // large); and keys that share a large common part (every key = 40 x one vector + its own part: the scores of a query all move by the same hundreds,
+        // which a softmax does not see, but which an attention that does not centre its keys pays for in precision: Qwen-Image's first block is like this)
+        foreach (var (qScale, kScale, vScale, kCommon) in new[] { (4f, 1f, 1f, 0f), (4f * 37f, 1f / 37f, 1f / 37f, 0f), (16f, 1f, 1f, 0f), (4f, 1f, 1f, 40f) })
+        {
+            var rng = new Random(11);
+            var qh = new float[Nq * C]; var kvh = new float[Nk * 2 * C];
+            for (int i = 0; i < qh.Length; i++) qh[i] = (float)(rng.NextDouble() * 2 - 1) * qScale;
+            for (int i = 0; i < kvh.Length; i++) kvh[i] = (float)(rng.NextDouble() * 2 - 1) * ((i % (2 * C)) < C ? kScale : vScale);
+            var common = new float[C]; for (int i = 0; i < C; i++) common[i] = (float)(rng.NextDouble() * 2 - 1) * kCommon;
+            for (int j = 0; j < Nk; j++) for (int i = 0; i < C; i++) kvh[j * 2 * C + i] += common[i];
+            var want = new float[Nq * C];
+            var sc = new double[Nk];
+            for (int h = 0; h < H; h++)
+                for (int i = 0; i < Nq; i++)
+                {
+                    double mx = double.NegativeInfinity;
+                    for (int j = 0; j < Nk; j++)
+                    {
+                        double s = 0;
+                        for (int d = 0; d < D; d++) s += (double)qh[i * C + h * D + d] * kvh[j * 2 * C + h * D + d];
+                        sc[j] = s / Math.Sqrt(D); mx = Math.Max(mx, sc[j]);
+                    }
+                    double sum = 0;
+                    for (int j = 0; j < Nk; j++) { sc[j] = Math.Exp(sc[j] - mx); sum += sc[j]; }
+                    for (int d = 0; d < D; d++)
+                    {
+                        double acc = 0;
+                        for (int j = 0; j < Nk; j++) acc += sc[j] * kvh[j * 2 * C + C + h * D + d];
+                        want[i * C + h * D + d] = (float)(acc / sum);
+                    }
+                }
+            using var q = accelerator.Allocate1D(qh); using var kv = accelerator.Allocate1D(kvh); using var o = accelerator.Allocate1D<float>((long)Nq * C);
+            async Task<double> Run(Trellis2.DiTKernels k)
+            {
+                o.View.MemSetToZero();
+                k.Attention(q.View, C, 0, kv.View, 2 * C, 0, C, default, o.View, Nq, Nk, H, D);
+                await accelerator.SynchronizeAsync();
+                var got = await o.View.CopyToHostAsync();
+                Ur_Expect(got.All(float.IsFinite), "a non-finite attention output");
+                return F2_RelRms(got, want);
+            }
+            double ep = await Run(portable), ex = await Run(exactTc), ef = await Run(fast);
+            report.Add($"q x {qScale:G3}, k x {kScale:G3}, v x {vScale:G3}, k common x {kCommon:G3}: portable {ep:E2}, exact tensor cores {ex:E2}, fast {ef:E2}");
+            if (kCommon != 0 && Trellis2.DiTKernels.EnableTensorCores && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator))
+            {
+                // the red check of the centring: the same kernel without it must be clearly worse on these keys
+                Trellis2.DiTKernels.CenterAttentionKeys = false;
+                double raw;
+                try { raw = await Run(exactTc); } finally { Trellis2.DiTKernels.CenterAttentionKeys = true; }
+                report.Add($"the same without centring the keys {raw:E2}");
+                Ur_Expect(raw > 10 * ex, $"centring the keys made no difference on keys with a common part: {raw:E2} without, {ex:E2} with");
+            }
+            worst = (Math.Max(worst.portable, ep), Math.Max(worst.exact, ex));
+        }
+        string line = $"{accelerator.AcceleratorType}: " + string.Join(" | ", report) + " (relative RMS against float64; exact tensor cores = the portable kernel where the card has none)";
+        Console.WriteLine("[Benchmark] Ltx2 exact attention kernels: " + line);
+        Ur_Expect(worst.portable < 2e-5, $"the portable kernel is {worst.portable:E2} from float64 (limit 2e-5): {line}");
+        Ur_Expect(worst.exact < 2e-5, $"the exact tensor-core kernel is {worst.exact:E2} from float64 (limit 2e-5): {line}");
         return line;
     });
 

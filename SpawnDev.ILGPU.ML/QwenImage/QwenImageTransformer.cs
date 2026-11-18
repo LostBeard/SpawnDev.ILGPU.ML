@@ -344,6 +344,7 @@ public sealed class QwenImageTransformer : IDisposable
         _u.RmsNormHeads(qkvI, w.BF16(b + "attn.norm_k.weight"), _nImg, 3 * Dim, Dim, Heads, HeadDim, Eps);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, 0, Heads, HeadDim);
         _f.RopeInterleaved(_qkv.View, _cosT.View, _sinT.View, _n, 3 * Dim, Dim, Heads, HeadDim);
+        Probe?.Invoke(b + "qkv", _qkv.View, _n, 3 * Dim);                                // the attention's inputs: [tokens][q | k | v], text tokens first
         _k.Attention(_qkv.View, 3 * Dim, 0, _qkv.View, 3 * Dim, Dim, 2 * Dim, _scores.View, _attn.View, _n, _n, Heads, HeadDim);
         Lin(w, _attn.View.SubView(0, (long)_nTxt * Dim), b + "attn.to_add_out", _attnTxt.View, _nTxt, Dim, Dim);
         Lin(w, _attn.View.SubView((long)_nTxt * Dim, (long)_nImg * Dim), b + "attn.to_out.0", _attnImg.View, _nImg, Dim, Dim);

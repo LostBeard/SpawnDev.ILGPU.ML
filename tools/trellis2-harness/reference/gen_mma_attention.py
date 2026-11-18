@@ -172,6 +172,185 @@ for j in range(D // 8):
     w(f"        if (r0ok) {{ O[ob0 + {8 * j} + 2 * t] = o{j}0 * inv0; O[ob0 + {8 * j} + 2 * t + 1] = o{j}1 * inv0; }}")
     w(f"        if (r1ok) {{ O[ob1 + {8 * j} + 2 * t] = o{j}2 * inv1; O[ob1 + {8 * j} + 2 * t + 1] = o{j}3 * inv1; }}")
 w("    }")
+w("")
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------
+# KernelExact (2026-11-18): the same flash attention with near-fp32 accuracy. q, k, v and the probabilities are each kept as two bf16 values,
+# hi = bf16(x) and lo = bf16(x - hi) (x - hi is exact in fp32), so a product a * b is hi_a hi_b + lo_a hi_b + hi_a lo_b: three MMAs where the fast
+# kernel runs one (the dropped lo_a lo_b is 2^-18 of the product, the size of lo's own rounding). Every k16 step runs its three MMAs from zero and
+# adds the result to the fp32 accumulators with an ordinary add: the tensor cores' own accumulation truncates (see gen_mma_gemm.py kernel_split).
+# K / V arrive as interleaved words (hi pair at [2p], lo pair at [2p + 1]). Both halves of a tile must fit the 48 KB of static shared memory, so
+# a tile is 32 keys: Ks 32 x 68 words and Vt 128 x 20 words, twice.
+# ---------------------------------------------------------------------------------------------------------------------------------------------
+XKT = 32
+XVT = 20                                # 16 key pairs + 4: g * 20 mod 32 runs over the multiples of 4, conflict free like the fast kernel's 36
+XNKI = XKT * D // 2 // TH               # K pair positions per thread and tile (a hi and a lo word each)
+XNVI = XKT * D // 4 // TH
+XPB = (XKT // 2).bit_length() - 1       # log2(key pairs per tile)
+XNT = XKT // 8                          # n-tiles of the score MMAs
+
+def mma3(acc, ah, al, bh0, bh1, bl0, bl1, ind):
+    w(f"{ind}{{")
+    w(f'{ind}CudaAsm.Emit("{MMA}",')
+    w(f"{ind}    out float e0, out float e1, out float e2, out float e3, {ah}0, {ah}1, {ah}2, {ah}3, {bh0}, {bh1}, 0f, 0f, 0f, 0f);")
+    w(f'{ind}CudaAsm.Emit("{MMA}",')
+    w(f"{ind}    out float f0, out float f1, out float f2, out float f3, {al}0, {al}1, {al}2, {al}3, {bh0}, {bh1}, e0, e1, e2, e3);")
+    w(f'{ind}CudaAsm.Emit("{MMA}",')
+    w(f"{ind}    out float d0, out float d1, out float d2, out float d3, {ah}0, {ah}1, {ah}2, {ah}3, {bl0}, {bl1}, f0, f1, f2, f3);")
+    w(f"{ind}{acc}0 += d0; {acc}1 += d1; {acc}2 += d2; {acc}3 += d3;")
+    w(f"{ind}}}")
+
+def maxtree(names):
+    while len(names) > 1:
+        names = [f"MathF.Max({names[i]}, {names[i + 1]})" if i + 1 < len(names) else names[i] for i in range(0, len(names), 2)]
+    return names[0]
+
+w("    // the two bf16 halves of a packed register as floats (bf16 is the top 16 bits of an fp32)")
+w("    private static float Bf16Lo(uint packed) => Interop.IntAsFloat(packed << 16);")
+w("    private static float Bf16Hi(uint packed) => Interop.IntAsFloat(packed & 0xFFFF0000u);")
+w("")
+w(f"    public const int KTileExact = {XKT};")
+w("")
+w("    /// <summary>mean[c] = the mean over the Nk keys of k's column c (c in 0 .. H * D): what <see cref=\"SplitPairs\"/> subtracts from every key.</summary>")
+w("    public static void KeyMean(Index1D c, FV kv, FV mean, int Nk, int kvStride, int kOff)")
+w("    {")
+w("        float sum = 0f;")
+w("        for (int j = 0; j < Nk; j++) sum += kv[(long)j * kvStride + kOff + c.X];")
+w("        mean[c] = sum / Nk;")
+w("    }")
+w("")
+w("    /// <summary>")
+w("    /// The (hi, lo) words KernelExact reads: dst[2p] = the bf16 pair of src[2p], src[2p + 1]; dst[2p + 1] = the bf16 pair of what that rounding lost.")
+w("    /// The k columns (kOff .. kOff + cols of every kvStride) are CENTRED first: mean[column] is subtracted. A term common to all keys shifts every score of a")
+w("    /// query by the same amount, which a softmax does not see, so the result is the same attention; but the two bf16 halves carry about 18 bits of a")
+w("    /// product, and a large common part would spend them (MEASURED 2026-11-18 on Qwen-Image's first block, where the common part of k is 4.5 times its")
+w("    /// variation and scores reach 3.5e4: 4.6e-2 from float64 without the centring, 5.8e-4 with it, the fp32 kernel 5.2e-4). Any mean works: it only has to")
+w("    /// be the same for every key.")
+w("    /// </summary>")
+w("    public static void SplitPairs(Index1D p, FV src, UV dst, FV mean, int kvStride, int kOff, int cols)")
+w("    {")
+w("        long e = 2L * p.X;")
+w("        float a = src[e], b = src[e + 1];")
+w("        int col = (int)(e % kvStride) - kOff;")
+w("        if (col >= 0 && col < cols) { a -= mean[col]; b -= mean[col + 1]; }")
+w("        uint hh = Pack(a, b);")
+w("        dst[e] = hh;")
+w("        dst[e + 1] = Pack(a - Bf16Lo(hh), b - Bf16Hi(hh));")
+w("    }")
+w("")
+w("    /// <summary>")
+w("    /// The flash attention of <see cref=\"Kernel\"/> at near-fp32 accuracy: q, k, v and the probabilities are each two bf16 values (hi + lo), every product is")
+w("    /// three MMAs, and the partial sums are added in fp32. KV holds interleaved (hi, lo) pair words (<see cref=\"SplitPairs\"/>). Same grid, group and layouts.")
+w("    /// </summary>")
+w("    public static void KernelExact(FV Q, UV KV, FV O, int Nq, int Nk, int H, int qStride, int qOff, int kvStride, int kOff, int vOff)")
+w("    {")
+w("        int qTile = Grid.IdxX / H, h = Grid.IdxX % H;")
+w("        int tid = Group.IdxX, warp = tid >> 5, lane = tid & 31;")
+w("        int g = lane >> 2, t = lane & 3;")
+w(f"        var ksh = SharedMemory.Allocate<uint>({XKT} * {KS_STRIDE});")
+w(f"        var ksl = SharedMemory.Allocate<uint>({XKT} * {KS_STRIDE});")
+w(f"        var vth = SharedMemory.Allocate<uint>({D} * {XVT});")
+w(f"        var vtl = SharedMemory.Allocate<uint>({D} * {XVT});")
+w(f"        int row0 = qTile * {QT} + warp * 16 + g, row1 = row0 + 8;")
+w("        long qb0 = (long)row0 * qStride + qOff + h * 128, qb1 = (long)row1 * qStride + qOff + h * 128;")
+w("        bool r0ok = row0 < Nq, r1ok = row1 < Nq;")
+w("")
+w("        // Q fragments as two bf16 halves: hi = bf16(q), lo = bf16(q - hi)")
+for s in range(D // 16):
+    c = 16 * s
+    for (n, rb, ok, off) in ((0, "qb0", "r0ok", c), (1, "qb1", "r1ok", c), (2, "qb0", "r0ok", c + 8), (3, "qb1", "r1ok", c + 8)):
+        w(f"        uint qh{s}{n} = 0u, ql{s}{n} = 0u;")
+        w(f"        if ({ok}) {{ float a = Q[{rb} + {off} + 2 * t], b = Q[{rb} + {off} + 2 * t + 1]; uint hh = Pack(a, b); qh{s}{n} = hh; ql{s}{n} = Pack(a - Bf16Lo(hh), b - Bf16Hi(hh)); }}")
+w("")
+for j in range(D // 8):
+    w(f"        float o{j}0 = 0f, o{j}1 = 0f, o{j}2 = 0f, o{j}3 = 0f;")
+w("        float m0 = -1e30f, m1 = -1e30f, l0 = 0f, l1 = 0f;")
+w("")
+w("        // the next tile's K / V words are fetched into registers while this tile computes")
+for i in range(XNKI): w(f"        uint krh{i} = 0u, krl{i} = 0u;")
+for i in range(XNVI): w(f"        uint nah{i} = 0u, nal{i} = 0u, nbh{i} = 0u, nbl{i} = 0u;")
+def xloads(kbexpr, ind):
+    for i in range(XNKI):
+        w(f"{ind}{{ int idx = {i * TH} + tid; int gk = {kbexpr} + (idx >> 6); long wp = (((long)gk * kvStride + kOff + h * 128) >> 1) + (idx & 63);")
+        w(f"{ind}  krh{i} = gk < Nk ? KV[2 * wp] : 0u; krl{i} = gk < Nk ? KV[2 * wp + 1] : 0u; }}")
+    for i in range(XNVI):
+        w(f"{ind}{{ int idx = {i * TH} + tid; int gv0 = {kbexpr} + 2 * (idx & {XKT // 2 - 1}), dp = idx >> {XPB};")
+        w(f"{ind}  long wa = (((long)gv0 * kvStride + vOff + h * 128) >> 1) + dp, wb = (((long)(gv0 + 1) * kvStride + vOff + h * 128) >> 1) + dp;")
+        w(f"{ind}  nah{i} = gv0 < Nk ? KV[2 * wa] : 0u; nal{i} = gv0 < Nk ? KV[2 * wa + 1] : 0u;")
+        w(f"{ind}  nbh{i} = gv0 + 1 < Nk ? KV[2 * wb] : 0u; nbl{i} = gv0 + 1 < Nk ? KV[2 * wb + 1] : 0u; }}")
+xloads("0", "        ")
+w("")
+w(f"        for (int kb = 0; kb < Nk; kb += {XKT})")
+w("        {")
+w("            // registers -> shared: K row-major dim pairs, V transposed key pairs; the hi and the lo words in their own arrays")
+for i in range(XNKI):
+    w(f"            {{ int idx = {i * TH} + tid; int ka = (idx >> 6) * {KS_STRIDE} + (idx & 63); ksh[ka] = krh{i}; ksl[ka] = krl{i}; }}")
+for i in range(XNVI):
+    w(f"            {{ int idx = {i * TH} + tid; int pair = idx & {XKT // 2 - 1}, dp = idx >> {XPB}; int va0 = (2 * dp) * {XVT} + pair, va1 = va0 + {XVT};")
+    w(f"              vth[va0] = (nah{i} & 0xFFFFu) | (nbh{i} << 16); vth[va1] = (nah{i} >> 16) | (nbh{i} & 0xFFFF0000u);")
+    w(f"              vtl[va0] = (nal{i} & 0xFFFFu) | (nbl{i} << 16); vtl[va1] = (nal{i} >> 16) | (nbl{i} & 0xFFFF0000u); }}")
+w("            Group.Barrier();")
+xloads(f"kb + {XKT}", "            ")
+w("")
+for j in range(XNT):
+    w(f"            float s{j}0 = 0f, s{j}1 = 0f, s{j}2 = 0f, s{j}3 = 0f;")
+w("            // S = Q K^T: per k16 step and n-tile, qh kh from zero, + ql kh, + qh kl, then an fp32 add")
+for s16 in range(D // 16):
+    w("            {")
+    w(f"                int kw = {s16 * 8} + t;")
+    for j in range(XNT):
+        w(f"                int kr{j} = ({8 * j} + g) * {KS_STRIDE} + kw;")
+        w(f"                uint kh{j}0 = ksh[kr{j}], kh{j}1 = ksh[kr{j} + 4], kl{j}0 = ksl[kr{j}], kl{j}1 = ksl[kr{j} + 4];")
+    for j in range(XNT):
+        mma3(f"s{j}", f"qh{s16}", f"ql{s16}", f"kh{j}0", f"kh{j}1", f"kl{j}0", f"kl{j}1", "                ")
+    w("            }")
+w("")
+w("            // online softmax in the log2 domain; keys >= Nk are masked")
+for j in range(XNT):
+    w(f"            int kk{j} = kb + {8 * j} + 2 * t;")
+w("            const float sc = " + repr(SC) + "f;")
+for j in range(XNT):
+    w(f"            float x{j}0 = kk{j} < Nk ? s{j}0 * sc : -1e30f, x{j}1 = kk{j} + 1 < Nk ? s{j}1 * sc : -1e30f;")
+    w(f"            float x{j}2 = kk{j} < Nk ? s{j}2 * sc : -1e30f, x{j}3 = kk{j} + 1 < Nk ? s{j}3 * sc : -1e30f;")
+w("            float mx0 = " + maxtree([f"x{j}{n}" for j in range(XNT) for n in (0, 1)]) + ";")
+w("            float mx1 = " + maxtree([f"x{j}{n}" for j in range(XNT) for n in (2, 3)]) + ";")
+w("            mx0 = MathF.Max(mx0, Warp.ShuffleXor(mx0, 1)); mx0 = MathF.Max(mx0, Warp.ShuffleXor(mx0, 2));")
+w("            mx1 = MathF.Max(mx1, Warp.ShuffleXor(mx1, 1)); mx1 = MathF.Max(mx1, Warp.ShuffleXor(mx1, 2));")
+w("            float mn0 = MathF.Max(m0, mx0), mn1 = MathF.Max(m1, mx1);")
+w("            float al0 = XMath.Exp2(m0 - mn0), al1 = XMath.Exp2(m1 - mn1);")
+w("            m0 = mn0; m1 = mn1;")
+for j in range(XNT):
+    w(f"            float p{j}0 = XMath.Exp2(x{j}0 - mn0), p{j}1 = XMath.Exp2(x{j}1 - mn0);")
+    w(f"            float p{j}2 = XMath.Exp2(x{j}2 - mn1), p{j}3 = XMath.Exp2(x{j}3 - mn1);")
+w("            l0 = l0 * al0 + (" + " + ".join([f"p{j}0 + p{j}1" for j in range(XNT)]) + ");")
+w("            l1 = l1 * al1 + (" + " + ".join([f"p{j}2 + p{j}3" for j in range(XNT)]) + ");")
+for j in range(D // 8):
+    w(f"            o{j}0 *= al0; o{j}1 *= al0; o{j}2 *= al1; o{j}3 *= al1;")
+w("")
+w("            // O += P V: ph vh from zero, + pl vh, + ph vl, then an fp32 add")
+for s in range(XKT // 16):
+    w("            {")
+    for n, (a, b) in enumerate(((f"p{2*s}0", f"p{2*s}1"), (f"p{2*s}2", f"p{2*s}3"), (f"p{2*s+1}0", f"p{2*s+1}1"), (f"p{2*s+1}2", f"p{2*s+1}3"))):
+        w(f"                uint ph{n} = Pack({a}, {b}); uint pl{n} = Pack({a} - Bf16Lo(ph{n}), {b} - Bf16Hi(ph{n}));")
+    w(f"                int vw = {s * 8} + t;")
+    for j in range(D // 8):
+        w("                {")
+        w(f"                int vr = ({8 * j} + g) * {XVT} + vw;")
+        w("                uint vh0 = vth[vr], vh1 = vth[vr + 4], vl0 = vtl[vr], vl1 = vtl[vr + 4];")
+        mma3(f"o{j}", "ph", "pl", "vh0", "vh1", "vl0", "vl1", "                ")
+        w("                }")
+    w("            }")
+w("            Group.Barrier();")
+w("        }")
+w("")
+w("        l0 += Warp.ShuffleXor(l0, 1); l0 += Warp.ShuffleXor(l0, 2);")
+w("        l1 += Warp.ShuffleXor(l1, 1); l1 += Warp.ShuffleXor(l1, 2);")
+w("        float inv0 = 1f / l0, inv1 = 1f / l1;")
+w("        long ob0 = (long)row0 * H * 128 + h * 128, ob1 = (long)row1 * H * 128 + h * 128;")
+for j in range(D // 8):
+    w(f"        if (r0ok) {{ O[ob0 + {8 * j} + 2 * t] = o{j}0 * inv0; O[ob0 + {8 * j} + 2 * t + 1] = o{j}1 * inv0; }}")
+    w(f"        if (r1ok) {{ O[ob1 + {8 * j} + 2 * t] = o{j}2 * inv1; O[ob1 + {8 * j} + 2 * t + 1] = o{j}3 * inv1; }}")
+w("    }")
 w("}")
 
 open(sys.argv[1], "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")

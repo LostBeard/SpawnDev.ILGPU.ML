@@ -145,6 +145,15 @@ public sealed class Ltx2Pipeline
     /// </summary>
     public bool PreciseActivations { get; set; } = true;
 
+    /// <summary>
+    /// With <see cref="PreciseActivations"/> on a card with tensor cores: run the transformer's attentions on the tensor cores with q, k, v and the probabilities kept as
+    /// two bf16 halves each (three passes per product, fp32 sums, keys centred). MEASURED 2026-11-18, RTX 4070, 768 x 512 x 121: the GPU work of a two-row call
+    /// 34.2 s -> 23.7 s (video self-attention 14.3 s -> 5.1 s); one attention is 4e-6 to 9e-6 (relative RMS) from float64 where the fp32 kernel is 3e-7 and the
+    /// bf16 one 3e-3; the transformer against ComfyUI's float32 taps is 5.9e-6 at the final projection (1.2e-5 with the fp32 attention kernel: both inside
+    /// the reference's own rounding). False by default: it is a little less precise per attention, so it is yours to turn on.
+    /// </summary>
+    public bool ExactTensorCoreAttention { get; set; }
+
     public Ltx2Pipeline(Accelerator accelerator, IModelSource source, Ltx2Paths paths)
     {
         _acc = accelerator; _source = source; _paths = paths;
@@ -283,6 +292,7 @@ public sealed class Ltx2Pipeline
             model.Transformer.Weights.HostCacheBytes = cacheForBlocks;
             model.Transformer.Weights.ReadAheadBytes = ReadAheadBytes;
             model.Transformer.PreciseActivations = PreciseActivations;
+            if (ExactTensorCoreAttention) model.Transformer.ExactTensorCoreAttention = true;      // otherwise the kernels' own default (env TRELLIS2_MMA_EXACT_ATTN)
             try
             {
                 if (req.Distilled)

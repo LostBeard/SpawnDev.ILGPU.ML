@@ -57,6 +57,8 @@ public sealed class Ltx2Transformer : IDisposable
 
     /// <summary>CUDA: fp32-class activations through the tensor-core GEMMs (on: the ComfyUI reference runs float32).</summary>
     public bool PreciseActivations { get => _k.PreciseActivations; set => _k.PreciseActivations = value; }
+    /// <summary>CUDA with tensor cores, <see cref="PreciseActivations"/> on: the attentions run on the tensor cores with q, k, v and the probabilities as two bf16 halves each (<see cref="DiTKernels.ExactTensorCoreAttention"/>). Off by default.</summary>
+    public bool ExactTensorCoreAttention { get => _k.ExactTensorCoreAttention; set => _k.ExactTensorCoreAttention = value; }
 
     /// <summary>The streamed weights (timers, prefetch, host cache).</summary>
     public StreamedModelWeights Weights => _w;

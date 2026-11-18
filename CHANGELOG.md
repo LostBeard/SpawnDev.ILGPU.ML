@@ -4,6 +4,23 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Attention on the tensor cores at near-fp32 accuracy** (`DiTKernels.ExactTensorCoreAttention`, `Ltx2Pipeline.ExactTensorCoreAttention`,
+  `Ltx2Transformer.ExactTensorCoreAttention`; env `TRELLIS2_MMA_EXACT_ATTN=1` for every model on `DiTKernels`; CUDA cards with tensor cores, head width 128;
+  **off by default**). With `PreciseActivations` on, attention ran the portable fp32 flash kernel, the slowest stage of an LTX-2 call. The new kernel
+  (`MmaAttention.KernelExact`) keeps q, k, v and the probabilities as two bf16 values each (hi + lo), runs three tensor-core passes per product, adds the partial
+  sums in fp32, and centres the keys first (the mean key is subtracted: a softmax does not see a term common to all keys, but the split would spend its bits
+  on it). MEASURED 2026-11-18, RTX 4070:
+  - Speed: LTX-2's video self-attention (6144 x 6144 tokens, 32 heads x 128) 140.4 -> 46.5 ms; the GPU work of a precise two-row call at 768 x 512 x 121
+    34.2 -> 23.7 s. (The bf16 kernel of `PreciseActivations = false` takes 18.5 ms.)
+  - One attention against a float64 reference (relative RMS): fp32 kernel 3e-7, this kernel 4e-6 to 9e-6, bf16 kernel 2e-3 to 5e-3. It is NOT fp32-exact,
+    which is why it is opt-in.
+  - Against ComfyUI's float32 references, with it on / with the fp32 kernel: LTX-2 final projection 5.9e-6 / 1.2e-5; LTX-2 LoRA final latent 9.3e-6 / 5.3e-6;
+    FLUX.1 calls 9.9e-6, 2.0e-5 / 5.6e-6, 2.3e-5; Qwen-Image calls 2.4e-4, 1.3e-4 / 1.8e-4, 1.8e-4; Z-Image passes its gate either way.
+  - Why the centring: Qwen-Image's first block has keys whose common part is 4.5 times their variation and scores up to 3.5e4. Without centring the kernel was
+    4.6e-2 from float64 there and the model 1.0e-2 from ComfyUI; with it 6.6e-4 (the fp32 kernel: 5.2e-4) and 2.4e-4.
+    `Ltx2_ExactAttentionKernels_MatchFloat64` holds both exact kernels to 2e-5 on four kinds of input and requires the kernel without centring to be at
+    least ten times worse on keys with a common part; `QwenImage_AttentionKernels_OnRealActivations` reports the kernels on Qwen-Image's own q / k / v.
+
 - **LTX-2 speed, measured where the time goes** (RTX 4070, 768 x 512 x 121; `Ltx2_RealSize_Benchmark` with repeated calls). A two-row model call is 44 s from a SATA
   drive: about 30 s of GPU work, 8 s of upload, 5 s waiting on reads (the reads run behind the GPU work; an earlier note here called the sampling disk-bound, which
   was wrong for this recipe). Three opt-in switches on `Ltx2Pipeline`, all off by default (the pipeline's behaviour is unchanged):

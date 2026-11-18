@@ -464,6 +464,11 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, UV, FV, int, int, int, int, int, int, int, int>? _flash;
     private Action<Index1D, FV, UV>? _toBf16Pairs;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _kv16;
+    private Action<KernelConfig, FV, UV, FV, int, int, int, int, int, int, int, int>? _flashExact;
+    private Action<Index1D, FV, UV, FV, int, int, int>? _splitPairs;
+    private Action<Index1D, FV, FV, int, int, int>? _keyMean;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _kvSplit;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _kMean;
 
     private static uint Bf16Bits(float f)
     {
@@ -476,7 +481,17 @@ public sealed class DiTKernels
     public static long MaxAttentionPairsPerDispatch { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_ATTN_PAIRS"), out var ap) && ap > 0 ? ap : 1L << 28;
 
     /// <summary>True when <see cref="Attention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core one or the portable one.</summary>
-    public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesTiledAttention(headDim);
+    public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesMmaExactAttention(headDim) || UsesTiledAttention(headDim);
+    /// <summary>
+    /// With <see cref="PreciseActivations"/> on a tensor-core card: run head-width-128 attention on <see cref="MmaAttention.KernelExact"/> (q, k, v and the
+    /// probabilities as hi + lo bf16 halves, three MMAs per product, fp32 sums: near-fp32 results) instead of the portable fp32 kernel.
+    /// Env TRELLIS2_MMA_EXACT_ATTN=1 turns it on for new instances.
+    /// </summary>
+    public bool ExactTensorCoreAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_EXACT_ATTN") == "1";
+    /// <summary>False: the exact tensor-core attention does not centre its keys (tests use it to show what the centring is worth; env TRELLIS2_ATTN_CENTER=0).</summary>
+    public static bool CenterAttentionKeys { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_ATTN_CENTER") != "0";
+    private bool UsesMmaExactAttention(int headDim)
+        => EnableTensorCores && PreciseActivations && ExactTensorCoreAttention && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && headDim == MmaAttention.HeadDim;
     private bool UsesMmaAttention(int headDim)
         => EnableTensorCores && !PreciseActivations && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(_acc) && headDim == MmaAttention.HeadDim;    // sm_80 PTX (Kernels/CudaCaps); bf16 q / k / v
     /// <summary>Portable flash attention (<see cref="TiledAttention"/>): needs 256-thread groups and warp shuffles over groups of 4 lanes.</summary>
@@ -579,6 +594,23 @@ public sealed class DiTKernels
     /// </summary>
     public void Attention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int Nq, int Nk, int H, int D)
     {
+        if (UsesMmaExactAttention(D))
+        {
+            // K and V go to the kernel as (hi, lo) bf16 pair words: one split pass here instead of one per query tile inside the kernel. The keys are
+            // centred first (their mean over the keys subtracted: the same attention, see MmaAttention.SplitPairs).
+            if ((kvStride & 1) != 0 || (kOff & 1) != 0 || (vOff & 1) != 0) throw new ArgumentException("the tensor-core attention reads k / v as pairs: kvStride, kOff and vOff must be even");
+            _flashExact ??= _acc.LoadStreamKernel<FV, UV, FV, int, int, int, int, int, int, int, int>(MmaAttention.KernelExact);
+            _splitPairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, int, int, int>(MmaAttention.SplitPairs);
+            _keyMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(MmaAttention.KeyMean);
+            long pairs = ((long)(Nk - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
+            if (_kvSplit == null || _kvSplit.Length < 2 * pairs) { _kvSplit?.Dispose(); _kvSplit = _acc.Allocate1D<uint>(2 * pairs); }
+            if (_kMean == null || _kMean.Length < H * D) { _kMean?.Dispose(); _kMean = _acc.Allocate1D<float>(H * D); }
+            if (CenterAttentionKeys) _keyMean(H * D, kv, _kMean.View, Nk, kvStride, kOff); else _kMean.MemSetToZero();
+            _splitPairs((int)pairs, kv, _kvSplit.View, _kMean.View, kvStride, kOff, H * D);
+            _flashExact(new KernelConfig(((Nq + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
+                q, _kvSplit.View, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+            return;
+        }
         if (!UsesMmaAttention(D) && UsesTiledAttention(D))
         {
             IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;

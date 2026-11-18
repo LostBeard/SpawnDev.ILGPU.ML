@@ -144,6 +144,127 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Diagnostic: the head-width-128 attention kernels on Qwen-Image's own q / k / v (blocks 0, 30 and 59 of ComfyUI's call 0, captured through the transformer's
+    /// Probe) against a float64 host reference, with what the data looks like (largest values; how much of k is common to every key; the scores' range) and
+    /// float64 emulations of the hi + lo bf16 arithmetic of <see cref="Trellis2.DiTKernels.ExactTensorCoreAttention"/>: the split on the scores only, on the scores
+    /// and the probabilities, and the same with k centred (its mean over the keys subtracted: a softmax does not see a term common to all keys).
+    /// Reported, not asserted. Prints "[Benchmark] QwenImage attention kernels on real activations ...".
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task QwenImage_AttentionKernels_OnRealActivations() => await RunTest(async accelerator =>
+    {
+        var path = Qi_Require(accelerator, Path.Combine("diffusion_models", "qwen_image_fp8_e4m3fn.safetensors")); var d = Qi_Dumps();
+        const int rows = 16, cols = 16, lat = 16 * 32 * 32, n = 12, H = 24, D = 128, Dim = H * D;
+        using var tr = await QwenImage.QwenImageTransformer.OpenAsync(accelerator, new LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path), 12, rows, cols, (long)7e9);
+        var fk = new Flux1.Flux1Kernels(accelerator);
+        using var x = accelerator.Allocate1D<float>(lat); using var tokens = accelerator.Allocate1D<float>(rows * cols * 64L); using var cond = accelerator.Allocate1D<float>(12L * 3584);
+        float sigma = F2_Raw(Path.Combine(d, "qi_call_0_timestep_f32_1.raw"), 1)[0];
+        x.View.CopyFromCPU(F2_Raw(Path.Combine(d, "qi_call_0_input_f32_1x16x1x32x32.raw"), lat));
+        cond.View.CopyFromCPU(F2_Raw(Path.Combine(d, $"qi_call_0_c_c_crossattn_f32_1x{n}x3584.raw"), (long)n * 3584));
+        fk.Patchify(x.View, tokens.View, rows, cols);
+        var caps = new List<(string Name, float[] Qkv, int Tokens)>();
+        var pending = new List<(string Name, Task<float[]> Data, int Tokens)>();
+        tr.Probe = (name, view, r, c) =>
+        {
+            if (!name.EndsWith("qkv") || c != 3 * Dim) return;
+            var parts = name.Split('.');                                                       // transformer_blocks.<k>.qkv
+            if (parts.Length >= 3 && parts[^2] is "0" or "30" or "59") pending.Add((name, view.SubView(0, (long)r * c).CopyToHostAsync(), r));
+        };
+        await tr.ForwardAsync(tokens.View, cond.View, sigma, n);
+        tr.Probe = null;
+        foreach (var (name, data, tok) in pending) caps.Add((name, await data, tok));
+        Ur_Expect(caps.Count == 3, $"captured {caps.Count} of 3 q / k / v sets ({string.Join(", ", caps.Select(c => c.Name))})");
+
+        static float Bf(float f) { uint b = BitConverter.SingleToUInt32Bits(f); b = (b + 0x7FFFu + ((b >> 16) & 1u)) & 0xFFFF0000u; return BitConverter.UInt32BitsToSingle(b); }
+        var portable = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };
+        var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true };
+        var fast = new Trellis2.DiTKernels(accelerator) { PreciseActivations = false };
+        var report = new List<string>();
+        foreach (var (name, qkv, N) in caps)
+        {
+            int S3 = 3 * Dim;
+            var oRef = new float[N * Dim]; var oS = new float[N * Dim]; var oSP = new float[N * Dim]; var oC = new float[N * Dim];
+            double maxQ = 0, maxK = 0, maxV = 0, cmNum = 0, cmDen = 0, maxScore = 0, maxSpread = 0;
+            double isd = 1.0 / Math.Sqrt(D);
+            var lockObj = new object();
+            System.Threading.Tasks.Parallel.For(0, H, h =>
+            {
+                var q = new float[N * D]; var k = new float[N * D]; var v = new float[N * D];
+                for (int i = 0; i < N; i++)
+                    for (int e = 0; e < D; e++) { q[i * D + e] = qkv[i * S3 + h * D + e]; k[i * D + e] = qkv[i * S3 + Dim + h * D + e]; v[i * D + e] = qkv[i * S3 + 2 * Dim + h * D + e]; }
+                var mean = new double[D];
+                for (int j = 0; j < N; j++) for (int e = 0; e < D; e++) mean[e] += k[j * D + e];
+                for (int e = 0; e < D; e++) mean[e] /= N;
+                var kc = new float[N * D];
+                double num = 0, den = 0, mq = 0, mk = 0, mv = 0;
+                for (int j = 0; j < N; j++)
+                    for (int e = 0; e < D; e++)
+                    {
+                        kc[j * D + e] = (float)(k[j * D + e] - mean[e]);
+                        num += mean[e] * mean[e]; den += (double)kc[j * D + e] * kc[j * D + e];
+                        mq = Math.Max(mq, Math.Abs(q[j * D + e])); mk = Math.Max(mk, Math.Abs(k[j * D + e])); mv = Math.Max(mv, Math.Abs(v[j * D + e]));
+                    }
+                float[] Hi(float[] a) => a.Select(Bf).ToArray();
+                float[] Lo(float[] a, float[] hi) { var r = new float[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = Bf(a[i] - hi[i]); return r; }
+                var qh = Hi(q); var ql = Lo(q, qh); var kh = Hi(k); var kl = Lo(k, kh); var kch = Hi(kc); var kcl = Lo(kc, kch); var vh = Hi(v); var vl = Lo(v, vh);
+                var sR = new double[N]; var sS = new double[N]; var sC = new double[N];
+                double ms = 0, msp = 0;
+                void Out(double[] sc, bool splitPv, float[] dst, int i)
+                {
+                    double mx = sc.Max(), sum = 0;
+                    var acc = new double[D];
+                    for (int j = 0; j < N; j++)
+                    {
+                        double pj = Math.Exp(sc[j] - mx);
+                        if (splitPv)
+                        {
+                            float pf = (float)pj, ph = Bf(pf), pl = Bf(pf - ph);
+                            sum += pf;
+                            for (int e = 0; e < D; e++) acc[e] += (double)ph * vh[j * D + e] + (double)pl * vh[j * D + e] + (double)ph * vl[j * D + e];
+                        }
+                        else { sum += pj; for (int e = 0; e < D; e++) acc[e] += pj * v[j * D + e]; }
+                    }
+                    for (int e = 0; e < D; e++) dst[i * Dim + h * D + e] = (float)(acc[e] / sum);
+                }
+                for (int i = 0; i < N; i++)
+                {
+                    double lo = double.MaxValue, hi = double.MinValue;
+                    for (int j = 0; j < N; j++)
+                    {
+                        double a = 0, b = 0, c = 0;
+                        for (int e = 0; e < D; e++)
+                        {
+                            a += (double)q[i * D + e] * k[j * D + e];
+                            b += (double)qh[i * D + e] * kh[j * D + e] + (double)ql[i * D + e] * kh[j * D + e] + (double)qh[i * D + e] * kl[j * D + e];
+                            c += (double)qh[i * D + e] * kch[j * D + e] + (double)ql[i * D + e] * kch[j * D + e] + (double)qh[i * D + e] * kcl[j * D + e];
+                        }
+                        sR[j] = a * isd; sS[j] = b * isd; sC[j] = c * isd;
+                        lo = Math.Min(lo, sR[j]); hi = Math.Max(hi, sR[j]);
+                    }
+                    ms = Math.Max(ms, Math.Max(Math.Abs(lo), Math.Abs(hi))); msp = Math.Max(msp, hi - lo);
+                    Out(sR, false, oRef, i); Out(sS, false, oS, i); Out(sS, true, oSP, i); Out(sC, true, oC, i);
+                }
+                lock (lockObj) { cmNum += num; cmDen += den; maxQ = Math.Max(maxQ, mq); maxK = Math.Max(maxK, mk); maxV = Math.Max(maxV, mv); maxScore = Math.Max(maxScore, ms); maxSpread = Math.Max(maxSpread, msp); }
+            });
+            using var g = accelerator.Allocate1D(qkv); using var o = accelerator.Allocate1D<float>((long)N * Dim);
+            async Task<double> Run(Trellis2.DiTKernels kk)
+            {
+                o.View.MemSetToZero();
+                kk.Attention(g.View, S3, 0, g.View, S3, Dim, 2 * Dim, default, o.View, N, N, H, D);
+                await accelerator.SynchronizeAsync();
+                return F2_RelRms(await o.View.CopyToHostAsync(), oRef);
+            }
+            double ep = await Run(portable), ex = await Run(exactTc), ef = await Run(fast);
+            report.Add($"{name} ({N} tokens): max |q| {maxQ:G3}, |k| {maxK:G3}, |v| {maxV:G3}; k common to all keys / k's own variation {Math.Sqrt(cmNum / Math.Max(cmDen, 1e-300)):G3}; "
+                + $"largest |score| {maxScore:G3}, largest spread in a row {maxSpread:G3}; GPU vs float64: portable {ep:E2}, exact tensor cores {ex:E2}, fast {ef:E2}; "
+                + $"float64 emulation of the hi + lo split: scores only {F2_RelRms(oS, oRef):E2}, scores and probabilities {F2_RelRms(oSP, oRef):E2}, the same with k centred {F2_RelRms(oC, oRef):E2}");
+        }
+        string line = $"{accelerator.AcceleratorType}: " + string.Join(" | ", report);
+        Console.WriteLine("[Benchmark] QwenImage attention kernels on real activations: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// Qwen-Image's 20B transformer (qwen_image_fp8_e4m3fn.safetensors, 8-bit floats without scales; blocks past QI_RESIDENT_GB stream from the file) against ComfyUI's model calls
     /// of a 2-step 256 px run at cfg 4 (SpawnGen's dumps, float32 CPU): call 0 the prompt's 12 rows, call 1 the empty prompt's 5 rows, both at sigma 1. One open serves both lengths
     /// (per-call text length), and a third call with the 12 rows again must reproduce call 0 exactly. The time convention (sigma or 1 - sigma) and the output convention (x - sigma v,
