@@ -547,10 +547,11 @@ public abstract partial class MLTestBase
                     for (int i = 0; i < got.Length; i++) if (got[i] != got2[i]) throw new Exception($"chunked biased attention {tag} differs at {i}: {got2[i]} vs {got[i]} on {accelerator.AcceleratorType}");
                 }
                 finally { DiTKernels.MaxAttentionPairsPerDispatch = was; }
-                // an all-zero bias = the plain portable flash kernel, bit for bit
+                // an all-zero bias = the plain portable flash kernel, bit for bit. Named explicitly: since 5.8.22 the precise path's plain attention on a
+                // tensor-core card runs the exact tensor-core kernel by default (DiTKernels.ExactTensorCoreAttention), which the biased kernel is not
                 var zero = await Run(dk, zeroDev.View);
                 using var o3 = accelerator.Allocate1D<float>((long)N * C);
-                dk.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o3.View, N, N, H, D);
+                new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false }.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o3.View, N, N, H, D);
                 var plain = await o3.View.CopyToHostAsync();
                 for (int i = 0; i < plain.Length; i++) if (zero[i] != plain[i]) throw new Exception($"biased attention with a zero bias {tag} differs from the plain kernel at {i}: {zero[i]} vs {plain[i]} on {accelerator.AcceleratorType}");
                 // the reference kernels, forced
