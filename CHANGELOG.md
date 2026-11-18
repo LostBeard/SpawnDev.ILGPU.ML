@@ -22,8 +22,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - `Ltx2VideoEncoder` (the checkpoint's BF16 vae.encoder, for image-to-video): 4.9e-6 (`Ltx2_VideoEncode_MatchesComfyUi`).
   - `Ltx2Lora` + `Ltx2Transformer.AddLora` (PEFT lora_A / lora_B, e.g. the distilled LoRA 384; applied on the fly as strength (x A^T) B^T, streamed per block): on bf16 layers,
     where ComfyUI's patched weight is float32 W + B A, calls 5.5e-6 and the final latent 5.3e-6 (`Ltx2_Lora_Bf16Subset_MatchesComfyUi`). On fp8 layers ComfyUI re-rounds
-    W + B A into fp8 STOCHASTICALLY (seeded, repeatable), which this exact implementation does not imitate: 7.4e-3 from ComfyUI on block 1 against the LoRA's own 2.2e-2
-    (`Ltx2_Lora_Fp8Subset_DistanceFromComfyUi`, diagnostic; open decision).
+    W + B A into fp8 STOCHASTICALLY (seeded, repeatable); the default here keeps W + B A exact (the LoRA's full effect): 7.4e-3 from ComfyUI on block 1 against the
+    LoRA's own 2.2e-2 (`Ltx2_Lora_Fp8Subset_DistanceFromComfyUi`).
+  - **`Ltx2Transformer.ComfyCompatibleFp8Lora` / `Ltx2Request.ComfyCompatibleFp8Lora` (opt-in): ComfyUI's result on fp8 layers.** The patched weight is re-rounded to
+    F8_E4M3 with ComfyUI's seeded rounding, reproduced from measurements alone (`Ltx2Fp8Rounding`: MT19937 seeded with the crc32 of the tensor's key, 8-bit draws, the
+    scaled weight through half precision): block 1 against ComfyUI 3.3e-5 on CUDA, 3.2e-5 on OpenCL (`Ltx2_Lora_Fp8Subset_CompatMode_MatchesComfyUi`); the device chain
+    equals the host rule on every element of a 16384 x 4096 matrix (`Ltx2_Fp8CompatRounding_MatchesHostRule`). The stream is vectorized (0.23 ns a draw, 17.7x the plain
+    form) and generated on the thread pool per block (`Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads`). Use it to reproduce a ComfyUI render; leave it off otherwise.
+  - Fixed: `Ltx2Transformer`'s input-scale scratch was smaller than the text cross-attention's k / v input, so an fp8 checkpoint WITH per-tensor scales would have
+    failed in that Linear at small video sizes.
   - `Ltx2AvModel.SampleAsync` also runs batch 1 (cfg 1: the conditioned prompt only, the template's second pass).
   - Where ComfyUI differs from the reference code (found with float64 references; we follow ComfyUI): Gemma's RMSNorm scale 1 + w is formed in bf16; the DiT's q / k norms
     use epsilon 1e-5; video-to-audio attention reads the video after the audio-to-video update.

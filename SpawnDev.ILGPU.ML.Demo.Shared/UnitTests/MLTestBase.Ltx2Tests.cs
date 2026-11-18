@@ -333,6 +333,172 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The same block-1 subset in the ComfyUI-compatible mode (<see cref="Ltx2Transformer.ComfyCompatibleFp8Lora"/>): the patched 8-bit weights are re-rounded by
+    /// ComfyUI's seeded rule (<see cref="Ltx2Fp8Rounding"/>), so the calls and the final latent EQUAL ComfyUI's instead of sitting a third of the LoRA's effect away.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_Lora_Fp8Subset_CompatMode_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        var (line, worst, _) = await Ltx2_LoraSubset(accelerator, "fp8_block1_repeat", "ltx2_lora8", n => n.StartsWith("transformer_blocks.1.", StringComparison.Ordinal), compat: true);
+        Console.WriteLine("[Ltx2] LoRA (fp8 subset, ComfyUI-compatible rounding) vs ComfyUI: " + line);
+        Ur_Expect(worst < 1e-4, line);
+        return line;
+    });
+
+    /// <summary>
+    /// The parts of the ComfyUI-compatible fp8 LoRA mode (<see cref="Ltx2Fp8Rounding"/>). Host: the stream's seed and draws against values produced OUTSIDE this code
+    /// (zlib's crc32 of the key; numpy's MT19937 seeded with it, the low 8 bits of words 0..7, 622..627 and 1246..1251: either side of the generator's first two state
+    /// refills). Device: the whole chain (W x scale + two scaled LoRA products, max / 448, the seeded rounding) against the host rule on every element, bitwise. The
+    /// matrix carries what a device can get wrong: quotients one and two float32 steps either side of half-precision rounding boundaries (normal and subnormal halves)
+    /// and of F8_E4M3 cell edges, zeros of both signs, tiny values; a second pass at a power-of-two scale makes the ties exact. [16384, 4096] (the largest patched
+    /// matrix) on CUDA / OpenCL, [1024, 4096] elsewhere.
+    /// </summary>
+    [TestMethod(Timeout = 900000)]
+    public async Task Ltx2_Fp8CompatRounding_MatchesHostRule() => await RunTest(async accelerator =>
+    {
+        const string name = "transformer_blocks.1.attn1.to_q";
+        uint seed = Ltx2Fp8Rounding.Seed(name);
+        Ur_Expect(seed == 1881967891u, $"crc32 of {Ltx2Fp8Rounding.Key(name)} is {seed}, zlib's 1881967891");
+        static int Draw(uint[] p, long i) => (int)((p[i >> 2] >> (int)((i & 3) << 3)) & 0xFFu);
+        var head = new uint[313]; Ltx2Fp8Rounding.Low8(seed, head, 1252);
+        void Draws(int at, int[] gold) { for (int i = 0; i < gold.Length; i++) Ur_Expect(Draw(head, at + i) == gold[i], $"draw {at + i} is {Draw(head, at + i)}, numpy's {gold[i]}"); }
+        Draws(0, new[] { 200, 214, 181, 81, 235, 10, 189, 229 }); Draws(622, new[] { 181, 194, 47, 136, 106, 114 }); Draws(1246, new[] { 98, 92, 34, 74, 108, 139 });
+
+        bool big = accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL;
+        int N = big ? 16384 : 1024; const int K = 4096; int cnt = N * K, words = cnt / 4, C = 1 << 20;
+        var l = new Ltx2Kernels(accelerator);
+        using var decB = accelerator.Allocate1D<BFloat16>(cnt); using var wB = accelerator.Allocate1D<float>(cnt); using var ba1B = accelerator.Allocate1D<float>(cnt);
+        using var ba2B = accelerator.Allocate1D<float>(cnt); using var rndB = accelerator.Allocate1D<uint>(words); using var rowMaxB = accelerator.Allocate1D<float>(N);
+        using var scaleB = accelerator.Allocate1D<float>(1); using var qB = accelerator.Allocate1D<BFloat16>(cnt);
+        var dec = new ushort[cnt]; var ba1 = new float[cnt]; var ba2 = new float[cnt]; var rnd = new uint[words]; var want = new float[cnt];
+        Ltx2Fp8Rounding.Low8(seed, rnd, cnt);
+        static float Bf(ushort u) => BitConverter.Int32BitsToSingle(u << 16);
+        static float Steps(float x, int n) => BitConverter.Int32BitsToSingle(Math.Max(0, BitConverter.SingleToInt32Bits(x) + n));   // x >= 0 moved n float32 steps
+        string[] kinds = { "midpoint - 2", "midpoint - 1", "midpoint", "midpoint + 1", "midpoint + 2", "half value", "cell edge", "special", "random" };
+        var report = new List<string>(); long worstBad = 0;
+        foreach (float wmax in new[] { 0.37f, 0.4375f })   // 0.4375 = 448 x 2^-10: that pass's scale is a power of two, every quotient exact, the ties real
+        {
+            float s = wmax / 448f, ws = wmax * 0.9f / 448f;
+            var rng = new Random(11);
+            Array.Clear(ba2);
+            // the body: random F8_E4M3 values (subnormal ones too) x a scale + 0.7 x a random product
+            for (int i = C; i < cnt; i++)
+            {
+                int m = rng.Next(8), e = rng.Next(-9, 9);
+                if (e == 8 && m == 7) m = 6;                                                                    // 448 is the largest value
+                float v = e < -6 ? m * 0.001953125f : (1f + m * 0.125f) * MathF.ScaleB(1f, e);
+                if ((rng.Next() & 1) != 0) v = -v;
+                dec[i] = (ushort)(BitConverter.SingleToUInt32Bits(v) >> 16);
+                ba1[i] = (float)((rng.NextDouble() * 2 - 1) * 0.05 * wmax);
+            }
+            // the head: W = 0 and the first product 0, so the patched weight IS the second product: element 0 the maximum, then the crafted cases
+            Array.Clear(dec, 0, C); Array.Clear(ba1, 0, C);
+            ba2[0] = wmax;
+            float[] specials = { 0f, -0f, float.Epsilon, 1e-30f, (float)(Math.ScaleB(1.0, -25) * s), Steps((float)(Math.ScaleB(1.0, -25) * s), 1), (float)(Math.ScaleB(1.0, -24) * s), (float)(Math.ScaleB(3.0, -25) * s) };
+            for (int j = 1; j < C; j++)
+            {
+                int kind = j % 8; float v;
+                // a half-precision value hv below 448 and the half grid's step there (subnormal halves below 2^-14: multiples of 2^-24)
+                int e = rng.Next(-18, 9); double hv, step;
+                if (e < -14) { step = Math.ScaleB(1.0, -24); hv = rng.Next(1, 1024) * step; }
+                else { step = Math.ScaleB(1.0, e - 10); hv = (1024 + rng.Next(e == 8 ? 767 : 1024)) * step; }
+                if (kind < 5) v = Steps((float)((hv + 0.5 * step) * s), kind - 2);
+                else if (kind == 5) v = Steps((float)(hv * s), rng.Next(-1, 2));
+                else if (kind == 6) { int e2 = rng.Next(-6, 9), m2 = rng.Next(e2 == 8 ? 6 : 8); v = Steps((float)((1.0 + m2 * 0.125) * Math.ScaleB(1.0, e2) * s), rng.Next(-1, 2)); }
+                else v = specials[(j >> 3) % specials.Length];
+                ba2[j] = (rng.Next() & 1) != 0 ? -v : v;
+            }
+            float max = 0f;
+            for (int i = 0; i < cnt; i++)
+            {
+                float w0 = Bf(dec[i]) * ws; float t = 0.7f * ba1[i]; w0 += t; w0 += ba2[i];
+                max = MathF.Max(max, MathF.Abs(w0));
+                want[i] = Ltx2Fp8Rounding.Round(w0, s, Draw(rnd, i));
+            }
+            Ur_Expect(max == wmax, $"the matrix's maximum is {max:R}, built for {wmax:R}");
+            decB.View.Cast<BFloat16, ushort>().CopyFromCPU(dec); ba1B.CopyFromCPU(ba1); ba2B.CopyFromCPU(ba2); rndB.CopyFromCPU(rnd);
+            l.PatchedWeightInit(decB.View, wB.View, ws, cnt);
+            l.AddScaled(wB.View, ba1B.View, 0.7f, cnt);
+            l.AddScaled(wB.View, ba2B.View, 1f, cnt);
+            l.Fp8Scale(wB.View, rowMaxB.View, scaleB.View, N, K);
+            l.Fp8StochasticRound(wB.View, rndB.View, scaleB.View, qB.View, cnt);
+            l.Bf16ToF32(qB.View, ba1B.View, cnt);                                                              // the rounded matrix as float32 for the readback
+            var sc = await scaleB.View.CopyToHostAsync();
+            var got = await ba1B.View.CopyToHostAsync();
+            long bad = 0, zeroSign = 0, up = 0; var byKind = new long[9]; string first = "";
+            for (int i = 0; i < cnt; i++)
+            {
+                if (MathF.Abs(want[i]) * s > MathF.Abs(Bf(dec[i]) * ws + 0.7f * ba1[i] + ba2[i])) up++;
+                if (BitConverter.SingleToInt32Bits(got[i]) == BitConverter.SingleToInt32Bits(want[i])) continue;
+                if (got[i] == 0f && want[i] == 0f) { zeroSign++; continue; }                                    // +0 against -0: the same weight
+                int kind = i == 0 || i >= C ? 8 : i % 8;
+                byKind[kind]++;
+                if (bad++ == 0) first = $"; first at {i} ({kinds[kind]}): device {got[i]:R}, host {want[i]:R}, draw {Draw(rnd, i)}";
+            }
+            string by = string.Join(", ", Enumerable.Range(0, 9).Where(k => byKind[k] > 0).Select(k => $"{kinds[k]} {byKind[k]}"));
+            report.Add($"max {wmax}: scale device {sc[0]:R} host {s:R}, {bad} of {cnt} differ{(bad > 0 ? " (" + by + ")" + first : "")}, {zeroSign} zeros of the other sign, {100.0 * up / cnt:F1}% rounded up");
+            worstBad = Math.Max(worstBad, bad);
+            Ur_Expect(sc[0] == s, report[^1]);
+            Ur_Expect(up > cnt / 4 && up < cnt - cnt / 4, "the rounding does not go both ways: " + report[^1]);
+        }
+        string line = $"[{N}, {K}] on {accelerator.AcceleratorType}: " + string.Join(" | ", report);
+        Console.WriteLine("[Ltx2] fp8 compat rounding vs the host rule: " + line);
+        Ur_Expect(worstBad == 0, line);
+        return line;
+    });
+
+    /// <summary>
+    /// The compatible mode's random stream at speed: the vectorized <see cref="Ltx2Fp8Rounding.Low8"/> against the plain <see cref="Ltx2Fp8Rounding.Low8Scalar"/>, word
+    /// for word, at counts either side of the generator's 624-word refills and of the 16-word output step, then the largest matrix's stream timed both ways. And the
+    /// contract the mode's pooled host arrays lean on: an upload has TAKEN the words when CopyFromCPU returns (the host array is overwritten right after each upload,
+    /// the device must still hold what was uploaded).
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task Ltx2_Fp8CompatStream_MatchesPlainFormAndUploads() => await RunTest(async accelerator =>
+    {
+        bool big = accelerator.AcceleratorType is AcceleratorType.Cuda or AcceleratorType.OpenCL;
+        var report = new List<string>();
+        foreach (int count in new[] { 1, 3, 4, 15, 16, 17, 623, 624, 625, 640, 1247, 1248, 1249, 2000003 })
+            foreach (uint seed in new[] { 0u, 5489u, 1881967891u, 0xFFFFFFFFu })
+            {
+                int words = (count + 3) / 4;
+                var a = new uint[words + 2]; var b = new uint[words + 2];
+                a[words] = b[words] = 0xDEADBEEFu;                                                             // a guard word: neither form may write past its words
+                Ltx2Fp8Rounding.Low8(seed, a, count); Ltx2Fp8Rounding.Low8Scalar(seed, b, count);
+                for (int i = 0; i <= words; i++) Ur_Expect(a[i] == b[i], $"seed {seed}, {count} draws: word {i} is {a[i]:X8}, the plain form's {b[i]:X8}");
+            }
+        int n = big ? 16384 * 4096 : 1024 * 4096, nw = n / 4;
+        var fast = new uint[nw]; var plain = new uint[nw];
+        double tf = double.MaxValue, tp = double.MaxValue;
+        for (int rep = 0; rep < 3; rep++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew(); Ltx2Fp8Rounding.Low8(77u + (uint)rep, fast, n); tf = Math.Min(tf, sw.Elapsed.TotalSeconds);
+            sw.Restart(); Ltx2Fp8Rounding.Low8Scalar(77u + (uint)rep, plain, n); tp = Math.Min(tp, sw.Elapsed.TotalSeconds);
+            for (int i = 0; i < nw; i++) if (fast[i] != plain[i]) throw new Exception($"seed {77 + rep}, {n} draws: word {i} is {fast[i]:X8}, the plain form's {plain[i]:X8}");
+        }
+        report.Add($"{n} draws: vectorized {tf * 1e9 / n:F2} ns a draw ({tf * 1e3:F0} ms), plain {tp * 1e9 / n:F2} ns ({tp * 1e3:F0} ms), {tp / tf:F1}x");
+
+        // the upload contract: three rounds, the host array overwritten the moment CopyFromCPU returns
+        using var dev = accelerator.Allocate1D<uint>(nw);
+        for (int round = 0; round < 3; round++)
+        {
+            Ltx2Fp8Rounding.Low8(1000u + (uint)round, fast, n);
+            dev.CopyFromCPU(fast);
+            Array.Fill(fast, 0xA5A5A5A5u);
+            var back = await dev.View.CopyToHostAsync();
+            Ltx2Fp8Rounding.Low8(1000u + (uint)round, plain, n);
+            long wrong = 0; int firstWrong = -1;
+            for (int i = 0; i < nw; i++) if (back[i] != plain[i]) { if (wrong++ == 0) firstWrong = i; }
+            Ur_Expect(wrong == 0, $"upload round {round} on {accelerator.AcceleratorType}: {wrong} of {nw} words on the device are not what was uploaded (first at {firstWrong}: {back[Math.Max(0, firstWrong)]:X8}): CopyFromCPU returned before it had the data");
+        }
+        report.Add($"3 uploads of {nw} words each survived the host array's overwrite");
+        string line = $"{accelerator.AcceleratorType}: " + string.Join("; ", report);
+        Console.WriteLine("[Benchmark] Ltx2 fp8 compat stream: " + line);
+        if (big && System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated) Ur_Expect(tp / tf > 1.5, "the vectorized stream is not faster than the plain one: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// A LoRA that covers only some blocks (here block 1 alone, cut from the distilled LoRA: test-lora-block1-only.safetensors next to it) opens: the anchor is any lora_A
     /// tensor, the rank comes from the first covered block, and only that block carries tensors (SpawnGen's request, 11-17).
     /// </summary>
@@ -352,7 +518,7 @@ public abstract partial class MLTestBase
 
     // one LoRA subset against SpawnGen's taps in lora/<folder> (calls 0 / 1 at cfg 1 and the final latent); effect = ComfyUI's call 0 with the LoRA vs its call 0 without (the
     // base run's conditioned row, same input and prompt)
-    private async Task<(string Line, double Worst, double Effect)> Ltx2_LoraSubset(Accelerator accelerator, string folder, string tap, Func<string, bool> include)
+    private async Task<(string Line, double Worst, double Effect)> Ltx2_LoraSubset(Accelerator accelerator, string folder, string tap, Func<string, bool> include, bool compat = false)
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
         var dir = Path.Combine(Ltx2_Models(), "lightricks");
@@ -365,6 +531,7 @@ public abstract partial class MLTestBase
         using var model = await Ltx2AvModel.OpenAsync(accelerator, src, "", "ltx-2-19b-dev-fp8.safetensors", 1, 2, 2, 2, 9, L, (long)(residentGb * 1e9));
         using var lora = await Ltx2Lora.OpenAsync(accelerator, src, "", "ltx-2-19b-distilled-lora-384.safetensors", 1f, 1L << 30, include);
         model.Transformer.AddLora(lora);
+        model.Transformer.ComfyCompatibleFp8Lora = compat;
         using var ctx = accelerator.Allocate1D(T($"{tap}_call_0_c_c_crossattn", (long)L * Ltx2AvModel.ContextWidth));
         var sigmas = T($"{tap}_call_0_c_transformer_options_sample_sigmas", 3);
         var report = new List<string>(); double worst = 0;
@@ -382,7 +549,7 @@ public abstract partial class MLTestBase
             var baseOut = F2_Raw(Ltx2_Tap(baseCall, "ltx2_tcall_0_output"), 2L * P)[P..];              // the base run's row 1: the conditioned prompt, same noise
             effect = F2_RelRms(out0, baseOut);
         }
-        string line = $"{string.Join("; ", report)} | the LoRA's own effect on call 0 (ComfyUI with vs without) {effect:E2} | rank {lora.Rank}, {sw.Elapsed.TotalSeconds:F1} s";
+        string line = $"{string.Join("; ", report)} | the LoRA's own effect on call 0 (ComfyUI with vs without) {effect:E2} | rank {lora.Rank}, {sw.Elapsed.TotalSeconds:F1} s{(compat ? $", ComfyUI-compatible fp8 rounding: {model.Transformer.CompatStreamSeconds:F2} s of host stream in the last call, {model.Transformer.CompatHostBytes / 1048576.0:F0} MiB of host memory" : "")}";
         return (line, worst, effect);
     }
 
@@ -601,6 +768,7 @@ public abstract partial class MLTestBase
         var req = new Ltx2Request
         {
             Keyframes = keyframes,
+            ComfyCompatibleFp8Lora = Env("LTX2_PIPE_COMPAT", "0") == "1",                        // LTX2_PIPE_COMPAT=1: the LoRA's 8-bit weights re-rounded ComfyUI's way
             Prompt = prompt, NegativePrompt = "worst quality, inconsistent motion, blurry, jittery, distorted", Width = size[0], Height = size[1], Frames = size[2],
             Distilled = distilled, Steps = int.Parse(Env("LTX2_PIPE_STEPS", "20")), Cfg = 4f, Seed = long.Parse(Env("LTX2_PIPE_SEED", "42")),
         };
@@ -648,7 +816,7 @@ public abstract partial class MLTestBase
             wavNote = $"{samples / (double)rate:F2} s of stereo at {rate} Hz, rms {audioRms:F4}";
         }
         string secs = string.Join(", ", clip.Seconds.Select(kv => $"{kv.Key} {kv.Value:F1} s"));
-        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1}{keyNote} | {wavNote} | {outDir}";
+        string line = $"{w}x{h}x{n} {(distilled ? "distilled 8 steps" : $"{req.Steps} steps cfg {req.Cfg}")}{(req.ComfyCompatibleFp8Lora ? ", ComfyUI-compatible fp8 LoRA" : "")}, seed {req.Seed}: total {total:F1} s ({secs}) | first frame luma {m0:F1} +- {sd0:F1}, last {m1:F1} +- {sd1:F1}, mean |first - last| {moved:F1}{keyNote} | {wavNote} | {outDir}";
         Console.WriteLine("[Benchmark] Ltx2 pipeline: " + line);
         lock (stages) Console.WriteLine("[Ltx2] pipeline stages: " + string.Join(" | ", stages));
         Ur_Expect(sd0 > 4 && sd1 > 4 && moved > 1, "the frames are flat or do not move: " + line);

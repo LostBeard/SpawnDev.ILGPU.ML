@@ -81,6 +81,126 @@ public sealed class Ltx2Transformer : IDisposable
     /// <summary>Stop applying <paramref name="lora"/> (it stays open; the caller disposes it).</summary>
     public bool RemoveLora(Ltx2Lora lora) => _loras.Remove(lora);
 
+    /// <summary>
+    /// How a LoRA meets a Linear whose checkpoint weight is 8-bit (F8_E4M3). False (default): exact, <c>x (W + strength B A)^T</c> in float32, the LoRA's full
+    /// effect. True: ComfyUI's result: the patched weight is re-rounded to F8_E4M3 with its seeded stochastic rounding (<see cref="Ltx2Fp8Rounding"/>: reproduced
+    /// black box; ~4% noise per weight, so outputs equal ComfyUI's and differ from the exact ones by a third of a one-block LoRA's effect, MEASURED). Costs a
+    /// re-rounding of every patched 8-bit matrix on every call (the model streams, so nothing is kept): MEASURED 2026-11-17 on the distilled LoRA (all 48 blocks),
+    /// 768 x 512 x 121, RTX 4070: 53.4 s a step against 52.4 s; 0.8 GB of device memory and <see cref="CompatHostBytes"/> of host memory. bf16 Linears are exact either way.
+    /// </summary>
+    public bool ComfyCompatibleFp8Lora { get; set; }
+
+    // the compatible mode's scratch, sized once for the largest patched matrix (16384 x 4096) at the first call that needs it
+    private MemoryBuffer1D<float, Stride1D.Dense>? _cw, _cba, _cB, _cRowMax, _cScale;
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _cq, _cAt;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _cRnd;
+    private uint[]? _cHost;
+    private int _cRank;
+    // a block's streams, started on the thread pool when its weights are in (a stream depends on its tensor's name alone): each a slice of ONE host array the
+    // transformer owns, sized for the largest block. (Pooled arrays per stream, the first form: 5.8 GB of committed host memory after a clip, MEASURED 2026-11-17.)
+    private uint[]? _cBlockHost;
+    private readonly Dictionary<string, (Task Task, int Offset, int Words)> _cStreams = new();
+    /// <summary>Seconds the last call's own thread spent on the compatible mode's random streams, generating them or waiting for the thread pool's (0 when the mode is off).</summary>
+    public double CompatStreamSeconds { get; private set; }
+    /// <summary>Host memory the compatible mode holds for its streams, bytes (0 when it has not run).</summary>
+    public long CompatHostBytes => 4L * ((_cBlockHost?.LongLength ?? 0) + (_cHost?.LongLength ?? 0));
+
+    // Start the streams of every patched 8-bit Linear of the block on the thread pool: a 16384 x 4096 matrix's 67 M draws are sequential by nature (one generator),
+    // but the block's 28 matrices are independent. Not in a browser (one thread: LinFp8Compat generates there).
+    private void StartCompatStreams(GpuWeights w)
+    {
+        if (OperatingSystem.IsBrowser()) return;
+        var plan = new List<(string Name, int Cnt)>(); long total = 0;
+        for (int i = 0; i < _loras.Count; i++)
+        {
+            if (_loraBlock[i] is not { } lw) continue;
+            foreach (var n in lw.Names)
+            {
+                const string tail = ".lora_A.weight";
+                if (!n.EndsWith(tail, StringComparison.Ordinal)) continue;
+                string name = n[..^tail.Length];
+                if (!w.Has(name + ".weight") || !w.IsF8(name + ".weight") || plan.Any(p => p.Name == name)) continue;
+                var shape = w.Shape(name + ".weight");
+                int cnt = checked(shape[0] * shape[1]);
+                plan.Add((name, cnt)); total += (cnt + 3) / 4;
+            }
+        }
+        if (_cBlockHost == null || _cBlockHost.Length < total) _cBlockHost = GC.AllocateUninitializedArray<uint>(checked((int)total));
+        var host = _cBlockHost; int at = 0;
+        foreach (var (name, cnt) in plan)
+        {
+            int words = (cnt + 3) / 4, offset = at;
+            _cStreams[name] = (Task.Run(() => Ltx2Fp8Rounding.Low8(Ltx2Fp8Rounding.Seed(name), host.AsSpan(offset, words), cnt)), offset, words);
+            at += words;
+        }
+    }
+
+    // The block is done: every stream it started has to have FINISHED before the next block's streams write the same array (one nothing consumed, a LoRA tensor for
+    // a Linear this call did not run or a call that threw, may still be generating).
+    private void FinishCompatStreams()
+    {
+        foreach (var s in _cStreams.Values) { try { s.Task.Wait(); } catch (AggregateException) { } }
+        _cStreams.Clear();
+    }
+
+    private async Task EnsureCompatAsync()
+    {
+        int rank = _loras.Max(l => l.Rank);
+        if (_cw != null && rank <= _cRank) return;
+        if (_cw != null) { await _acc.SynchronizeAsync(); DisposeCompat(); }                 // a larger rank: nothing queued may still read the old scratch
+        long cnt = (long)Fv * Dv, side = Fv;
+        _cw = _acc.Allocate1D<float>(cnt); _cba = _acc.Allocate1D<float>(cnt); _cq = _acc.Allocate1D<BFloat16>(cnt); _cRnd = _acc.Allocate1D<uint>((cnt + 3) / 4);
+        _cB = _acc.Allocate1D<float>(side * rank); _cAt = _acc.Allocate1D<BFloat16>(side * rank); _cRowMax = _acc.Allocate1D<float>(side); _cScale = _acc.Allocate1D<float>(1);
+        _cRank = rank;
+    }
+
+    private void DisposeCompat()
+    {
+        _cw?.Dispose(); _cba?.Dispose(); _cB?.Dispose(); _cRowMax?.Dispose(); _cScale?.Dispose(); _cq?.Dispose(); _cAt?.Dispose(); _cRnd?.Dispose();
+        _cw = _cba = _cB = _cRowMax = _cScale = null; _cq = _cAt = null; _cRnd = null;
+        _cBlockHost = null; _cHost = null;
+    }
+
+    // a LoRA-patched Linear on an 8-bit weight, ComfyUI's way: w = W + sum strength B A (float32), re-rounded to F8_E4M3 at scale max|w| / 448 with the tensor's
+    // seeded 8-bit stream, then the Linear on the rounded matrix (its scale on the input, as for the checkpoint's own 8-bit matrices)
+    private void LinFp8Compat(GpuWeights w, FV x, string name, FV o, int M, int K, int N, DiTKernels.Act act, bool block)
+    {
+        int cnt = checked(N * K), words = (cnt + 3) / 4;
+        if (cnt > _cw!.Length) throw new InvalidOperationException($"{name}: [{N}, {K}] is larger than the compatible mode's scratch");
+        var cw = _cw.View.SubView(0, cnt); var cba = _cba!.View.SubView(0, cnt); var cq = _cq!.View.SubView(0, cnt);
+        _l.PatchedWeightInit(_w.MatrixExact(w, name + ".weight"), cw, _w.ActivationScale(w, name + ".weight"), cnt);
+        for (int i = 0; i < _loras.Count; i++)
+        {
+            var lw = block ? _loraBlock[i] : _loras[i].Weights.Base;
+            if (lw == null || !lw.Has(name + ".lora_A.weight")) continue;
+            int r = lw.Shape(name + ".lora_A.weight")[0];
+            if (lw.Shape(name + ".lora_A.weight")[1] != K || lw.Shape(name + ".lora_B.weight")[0] != N) throw new InvalidDataException($"LoRA {name}: A [{string.Join(", ", lw.Shape(name + ".lora_A.weight"))}], B [{string.Join(", ", lw.Shape(name + ".lora_B.weight"))}] for a [{N}, {K}] Linear");
+            var bF = _cB!.View.SubView(0, (long)N * r); var at = _cAt!.View.SubView(0, (long)K * r);
+            _l.Bf16ToF32(lw.BF16(name + ".lora_B.weight"), bF, N * r);
+            _l.TransposeBf16(lw.BF16(name + ".lora_A.weight"), at, r, K);
+            _k.Linear(bF, at, null, cba, N, r, K);                                           // B A [N, K]: rows of B through A^T's rows
+            _l.AddScaled(cw, cba, _loras[i].Strength, cnt);
+        }
+        _l.Fp8Scale(cw, _cRowMax!.View, _cScale!.View, N, K);
+        // the tensor's stream: seeded by its key, the same on every call; from the thread pool when the block started it (StartCompatStreams)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        uint[] host; int offset = 0;
+        if (_cStreams.Remove(name, out var started)) { started.Task.GetAwaiter().GetResult(); host = _cBlockHost!; offset = started.Offset; }
+        else
+        {
+            host = _cHost ??= GC.AllocateUninitializedArray<uint>((Fv * Dv + 3) / 4);        // no thread pool stream (a browser, a top-level Linear): generated here
+            Ltx2Fp8Rounding.Low8(Ltx2Fp8Rounding.Seed(name), host.AsSpan(0, words), cnt);
+        }
+        CompatStreamSeconds += sw.Elapsed.TotalSeconds;
+        var rnd = _cRnd!.View.SubView(0, words);
+        rnd.CopyFromCPU(ref host[offset], (long)words);                                      // has taken the words when it returns: the host arrays are reused
+        _l.Fp8StochasticRound(cw, rnd, _cScale.View, cq, cnt);
+        var xs = _xs.View.SubView(0, (long)M * K);
+        _l.ScaleBy(x, _cScale.View, xs, M * K);
+        string bias = name + ".bias";
+        _k.Linear(xs, cq, w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, act);
+    }
+
     private Ltx2Transformer(Accelerator accelerator, StreamedModelWeights weights, int batch, int videoTokens, int audioTokens, int contextTokens)
     {
         _acc = accelerator; _w = weights; _B = batch; _nv = videoTokens; _na = audioTokens; _L = contextTokens;
@@ -89,7 +209,7 @@ public sealed class Ltx2Transformer : IDisposable
         _v = Alloc(B * nv * Dv); _a = Alloc(B * na * Da); _vn = Alloc(B * nv * Dv); _an = Alloc(B * na * Da);
         _vctx = Alloc(B * L * Dv); _actx = Alloc(B * L * Da);
         _q = Alloc(B * rows * Dv); _kv = Alloc(B * rows * 2 * Dv); _part = Alloc(B * rows * Dv); _o = Alloc(B * rows * Dv);
-        _hid = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Dv))); _xs = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Caption)));
+        _hid = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Dv))); _xs = Alloc(B * Math.Max(nv * Fv, Math.Max(na * Fa, L * Math.Max(Caption, Dv))));   // L x Dv: the text cross-attention's k / v input, once its matrix carries a scale
         // the score matrix exists only where no flash attention runs (the reference kernels): at a real clip's token count it is gigabytes (32 heads x 6144^2
         // floats = 4.8 GB), so a flash-capable backend gets a placeholder
         bool flash = _k.UsesFlashAttention(HeadV) && _k.UsesFlashAttention(HeadA) && _k.UsesFlashBiasedAttention(HeadV);
@@ -147,9 +267,6 @@ public sealed class Ltx2Transformer : IDisposable
     private void Lin(GpuWeights w, FV x, string name, FV o, int M, int K, int N, DiTKernels.Act act = DiTKernels.Act.None)
     {
         var xin = x;
-        float s = _w.ActivationScale(w, name + ".weight");
-        if (s != 1f) { var xs = _xs.View.SubView(0, (long)M * K); _f.ScaleInto(x, xs, s, M * K); x = xs; }
-        string bias = name + ".bias";
         bool block = name.StartsWith("transformer_blocks.", StringComparison.Ordinal);
         bool patched = false;
         for (int i = 0; i < _loras.Count; i++)
@@ -157,6 +274,10 @@ public sealed class Ltx2Transformer : IDisposable
             var lw = block ? _loraBlock[i] : _loras[i].Weights.Base;
             if (lw != null && lw.Has(name + ".lora_A.weight")) { patched = true; break; }
         }
+        if (patched && ComfyCompatibleFp8Lora && w.IsF8(name + ".weight")) { LinFp8Compat(w, x, name, o, M, K, N, act, block); return; }
+        float s = _w.ActivationScale(w, name + ".weight");
+        if (s != 1f) { var xs = _xs.View.SubView(0, (long)M * K); _f.ScaleInto(x, xs, s, M * K); x = xs; }
+        string bias = name + ".bias";
         _k.Linear(x, _w.MatrixExact(w, name + ".weight"), w.Has(bias) ? w.BF16(bias) : null, o, M, K, N, patched ? DiTKernels.Act.None : act);
         if (!patched) return;
         for (int i = 0; i < _loras.Count; i++)
@@ -292,6 +413,8 @@ public sealed class Ltx2Transformer : IDisposable
         for (int b = 0; b < B && uniform; b++) for (int f = 0; f < F; f++) if (Mult(b, f) != 1f) { uniform = false; break; }
         _vg = uniform ? 1 : F; _rpg = uniform ? nv : H * W;
         if (_vg > _gCap) { await _acc.SynchronizeAsync(); AllocGroups(_vg); }
+        CompatStreamSeconds = 0;
+        if (ComfyCompatibleFp8Lora && _loras.Count > 0) await EnsureCompatAsync();
         _guideSplit = null;
         if (guideBias is { } gb && gb.TokenBias.Any(v => v != 0f))
         {
@@ -333,9 +456,14 @@ public sealed class Ltx2Transformer : IDisposable
         {
             var (w, streamed) = await _w.BlockAsync(k, ct);
             for (int i = 0; i < _loras.Count; i++) (_loraBlock[i], loraStreamed[i]) = await _loras[i].Weights.BlockAsync(k, ct);
-            try { Block(w, $"transformer_blocks.{k}."); }
+            try
+            {
+                if (ComfyCompatibleFp8Lora && _loras.Count > 0) StartCompatStreams(w);
+                Block(w, $"transformer_blocks.{k}.");
+            }
             finally
             {
+                FinishCompatStreams();
                 if (streamed || loraStreamed.Any(b => b)) await _acc.SynchronizeAsync();
                 if (streamed) w.Dispose();
                 for (int i = 0; i < _loras.Count; i++) { if (loraStreamed[i]) _loraBlock[i]!.Dispose(); _loraBlock[i] = null; }
@@ -460,6 +588,7 @@ public sealed class Ltx2Transformer : IDisposable
         foreach (var o in _owned) o.Dispose();
         _owned.Clear();
         _loraT?.Dispose(); _loraU?.Dispose(); _loraT = _loraU = null;
+        DisposeCompat();
         foreach (var o in _groupOwned) o.Dispose();
         _groupOwned.Clear();
         _w.Dispose();

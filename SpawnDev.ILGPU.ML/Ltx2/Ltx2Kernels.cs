@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using FV = ILGPU.Runtime.ArrayView1D<float, ILGPU.Stride1D.Dense>;
 using BV = ILGPU.Runtime.ArrayView1D<ILGPU.BFloat16, ILGPU.Stride1D.Dense>;
+using UV = ILGPU.Runtime.ArrayView1D<uint, ILGPU.Stride1D.Dense>;
 
 namespace SpawnDev.ILGPU.ML.Ltx2;
 
@@ -186,6 +187,140 @@ public sealed class Ltx2Kernels
     {
         _act ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(ActImpl);
         _act(count, x, act);
+    }
+
+    // ───────────────────────── ComfyUI-compatible fp8 LoRA: the patched weight re-rounded to F8_E4M3 (Ltx2Fp8Rounding has the rule and its evidence) ─────────────────────────
+
+    private Action<Index1D, BV, FV, float>? _patchInit;
+    private static void PatchInitImpl(Index1D i, BV dec, FV o, float ws) => o[i] = PrecisionConvert.ConvertToSingle(dec[i]) * ws;
+    /// <summary>w = the checkpoint's decoded 8-bit values (as bf16, exact) times their scale, in float32: the weight a LoRA is added to.</summary>
+    public void PatchedWeightInit(BV decoded, FV w, float scale, int count)
+    {
+        _patchInit ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, FV, float>(PatchInitImpl);
+        _patchInit(count, decoded, w, scale);
+    }
+
+    private Action<Index1D, FV, float>? _scaleInPlace;
+    private static void ScaleInPlaceImpl(Index1D i, FV y, float a) => y[i] = a * y[i];
+    private Action<Index1D, FV, FV>? _addInPlace;
+    private static void AddInPlaceImpl(Index1D i, FV x, FV y) => x[i] = x[i] + y[i];
+    /// <summary>
+    /// x += a y the way torch's <c>w + strength * (B A)</c> rounds: the product rounded to float32, THEN the add. Two dispatches on purpose, do NOT merge them: inside
+    /// one kernel the device compiler fuses the pair into a multiply-add (MEASURED 2026-11-17 on CUDA, a = 0.7: 24 of 67,108,864 elements of the re-rounded matrix
+    /// differed from the rule). y is left holding a y; a = 1 is the add alone.
+    /// </summary>
+    public void AddScaled(FV x, FV y, float a, int count)
+    {
+        if (a != 1f)
+        {
+            _scaleInPlace ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, float>(ScaleInPlaceImpl);
+            _scaleInPlace(count, y, a);
+        }
+        _addInPlace ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV>(AddInPlaceImpl);
+        _addInPlace(count, x, y);
+    }
+
+    private Action<Index1D, BV, FV>? _bf16ToF32;
+    private static void Bf16ToF32Impl(Index1D i, BV src, FV dst) => dst[i] = PrecisionConvert.ConvertToSingle(src[i]);
+    /// <summary>bf16 values as float32 (exact).</summary>
+    public void Bf16ToF32(BV src, FV dst, int count)
+    {
+        _bf16ToF32 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, FV>(Bf16ToF32Impl);
+        _bf16ToF32(count, src, dst);
+    }
+
+    private Action<Index1D, BV, BV, int, int>? _transposeBf16;
+    private static void TransposeBf16Impl(Index1D i, BV src, BV dst, int rows, int cols)
+    {
+        int r = i / cols, c = i % cols;
+        dst[c * rows + r] = src[i];
+    }
+    /// <summary>A bf16 matrix [rows, cols] transposed into [cols, rows].</summary>
+    public void TransposeBf16(BV src, BV dst, int rows, int cols)
+    {
+        _transposeBf16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, BV, int, int>(TransposeBf16Impl);
+        _transposeBf16(rows * cols, src, dst, rows, cols);
+    }
+
+    private Action<Index1D, FV, FV, int>? _rowAbsMax;
+    private static void RowAbsMaxImpl(Index1D row, FV w, FV o, int K)
+    {
+        long b = (long)(int)row * K;
+        float m = 0f;
+        for (int k = 0; k < K; k++) m = MathF.Max(m, MathF.Abs(w[b + k]));
+        o[row] = m;
+    }
+    private Action<Index1D, FV, FV, int>? _scaleFromMax;
+    private static void ScaleFromRowMaxImpl(Index1D i, FV rowMax, FV scale, int N)
+    {
+        float m = 0f;
+        for (int r = 0; r < N; r++) m = MathF.Max(m, rowMax[r]);
+        scale[i] = m / 448f;
+    }
+    /// <summary>scale[0] = max|w| / 448 over the [N, K] matrix (448 = the largest F8_E4M3 value): the re-rounded weight's scale. rowMax is scratch [N].</summary>
+    public void Fp8Scale(FV w, FV rowMax, FV scale, int N, int K)
+    {
+        _rowAbsMax ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(RowAbsMaxImpl);
+        _scaleFromMax ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(ScaleFromRowMaxImpl);
+        _rowAbsMax(N, w, rowMax, K);
+        _scaleFromMax(1, rowMax, scale, N);
+    }
+
+    private Action<Index1D, FV, UV, FV, BV>? _fp8Round;
+    private static void Fp8RoundImpl(Index1D i, FV w, UV rnd, FV scale, BV o)
+    {
+        float v = w[i], s = scale[0];
+        float y = s > 0f ? MathF.Abs(v) / s : 0f;
+        // through half precision, round to nearest even: 11 significant bits from 2^-14 up, multiples of 2^-24 below
+        float y16 = 0f;
+        if (y >= 6.103515625e-05f)
+        {
+            uint b = (uint)Interop.FloatAsInt(y);
+            y16 = Interop.IntAsFloat((b + 0xFFFu + ((b >> 13) & 1u)) & 0xFFFFE000u);
+        }
+        else
+        {
+            float sc = y * 16777216f, t = MathF.Floor(sc), f = sc - t;
+            bool more = f > 0.5f, tie = f == 0.5f, odd = (((int)t) & 1) != 0;
+            if (more | (tie & odd)) t += 1f;
+            y16 = t * 5.9604644775390625e-08f;
+        }
+        // its F8_E4M3 neighbours l <= y16 < h and the position between them
+        float l = 0f, h = 0f, fr = 0f;
+        if (y16 >= 0.015625f)
+        {
+            uint b = (uint)Interop.FloatAsInt(y16), lb = b & 0xFFF00000u;
+            l = Interop.IntAsFloat(lb); h = Interop.IntAsFloat(lb + 0x100000u); fr = (b & 0xFFFFFu) * 9.5367431640625e-07f;
+        }
+        else
+        {
+            float sc = y16 * 512f, t = MathF.Floor(sc);
+            fr = sc - t; l = t * 0.001953125f; h = (t + 1f) * 0.001953125f;
+        }
+        uint draw = (rnd[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
+        float q = fr * 256f + draw >= 256f ? h : l;                                       // ">" here: 0.38% of the elements differ from the rule (red-check, and ComfyUI)
+        o[i] = (BFloat16)(v < 0f ? -q : q);
+    }
+    /// <summary>
+    /// ComfyUI's seeded stochastic re-rounding of a patched weight to F8_E4M3 (<see cref="Ltx2Fp8Rounding"/>: the rule, measured black box): w [count] float32 and
+    /// its scale (scale[0], <see cref="Fp8Scale"/>) in; the 8-bit draws packed four to a word (<see cref="Ltx2Fp8Rounding.Low8"/>); the rounded values out as bf16
+    /// (every F8_E4M3 value is one), WITHOUT the scale: the caller multiplies the matrix's input by it (<see cref="ScaleBy"/>), as for a checkpoint's own 8-bit matrix.
+    /// The division by the scale is float32: IEEE on CUDA; a backend whose float32 division is not exact can differ by one step on a few elements.
+    /// </summary>
+    public void Fp8StochasticRound(FV w, UV rnd, FV scale, BV o, int count)
+    {
+        if (rnd.Length * 4 < count) throw new ArgumentException($"{count} draws need {(count + 3) / 4} words");
+        _fp8Round ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, BV>(Fp8RoundImpl);
+        _fp8Round(count, w, rnd, scale, o);
+    }
+
+    private Action<Index1D, FV, FV, FV>? _scaleBy;
+    private static void ScaleByImpl(Index1D i, FV x, FV scale, FV o) => o[i] = x[i] * scale[0];
+    /// <summary>o = x times the device scalar scale[0].</summary>
+    public void ScaleBy(FV x, FV scale, FV o, int count)
+    {
+        _scaleBy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV>(ScaleByImpl);
+        _scaleBy(count, x, scale, o);
     }
 
     // ───────────────────────── video VAE decoder ─────────────────────────

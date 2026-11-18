@@ -70,6 +70,11 @@ public sealed class Ltx2Request
     /// <summary>The distilled recipe: the distilled LoRA (<see cref="Ltx2Paths.DistilledLora"/>) at <see cref="LoraStrength"/>, <see cref="Ltx2Schedule.Distilled"/>'s 8 steps, no guidance.</summary>
     public bool Distilled { get; init; }
     public float LoraStrength { get; init; } = 1f;
+    /// <summary>
+    /// How the LoRA meets the checkpoint's 8-bit (F8_E4M3) weights. False (default): exact, the LoRA's full effect in float32. True: ComfyUI's result, the patched
+    /// weight re-rounded to 8 bits with its seeded rounding (<see cref="Ltx2Transformer.ComfyCompatibleFp8Lora"/>): pick it to reproduce a ComfyUI render.
+    /// </summary>
+    public bool ComfyCompatibleFp8Lora { get; init; }
     /// <summary>The sigmas to run (ending in 0), instead of the schedule.</summary>
     public float[]? Sigmas { get; init; }
     public long Seed { get; init; } = 42;
@@ -258,6 +263,7 @@ public sealed class Ltx2Pipeline
                 {
                     lora = await Ltx2Lora.OpenAsync(_acc, _source, _paths.Repo, _paths.DistilledLora!, req.LoraStrength, 1L << 30, ct);
                     model.Transformer.AddLora(lora);
+                    model.Transformer.ComfyCompatibleFp8Lora = req.ComfyCompatibleFp8Lora;
                 }
                 int steps = sigmas.Length - 1;
                 progress?.Report(new WanProgress("sample", 0, $"{steps} steps, {nv} video + {Ta} audio tokens"));
