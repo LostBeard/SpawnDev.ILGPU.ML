@@ -84,6 +84,12 @@ public class HttpModelDownloader
     }
     /// <summary>Fetch chunks seen. Reset per download - the loop cost scales with THIS, not with bytes.</summary>
     public static long LastFetchChunks { get; private set; }
+    /// <summary>
+    /// Requests of the last download sent to its source URL itself rather than to where the source resolved: on Hugging Face one "resolver" call each
+    /// (3,000 per 5 minutes per client). On a source that redirects: the first request, plus one per segment that found its signed URL expired (the segments
+    /// go to the resolved URL). On one that does not: every request.
+    /// </summary>
+    public static long LastResolveRequests { get; private set; }
 
     // ⚠️ THE UNACCOUNTED TIME HAD (AT LEAST) TWO CANDIDATES AND DIVIDING BY ONE OF THEM PROVED NOTHING.
     // 12,211 ms of a 44 s download sat outside fetch and store-write. That is 132 us x 92,182 fetch
@@ -509,6 +515,11 @@ public class HttpModelDownloader
         var lastReport = Environment.TickCount64 - ProgressIntervalMs;
         var lastCheckpoint = written;
         ResetTransferCensus();
+        LastResolveRequests = 1;
+        // Where the segments go: the first response's final URL (fetch followed the redirect). Hugging Face answers /resolve/ with a 302 to a signed CDN URL
+        // and counts every /resolve/ request against its resolver limit (3,000 per 5 minutes per client): segments sent to `url` each cost one (2026-11-19,
+        // Lore). A segment that fails on it resolves again (a signed URL expires).
+        string rangeUrl = response.Redirected && !string.IsNullOrEmpty(response.Url) ? response.Url : url;
         long chunkCount = 0, writeCount = 0;
         Uint8Array? writeBuffer = null;
         long bufferFill = 0;
@@ -535,8 +546,17 @@ public class HttpModelDownloader
                     if (!string.IsNullOrEmpty(etag)) h["If-Range"] = etag!;
 
                     var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    var r = await _js.Fetch(url, new FetchOptions { Headers = h, Signal = abortSignal })
+                    if (rangeUrl == url) LastResolveRequests++;   // a source that did not redirect: every segment goes to it
+                    var r = await _js.Fetch(rangeUrl, new FetchOptions { Headers = h, Signal = abortSignal })
                         .ConfigureAwait(false);
+                    if (!r.Ok && rangeUrl != url)
+                    {
+                        // the resolved URL failed (a signed URL expires): resolve again through the source and use where it lands now
+                        r.Dispose();
+                        LastResolveRequests++;
+                        r = await _js.Fetch(url, new FetchOptions { Headers = h, Signal = abortSignal }).ConfigureAwait(false);
+                        if (r.Ok && r.Redirected && !string.IsNullOrEmpty(r.Url)) rangeUrl = r.Url;
+                    }
                     using (r)
                     {
                         if (!r.Ok)

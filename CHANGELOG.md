@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Hugging Face ranges resolve once, not once per request** (Lore's find, 2026-11-19). Hugging Face answers `/resolve/` with a 302 to a signed CDN URL
+  and counts every `/resolve/` request against its "resolver" limit: 3,000 per 5 minutes per client (anonymous; `ratelimit: "resolvers";r=2999;t=118`).
+  The three range readers sent every range there: `FetchRangeStream` one per 16 MiB chunk (a 27 GB LTX-2 checkpoint streamed in the browser: ~1,700 a
+  load), `HttpModelDownloader`'s segments one each (down to 512 KiB), `HttpRangeStream` one per read. Now the first response's final URL takes the rest
+  of the file (`Response.url` in the browser; `RequestMessage.RequestUri` on desktop; the browser's HttpClient hides it, so `HttpRangeStream` asks
+  `fetch` with a one-byte range), chunks in flight wait for the first answer, a failure on the signed URL (it expires) resolves again, and a 429
+  waits out Retry-After / the ratelimit window. MEASURED against a public Hugging Face LFS file: desktop 8 reads -> 1 resolver request, 7 straight
+  to us.aws.cdn.hf.co; browser `FetchRangeStream` 16 chunks -> 1, the downloader 19 segments -> 1, `HttpRangeStream` 8 reads -> 2 (was one each:
+  red-checked, 20 / 8 / 16 with the pinning off). `ResolveRequests` (`HttpModelDownloader.LastResolveRequests`) counts them. A local server shaped
+  like the Hub covers the expiry: 20 reads, 1 resolve, 1 more after a 403.
 - **LTX-2 keyframe-guided attention on the tensor cores, opt-in** (`DiTKernels.TensorCoreBiasedAttention`, env `TRELLIS2_MMA_BIAS_ATTN=1`; `BiasedAttention`:
   the guides' two-group score bias, `MmaAttention.KernelExactBias` / `KernelBias`, generated from the plain kernels by one transform). Default OFF: a
   pre-registered keyframe clip test (768 x 512 x 121, strength 0.6, seeds 42 / 7 / 1234) put it at a mean |frame difference| of 0.229 from the CUDA fp32

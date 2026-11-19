@@ -1,4 +1,6 @@
 using System.Net.Http.Headers;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Hub;
 
@@ -69,6 +71,23 @@ public sealed class HttpRangeStream : Stream
     /// <summary>Times a read resumed after a stall, a dropped connection or a short response (diagnostics).</summary>
     public int Resumes { get; private set; }
 
+    // Where the ranges go once a response showed where the source lands (HttpClient followed the redirect: the response's RequestMessage carries the final
+    // URI). Hugging Face answers /resolve/ with a 302 to a signed CDN URL and counts every /resolve/ request against its resolver limit (3,000 per 5 minutes
+    // per client; 2026-11-19, Lore): a range per read to /resolve/ spent one each. Null until the first response, and again after a failure on it (a
+    // signed URL expires). Not used when the client sends a default Authorization header: a signed URL refuses a second authentication.
+    private string? _rangeUrl;   // null: not learned yet (or forgotten after a failure on it)
+    private bool _resolved;      // _rangeUrl is where the source landed, not the source itself
+
+    /// <summary>
+    /// Requests sent to the source URL itself rather than to where it resolved: on Hugging Face one "resolver" call each. On a source that redirects: one
+    /// per stream (two in the browser, which asks fetch where the redirect landed), plus one per expired signed URL. On one that does not: every request
+    /// (there is nothing to resolve). Diagnostics; the tests assert it.
+    /// </summary>
+    public int ResolveRequests { get; private set; }
+
+    /// <summary>Where range requests go now: the resolved URL (the source itself when it did not redirect), or null before the first response.</summary>
+    public string? RangeUrl => _rangeUrl;
+
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
         if (_position >= _length || buffer.Length == 0) return 0;
@@ -79,13 +98,17 @@ public sealed class HttpRangeStream : Stream
         {
             long start = _position + got, end = _position + want - 1;   // clamp to EOF (RFC 7233)
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            string target = _resolved ? _rangeUrl! : _url;
             try
             {
-                using var req = new HttpRequestMessage(HttpMethod.Get, _url);
+                using var req = new HttpRequestMessage(HttpMethod.Get, target);
                 req.Headers.Range = new RangeHeaderValue(start, end);
                 stall.CancelAfter(StallTimeout);
+                bool learn = _rangeUrl == null;
+                if (!_resolved) ResolveRequests++;
                 using var resp = await ModelsHost.SendAsync(_http, req, HttpCompletionOption.ResponseHeadersRead, stall.Token).ConfigureAwait(false);
                 resp.EnsureSuccessStatusCode();
+                if (learn) await LearnWhereItLandsAsync(resp).ConfigureAwait(false);
                 // a server that ignores Range answers 200 with the whole file: its first bytes are not the ones asked for
                 bool whole = start == 0 && end == _length - 1;
                 if (resp.StatusCode != System.Net.HttpStatusCode.PartialContent && !whole)
@@ -107,6 +130,8 @@ public sealed class HttpRangeStream : Stream
             catch (RangeRefusedException) { throw; }
             catch (Exception ex) when (!ct.IsCancellationRequested && ex is IOException or HttpRequestException or OperationCanceledException)
             {
+                // a failure on a resolved URL (a signed URL expires, or anything else): the next attempt resolves again
+                if (_resolved && _rangeUrl == target) { _rangeUrl = null; _resolved = false; }
                 last = ex is OperationCanceledException ? new TimeoutException($"GET {_url} bytes={start}-{end}: no bytes for {StallTimeout.TotalSeconds:F0} s", ex) : ex;
                 if (++failures >= Attempts) throw new IOException($"GET {_url}: {failures} failed attempts at byte {_position + got}", last);
                 Resumes++;
@@ -115,6 +140,33 @@ public sealed class HttpRangeStream : Stream
         }
         _position += got;
         return got;
+    }
+
+    // Where the first response's request ended up: HttpClient follows a redirect and leaves the final URI on the response's RequestMessage (desktop). The
+    // browser's HttpClient does not (its RequestUri stays the one requested), so there fetch is asked, whose Response.url is the final URL: one byte, one
+    // more resolve per stream instead of one per read.
+    private async Task LearnWhereItLandsAsync(HttpResponseMessage resp)
+    {
+        string? requested = Uri.TryCreate(_url, UriKind.Absolute, out var abs) ? abs.AbsoluteUri : _http.BaseAddress != null ? new Uri(_http.BaseAddress, _url).AbsoluteUri : null;
+        string? landed = resp.RequestMessage?.RequestUri is { IsAbsoluteUri: true } final ? final.AbsoluteUri : null;
+        if (OperatingSystem.IsBrowser() && landed != null)
+        {
+            ResolveRequests++;
+            landed = await BrowserLandingAsync(landed).ConfigureAwait(false) ?? landed;
+        }
+        _resolved = landed != null && landed != requested && _http.DefaultRequestHeaders.Authorization == null;
+        _rangeUrl = _resolved ? landed : _url;
+    }
+
+    private static async Task<string?> BrowserLandingAsync(string url)
+    {
+        try
+        {
+            if (SpawnJSRuntime.Instance is not { } js) return null;
+            using var r = await js.Fetch(url, new FetchOptions { Headers = new() { ["Range"] = "bytes=0-0" } });
+            return r.Ok && r.Redirected && !string.IsNullOrEmpty(r.Url) ? r.Url : null;
+        }
+        catch { return null; }   // no answer: the stream keeps the source URL
     }
 
     // a response that cannot be resumed from: retrying the same request would get the same wrong bytes
