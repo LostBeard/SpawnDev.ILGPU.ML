@@ -108,8 +108,13 @@ public sealed partial class BackwardKernels
     private MemoryBuffer1D<ushort, Stride1D.Dense>? _fQ16, _fO16, _fK16, _fV16;
     private MemoryBuffer1D<float, Stride1D.Dense>? _fScDs;
     private MemoryBuffer1D<int, Stride1D.Dense>? _fMaxDs;
-    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>? _fQ, _fQSm75;
-    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>? _fKv, _fKvSm75;
+    // the generated kernels live in SpawnDev.ILGPU.ML.Kernels (left to the interpreter under browser AOT) and take Kernels.KernelAttnDims, AttnDims' layout twin
+    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, Kernels.KernelAttnDims>? _fQ, _fQSm75;
+    private Action<KernelConfig, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, Kernels.KernelAttnDims>? _fKv, _fKvSm75;
+    private static Kernels.KernelAttnDims ToKernel(AttnDims d) => new()
+    {
+        Heads = d.Heads, KvHeads = d.KvHeads, SeqQ = d.SeqQ, SeqKV = d.SeqKV, HeadDim = d.HeadDim, Causal = d.Causal, Window = d.Window, KvOffset = d.KvOffset, Scale = d.Scale,
+    };
 
     private bool FlashAttentionEligible(AttnDims d) => UseFlashAttentionBackward && d.HeadDim == Kernels.MmaFlashAttnBwd.HeadDim;
 
@@ -134,25 +139,26 @@ public sealed partial class BackwardKernels
         var qw = Words(Q16, qn); var ow = Words(O16, qn); var kw = Words(K16, kn); var vw = Words(V16, kn);
         var gq = new KernelConfig((d.SeqQ + Kernels.MmaFlashAttnBwd.QRows - 1) / Kernels.MmaFlashAttnBwd.QRows * d.Heads, Kernels.MmaFlashAttnBwd.Threads);
         var gkv = new KernelConfig((d.SeqKV + Kernels.MmaFlashAttnBwd.KeyRows - 1) / Kernels.MmaFlashAttnBwd.KeyRows * d.KvHeads, Kernels.MmaFlashAttnBwd.Threads);
+        var kd = ToKernel(d);
         if (turing)
         {
-            _fQSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>(
+            _fQSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, Kernels.KernelAttnDims>(
                 Kernels.MmaFlashAttnBwd.KernelQSm75);
-            _fKvSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>(
+            _fKvSm75 ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, Kernels.KernelAttnDims>(
                 Kernels.MmaFlashAttnBwd.KernelKVSm75);
             _zeroInt(1, _fMaxDs.View);
-            _fQSm75(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, d);
+            _fQSm75(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, kd);
             _scaleK(1, _fMaxDs.View, _fScDs.View);
-            _fKvSm75(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, d);
+            _fKvSm75(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, kd);
         }
         else
         {
-            _fQ ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, AttnDims>(
+            _fQ ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, ArrayView1D<int, Stride1D.Dense>, FV, Kernels.KernelAttnDims>(
                 Kernels.MmaFlashAttnBwd.KernelQ);
-            _fKv ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, AttnDims>(
+            _fKv ??= _acc.LoadStreamKernel<ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, ArrayView<uint>, FV, FV, FV, FV, FV, Kernels.KernelAttnDims>(
                 Kernels.MmaFlashAttnBwd.KernelKV);
-            _fQ(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, d);
-            _fKv(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, d);
+            _fQ(gq, qw, ow, kw, vw, dout, outp, stats, scDo, _fMaxDs.View, dq, kd);
+            _fKv(gkv, qw, ow, kw, vw, stats, scDo, _fScDs.View, dk, dv, kd);
         }
     }
 

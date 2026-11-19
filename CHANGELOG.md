@@ -2,6 +2,13 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+- **The kernel assembly, stage 2: MmaFlashAttnBwd** (the training flash-attention backward) moved into SpawnDev.ILGPU.ML.Kernels: in the 5.8.23 AOT
+  build it was 24% of the remaining clang time on SpawnDev.ILGPU.ML.dll (115 of 476 s, Bones' trace). It takes `KernelAttnDims`, a public (kernel parameter types must be:
+  ILGPU emits launchers into a dynamic assembly) layout twin of `BackwardKernels.AttnDims`, hidden from IntelliSense; `Kernel_LayoutTwins_MatchTheirPublicStructs`
+  pins the twin's size and every field's name, type and offset (red-checked). Public API unchanged.
+
 ## 5.8.23 - 2026-11-19 (nuget.org) - browser AOT leaves the GPU kernels interpreted; LTX-2 in-place image to video; fp8 LoRA compat exact; SpawnDev.ILGPU 5.4.38
 
 - **SpawnDev.ILGPU 5.4.38** (stable 2026-11-19; ML gate on its local.2: 7,812 / 0 / 495, zero outcome changes against the 5.4.37 gate, no kernel hit the new
