@@ -13,8 +13,17 @@ namespace SpawnDev.ILGPU.ML.Ltx2;
 /// each guide token's attention strength (its guide's strength, times the guide's attention mask at latent resolution when it has one; 0 = blocked). Null: every guide
 /// token at <paramref name="Strength"/>. MEASURED on ComfyUI's attention masks: a noisy query's score to a guide key gets ln(the key's strength), a guide query's score to a
 /// noisy key ln(its own), guide tokens among themselves nothing (also between two guides).</para>
+/// <para><paramref name="GuideFrames"/> 0 (<see cref="InPlace"/>): no appended frames, only the denoise mask, ComfyUI's LTXVImgToVideoInplace (the start picture
+/// encoded INTO the video's first latent frame at mask 1 - strength).</para>
 /// </summary>
-public sealed record Ltx2Guide(int GuideFrames, float[] KeyframeBoxes, float Strength, float[] FrameMask, float[]? TokenStrengths = null);
+public sealed record Ltx2Guide(int GuideFrames, float[] KeyframeBoxes, float Strength, float[] FrameMask, float[]? TokenStrengths = null)
+{
+    /// <summary>
+    /// ComfyUI's LTXVImgToVideoInplace: no guide frames, only <paramref name="frameMask"/> (the denoise_mask per latent frame, [F] or [B, F]; the start picture's frame at
+    /// 1 - strength, the rest 1). Each frame's timestep is sigma x mask, and the masked sampler holds the masked frames to the clean latent (the picture's encoding).
+    /// </summary>
+    public static Ltx2Guide InPlace(float[] frameMask) => new(0, Array.Empty<float>(), 1f, frameMask);
+}
 
 /// <summary>
 /// LTX-2's model call in ComfyUI's own form (what SpawnGen's sampler calls): the packed audio-video latent of each batch item, <c>[video [128, F, H, W] row-major, then audio
@@ -90,9 +99,15 @@ public sealed class Ltx2AvModel : IDisposable
         float[]? boxes = null; (int, float[])? bias = null; IReadOnlyList<float>? mults = guide?.FrameMask;
         if (guide != null)
         {
-            int gf = guide.GuideFrames, hw = _H * _W, ng = gf * hw, grid = (_F - gf) * hw;
-            if (gf < 1 || gf >= _F) throw new ArgumentException($"guide frames {gf} of {_F} latent frames");
+            int gf = guide.GuideFrames, ng = gf * _H * _W;
+            if (gf < 0 || gf >= _F) throw new ArgumentException($"guide frames {gf} of {_F} latent frames");
             if (guide.KeyframeBoxes.Length != 3 * ng * 2) throw new ArgumentException($"keyframe boxes: [3, {ng}, 2] (the guide's tokens)");
+            if (guide.TokenStrengths != null && guide.TokenStrengths.Length != ng) throw new ArgumentException($"token strengths: one per guide token ({ng})");
+        }
+        // guide frames: their tokens' RoPE boxes and their attention strengths (0 guide frames, LTXVImgToVideoInplace: only the frame mask, the grid as without a guide)
+        if (guide != null && guide.GuideFrames > 0)
+        {
+            int gf = guide.GuideFrames, hw = _H * _W, ng = gf * hw, grid = (_F - gf) * hw;
             boxes = new float[_F * hw * 6];
             Array.Copy(Ltx2Transformer.GridBoxes(_F - gf, _H, _W), boxes, grid * 6);
             for (int j = 0; j < ng; j++)
@@ -101,7 +116,6 @@ public sealed class Ltx2AvModel : IDisposable
                     boxes[(grid + j) * 6 + 2 * ax] = guide.KeyframeBoxes[(ax * ng + j) * 2];
                     boxes[(grid + j) * 6 + 2 * ax + 1] = guide.KeyframeBoxes[(ax * ng + j) * 2 + 1];
                 }
-            if (guide.TokenStrengths != null && guide.TokenStrengths.Length != ng) throw new ArgumentException($"token strengths: one per guide token ({ng})");
             var tb = new float[nv]; bool any = false;
             for (int j = 0; j < ng; j++)
             {

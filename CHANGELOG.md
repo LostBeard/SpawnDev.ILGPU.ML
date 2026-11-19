@@ -4,6 +4,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **LTX-2 in-place image to video** (`Ltx2Guide.InPlace(frameMask)`, ComfyUI's LTXVImgToVideoInplace; SpawnGen's request): a guide with 0 guide frames, only the
+  denoise mask (the start picture encoded into the first latent frame at 1 - strength). MEASURED 2026-11-18 against ComfyUI (128 x 96 x 9, cfg 4, 2 steps,
+  CUDA): strength 1 calls 2.9e-6 / 9.8e-7, sampled final latent 2.4e-5; strength 0.6 calls 7.9e-6 / 7.2e-6, final 8.3e-5 (`Ltx2_InPlaceI2V_MatchesComfyUi`;
+  without the mask 0.66 / 0.81: red-checked). The guided gates are unchanged.
 - **SpawnDev.ILGPU 5.4.37** (stable, 2026-11-18; ML gate on its local.1: 7,812 / 0 / 495, no Pass -> Fail). Its CUDA page-lock now binds the context on any thread, so:
 - **Streamed block images are page-locked on CUDA** (`StreamedModelWeights.PageLockImages`, env `ML_STREAM_PAGELOCK=0` turns it off): uploads are a straight DMA.
   MEASURED 2026-11-18, LTX-2 768 x 512 x 121 two-row calls from an NVMe drive, alternating A/B, 6 calls each way: upload 5.8 -> 4.5 s a call, the call 0.5 to

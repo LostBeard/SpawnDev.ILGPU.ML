@@ -764,6 +764,68 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// ComfyUI's LTXVImgToVideoInplace (SpawnGen's taps _DevComms 2026-11-19-0010: a 192 x 256 picture encoded INTO the first latent frame of 128 x 96 x 9 + 9 audio
+    /// frames, cfg 4, Euler over LTXVScheduler's 2 steps, strengths 1.0 and 0.6) through <see cref="Ltx2Guide.InPlace"/>: no guide frames, only the denoise mask
+    /// [1 - strength, 1]. Both model calls on ComfyUI's own inputs (per-frame timesteps sigma x mask) against its denoised outputs, then the whole masked sampling run
+    /// (the model sees m x + (1 - m) latent, the step uses m D + (1 - m) latent) against call 1's input and the final latent.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_InPlaceI2V_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        var root = Path.Combine(Ltx2_Dumps(), "i2v_inplace");
+        if (!Directory.Exists(root)) throw new UnsupportedTestException($"SpawnGen's in-place i2v taps not found in {root}");
+        const int B = 2, F = 2, H = 3, W = 4, Ta = 9, L = 1024, hw = H * W, nv = F * hw, V = 128 * nv, P = V + 8 * Ta * 16;
+        double residentGb = double.TryParse(Environment.GetEnvironmentVariable("LTX2_DIT_RESIDENT_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gb) ? gb : 6.0;
+        using var model = await Ltx2AvModel.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "ltx-2-19b-dev-fp8.safetensors", B, F, H, W, Ta, L, (long)(residentGb * 1e9));
+        var report = new List<string>(); double worstCall = 0, worstSample = 0; int ran = 0;
+        foreach (var (folder, strength) in new[] { ("i2vcall_s10", 1.0f), ("i2vcall_s06", 0.6f) })
+        {
+            var d = Path.Combine(root, folder);
+            if (!Directory.Exists(d)) continue;
+            float[] T(string prefix, long n) => F2_Raw(Ltx2_Tap(d, prefix), n);
+            var mask = T("i2v_call_0_c_denoise_mask", (long)B * 128 * F * hw);
+            var frameMask = new float[F];
+            for (int f = 0; f < F; f++) frameMask[f] = mask[(long)f * hw];
+            Ur_Expect(MathF.Abs(frameMask[0] - (1f - strength)) < 1e-6f && frameMask[1] == 1f, $"{folder}: frame mask [{string.Join(", ", frameMask)}], built for [{1f - strength}, 1]");
+            var guide = Ltx2Guide.InPlace(frameMask);
+            using var ctx = accelerator.Allocate1D(T("i2v_call_0_c_c_crossattn", (long)B * L * Ltx2AvModel.ContextWidth));
+            // both calls on ComfyUI's own inputs
+            var calls = new List<string>();
+            for (int c = 0; c < 2; c++)
+            {
+                var sigma = T($"i2v_call_{c}_timestep", B);
+                var den = await model.DenoiseAsync(T($"i2v_call_{c}_input", (long)B * P), new[] { sigma[0], sigma[1] }, ctx.View, 25f, guide);
+                double e = F2_RelRms(den, T($"i2v_call_{c}_output", (long)B * P)); worstCall = Math.Max(worstCall, e);
+                calls.Add($"call {c} {e:E2}");
+                await accelerator.SynchronizeAsync();
+            }
+            // the whole run: the start state is ComfyUI's call-0 input with the start frame's blend undone (strength 1: that frame is the clean latent, never read)
+            var sigmas = T("i2v_call_0_c_transformer_options_sample_sigmas", 3);
+            var latent = T("i2v_av_in_samples_part0", V).Concat(T("i2v_av_in_samples_part1", 8L * Ta * 16)).ToArray();
+            var in0 = T("i2v_call_0_input", (long)B * P)[..P];
+            float M(int k) => k < V ? frameMask[(k % nv) / hw] : 1f;
+            var start = new float[P];
+            for (int k = 0; k < P; k++) { float m = M(k); start[k] = m > 0f ? (in0[k] - (1f - m) * latent[k]) / m : in0[k]; }
+            float[]? afterStep0 = null;
+            var x = await model.SampleAsync(start, ctx.View, sigmas, 4f, 25f, guide, latent, (i, xi) => { if (i == 0) afterStep0 = xi; });
+            var in1 = new float[P];
+            for (int k = 0; k < P; k++) { float m = M(k); in1[k] = m * afterStep0![k] + (1f - m) * latent[k]; }
+            double e1 = F2_RelRms(in1, T("i2v_call_1_input", (long)B * P)[..P]);
+            var final = T("i2v_out_samples_part0", V).Concat(T("i2v_out_samples_part1", 8L * Ta * 16)).ToArray();
+            double e2 = F2_RelRms(x, final);
+            worstSample = Math.Max(worstSample, Math.Max(e1, e2)); ran++;
+            report.Add($"strength {strength}: {string.Join(", ", calls)}; sample: call 1's input {e1:E2}, final latent {e2:E2}");
+        }
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Ltx2] in-place i2v vs ComfyUI: " + line);
+        Ur_Expect(ran == 2, $"{ran} of 2 in-place i2v tap folders found in {root}");
+        Ur_Expect(worstCall < 1e-4 && worstSample < 5e-4, line);   // the guided gates' bars (calls 1e-4, sampling 5e-4)
+        return line;
+    });
+
+    /// <summary>
     /// A guided call at a size where the kernels leave their one-group case (SpawnGen's tap _DevComms 2026-11-18-1200: 384 x 256 x 25 frames + 25 audio frames, a picture
     /// guide at the last frame, strength 0.6, cfg 4): 480 video tokens (4 latent frames of 8 x 12 + the 96-token guide frame: four query groups of the flash attention's
     /// 128, 960-row GEMMs over the batch), both of ComfyUI's calls (sigma 1 and 0.1, each on ComfyUI's own input), against its denoised outputs. Every other LTX-2 tap is 8 to 48 tokens.
