@@ -14,10 +14,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   to us.aws.cdn.hf.co; browser `FetchRangeStream` 16 chunks -> 1, the downloader 19 segments -> 1, `HttpRangeStream` 8 reads -> 2 (was one each:
   red-checked, 20 / 8 / 16 with the pinning off). `ResolveRequests` (`HttpModelDownloader.LastResolveRequests`) counts them. A local server shaped
   like the Hub covers the expiry: 20 reads, 1 resolve, 1 more after a 403.
-- **LTX-2 keyframe-guided attention on the tensor cores, opt-in** (`DiTKernels.TensorCoreBiasedAttention`, env `TRELLIS2_MMA_BIAS_ATTN=1`; `BiasedAttention`:
-  the guides' two-group score bias, `MmaAttention.KernelExactBias` / `KernelBias`, generated from the plain kernels by one transform). Default OFF: a
-  pre-registered keyframe clip test (768 x 512 x 121, strength 0.6, seeds 42 / 7 / 1234) put it at a mean |frame difference| of 0.229 from the CUDA fp32
-  clip where OpenCL is at 0.215 (the rule needed no larger; the three clips sit about equally far apart, but the rule stands). MEASURED 2026-11-19, RTX 4070, 6528 tokens (a 384-token guide frame), 32 heads x 128: portable 193.6 ms,
+- **LTX-2 keyframe-guided attention on the tensor cores** (`DiTKernels.TensorCoreBiasedAttention`, env `TRELLIS2_MMA_BIAS_ATTN=0` turns it off;
+  `BiasedAttention`: the guides' two-group score bias, `MmaAttention.KernelExactBias` / `KernelBias`, generated from the plain kernels by one transform).
+  Default ON since a pre-registered nine-seed keyframe clip test (768 x 512 x 121, strength 0.6): mean |frame difference| from the CUDA fp32 clip 0.194,
+  OpenCL 0.454 (0.198 vs 0.201 without OpenCL's diverged seed 31337). A first three-seed run had missed by 6% (0.229 vs 0.215); TJ chose the bigger test. MEASURED 2026-11-19, RTX 4070, 6528 tokens (a 384-token guide frame), 32 heads x 128: portable 193.6 ms,
   exact tensor-core 61.3 ms (3.2x), bf16 tensor-core (PreciseActivations off) 23.7 ms. Its ComfyUI gates pass with it on (the two-guide call 1.27e-5).
 - **The exact tensor-core attention is now at fp32 accuracy: fp16 halves instead of bf16** (`MmaAttention.KernelExact`, the precise path's default since
   5.8.22). Each of q, k, v and the probabilities is hi + lo in fp16 (22 bits a value where bf16 gave 16), with power-of-two scales (exact) from a device-side
