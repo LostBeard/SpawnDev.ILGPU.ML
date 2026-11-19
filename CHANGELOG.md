@@ -4,6 +4,19 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **LTX-2 keyframe-guided attention on the tensor cores** (`DiTKernels.BiasedAttention`: the guides' two-group score bias, `MmaAttention.KernelExactBias` /
+  `KernelBias`, generated from the plain kernels by one transform). Guided calls with a guide strength below 1 ran the portable fp32 kernel; now they run
+  the same kernel kind as unguided attention. MEASURED 2026-11-19, RTX 4070, 6528 tokens (a 384-token guide frame), 32 heads x 128: portable 193.6 ms,
+  exact tensor-core 61.3 ms (3.2x), bf16 tensor-core (PreciseActivations off) 23.7 ms. `TensorCoreBiasedAttention` (env `TRELLIS2_MMA_BIAS_ATTN=0`) turns it off.
+- **The exact tensor-core attention is now at fp32 accuracy: fp16 halves instead of bf16** (`MmaAttention.KernelExact`, the precise path's default since
+  5.8.22). Each of q, k, v and the probabilities is hi + lo in fp16 (22 bits a value where bf16 gave 16), with power-of-two scales (exact) from a device-side
+  max-abs pass (`MmaAttention.MaxAbs` / `Pow2Scale`) to fit fp16's range. Found by the guided kernel: the bf16 form's 3e-6 per call failed the two-guide
+  ComfyUI gate (1.22e-4, bar 1e-4); a float64 emulation of its arithmetic on LTX-2's own activations reproduced the kernel (3.4e-6 vs 3.3e-6) and put fp16
+  halves at 6e-8. MEASURED 2026-11-19 against float64: random cases 4.4e-7 to 6.1e-7 (bf16 halves 5.7e-6 to 9.1e-6, the portable fp32 kernel 2.9e-7 to
+  3.6e-7); keys with a large common part 4.3e-7 (portable 4.7e-6); LTX-2's guided self-attention 2.7e-7 (bf16 halves 3.2e-6); Qwen-Image's first block,
+  scores to 3.5e4, 5.7e-5 (bf16 halves 6.6e-4, portable 5.2e-4). Against ComfyUI on CUDA, all 16 exact-attention gates pass: the two-guide call 1.22e-4 ->
+  1.27e-5, Qwen-Image call 0 1.74e-4 (bf16 halves 2.44e-4, portable 1.78e-4), LTX-2 call 0 proj_out 1.32e-5. Plain self-attention at 6144 tokens 46.6 ->
+  48.4 ms (the conversions and the max-abs pass; portable 142 ms).
 - **The kernel assembly, stage 2: MmaFlashAttnBwd** (the training flash-attention backward) moved into SpawnDev.ILGPU.ML.Kernels: in the 5.8.23 AOT
   build it was 24% of the remaining clang time on SpawnDev.ILGPU.ML.dll (115 of 476 s, Bones' trace). It takes `KernelAttnDims`, a public (kernel parameter types must be:
   ILGPU emits launchers into a dynamic assembly) layout twin of `BackwardKernels.AttnDims`, hidden from IntelliSense; `Kernel_LayoutTwins_MatchTheirPublicStructs`

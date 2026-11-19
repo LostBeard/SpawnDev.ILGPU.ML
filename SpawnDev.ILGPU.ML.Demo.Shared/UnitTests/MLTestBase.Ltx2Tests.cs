@@ -826,6 +826,161 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Diagnostic: the biased-attention kernels on LTX-2's own q / k / v of the two-guide call (SpawnGen's guidecall_two: blocks 0, 24, 47, both rows), captured through
+    /// the transformer's Probe, against a float64 host reference: portable fp32, exact tensor-core, bf16 tensor-core. With what the data looks like (largest values,
+    /// how much of k is common to the noisy and to the guide keys, the score range, the bias values), and float64 emulations of the exact kernel's input precision:
+    /// bf16 hi + lo halves (the kernel until 2026-11-19: on scores and p.v, each alone, and a three-way split of the scores) and fp16 halves at power-of-two scales
+    /// (the kernel since). Reported, not asserted.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx2_BiasedAttentionKernels_OnRealActivations() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda) throw new UnsupportedTestException("the tensor-core kernels: CUDA");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        var d = Path.Combine(Ltx2_Dumps(), "guided", "guidecall_two");
+        if (!Directory.Exists(d)) throw new UnsupportedTestException($"SpawnGen's two-guide taps not found in {d}");
+        const int B = 2, F = 4, H = 3, W = 4, Ta = 9, L = 1024, hw = H * W, gf = 2, P = 128 * F * hw + 8 * Ta * 16, Hh = 32, D = 128, C = Hh * D;
+        float[] T(string prefix, long n) => F2_Raw(Ltx2_Tap(d, prefix), n);
+        using var model = await Ltx2AvModel.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "ltx-2-19b-dev-fp8.safetensors", B, F, H, W, Ta, L, (long)6e9);
+        var sigma = T("guide_call_0_timestep", B);
+        var mask = T("guide_call_0_c_denoise_mask", (long)B * 128 * F * hw);
+        var frameMask = new float[B * F];
+        for (int b = 0; b < B; b++) for (int f = 0; f < F; f++) frameMask[b * F + f] = mask[(((long)b * 128) * F + f) * hw];
+        var kf = T("guide_call_0_c_keyframe_idxs", 2L * 3 * gf * hw * 2)[..(3 * gf * hw * 2)];
+        var two = Enumerable.Range(0, 2 * hw).Select(j => j < hw ? 0.6f : 0.3f).ToArray();
+        using var ctx = accelerator.Allocate1D(T("guide_call_0_c_c_crossattn", (long)B * L * Ltx2AvModel.ContextWidth));
+        var pending = new List<(string Name, Task<float[]> Data)>();
+        model.Transformer.Probe = (name, view, r, c) =>
+        {
+            if (!name.Contains(".attn1.bias_")) return;
+            var parts = name.Split('.');
+            if (parts.Length >= 2 && parts[1] is "0" or "24" or "47") pending.Add((name, view.SubView(0, (long)r * c).CopyToHostAsync()));
+        };
+        await model.DenoiseAsync(T("guide_call_0_input", (long)B * P), new[] { sigma[0], sigma[1] }, ctx.View, 25f, new Ltx2Guide(gf, kf, 0.6f, frameMask, two));
+        model.Transformer.Probe = null;
+        var caps = new Dictionary<string, float[]>();
+        foreach (var (name, data) in pending) caps[name] = await data;
+        int N = F * hw;
+        var portable = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };
+        var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true };
+        var fast = new Trellis2.DiTKernels(accelerator) { PreciseActivations = false };
+        var report = new List<string>();
+        foreach (var qName in caps.Keys.Where(k => k.Contains(".attn1.bias_q.")).OrderBy(k => k, StringComparer.Ordinal))
+        {
+            string pre = qName[..qName.IndexOf("bias_q.", StringComparison.Ordinal)], row = qName[(qName.LastIndexOf('.') + 1)..];
+            var q = caps[qName]; var kv = caps[pre + "bias_kv." + row];
+            var tokKey = caps.Keys.First(k => k.StartsWith(pre + "bias_tok.", StringComparison.Ordinal));
+            int split = int.Parse(tokKey[(tokKey.LastIndexOf('.') + 1)..]); var tb = caps[tokKey];
+            // float64 reference, and what the data looks like
+            var want = new double[N * C]; double maxQ = 0, maxK = 0, maxS = 0, cmNoisy = 0, cmGuide = 0, spread = 0;
+            for (int h = 0; h < Hh; h++)
+            {
+                for (int e = 0; e < D; e++)
+                {
+                    double mn = 0, mg = 0; for (int j = 0; j < N; j++) { double kk = kv[j * 2 * C + h * D + e]; if (j < split) mn += kk; else mg += kk; }
+                    mn /= split; mg /= N - split; cmNoisy += mn * mn; cmGuide += mg * mg;
+                    for (int j = 0; j < N; j++) { double kk = kv[j * 2 * C + h * D + e] - (j < split ? mn : mg); spread += kk * kk; }
+                }
+                for (int i = 0; i < N; i++)
+                {
+                    var s = new double[N]; double mx = double.MinValue;
+                    for (int j = 0; j < N; j++)
+                    {
+                        double acc = 0; for (int e = 0; e < D; e++) acc += (double)q[i * C + h * D + e] * kv[j * 2 * C + h * D + e];
+                        maxS = Math.Max(maxS, Math.Abs(acc / Math.Sqrt(D)));
+                        s[j] = acc / Math.Sqrt(D) + ((i >= split) != (j >= split) ? (double)tb[i] + tb[j] : 0.0); mx = Math.Max(mx, s[j]);
+                    }
+                    double sum = 0; for (int j = 0; j < N; j++) { s[j] = Math.Exp(s[j] - mx); sum += s[j]; }
+                    for (int e = 0; e < D; e++) { double a = 0; for (int j = 0; j < N; j++) a += s[j] * kv[j * 2 * C + C + h * D + e]; want[i * C + h * D + e] = a / sum; }
+                }
+            }
+            for (int i = 0; i < q.Length; i++) maxQ = Math.Max(maxQ, Math.Abs(q[i]));
+            for (int j = 0; j < N; j++) for (int e = 0; e < C; e++) maxK = Math.Max(maxK, Math.Abs(kv[j * 2 * C + e]));
+            // float64 emulations of the exact tensor-core kernel's input precision: x = hi + lo (hi = bf16(x), lo = bf16(x - hi)), a product = hh + hl + lh;
+            // keys centred (over all keys, as KeyMean); every other operation in float64. qk: 2 = that split on the scores, 3 = hi + mid + lo with the six terms
+            // down to 2^-16 (hh hm mh mm hl lh), 0 = exact; pv: true = the 2-split on the probabilities and v, false = exact.
+            static float Bf(float f) { uint b = BitConverter.SingleToUInt32Bits(f); b = (b + 0x7FFFu + ((b >> 16) & 1u)) & 0xFFFF0000u; return BitConverter.UInt32BitsToSingle(b); }
+            static (double H, double M, double L) Sp(float x, int parts)
+            {
+                float h = Bf(x), m = Bf(x - h);
+                return parts == 2 ? (h, m, 0) : (h, m, Bf(x - h - m));
+            }
+            static double Prod((double H, double M, double L) a, (double H, double M, double L) b, int parts)
+                => parts == 2 ? a.H * b.H + a.H * b.M + a.M * b.H
+                 : a.H * b.H + a.H * b.M + a.M * b.H + a.M * b.M + a.H * b.L + a.L * b.H;
+            // the fp16 form: x scaled by a power of two (max |x| into [2^14, 2^15): fp16's range), hi = fp16(x), lo = fp16(x - hi); parts = 16 selects it
+            static double P2(double maxAbs) => maxAbs > 0 ? Math.Pow(2, 14 - Math.Floor(Math.Log2(maxAbs))) : 1;
+            static (double H, double M, double L) Sp16(float x, double scale)
+            {
+                float xs = (float)(x * scale), h = (float)(System.Half)xs, l = (float)(System.Half)(xs - h);
+                return (h / scale, l / scale, 0);
+            }
+            double sQ = P2(q.Max(v => Math.Abs((double)v)));
+            double kMaxC = 0, vMax = 0;
+            for (int j = 0; j < N; j++) for (int e = 0; e < C; e++) vMax = Math.Max(vMax, Math.Abs((double)kv[j * 2 * C + C + e]));
+            double sV = P2(vMax), sP = Math.Pow(2, 14);
+            var kMean = new double[C];
+            for (int e = 0; e < C; e++) { double s = 0; for (int j = 0; j < N; j++) s += kv[j * 2 * C + e]; kMean[e] = s / N; }
+            for (int j = 0; j < N; j++) for (int e = 0; e < C; e++) kMaxC = Math.Max(kMaxC, Math.Abs((float)(kv[j * 2 * C + e] - kMean[e])));
+            double sK = P2(kMaxC);
+            string Emu(int qk, bool pv, bool f16 = false)
+            {
+                var got = new double[N * C];
+                for (int h = 0; h < Hh; h++)
+                {
+                    var mean = new double[D];
+                    for (int e = 0; e < D; e++) mean[e] = kMean[h * D + e];
+                    for (int i = 0; i < N; i++)
+                    {
+                        var s = new double[N]; double mx = double.MinValue;
+                        for (int j = 0; j < N; j++)
+                        {
+                            double acc = 0;
+                            for (int e = 0; e < D; e++)
+                            {
+                                float qv = q[i * C + h * D + e];
+                                if (qk == 0) { acc += (double)qv * kv[j * 2 * C + h * D + e]; continue; }
+                                float kc = (float)(kv[j * 2 * C + h * D + e] - mean[e]);
+                                acc += f16 ? Prod(Sp16(qv, sQ), Sp16(kc, sK), 2) : Prod(Sp(qv, qk), Sp(kc, qk), qk);
+                            }
+                            s[j] = acc / Math.Sqrt(D) + ((i >= split) != (j >= split) ? (double)tb[i] + tb[j] : 0.0); mx = Math.Max(mx, s[j]);
+                        }
+                        double sum = 0; for (int j = 0; j < N; j++) { s[j] = Math.Exp(s[j] - mx); sum += s[j]; }
+                        for (int e = 0; e < D; e++)
+                        {
+                            double a = 0;
+                            for (int j = 0; j < N; j++)
+                            {
+                                float vv = kv[j * 2 * C + C + h * D + e];
+                                a += !pv ? s[j] * vv : f16 ? Prod(Sp16((float)s[j], sP), Sp16(vv, sV), 2) : Prod(Sp((float)s[j], 2), Sp(vv, 2), 2);
+                            }
+                            got[i * C + h * D + e] = a / sum;
+                        }
+                    }
+                }
+                double num = 0, den = 0; for (int i = 0; i < got.Length; i++) { double dd = got[i] - want[i]; num += dd * dd; den += want[i] * want[i]; }
+                return $"{Math.Sqrt(num / den):E2}";
+            }
+            string emu = $"emulated: 2-split all {Emu(2, true)}, exact scores + 2-split pv {Emu(0, true)}, 2-split scores + exact pv {Emu(2, false)}, 3-split scores + 2-split pv {Emu(3, true)}; fp16 halves (scales 2^{Math.Log2(sQ)} / 2^{Math.Log2(sK)} / 2^{Math.Log2(sV)}): all {Emu(2, true, true)}, scores only {Emu(2, false, true)}";
+            using var qb = accelerator.Allocate1D(q); using var kvb = accelerator.Allocate1D(kv); using var tbb = accelerator.Allocate1D(tb);
+            using var scores = accelerator.Allocate1D<float>((long)Hh * N * N); using var o = accelerator.Allocate1D<float>((long)N * C);
+            string Err(Trellis2.DiTKernels k)
+            {
+                k.BiasedAttention(qb.View, C, 0, kvb.View, 2 * C, 0, C, scores.View, o.View, N, Hh, D, split, tbb.View);
+                var got = o.View.CopyToHostAsync().GetAwaiter().GetResult();
+                double num = 0, den = 0; for (int i = 0; i < got.Length; i++) { double dd = got[i] - want[i]; num += dd * dd; den += want[i] * want[i]; }
+                return $"{Math.Sqrt(num / den):E2}";
+            }
+            string e1 = Err(portable), e2 = Err(exactTc), e3 = Err(fast);
+            report.Add($"{pre}row {row} (split {split}, bias {tb.Where(v => v != 0).Distinct().Count()} values, min {tb.Min():F3}): portable {e1}, exact tc {e2}, bf16 tc {e3}; {emu} | "
+                + $"max |q| {maxQ:F1}, |k| {maxK:F1}, |score| {maxS:F1}; common part of k: noisy {Math.Sqrt(cmNoisy / Hh / D):F2}, guide {Math.Sqrt(cmGuide / Hh / D):F2}, spread {Math.Sqrt(spread / Hh / D / N):F2}");
+        }
+        string line = string.Join(" | ", report);
+        Console.WriteLine("[Benchmark] Ltx2 biased attention kernels on real activations: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// A guided call at a size where the kernels leave their one-group case (SpawnGen's tap _DevComms 2026-11-18-1200: 384 x 256 x 25 frames + 25 audio frames, a picture
     /// guide at the last frame, strength 0.6, cfg 4): 480 video tokens (4 latent frames of 8 x 12 + the 96-token guide frame: four query groups of the flash attention's
     /// 128, 960-row GEMMs over the batch), both of ComfyUI's calls (sigma 1 and 0.1, each on ComfyUI's own input), against its denoised outputs. Every other LTX-2 tap is 8 to 48 tokens.
@@ -1011,6 +1166,7 @@ public abstract partial class MLTestBase
     /// separate buffers as the transformer passes them) and the text cross-attention (6144 queries x 1024 keys), on the kernel the exact path runs
     /// (<see cref="Trellis2.DiTKernels.PreciseActivations"/>: the portable fp32 flash kernel) and on the one the fast path runs (the tensor-core flash kernel where the
     /// card has it). Milliseconds (best of 3 after a compile call), TFLOPS = 4 Nq Nk H D / time, and the distance between the two results.
+    /// Then the keyframe-guided self-attention (<see cref="Trellis2.DiTKernels.BiasedAttention"/>: the tokens + a 384-token guide frame at ln 0.6) on each kernel kind.
     /// LTX2_ATTN_TOKENS overrides the token count. Prints "[Benchmark] Ltx2 attention kernels ...".
     /// </summary>
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
@@ -1046,6 +1202,25 @@ public abstract partial class MLTestBase
             double tx = await Time(() => exactTc.Attention(q.View, C, 0, keys.View, 2 * C, 0, C, default, oF.View, N, Nk, H, D));
             double distX = F2_RelRms(await oF.View.CopyToHostAsync(), hostP);
             report.Add($"{label} exact on tensor cores {tx:F1} ms ({flops / tx / 1e9:F1} TFLOPS), {tp / tx:F1}x the portable kernel; vs the portable kernel {distX:E2}");
+        }
+        // the keyframe-guided self-attention (BiasedAttention): the video tokens + one guide frame's 384 tokens at ln 0.6, on each kernel kind
+        {
+            int Ng = N + 384, split = N;
+            var tb = new float[Ng]; for (int i = split; i < Ng; i++) tb[i] = MathF.Log(0.6f);
+            using var tbv = accelerator.Allocate1D(tb);
+            using var qg = accelerator.Allocate1D(Rand((long)Ng * C)); using var kvg = accelerator.Allocate1D(Rand((long)Ng * 2 * C)); using var og = accelerator.Allocate1D<float>((long)Ng * C);
+            double flops = 4.0 * Ng * Ng * H * D;
+            var kinds = new List<(string Name, Trellis2.DiTKernels K)> { ("portable", precise), ("exact tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true }), ("bf16 tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = false }) };
+            double tPort = 0; float[]? hostB = null; var parts = new List<string>();
+            foreach (var (name, k) in kinds)
+            {
+                if (!k.UsesFlashBiasedAttention(D)) continue;
+                double t = await Time(() => k.BiasedAttention(qg.View, C, 0, kvg.View, 2 * C, 0, C, default, og.View, Ng, H, D, split, tbv.View));
+                var got = await og.View.CopyToHostAsync();
+                if (hostB == null) { hostB = got; tPort = t; parts.Add($"{name} {t:F1} ms ({flops / t / 1e9:F1} TFLOPS)"); }
+                else parts.Add($"{name} {t:F1} ms ({flops / t / 1e9:F1} TFLOPS, {tPort / t:F1}x; vs portable {F2_RelRms(got, hostB):E2})");
+            }
+            report.Add($"biased self {Ng} x {Ng} (guide frame of 384 at ln 0.6): " + string.Join(", ", parts));
         }
         string line = $"{accelerator.AcceleratorType}, {H} heads x {D}: " + string.Join(" | ", report);
         Console.WriteLine("[Benchmark] Ltx2 attention kernels: " + line);

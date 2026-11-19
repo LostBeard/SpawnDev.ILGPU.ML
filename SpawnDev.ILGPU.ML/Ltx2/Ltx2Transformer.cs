@@ -581,7 +581,12 @@ public sealed class Ltx2Transformer : IDisposable
             var qb = _q.View.SubView((long)b * Nq * C, (long)Nq * C); var kvb = _kv.View.SubView((long)b * Nk * 2 * C, (long)Nk * 2 * C);
             if (ropeQ is { } rq) _l.RopeSplit(qb, rq.Cos, rq.Sin, Nq, C, 0, H, D);
             if (ropeK is { } rk) _l.RopeSplit(kvb, rk.Cos, rk.Sin, Nk, 2 * C, 0, H, D);
-            if (biasSplit is { } split) _k.BiasedAttention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, H, D, split, _tokBias.View);
+            if (biasSplit is { } split)
+            {
+                // the biased attention's own inputs, for diagnostics ("<p>bias_q.<b>" [Nq, C], "<p>bias_kv.<b>" [Nq, 2C], "<p>bias_tok.<split>" [1, Nq])
+                if (Probe != null) { Probe($"{p}bias_q.{b}", qb, Nq, C); Probe($"{p}bias_kv.{b}", kvb, Nk, 2 * C); Probe($"{p}bias_tok.{split}", _tokBias.View, 1, Nq); }
+                _k.BiasedAttention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, H, D, split, _tokBias.View);
+            }
             else _k.Attention(qb, C, 0, kvb, 2 * C, 0, C, _scores.View, _o.View.SubView((long)b * Nq * C, (long)Nq * C), Nq, Nk, H, D);
         }
         Stage(tag + ": norms, RoPE, attention");

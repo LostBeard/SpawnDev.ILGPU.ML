@@ -49,8 +49,8 @@ public sealed class DiTKernels
     /// <summary>
     /// fp32-class activations on CUDA's tensor-core paths, for models checked against an fp32-activation reference (ComfyUI's CPU runs: FLUX.1, Z-Image, Qwen-Image), where
     /// bf16 activations cost ~5e-3 relRMS per model call. <see cref="Linear"/> runs the split-activation kernel (<c>MmaGemm.KernelBf16x2Dense</c>: every activation staged
-    /// as bf16 hi + bf16 lo, two MMA passes, ~16 mantissa bits instead of 8; the bf16 weights are exact) and <see cref="Attention"/> the portable fp32 flash kernel instead
-    /// of the bf16 tensor-core one. Only CUDA changes: the other backends compute in fp32 already. Default from ML_PRECISE_ACT (1 = on) for A/B runs; a model sets it on its own kernels.
+    /// as bf16 hi + bf16 lo, two MMA passes, ~16 mantissa bits instead of 8; the bf16 weights are exact) and <see cref="Attention"/> / <see cref="BiasedAttention"/> the
+    /// exact tensor-core flash kernels (<see cref="ExactTensorCoreAttention"/>; else the portable fp32 one) instead of the bf16 tensor-core ones. Only CUDA changes: the other backends compute in fp32 already. Default from ML_PRECISE_ACT (1 = on) for A/B runs; a model sets it on its own kernels.
     /// </summary>
     public bool PreciseActivations { get; set; } = DefaultPreciseActivations;
     /// <summary>The default of <see cref="PreciseActivations"/> for new instances (env ML_PRECISE_ACT=1 turns it on).</summary>
@@ -442,11 +442,15 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, UV, FV, int, int, int, int, int, int, int, int>? _flash;
     private Action<Index1D, FV, UV>? _toBf16Pairs;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _kv16;
-    private Action<KernelConfig, FV, UV, FV, int, int, int, int, int, int, int, int>? _flashExact;
-    private Action<Index1D, FV, UV, FV, int, int, int>? _splitPairs;
+    private Action<KernelConfig, FV, UV, FV, UV, int, int, int, int, int, int, int, int>? _flashExact;
+    private Action<KernelConfig, FV, UV, FV, FV, int, int, int, int, int, int, int, int, int>? _flashBias;   // BiasedAttention on the tensor cores
+    private Action<KernelConfig, FV, UV, FV, FV, UV, int, int, int, int, int, int, int, int, int>? _flashExactBias;
+    private Action<Index1D, FV, UV, FV, UV, int, int, int, int>? _splitPairs;
+    private Action<Index1D, FV, FV, UV, int, int, int, int, int, int>? _maxAbs;
     private Action<Index1D, FV, FV, int, int, int>? _keyMean;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _kvSplit;
     private MemoryBuffer1D<float, Stride1D.Dense>? _kMean;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _scl;   // the exact kernels' three maxima (q, centred k, v)
 
     private static uint Bf16Bits(float f)
     {
@@ -462,7 +466,9 @@ public sealed class DiTKernels
     public bool UsesFlashAttention(int headDim) => UsesMmaAttention(headDim) || UsesMmaExactAttention(headDim) || UsesTiledAttention(headDim);
     /// <summary>
     /// With <see cref="PreciseActivations"/> on a tensor-core card: run head-width-128 attention on <see cref="MmaAttention.KernelExact"/> (q, k, v and the
-    /// probabilities as hi + lo bf16 halves, three MMAs per product, fp32 sums: near-fp32 results) instead of the portable fp32 kernel.
+    /// probabilities as hi + lo fp16 halves at power-of-two scales, three MMAs per product, fp32 sums: fp32 accuracy) instead of the portable fp32 kernel.
+    /// The halves were bf16 until 2026-11-19 (16 bits a value; fp16's 22 bits: 3e-6 -> 6e-8 from float64 on LTX-2's guided self-attention, see
+    /// gen_mma_attention.py); the clip test below ran the bf16 form.
     /// On by default (<see cref="DefaultExactTensorCoreAttention"/>; env TRELLIS2_MMA_EXACT_ATTN=0 turns it off for new instances). DECIDED 2026-11-18 by a
     /// pre-registered test: LTX-2 distilled 768 x 512 x 121 clips, seeds 42 / 7 / 1234, mean |frame difference| (0..255) from the CUDA fp32-kernel clip:
     /// this kernel 0.0230 / 0.0075 / 0.0213 (mean 0.0173), the OpenCL fp32 path 0.0205 / 0.0186 / 0.0221 (mean 0.0204): inside the spread the precise path
@@ -570,6 +576,27 @@ public sealed class DiTKernels
         return _tiledSelf[key] = _acc.LoadStreamKernel<FV, FV, int, int, int, int, int, int, int, int>((Action<FV, FV, int, int, int, int, int, int, int, int>)SelfSmem[key / 2]);
     }
 
+    // The exact tensor-core kernels' inputs (MmaAttention.KernelExact / KernelExactBias): the keys' mean (when CenterAttentionKeys), the largest |value| of q,
+    // of the centred k and of v (MmaAttention.MaxAbs into _scl), then k / v as (hi, lo) fp16 pair words at those power-of-two scales (MmaAttention.SplitPairs):
+    // one split pass here instead of one per query tile inside the kernel. All on the stream: no host round trip.
+    private void PrepareExact(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, int Nq, int Nk, int H, int D)
+    {
+        if ((kvStride & 1) != 0 || (kOff & 1) != 0 || (vOff & 1) != 0) throw new ArgumentException("the tensor-core attention reads k / v as pairs: kvStride, kOff and vOff must be even");
+        _splitPairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, UV, int, int, int, int>(MmaAttention.SplitPairs);
+        _keyMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(MmaAttention.KeyMean);
+        _maxAbs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, UV, int, int, int, int, int, int>(MmaAttention.MaxAbs);
+        long pairs = ((long)(Nk - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
+        if (_kvSplit == null || _kvSplit.Length < 2 * pairs) { _kvSplit?.Dispose(); _kvSplit = _acc.Allocate1D<uint>(2 * pairs); }
+        if (_kMean == null || _kMean.Length < H * D) { _kMean?.Dispose(); _kMean = _acc.Allocate1D<float>(H * D); }
+        _scl ??= _acc.Allocate1D<uint>(4);
+        if (CenterAttentionKeys) _keyMean(H * D, kv, _kMean.View, Nk, kvStride, kOff); else _kMean.MemSetToZero();
+        _scl.MemSetToZero();
+        _maxAbs(MmaAttention.MaxAbsThreads, q, _kMean.View, _scl.View, 0, Nq, qStride, qOff, H * D, 0);
+        _maxAbs(MmaAttention.MaxAbsThreads, kv, _kMean.View, _scl.View, 1, Nk, kvStride, kOff, H * D, 1);
+        _maxAbs(MmaAttention.MaxAbsThreads, kv, _kMean.View, _scl.View, 2, Nk, kvStride, vOff, H * D, 0);
+        _splitPairs((int)pairs, kv, _kvSplit.View, _kMean.View, _scl.View, kvStride, kOff, vOff, H * D);
+    }
+
     /// <summary>
     /// Multi-head attention, no mask. q at q[i*qStride + qOff + h*D], k at kv[j*kvStride + kOff + h*D], v at
     /// kv[j*kvStride + vOff + h*D]; o is [Nq, H*D]. Flash kernel on CUDA (bf16 tensor cores, O(1) extra memory);
@@ -579,19 +606,10 @@ public sealed class DiTKernels
     {
         if (UsesMmaExactAttention(D))
         {
-            // K and V go to the kernel as (hi, lo) bf16 pair words: one split pass here instead of one per query tile inside the kernel. The keys are
-            // centred first (their mean over the keys subtracted: the same attention, see MmaAttention.SplitPairs).
-            if ((kvStride & 1) != 0 || (kOff & 1) != 0 || (vOff & 1) != 0) throw new ArgumentException("the tensor-core attention reads k / v as pairs: kvStride, kOff and vOff must be even");
-            _flashExact ??= _acc.LoadStreamKernel<FV, UV, FV, int, int, int, int, int, int, int, int>(MmaAttention.KernelExact);
-            _splitPairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, int, int, int>(MmaAttention.SplitPairs);
-            _keyMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(MmaAttention.KeyMean);
-            long pairs = ((long)(Nk - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
-            if (_kvSplit == null || _kvSplit.Length < 2 * pairs) { _kvSplit?.Dispose(); _kvSplit = _acc.Allocate1D<uint>(2 * pairs); }
-            if (_kMean == null || _kMean.Length < H * D) { _kMean?.Dispose(); _kMean = _acc.Allocate1D<float>(H * D); }
-            if (CenterAttentionKeys) _keyMean(H * D, kv, _kMean.View, Nk, kvStride, kOff); else _kMean.MemSetToZero();
-            _splitPairs((int)pairs, kv, _kvSplit.View, _kMean.View, kvStride, kOff, H * D);
+            PrepareExact(q, qStride, qOff, kv, kvStride, kOff, vOff, Nq, Nk, H, D);
+            _flashExact ??= _acc.LoadStreamKernel<FV, UV, FV, UV, int, int, int, int, int, int, int, int>(MmaAttention.KernelExact);
             _flashExact(new KernelConfig(((Nq + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
-                q, _kvSplit.View, o, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
+                q, _kvSplit!.View, o, _scl!.View, Nq, Nk, H, qStride, qOff, kvStride, kOff, vOff);
             return;
         }
         if (!UsesMmaAttention(D) && UsesTiledAttention(D))
@@ -675,20 +693,52 @@ public sealed class DiTKernels
     /// <summary>The most negative token bias <see cref="BiasedAttention"/> takes (a fully blocked token: ln 0). Finite, so no infinity enters the softmax.</summary>
     public const float BlockedTokenBias = -1e30f;
 
-    /// <summary>True when <see cref="BiasedAttention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default).</summary>
-    public bool UsesFlashBiasedAttention(int headDim) => headDim == 128 && UsesTiledAttention(headDim);
+    /// <summary>True when <see cref="BiasedAttention"/> runs a flash kernel (no score matrix, <c>scores</c> may be default): the tensor-core ones or the portable one.</summary>
+    public bool UsesFlashBiasedAttention(int headDim)
+        => headDim == 128 && ((TensorCoreBiasedAttention && (UsesMmaExactAttention(headDim) || UsesMmaAttention(headDim))) || UsesTiledAttention(headDim));
+
+    /// <summary>
+    /// <see cref="BiasedAttention"/> on the tensor cores where <see cref="Attention"/> runs there (default true; env TRELLIS2_MMA_BIAS_ATTN=0 = the portable fp32 kernel,
+    /// as before 2026-11-19). MEASURED 2026-11-19, RTX 4070, 6528 x 6528 tokens (a 384-token guide frame at ln 0.6), 32 heads: portable 193.6 ms, exact tensor-core
+    /// (fp16 halves) 61.3 ms, bf16 tensor-core 23.7 ms. Against ComfyUI on CUDA the two-guide call is 1.27e-5 (before: the portable biased kernel
+    /// beside the bf16-halves exact one 2.26e-5; OpenCL, all fp32, 4.80e-6).
+    /// </summary>
+    public bool TensorCoreBiasedAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_BIAS_ATTN") != "0";
 
     /// <summary>
     /// Self-attention over <paramref name="N"/> tokens (as <see cref="Attention"/>; q and k / v may sit in one buffer or two) with a two-group additive score bias: tokens
     /// from <paramref name="split"/> on are group 1, the rest group 0, and a score whose query and key are in different groups gets
     /// <c>tokenBias[query] + tokenBias[key]</c> (<paramref name="tokenBias"/> [N]: 0 for group 0, at least <see cref="BlockedTokenBias"/>). LTX-2's keyframe guides:
     /// tokenBias = ln(strength x mask) of a guide token, MEASURED on ComfyUI's attention masks (one guide, two guides at different strengths, a pixel mask: every entry).
-    /// Head width 128 runs the portable flash kernel in fp32 (the tensor-core kernel has no bias form), chunked like <see cref="Attention"/>; other widths and backends
-    /// without it run the reference kernels, which need <paramref name="scores"/> of H * N * N floats.
+    /// Head width 128 runs the same kernel <see cref="Attention"/> would, in its bias form: on a tensor-core card <see cref="MmaAttention.KernelExactBias"/>
+    /// (<see cref="PreciseActivations"/> with <see cref="ExactTensorCoreAttention"/>) or <see cref="MmaAttention.KernelBias"/> (bf16 activations), else the portable flash
+    /// kernel in fp32, chunked like <see cref="Attention"/>; other widths and backends without it run the reference kernels, which need <paramref name="scores"/> of
+    /// H * N * N floats.
     /// </summary>
     public void BiasedAttention(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, FV scores, FV o, int N, int H, int D, int split, FV tokenBias)
     {
         if (tokenBias.Length < N) throw new ArgumentException($"a bias per token: {N} values", nameof(tokenBias));
+        if (TensorCoreBiasedAttention && UsesMmaExactAttention(D))
+        {
+            // as Attention's exact path, one dispatch (the centring shifts a query's scores by one constant; the bias is per query and key, added inside the
+            // kernel, so the softmax is the same)
+            PrepareExact(q, qStride, qOff, kv, kvStride, kOff, vOff, N, N, H, D);
+            _flashExactBias ??= _acc.LoadStreamKernel<FV, UV, FV, FV, UV, int, int, int, int, int, int, int, int, int>(MmaAttention.KernelExactBias);
+            _flashExactBias(new KernelConfig(((N + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
+                q, _kvSplit!.View, o, tokenBias, _scl!.View, N, N, H, qStride, qOff, kvStride, kOff, vOff, split);
+            return;
+        }
+        if (TensorCoreBiasedAttention && UsesMmaAttention(D))
+        {
+            _flashBias ??= _acc.LoadStreamKernel<FV, UV, FV, FV, int, int, int, int, int, int, int, int, int>(MmaAttention.KernelBias);
+            _toBf16Pairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV>(ToBf16PairsImpl);
+            long pairs = ((long)(N - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
+            if (_kv16 == null || _kv16.Length < pairs) { _kv16?.Dispose(); _kv16 = _acc.Allocate1D<uint>(pairs); }
+            _toBf16Pairs((int)pairs, kv, _kv16.View);
+            _flashBias(new KernelConfig(((N + MmaAttention.QTile - 1) / MmaAttention.QTile) * H, MmaAttention.Threads),
+                q, _kv16.View, o, tokenBias, N, N, H, qStride, qOff, kvStride, kOff, vOff, split);
+            return;
+        }
         if (UsesFlashBiasedAttention(D))
         {
             IContiguousArrayView qv = q.BaseView, kvv = kv.BaseView;

@@ -465,9 +465,10 @@ public abstract partial class MLTestBase
 
     /// <summary>
     /// <see cref="DiTKernels.BiasedAttention"/> (LTX-2's keyframe-guide self-attention: a per-token bias on the scores between the noisy and the guide tokens) against a
-    /// float64 host reference, on whichever kernel the backend runs (the biased flash kernel at head width 128, else the reference kernels) AND on the reference kernels
-    /// forced; the flash kernel also chunked into one-group dispatches (bit-identical: the query base moves with the chunk) and with an all-zero bias against the plain
-    /// flash kernel (bit-identical). The split sits off every tile / lane boundary; 150 tokens span two query groups. Bias patterns: one strength (ln 0.6), two guides
+    /// float64 host reference, on every kernel kind the backend has: the portable flash kernel (fp32; else the reference kernels), and on a tensor-core card the exact
+    /// tensor-core kernel (MmaAttention.KernelExactBias, the precise default) and the bf16 one (KernelBias), plus the reference kernels forced. Every flash kind with an
+    /// all-zero bias equals its own plain attention bit for bit, and its bias must move the output at least half as far as the reference's; the portable kernel also
+    /// chunked into one-group dispatches (bit-identical). The split sits off every tile / lane boundary; 150 tokens span two query groups. Bias patterns: one strength (ln 0.6), two guides
     /// (ln 0.6 / ln 0.3), and a pixel mask (ln 0.6 with every other pair of guide tokens blocked).
     /// </summary>
     [TestMethod(Timeout = 300000)]
@@ -531,35 +532,54 @@ public abstract partial class MLTestBase
                 return await o.View.CopyToHostAsync();
             }
             string tag = $"{N} tokens, split {split}, {pattern}, {(packed ? "self" : "cross")}";
-            var dk = new DiTKernels(accelerator) { PreciseActivations = true };
-            bool flash = dk.UsesFlashBiasedAttention(D);
-            var got = await Run(dk, tbDev.View);
-            double err = MaxErr(got);
-            if (err > 1e-4) throw new Exception($"biased attention {tag} ({(flash ? "flash" : "reference")}) max |err| {err:E2} on {accelerator.AcceleratorType}");
-            string line = $"{tag}: {(flash ? "flash" : "reference")} {err:E1}, bias effect {effect:E1}";
-            if (flash)
+            // every kernel kind this backend has: the portable flash kernel (fp32), and on a tensor-core card the exact tensor-core one (the precise path's
+            // default) and the bf16 one (PreciseActivations off). Each against float64; with a zero bias, against its own plain attention bit for bit.
+            var kinds = new List<(string Name, DiTKernels K, double Bar)> { ("portable", new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false }, 1e-4) };
+            if (SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator) && D == MmaAttention.HeadDim)
             {
-                long was = DiTKernels.MaxAttentionPairsPerDispatch;
-                DiTKernels.MaxAttentionPairsPerDispatch = 1;
-                try
+                kinds.Add(("exact tensor-core", new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true }, 1e-4));
+                kinds.Add(("bf16 tensor-core", new DiTKernels(accelerator) { PreciseActivations = false }, 3e-2));   // bf16 q / k / v / p: ~2^-8 of values up to 2
+            }
+            string line = $"{tag}: bias effect {effect:E1}";
+            bool portableFlash = false;
+            foreach (var (kind, dk, bar) in kinds)
+            {
+                bool flash = dk.UsesFlashBiasedAttention(D);
+                var got = await Run(dk, tbDev.View);
+                double err = MaxErr(got);
+                if (err > bar) throw new Exception($"biased attention {tag} ({kind}{(flash ? "" : ", reference kernels")}) max |err| {err:E2} on {accelerator.AcceleratorType}");
+                line += $"; {kind}{(flash ? "" : " (reference kernels)")} {err:E1}";
+                if (!flash) continue;
+                if (kind == "portable")
                 {
-                    var got2 = await Run(dk, tbDev.View);
-                    for (int i = 0; i < got.Length; i++) if (got[i] != got2[i]) throw new Exception($"chunked biased attention {tag} differs at {i}: {got2[i]} vs {got[i]} on {accelerator.AcceleratorType}");
+                    portableFlash = true;
+                    long was = DiTKernels.MaxAttentionPairsPerDispatch;
+                    DiTKernels.MaxAttentionPairsPerDispatch = 1;
+                    try
+                    {
+                        var got2 = await Run(dk, tbDev.View);
+                        for (int i = 0; i < got.Length; i++) if (got[i] != got2[i]) throw new Exception($"chunked biased attention {tag} differs at {i}: {got2[i]} vs {got[i]} on {accelerator.AcceleratorType}");
+                    }
+                    finally { DiTKernels.MaxAttentionPairsPerDispatch = was; }
                 }
-                finally { DiTKernels.MaxAttentionPairsPerDispatch = was; }
-                // an all-zero bias = the plain portable flash kernel, bit for bit. Named explicitly: since 5.8.22 the precise path's plain attention on a
-                // tensor-core card runs the exact tensor-core kernel by default (DiTKernels.ExactTensorCoreAttention), which the biased kernel is not
+                // an all-zero bias = the same kind's plain attention, bit for bit
                 var zero = await Run(dk, zeroDev.View);
                 using var o3 = accelerator.Allocate1D<float>((long)N * C);
-                new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false }.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o3.View, N, N, H, D);
+                dk.Attention(qb.View, qStride, 0, packed ? qb.View : kvb!.View, kvStride, kOff, vOff, default, o3.View, N, N, H, D);
                 var plain = await o3.View.CopyToHostAsync();
-                for (int i = 0; i < plain.Length; i++) if (zero[i] != plain[i]) throw new Exception($"biased attention with a zero bias {tag} differs from the plain kernel at {i}: {zero[i]} vs {plain[i]} on {accelerator.AcceleratorType}");
+                for (int i = 0; i < plain.Length; i++) if (zero[i] != plain[i]) throw new Exception($"{kind} biased attention with a zero bias {tag} differs from its plain kernel at {i}: {zero[i]} vs {plain[i]} on {accelerator.AcceleratorType}");
+                // the bias must move the result as much as it moves the reference: an error bar near the effect (bf16) cannot show that alone
+                double moved = 0; for (int i = 0; i < got.Length; i++) moved = Math.Max(moved, Math.Abs(got[i] - zero[i]));
+                if (moved < 0.5 * effect) throw new Exception($"{kind} biased attention {tag}: the bias moves the output {moved:E2}, the reference {effect:E2}");
+            }
+            if (portableFlash)
+            {
                 // the reference kernels, forced
                 bool tiled = DiTKernels.EnableTiled;
                 DiTKernels.EnableTiled = false;
                 try
                 {
-                    var dr = new DiTKernels(accelerator) { PreciseActivations = true };
+                    var dr = new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };
                     if (dr.UsesFlashBiasedAttention(D)) throw new Exception("EnableTiled = false did not select the reference kernels");
                     double er = MaxErr(await Run(dr, tbDev.View));
                     if (er > 1e-4) throw new Exception($"biased attention {tag} (reference kernels) max |err| {er:E2} on {accelerator.AcceleratorType}");
