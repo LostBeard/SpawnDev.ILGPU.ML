@@ -115,7 +115,7 @@ public sealed partial class MeshDistanceGrid
         long total = (long)OccupiedCount * 512;
         if (total >= int.MaxValue) throw new InvalidOperationException("too many candidate voxels");
         using var flags = _acc.Allocate1D<int>(total);
-        _bandVoxels((int)total, Positions.View, Faces.View, CellStart.View, CellTris.View, Occupied.View, Dim, Resolution, band, halfWidth, flags.View);
+        BandVoxelsChunked(flags.View, band, halfWidth);
         using var offsets = _acc.Allocate1D<int>(total + 1);
         int n = await sk.ExclusiveScanAsync(flags.View, (int)total, offsets.View);
         var coords = _acc.Allocate1D<int>(Math.Max(1L, (long)n * 3));
@@ -136,6 +136,6 @@ public sealed partial class MeshDistanceGrid
     {
         if (count == 0) return;
         _udfDevice ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, IV, IV, int, float, float, FV>(UdfCornersImpl);
-        _udfDevice(count, gridPoints, Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, cap, shift, result);
+        Chunked(_acc, count, (b, c) => _udfDevice(c, gridPoints.SubView(b * 3, c * 3L), Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, cap, shift, result.SubView(b, c)));
     }
 }

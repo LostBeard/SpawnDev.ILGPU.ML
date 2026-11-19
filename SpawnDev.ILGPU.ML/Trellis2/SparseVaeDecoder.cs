@@ -5,6 +5,7 @@ namespace SpawnDev.ILGPU.ML.Trellis2;
 
 using FV = ArrayView1D<float, Stride1D.Dense>;
 using IV = ArrayView1D<int, Stride1D.Dense>;
+using HV = ArrayView1D<global::ILGPU.Half, Stride1D.Dense>;
 
 /// <summary>
 /// The TRELLIS.2 structured-latent decoders (trellis2/models/sc_vaes/sparse_unet_vae.py), shape and texture, on the device.
@@ -45,6 +46,29 @@ public sealed class SparseVaeDecoder : IDisposable
 
     /// <summary>Floats of the upsample conv's output held at a time (the rest of the decoder's buffers are at most one voxel tensor each): 128 Mi floats = 512 MB.</summary>
     public static long ChunkFloats { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_C2S_CHUNK_FLOATS"), out var cf) && cf > 0 ? cf : 128L << 20;   // env: tests and A/B runs
+
+    /// <summary>
+    /// Multiply-adds a sparse 3x3x3 conv sends to the device in one piece (default 2^35, about 69 GFLOP; env TRELLIS2_CONV_MACS): every conv runs over chunks of
+    /// rows of at most this much work (a multiple of 64 rows: the neighbour views stay 256-byte aligned), and each chunk is its own command buffer in the
+    /// browser. Windows resets a GPU whose one submission runs past ~2 s; an upsample conv at 512 was ~1.8 T multiply-adds in one piece (2026-11-19, Lore: the
+    /// texture decode lost the device on an RX 590 in Chrome). The rows are independent, so the chunks give the same values as one dispatch.
+    /// </summary>
+    public static long MaxConvMacsPerSubmit { get; set; } = long.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_CONV_MACS"), out var cm) && cm > 0 ? cm : 1L << 35;
+
+    // rows of a [rows, 27] sparse conv with cin -> cout channels that fit MaxConvMacsPerSubmit: a multiple of 64, at least 64
+    private static long ConvChunkRows(int cin, int cout) => Math.Max(64L, MaxConvMacsPerSubmit / (27L * cin * cout) / 64 * 64);
+
+    // a sparse 3x3x3 conv in chunks of rows (ConvChunkRows), each followed by a browser submit
+    private void Conv3Chunked(FV x, IV nbr, HV weight, HV bias, FV o, int rows, int cin, int cout)
+    {
+        long per = ConvChunkRows(cin, cout);
+        for (long r0 = 0; r0 < rows; r0 += per)
+        {
+            int r = (int)Math.Min(per, rows - r0);
+            _sk.Conv3(x, nbr.SubView(r0 * 27, (long)r * 27), weight, bias, o.SubView(r0 * cout, (long)r * cout), r, cin, cout);
+            _acc.Submit();
+        }
+    }
 
     public int LatentChannels => _latentCh;
     public int OutChannels => _outCh;
@@ -106,7 +130,7 @@ public sealed class SparseVaeDecoder : IDisposable
                 for (int j = 0; j < _numBlocks[i]; j++)
                 {
                     string p = $"blocks.{i}.{j}.";
-                    _sk.Conv3(x.View, nbr.View, _w.F16(p + "conv.weight"), _w.F16(p + "conv.bias"), y.View, n, C, C);
+                    Conv3Chunked(x.View, nbr.View, _w.F16(p + "conv.weight"), _w.F16(p + "conv.bias"), y.View, n, C, C);
                     _sk.LayerNorm(y.View, z.View, _w.F16(p + "norm.weight"), _w.F16(p + "norm.bias"), n, C, 1e-6f);
                     for (int r0 = 0; r0 < n; r0 += mlpRows)
                     {
@@ -153,7 +177,7 @@ public sealed class SparseVaeDecoder : IDisposable
             _sk.WriteChildren(subdiv.View, offsets.View, coords.View, n, newCoords.View, parent.View, slot.View);
             var h2 = F((long)m * outC);
             {
-                long chunkRows = Math.Max(1, ChunkFloats / ((long)outC * 8));
+                long chunkRows = Math.Min(Math.Max(1, ChunkFloats / ((long)outC * 8)), ConvChunkRows(C, outC * 8));   // memory, and the work of one submission
                 var offHost = await offsets.View.CopyToHostAsync();
                 using var hc = F(Math.Min(chunkRows, n) * outC * 8);
                 for (int r0 = 0; r0 < n; r0 += (int)chunkRows)
@@ -162,6 +186,7 @@ public sealed class SparseVaeDecoder : IDisposable
                     _sk.Conv3(xn.View, nbr.View.SubView((long)r0 * 27, (long)rows * 27), _w.F16(u + "conv1.weight"), _w.F16(u + "conv1.bias"), hc.View, rows, C, outC * 8);
                     int c0 = offHost[r0], c1 = offHost[r0 + rows];
                     if (c1 > c0) _sk.Channel2SpatialChunk(hc.View, parent.View.SubView(c0, c1 - c0), slot.View.SubView(c0, c1 - c0), h2.View.SubView((long)c0 * outC, (long)(c1 - c0) * outC), c1 - c0, outC, r0);
+                    _acc.Submit();
                 }
                 await _acc.SynchronizeAsync();                       // the chunk buffer and xn are reused / freed below: a real drain on the browser
             }
@@ -176,7 +201,7 @@ public sealed class SparseVaeDecoder : IDisposable
             h2.Dispose();
             _sk.SiluInPlace(h3.View, m * outC);
             var h4 = F((long)m * outC);
-            _sk.Conv3(h3.View, nbr2.View, _w.F16(u + "conv2.weight"), _w.F16(u + "conv2.bias"), h4.View, m, outC, outC);
+            Conv3Chunked(h3.View, nbr2.View, _w.F16(u + "conv2.weight"), _w.F16(u + "conv2.bias"), h4.View, m, outC, outC);
             h3.Dispose();
             _sk.AddRepeat(h4.View, xs.View, m, outC, outC / cc8);
 

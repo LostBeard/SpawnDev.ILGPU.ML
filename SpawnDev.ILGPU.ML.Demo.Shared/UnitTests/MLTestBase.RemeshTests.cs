@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Trellis2;
 using SpawnDev.UnitTesting;
 
@@ -56,6 +58,63 @@ public abstract partial class MLTestBase
         for (int i = 0; i < p.Length; i++) q[i] = p[i] * radius;
         return (q, f);
     }
+
+    /// <summary>
+    /// <see cref="MeshDistanceGrid.MaxSearchThreadsPerSubmit"/> (2026-11-19: an RX 590 in Chrome lost the WebGPU device in TRELLIS.2's device remesh, one
+    /// nearest-triangle search dispatch over every band voxel): every search kernel runs in chunks of points, each its own command buffer in the browser. The
+    /// points are independent, so each entry point (distances, band voxels on the host and on the device, device distances, projection, the bake's texel
+    /// projection) must give BIT FOR BIT the values of one dispatch, here with the smallest chunk (64 points; band voxels 64 cells) on a subdivided sphere.
+    /// </summary>
+    [TestMethod]
+    public async Task Remesh_DistanceGrid_ChunkedSearchesMatchOneDispatch() => await RunTest(async accelerator =>
+    {
+        const int R = 64;
+        var (p, f) = Rm_ScaledSphere(4, 0.3f);
+        var rng = new Random(11);
+        int nPts = 5000;
+        var pts = new float[nPts * 3];
+        for (int i = 0; i < pts.Length; i++) pts[i] = (float)(rng.NextDouble() * (R - 4) + 2);
+        for (int i = 0; i < nPts / 2; i++) { int v = rng.Next(p.Length / 3); for (int a = 0; a < 3; a++) pts[i * 3 + a] = p[v * 3 + a] * R + R / 2 + (float)(rng.NextDouble() * 4 - 2); }   // half of them near the surface
+        int texels = 5000, nf = f.Length / 3;
+        var idMap = new int[texels]; var bary = new float[texels * 2];
+        for (int i = 0; i < texels; i++) { idMap[i] = i % 7 == 0 ? 0 : rng.Next(nf) + 1; float w0 = (float)rng.NextDouble(), w1 = (float)rng.NextDouble() * (1 - w0); bary[i * 2] = w0; bary[i * 2 + 1] = w1; }
+        var sk = new SparseKernels(accelerator);
+        int was = MeshDistanceGrid.MaxSearchThreadsPerSubmit;
+        async Task<(float[] D, int[] B, int[] BD, float[] DD, float[] P, float[] T)> Run(int threads)
+        {
+            MeshDistanceGrid.MaxSearchThreadsPerSubmit = threads;
+            using var grid = MeshDistanceGrid.Build(accelerator, p, f, R, R, R / 2f);
+            var d = await grid.DistancesAsync(pts.Select(x => x).ToArray());
+            var b = await grid.BandVoxelsAsync(1f, 0.87f);
+            var (bdBuf, bdN) = await grid.BandVoxelsDeviceAsync(sk, 1f, 0.87f);
+            int[] bd; using (bdBuf) bd = (await bdBuf.View.CopyToHostAsync()).Take(bdN * 3).ToArray();
+            using var ptsDev = accelerator.Allocate1D(pts); using var dd = accelerator.Allocate1D<float>(nPts);
+            grid.DistancesDevice(ptsDev.View, nPts, dd.View, 0.25f);
+            var ddh = await dd.View.CopyToHostAsync();
+            var pr = await grid.ProjectAsync(pts);
+            using var idDev = accelerator.Allocate1D(idMap); using var baryDev = accelerator.Allocate1D(bary);
+            using var fDev = accelerator.Allocate1D(f); using var pDev = accelerator.Allocate1D(p); using var outP = accelerator.Allocate1D<float>(texels * 3L);
+            outP.MemSetToZero();
+            grid.ProjectTexels(texels, idDev.View, baryDev.View, fDev.View, pDev.View, outP.View);
+            var tp = await outP.View.CopyToHostAsync();
+            return (d, b, bd, ddh, pr, tp);
+        }
+        try
+        {
+            var one = await Run(int.MaxValue / 2);
+            var chunked = await Run(64);
+            static int Diff<T>(T[] a, T[] b) where T : IEquatable<T> { int n = Math.Abs(a.Length - b.Length); for (int i = 0; i < Math.Min(a.Length, b.Length); i++) if (!a[i].Equals(b[i])) n++; return n; }
+            var diffs = new (string Name, int N, int Of)[]
+            {
+                ("distances", Diff(one.D, chunked.D), one.D.Length), ("band voxels", Diff(one.B, chunked.B), one.B.Length), ("band voxels (device)", Diff(one.BD, chunked.BD), one.BD.Length),
+                ("device distances", Diff(one.DD, chunked.DD), one.DD.Length), ("projection", Diff(one.P, chunked.P), one.P.Length), ("texel projection", Diff(one.T, chunked.T), one.T.Length),
+            };
+            Rm_Expect(one.B.Length > 300 && one.B.Length == one.BD.Length, $"the band must be real and both band paths agree ({one.B.Length / 3} / {one.BD.Length / 3} voxels)");
+            foreach (var (name, n, of) in diffs) Rm_Expect(n == 0, $"{name}: chunked differs from one dispatch in {n} of {of} values");
+            return $"{nf} triangles, {one.B.Length / 3} band voxels, {nPts} points, {texels} texels: every search chunked (64) == one dispatch, bit for bit";
+        }
+        finally { MeshDistanceGrid.MaxSearchThreadsPerSubmit = was; }
+    });
 
     [TestMethod]
     public async Task Remesh_DistanceGrid_MatchesBruteForce() => await RunTest(async accelerator =>

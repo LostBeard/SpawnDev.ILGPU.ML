@@ -9,7 +9,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   FlowDiT forward (all three flows) went to the GPU as ONE command buffer: ~1 s on an RTX 4070 for a 1.3B-parameter flow forward at 4,096 tokens,
   several seconds on a slower card, past the ~2 s Windows GPU watchdog. `DeviceSync.Submit` (browser: flush, no wait; desktop: nothing) now ends a
   command buffer after every DINOv3 layer (forward and weight conversion), every FlowDiT block, every sparse-structure-decoder block and every sparse-VAE
-  MLP chunk. Desktop code paths are unchanged. **Not yet run in a browser** (the RX 590 check is Lore's; the 4070 check is pending).
+  MLP chunk. Desktop code paths are unchanged. Lore's RX 590 run with it (5.8.24-local.2) got through DINOv3 and all three flows (the
+  sparse-structure flow alone 560 s) and then lost the device in the device remesh, which led to:
+- **TRELLIS.2: no single dispatch runs long** (2026-11-19). Every nearest-triangle search (`MeshDistanceGrid`: the remesh's band voxels and distances,
+  the projection, the texture bake's texel projection) runs over chunks of at most `MeshDistanceGrid.MaxSearchThreadsPerSubmit` points (2^18; env
+  `TRELLIS2_SEARCH_THREADS`), and every sparse conv of the SLat decoders over row chunks of at most `SparseVaeDecoder.MaxConvMacsPerSubmit` multiply-adds
+  (2^35; env `TRELLIS2_CONV_MACS`; the upsample conv was ~1.8 T multiply-adds in one piece), each chunk its own command buffer in the browser. One
+  dispatch over every band voxel of a 2.1M-triangle mesh was the RX 590's hang. Rows and points are independent: chunked == one dispatch BIT FOR BIT
+  (`Trellis2_DeviceChunking_MatchesOneDispatch`: 458,179 texture voxels; `Remesh_DistanceGrid_ChunkedSearchesMatchOneDispatch`: all five search entry
+  points at 64-point chunks, red-checked). MEASURED with Nsight Systems, a whole 512 image-to-3D run on the RTX 4070: 39,720 launches, the longest 30.3 ms.
+  **Not yet run in a browser.**
 - **`Trellis2ImageTo3D.Trace` / `TraceSync`**: a line per step before the first pipeline stage (pipeline created, weights prefetch started, image prep,
   DINOv3 weights loaded / converted, kernels precompiled, the DINOv3 forward), the device drained before each with `TraceSync`, so the last line printed
   is where a hang happened. The demo's Image to 3D page turns it on with `?trace=1`.

@@ -174,6 +174,26 @@ public sealed partial class MeshDistanceGrid : IDisposable
     // kernels
     // ---------------------------------------------------------------------------------------------------
 
+    /// <summary>
+    /// Threads of a nearest-triangle search (<see cref="NearestD2"/>: every triangle binned into the point's cell) sent to the device in one piece (default 2^18;
+    /// env TRELLIS2_SEARCH_THREADS). Every search kernel runs over chunks of points of at most this many (a multiple of 64: the views stay 256-byte aligned),
+    /// each its own command buffer in the browser. On a dense mesh a thread tests hundreds of triangles; one dispatch over every band voxel of a 2.1M-triangle
+    /// mesh ran past the ~2 s Windows GPU watchdog on an RX 590 in Chrome (2026-11-19, Lore: DXGI_ERROR_DEVICE_HUNG in the device remesh). The points are
+    /// independent, so the chunks give the same values as one dispatch.
+    /// </summary>
+    public static int MaxSearchThreadsPerSubmit { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("TRELLIS2_SEARCH_THREADS"), out var st) && st > 0 ? st : 1 << 18;
+
+    // launch(first, count) over [0, n) in chunks of MaxSearchThreadsPerSubmit points (first a multiple of 64), a browser submit after each
+    internal static void Chunked(Accelerator acc, long n, Action<long, int> launch)
+    {
+        long per = Math.Max(64, MaxSearchThreadsPerSubmit / 64 * 64);
+        for (long b = 0; b < n; b += per)
+        {
+            launch(b, (int)Math.Min(per, n - b));
+            acc.Submit();
+        }
+    }
+
     private Action<Index1D, FV, FV, IV, IV, IV, int, float, FV>? _udf;
     private static void UdfImpl(Index1D i, FV pts, FV pos, IV faces, IV cellStart, IV cellTris, int dim, float cap, FV outD)
     {
@@ -190,7 +210,7 @@ public sealed partial class MeshDistanceGrid : IDisposable
         _udf ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, IV, IV, int, float, FV>(UdfImpl);
         using var p = _acc.Allocate1D(gridPoints);
         using var d = _acc.Allocate1D<float>(n);
-        _udf(n, p.View, Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, cap, d.View);
+        Chunked(_acc, n, (b, c) => _udf(c, p.View.SubView(b * 3, c * 3L), Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, cap, d.View.SubView(b, c)));
         return await d.View.CopyToHostAsync();
     }
 
@@ -219,7 +239,7 @@ public sealed partial class MeshDistanceGrid : IDisposable
         long total = (long)OccupiedCount * 512;
         if (total >= int.MaxValue) throw new InvalidOperationException("too many candidate voxels");
         using var flags = _acc.Allocate1D<int>(total);
-        _bandVoxels((int)total, Positions.View, Faces.View, CellStart.View, CellTris.View, Occupied.View, Dim, Resolution, band, halfWidth, flags.View);
+        BandVoxelsChunked(flags.View, band, halfWidth);
         var f = await flags.View.CopyToHostAsync();
         var cells = await Occupied.View.SubView(0, OccupiedCount).CopyToHostAsync();
         var coords = new List<int>(1 << 20);
@@ -231,6 +251,20 @@ public sealed partial class MeshDistanceGrid : IDisposable
             coords.Add((cx - 1) * CellSize + (local >> 6)); coords.Add((cy - 1) * CellSize + ((local >> 3) & 7)); coords.Add((cz - 1) * CellSize + (local & 7));
         }
         return coords.ToArray();
+    }
+
+    // the band-voxel kernel (512 voxel threads per occupied cell) in chunks of whole cells (MaxSearchThreadsPerSubmit / 512 of them, a multiple of 64)
+    private void BandVoxelsChunked(IV flags, float band, float halfWidth)
+    {
+        _bandVoxels ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, IV, IV, IV, IV, int, int, float, float, IV>(BandVoxelsImpl);
+        int perCells = Math.Max(64, MaxSearchThreadsPerSubmit / 512 / 64 * 64);
+        for (int c0 = 0; c0 < OccupiedCount; c0 += perCells)
+        {
+            int cells = Math.Min(perCells, OccupiedCount - c0);
+            _bandVoxels(cells * 512, Positions.View, Faces.View, CellStart.View, CellTris.View, Occupied.View.SubView(c0, cells), Dim, Resolution, band, halfWidth,
+                flags.SubView((long)c0 * 512, (long)cells * 512));
+            _acc.Submit();
+        }
     }
 
     private Action<Index1D, FV, FV, IV, IV, IV, int, FV>? _project;
@@ -248,7 +282,7 @@ public sealed partial class MeshDistanceGrid : IDisposable
         _project ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, IV, IV, IV, int, FV>(ProjectImpl);
         using var p = _acc.Allocate1D(gridPoints);
         using var q = _acc.Allocate1D<float>(gridPoints.Length);
-        _project(n, p.View, Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, q.View);
+        Chunked(_acc, n, (b, c) => _project(c, p.View.SubView(b * 3, c * 3L), Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, q.View.SubView(b * 3, c * 3L)));
         return await q.View.CopyToHostAsync();
     }
 
@@ -278,6 +312,6 @@ public sealed partial class MeshDistanceGrid : IDisposable
     public void ProjectTexels(int texels, IV idMap, FV bary, IV faces, FV positions, FV outP)
     {
         _bakeProject ??= _acc.LoadAutoGroupedStreamKernel<Index1D, IV, FV, IV, FV, FV, IV, IV, IV, int, float, float, FV>(BakeProjectImpl);
-        _bakeProject(texels, idMap, bary, faces, positions, Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, Scale, Offset, outP);
+        Chunked(_acc, texels, (b, c) => _bakeProject(c, idMap.SubView(b, c), bary.SubView(b * 2, c * 2L), faces, positions, Positions.View, Faces.View, CellStart.View, CellTris.View, Dim, Scale, Offset, outP.SubView(b * 3, c * 3L)));
     }
 }

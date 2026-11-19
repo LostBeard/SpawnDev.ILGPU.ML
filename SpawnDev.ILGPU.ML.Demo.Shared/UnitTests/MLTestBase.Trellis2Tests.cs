@@ -137,6 +137,18 @@ public abstract partial class MLTestBase
     public async Task Trellis2_ImageToGlb_EndToEnd() => await RunTest(async accelerator =>
     {
         if (accelerator.AcceleratorType != AcceleratorType.Cuda) throw new UnsupportedTestException("Trellis2 end to end runs on CUDA");
+        var paths = T2_Paths();
+        var (W, H, rgba) = T2_SyntheticObject();
+        var stages = new List<string>();
+        using var gen = new Trellis2ImageTo3D(accelerator, paths) { StageDone = (n, s) => stages.Add($"{n} {s:F1}s") };
+        var glb = gen.GenerateGlb(rgba, W, H, new Trellis2Options { TextureSize = 1024 });
+        await Task.CompletedTask;
+        return T2_CheckGlb(glb, stages);
+    });
+
+    // TRELLIS2_DIR (default the Hugging Face cache folder spawndev-trellis2): the checkpoints, or the test is skipped
+    private static Trellis2Paths T2_Paths()
+    {
         var dir = Environment.GetEnvironmentVariable("TRELLIS2_DIR")
             ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "spawndev-trellis2");
         var paths = new Trellis2Paths
@@ -147,7 +159,12 @@ public abstract partial class MLTestBase
         };
         if (!File.Exists(paths.DinoWeights) || !File.Exists(paths.SparseStructureDecoder + ".safetensors") || !Directory.Exists(Path.Combine(paths.ModelDir, "ckpts")))
             throw new UnsupportedTestException("TRELLIS.2 checkpoints not found (set TRELLIS2_DIR)");
+        return paths;
+    }
 
+    // the end-to-end tests' input: a 384 x 320 elliptical object with a transparent background
+    private static (int W, int H, int[] Rgba) T2_SyntheticObject()
+    {
         const int W = 384, H = 320;
         var rgba = new int[W * H];
         for (int y = 0; y < H; y++)
@@ -158,9 +175,12 @@ public abstract partial class MLTestBase
                 int r = 120 + (int)(100 * Math.Sin(x * 0.05)), g = 80 + (int)(90 * Math.Cos(y * 0.07)), b = 200 - y / 3;
                 rgba[y * W + x] = r | (g << 8) | (b << 16) | (a << 24);
             }
-        var stages = new List<string>();
-        using var gen = new Trellis2ImageTo3D(accelerator, paths) { StageDone = (n, s) => stages.Add($"{n} {s:F1}s") };
-        var glb = gen.GenerateGlb(rgba, W, H, new Trellis2Options { TextureSize = 1024 });
+        return (W, H, rgba);
+    }
+
+    // the end-to-end checks of a generated GLB: a plausible binary glTF, a real mesh, manifold after a weld by position
+    private string T2_CheckGlb(byte[] glb, List<string> stages)
+    {
         if (glb.Length < 100_000 || BitConverter.ToUInt32(glb, 0) != 0x46546C67u) throw new Exception($"implausible GLB ({glb.Length} bytes)");
         int jsonLen = (int)BitConverter.ToUInt32(glb, 12);
         using var doc = JsonDocument.Parse(glb.AsMemory(20, jsonLen));
@@ -171,7 +191,55 @@ public abstract partial class MLTestBase
         // thousands of non-manifold edges (Trellis2Options.RepairMesh, MeshRepair).
         var topo = Mr_GlbWeldedTopology(glb);
         if (topo.NonManifoldEdges != 0) throw new Exception($"the generated GLB has {topo.NonManifoldEdges} non-manifold edges after a weld by position: {topo}");
-        await Task.CompletedTask;
         return $"{glb.Length / 1024} KiB GLB, {triangles} triangles, {topo.NonManifoldEdges} non-manifold / {topo.OrientationConflicts} wrong-way edges; " + string.Join(", ", stages.TakeLast(6));
+    }
+
+    /// <summary>
+    /// The browser's GPU-watchdog chunking (2026-11-19: an RX 590 in Chrome lost the WebGPU device in TRELLIS.2's texture decode / device remesh): the decoders'
+    /// sparse convs in row chunks (<see cref="SparseVaeDecoder.MaxConvMacsPerSubmit"/>) and every nearest-triangle search in point chunks
+    /// (<see cref="MeshDistanceGrid.MaxSearchThreadsPerSubmit"/>: the remesh's band voxels and distances, the bake's projection). Rows and points are independent,
+    /// so the result must equal BIT FOR BIT the run with one dispatch each: the texture-decoded voxels (Output.Attributes, Coords) and the GLB. Runs 1 and 2
+    /// use budgets large enough for one dispatch each (the baseline must repeat itself; if the GLB does not, only the voxels are compared and the line says so),
+    /// run 3 budgets of 2^24 multiply-adds and 4096 search threads (hundreds of chunks). CUDA, the 512 pipeline on the end-to-end test's synthetic object.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Trellis2_DeviceChunking_MatchesOneDispatch() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda) throw new UnsupportedTestException("Trellis2 end to end runs on CUDA");
+        var paths = T2_Paths();
+        var (W, H, rgba) = T2_SyntheticObject();
+        using var gen = new Trellis2ImageTo3D(accelerator, paths);
+        using var img = accelerator.Allocate1D(rgba);
+        async Task<(float[] A, int[] C, byte[] Glb, double S)> Run(long macs, int searchThreads)
+        {
+            long wasM = SparseVaeDecoder.MaxConvMacsPerSubmit; int wasS = MeshDistanceGrid.MaxSearchThreadsPerSubmit;
+            SparseVaeDecoder.MaxConvMacsPerSubmit = macs; MeshDistanceGrid.MaxSearchThreadsPerSubmit = searchThreads;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var (o, pipeline) = await gen.GenerateAsync(img.View, W, H, new Trellis2Options { Resolution = 512 });
+                using (o)
+                {
+                    var a = await o.Attributes.View.CopyToHostAsync();
+                    var c = await o.Coords.View.SubView(0, (long)o.VoxelCount * 3).CopyToHostAsync();
+                    var glb = await pipeline.ToGlbAsync(o, 1024);
+                    return (a, c, glb, sw.Elapsed.TotalSeconds);
+                }
+            }
+            finally { SparseVaeDecoder.MaxConvMacsPerSubmit = wasM; MeshDistanceGrid.MaxSearchThreadsPerSubmit = wasS; }
+        }
+        static int Diff<T>(T[] a, T[] b) where T : IEquatable<T> { int d = Math.Abs(a.Length - b.Length); for (int i = 0; i < Math.Min(a.Length, b.Length); i++) if (!a[i].Equals(b[i])) d++; return d; }
+        var one1 = await Run(long.MaxValue / 4, int.MaxValue / 2);
+        var one2 = await Run(long.MaxValue / 4, int.MaxValue / 2);
+        int baseA = Diff(one1.A, one2.A), baseC = Diff(one1.C, one2.C), baseG = Diff(one1.Glb, one2.Glb);
+        Ur_Expect(baseA == 0 && baseC == 0, $"the one-dispatch voxels repeat themselves ({baseA} attribute / {baseC} coordinate values differ between two runs)");
+        var chunked = await Run(1L << 24, 4096);
+        int dA = Diff(one1.A, chunked.A), dC = Diff(one1.C, chunked.C), dG = Diff(one1.Glb, chunked.Glb);
+        Ur_Expect(dA == 0 && dC == 0, $"chunked convs differ from one dispatch per conv: {dA} attribute, {dC} coordinate values");
+        if (baseG == 0) Ur_Expect(dG == 0, $"the GLB with chunked convs and searches differs from one dispatch each: {dG} of {one1.Glb.Length} bytes");
+        string glbNote = baseG == 0 ? $"GLB {one1.Glb.Length / 1024} KiB identical" : $"GLB not compared: two one-dispatch runs already differ in {baseG} of {one1.Glb.Length} bytes (chunked vs run 1: {dG})";
+        string line = $"{one1.C.Length / 3} voxels: chunked == one dispatch, bit for bit; {glbNote}; runs {one1.S:F1} / {one2.S:F1} / {chunked.S:F1} s (one, one, chunked)";
+        Console.WriteLine("[Trellis2] device chunking: " + line);
+        return line;
     });
 }

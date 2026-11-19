@@ -49,9 +49,14 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.WebGPU or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the desktop pipeline test needs a desktop GPU (the browser pipeline is separate)");
-        var paths = Wan22Paths.InFolder(WanDir);
+        // env knobs for A/B runs (2026-11-19, Lore's speckle at 1280x704): WAN_DIT / WAN_TE (export file names), WAN_PROMPT, WAN_NEG (unset: the pipeline's default
+        // negative), WAN_CFG, WAN_SHIFT, WAN_SEED, WAN_TAG (output file names); unset = the original small test
+        static string? Env(string n) => Environment.GetEnvironmentVariable(n) is { Length: > 0 } v ? v : null;
+        static double EnvD(string n, double fb) => double.TryParse(Environment.GetEnvironmentVariable(n), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : fb;
+        var paths = Wan22Paths.InFolder(WanDir, Env("WAN_DIT") ?? "wan22_ti2v_5b_dit_q8.safetensors", Env("WAN_TE") ?? "umt5_xxl_enc_bf16.safetensors");
         if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder) || !File.Exists(paths.Tokenizer)) throw new UnsupportedTestException($"Wan exports not found in {WanDir}");
         string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
+        string runTag = Env("WAN_TAG") ?? "t2v";
         var pipe = new Wan22Pipeline(accelerator, paths);
         var stages = new List<string>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -59,7 +64,9 @@ public abstract partial class MLTestBase
         var progress = new Progress<WanProgress>(p => { if (p.Stage != last) { last = p.Stage; stages.Add($"{p.Stage} at {sw.Elapsed.TotalSeconds:F0} s"); } });
         var video = await pipe.GenerateAsync(new WanRequest
         {
-            Prompt = "A red fox walking through fresh snow at golden hour, the camera follows it slowly.", Width = EnvInt("WAN_W", 320), Height = EnvInt("WAN_H", 192), Frames = EnvInt("WAN_FRAMES", 9), Steps = EnvInt("WAN_STEPS", 8), Seed = 1,
+            Prompt = Env("WAN_PROMPT") ?? "A red fox walking through fresh snow at golden hour, the camera follows it slowly.", NegativePrompt = Env("WAN_NEG"),
+            GuidanceScale = EnvD("WAN_CFG", 5.0), Shift = EnvD("WAN_SHIFT", 5.0),
+            Width = EnvInt("WAN_W", 320), Height = EnvInt("WAN_H", 192), Frames = EnvInt("WAN_FRAMES", 9), Steps = EnvInt("WAN_STEPS", 8), Seed = EnvInt("WAN_SEED", 1),
         }, progress);
         void Check(WanVideo v, string tag)
         {
@@ -72,7 +79,7 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[Wan] pipeline {tag}: {v.Frames} frames {v.Width}x{v.Height}, pixel mean {mean:F3}, std {std:F3}");
             foreach (int f in new[] { 0, v.Frames / 2, v.Frames - 1 }) File.WriteAllBytes(Path.Combine(outDir, $"pipeline_{tag}_{f}.png"), Assets.AssetGenerator.EncodePng(v.GetFrameRgba(f), v.Width, v.Height));
         }
-        Check(video, "t2v");
+        Check(video, runTag);
         Console.WriteLine($"[Wan] pipeline t2v stages: {string.Join(", ", stages)}; total {sw.Elapsed.TotalSeconds:F0} s");
         return $"t2v ok in {sw.Elapsed.TotalSeconds:F0} s";
     });
@@ -505,6 +512,43 @@ public abstract partial class MLTestBase
     /// <summary>The same check on the 8-bit block export (6.4 GB): the matrices and the embedding rows are quantised, so the error against the exact math is the quantisation's on top of the rounding.</summary>
     [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
     public async Task Wan_UmT5_Quantized_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, "umt5_xxl_enc_q8.safetensors", 0.06, 0.04));
+
+    /// <summary>
+    /// Diagnostic (2026-11-19, Lore: an English negative prompt turns Wan 2.2 5B video into colour noise): the umT5 encoder, bf16 and 8-bit exports, against the
+    /// reference's bf16 output for ONE text dumped by tools/wan-harness/reference/ref_t5_dump.py into WAN_T5_CASE (t5_0.npz), fed the reference's token ids.
+    /// Reports relative RMS, the largest |value| of each, and the five tokens with the worst relative error (a single token gone wrong would stand out).
+    /// Reported, not asserted.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_UmT5_OneText_VsReference() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the layer-streaming encoder reads the export from disk on a desktop GPU");
+        var dir = Environment.GetEnvironmentVariable("WAN_T5_CASE") ?? "";
+        var npz = Path.Combine(dir, "t5_0.npz");
+        if (!File.Exists(npz)) throw new UnsupportedTestException($"set WAN_T5_CASE to a folder holding a ref_t5_dump.py t5_0.npz ({npz})");
+        using var fx = ZipFile.OpenRead(npz);
+        var (ids, _) = WanNpz(fx, "ids"); var (mask, _) = WanNpz(fx, "mask"); var (want, _) = WanNpz(fx, "context");
+        int n = (int)mask.Sum(), D = 4096;
+        var report = new List<string> { $"{n} tokens" };
+        foreach (var file in new[] { "umt5_xxl_enc_bf16.safetensors", "umt5_xxl_enc_q8.safetensors" })
+        {
+            var path = Path.Combine(WanDir, file);
+            if (!File.Exists(path)) { report.Add($"{file}: not found"); continue; }
+            using var enc = await UmT5Encoder.CreateAsync(accelerator, path);
+            var got = await enc.EncodeAsync(ids.Take(n).Select(v => (int)v).ToArray());
+            var all = WanCompare(got, want);
+            var perTok = Enumerable.Range(0, n).Select(t =>
+            {
+                double num = 0, den = 0;
+                for (int e = 0; e < D; e++) { double d = got[t * D + e] - want[t * D + e]; num += d * d; den += (double)want[t * D + e] * want[t * D + e]; }
+                return (Tok: t, Id: (long)ids[t], Rel: Math.Sqrt(num / Math.Max(den, 1e-30)));
+            }).OrderByDescending(x => x.Rel).Take(5);
+            report.Add($"{file}: relRMS {all.RelRms:E2}, max |got| {got.Max(Math.Abs):F1} vs reference {all.RefMaxAbs:F1}; worst tokens " + string.Join(", ", perTok.Select(x => $"#{x.Tok} (id {x.Id}) {x.Rel:E1}")));
+        }
+        string line = string.Join(" | ", report);
+        Console.WriteLine("[Wan] umT5 one text vs reference: " + line);
+        return line;
+    });
 
     private async Task<string> WanUmT5Check(Accelerator accelerator, string file, double boundBf16, double boundExact)
     {
