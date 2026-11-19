@@ -288,7 +288,7 @@ public sealed class Ltx2Kernels
         // ComfyUI's arithmetic, in HALF precision (Ltx2Fp8Rounding.RoundY, the host form): e = floor(half(log2 y)), at least -6; step = 2^(e-3);
         // x = y / step, l = floor(x) * step, stored = l + step when half(frac + u) >= 1. A multiply by 2^(3-e), never a division (an inexact fp32 division
         // would move it on some backends).
-        float lg = y16 > 0f ? global::ILGPU.Algorithms.XMath.Log2(y16) : -6f;                   // MathF.Log2 has no remap in ILGPU yet (Data: 5.4.38)
+        float lg = y16 > 0f ? global::ILGPU.Algorithms.XMath.Log2(y16) : -6f;                   // XMath.Log2: verified here first (MathF.Log2 compiles in kernels since ILGPU 5.4.38)
         if (MathF.Abs(lg) >= 6.103515625e-05f) { uint gb = (uint)Interop.FloatAsInt(lg); lg = Interop.IntAsFloat((gb + 0xFFFu + ((gb >> 13) & 1u)) & 0xFFFFE000u); }
         int e = (int)MathF.Floor(lg);
         if (e < -6) e = -6;
