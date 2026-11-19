@@ -27,6 +27,48 @@ def build_encoder():
     cfg = dict(vocab=256384, dim=4096, dim_attn=4096, dim_ffn=10240, num_heads=64, num_layers=24, num_buckets=32, shared_pos=False, dropout=0.1)
     with torch.device("meta"):
         enc = T5Encoder(**cfg)
+    export = os.environ.get("WAN_T5_FROM_EXPORT")
+    if export:
+        # 2026-11-19: WSL's overcommit heuristic refused the 11.4 GB private mmap of the .pth (RAM 7.6 GB + swap 2 GB). The same bf16 bits from our own
+        # export (export_t5_bf16.py: q / k / v fused into qkv, ffn.gate.0 -> ffn.gate), one tensor at a time: everything but the token embedding straight
+        # to the GPU, the embedding (2.1 GB) to the CPU. Names come from the reference model itself; every export tensor must be used.
+        # plain reads of each tensor's byte range (safetensors' safe_open maps the whole file too, which the same heuristic refuses)
+        import json as _json
+        import struct as _struct
+        sd, used = {}, set()
+        with open(export, "rb") as fh:
+            hlen = _struct.unpack("<Q", fh.read(8))[0]
+            header = _json.loads(fh.read(hlen))
+            header.pop("__metadata__", None)
+            names = set(header.keys())
+
+            def read(name):
+                e = header[name]
+                assert e["dtype"] == "BF16", (name, e["dtype"])
+                a, b = e["data_offsets"]
+                fh.seek(8 + hlen + a)
+                buf = bytearray(fh.read(b - a))
+                return torch.frombuffer(buf, dtype=torch.bfloat16).reshape(e["shape"])
+
+            for key in enc.state_dict().keys():
+                parts = key.split(".")
+                if len(parts) == 5 and parts[0] == "blocks" and parts[2] == "attn" and parts[3] in ("q", "k", "v"):
+                    src = f"blocks.{parts[1]}.attn.qkv.weight"
+                    i = "qkv".index(parts[3])
+                    t = read(src)[i * 4096:(i + 1) * 4096].clone()
+                elif key.endswith(".ffn.gate.0.weight"):
+                    src = key.replace(".ffn.gate.0.weight", ".ffn.gate.weight")
+                    t = read(src)
+                else:
+                    src = key
+                    t = read(src)
+                assert src in names, (key, src)
+                used.add(src)
+                sd[key] = t if key == "token_embedding.weight" else t.to("cuda")
+            assert used == names, sorted(names - used)[:5]
+        missing, unexpected = enc.load_state_dict(sd, strict=True, assign=True)
+        enc.eval().requires_grad_(False)
+        return enc
     sd = torch.load(os.path.join(CKPT, "models_t5_umt5-xxl-enc-bf16.pth"), map_location="cpu", mmap=True, weights_only=True)
     missing, unexpected = enc.load_state_dict(sd, strict=False, assign=True)
     print("load_state_dict missing", missing[:5], "unexpected", unexpected[:5])

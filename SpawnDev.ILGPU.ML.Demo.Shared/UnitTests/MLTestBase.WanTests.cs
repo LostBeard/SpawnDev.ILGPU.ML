@@ -67,6 +67,8 @@ public abstract partial class MLTestBase
             Prompt = Env("WAN_PROMPT") ?? "A red fox walking through fresh snow at golden hour, the camera follows it slowly.", NegativePrompt = Env("WAN_NEG"),
             GuidanceScale = EnvD("WAN_CFG", 5.0), Shift = EnvD("WAN_SHIFT", 5.0),
             Width = EnvInt("WAN_W", 320), Height = EnvInt("WAN_H", 192), Frames = EnvInt("WAN_FRAMES", 9), Steps = EnvInt("WAN_STEPS", 8), Seed = EnvInt("WAN_SEED", 1),
+            // WAN_NOISE_NPZ: start from that ref_dit_dump.py file's "noise" instead of our seeded noise (A/B of the noise generator)
+            InitialNoise = Env("WAN_NOISE_NPZ") is { } nz ? WanNpz(ZipFile.OpenRead(nz), "noise").Data : null,
         }, progress);
         void Check(WanVideo v, string tag)
         {
@@ -293,19 +295,24 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU or AcceleratorType.Velocity)
             throw new UnsupportedTestException("the DiT runs on a desktop GPU or WebGPU");
-        var weightsPath = Path.Combine(WanDir, "wan22_ti2v_5b_dit_q8.safetensors"); var fixture = Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        // WAN_DIT_FIXTURE / WAN_DIT_T5 / WAN_DIT / WAN_SHIFT / WAN_CFG: another trajectory (2026-11-19: Lore's 1280x704 speckle)
+        var weightsPath = Path.Combine(WanDir, Environment.GetEnvironmentVariable("WAN_DIT") ?? "wan22_ti2v_5b_dit_q8.safetensors");
+        var fixture = Environment.GetEnvironmentVariable("WAN_DIT_FIXTURE") ?? Path.Combine(WanDir, "dump2", "dit_t2v30.npz");
+        string t5Dir = Environment.GetEnvironmentVariable("WAN_DIT_T5") ?? Path.Combine(WanDir, "dump");
+        double shift = double.TryParse(Environment.GetEnvironmentVariable("WAN_SHIFT"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sh) ? sh : 5.0;
+        float cfg = float.TryParse(Environment.GetEnvironmentVariable("WAN_CFG"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cg) ? cg : 5.0f;
         if (!File.Exists(weightsPath) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
-        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz")); using var t5n = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_neg.npz"));
+        using var t50 = ZipFile.OpenRead(Path.Combine(t5Dir, "t5_0.npz")); using var t5n = ZipFile.OpenRead(Path.Combine(t5Dir, "t5_neg.npz"));
         var (ctx0, cs0) = WanNpz(t50, "context"); var (ctxN, csN) = WanNpz(t5n, "context");
         using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
         using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
         using var fx = ZipFile.OpenRead(fixture);
         var (noise, ns) = WanNpz(fx, "noise"); var (ts, _) = WanNpz(fx, "timesteps");
         dit.SetGrid(ns[1], ns[2], ns[3]); dit.SetContext(0, ctx0, cs0[0]); dit.SetContext(1, ctxN, csN[0]);
-        var sched = new FlowUniPCScheduler(); sched.SetTimesteps(ts.Length, 5.0);
+        var sched = new FlowUniPCScheduler(); sched.SetTimesteps(ts.Length, shift);
         using var lIn = accelerator.Allocate1D<float>(noise.Length); using var lOut = accelerator.Allocate1D<float>(noise.Length);
         var lines = new List<string>(); double worst = 0;
-        var schedFree = new FlowUniPCScheduler(); schedFree.SetTimesteps(ts.Length, 5.0);
+        var schedFree = new FlowUniPCScheduler(); schedFree.SetTimesteps(ts.Length, shift);
         var free = (float[])noise.Clone();
         for (int s = 0; s < ts.Length; s++)
         {
@@ -313,13 +320,13 @@ public abstract partial class MLTestBase
             lIn.View.CopyFromCPU(free);
             dit.Forward(lIn.View, schedFree.Timesteps[s], false, 0, lOut.View); var fc = await lOut.View.CopyToHostAsync();
             dit.Forward(lIn.View, schedFree.Timesteps[s], false, 1, lOut.View); var fu = await lOut.View.CopyToHostAsync();
-            for (int i = 0; i < fc.Length; i++) fc[i] = fu[i] + 5.0f * (fc[i] - fu[i]);
+            for (int i = 0; i < fc.Length; i++) fc[i] = fu[i] + cfg * (fc[i] - fu[i]);
             free = schedFree.Step(fc, free);
             var mfree = WanCompare(free, want);
             lIn.View.CopyFromCPU(refIn);
             dit.Forward(lIn.View, sched.Timesteps[s], false, 0, lOut.View); var nc = await lOut.View.CopyToHostAsync();
             dit.Forward(lIn.View, sched.Timesteps[s], false, 1, lOut.View); var nu = await lOut.View.CopyToHostAsync();
-            for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + 5.0f * (nc[i] - nu[i]);
+            for (int i = 0; i < nc.Length; i++) nc[i] = nu[i] + cfg * (nc[i] - nu[i]);
             var got = sched.Step(nc, refIn);
             var m = WanCompare(got, want); worst = Math.Max(worst, m.RelRms);
             lines.Add($"step {s} t={sched.Timesteps[s]:F0}: teacher-forced relRMS {m.RelRms:E2}; free-running {mfree.RelRms:E2}");
@@ -343,7 +350,9 @@ public abstract partial class MLTestBase
         if (!File.Exists(vaePath) || !File.Exists(fixture)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir}");
         string outDir = Environment.GetEnvironmentVariable("WAN_OUT") ?? Path.Combine(WanDir, "out"); Directory.CreateDirectory(outDir);
         using var fx = ZipFile.OpenRead(fixture);
-        var (final, s) = WanNpz(fx, "step29_latent_out");
+        // the last step's latent, whatever the step count of the dump (env WAN_REF_TAG picks the dump)
+        int lastStep = fx.Entries.Select(e => e.Name).Where(n => n.StartsWith("step") && n.EndsWith("_latent_out.npy")).Select(n => int.Parse(n[4..n.IndexOf('_')])).Max();
+        var (final, s) = WanNpz(fx, $"step{lastStep}_latent_out");
         int Fz = s[1], h = s[2], w = s[3];
         using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
         var video = new WanVideo { Data = await vae.DecodeAsync(final, Fz, h, w), Width = w * 16, Height = h * 16, Frames = 4 * Fz - 3 };
@@ -514,6 +523,41 @@ public abstract partial class MLTestBase
     public async Task Wan_UmT5_Quantized_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, "umt5_xxl_enc_q8.safetensors", 0.06, 0.04));
 
     /// <summary>
+    /// Diagnostic (2026-11-19, Lore's speckle: our pipeline from the reference's torch noise is clean, from our seeded noise it is not): statistics of
+    /// <see cref="Wan22Pipeline.Gaussian"/> (seed WAN_SEED, default 42) against the noise of a ref_dit_dump.py file (WAN_NOISE_NPZ), same shape [48, F, h, w]:
+    /// mean, std, tails, and the correlation of neighbours along w, h, F and the channels. Reported, not asserted.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task Wan_SeededNoise_VsReferenceNoise() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.CPU) throw new UnsupportedTestException("host-only: runs on the CPU lane");
+        var nz = Environment.GetEnvironmentVariable("WAN_NOISE_NPZ") ?? "";
+        if (!File.Exists(nz)) throw new UnsupportedTestException("set WAN_NOISE_NPZ to a ref_dit_dump.py npz");
+        using var fx = ZipFile.OpenRead(nz);
+        var (refNoise, s) = WanNpz(fx, "noise");
+        int C = s[0], F = s[1], H = s[2], W = s[3];
+        long seed = long.TryParse(Environment.GetEnvironmentVariable("WAN_SEED"), out var sd) ? sd : 42;
+        var ours = Wan22Pipeline.Gaussian(refNoise.Length, seed);
+        string Stats(float[] x)
+        {
+            double m = x.Average(v => (double)v), v2 = x.Average(v => ((double)v - m) * ((double)v - m)), sdv = Math.Sqrt(v2);
+            double tail = x.Count(v => Math.Abs(v) > 4) / (double)x.Length;
+            double Corr(int stride, int span, int period)   // neighbours i, i + stride inside the same row of length span * stride, period = the axis' size
+            {
+                double num = 0; long n = 0;
+                for (long i = 0; i + stride < x.Length; i++) { if ((i / stride) % period == period - 1) continue; num += ((double)x[i] - m) * ((double)x[i + stride] - m); n++; }
+                return num / n / v2;
+            }
+            var chStd = Enumerable.Range(0, C).Select(c => { double mm = 0, vv = 0; int per = F * H * W; for (int i = 0; i < per; i++) mm += x[c * per + i]; mm /= per; for (int i = 0; i < per; i++) vv += (x[c * per + i] - mm) * (x[c * per + i] - mm); return Math.Sqrt(vv / per); }).ToArray();
+            return $"mean {m:F4}, std {sdv:F4}, |x|>4 {tail:E1}, corr w {Corr(1, W, W):F4}, h {Corr(W, H, H):F4}, F {Corr(W * H, F, F):F4}, ch {Corr(W * H * F, C, C):F4}, channel std {chStd.Min():F3}..{chStd.Max():F3}";
+        }
+        string line = $"[{C}, {F}, {H}, {W}] reference: {Stats(refNoise)} | ours (seed {seed}): {Stats(ours)}";
+        Console.WriteLine("[Wan] noise statistics: " + line);
+        await Task.CompletedTask;
+        return line;
+    });
+
+    /// <summary>
     /// Diagnostic (2026-11-19, Lore: an English negative prompt turns Wan 2.2 5B video into colour noise): the umT5 encoder, bf16 and 8-bit exports, against the
     /// reference's bf16 output for ONE text dumped by tools/wan-harness/reference/ref_t5_dump.py into WAN_T5_CASE (t5_0.npz), fed the reference's token ids.
     /// Reports relative RMS, the largest |value| of each, and the five tokens with the worst relative error (a single token gone wrong would stand out).
@@ -524,7 +568,7 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the layer-streaming encoder reads the export from disk on a desktop GPU");
         var dir = Environment.GetEnvironmentVariable("WAN_T5_CASE") ?? "";
-        var npz = Path.Combine(dir, "t5_0.npz");
+        var npz = Path.Combine(dir, $"t5_{Environment.GetEnvironmentVariable("WAN_T5_NAME") ?? "0"}.npz");   // WAN_T5_NAME: which dumped text (default 0)
         if (!File.Exists(npz)) throw new UnsupportedTestException($"set WAN_T5_CASE to a folder holding a ref_t5_dump.py t5_0.npz ({npz})");
         using var fx = ZipFile.OpenRead(npz);
         var (ids, _) = WanNpz(fx, "ids"); var (mask, _) = WanNpz(fx, "mask"); var (want, _) = WanNpz(fx, "context");
@@ -766,17 +810,23 @@ public abstract partial class MLTestBase
         var weightsPath = Path.Combine(WanDir, "wan22_ti2v_5b_dit_bf16.safetensors");
         if (!File.Exists(weightsPath)) throw new UnsupportedTestException($"Wan fixtures not found in {WanDir} (set WAN_DIR)");
 
-        using var t50 = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_0.npz"));
-        using var t5n = ZipFile.OpenRead(Path.Combine(WanDir, "dump", "t5_neg.npz"));
+        // WAN_DIT_FIXTURE (a ref_dit_dump.py npz) + WAN_DIT_T5 (its t5 folder): that one text-to-video case instead of the 640x352 pair (2026-11-19: Lore's
+        // speckle at 1280x704, where the reference is clean and our pipeline is not)
+        string? caseFx = Environment.GetEnvironmentVariable("WAN_DIT_FIXTURE"), caseT5 = Environment.GetEnvironmentVariable("WAN_DIT_T5");
+        string t5Dir = caseT5 ?? Path.Combine(WanDir, "dump");
+        using var t50 = ZipFile.OpenRead(Path.Combine(t5Dir, "t5_0.npz"));
+        using var t5n = ZipFile.OpenRead(Path.Combine(t5Dir, "t5_neg.npz"));
         var (ctx0, cs0) = WanNpz(t50, "context"); var (ctxN, csN) = WanNpz(t5n, "context");
 
         using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
         using var dit = new WanDiT(accelerator, new DiTKernels(accelerator), weights);
         var report = new List<string>();
         var worst = 0.0;
-        foreach (var (tag, firstFrame) in new[] { ("t2v", false), ("i2v", true) })
+        var cases = caseFx != null ? new[] { ("case", false, caseFx) }
+            : new[] { ("t2v", false, Path.Combine(WanDir, "dump", "dit_t2v_640x352_f33.npz")), ("i2v", true, Path.Combine(WanDir, "dump", "dit_i2v_640x352_f33.npz")) };
+        foreach (var (tag, firstFrame, fxPath) in cases)
         {
-            using var fx = ZipFile.OpenRead(Path.Combine(WanDir, "dump", $"dit_{tag}_640x352_f33.npz"));
+            using var fx = ZipFile.OpenRead(fxPath);
             var (lat, ls) = WanNpz(fx, "step0_latent_in");      // [48, Fz, h, w]
             int Fz = ls[1], h = ls[2], w = ls[3];
             var (tArr, _) = WanNpz(fx, "step0_t");
