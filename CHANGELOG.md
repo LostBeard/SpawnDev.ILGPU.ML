@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **TRELLIS.2 in the browser: a command buffer per block** (Lore: image to 3D lost the WebGPU device, DXGI_ERROR_DEVICE_HUNG, on an RX 590 in Chrome;
+  the same card completes it on the desktop over OpenCL in 552 s). In the browser `DeviceSync.Fence` is a flush, and DINOv3 (24 layers) and every
+  FlowDiT forward (all three flows) went to the GPU as ONE command buffer: ~1 s on an RTX 4070 for a 1.3B-parameter flow forward at 4,096 tokens,
+  several seconds on a slower card, past the ~2 s Windows GPU watchdog. `DeviceSync.Submit` (browser: flush, no wait; desktop: nothing) now ends a
+  command buffer after every DINOv3 layer (forward and weight conversion), every FlowDiT block, every sparse-structure-decoder block and every sparse-VAE
+  MLP chunk. Desktop code paths are unchanged. **Not yet run in a browser** (the RX 590 check is Lore's; the 4070 check is pending).
+- **`Trellis2ImageTo3D.Trace` / `TraceSync`**: a line per step before the first pipeline stage (pipeline created, weights prefetch started, image prep,
+  DINOv3 weights loaded / converted, kernels precompiled, the DINOv3 forward), the device drained before each with `TraceSync`, so the last line printed
+  is where a hang happened. The demo's Image to 3D page turns it on with `?trace=1`.
 - **Hugging Face ranges resolve once, not once per request** (Lore's find, 2026-11-19). Hugging Face answers `/resolve/` with a 302 to a signed CDN URL
   and counts every `/resolve/` request against its "resolver" limit: 3,000 per 5 minutes per client (anonymous; `ratelimit: "resolvers";r=2999;t=118`).
   The three range readers sent every range there: `FetchRangeStream` one per 16 MiB chunk (a 27 GB LTX-2 checkpoint streamed in the browser: ~1,700 a
