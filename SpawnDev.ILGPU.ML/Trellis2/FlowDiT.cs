@@ -166,6 +166,7 @@ public sealed class FlowDiT : IDisposable
                 if (b == 0) Tap("block0", _h, N * C);
                 if (b == _blocks - 1) Tap("block29", _h, N * C);
             }
+            _acc.Submit();   // one command buffer per block in the browser (DeviceSync.Submit: the GPU watchdog on slower cards)
         }
 
         // out: F.layer_norm (torch default eps 1e-5, no affine), then out_layer

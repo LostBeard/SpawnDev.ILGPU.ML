@@ -89,6 +89,7 @@ public sealed class SparseStructureDecoder : IDisposable
         // skip_connection = Identity: x + h
         _dk.GateResidual(t2.View, x.View, default, -1, n * c, c);
         (x, t2) = (t2, x);                  // the result is x; the old x becomes the scratch
+        _acc.Submit();                      // one command buffer per block in the browser (DeviceSync.Submit: the GPU watchdog on slower cards)
     }
 
     /// <summary>
@@ -126,6 +127,7 @@ public sealed class SparseStructureDecoder : IDisposable
                 int g2 = g * 2, n2 = n * 8;
                 var up = F((long)n2 * next);
                 _sk.PixelShuffle3d(big.View, up.View, g, next);
+                _acc.Submit();
                 big.Dispose(); x.Dispose(); t1.Dispose(); t2.Dispose(); nbr.Dispose();
                 g = g2; n = n2; c = next; x = up;
                 t1 = F((long)n * c); t2 = F((long)n * c);

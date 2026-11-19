@@ -72,6 +72,17 @@ public sealed class Trellis2ImageTo3D : IDisposable
     /// <summary>Per-stage progress: (stage, seconds).</summary>
     public Action<string, double>? StageDone { get; set; }
 
+    /// <summary>
+    /// Diagnostics: a line per step of <see cref="GenerateAsync"/> up to the first flow ("+12.3 s dinov3 weights: loaded"), the span before the
+    /// pipeline's own <see cref="StageDone"/> stages (which drain and report themselves). With <see cref="TraceSync"/> the device is drained before
+    /// each line, so a step's GPU time lands on its own line and the last line printed is where a hang or a lost device happened (2026-11-19: an
+    /// RX 590 in Chrome lost the device with no stage reported). Null (default): no lines, no drains.
+    /// </summary>
+    public Action<string>? Trace { get; set; }
+
+    /// <summary>Drain the device before every <see cref="Trace"/> line (slower; use it to find a hang).</summary>
+    public bool TraceSync { get; set; }
+
     /// <summary>Checkpoints from local files (desktop).</summary>
     public Trellis2ImageTo3D(Accelerator accelerator, Trellis2Paths paths) : this(accelerator, Trellis2Weights.FromFiles(paths)) { }
 
@@ -178,12 +189,23 @@ public sealed class Trellis2ImageTo3D : IDisposable
         if (options.Resolution == 1536 && !options.Cascade) throw new ArgumentException("Resolution 1536 is the 1536_cascade pipeline: set Cascade");
         if (options.Cascade && options.Resolution == 512) throw new ArgumentException("A cascade runs at 1024 or 1536");
         var sw = Stopwatch.StartNew();
+        var traceClock = Stopwatch.StartNew();
+        async Task Mark(string what)
+        {
+            if (Trace == null) return;
+            if (TraceSync) await _acc.WaitAsync();
+            Trace($"+{traceClock.Elapsed.TotalSeconds:F1} s {what}");
+        }
+        await Mark($"generate: resolution {options.Resolution}{(options.Cascade ? " cascade" : "")}, {width} x {height}, {_acc.AcceleratorType}");
         // WebGPU: the large kernels' pipelines build in the background, in parallel, while the image is prepared and DINOv3 loads
         _precompile ??= Task.WhenAll(_dk.PrecompileAsync(), _sk.PrecompileAsync());
         var pipeline = await Trellis2Pipeline.CreateAsync(_acc, _weights, ct);
         pipeline.StageDone = StageDone;
+        await Mark("pipeline created (pipeline.json read)");
         pipeline.PrefetchFirstStage(includeDino: true);      // the reads overlap the image preparation and the feature extraction
+        await Mark("weights prefetch started (DINOv3 + the first flow)");
         using var image = await new Trellis2ImagePrep(_acc).PrepareAsync(rgba, width, height, 512);
+        await Mark("image prep: done");
         StageDone?.Invoke("image prep", sw.Elapsed.TotalSeconds); sw.Restart();
 
         const int tokens = 1 + 4 + 32 * 32;
@@ -194,9 +216,13 @@ public sealed class Trellis2ImageTo3D : IDisposable
         {
             {   // the feature extractor's weights are released before the flows load
                 using var w = await _weights.LoadDinoAsync(_acc, ct);
+                await Mark("dinov3 weights: loaded");
                 await _precompile;                           // a launch while its pipeline is still building would compile it a second time
+                await Mark("kernels precompiled");
                 using var dino = new DinoV3Extractor(_acc, _sk, _dk, w);
+                await Mark("dinov3 weights: converted");
                 dino.Extract(image.View, 512, cond.View);
+                await Mark("dinov3 forward (512): done");
                 if (options.Resolution >= 1024)
                 {
                     // the same preprocessed image resampled to 1024 px for the shape / texture flows

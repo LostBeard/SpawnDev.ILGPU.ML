@@ -22,6 +22,17 @@ internal static class DeviceSync
         else a.Synchronize();
     }
 
+    /// <summary>
+    /// Browser: end the current command buffer here (a submit, no wait); desktop: nothing (each launch is its own submission). Called after every block
+    /// of a model: Windows resets a GPU whose one submission runs past ~2 s (TDR, DXGI_ERROR_DEVICE_HUNG), and a whole forward in one command buffer
+    /// was ~1 s on an RTX 4070 but several seconds on a slower card (2026-11-19, Lore: TRELLIS.2 lost the device on an RX 590 in Chrome). A submit per
+    /// block costs microseconds.
+    /// </summary>
+    public static void Submit(this Accelerator a)
+    {
+        if (a.IsBrowser()) a.Flush();
+    }
+
     /// <summary>Real completion, every backend (browser: SynchronizeAsync; desktop: the synchronous wait).</summary>
     public static Task WaitAsync(this Accelerator a)
     {

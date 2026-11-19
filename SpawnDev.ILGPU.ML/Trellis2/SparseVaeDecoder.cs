@@ -113,6 +113,7 @@ public sealed class SparseVaeDecoder : IDisposable
                         int rows = Math.Min(mlpRows, n - r0);
                         _sk.Linear(z.View.SubView((long)r0 * C, (long)rows * C), _w.F16(p + "mlp.0.weight"), _w.F16(p + "mlp.0.bias"), hid.View, rows, C, 4 * C, act: 1);
                         _sk.Linear(hid.View, _w.F16(p + "mlp.2.weight"), _w.F16(p + "mlp.2.bias"), y.View.SubView((long)r0 * C, (long)rows * C), rows, 4 * C, C, res: x.View.SubView((long)r0 * C, (long)rows * C));
+                        _acc.Submit();   // a command buffer per MLP chunk in the browser (DeviceSync.Submit: the GPU watchdog on slower cards)
                     }
                     (x, y) = (y, x);                        // y now holds the old x, reused as scratch
                 }

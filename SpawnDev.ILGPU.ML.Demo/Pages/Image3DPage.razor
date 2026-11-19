@@ -383,6 +383,12 @@
             _storageNote = $"This browser reports room for {e.Headroom / 1073741824.0:F1} GB more: {cachedBytes / 1073741824.0:F1} GB of the TRELLIS.2 weights are cached, "
                 + $"the other {streamedBytes / 1073741824.0:F1} GB stream from the hub on every run.";
         _trellis = new Trellis2ImageTo3D(_accelerator, Trellis2Weights.FromModelSource(ranged)) { StageDone = OnStageDone };
+        // ?trace=1: a console line per step before the first stage, the device drained before each (Trellis2ImageTo3D.Trace: finds where a hang is)
+        if (new Uri(Nav.Uri).Query.Contains("trace=1"))
+        {
+            _trellis.Trace = line => Console.WriteLine("[Trellis2 trace] " + line);
+            _trellis.TraceSync = true;
+        }
     }
 
     // bytes of the planned-for-cache files that are not in OPFS yet (they download once, on the next run)

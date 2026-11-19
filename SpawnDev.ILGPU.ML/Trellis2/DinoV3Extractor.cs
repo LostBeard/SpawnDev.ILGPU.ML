@@ -148,6 +148,7 @@ public sealed class DinoV3Extractor : IDisposable
                 l.Scale1 = F32Copy(p + "layer_scale1.lambda1"); l.Scale2 = F32Copy(p + "layer_scale2.lambda1");
             }
             _layers[i] = l;
+            _acc.Submit();   // the weight conversion, a command buffer per layer in the browser (DeviceSync.Submit)
         }
         _acc.Fence();
     }
@@ -193,6 +194,7 @@ public sealed class DinoV3Extractor : IDisposable
             _sk.Linear(hn.View, l.Up, l.UpBias, mlp.View, N, C, Mlp, act: 3);
             _sk.Linear(mlp.View, l.Down, l.DownBias, proj.View, N, Mlp, C);
             _dk.GateResidual(h.View, proj.View, l.Scale2, 0, N * C, C);
+            _acc.Submit();   // one command buffer per layer in the browser (DeviceSync.Submit: the GPU watchdog on slower cards)
         }
         _dk.LayerNormPlain(h.View, o, N, C, 1e-5f);                                  // F.layer_norm(hidden_states, hidden_states.shape[-1:])
         _acc.Fence();
