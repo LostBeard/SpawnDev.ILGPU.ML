@@ -2,8 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.8.23 - 2026-11-19 (nuget.org) - browser AOT leaves the GPU kernels interpreted; LTX-2 in-place image to video; fp8 LoRA compat exact; SpawnDev.ILGPU 5.4.38
 
+- **SpawnDev.ILGPU 5.4.38** (stable 2026-11-19; ML gate on its local.2: 7,812 / 0 / 495, zero outcome changes against the 5.4.37 gate, no kernel hit the new
+  fail-loud check for unimplementable calls): accurate WebGPU / WebGL log, a WGSL short-circuit miscompile fixed, Math / MathF remaps (Log2, Cbrt, ...), and
+  its ArgumentMapper rewritten without the polymorphic generic recursion that mono AOT expands to its depth cap (Bones: 94-100% of the dedup pass in it;
+  a standalone repro 8,050 s -> 5 s).
+- **The demo's browser AOT publish: 16.7 minutes, from 2 h 40 min** (MEASURED 2026-11-19 by Bones, this commit's code, a clean clone restoring from nuget.org,
+  12 threads; the baseline 02df20f on 2026-11-16, GitHub's runner 2 h 40 min). The two single-threaded tails are gone: clang -O2 on SpawnDev.ILGPU.ML.dll's
+  bitcode 3,481 s -> 386 s (the generated kernels left to the interpreter, below), and mono's aot-instances pass 1,049 s of JIT -> 10.1 s (53,952 instances,
+  19.2 -> 0.19 ms each: SpawnDev.ILGPU 5.4.38's ArgumentMapper). dotnet.native.wasm 30.4 MB gzip / 18.65 MB brotli (the live build of an older commit: 31.7 /
+  19.17; different commits, not a clean A/B); the interpreted SpawnDev.ILGPU.ML.Kernels assembly adds 0.63 MB gzip / 0.45 MB brotli.
 - **LTX-2 in-place image to video** (`Ltx2Guide.InPlace(frameMask)`, ComfyUI's LTXVImgToVideoInplace; SpawnGen's request): a guide with 0 guide frames, only the
   denoise mask (the start picture encoded into the first latent frame at 1 - strength). MEASURED 2026-11-18 against ComfyUI (128 x 96 x 9, cfg 4, 2 steps,
   CUDA): strength 1 calls 2.9e-6 / 9.8e-7, sampled final latent 2.4e-5; strength 0.6 calls 7.9e-6 / 7.2e-6, final 8.3e-5 (`Ltx2_InPlaceI2V_MatchesComfyUi`;
