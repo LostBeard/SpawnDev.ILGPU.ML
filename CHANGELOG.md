@@ -4,10 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
-- **LTX-2 keyframe-guided attention on the tensor cores** (`DiTKernels.BiasedAttention`: the guides' two-group score bias, `MmaAttention.KernelExactBias` /
-  `KernelBias`, generated from the plain kernels by one transform). Guided calls with a guide strength below 1 ran the portable fp32 kernel; now they run
-  the same kernel kind as unguided attention. MEASURED 2026-11-19, RTX 4070, 6528 tokens (a 384-token guide frame), 32 heads x 128: portable 193.6 ms,
-  exact tensor-core 61.3 ms (3.2x), bf16 tensor-core (PreciseActivations off) 23.7 ms. `TensorCoreBiasedAttention` (env `TRELLIS2_MMA_BIAS_ATTN=0`) turns it off.
+- **LTX-2 keyframe-guided attention on the tensor cores, opt-in** (`DiTKernels.TensorCoreBiasedAttention`, env `TRELLIS2_MMA_BIAS_ATTN=1`; `BiasedAttention`:
+  the guides' two-group score bias, `MmaAttention.KernelExactBias` / `KernelBias`, generated from the plain kernels by one transform). Default OFF: a
+  pre-registered keyframe clip test (768 x 512 x 121, strength 0.6, seeds 42 / 7 / 1234) put it at a mean |frame difference| of 0.229 from the CUDA fp32
+  clip where OpenCL is at 0.215 (the rule needed no larger; the three clips sit about equally far apart, but the rule stands). MEASURED 2026-11-19, RTX 4070, 6528 tokens (a 384-token guide frame), 32 heads x 128: portable 193.6 ms,
+  exact tensor-core 61.3 ms (3.2x), bf16 tensor-core (PreciseActivations off) 23.7 ms. Its ComfyUI gates pass with it on (the two-guide call 1.27e-5).
 - **The exact tensor-core attention is now at fp32 accuracy: fp16 halves instead of bf16** (`MmaAttention.KernelExact`, the precise path's default since
   5.8.22). Each of q, k, v and the probabilities is hi + lo in fp16 (22 bits a value where bf16 gave 16), with power-of-two scales (exact) from a device-side
   max-abs pass (`MmaAttention.MaxAbs` / `Pow2Scale`) to fit fp16's range. Found by the guided kernel: the bf16 form's 3e-6 per call failed the two-guide

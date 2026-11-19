@@ -698,12 +698,15 @@ public sealed class DiTKernels
         => headDim == 128 && ((TensorCoreBiasedAttention && (UsesMmaExactAttention(headDim) || UsesMmaAttention(headDim))) || UsesTiledAttention(headDim));
 
     /// <summary>
-    /// <see cref="BiasedAttention"/> on the tensor cores where <see cref="Attention"/> runs there (default true; env TRELLIS2_MMA_BIAS_ATTN=0 = the portable fp32 kernel,
-    /// as before 2026-11-19). MEASURED 2026-11-19, RTX 4070, 6528 x 6528 tokens (a 384-token guide frame at ln 0.6), 32 heads: portable 193.6 ms, exact tensor-core
+    /// <see cref="BiasedAttention"/> on the tensor cores where <see cref="Attention"/> runs there. Default OFF (env TRELLIS2_MMA_BIAS_ATTN=1 turns it on): the portable
+    /// fp32 kernel, as before. DECIDED 2026-11-19 by a pre-registered test (the rule written before any clip ran): LTX-2 distilled 768 x 512 x 121 clips guided
+    /// by a keyframe at frame 0, strength 0.6, seeds 42 / 7 / 1234, mean |frame difference| (0..255) from the CUDA all-fp32 clip: these kernels (with the fp16
+    /// exact attention) 0.302 / 0.130 / 0.256 (mean 0.229), the OpenCL fp32 path 0.268 / 0.089 / 0.289 (mean 0.215); the rule needed the first to be no larger.
+    /// The three clips sit about equally far apart (the tensor-core one vs OpenCL 0.237 / 0.086 / 0.333), so the miss is inside the spread, but the rule stands. MEASURED 2026-11-19, RTX 4070, 6528 x 6528 tokens (a 384-token guide frame at ln 0.6), 32 heads: portable 193.6 ms, exact tensor-core
     /// (fp16 halves) 61.3 ms, bf16 tensor-core 23.7 ms. Against ComfyUI on CUDA the two-guide call is 1.27e-5 (before: the portable biased kernel
     /// beside the bf16-halves exact one 2.26e-5; OpenCL, all fp32, 4.80e-6).
     /// </summary>
-    public bool TensorCoreBiasedAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_BIAS_ATTN") != "0";
+    public bool TensorCoreBiasedAttention { get; set; } = Environment.GetEnvironmentVariable("TRELLIS2_MMA_BIAS_ATTN") == "1";
 
     /// <summary>
     /// Self-attention over <paramref name="N"/> tokens (as <see cref="Attention"/>; q and k / v may sit in one buffer or two) with a two-group additive score bias: tokens

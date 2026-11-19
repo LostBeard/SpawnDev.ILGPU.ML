@@ -537,8 +537,8 @@ public abstract partial class MLTestBase
             var kinds = new List<(string Name, DiTKernels K, double Bar)> { ("portable", new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false }, 1e-4) };
             if (SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator) && D == MmaAttention.HeadDim)
             {
-                kinds.Add(("exact tensor-core", new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true }, 1e-4));
-                kinds.Add(("bf16 tensor-core", new DiTKernels(accelerator) { PreciseActivations = false }, 3e-2));   // bf16 q / k / v / p: ~2^-8 of values up to 2
+                kinds.Add(("exact tensor-core", new DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true, TensorCoreBiasedAttention = true }, 1e-4));
+                kinds.Add(("bf16 tensor-core", new DiTKernels(accelerator) { PreciseActivations = false, TensorCoreBiasedAttention = true }, 3e-2));   // bf16 q / k / v / p: ~2^-8 of values up to 2
             }
             string line = $"{tag}: bias effect {effect:E1}";
             bool portableFlash = false;

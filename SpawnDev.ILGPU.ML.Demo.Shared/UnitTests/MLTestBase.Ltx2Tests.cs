@@ -862,8 +862,8 @@ public abstract partial class MLTestBase
         foreach (var (name, data) in pending) caps[name] = await data;
         int N = F * hw;
         var portable = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = false };
-        var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true };
-        var fast = new Trellis2.DiTKernels(accelerator) { PreciseActivations = false };
+        var exactTc = new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true, TensorCoreBiasedAttention = true };
+        var fast = new Trellis2.DiTKernels(accelerator) { PreciseActivations = false, TensorCoreBiasedAttention = true };
         var report = new List<string>();
         foreach (var qName in caps.Keys.Where(k => k.Contains(".attn1.bias_q.")).OrderBy(k => k, StringComparer.Ordinal))
         {
@@ -1210,7 +1210,7 @@ public abstract partial class MLTestBase
             using var tbv = accelerator.Allocate1D(tb);
             using var qg = accelerator.Allocate1D(Rand((long)Ng * C)); using var kvg = accelerator.Allocate1D(Rand((long)Ng * 2 * C)); using var og = accelerator.Allocate1D<float>((long)Ng * C);
             double flops = 4.0 * Ng * Ng * H * D;
-            var kinds = new List<(string Name, Trellis2.DiTKernels K)> { ("portable", precise), ("exact tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true }), ("bf16 tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = false }) };
+            var kinds = new List<(string Name, Trellis2.DiTKernels K)> { ("portable", precise), ("exact tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = true, ExactTensorCoreAttention = true, TensorCoreBiasedAttention = true }), ("bf16 tensor-core", new Trellis2.DiTKernels(accelerator) { PreciseActivations = false, TensorCoreBiasedAttention = true }) };
             double tPort = 0; float[]? hostB = null; var parts = new List<string>();
             foreach (var (name, k) in kinds)
             {
