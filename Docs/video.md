@@ -279,7 +279,10 @@ attention masks are supported by the model call (`Ltx2Guide`).
 
 **LoRA on the 8-bit layers, two modes.** ComfyUI adds a LoRA to an fp8 weight and then re-rounds the sum to 8 bits with a seeded random rounding, which costs about a
 third of a one-block LoRA's effect in noise. The default here keeps the sum exact in float32 (the LoRA's full effect). `Ltx2Request.ComfyCompatibleFp8Lora = true`
-reproduces ComfyUI's rounding exactly (measured from its outputs, never read from its source): use it to reproduce a ComfyUI render.
+reproduces ComfyUI's rounding exactly (measured from its outputs, never read from its source): use it to reproduce a ComfyUI render. The rule, including two
+half-precision steps of ComfyUI's arithmetic (the exponent from a half-precision log2, frac + u rounded to half), is held against ComfyUI's own patched weights:
+every 8-bit LoRA tensor of every fp8 block (1,176 tensors, 16.2 billion elements, MEASURED 2026-11-18 on an RX 590) equals ComfyUI's except 6,180 elements, each a
+float32 summation-order tie (`Ltx2_Fp8CompatWeights_MatchComfyUiDump`).
 
 **The stages on their own:** `Gemma3TextEncoder`, `Ltx2TextConnectors`, `Ltx2Transformer` / `Ltx2AvModel` (the model call and the sampler in ComfyUI's form),
 `Ltx2Schedule` (LTXVScheduler), `Ltx2VideoDecoder`, `Ltx2VideoEncoder`, `Ltx2AudioDecoder`, `Ltx2LatentUpsampler` (the x2 latent upscaler), `Ltx2Lora`.

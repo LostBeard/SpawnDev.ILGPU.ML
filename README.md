@@ -322,6 +322,11 @@ Scope a run with environment variables, for example `PMT_LANES=cuda,webgpu` for 
 
 The demo is published with `dotnet publish SpawnDev.ILGPU.ML.Demo -c Release -p:DemoAot=true` (AOT keeps the CPU-bound stages of the 3D pipeline fast in the browser).
 
+**Browser AOT and the GPU kernels.** The generated GPU kernels ship in their own assembly inside this package, `SpawnDev.ILGPU.ML.Kernels.dll`, and the package's
+`buildTransitive` targets leave it to the interpreter in a Blazor WebAssembly AOT build: in a browser those methods never run as .NET code (SpawnDev.ILGPU
+compiles kernels from their IL), and AOT-compiling them was most of the library's AOT build time and machine code (MEASURED 2026-11-18: 83% of the 58-minute
+clang step, 74% of the code). An app that runs a `CPUAccelerator` in the browser and wants those kernels compiled sets `<SpawnDevMLAotKernels>true</SpawnDevMLAotKernels>`.
+
 ## Model licenses
 
 The code in this repository is MIT. Model weights keep their own licenses, which travel with the files on the models host and are listed in each model's doc. Notably, **FLUX 3 Image Klein weights are under the FLUX Kommunity License (non-commercial)**, FLUX.2 klein is Apache-2.0, **LTX-Video weights are under the LTXV Open Weights License (use restrictions; entities with $10M+ annual revenue need a commercial licence from Lightricks)**, Wan 2.2 is Apache-2.0, Stable Diffusion checkpoints carry their own CreativeML / Open RAIL licences, TRELLIS.2, SkinTokens and UniRig are MIT, and the bundled Kimodo motion clips carry the terms in [`SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md`](SpawnDev.ILGPU.ML.Demo/wwwroot/motions/NOTICE.md). Check them before commercial use.
