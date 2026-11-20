@@ -160,7 +160,7 @@ public sealed class SparseKernels
             _mmaConv(new KernelConfig(tiles, MmaGemm.Threads), x.Cast<float, F4>(), weight.Cast<global::ILGPU.Half, U4>(), bias, o, _noRes.View, nbr, M, taps * cin, cout, cin, 1, 0, 0);
             return;
         }
-        if (UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, x.Length / cin, cin))
+        if (UseTiledGather(taps, cin) && TiledGemm.Fits(M, taps * cin, cout, x.Length / cin, cin))
         {
             _tiledGemm ??= _acc.LoadStreamKernel<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>(TiledGemm.For(_acc));
             EnsureTiledDummies();
@@ -257,7 +257,24 @@ public sealed class SparseKernels
     }
 
     /// <summary>True when <see cref="ConvTapsExact"/> can run (the portable tiled GEMM, never the tensor-core path, which rounds the activations to fp16).</summary>
-    public bool ConvTapsExactOk(int M, int taps, int cin, int cout, long xRows) => UseTiled(taps * cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
+    public bool ConvTapsExactOk(int M, int taps, int cin, int cout, long xRows) => UseTiledGather(taps, cin) && TiledGemm.Fits(M, taps * cin, cout, xRows, cin);
+
+    /// <summary>
+    /// <see cref="ConvTapsExact"/> with an fp32 weight given as its fp16 high and low halves (<see cref="SdWeights.KeepLowHalves"/>) in ONE pass: the tiled GEMM sums
+    /// hi + lo in fp32 (exact) while it stages the weights (TiledGemm.GemmGatherF16Split). Replaces two ConvTapsExact calls (the second adding the low halves' product):
+    /// half the arithmetic, one accumulation. <paramref name="biasLo"/> with <paramref name="bias"/> only. Needs <see cref="ConvTapsExactOk"/>.
+    /// </summary>
+    public void ConvTapsExactSplit(FV x, IV nbr, HV weight, HV weightLo, HV? bias, HV? biasLo, FV o, int M, int cin, int cout, int taps)
+    {
+        _tiledGemmSplit ??= _acc.LoadStreamKernel<FV, UV, UV, UV, UV, FV, IV, int, int, int, int, int>(TiledGemm.ForGatherF16Split(_acc));
+        EnsureTiledDummies();
+        int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
+        int hasBias = bias.HasValue ? (biasLo.HasValue ? 3 : 1) : 0;
+        _tiledGemmSplit(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), weightLo.Cast<global::ILGPU.Half, uint>(),
+            bias.HasValue ? BiasWords(bias.Value) : _tiledDummyU!.View, biasLo.HasValue ? BiasWords(biasLo.Value) : _tiledDummyU!.View, o, nbr,
+            M, taps * cin, cout, cin, TiledGemm.SplitFlags(hasBias, 0, 0));
+    }
+    private Action<KernelConfig, FV, UV, UV, UV, UV, FV, IV, int, int, int, int, int>? _tiledGemmSplit;
 
     /// <summary>
     /// <see cref="ConvTaps"/> on the portable tiled GEMM with fp32 activations all the way (no tensor cores). <paramref name="addToOutput"/> adds the product to what <paramref name="o"/> already
@@ -280,7 +297,7 @@ public sealed class SparseKernels
     /// </summary>
     public void ConvTapsBf16Exact(FV x, IV nbr, ArrayView1D<BFloat16, Stride1D.Dense> weight, ArrayView1D<BFloat16, Stride1D.Dense>? bias, FV o, int M, int cin, int cout, int taps)
     {
-        if (!UseTiled(taps * cin))
+        if (!UseTiledGather(taps, cin))
         {
             // threw NotSupportedException here until 2026-11-17: the LTX-2 decoders could not run on CPU / Velocity / WebGL at all (Ltx2_ConvBf16Exact_MatchesHost,
             // first run on those lanes). Row ranges per dispatch as below, so no dispatch grows with the input.
@@ -561,6 +578,9 @@ public sealed class SparseKernels
     // Portable register-tiled path for every backend without the tensor-core kernels (see DiTKernels.UseTiled).
     private MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>? _normDummyG, _normDummyB;
     private bool UseTiled(int K) => DiTKernels.EnableTiled && K % TiledGemm.BK == 0 && _acc.MaxNumThreadsPerGroup >= TiledGemm.Threads && _acc.AcceleratorType != AcceleratorType.WebGL;
+    // the gathered-rows GEMM steps through one tap at a time (2026-11-20, no division per element): the channel count must be a multiple of its k step. Always true for
+    // 1, 9 or 27 taps once taps * cin is (they are odd); another tap count with such a cin takes the plain kernel.
+    private bool UseTiledGather(int taps, int cin) => UseTiled(taps * cin) && cin % TiledGemm.BK == 0;
     private Action<KernelConfig, FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int>? _tiledGemm;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU;
     private MemoryBuffer1D<float, Stride1D.Dense>? _tiledDummyF;

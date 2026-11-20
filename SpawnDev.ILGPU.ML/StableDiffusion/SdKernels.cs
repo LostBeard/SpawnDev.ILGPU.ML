@@ -190,8 +190,9 @@ public sealed class SdKernels
             var yo = y.SubView((long)m0 * cout, (long)rows * cout);
             if (exact && _sk.ConvTapsExactOk(rows, taps, cin, cout, x.Length / cin))
             {
-                _sk.ConvTapsExact(x, nb, weight, yo, rows, cin, cout, taps, false, bias);
-                if (weightLo.HasValue) _sk.ConvTapsExact(x, nb, weightLo.Value, yo, rows, cin, cout, taps, true, biasLo);   // + the low halves (and the bias's)
+                // an fp32 weight's two halves in one pass (2026-11-20: was a second GEMM adding the low halves' product, twice the work)
+                if (weightLo.HasValue) _sk.ConvTapsExactSplit(x, nb, weight, weightLo.Value, bias, biasLo, yo, rows, cin, cout, taps);
+                else _sk.ConvTapsExact(x, nb, weight, yo, rows, cin, cout, taps, false, bias);
             }
             else
             {

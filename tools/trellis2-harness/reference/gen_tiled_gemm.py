@@ -26,7 +26,7 @@ LD = 132          # shared row stride (floats): 132 % 32 = 4 -> the transposed s
 out = []
 w = out.append
 
-def kernel(name, BK, variants=((True, True), (True, False), (False, False)), summary=None):
+def kernel(name, BK, variants=((True, True), (True, False), (False, False)), summary=None, split=False):
     # ONE kernel for all three variants (bf16 / f16 weights, dense / gathered rows), chosen by the uniform `mode` argument: on WebGPU each
     # kernel costs ~7 s of IL -> WGSL compile in the browser's interpreted .NET runtime plus a shader compile, MEASURED per variant.
     NA = BM * BK // TH              # A floats per thread per k step
@@ -35,9 +35,17 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
     sb = (BK // 2).bit_length() - 1
     tail = BK > 8                   # K is a multiple of 8, not necessarily of BK: the last step is masked
     w(summary or f"    /// <summary>k step {BK}. mode bit 0: f16 weights (else bf16); bit 1: gathered rows (sparse conv, A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]) - gathered rows read F16 weights only (bf16 gathered: GemmGatherBf16). grid = ceil(M/128) * ceil(N/128), group = {TH}, shared {2 * BK * LD * 4} bytes.</summary>")
-    w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)")
-    w("    {")
-    w("        bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;")
+    if split:
+        # own signature: two more weight views would pass ILGPU's 16 launcher type arguments, so the small flags share one int and Res goes
+        # (a convolution adds to C in place, hasRes 2, or not at all)
+        w(f"    public static void {name}(FV A, UV W, UV WLo, UV Bias, UV BiasLo, FV C, IV nbr, int M, int K, int N, int cin, int flags)")
+        w("    {")
+        w("        bool f16 = true;")
+        w("        int hasBias = flags & 3, hasRes = (flags >> 2) & 3, act = flags >> 4;")
+    else:
+        w(f"    public static void {name}(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)")
+        w("    {")
+        w("        bool f16 = (mode & 1) != 0, gather = (mode & 2) != 0;")
     w(f"        int tilesN = (N + {BN - 1}) / {BN};")
     w("        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX - tm * tilesN;")
     w("        int tid = Group.IdxX, tx = tid & 15, ty = tid >> 4;")
@@ -63,32 +71,64 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
     def kloop(f16v, gatherv, indent):
         sp = " " * indent
         lo, hi = ("F16Lo", "F16Hi") if f16v else ("Bf16Lo", "Bf16Hi")
+        # Gathered rows, hoisted (2026-11-20): cin is a multiple of the k step (the host requires it), so one k step never crosses a tap: the
+        # tap and the channel offset are uniform across the group, kept as running counters (no division), and each thread's neighbour rows
+        # are read once per tap instead of once per element. Was GatherA: a division and a table read for every A element.
+        # MEASURED (Sd_VaeConv_Benchmark, the SD VAE decoder's six 3x3 shapes at 512 x 512, sum of medians): RTX 4070 CUDA 129 -> 109 ms,
+        # Chrome WebGPU 150 -> 124 ms; with an fp32 weight's halves (GemmGatherF16Split, one pass instead of two) CUDA 248 -> 119 ms, WebGPU 278 -> 134 ms.
+        assert not (gatherv and tail), "the hoisted gather needs k step 8"
         def loadA(r, k0):
             kOk = f" && {k0} + aK{r} < K" if tail else ""
             if gatherv:
                 return f"aM{r} < M{kOk} ? GatherA(A, nbr, aM{r}, {k0} + aK{r}, cin) : 0f"
             return f"aM{r} < M{kOk} ? A[aOff{r} + {k0}] : 0f"
-        def loadB(r, k0):
+        def loadB(r, k0, arr="W"):
             kOk = f" && {k0} + 2 * bW{r} < K" if tail else ""
-            return f"bN{r} < N{kOk} ? W[bOff{r} + ({k0} >> 1)] : 0u"
-        for r in range(NA):
-            w(f"{sp}float pa{r} = {loadA(r, '0')};")
+            return f"bN{r} < N{kOk} ? {arr}[bOff{r} + ({k0} >> 1)] : 0u"
+        if gatherv:
+            w(f"{sp}int gci = 0, gtap = 0;")
+            for r in range(NA):
+                w(f"{sp}int gs{r} = aM{r} < M ? nbr[aM{r} * 27] : -1;")
+            for r in range(NA):
+                w(f"{sp}float pa{r} = gs{r} >= 0 ? A[gs{r} * cin + aK{r}] : 0f;")
+        else:
+            for r in range(NA):
+                w(f"{sp}float pa{r} = {loadA(r, '0')};")
         for r in range(NB):
             w(f"{sp}uint pb{r} = {loadB(r, '0')};")
+            if split:
+                w(f"{sp}uint pl{r} = {loadB(r, '0', 'WLo')};")
         w(f"{sp}for (int k0 = 0; k0 < K; k0 += {BK})")
         w(f"{sp}{{")
         for r in range(NA):
             w(f"{sp}    As[aK{r} * {LD} + aRow{r}] = pa{r};")
         for r in range(NB):
-            w(f"{sp}    Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r});")
+            if split:
+                # hi + lo in fp32 is exact (11 + 11 bits): the weight at 22 bits, one product per term
+                w(f"{sp}    Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}) + {lo}(pl{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r}) + {hi}(pl{r});")
+            else:
+                w(f"{sp}    Bs[(2 * bW{r}) * {LD} + bRow{r}] = {lo}(pb{r}); Bs[(2 * bW{r} + 1) * {LD} + bRow{r}] = {hi}(pb{r});")
         w(f"{sp}    Group.Barrier();")
         w(f"{sp}    int kn = k0 + {BK};")
         w(f"{sp}    if (kn < K)")
         w(f"{sp}    {{")
-        for r in range(NA):
-            w(f"{sp}        pa{r} = {loadA(r, 'kn')};")
+        if gatherv:
+            w(f"{sp}        gci += {BK};")
+            w(f"{sp}        if (gci == cin)")
+            w(f"{sp}        {{")
+            w(f"{sp}            gci = 0; gtap++;")
+            for r in range(NA):
+                w(f"{sp}            gs{r} = aM{r} < M ? nbr[aM{r} * 27 + gtap] : -1;")
+            w(f"{sp}        }}")
+            for r in range(NA):
+                w(f"{sp}        pa{r} = gs{r} >= 0 ? A[gs{r} * cin + gci + aK{r}] : 0f;")
+        else:
+            for r in range(NA):
+                w(f"{sp}        pa{r} = {loadA(r, 'kn')};")
         for r in range(NB):
             w(f"{sp}        pb{r} = {loadB(r, 'kn')};")
+            if split:
+                w(f"{sp}        pl{r} = {loadB(r, 'kn', 'WLo')};")
         w(f"{sp}    }}")
         # KU = k steps per iteration of the inner loop, emitted with constant offsets (GEMM_KU=8 removes the loop). MEASURED 2026-10-21 on WebGPU
         # (RTX 4070, Chrome 156, SpawnDev.ILGPU 5.4.1-local.2, 4096x1536 -> 6144): NO GAIN from source-level unrolling, so the default stays 1.
@@ -145,14 +185,21 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
         w("        }")
     for j in range(8):
         w(f"        int n{j} = nBase + tx + {16 * j};")
-        w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? Lo(Bias[n{j} >> 1], f16) : Hi(Bias[n{j} >> 1], f16)) : 0f;")
+        if split:
+            # hasBias: 1 = the high halves, 3 = high + low
+            w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? F16Lo(Bias[n{j} >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n{j} >> 1]) : 0f) : F16Hi(Bias[n{j} >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n{j} >> 1]) : 0f)) : 0f;")
+        else:
+            w(f"        float bias{j} = hasBias != 0 && n{j} < N ? ((n{j} & 1) == 0 ? Lo(Bias[n{j} >> 1], f16) : Hi(Bias[n{j} >> 1], f16)) : 0f;")
     for i in range(8):
         w(f"        int m{i} = mBase + ty + {16 * i};")
         w(f"        if (m{i} < M)")
         w("        {")
         w(f"            int rb = m{i} * N;")
         for j in range(8):
-            w(f"            if (n{j} < N) {{ float v = KernelMath.Activate(c{i}{j} + bias{j}, act); if (hasRes == 1) v += Res[rb + n{j}]; else if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
+            if split:
+                w(f"            if (n{j} < N) {{ float v = KernelMath.Activate(c{i}{j} + bias{j}, act); if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
+            else:
+                w(f"            if (n{j} < N) {{ float v = KernelMath.Activate(c{i}{j} + bias{j}, act); if (hasRes == 1) v += Res[rb + n{j}]; else if (hasRes == 2) v += C[rb + n{j}]; C[rb + n{j}] = v; }}")
         w("        }")
     w("    }")
     w("")
@@ -179,6 +226,12 @@ w("    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int
 w("")
 w("    /// <summary>The gathered-rows GEMM with BF16 weights (<see cref=\"GemmGatherBf16\"/>): a kernel of its own, so <see cref=\"Gemm\"/> keeps three k-loops.</summary>")
 w("    public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> ForGatherBf16(Accelerator accelerator) => GemmGatherBf16;")
+w("")
+w("    /// <summary>The gathered-rows GEMM with an fp32 weight as fp16 high + low halves in one pass (<see cref=\"GemmGatherF16Split\"/>).</summary>")
+w("    public static Action<FV, UV, UV, UV, UV, FV, IV, int, int, int, int, int> ForGatherF16Split(Accelerator accelerator) => GemmGatherF16Split;")
+w("")
+w("    /// <summary>The flags argument of <see cref=\"GemmGatherF16Split\"/>: hasBias (0, 1 = high halves, 3 = high + low) | hasRes (0, or 2 = add to C) &lt;&lt; 2 | act &lt;&lt; 4.</summary>")
+w("    public static int SplitFlags(int hasBias, int hasRes, int act) => hasBias | (hasRes << 2) | (act << 4);")
 w("")
 w("    /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>")
 w("    /// <remarks>Dense A: A[m * K + k]. Gathered A (pass <paramref name=\"cin\"/>): A[nbr[m * 27 + tap] * cin + ci], so the activation bound is rowsA * cin, not M * K or rowsA * K (a 3x3x3 convolution on 225k voxels of 512 channels has M * K = 3.1e9 and is still exact).</remarks>")
@@ -207,6 +260,8 @@ w("        return src >= 0 ? A[src * cin + ci] : 0f;")
 w("    }")
 w("")
 kernel("Gemm", BK)
+kernel("GemmGatherF16Split", BK, variants=((True, True),), split=True,
+       summary=f"    /// <summary>k step {BK}: gathered rows with an fp32 weight given as fp16 high and low halves [N, K] (W, WLo; SdWeights.KeepLowHalves), summed in fp32 while B is staged: the full-precision convolution in ONE pass (it was two GEMMs, the second adding the low halves' product). Bias likewise (BiasLo with hasBias 3). See SplitFlags. grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
 kernel("GemmGatherBf16", BK, variants=((False, True),),
        summary=f"    /// <summary>k step {BK}: gathered rows (A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]) with BF16 weights [N, K] (the LTX-2 VAE's exact convolutions). Pass mode = ModeBf16 | ModeGather (the bias is read as bf16). grid = ceil(M/128) * ceil(N/128), group = {TH}.</summary>")
 w("}")

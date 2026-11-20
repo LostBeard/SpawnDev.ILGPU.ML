@@ -21,6 +21,12 @@ internal static class TiledGemm
     /// <summary>The gathered-rows GEMM with BF16 weights (<see cref="GemmGatherBf16"/>): a kernel of its own, so <see cref="Gemm"/> keeps three k-loops.</summary>
     public static Action<FV, UV, UV, FV, FV, IV, int, int, int, int, int, int, int, int> ForGatherBf16(Accelerator accelerator) => GemmGatherBf16;
 
+    /// <summary>The gathered-rows GEMM with an fp32 weight as fp16 high + low halves in one pass (<see cref="GemmGatherF16Split"/>).</summary>
+    public static Action<FV, UV, UV, UV, UV, FV, IV, int, int, int, int, int> ForGatherF16Split(Accelerator accelerator) => GemmGatherF16Split;
+
+    /// <summary>The flags argument of <see cref="GemmGatherF16Split"/>: hasBias (0, 1 = high halves, 3 = high + low) | hasRes (0, or 2 = add to C) &lt;&lt; 2 | act &lt;&lt; 4.</summary>
+    public static int SplitFlags(int hasBias, int hasRes, int act) => hasBias | (hasRes << 2) | (act << 4);
+
     /// <summary>The kernels index in int (64-bit index math is emulated on WebGPU): every flat index of A, C, W and the neighbour table must fit.</summary>
     /// <remarks>Dense A: A[m * K + k]. Gathered A (pass <paramref name="cin"/>): A[nbr[m * 27 + tap] * cin + ci], so the activation bound is rowsA * cin, not M * K or rowsA * K (a 3x3x3 convolution on 225k voxels of 512 channels has M * K = 3.1e9 and is still exact).</remarks>
     public static bool Fits(long M, long K, long N, long rowsA = -1, long cin = 0) => M * N < int.MaxValue && N * K < int.MaxValue && M * 27 < int.MaxValue && (cin > 0 ? (rowsA < 0 ? M : rowsA) * cin < int.MaxValue : M * K < int.MaxValue && (rowsA < 0 || rowsA * K < int.MaxValue));
@@ -79,10 +85,15 @@ internal static class TiledGemm
         float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
         if (gather)
         {
-            float pa0 = aM0 < M ? GatherA(A, nbr, aM0, 0 + aK0, cin) : 0f;
-            float pa1 = aM1 < M ? GatherA(A, nbr, aM1, 0 + aK1, cin) : 0f;
-            float pa2 = aM2 < M ? GatherA(A, nbr, aM2, 0 + aK2, cin) : 0f;
-            float pa3 = aM3 < M ? GatherA(A, nbr, aM3, 0 + aK3, cin) : 0f;
+            int gci = 0, gtap = 0;
+            int gs0 = aM0 < M ? nbr[aM0 * 27] : -1;
+            int gs1 = aM1 < M ? nbr[aM1 * 27] : -1;
+            int gs2 = aM2 < M ? nbr[aM2 * 27] : -1;
+            int gs3 = aM3 < M ? nbr[aM3 * 27] : -1;
+            float pa0 = gs0 >= 0 ? A[gs0 * cin + aK0] : 0f;
+            float pa1 = gs1 >= 0 ? A[gs1 * cin + aK1] : 0f;
+            float pa2 = gs2 >= 0 ? A[gs2 * cin + aK2] : 0f;
+            float pa3 = gs3 >= 0 ? A[gs3 * cin + aK3] : 0f;
             uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
             uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
             for (int k0 = 0; k0 < K; k0 += 8)
@@ -97,10 +108,19 @@ internal static class TiledGemm
                 int kn = k0 + 8;
                 if (kn < K)
                 {
-                    pa0 = aM0 < M ? GatherA(A, nbr, aM0, kn + aK0, cin) : 0f;
-                    pa1 = aM1 < M ? GatherA(A, nbr, aM1, kn + aK1, cin) : 0f;
-                    pa2 = aM2 < M ? GatherA(A, nbr, aM2, kn + aK2, cin) : 0f;
-                    pa3 = aM3 < M ? GatherA(A, nbr, aM3, kn + aK3, cin) : 0f;
+                    gci += 8;
+                    if (gci == cin)
+                    {
+                        gci = 0; gtap++;
+                        gs0 = aM0 < M ? nbr[aM0 * 27 + gtap] : -1;
+                        gs1 = aM1 < M ? nbr[aM1 * 27 + gtap] : -1;
+                        gs2 = aM2 < M ? nbr[aM2 * 27 + gtap] : -1;
+                        gs3 = aM3 < M ? nbr[aM3 * 27 + gtap] : -1;
+                    }
+                    pa0 = gs0 >= 0 ? A[gs0 * cin + gci + aK0] : 0f;
+                    pa1 = gs1 >= 0 ? A[gs1 * cin + gci + aK1] : 0f;
+                    pa2 = gs2 >= 0 ? A[gs2 * cin + gci + aK2] : 0f;
+                    pa3 = gs3 >= 0 ? A[gs3 * cin + gci + aK3] : 0f;
                     pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
                     pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
                 }
@@ -373,6 +393,234 @@ internal static class TiledGemm
         }
     }
 
+    /// <summary>k step 8: gathered rows with an fp32 weight given as fp16 high and low halves [N, K] (W, WLo; SdWeights.KeepLowHalves), summed in fp32 while B is staged: the full-precision convolution in ONE pass (it was two GEMMs, the second adding the low halves' product). Bias likewise (BiasLo with hasBias 3). See SplitFlags. grid = ceil(M/128) * ceil(N/128), group = 256.</summary>
+    public static void GemmGatherF16Split(FV A, UV W, UV WLo, UV Bias, UV BiasLo, FV C, IV nbr, int M, int K, int N, int cin, int flags)
+    {
+        bool f16 = true;
+        int hasBias = flags & 3, hasRes = (flags >> 2) & 3, act = flags >> 4;
+        int tilesN = (N + 127) / 128;
+        int tm = Grid.IdxX / tilesN, tn = Grid.IdxX - tm * tilesN;
+        int tid = Group.IdxX, tx = tid & 15, ty = tid >> 4;
+        var As = SharedMemory.Allocate<float>(1056);
+        var Bs = SharedMemory.Allocate<float>(1056);
+        int mBase = tm * 128, nBase = tn * 128;
+        int aRow0 = (0 + tid) >> 3, aK0 = (0 + tid) & 7, aM0 = mBase + aRow0;
+        int aRow1 = (256 + tid) >> 3, aK1 = (256 + tid) & 7, aM1 = mBase + aRow1;
+        int aRow2 = (512 + tid) >> 3, aK2 = (512 + tid) & 7, aM2 = mBase + aRow2;
+        int aRow3 = (768 + tid) >> 3, aK3 = (768 + tid) & 7, aM3 = mBase + aRow3;
+        int bRow0 = (0 + tid) >> 2, bW0 = (0 + tid) & 3, bN0 = nBase + bRow0;
+        int bRow1 = (256 + tid) >> 2, bW1 = (256 + tid) & 3, bN1 = nBase + bRow1;
+        int aOff0 = aM0 * K + aK0;
+        int aOff1 = aM1 * K + aK1;
+        int aOff2 = aM2 * K + aK2;
+        int aOff3 = aM3 * K + aK3;
+        int bOff0 = ((bN0 * K) >> 1) + bW0;
+        int bOff1 = ((bN1 * K) >> 1) + bW1;
+        float c00 = 0f, c01 = 0f, c02 = 0f, c03 = 0f, c04 = 0f, c05 = 0f, c06 = 0f, c07 = 0f;
+        float c10 = 0f, c11 = 0f, c12 = 0f, c13 = 0f, c14 = 0f, c15 = 0f, c16 = 0f, c17 = 0f;
+        float c20 = 0f, c21 = 0f, c22 = 0f, c23 = 0f, c24 = 0f, c25 = 0f, c26 = 0f, c27 = 0f;
+        float c30 = 0f, c31 = 0f, c32 = 0f, c33 = 0f, c34 = 0f, c35 = 0f, c36 = 0f, c37 = 0f;
+        float c40 = 0f, c41 = 0f, c42 = 0f, c43 = 0f, c44 = 0f, c45 = 0f, c46 = 0f, c47 = 0f;
+        float c50 = 0f, c51 = 0f, c52 = 0f, c53 = 0f, c54 = 0f, c55 = 0f, c56 = 0f, c57 = 0f;
+        float c60 = 0f, c61 = 0f, c62 = 0f, c63 = 0f, c64 = 0f, c65 = 0f, c66 = 0f, c67 = 0f;
+        float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
+        {
+            int gci = 0, gtap = 0;
+            int gs0 = aM0 < M ? nbr[aM0 * 27] : -1;
+            int gs1 = aM1 < M ? nbr[aM1 * 27] : -1;
+            int gs2 = aM2 < M ? nbr[aM2 * 27] : -1;
+            int gs3 = aM3 < M ? nbr[aM3 * 27] : -1;
+            float pa0 = gs0 >= 0 ? A[gs0 * cin + aK0] : 0f;
+            float pa1 = gs1 >= 0 ? A[gs1 * cin + aK1] : 0f;
+            float pa2 = gs2 >= 0 ? A[gs2 * cin + aK2] : 0f;
+            float pa3 = gs3 >= 0 ? A[gs3 * cin + aK3] : 0f;
+            uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
+            uint pl0 = bN0 < N ? WLo[bOff0 + (0 >> 1)] : 0u;
+            uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
+            uint pl1 = bN1 < N ? WLo[bOff1 + (0 >> 1)] : 0u;
+            for (int k0 = 0; k0 < K; k0 += 8)
+            {
+                As[aK0 * 132 + aRow0] = pa0;
+                As[aK1 * 132 + aRow1] = pa1;
+                As[aK2 * 132 + aRow2] = pa2;
+                As[aK3 * 132 + aRow3] = pa3;
+                Bs[(2 * bW0) * 132 + bRow0] = F16Lo(pb0) + F16Lo(pl0); Bs[(2 * bW0 + 1) * 132 + bRow0] = F16Hi(pb0) + F16Hi(pl0);
+                Bs[(2 * bW1) * 132 + bRow1] = F16Lo(pb1) + F16Lo(pl1); Bs[(2 * bW1 + 1) * 132 + bRow1] = F16Hi(pb1) + F16Hi(pl1);
+                Group.Barrier();
+                int kn = k0 + 8;
+                if (kn < K)
+                {
+                    gci += 8;
+                    if (gci == cin)
+                    {
+                        gci = 0; gtap++;
+                        gs0 = aM0 < M ? nbr[aM0 * 27 + gtap] : -1;
+                        gs1 = aM1 < M ? nbr[aM1 * 27 + gtap] : -1;
+                        gs2 = aM2 < M ? nbr[aM2 * 27 + gtap] : -1;
+                        gs3 = aM3 < M ? nbr[aM3 * 27 + gtap] : -1;
+                    }
+                    pa0 = gs0 >= 0 ? A[gs0 * cin + gci + aK0] : 0f;
+                    pa1 = gs1 >= 0 ? A[gs1 * cin + gci + aK1] : 0f;
+                    pa2 = gs2 >= 0 ? A[gs2 * cin + gci + aK2] : 0f;
+                    pa3 = gs3 >= 0 ? A[gs3 * cin + gci + aK3] : 0f;
+                    pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
+                    pl0 = bN0 < N ? WLo[bOff0 + (kn >> 1)] : 0u;
+                    pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
+                    pl1 = bN1 < N ? WLo[bOff1 + (kn >> 1)] : 0u;
+                }
+                for (int kk = 0; kk < 8; kk++)
+                {
+                    int ab = kk * 132 + ty, bb = kk * 132 + tx;
+                    float a0 = As[ab + 0];
+                    float a1 = As[ab + 16];
+                    float a2 = As[ab + 32];
+                    float a3 = As[ab + 48];
+                    float a4 = As[ab + 64];
+                    float a5 = As[ab + 80];
+                    float a6 = As[ab + 96];
+                    float a7 = As[ab + 112];
+                    float b0 = Bs[bb + 0];
+                    float b1 = Bs[bb + 16];
+                    float b2 = Bs[bb + 32];
+                    float b3 = Bs[bb + 48];
+                    float b4 = Bs[bb + 64];
+                    float b5 = Bs[bb + 80];
+                    float b6 = Bs[bb + 96];
+                    float b7 = Bs[bb + 112];
+                    c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03); c04 = float.MultiplyAddEstimate(a0, b4, c04); c05 = float.MultiplyAddEstimate(a0, b5, c05); c06 = float.MultiplyAddEstimate(a0, b6, c06); c07 = float.MultiplyAddEstimate(a0, b7, c07);
+                    c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13); c14 = float.MultiplyAddEstimate(a1, b4, c14); c15 = float.MultiplyAddEstimate(a1, b5, c15); c16 = float.MultiplyAddEstimate(a1, b6, c16); c17 = float.MultiplyAddEstimate(a1, b7, c17);
+                    c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23); c24 = float.MultiplyAddEstimate(a2, b4, c24); c25 = float.MultiplyAddEstimate(a2, b5, c25); c26 = float.MultiplyAddEstimate(a2, b6, c26); c27 = float.MultiplyAddEstimate(a2, b7, c27);
+                    c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33); c34 = float.MultiplyAddEstimate(a3, b4, c34); c35 = float.MultiplyAddEstimate(a3, b5, c35); c36 = float.MultiplyAddEstimate(a3, b6, c36); c37 = float.MultiplyAddEstimate(a3, b7, c37);
+                    c40 = float.MultiplyAddEstimate(a4, b0, c40); c41 = float.MultiplyAddEstimate(a4, b1, c41); c42 = float.MultiplyAddEstimate(a4, b2, c42); c43 = float.MultiplyAddEstimate(a4, b3, c43); c44 = float.MultiplyAddEstimate(a4, b4, c44); c45 = float.MultiplyAddEstimate(a4, b5, c45); c46 = float.MultiplyAddEstimate(a4, b6, c46); c47 = float.MultiplyAddEstimate(a4, b7, c47);
+                    c50 = float.MultiplyAddEstimate(a5, b0, c50); c51 = float.MultiplyAddEstimate(a5, b1, c51); c52 = float.MultiplyAddEstimate(a5, b2, c52); c53 = float.MultiplyAddEstimate(a5, b3, c53); c54 = float.MultiplyAddEstimate(a5, b4, c54); c55 = float.MultiplyAddEstimate(a5, b5, c55); c56 = float.MultiplyAddEstimate(a5, b6, c56); c57 = float.MultiplyAddEstimate(a5, b7, c57);
+                    c60 = float.MultiplyAddEstimate(a6, b0, c60); c61 = float.MultiplyAddEstimate(a6, b1, c61); c62 = float.MultiplyAddEstimate(a6, b2, c62); c63 = float.MultiplyAddEstimate(a6, b3, c63); c64 = float.MultiplyAddEstimate(a6, b4, c64); c65 = float.MultiplyAddEstimate(a6, b5, c65); c66 = float.MultiplyAddEstimate(a6, b6, c66); c67 = float.MultiplyAddEstimate(a6, b7, c67);
+                    c70 = float.MultiplyAddEstimate(a7, b0, c70); c71 = float.MultiplyAddEstimate(a7, b1, c71); c72 = float.MultiplyAddEstimate(a7, b2, c72); c73 = float.MultiplyAddEstimate(a7, b3, c73); c74 = float.MultiplyAddEstimate(a7, b4, c74); c75 = float.MultiplyAddEstimate(a7, b5, c75); c76 = float.MultiplyAddEstimate(a7, b6, c76); c77 = float.MultiplyAddEstimate(a7, b7, c77);
+                }
+                Group.Barrier();
+            }
+        }
+        int n0 = nBase + tx + 0;
+        float bias0 = hasBias != 0 && n0 < N ? ((n0 & 1) == 0 ? F16Lo(Bias[n0 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n0 >> 1]) : 0f) : F16Hi(Bias[n0 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n0 >> 1]) : 0f)) : 0f;
+        int n1 = nBase + tx + 16;
+        float bias1 = hasBias != 0 && n1 < N ? ((n1 & 1) == 0 ? F16Lo(Bias[n1 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n1 >> 1]) : 0f) : F16Hi(Bias[n1 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n1 >> 1]) : 0f)) : 0f;
+        int n2 = nBase + tx + 32;
+        float bias2 = hasBias != 0 && n2 < N ? ((n2 & 1) == 0 ? F16Lo(Bias[n2 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n2 >> 1]) : 0f) : F16Hi(Bias[n2 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n2 >> 1]) : 0f)) : 0f;
+        int n3 = nBase + tx + 48;
+        float bias3 = hasBias != 0 && n3 < N ? ((n3 & 1) == 0 ? F16Lo(Bias[n3 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n3 >> 1]) : 0f) : F16Hi(Bias[n3 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n3 >> 1]) : 0f)) : 0f;
+        int n4 = nBase + tx + 64;
+        float bias4 = hasBias != 0 && n4 < N ? ((n4 & 1) == 0 ? F16Lo(Bias[n4 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n4 >> 1]) : 0f) : F16Hi(Bias[n4 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n4 >> 1]) : 0f)) : 0f;
+        int n5 = nBase + tx + 80;
+        float bias5 = hasBias != 0 && n5 < N ? ((n5 & 1) == 0 ? F16Lo(Bias[n5 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n5 >> 1]) : 0f) : F16Hi(Bias[n5 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n5 >> 1]) : 0f)) : 0f;
+        int n6 = nBase + tx + 96;
+        float bias6 = hasBias != 0 && n6 < N ? ((n6 & 1) == 0 ? F16Lo(Bias[n6 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n6 >> 1]) : 0f) : F16Hi(Bias[n6 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n6 >> 1]) : 0f)) : 0f;
+        int n7 = nBase + tx + 112;
+        float bias7 = hasBias != 0 && n7 < N ? ((n7 & 1) == 0 ? F16Lo(Bias[n7 >> 1]) + (hasBias == 3 ? F16Lo(BiasLo[n7 >> 1]) : 0f) : F16Hi(Bias[n7 >> 1]) + (hasBias == 3 ? F16Hi(BiasLo[n7 >> 1]) : 0f)) : 0f;
+        int m0 = mBase + ty + 0;
+        if (m0 < M)
+        {
+            int rb = m0 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c00 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c01 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c02 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c03 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c04 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c05 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c06 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c07 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m1 = mBase + ty + 16;
+        if (m1 < M)
+        {
+            int rb = m1 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c10 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c11 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c12 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c13 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c14 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c15 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c16 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c17 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m2 = mBase + ty + 32;
+        if (m2 < M)
+        {
+            int rb = m2 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c20 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c21 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c22 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c23 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c24 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c25 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c26 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c27 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m3 = mBase + ty + 48;
+        if (m3 < M)
+        {
+            int rb = m3 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c30 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c31 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c32 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c33 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c34 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c35 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c36 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c37 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m4 = mBase + ty + 64;
+        if (m4 < M)
+        {
+            int rb = m4 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c40 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c41 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c42 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c43 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c44 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c45 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c46 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c47 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m5 = mBase + ty + 80;
+        if (m5 < M)
+        {
+            int rb = m5 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c50 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c51 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c52 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c53 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c54 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c55 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c56 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c57 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m6 = mBase + ty + 96;
+        if (m6 < M)
+        {
+            int rb = m6 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c60 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c61 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c62 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c63 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c64 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c65 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c66 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c67 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+        int m7 = mBase + ty + 112;
+        if (m7 < M)
+        {
+            int rb = m7 * N;
+            if (n0 < N) { float v = KernelMath.Activate(c70 + bias0, act); if (hasRes == 2) v += C[rb + n0]; C[rb + n0] = v; }
+            if (n1 < N) { float v = KernelMath.Activate(c71 + bias1, act); if (hasRes == 2) v += C[rb + n1]; C[rb + n1] = v; }
+            if (n2 < N) { float v = KernelMath.Activate(c72 + bias2, act); if (hasRes == 2) v += C[rb + n2]; C[rb + n2] = v; }
+            if (n3 < N) { float v = KernelMath.Activate(c73 + bias3, act); if (hasRes == 2) v += C[rb + n3]; C[rb + n3] = v; }
+            if (n4 < N) { float v = KernelMath.Activate(c74 + bias4, act); if (hasRes == 2) v += C[rb + n4]; C[rb + n4] = v; }
+            if (n5 < N) { float v = KernelMath.Activate(c75 + bias5, act); if (hasRes == 2) v += C[rb + n5]; C[rb + n5] = v; }
+            if (n6 < N) { float v = KernelMath.Activate(c76 + bias6, act); if (hasRes == 2) v += C[rb + n6]; C[rb + n6] = v; }
+            if (n7 < N) { float v = KernelMath.Activate(c77 + bias7, act); if (hasRes == 2) v += C[rb + n7]; C[rb + n7] = v; }
+        }
+    }
+
     /// <summary>k step 8: gathered rows (A[m,k] = x[nbr[m*27 + k/cin]*cin + k%cin]) with BF16 weights [N, K] (the LTX-2 VAE's exact convolutions). Pass mode = ModeBf16 | ModeGather (the bias is read as bf16). grid = ceil(M/128) * ceil(N/128), group = 256.</summary>
     public static void GemmGatherBf16(FV A, UV W, UV Bias, FV C, FV Res, IV nbr, int M, int K, int N, int cin, int hasBias, int act, int hasRes, int mode)
     {
@@ -404,10 +652,15 @@ internal static class TiledGemm
         float c60 = 0f, c61 = 0f, c62 = 0f, c63 = 0f, c64 = 0f, c65 = 0f, c66 = 0f, c67 = 0f;
         float c70 = 0f, c71 = 0f, c72 = 0f, c73 = 0f, c74 = 0f, c75 = 0f, c76 = 0f, c77 = 0f;
         {
-            float pa0 = aM0 < M ? GatherA(A, nbr, aM0, 0 + aK0, cin) : 0f;
-            float pa1 = aM1 < M ? GatherA(A, nbr, aM1, 0 + aK1, cin) : 0f;
-            float pa2 = aM2 < M ? GatherA(A, nbr, aM2, 0 + aK2, cin) : 0f;
-            float pa3 = aM3 < M ? GatherA(A, nbr, aM3, 0 + aK3, cin) : 0f;
+            int gci = 0, gtap = 0;
+            int gs0 = aM0 < M ? nbr[aM0 * 27] : -1;
+            int gs1 = aM1 < M ? nbr[aM1 * 27] : -1;
+            int gs2 = aM2 < M ? nbr[aM2 * 27] : -1;
+            int gs3 = aM3 < M ? nbr[aM3 * 27] : -1;
+            float pa0 = gs0 >= 0 ? A[gs0 * cin + aK0] : 0f;
+            float pa1 = gs1 >= 0 ? A[gs1 * cin + aK1] : 0f;
+            float pa2 = gs2 >= 0 ? A[gs2 * cin + aK2] : 0f;
+            float pa3 = gs3 >= 0 ? A[gs3 * cin + aK3] : 0f;
             uint pb0 = bN0 < N ? W[bOff0 + (0 >> 1)] : 0u;
             uint pb1 = bN1 < N ? W[bOff1 + (0 >> 1)] : 0u;
             for (int k0 = 0; k0 < K; k0 += 8)
@@ -422,10 +675,19 @@ internal static class TiledGemm
                 int kn = k0 + 8;
                 if (kn < K)
                 {
-                    pa0 = aM0 < M ? GatherA(A, nbr, aM0, kn + aK0, cin) : 0f;
-                    pa1 = aM1 < M ? GatherA(A, nbr, aM1, kn + aK1, cin) : 0f;
-                    pa2 = aM2 < M ? GatherA(A, nbr, aM2, kn + aK2, cin) : 0f;
-                    pa3 = aM3 < M ? GatherA(A, nbr, aM3, kn + aK3, cin) : 0f;
+                    gci += 8;
+                    if (gci == cin)
+                    {
+                        gci = 0; gtap++;
+                        gs0 = aM0 < M ? nbr[aM0 * 27 + gtap] : -1;
+                        gs1 = aM1 < M ? nbr[aM1 * 27 + gtap] : -1;
+                        gs2 = aM2 < M ? nbr[aM2 * 27 + gtap] : -1;
+                        gs3 = aM3 < M ? nbr[aM3 * 27 + gtap] : -1;
+                    }
+                    pa0 = gs0 >= 0 ? A[gs0 * cin + gci + aK0] : 0f;
+                    pa1 = gs1 >= 0 ? A[gs1 * cin + gci + aK1] : 0f;
+                    pa2 = gs2 >= 0 ? A[gs2 * cin + gci + aK2] : 0f;
+                    pa3 = gs3 >= 0 ? A[gs3 * cin + gci + aK3] : 0f;
                     pb0 = bN0 < N ? W[bOff0 + (kn >> 1)] : 0u;
                     pb1 = bN1 < N ? W[bOff1 + (kn >> 1)] : 0u;
                 }
