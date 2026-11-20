@@ -176,6 +176,10 @@ public sealed class Flux2Transformer : IDisposable
             DoubleBlock(l);
             Probe?.Invoke($"double{l + 1}_img", _img.View, _nImg, Dim);
             Probe?.Invoke($"double{l + 1}_txt", _txt.View, _nTxt, Dim);
+            // one command buffer per block in the browser (DeviceSync.Submit; a no-op elsewhere). 2026-11-20, Lore: the FLUX.2 Klein 4B picture edit at 512 x 512 lost
+            // the WebGPU device on an RX 590 in Chrome four times (TDR 25-62 s in): the whole forward was ONE command buffer, and the edit's reference tokens
+            // roughly double the sequence (about 4x the attention) over text to image, which still fit.
+            _acc.Submit();
         }
         // one stream: [txt | img]
         _proj.View.SubView(0, (long)_nTxt * Dim).CopyFrom(_txt.View.SubView(0, (long)_nTxt * Dim));
@@ -185,6 +189,7 @@ public sealed class Flux2Transformer : IDisposable
         {
             SingleBlock(l);
             if (Probe != null) Probe($"single{l + 1}", _proj.View, _n, Dim);
+            _acc.Submit();
         }
         // final adaln_continuous on the image rows, then proj_out
         var imgRows = _proj.View.SubView((long)_nTxt * Dim, (long)_nImg * Dim);
