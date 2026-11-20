@@ -30,7 +30,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.40" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.42" />
 	</ItemGroup>
 
 	<ItemGroup>

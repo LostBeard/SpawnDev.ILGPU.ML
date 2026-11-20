@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.24</Version>
-		<PackageReleaseNotes>v5.8.24 - on SpawnDev.ILGPU 5.4.40 (a Wasm sub-view copy fix; a workaround for a Mono wasm interpreter bug that aborted browser pages). TRELLIS.2 image to 3D now completes on slower GPUs in the browser (an RX 590 in Chrome: before, the device was lost every run): every model block is its own WebGPU command buffer, and the distance searches and decoder convolutions run in chunks, so no submission nears the Windows 2 s GPU watchdog (bit-identical results; Trellis2ImageTo3D.Trace finds a hang); Wan 2.2's transformer likewise ends a command buffer per block in the browser. Hugging Face files resolve once per file instead of once per range request (the Hub allows 3,000 resolver calls per 5 minutes; a streamed 27 GB checkpoint spent ~1,700). The exact tensor-core attention keeps q, k, v and the probabilities as fp16 halves at power-of-two scales: fp32 accuracy at the same speed (it was 15x the fp32 kernel's error). LTX-2 keyframe-guided attention runs on the tensor cores (3x faster; TRELLIS2_MMA_BIAS_ATTN=0 turns it off). See CHANGELOG.md.</PackageReleaseNotes>
+		<Version>5.8.25</Version>
+		<PackageReleaseNotes>v5.8.25 - on SpawnDev.ILGPU 5.4.42. Tensors stay on the GPU (rule 4, for SpawnGen's device-resident IMAGE / LATENT): DeviceFrames on the Wan, LTX and LTX-2 requests returns the video as a device buffer in ComfyUI's IMAGE layout ([F, H, W, 3] in 0..1, the caller owns it; tiled Wan blends on the device); with it the Wan denoising loop keeps the latent, guidance, sampler step and image-to-video frame on the device, and every decoder reads the device latent. Device VAE paths: decode from a device latent (Wan, LTX, LTX-2), device encode (Wan 2.2 / 2.1, LTX, LTX-2), ComfyUI IMAGE overloads on SdVae and SdTaesd, ImageTensorKernels (IMAGE to channel-first and back), LtxPipeline.DenoiseDeviceAsync, LTX / LTX-2 UpsampleDeviceAsync (AdaIN on the device). FLUX.1, Z-Image, Qwen-Image and FLUX.2 transformers can write their output into the caller's buffer. Speed: the Stable Diffusion VAE's 3x3 convolutions about 2x faster (a VAE loaded from an fp32 file ran each one twice, once more for the weights' low halves; now one pass, and the gather index math is hoisted): WebGPU 278 -&gt; 134 ms for the decoder's conv shapes on an RTX 4070. Device and host paths match bit for bit except the Wan device loop (float32 sampler; within the host's own rounding spread) and the upsamplers' device AdaIN (8.5e-8).</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="3.0.8" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.40" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.4.42" />
 	</ItemGroup>
 
 	<ItemGroup>
