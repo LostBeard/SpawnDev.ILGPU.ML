@@ -86,19 +86,13 @@ public sealed class LtxLatentUpsampler : IDisposable
 
     private void Tapped(string name, Buf x, int T, int H, int W, int C) => Tap?.Invoke(name, x.View, T, H, W, C);
 
-    /// <summary>
-    /// Upsample the model-space latent <paramref name="z"/> ([128, <paramref name="frames"/>, <paramref name="h"/>, <paramref name="w"/>] channel-first) to [128, frames, 2h, 2w] in model
-    /// space. <paramref name="adainFactor"/>: 1 = each channel takes the input's mean and standard deviation (the 0.9.8 recipe), 0 = the upsampler's output as it is.
-    /// </summary>
-    public async Task<float[]> UpsampleAsync(float[] z, int frames, int h, int w, float adainFactor = 1f)
+    // the network on a device latent [128, T, H, W] channel-first (read, not modified): the upsampled denormalised latent [T * 2H * 2W, 128] channel-last (a pooled buffer:
+    // the caller Drops it), drained (the caller may free the input on return)
+    private async Task<Buf> NetworkAsync(FV z, int T, int H, int W)
     {
-        int T = frames, H = h, W = w, vox = T * H * W;
-        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, frames, h, w]");
-        var meanH = await _w.F32("latents_mean").CopyToHostAsync(); var stdH = await _w.F32("latents_std").CopyToHostAsync();
-
-        using var zIn = _acc.Allocate1D(z);
+        int vox = T * H * W;
         var x0 = Tmp((long)vox * LatentChannels);
-        _lk.LatentToVoxels(zIn.View, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), null, vox, LatentChannels, 1f, 0f);
+        _lk.LatentToVoxels(z, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), null, vox, LatentChannels, 1f, 0f);
         var c = Conv("initial_conv", x0, T, H, W, LatentChannels, _mid); Drop(x0);
         var x = Norm("initial_norm", c, vox, _mid, silu: true); Drop(c); Flush();
         Tapped("initial", x, T, H, W, _mid);
@@ -109,15 +103,54 @@ public sealed class LtxLatentUpsampler : IDisposable
         x = Tmp((long)vox * 4 * _mid);
         _lk.PixelShuffle2(u.View, x.View, T, H, W, _mid);
         Drop(u); Flush();
-        H *= 2; W *= 2;
+        H *= 2; W *= 2;                                                                  // local copies: the caller doubles its own
         Tapped("upsampled", x, T, H, W, _mid);
         for (int j = 0; j < _blocks; j++) x = ResBlock($"post_upsample_res_blocks.{j}.", x, T, H, W);
         Tapped("post", x, T, H, W, _mid);
         var f = Conv("final_conv", x, T, H, W, _mid, LatentChannels); Drop(x); Flush();
         Tapped("final", f, T, H, W, LatentChannels);
         await _acc.SynchronizeAsync();
+        return f;
+    }
+
+    /// <summary>
+    /// <see cref="UpsampleAsync"/> on the device (rule 4: a device latent in, a device latent out): <paramref name="z"/> [128, frames, h, w] channel-first (read, not modified);
+    /// returns [128, frames, 2h, 2w] in model space in a buffer the caller owns. The AdaIN statistics and blend run on the device in float32 (two-pass per-channel
+    /// statistics; the host path accumulates in double): within float rounding of <see cref="UpsampleAsync"/>.
+    /// </summary>
+    public async Task<Buf> UpsampleDeviceAsync(FV z, int frames, int h, int w, float adainFactor = 1f)
+    {
+        int vox = frames * h * w, vox2 = frames * 4 * h * w;
+        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, frames, h, w]");
+        var f = await NetworkAsync(z, frames, h, w);
+        FV mean = _w.F32("latents_mean"), std = _w.F32("latents_std");
+        using var rs = _acc.Allocate1D<float>(2 * LatentChannels); using var us = _acc.Allocate1D<float>(2 * LatentChannels);
+        if (adainFactor != 0f)
+        {
+            _lk.ChannelStats(z, rs.View, mean, std, LatentChannels, vox, vox, 1, affine: true);              // the denormalised input, channel-first
+            _lk.ChannelStats(f.View, us.View, mean, std, LatentChannels, vox2, 1, LatentChannels, affine: false);   // the output, channel-last
+        }
+        var o = _acc.Allocate1D<float>((long)LatentChannels * vox2);
+        _lk.AdainApply(f.View, rs.View, us.View, mean, std, o.View, LatentChannels, vox2, adainFactor);
+        await _acc.SynchronizeAsync();                                                   // f goes back to the pool, rs / us are freed
+        Drop(f); Flush();
+        return o;
+    }
+
+    /// <summary>
+    /// Upsample the model-space latent <paramref name="z"/> ([128, <paramref name="frames"/>, <paramref name="h"/>, <paramref name="w"/>] channel-first) to [128, frames, 2h, 2w] in model
+    /// space. <paramref name="adainFactor"/>: 1 = each channel takes the input's mean and standard deviation (the 0.9.8 recipe), 0 = the upsampler's output as it is.
+    /// </summary>
+    public async Task<float[]> UpsampleAsync(float[] z, int frames, int h, int w, float adainFactor = 1f)
+    {
+        int T = frames, H = h, W = w, vox = T * H * W;
+        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, frames, h, w]");
+        var meanH = await _w.F32("latents_mean").CopyToHostAsync(); var stdH = await _w.F32("latents_std").CopyToHostAsync();
+        using var zIn = _acc.Allocate1D(z);
+        var f = await NetworkAsync(zIn.View, T, H, W);
         var up = await f.View.CopyToHostAsync();                                          // [vox2, 128] channel-last, denormalised
         Drop(f); Flush();
+        H *= 2; W *= 2;
 
         // AdaIN against the denormalised input (torch.std_mean: the unbiased standard deviation), then back to model space, channel-first
         int vox2 = T * H * W;

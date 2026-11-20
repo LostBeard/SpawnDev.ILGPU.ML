@@ -173,23 +173,10 @@ public sealed class Ltx2LatentUpsampler : IDisposable
         int T = frames, H = h, W = w, vox = T * H * W;
         if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, frames, h, w]");
         using var zIn = _acc.Allocate1D(z); using var mean = _acc.Allocate1D(_mean); using var std = _acc.Allocate1D(_std);
-        var x0 = Tmp((long)vox * LatentChannels);
-        _lk.LatentToVoxels(zIn.View, x0.View, mean.View, std.View, null, vox, LatentChannels, 1f, 0f);
-        var c = Conv("initial_conv", x0, T, H, W, LatentChannels); Drop(x0);
-        var x = Norm("initial_norm", c, vox, _mid, silu: true); Drop(c); Flush();
-        Tap?.Invoke("initial", x.View, T, H, W, _mid);
-        for (int j = 0; j < _blocks; j++) x = ResBlock($"res_blocks.{j}.", x, T, H, W);
-        var u = Conv("upsampler.conv", x, T, H, W, _mid); Drop(x);
-        x = Tmp((long)vox * 4 * _mid);
-        _lk.PixelShuffle2(u.View, x.View, T, H, W, _mid);
-        Drop(u); Flush();
-        H *= 2; W *= 2;
-        for (int j = 0; j < _blocks; j++) x = ResBlock($"post_upsample_res_blocks.{j}.", x, T, H, W);
-        var f = Conv("final_conv", x, T, H, W, _mid); Drop(x); Flush();
-        Tap?.Invoke("final", f.View, T, H, W, LatentChannels);
-        await _acc.SynchronizeAsync();
+        var f = await NetworkAsync(zIn.View, mean.View, std.View, T, H, W);
         var up = await f.View.CopyToHostAsync();
         Drop(f); Flush();
+        H *= 2; W *= 2;
         int vox2 = T * H * W;
         var o = new float[(long)LatentChannels * vox2];
         for (int ch = 0; ch < LatentChannels; ch++)
@@ -210,6 +197,51 @@ public sealed class Ltx2LatentUpsampler : IDisposable
                 o[(long)ch * vox2 + v] = (float)((blended - _mean[ch]) / _std[ch]);
             }
         }
+        return o;
+    }
+
+    // the network on a device latent [128, T, H, W] channel-first (read, not modified) -> [T * 2H * 2W, 128] channel-last, denormalised (pooled: the caller Drops it), drained
+    private async Task<Buf> NetworkAsync(FV z, FV mean, FV std, int T, int H, int W)
+    {
+        int vox = T * H * W;
+        var x0 = Tmp((long)vox * LatentChannels);
+        _lk.LatentToVoxels(z, x0.View, mean, std, null, vox, LatentChannels, 1f, 0f);
+        var c = Conv("initial_conv", x0, T, H, W, LatentChannels); Drop(x0);
+        var x = Norm("initial_norm", c, vox, _mid, silu: true); Drop(c); Flush();
+        Tap?.Invoke("initial", x.View, T, H, W, _mid);
+        for (int j = 0; j < _blocks; j++) x = ResBlock($"res_blocks.{j}.", x, T, H, W);
+        var u = Conv("upsampler.conv", x, T, H, W, _mid); Drop(x);
+        x = Tmp((long)vox * 4 * _mid);
+        _lk.PixelShuffle2(u.View, x.View, T, H, W, _mid);
+        Drop(u); Flush();
+        H *= 2; W *= 2;
+        for (int j = 0; j < _blocks; j++) x = ResBlock($"post_upsample_res_blocks.{j}.", x, T, H, W);
+        var f = Conv("final_conv", x, T, H, W, _mid); Drop(x); Flush();
+        Tap?.Invoke("final", f.View, T, H, W, LatentChannels);
+        await _acc.SynchronizeAsync();
+        return f;
+    }
+
+    /// <summary>
+    /// <see cref="UpsampleAsync"/> on the device (rule 4: a device latent in, a device latent out): <paramref name="z"/> [128, frames, h, w] channel-first (read, not modified);
+    /// returns [128, frames, 2h, 2w] in model space in a buffer the caller owns. AdaIN (when <paramref name="adainFactor"/> is not 0) on the device in float32.
+    /// </summary>
+    public async Task<Buf> UpsampleDeviceAsync(FV z, int frames, int h, int w, float adainFactor = 0f)
+    {
+        int vox = frames * h * w, vox2 = frames * 4 * h * w;
+        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, frames, h, w]");
+        using var mean = _acc.Allocate1D(_mean); using var std = _acc.Allocate1D(_std);
+        var f = await NetworkAsync(z, mean.View, std.View, frames, h, w);
+        using var rs = _acc.Allocate1D<float>(2 * LatentChannels); using var us = _acc.Allocate1D<float>(2 * LatentChannels);
+        if (adainFactor != 0f)
+        {
+            _lk.ChannelStats(z, rs.View, mean.View, std.View, LatentChannels, vox, vox, 1, affine: true);
+            _lk.ChannelStats(f.View, us.View, mean.View, std.View, LatentChannels, vox2, 1, LatentChannels, affine: false);
+        }
+        var o = _acc.Allocate1D<float>((long)LatentChannels * vox2);
+        _lk.AdainApply(f.View, rs.View, us.View, mean.View, std.View, o.View, LatentChannels, vox2, adainFactor);
+        await _acc.SynchronizeAsync();                                                   // f back to the pool; mean, std, rs, us freed
+        Drop(f); Flush();
         return o;
     }
 

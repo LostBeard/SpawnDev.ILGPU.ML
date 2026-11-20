@@ -81,6 +81,59 @@ public sealed class LtxKernels
     }
 
     // channel-first latent [C, vox] -> channel-last [vox, C], denormalised, then mixed with noise like the pipeline's decode_noise_scale:
+    // AdaIN statistics for the latent upsamplers on the device: per channel c the mean and the UNBIASED standard deviation of
+    // v = x[c * strideC + i * strideV] (* affStd[c] + affMean[c] when affine), i < count. One group per channel, two passes (the mean, then the squared deviations: no
+    // cancellation), float accumulation. affMean / affStd are always real buffers (WebGPU binds every view read-write: no shared dummy for both).
+    private Action<KernelConfig, FV, FV, FV, FV, int, int, int, int>? _channelStats;
+    private static void ChannelStatsImpl(FV x, FV stats, FV affMean, FV affStd, int count, int strideC, int strideV, int affine)
+    {
+        int c = Grid.IdxX, t = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(NormGroup);
+        float am = affine != 0 ? affMean[c] : 0f, asd = affine != 0 ? affStd[c] : 1f;
+        long b = (long)c * strideC;
+        float s = 0f;
+        for (int i = t; i < count; i += NormGroup) s += x[b + (long)i * strideV] * asd + am;
+        sh[t] = s;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        float mean = sh[0] / count;
+        Group.Barrier();                                                                    // every thread has read sh[0] before it is reused
+        float q = 0f;
+        for (int i = t; i < count; i += NormGroup) { float d = x[b + (long)i * strideV] * asd + am - mean; q = float.MultiplyAddEstimate(d, d, q); }
+        sh[t] = q;
+        Group.Barrier();
+        for (int st = NormGroup / 2; st > 0; st >>= 1) { if (t < st) sh[t] += sh[t + st]; Group.Barrier(); }
+        if (t == 0) { stats[2 * c] = mean; float var = count > 1 ? sh[0] / (count - 1) : 0f; stats[2 * c + 1] = MathF.Sqrt(var > 0f ? var : 0f); }
+    }
+    /// <summary>
+    /// Per channel (<paramref name="C"/> of them) the mean and the unbiased standard deviation into <paramref name="stats"/> [C, 2] of v = x[c * strideC + i * strideV], i &lt;
+    /// <paramref name="count"/>, optionally through v * affStd[c] + affMean[c] (<paramref name="affine"/>). The latent upsamplers' AdaIN (torch.std_mean).
+    /// </summary>
+    public void ChannelStats(FV x, FV stats, FV affMean, FV affStd, int C, int count, int strideC, int strideV, bool affine)
+    {
+        _channelStats ??= _acc.LoadStreamKernel<FV, FV, FV, FV, int, int, int, int>(ChannelStatsImpl);
+        _channelStats(new KernelConfig(C, NormGroup), x, stats, affMean, affStd, count, strideC, strideV, affine ? 1 : 0);
+    }
+    // o[c, v] = (lerp(a, adain(a), factor) - mean[c]) / std[c],  a = up[v, c] (channel-last),  adain(a) = (a - uMean) / uSd * rSd + rMean
+    private Action<Index1D, FV, FV, FV, FV, FV, FV, int, int, float>? _adainApply;
+    private static void AdainApplyImpl(Index1D i, FV up, FV rs, FV us, FV mean, FV std, FV o, int C, int vox2, float factor)
+    {
+        int v = i % vox2, c = i / vox2;
+        float a = up[(long)v * C + c];
+        float blended = factor == 0f ? a : a + factor * ((a - us[2 * c]) / us[2 * c + 1] * rs[2 * c + 1] + rs[2 * c] - a);
+        o[i] = (blended - mean[c]) / std[c];
+    }
+    /// <summary>
+    /// The latent upsamplers' last step on the device: the network's output <paramref name="up"/> [vox2, C] channel-last (denormalised) blended toward the input's statistics
+    /// (<paramref name="rs"/>, <paramref name="us"/>: <see cref="ChannelStats"/> of the denormalised input and of <paramref name="up"/>) by <paramref name="factor"/>, then back to model
+    /// space, channel-first [C, vox2].
+    /// </summary>
+    public void AdainApply(FV up, FV rs, FV us, FV mean, FV std, FV o, int C, int vox2, float factor)
+    {
+        _adainApply ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, FV, FV, int, int, float>(AdainApplyImpl);
+        _adainApply(C * vox2, up, rs, us, mean, std, o, C, vox2, factor);
+    }
+
     // the conditioned denoise's result: tokens [extra + N, 128] token-major -> the latent [128, N] channel-major (the extra condition tokens dropped)
     private Action<Index1D, FV, FV, int, int>? _tokensToChannels;
     private static void TokensToChannelsImpl(Index1D i, FV tokens, FV o, int N, int extra) { int n = i % N, c = i / N; o[i] = tokens[((long)extra + n) * 128 + c]; }

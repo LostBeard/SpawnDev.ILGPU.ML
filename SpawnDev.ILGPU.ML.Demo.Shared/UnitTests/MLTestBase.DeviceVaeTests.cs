@@ -138,6 +138,49 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The latent upsamplers on the device (2026-11-20, rule 4: a device LATENT in, a device LATENT out): <see cref="Ltx.LtxLatentUpsampler.UpsampleDeviceAsync"/> and
+    /// <see cref="Ltx2.Ltx2LatentUpsampler.UpsampleDeviceAsync"/> against their host paths on seeded latents, AdaIN on (factor 1) and off (0). The device AdaIN accumulates
+    /// in float (two-pass), the host in double: within 1e-5 relative RMS.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task LatentUpsamplers_Device_MatchHost() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the upsampler files are read from disk: a desktop GPU");
+        var report = new List<string>();
+        async Task Case(string label, int F, int h, int w, float factor, Func<float[], Task<float[]>> host, Func<ArrayView1D<float, Stride1D.Dense>, Task<MemoryBuffer1D<float, Stride1D.Dense>>> dev)
+        {
+            var z = Wan22Pipeline.Gaussian(128L * F * h * w, 17);
+            var want = await host(z);
+            using var zDev = accelerator.Allocate1D(z);
+            using var got = await dev(zDev.View);
+            var g = await got.View.CopyToHostAsync();
+            double rel = g.Length == want.Length ? Dv_Rel(want, g) : double.NaN;
+            report.Add($"{label} [128, {F}, {h}, {w}] adain {factor}: device vs host {rel:E2} ({Dv_BitDiff(want, g)} of {want.Length} differ in a bit)");
+            Ur_Expect(rel < 1e-5, report[^1]);
+        }
+        var ltxUp = Path.Combine(LtxDir, "ltx_upsampler_f16.safetensors");
+        if (File.Exists(ltxUp))
+        {
+            using var weights = GpuWeights.LoadFile(accelerator, ltxUp);
+            using var up = new Ltx.LtxLatentUpsampler(accelerator, weights);
+            foreach (float f in new[] { 1f, 0f })
+                await Case("LTX", 2, 8, 12, f, z => up.UpsampleAsync(z, 2, 8, 12, f), v => up.UpsampleDeviceAsync(v, 2, 8, 12, f));
+        }
+        else report.Add("LTX: file not here");
+        var dir = Path.Combine(Ltx2_Models(), "lightricks");
+        if (File.Exists(Path.Combine(dir, "ltx-2-spatial-upscaler-x2-1.0.safetensors")) && File.Exists(Path.Combine(dir, "ltx-2-19b-dev-fp8.safetensors")))
+        {
+            using var u = await Ltx2.Ltx2LatentUpsampler.OpenAsync(accelerator, new LocalFolderModelSource(dir), "", "ltx-2-spatial-upscaler-x2-1.0.safetensors", "ltx-2-19b-dev-fp8.safetensors");
+            foreach (float f in new[] { 0f, 1f })
+                await Case("LTX-2", 2, 4, 6, f, z => u.UpsampleAsync(z, 2, 4, 6, f), v => u.UpsampleDeviceAsync(v, 2, 4, 6, f));
+        }
+        else report.Add("LTX-2: files not here");
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Vae] upsamplers: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// SdVae (vae-ft-mse) and SdTaesd: DecodeImage01Async against the host DecodeAsync through ComfyUI's IMAGE formula, and EncodeImage01Async against the host
     /// EncodeAsync, bit for bit (the same kernels on the same values).
     /// </summary>
