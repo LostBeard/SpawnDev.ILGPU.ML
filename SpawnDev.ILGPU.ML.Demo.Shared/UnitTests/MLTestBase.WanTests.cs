@@ -797,7 +797,61 @@ public abstract partial class MLTestBase
         using var vae = new Ltx.LtxVae(accelerator, weights);
         var host = await vae.DecodeAsync(latent, Fz, h, w, tArr[0]);
         using var dev = await vae.DecodeDeviceFramesAsync(latent, Fz, h, w, tArr[0]);
-        return DeviceFramesCheck(host, await dev.View.CopyToHostAsync(), 8 * (Fz - 1) + 1, 32 * h, 32 * w);
+        var got = await dev.View.CopyToHostAsync();
+        // and from a DEVICE latent (rule 4 step 3): the same kernels on the same values, so bit for bit
+        using var zDev = accelerator.Allocate1D(latent);
+        using var dev2 = await vae.DecodeDeviceFramesAsync(zDev.View, Fz, h, w, tArr[0]);
+        var got2 = await dev2.View.CopyToHostAsync();
+        int diff = 0; for (int i = 0; i < got.Length; i++) if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(got2[i])) diff++;
+        Ur_Expect(got2.Length == got.Length && diff == 0, $"device latent vs host latent: {diff} of {got.Length} values differ");
+        return DeviceFramesCheck(host, got, 8 * (Fz - 1) + 1, 32 * h, 32 * w) + $"; from a device latent: bit for bit ({got.Length} values)";
+    });
+
+    /// <summary>
+    /// The LTX pipeline with <see cref="Ltx.LtxRequest.DeviceFrames"/> (2026-11-20, rule 4 step 3: <see cref="Ltx.LtxPipeline.DenoiseDeviceAsync"/>, the decode reads the latent on the
+    /// device, the conditioned path reorders its tokens there) against the host path, bit for bit: the sampler is the same device code either way and the device-side
+    /// steps are copies, so nothing may change. 256 x 160 x 9 from the fixture's prompt embedding (no T5): no condition, a picture at frame 0, a keyframe at frame 8 (extra
+    /// tokens: the reorder's offset), and the two-pass upscale when the upsampler is there.
+    /// The host path's DenoiseAsync reads DenoiseDeviceAsync's latent back, so a fault in the shared token reorder (LtxKernels.TokensToChannels) moves both sides alike and this
+    /// test cannot see it (red check 2026-11-20: offset dropped, still green). That kernel is guarded by <see cref="Ltx_KeyframeAndClipConditions_MatchReference"/>
+    /// (the same mutation failed it: "LTX conditioning deviates from the reference").
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Ltx_Pipeline_DeviceFrames_MatchHostPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the pipeline reads its files from disk: a desktop GPU");
+        var paths = Ltx.LtxPaths.InFolder(LtxDir);
+        var t5Path = Path.Combine(LtxDir, "ref", "t5_0.npz");
+        if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.VaeEncoder) || !File.Exists(t5Path)) throw new UnsupportedTestException($"LTX files not found in {LtxDir} (set LTX_DIR)");
+        using var t5 = ZipFile.OpenRead(t5Path);
+        var (ctx, _) = WanNpz(t5, "context"); var (mask, _) = WanNpz(t5, "mask"); int rows = (int)mask.Sum();
+        var emb = ctx.AsSpan(0, rows * 4096).ToArray();
+        const int W = 256, H = 160, Frames = 9;
+        var rgb = new byte[W * H * 3];
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { int i = (y * W + x) * 3; rgb[i] = (byte)(x * 255 / W); rgb[i + 1] = (byte)(y * 255 / H); rgb[i + 2] = (byte)((3 * x + y) % 256); }
+        var cases = new List<(string Name, Ltx.LtxRequest Req)>
+        {
+            ("no condition", new Ltx.LtxRequest { Prompt = "", PromptEmbedding = emb, Width = W, Height = H, Frames = Frames, Seed = 5 }),
+            ("picture at frame 0", new Ltx.LtxRequest { Prompt = "", PromptEmbedding = emb, Width = W, Height = H, Frames = Frames, Seed = 5, Conditions = new[] { Ltx.LtxCondition.Image(rgb, W, H) } }),
+            ("keyframe at frame 8", new Ltx.LtxRequest { Prompt = "", PromptEmbedding = emb, Width = W, Height = H, Frames = Frames, Seed = 5, Conditions = new[] { Ltx.LtxCondition.Image(rgb, W, H, frameIndex: 8) } }),
+        };
+        if (File.Exists(paths.Upsampler)) cases.Add(("two passes", new Ltx.LtxRequest { Prompt = "", PromptEmbedding = emb, Width = W, Height = H, Frames = Frames, Seed = 5, Upscale = true }));
+        var pipe = new Ltx.LtxPipeline(accelerator, paths);
+        var report = new List<string>();
+        foreach (var (name, req) in cases)
+        {
+            var host = await pipe.GenerateAsync(req);
+            using var dev = await pipe.GenerateAsync(new Ltx.LtxRequest
+            {
+                Prompt = req.Prompt, PromptEmbedding = req.PromptEmbedding, Width = req.Width, Height = req.Height, Frames = req.Frames, Seed = req.Seed, Conditions = req.Conditions,
+                Upscale = req.Upscale, DeviceFrames = true,
+            });
+            Ur_Expect(dev.DeviceFrames != null && dev.Data.Length == 0 && dev.Latent == null, $"{name}: the device run returns device frames only");
+            report.Add($"{name}: " + DeviceFramesCheck(host.Data, await dev.DeviceFrames!.View.CopyToHostAsync(), host.Frames, host.Height, host.Width));
+        }
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Ltx] device pipeline: " + line);
+        return line;
     });
 
     /// <summary><see cref="Ltx2.Ltx2VideoDecoder.DecodeDeviceFramesAsync"/> against <see cref="Ltx2.Ltx2VideoDecoder.DecodeAsync"/> through the same formula, bit for bit (a seeded latent [128, 2, 2, 2]).</summary>
@@ -812,7 +866,13 @@ public abstract partial class MLTestBase
         using var vae = await Ltx2.Ltx2VideoDecoder.OpenAsync(accelerator, new SpawnDev.ILGPU.ML.Hub.LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path));
         var host = await vae.DecodeAsync(z, Fz, h, w);
         using var dev = await vae.DecodeDeviceFramesAsync(z, Fz, h, w);
-        return DeviceFramesCheck(host, await dev.View.CopyToHostAsync(), 8 * (Fz - 1) + 1, 32 * h, 32 * w);
+        var got = await dev.View.CopyToHostAsync();
+        using var zDev = accelerator.Allocate1D(z);
+        using var dev2 = await vae.DecodeDeviceFramesAsync(zDev.View, Fz, h, w);
+        var got2 = await dev2.View.CopyToHostAsync();
+        int diff = 0; for (int i = 0; i < got.Length; i++) if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(got2[i])) diff++;
+        Ur_Expect(got2.Length == got.Length && diff == 0, $"device latent vs host latent: {diff} of {got.Length} values differ");
+        return DeviceFramesCheck(host, got, 8 * (Fz - 1) + 1, 32 * h, 32 * w) + $"; from a device latent: bit for bit ({got.Length} values)";
     });
 
     /// <summary>

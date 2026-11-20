@@ -134,8 +134,15 @@ public sealed class Flux2Transformer : IDisposable
     }
 
     /// <summary>The model call with the latents and prompt embeddings already on the device and the rotary tables set (see the host overload).</summary>
-    public void Forward(FV latents, FV promptEmbeds, float t)
+    public void Forward(FV latents, FV promptEmbeds, float t) => Forward(latents, promptEmbeds, t, _out.View);
+
+    /// <summary>
+    /// <see cref="Forward(FV, FV, float)"/> writing the prediction straight into the caller's <paramref name="output"/> (rule 4: no copy out of <see cref="Output"/>, which this
+    /// call leaves untouched): at least <see cref="Output"/>'s length, the same layout; it may not alias an input.
+    /// </summary>
+    public void Forward(FV latents, FV promptEmbeds, float t, FV output)
     {
+        if (output.Length < _out.Length) throw new ArgumentException($"the output view holds {output.Length} floats, the call writes {_out.Length}");
         float tt = t;
         if (RoundTimestepToBf16) { tt = BF16Round(t); tt = BF16Round(tt / 1000f); tt = BF16Round(tt * 1000f); }
         else { tt = t; }
@@ -182,7 +189,7 @@ public sealed class Flux2Transformer : IDisposable
         // final adaln_continuous on the image rows, then proj_out
         var imgRows = _proj.View.SubView((long)_nTxt * Dim, (long)_nImg * Dim);
         _k.LayerNormModulate(imgRows, _normI.View, _modOut.View, Dim, 0, _nImg, Dim, Eps);          // out = LN(x) * (1 + scale) + shift, chunk order (scale, shift)
-        Lin(_normI.View, "proj_out.weight", _out.View, _nImg, Dim, InChannels);
+        Lin(_normI.View, "proj_out.weight", output, _nImg, Dim, InChannels);
     }
 
     private void DoubleBlock(int l)

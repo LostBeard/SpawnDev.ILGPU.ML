@@ -279,8 +279,13 @@ public sealed class LtxPipeline : IDisposable
     public async Task<WanVideo> GenerateAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
         if (req.Upscale) return await GenerateMultiScaleAsync(req, progress, ct);
-        var latent = await DenoiseAsync(req, progress, ct);
         int Fz = (req.Frames - 1) / TemporalRatio + 1, h = req.Height / SpatialRatio, w = req.Width / SpatialRatio;
+        if (req.DeviceFrames)
+        {
+            using var dl = await DenoiseDeviceAsync(req, progress, ct);
+            return await DecodeDeviceLatentAsync(req, dl, Fz, h, w, progress, ct);
+        }
+        var latent = await DenoiseAsync(req, progress, ct);
         return await DecodeAsync(req, latent, Fz, h, w, progress, ct);
     }
 
@@ -299,6 +304,19 @@ public sealed class LtxPipeline : IDisposable
         }
         progress?.Report(new WanProgress("decode", 1, "done"));
         return new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1, Latent = latent };
+    }
+
+    // DeviceFrames: the decode reads the latent on the device (WanVideo.Latent stays null, as Wan's device run)
+    private async Task<WanVideo> DecodeDeviceLatentAsync(LtxRequest req, MemoryBuffer1D<float, Stride1D.Dense> latent, int Fz, int h, int w, IProgress<WanProgress>? progress, CancellationToken ct)
+    {
+        progress?.Report(new WanProgress("decode", 0, "decoding the video"));
+        var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
+        MemoryBuffer1D<float, Stride1D.Dense> frames;
+        using (var vw = await AcquireAsync(_paths.Vae, ct))
+        using (var vae = new LtxVae(_acc, vw.W))
+            frames = await vae.DecodeDeviceFramesAsync(latent.View, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
+        progress?.Report(new WanProgress("decode", 1, "done"));
+        return new WanVideo { Data = Array.Empty<float>(), DeviceFrames = frames, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1 };
     }
 
     private static LtxRequest Pass(LtxRequest r, int width, int height, float[]? sigmas, float[]? latents, long seed, float[] embedding) => new()
@@ -327,7 +345,15 @@ public sealed class LtxPipeline : IDisposable
         Report("upscale", 1, "done");
         var inner2 = progress == null ? null : new Progress<WanProgress>(p => progress.Report(p.Stage == "denoise" ? p with { Message = "second pass: " + p.Message } : p));
         _pass = "second pass";
-        var second = await DenoiseAsync(Pass(req, 2 * w1, 2 * h1, req.SecondPassSigmas ?? LtxSampler.DistilledSecondPass, up, req.Seed + 7919L, embedding), inner2, ct);
+        var pass2 = Pass(req, 2 * w1, 2 * h1, req.SecondPassSigmas ?? LtxSampler.DistilledSecondPass, up, req.Seed + 7919L, embedding);
+        if (req.DeviceFrames)
+        {
+            // the second pass's latent stays on the device for the decode (the upscaler between the passes still takes and returns host arrays: its AdaIN is host double)
+            using var dl = await DenoiseDeviceAsync(pass2, inner2, ct);
+            _pass = "";
+            return await DecodeDeviceLatentAsync(req, dl, Fz, 2 * h1 / SpatialRatio, 2 * w1 / SpatialRatio, progress, ct);
+        }
+        var second = await DenoiseAsync(pass2, inner2, ct);
         _pass = "";
         return await DecodeAsync(req, second, Fz, 2 * h1 / SpatialRatio, 2 * w1 / SpatialRatio, progress, ct);
     }
@@ -336,6 +362,16 @@ public sealed class LtxPipeline : IDisposable
     /// Text (and conditions) to the denoised latent [128, (F - 1) / 8 + 1, H / 32, W / 32] in model space, before the decode (the reference's <c>output_type="latent"</c>).
     /// </summary>
     public async Task<float[]> DenoiseAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
+    {
+        using var latent = await DenoiseDeviceAsync(req, progress, ct);
+        return await latent.View.CopyToHostAsync();
+    }
+
+    /// <summary>
+    /// <see cref="DenoiseAsync"/> with the result left on the device (rule 4): the latent [128, (F - 1) / 8 + 1, H / 32, W / 32] in model space, channel-major, in a buffer the
+    /// caller owns. The sampler already runs on the device, so nothing crosses to the host after the prompt and the starting noise.
+    /// </summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DenoiseDeviceAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
         if (req.Width % SpatialRatio != 0 || req.Height % SpatialRatio != 0) throw new ArgumentException("width and height must be multiples of 32");
         if ((req.Frames - 1) % TemporalRatio != 0 || req.Frames < 1) throw new ArgumentException("the frame count must be 8n + 1");
@@ -374,7 +410,9 @@ public sealed class LtxPipeline : IDisposable
         using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw.W);
         dit.SetGrid(Fz, h, w, (float)TemporalRatio / req.FrameRate, SpatialRatio, SpatialRatio);
         dit.SetContext(0, ctx, rows);
-        using var lat = _acc.Allocate1D(noise); using var v = _acc.Allocate1D<float>(noise.Length);
+        var lat = _acc.Allocate1D(noise); using var v = _acc.Allocate1D<float>(noise.Length);
+        try
+        {
         for (int s = 0; s < steps; s++)
         {
             ct.ThrowIfCancellationRequested();
@@ -390,7 +428,9 @@ public sealed class LtxPipeline : IDisposable
             await _acc.SynchronizeAsync();                                               // one step at a time: the browser queue must not run ahead
             Report("denoise", (s + 1.0) / steps, $"step {s + 1} of {steps}");
         }
-        return await lat.View.CopyToHostAsync();                                         // the small latent crosses once, for the decode
+        }
+        catch { await _acc.SynchronizeAsync(); lat.Dispose(); throw; }
+        return lat;                                                                      // drained by the last step's SynchronizeAsync
     }
 
     /// <summary>The token positions of a latent block of <paramref name="frames"/> x h x w starting at pixel frame <paramref name="frameIndex"/>: [tokens, 3] (time in seconds, pixel row, pixel column).</summary>
@@ -452,7 +492,7 @@ public sealed class LtxPipeline : IDisposable
     /// <c>t / 1000 - 1e-6 &lt; 1 - m</c>, with the flow-matching Euler step from its own sigma to the next lower sigma of the schedule; before every step the hard-conditioned tokens
     /// (m = 1) are reset to their clean latent plus the image-conditioning noise times (t / 1000)^2.
     /// </summary>
-    private async Task<float[]> DenoiseConditionedAsync(LtxRequest req, float[] ctx, int rows, float[] noise, float[] sigmas, int Fz, int h, int w, Action<string, double, string> Report, CancellationToken ct)
+    private async Task<MemoryBuffer1D<float, Stride1D.Dense>> DenoiseConditionedAsync(LtxRequest req, float[] ctx, int rows, float[] noise, float[] sigmas, int Fz, int h, int w, Action<string, double, string> Report, CancellationToken ct)
     {
         int hw = h * w, N = Fz * hw, steps = sigmas.Length - 1;
         var main = Pack(noise, N);
@@ -589,10 +629,10 @@ public sealed class LtxPipeline : IDisposable
             Report("denoise", (s + 1.0) / steps, $"step {s + 1} of {steps}");
         }
 
-        // the video's tokens back to [128, Fz, h, w]
-        var all = await lat.View.CopyToHostAsync();
-        var latent = new float[128L * N];
-        for (int n = 0; n < N; n++) for (int c = 0; c < 128; c++) latent[(long)c * N + n] = all[((long)extraTokens + n) * 128 + c];
+        // the video's tokens back to [128, Fz, h, w], on the device
+        var latent = _acc.Allocate1D<float>(128L * N);
+        lk.TokensToChannels(lat.View, latent.View, N, extraTokens);
+        await _acc.SynchronizeAsync();                                                   // the token buffers are disposed on return
         return latent;
     }
 }

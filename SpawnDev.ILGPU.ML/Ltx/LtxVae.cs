@@ -145,9 +145,16 @@ public sealed class LtxVae : IDisposable
     /// <see cref="DecodeAsync"/> into a device buffer the caller owns: frames [8 (Fz - 1) + 1, H, W, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1) (ComfyUI's IMAGE),
     /// converted on the device (<see cref="LtxKernels.FramesNhwc01"/>); nothing is read back to the host.
     /// </summary>
-    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
+        => DecodeDeviceFramesCoreAsync(z, null, Fz, h, w, timestep, noiseScale, noise);
+
+    /// <summary><see cref="DecodeDeviceFramesAsync(float[], int, int, int, float, float, float[])"/> from a device latent [128, Fz, h, w] (read, not modified): nothing crosses to the host.</summary>
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(FV z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
+        => DecodeDeviceFramesCoreAsync(null, z, Fz, h, w, timestep, noiseScale, noise);
+
+    private async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesCoreAsync(float[]? z, FV? zDev, int Fz, int h, int w, float timestep, float noiseScale, float[]? noise)
     {
-        var video = await DecodeToDeviceAsync(z, Fz, h, w, timestep, noiseScale, noise);
+        var video = await DecodeToDeviceAsync(z, Fz, h, w, timestep, noiseScale, noise, zDev);
         int frames = 8 * (Fz - 1) + 1, pixels = 32 * h * 32 * w;
         var o = _acc.Allocate1D<float>(3L * frames * pixels);
         _lk.FramesNhwc01(video.View, o.View, frames, pixels, 0);
@@ -156,18 +163,20 @@ public sealed class LtxVae : IDisposable
         return o;
     }
 
-    private async Task<Buf> DecodeToDeviceAsync(float[] z, int Fz, int h, int w, float timestep, float noiseScale, float[]? noise)
+    // a host latent (z) or a device latent (zDev, read only)
+    private async Task<Buf> DecodeToDeviceAsync(float[]? z, int Fz, int h, int w, float timestep, float noiseScale, float[]? noise, FV? zDev = null)
     {
         int T = Fz, H = h, W = w, vox = T * H * W;
-        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, Fz, h, w]");
-        if (noiseScale != 0f && (noise == null || noise.Length != z.Length)) throw new ArgumentException("a decode noise scale needs standard normal noise shaped like the latent");
+        long need = (long)LatentChannels * vox;
+        if ((zDev is { } zd0 ? zd0.Length : z!.Length) != need) throw new ArgumentException("the latent must be [128, Fz, h, w]");
+        if (noiseScale != 0f && (noise == null || noise.Length != need)) throw new ArgumentException("a decode noise scale needs standard normal noise shaped like the latent");
         var scaleHost = await _w.F32("timestep_scale_multiplier").CopyToHostAsync();
         double tScaled = timestep * scaleHost[0];
 
-        using var zIn = _acc.Allocate1D(z);
+        using var zIn = zDev == null ? _acc.Allocate1D(z!) : null;
         using var nIn = noiseScale != 0f ? _acc.Allocate1D(noise!) : null;
         var x0 = Tmp((long)vox * LatentChannels);
-        _lk.LatentToVoxels(zIn.View, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), nIn?.View, vox, LatentChannels, 1f, noiseScale);
+        _lk.LatentToVoxels(zDev ?? zIn!.View, x0.View, _w.F32("latents_mean"), _w.F32("latents_std"), nIn?.View, vox, LatentChannels, 1f, noiseScale);
         var x = Conv("conv_in", x0, T, H, W, LatentChannels, 1024); Drop(x0); Flush();
         Tapped("conv_in", x, T, H, W, 1024);
 
@@ -198,6 +207,7 @@ public sealed class LtxVae : IDisposable
         var video = Tmp(3L * T * Patch * H * Patch * W);
         _lk.UnpatchifyVideo(head.View, video.View, T, H, W);
         Drop(head);
+        if (zIn != null || nIn != null) await _acc.SynchronizeAsync();                           // the uploads are disposed on return: nothing queued may still read them (Wasm)
         return video;
     }
 

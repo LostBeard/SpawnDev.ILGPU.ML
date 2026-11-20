@@ -261,8 +261,15 @@ public sealed class QwenImageTransformer : IDisposable
     /// encoder's rows [textTokens, 3584], <paramref name="timestep"/> the model's time (how ComfyUI maps sigma to it is measured by the gate). <paramref name="textTokens"/>: this call's
     /// rows, 1 to <see cref="MaxTextTokens"/> (-1: the maximum); only the rotary table is rebuilt when it changes. The velocity is left in <see cref="Output"/>.
     /// </summary>
-    public async Task ForwardAsync(FV imageTokens, FV cond, float timestep, int textTokens = -1, CancellationToken ct = default)
+    public Task ForwardAsync(FV imageTokens, FV cond, float timestep, int textTokens = -1, CancellationToken ct = default) => ForwardAsync(imageTokens, cond, timestep, _out.View, textTokens, ct);
+
+    /// <summary>
+    /// <see cref="ForwardAsync(FV, FV, float, int, CancellationToken)"/> writing the velocity straight into the caller's <paramref name="output"/> (rule 4: no copy out of
+    /// <see cref="Output"/>, which this call leaves untouched): at least <see cref="Output"/>'s length, the same layout; it may not alias an input.
+    /// </summary>
+    public async Task ForwardAsync(FV imageTokens, FV cond, float timestep, FV output, int textTokens = -1, CancellationToken ct = default)
     {
+        if (output.Length < _out.Length) throw new ArgumentException($"the output view holds {output.Length} floats, the call writes {_out.Length}");
         if (textTokens < 0) textTokens = _maxTxt;
         if (textTokens < 1 || textTokens > _maxTxt) throw new ArgumentOutOfRangeException(nameof(textTokens), $"1 to {_maxTxt} (the transformer's MaxTextTokens)");
         if (textTokens != _nTxt) { _nTxt = textTokens; _n = _nTxt + _nImg; SetPositions(); }
@@ -294,8 +301,8 @@ public sealed class QwenImageTransformer : IDisposable
         Gemv(b0, _tembAct.View, "norm_out.linear", _modOut.View, Dim, 2 * Dim);       // (scale, shift): the call's t only, also in 2511 (ComfyUI's norm_out gets one [1, 3072] row)
         _k.LayerNormModulate(_img.View, _normI.View, _modOut.View, Dim, 0, _nOut, Dim, Eps);   // the head runs per token: only the noise latent's rows are the prediction
         Probe?.Invoke("norm_out", _normI.View, _nOut, Dim);
-        Lin(b0, _normI.View, "proj_out", _out.View, _nOut, Dim, InChannels);
-        Probe?.Invoke("proj_out", _out.View, _nOut, InChannels);
+        Lin(b0, _normI.View, "proj_out", output, _nOut, Dim, InChannels);
+        Probe?.Invoke("proj_out", output, _nOut, InChannels);
     }
 
     private bool _zero;                                                              // this call modulates the reference tokens at t = 0

@@ -40,6 +40,11 @@ public abstract partial class MLTestBase
             var readings = new List<(string Name, double Rel)>();
             foreach (var (tName, modelTime) in c == 0 ? new[] { ("t = 1 - sigma", 1f - sigma), ("t = sigma", sigma) } : new[] { ("t = 1 - sigma", 1f - sigma) })
             {
+                if (c == 0 && tName == "t = 1 - sigma")
+                {
+                    await tr.ForwardAsync(x.View, cap.View, modelTime, capRows);
+                    Console.WriteLine("[ZImage] " + await Dv_CallerView(accelerator, tr.Output, v => tr.ForwardAsync(x.View, cap.View, modelTime, v, capRows)));
+                }
                 sw.Restart();
                 await tr.ForwardAsync(x.View, cap.View, modelTime, capRows);
                 foreach (var (sName, factor) in new[] { ("x + sigma * out", sigma), ("x - sigma * out", -sigma) })

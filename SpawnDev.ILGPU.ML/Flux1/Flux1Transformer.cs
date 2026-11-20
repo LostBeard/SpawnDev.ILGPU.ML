@@ -155,8 +155,15 @@ public sealed class Flux1Transformer : IDisposable
     /// [textTokens, 4096], <paramref name="pooled"/> the pooled CLIP-L vector [768], <paramref name="sigma"/> the timestep as ComfyUI passes it, <paramref name="guidance"/> FluxGuidance's
     /// value (dev; ignored when the model has no guidance embedder). The velocity is left in <see cref="Output"/>. Streamed blocks are read from the file as the pass reaches them.
     /// </summary>
-    public async Task ForwardAsync(FV imageTokens, FV txt, FV pooled, float sigma, float guidance, CancellationToken ct = default)
+    public Task ForwardAsync(FV imageTokens, FV txt, FV pooled, float sigma, float guidance, CancellationToken ct = default) => ForwardAsync(imageTokens, txt, pooled, sigma, guidance, _out.View, ct);
+
+    /// <summary>
+    /// <see cref="ForwardAsync(FV, FV, FV, float, float, CancellationToken)"/> writing the velocity straight into the caller's <paramref name="output"/> (rule 4: no copy out of
+    /// <see cref="Output"/>, which this call leaves untouched): at least <see cref="Output"/>'s length, the same layout [imageTokens, 64]; it may not alias an input.
+    /// </summary>
+    public async Task ForwardAsync(FV imageTokens, FV txt, FV pooled, float sigma, float guidance, FV output, CancellationToken ct = default)
     {
+        if (output.Length < _out.Length) throw new ArgumentException($"the output view holds {output.Length} floats, the call writes {_out.Length}");
         var b0 = _w.Base;
         // the conditioning vector
         _tproj.View.CopyFromCPU(Sinusoid(sigma));
@@ -197,7 +204,7 @@ public sealed class Flux1Transformer : IDisposable
         Gemv(b0, _vecAct.View, "final_layer.adaLN_modulation.1", _modOut.View, Dim, 2 * Dim);       // (shift, scale)
         var imgRows = _proj.View.SubView((long)_nTxt * Dim, (long)_nImg * Dim);
         _k.LayerNormModulate(imgRows, _normI.View, _modOut.View, 0, Dim, _nImg, Dim, Eps);
-        Lin(b0, _normI.View, "final_layer.linear", _out.View, _nImg, Dim, InChannels);
+        Lin(b0, _normI.View, "final_layer.linear", output, _nImg, Dim, InChannels);
     }
 
     private void DoubleBlock(GpuWeights w, string b)

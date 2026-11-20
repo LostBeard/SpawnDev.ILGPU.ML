@@ -446,6 +446,20 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // ---- the picture encode on the device: the encoder's moments [hw, stride] channel-last (mu = the first Z channels) -> the normalised latent [Z, hw]
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _momentsToLatent;
+    private static void MomentsToLatentImpl(Index1D i, FV m, FV mean, FV std, FV z, int Z, int stride, int hw)
+    {
+        int p = i % hw, c = i / hw;
+        z[i] = (m[(long)p * stride + c] - mean[c]) / std[c];
+    }
+    /// <summary>(mu - latents_mean) / latents_std, channel-first [Z, hw], from the encoder's channel-last moments [hw, stride] (mu = its first Z channels).</summary>
+    public void MomentsToLatent(FV moments, FV mean, FV std, FV z, int Z, int stride, int hw)
+    {
+        _momentsToLatent ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(MomentsToLatentImpl);
+        _momentsToLatent(Z * hw, moments, mean, std, z, Z, stride, hw);
+    }
+
     // ---- the denoising loop on the device (Wan22Pipeline with DeviceFrames, rule 4)
     private Action<Index1D, FV, FV, float>? _cfg;
     private static void GuidanceCombineImpl(Index1D i, FV cond, FV uncond, float g) => cond[i] = uncond[i] + g * (cond[i] - uncond[i]);

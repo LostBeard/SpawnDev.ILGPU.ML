@@ -154,8 +154,15 @@ public sealed class ZImageTransformer : IDisposable
     /// the reference's model time (1 - sigma). <paramref name="captionTokens"/>: this call's caption rows, 1 to <see cref="MaxCaptionTokens"/> (-1: the maximum); the weights and buffers are
     /// shared, only the rotary table is rebuilt when the length changes. The output tokens are left in <see cref="Output"/> (<see cref="ZImageKernels.Denoised"/> makes the denoised estimate).
     /// </summary>
-    public async Task ForwardAsync(FV latent, FV caption, float modelTime, int captionTokens = -1, CancellationToken ct = default)
+    public Task ForwardAsync(FV latent, FV caption, float modelTime, int captionTokens = -1, CancellationToken ct = default) => ForwardAsync(latent, caption, modelTime, _out.View, captionTokens, ct);
+
+    /// <summary>
+    /// <see cref="ForwardAsync(FV, FV, float, int, CancellationToken)"/> writing the output tokens straight into the caller's <paramref name="output"/> (rule 4: no copy out of
+    /// <see cref="Output"/>, which this call leaves untouched): at least <see cref="Output"/>'s length, the same layout; it may not alias an input.
+    /// </summary>
+    public async Task ForwardAsync(FV latent, FV caption, float modelTime, FV output, int captionTokens = -1, CancellationToken ct = default)
     {
+        if (output.Length < _out.Length) throw new ArgumentException($"the output view holds {output.Length} floats, the call writes {_out.Length}");
         if (captionTokens < 0) captionTokens = _maxCap;
         if (captionTokens < 1 || captionTokens > _maxCap) throw new ArgumentOutOfRangeException(nameof(captionTokens), $"1 to {_maxCap} (the transformer's MaxCaptionTokens)");
         if (captionTokens != _nCap) { _nCap = captionTokens; _nCapPad = Padded(captionTokens); _n = _nImgPad + _nCapPad; SetPositions(); }
@@ -188,7 +195,7 @@ public sealed class ZImageTransformer : IDisposable
         _modOut.View.SubView(0, Dim).MemSetToZero();                                        // no shift
         Gemv(b0, _cAct.View, "final_layer.adaLN_modulation.1", _modOut.View.SubView(Dim, Dim), AdaDim, Dim);
         _k.LayerNormModulate(_h.View, _norm.View, _modOut.View, 0, Dim, _n, Dim, FinalEps);
-        Lin(b0, _norm.View, "final_layer.linear", _out.View, _n, Dim, InChannels, true);
+        Lin(b0, _norm.View, "final_layer.linear", output, _n, Dim, InChannels, true);
     }
 
     private async Task RunBlockAsync(int k, int row0, int rows, bool modulated, CancellationToken ct)

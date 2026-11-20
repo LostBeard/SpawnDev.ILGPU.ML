@@ -112,6 +112,10 @@ public abstract partial class MLTestBase
         };
         tr.Forward(noise, embeds, ts[0], imgIds, txtIds);
         var got0 = await tr.Output.SubView(0, (long)nImg * Flux2Transformer.InChannels).CopyToHostAsync();
+        {
+            using var dl = accelerator.Allocate1D(noise); using var de = accelerator.Allocate1D(embeds);
+            Console.WriteLine("[Flux2] " + await Dv_CallerView(accelerator, tr.Output, v => { tr.Forward(dl.View, de.View, ts[0], v); return Task.CompletedTask; }));
+        }
         var (pred0, _) = Ur_Npy<float>(Path.Combine(g, "pred_0.npy"));
         var report = new List<string>();
         void Cmp(string mine, string theirs)

@@ -175,6 +175,31 @@ public sealed class SdTaesd : IDisposable
         _dk.Transpose(o, image, H * W, 3);
     }
 
+    /// <summary>
+    /// Decode to ComfyUI's IMAGE on the device (rule 4): <paramref name="latent"/> [4, h, w] UNSCALED (read, not modified); returns [8h, 8w, 3] channel-last in 0..1
+    /// = clamp((x + 1) / 2, 0, 1) in a buffer the caller owns.
+    /// </summary>
+    public async Task<Buf> DecodeImage01Async(FV latent, int h, int w, CancellationToken cancellationToken = default)
+    {
+        long px = 64L * h * w;
+        var img = Slot(11, 3 * px);
+        await DecodeAsync(latent, h, w, img, cancellationToken);
+        var o = _acc.Allocate1D<float>(3 * px);
+        (_ik ??= new ImageTensorKernels(_acc)).ToImage01(img, o.View, 1, (int)px);
+        await _acc.SynchronizeAsync();
+        return o;
+    }
+
+    /// <summary><see cref="EncodeAsync(FV, int, int, FV, CancellationToken)"/> from ComfyUI's IMAGE: <paramref name="image"/> [H, W, 3] channel-last in 0..1 on the device (x * 2 - 1).</summary>
+    public async Task EncodeImage01Async(FV image, int H, int W, FV latent, CancellationToken cancellationToken = default)
+    {
+        if (image.Length != 3L * H * W) throw new ArgumentException($"the IMAGE must be [{H}, {W}, 3]");
+        var xin = Slot(10, 3L * H * W);
+        (_ik ??= new ImageTensorKernels(_acc)).FromImage01(image, xin, 1, H * W);
+        await EncodeAsync(xin, H, W, latent, cancellationToken);
+    }
+    private ImageTensorKernels? _ik;
+
     /// <summary>Decode from a host array: [4, h, w] UNSCALED -> [3, 8h, 8w] in [-1, 1].</summary>
     public async Task<float[]> DecodeAsync(float[] latent, int h, int w, CancellationToken cancellationToken = default)
     {

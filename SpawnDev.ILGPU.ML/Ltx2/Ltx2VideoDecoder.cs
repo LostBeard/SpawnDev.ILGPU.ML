@@ -164,9 +164,14 @@ public sealed class Ltx2VideoDecoder : IDisposable
     /// <see cref="DecodeAsync"/> into a device buffer the caller owns: frames [8 (Fz - 1) + 1, H, W, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1) (ComfyUI's IMAGE),
     /// converted on the device (<see cref="Ltx.LtxKernels.FramesNhwc01"/>); nothing is read back to the host.
     /// </summary>
-    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w)
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w) => DecodeDeviceFramesCoreAsync(z, null, Fz, h, w);
+
+    /// <summary><see cref="DecodeDeviceFramesAsync(float[], int, int, int)"/> from a device latent [128, Fz, h, w] (read, not modified): nothing crosses to the host.</summary>
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(FV z, int Fz, int h, int w) => DecodeDeviceFramesCoreAsync(null, z, Fz, h, w);
+
+    private async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesCoreAsync(float[]? z, FV? zDev, int Fz, int h, int w)
     {
-        var video = await DecodeToDeviceAsync(z, Fz, h, w);
+        var video = await DecodeToDeviceAsync(z, Fz, h, w, zDev);
         int frames = 8 * (Fz - 1) + 1, pixels = 32 * h * 32 * w;
         var o = _acc.Allocate1D<float>(3L * frames * pixels);
         _lk.FramesNhwc01(video.View, o.View, frames, pixels, 0);
@@ -176,13 +181,13 @@ public sealed class Ltx2VideoDecoder : IDisposable
     }
 
     // the decoded video [3, 8 (Fz - 1) + 1, 32 h, 32 w] channel-first on the device (a pooled buffer: the caller Drops it)
-    private async Task<Buf> DecodeToDeviceAsync(float[] z, int Fz, int h, int w)
+    private async Task<Buf> DecodeToDeviceAsync(float[]? z, int Fz, int h, int w, FV? zDev = null)
     {
         int T = Fz, H = h, W = w, vox = T * H * W;
-        if (z.Length != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, Fz, h, w]");
-        using var zIn = _acc.Allocate1D(z);
+        if ((zDev is { } zd0 ? zd0.Length : z!.Length) != (long)LatentChannels * vox) throw new ArgumentException("the latent must be [128, Fz, h, w]");
+        using var zIn = zDev == null ? _acc.Allocate1D(z!) : null;
         var x0 = Tmp((long)vox * LatentChannels);
-        _lk.LatentToVoxels(zIn.View, x0.View, _mean.View, _std.View, null, vox, LatentChannels, 1f, 0f);
+        _lk.LatentToVoxels(zDev ?? zIn!.View, x0.View, _mean.View, _std.View, null, vox, LatentChannels, 1f, 0f);
         var x = Conv("conv_in", x0, T, H, W, LatentChannels, 1024); Drop(x0); Flush();
         Tap?.Invoke("conv_in", x.View, T, H, W, 1024);
         int c = 1024;

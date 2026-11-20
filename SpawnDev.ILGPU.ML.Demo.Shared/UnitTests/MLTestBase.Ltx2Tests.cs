@@ -1308,6 +1308,38 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="Ltx2Request.DeviceFrames"/> (2026-11-20, rule 4 step 3): the sampler's video latent stays on the device, its guide frames cropped there (per-channel device
+    /// copies, ComfyUI's LTXVCropGuides), and the decoder reads it there. Against the host path (its own Array.Copy crop) bit for bit: the sampler is the same device code
+    /// either way. 64 x 64 x 9, the distilled LoRA (8 steps), a keyframe at frame 8 (guide frames: the crop is not trivial), no audio decode; the audio latent must match too.
+    /// </summary>
+    [TestMethod(Timeout = 10800000, Category = "HeavyModel")]
+    public async Task Ltx2_Pipeline_DeviceFrames_MatchHostPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("streams a 27 GB checkpoint from disk: a desktop GPU");
+        var paths = Ltx2Paths.InFolder();
+        var src = new LocalFolderModelSource(Ltx2_Models());
+        if (!src.Exists(paths.Checkpoint) || !src.Exists(paths.TextEncoder) || !src.Exists(paths.DistilledLora!)) throw new UnsupportedTestException($"needs the checkpoint, text encoder and distilled LoRA in {Ltx2_Models()}");
+        const int W = 64, H = 64, Frames = 9;
+        var rgb = new byte[W * H * 3];
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { int i = (y * W + x) * 3; rgb[i] = (byte)(x * 4); rgb[i + 1] = (byte)(y * 4); rgb[i + 2] = (byte)((x + 2 * y) * 2); }
+        Ltx2Request Make(bool device) => new()
+        {
+            Prompt = "A paper boat drifts across a calm pond at sunset.", Width = W, Height = H, Frames = Frames, Distilled = true, Seed = 11, Audio = false, DeviceFrames = device, RgbaFrames = false,
+            Keyframes = new List<Ltx2Keyframe> { Ltx2Keyframe.FromRgb(rgb, W, H, 8, 1f) },
+        };
+        var pipe = new Ltx2Pipeline(accelerator, src, paths);
+        var host = await pipe.GenerateAsync(Make(false));
+        var dev = await pipe.GenerateAsync(Make(true));
+        using var video = dev.Video;
+        Ur_Expect(video.DeviceFrames != null && video.Data.Length == 0 && video.Latent == null && dev.VideoLatent.Length == 0, "the device run returns device frames only");
+        int ad = 0; for (int i = 0; i < host.AudioLatent.Length; i++) if (BitConverter.SingleToInt32Bits(host.AudioLatent[i]) != BitConverter.SingleToInt32Bits(dev.AudioLatent[i])) ad++;
+        Ur_Expect(dev.AudioLatent.Length == host.AudioLatent.Length && ad == 0, $"the audio latent: {ad} of {host.AudioLatent.Length} values differ");
+        string line = DeviceFramesCheck(host.Video.Data, await video.DeviceFrames!.View.CopyToHostAsync(), host.Video.Frames, H, W) + $"; audio latent bit for bit ({host.AudioLatent.Length} values)";
+        Console.WriteLine("[Ltx2] device pipeline: " + line);
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="Ltx2Pipeline"/> end to end: a prompt to a clip with sound (Gemma 3 encode, connectors, the sampler, video and audio decode), written as PNG frames and a
     /// WAV file to LTX2_PIPE_OUT (default: a folder in the temp directory) so a person can look at it. LTX2_PIPE_SIZE "width x height x frames" (default 768x512x121),
     /// LTX2_PIPE_DISTILLED (default 1: the distilled LoRA, 8 steps, no guidance; 0: LTX2_PIPE_STEPS steps at cfg 4), LTX2_PIPE_PROMPT, LTX2_PIPE_SEED.

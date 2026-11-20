@@ -116,6 +116,11 @@ public abstract partial class MLTestBase
             float sigma = F2_Raw(Path.Combine(d, $"flux1_call_{c}_timestep_f32_1.raw"), 1)[0];
             x.View.CopyFromCPU(F2_Raw(Path.Combine(d, $"flux1_call_{c}_input_f32_1x16x32x32.raw"), 16L * 32 * 32));
             k.Patchify(x.View, tokens.View, rows, cols);
+            if (c == 0)
+            {
+                await tr.ForwardAsync(tokens.View, txt.View, pooled.View, sigma, 3.5f);
+                Console.WriteLine("[Flux1] " + await Dv_CallerView(accelerator, tr.Output, v => tr.ForwardAsync(tokens.View, txt.View, pooled.View, sigma, 3.5f, v)));
+            }
             sw.Restart();
             await tr.ForwardAsync(tokens.View, txt.View, pooled.View, sigma, 3.5f);
             k.Denoised(x.View, tr.Output, den.View, sigma, rows, cols);

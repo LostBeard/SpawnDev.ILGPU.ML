@@ -100,7 +100,7 @@ public sealed class Ltx2Clip
     /// <summary>The stereo waveform [2, samples] channel-first (left, then right) at <see cref="AudioSampleRate"/>; null when the request skipped it.</summary>
     public float[]? Audio { get; init; }
     public int AudioSampleRate { get; init; } = Ltx2AudioDecoder.SampleRate;
-    /// <summary>The final latents: video [128, F, H, W] (guide frames cropped) and audio [8, Ta, 16].</summary>
+    /// <summary>The final latents: video [128, F, H, W] (guide frames cropped) and audio [8, Ta, 16]. With <see cref="Ltx2Request.DeviceFrames"/> the video latent stays on the device and <see cref="VideoLatent"/> is empty.</summary>
     public required float[] VideoLatent { get; init; }
     public required float[] AudioLatent { get; init; }
     /// <summary>Seconds per stage: "encode" (Gemma + connectors), "sample", "video decode", "audio decode".</summary>
@@ -291,6 +291,7 @@ public sealed class Ltx2Pipeline
             for (int i = 0; i < P; i++) start[i] = s0 * noise[i] + (1f - s0) * (clean?[i] ?? 0f);
         }
         float[] latent;
+        MemoryBuffer1D<float, Stride1D.Dense>? videoDev = null; float[]? audioHost = null;     // DeviceFrames: the video latent stays on the device
         using (var model = await Ltx2AvModel.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, B, Fall, H, W, Ta, ContextTokens, TransformerResidentBytes, ct))
         {
             Ltx2Lora? lora = null;
@@ -318,7 +319,15 @@ public sealed class Ltx2Pipeline
                 {
                     var x = await model.SampleAsync(startDev.View, context.View, sigmas, cfg, req.FrameRate, guide, cleanDev != null ? cleanDev.View : default(FV),
                         (i, _) => { progress?.Report(new WanProgress("sample", (i + 1.0) / steps, $"step {i + 1} of {steps}")); return Task.CompletedTask; }, ct);
-                    latent = await x.CopyToHostAsync();
+                    if (req.DeviceFrames)
+                    {
+                        // rule 4: the video latent stays on the device, cropped there (ComfyUI's LTXVCropGuides: each channel's first F * hw tokens); only the small audio latent is read back
+                        videoDev = _acc.Allocate1D<float>((long)Ltx2AvModel.Channels * F * hw);
+                        for (int c = 0; c < Ltx2AvModel.Channels; c++) videoDev.View.SubView((long)c * F * hw, (long)F * hw).CopyFrom(x.SubView((long)c * nv, (long)F * hw));
+                        audioHost = await x.SubView(V, A).CopyToHostAsync();
+                        latent = Array.Empty<float>();
+                    }
+                    else latent = await x.CopyToHostAsync();
                 }
                 finally { await _acc.SynchronizeAsync(); }                                   // nothing queued may still read the two uploads when they are disposed
             }
@@ -331,19 +340,26 @@ public sealed class Ltx2Pipeline
         seconds["sample"] = sw.Elapsed.TotalSeconds; sw.Restart();
 
         // 4. the latents (guide frames cropped: ComfyUI's LTXVCropGuides) and the decodes
-        var videoLatent = new float[Ltx2AvModel.Channels * F * hw];
-        for (int c = 0; c < Ltx2AvModel.Channels; c++) Array.Copy(latent, c * nv, videoLatent, c * F * hw, F * hw);
-        var audioLatent = new float[A];
-        Array.Copy(latent, V, audioLatent, 0, A);
+        float[] videoLatent, audioLatent;
+        if (videoDev != null) { videoLatent = Array.Empty<float>(); audioLatent = audioHost!; }
+        else
+        {
+            videoLatent = new float[Ltx2AvModel.Channels * F * hw];
+            for (int c = 0; c < Ltx2AvModel.Channels; c++) Array.Copy(latent, c * nv, videoLatent, c * F * hw, F * hw);
+            audioLatent = new float[A];
+            Array.Copy(latent, V, audioLatent, 0, A);
+        }
         progress?.Report(new WanProgress("decode", 0, "decoding the video"));
         float[] video = Array.Empty<float>(); byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
-        using (var vae = await Ltx2VideoDecoder.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, ct))
+        try
         {
-            if (req.DeviceFrames) deviceFrames = await vae.DecodeDeviceFramesAsync(videoLatent, F, H, W);
+            using var vae = await Ltx2VideoDecoder.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, ct);
+            if (videoDev != null) deviceFrames = await vae.DecodeDeviceFramesAsync(videoDev.View, F, H, W);
             else if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(videoLatent, F, H, W);
             else video = await vae.DecodeAsync(videoLatent, F, H, W);
             await _acc.SynchronizeAsync();
         }
+        finally { if (videoDev != null) { await _acc.SynchronizeAsync(); videoDev.Dispose(); } }
         seconds["video decode"] = sw.Elapsed.TotalSeconds; sw.Restart();
         float[]? wav = null;
         if (req.Audio)
@@ -357,7 +373,7 @@ public sealed class Ltx2Pipeline
         progress?.Report(new WanProgress("decode", 1, "done"));
         return new Ltx2Clip
         {
-            Video = new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = req.Frames, Latent = videoLatent },
+            Video = new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = req.Frames, Latent = videoDev != null ? null : videoLatent },
             Audio = wav, VideoLatent = videoLatent, AudioLatent = audioLatent, Seconds = seconds,
         };
     }

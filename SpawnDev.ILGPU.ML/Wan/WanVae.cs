@@ -301,15 +301,53 @@ public sealed class WanVae : IDisposable
     /// </summary>
     public async Task<float[]> EncodeImageAsync(float[] image, int H, int W)
     {
-        if (_v21) return await EncodeImage21Async(image, H, W);                 // Wan 2.1: multiples of 8, [16, 1, H/8, W/8]
+        if (image.Length != 3L * H * W) throw new ArgumentException($"the picture must be [3, 1, {H}, {W}]");
+        using var img = _acc.Allocate1D(image);
+        var (moments, hw, stride, Z) = _v21 ? await EncodeMoments21Async(img.View, H, W) : await EncodeMoments22Async(img.View, H, W);
+        var host = await moments.View.CopyToHostAsync();
+        Drop(moments); Flush();
+        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+        var z = new float[(long)Z * hw];                                                 // (mu - mean) / std, channel-first [Z, 1, h, w]
+        for (int c = 0; c < Z; c++) for (int p = 0; p < hw; p++) z[(long)c * hw + p] = (host[(long)p * stride + c] - mean[c]) / std[c];
+        return z;
+    }
+
+    /// <summary>
+    /// <see cref="EncodeImageAsync(float[], int, int)"/> on the device (rule 4): <paramref name="image"/> [3, 1, H, W] channel-first in [-1, 1] (read, not modified); returns the
+    /// normalised latent [Z, 1, H/f, W/f] (Wan 2.2: 48 channels, f 16; Wan 2.1: 16, f 8) in a buffer the caller owns. The normalisation runs on the device in float32
+    /// (the host path's arithmetic; a device division may round differently on OpenCL).
+    /// </summary>
+    public async Task<Buf> EncodeImageDeviceAsync(FV image, int H, int W)
+    {
+        if (image.Length != 3L * H * W) throw new ArgumentException($"the picture must be [3, 1, {H}, {W}]");
+        var (moments, hw, stride, Z) = _v21 ? await EncodeMoments21Async(image, H, W) : await EncodeMoments22Async(image, H, W);
+        var z = _acc.Allocate1D<float>((long)Z * hw);
+        _wk.MomentsToLatent(moments.View, _w.F32("latents_mean"), _w.F32("latents_std"), z.View, Z, stride, hw);
+        await _acc.SynchronizeAsync();                                                   // the moments go back to the pool below
+        Drop(moments); Flush();
+        return z;
+    }
+
+    /// <summary><see cref="EncodeImageDeviceAsync"/> from ComfyUI's IMAGE: <paramref name="image"/> [H, W, 3] channel-last in 0..1 on the device (x * 2 - 1, as ComfyUI's VAEEncode).</summary>
+    public async Task<Buf> EncodeImage01Async(FV image, int H, int W)
+    {
+        if (image.Length != 3L * H * W) throw new ArgumentException($"the IMAGE must be [{H}, {W}, 3]");
+        using var cf = _acc.Allocate1D<float>(3L * H * W);
+        (_ik ??= new ImageTensorKernels(_acc)).FromImage01(image, cf.View, 1, H * W);
+        return await EncodeImageDeviceAsync(cf.View, H, W);                              // drains before returning: cf may go
+    }
+    private ImageTensorKernels? _ik;
+
+    // Wan 2.2: the encoder network on a device picture -> its moments [hw, 96] channel-last (a pooled buffer: the caller Drops it)
+    private async Task<(Buf Moments, int Hw, int Stride, int Z)> EncodeMoments22Async(FV img, int H, int W)
+    {
         if (H % 16 != 0 || W % 16 != 0) throw new ArgumentException("the picture size must be a multiple of 16");
         _caches.Clear(); _cacheEnabled = false;
         try
         {
-            using var img = _acc.Allocate1D(image);
             int h2 = H / 2, w2 = W / 2;
             var x0 = Tmp((long)h2 * w2 * 12);
-            _wk.PatchifyImage(img.View, x0.View, 1, H, W);
+            _wk.PatchifyImage(img, x0.View, 1, H, W);
             int T = 1, Hc = h2, Wc = w2;
             var cur = ConvCausal("encoder.conv1", x0, T, Hc, Wc, 12, 160); Drop(x0);
             Tap?.Invoke("enc_conv1", cur.View, T, Hc, Wc, 160);
@@ -329,13 +367,7 @@ public sealed class WanVae : IDisposable
             var hc = ConvCausal("encoder.head.2", hn, T, Hc, Wc, 640, 96); Drop(hn);
             Tap?.Invoke("enc_head", hc.View, T, Hc, Wc, 96);
             var moments = Pointwise("conv1", hc, T * Hc * Wc, 96, 96); Drop(hc);        // WanVAE_.conv1: 1x1, then the first 48 channels are mu
-            var host = await moments.View.CopyToHostAsync();
-            Drop(moments); Flush();
-            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
-            int hw = Hc * Wc;
-            var z = new float[48L * hw];                                                 // (mu - mean) / std, channel-first [48, 1, h, w]
-            for (int c = 0; c < 48; c++) for (int p = 0; p < hw; p++) z[(long)c * hw + p] = (host[(long)p * 96 + c] - mean[c]) / std[c];
-            return z;
+            return (moments, Hc * Wc, 96, 48);
         }
         finally { _cacheEnabled = true; }
     }
@@ -788,16 +820,15 @@ public sealed class WanVae : IDisposable
         return cur;
     }
 
-    /// <summary>Wan 2.1 <see cref="EncodeImageAsync"/>: [3, 1, H, W] in [-1, 1] (multiples of 8) -> the normalised latent mean [16, 1, H/8, W/8].</summary>
-    private async Task<float[]> EncodeImage21Async(float[] image, int H, int W)
+    // Wan 2.1: [3, 1, H, W] in [-1, 1] (multiples of 8) -> the moments [hw, 2 Z] channel-last, mu = the first Z = 16 (a pooled buffer: the caller Drops it)
+    private async Task<(Buf Moments, int Hw, int Stride, int Z)> EncodeMoments21Async(FV img, int H, int W)
     {
         if (H % 8 != 0 || W % 8 != 0) throw new ArgumentException("the picture size must be a multiple of 8");
         _caches.Clear(); _cacheEnabled = false;
         try
         {
-            using var img = _acc.Allocate1D(image);
             var x0 = Tmp((long)H * W * 3);
-            _wk.ToChannelLast3(img.View, x0.View, H * W);
+            _wk.ToChannelLast3(img, x0.View, H * W);
             int T = 1, c1 = ConvOut("encoder.conv1");
             var cur = ConvCausal("encoder.conv1", x0, T, H, W, 3, c1); Drop(x0);
             Tap?.Invoke("enc_conv1", cur.View, T, H, W, c1);
@@ -812,13 +843,7 @@ public sealed class WanVae : IDisposable
             int z2 = ConvOut("encoder.head.2");
             var hc = ConvCausal("encoder.head.2", hn, T, Hc, Wc, C, z2); Drop(hn);
             var moments = Pointwise("conv1", hc, T * Hc * Wc, z2, z2); Drop(hc);                     // quant_conv; the first half of the channels is mu
-            var host = await moments.View.CopyToHostAsync();
-            Drop(moments); Flush();
-            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
-            int Z = z2 / 2, hw = Hc * Wc;
-            var z = new float[(long)Z * hw];
-            for (int c = 0; c < Z; c++) for (int p = 0; p < hw; p++) z[(long)c * hw + p] = (host[(long)p * z2 + c] - mean[c]) / std[c];
-            return z;
+            return (moments, Hc * Wc, z2, z2 / 2);
         }
         finally { _cacheEnabled = true; }
     }

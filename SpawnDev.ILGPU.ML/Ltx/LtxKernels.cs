@@ -81,6 +81,16 @@ public sealed class LtxKernels
     }
 
     // channel-first latent [C, vox] -> channel-last [vox, C], denormalised, then mixed with noise like the pipeline's decode_noise_scale:
+    // the conditioned denoise's result: tokens [extra + N, 128] token-major -> the latent [128, N] channel-major (the extra condition tokens dropped)
+    private Action<Index1D, FV, FV, int, int>? _tokensToChannels;
+    private static void TokensToChannelsImpl(Index1D i, FV tokens, FV o, int N, int extra) { int n = i % N, c = i / N; o[i] = tokens[((long)extra + n) * 128 + c]; }
+    /// <summary>Packed tokens [<paramref name="extra"/> + N, 128] -> a latent [128, N] channel-major, dropping the first <paramref name="extra"/> tokens.</summary>
+    public void TokensToChannels(FV tokens, FV o, int N, int extra)
+    {
+        _tokensToChannels ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(TokensToChannelsImpl);
+        _tokensToChannels(128 * N, tokens, o, N, extra);
+    }
+
     // o[v, c] = (1 - s) * (z[c, v] * std[c] / scaling + mean[c]) + s * noise[c, v]
     private Action<Index1D, FV, FV, FV, FV, FV, int, int, float, float>? _latentToVoxels;
     private static void LatentToVoxelsImpl(Index1D i, FV z, FV o, FV mean, FV std, FV noise, int vox, int C, float scale, float noiseScale)
@@ -297,19 +307,14 @@ public sealed class LtxKernels
     // video [3, F, H, W] channel-first in [-1, 1] -> frames [F, H, W, 3] channel-last in 0..1 at frame offset `first`: clamp((v + 1) / 2, 0, 1),
     // ComfyUI's VAEDecode (its IMAGE type). Written straight into the caller's whole-clip buffer, one decoded chunk at a time.
     private Action<Index1D, FV, FV, int, int, int>? _framesNhwc01;
-    private static void FramesNhwc01Impl(Index1D i, FV video, FV o, int frames, int pixels, int first)
-    {
-        int c = i % 3, p = (i / 3) % pixels, f = i / (3 * pixels);
-        float q = (video[(long)c * frames * pixels + (long)f * pixels + p] + 1f) * 0.5f;
-        o[((long)(first + f) * pixels + p) * 3 + c] = q < 0f ? 0f : (q > 1f ? 1f : q);
-    }
+    // the body is ImageTensorKernels.ToImage01Impl (shared with every VAE's IMAGE path)
     /// <summary>
     /// A chunk of channel-first video <paramref name="video"/> [3, <paramref name="frames"/>, H, W] in [-1, 1] into <paramref name="o"/>, frames [F, H, W, 3] in 0..1
     /// (clamp((v + 1) / 2, 0, 1): ComfyUI's IMAGE), at frame <paramref name="first"/>. Nothing leaves the device.
     /// </summary>
     public void FramesNhwc01(FV video, FV o, int frames, int pixels, int first)
     {
-        _framesNhwc01 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(FramesNhwc01Impl);
+        _framesNhwc01 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(ImageTensorKernels.ToImage01Impl);
         _framesNhwc01(3 * frames * pixels, video, o, frames, pixels, first);
     }
 

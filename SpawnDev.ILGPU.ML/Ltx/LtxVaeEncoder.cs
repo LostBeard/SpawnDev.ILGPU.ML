@@ -108,17 +108,40 @@ public sealed class LtxVaeEncoder : IDisposable
     /// </summary>
     public async Task<float[]> EncodeAsync(float[] video, int frames, int height, int width, float[]? noise = null)
     {
+        using var z = await EncodeCoreAsync(video, null, frames, height, width, noise);
+        return await z.View.CopyToHostAsync();
+    }
+
+    /// <summary>
+    /// <see cref="EncodeAsync(float[], int, int, int, float[])"/> on the device (rule 4): <paramref name="video"/> [3, frames, height, width] channel-first in [-1, 1] (read, not
+    /// modified); returns the latent [128, (frames - 1) / 8 + 1, height / 32, width / 32] in a buffer the caller owns.
+    /// </summary>
+    public Task<Buf> EncodeDeviceAsync(FV video, int frames, int height, int width, float[]? noise = null) => EncodeCoreAsync(null, video, frames, height, width, noise);
+
+    /// <summary><see cref="EncodeDeviceAsync"/> from ComfyUI's IMAGE: <paramref name="images"/> [frames, height, width, 3] channel-last in 0..1 on the device (x * 2 - 1).</summary>
+    public async Task<Buf> EncodeFrames01Async(FV images, int frames, int height, int width, float[]? noise = null)
+    {
+        if (images.Length != 3L * frames * height * width) throw new ArgumentException($"the IMAGE must be [{frames}, {height}, {width}, 3]");
+        using var cf = _acc.Allocate1D<float>(3L * frames * height * width);
+        (_ik ??= new ImageTensorKernels(_acc)).FromImage01(images, cf.View, frames, height * width);
+        return await EncodeCoreAsync(null, cf.View, frames, height, width, noise);           // drains before returning: cf may go
+    }
+    private ImageTensorKernels? _ik;
+
+    // a host video or a device one (read only) -> the latent in a new buffer the caller owns
+    private async Task<Buf> EncodeCoreAsync(float[]? video, FV? videoDev, int frames, int height, int width, float[]? noise)
+    {
         if ((frames - 1) % 8 != 0 || frames < 1) throw new ArgumentException("the frame count must be 8n + 1");
         if (height % 32 != 0 || width % 32 != 0) throw new ArgumentException("height and width must be multiples of 32");
-        if (video.Length != 3L * frames * height * width) throw new ArgumentException("the video must be [3, frames, height, width]");
+        if ((videoDev is { } vd0 ? vd0.Length : video!.Length) != 3L * frames * height * width) throw new ArgumentException("the video must be [3, frames, height, width]");
         int T = frames, H = height / LtxVae.Patch, W = width / LtxVae.Patch;
         int latentLength = 128 * ((frames - 1) / 8 + 1) * (height / 32) * (width / 32);
         if (noise != null && noise.Length != latentLength) throw new ArgumentException("the sampling noise must be shaped like the latent");
         _zeros ??= _acc.Allocate1D(new float[2048]);
 
-        using var vIn = _acc.Allocate1D(video);
+        using var vIn = videoDev == null ? _acc.Allocate1D(video!) : null;
         var x0 = Tmp((long)T * H * W * 48);
-        _lk.PatchifyVideo(vIn.View, x0.View, T, H, W);
+        _lk.PatchifyVideo(videoDev ?? vIn!.View, x0.View, T, H, W);
         var x = Conv("conv_in", x0, T, H, W, 48, 128); Drop(x0); Flush();
         Tapped("conv_in", x, T, H, W, 128);
 
@@ -139,13 +162,12 @@ public sealed class LtxVaeEncoder : IDisposable
         var head = Conv("conv_out", n, T, H, W, c, 129); Drop(n); Flush();
         Tapped("conv_out", head, T, H, W, 129);
         using var nIn = noise != null ? _acc.Allocate1D(noise) : null;
-        var latent = Tmp(128L * vox);
+        var latent = _acc.Allocate1D<float>(128L * vox);
         _lk.Posterior(head.View, latent.View, _w.F32("latents_mean"), _w.F32("latents_std"), nIn?.View, vox);
         Drop(head);
-        await _acc.SynchronizeAsync();
-        var result = await latent.View.CopyToHostAsync();
-        Drop(latent); Flush();
-        return result;
+        await _acc.SynchronizeAsync();                                                   // the uploads are disposed on return
+        Flush();
+        return latent;
     }
 
     public void Dispose()

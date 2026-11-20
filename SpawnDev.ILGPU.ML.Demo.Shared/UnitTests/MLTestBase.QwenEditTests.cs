@@ -53,6 +53,11 @@ public abstract partial class MLTestBase
         if (Environment.GetEnvironmentVariable("QI_PREFETCH") is string pf) tr.Weights.Prefetch = pf != "0";
         if (double.TryParse(Environment.GetEnvironmentVariable("QI_HOST_CACHE_GB"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cacheGb))
             tr.Weights.HostCacheBytes = (long)(cacheGb * 1e9);
+        if (call == 0)
+        {
+            await tr.ForwardAsync(dTok.View, cond.View, sigma, n);
+            Console.WriteLine("[QwenImage] " + await Dv_CallerView(accelerator, tr.Output, v => tr.ForwardAsync(dTok.View, cond.View, sigma, v, n)));
+        }
         var sw = System.Diagnostics.Stopwatch.StartNew();
         double s0 = tr.Weights.StreamSeconds;
         await tr.ForwardAsync(dTok.View, cond.View, sigma, n);
