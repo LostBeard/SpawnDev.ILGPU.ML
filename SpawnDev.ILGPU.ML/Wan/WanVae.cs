@@ -419,7 +419,12 @@ public sealed class WanVae : IDisposable
     /// <see cref="DecodeAsync"/> into a device buffer the caller owns: frames [4 Fz - 3, H, W, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1) (ComfyUI's IMAGE). Every decoded
     /// chunk is unpatchified and converted on the device straight into it (<see cref="Ltx.LtxKernels.FramesNhwc01"/>); nothing is read back to the host.
     /// </summary>
-    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w)
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w) => DecodeDeviceFramesCoreAsync(z, null, Fz, h, w);
+
+    /// <summary><see cref="DecodeDeviceFramesAsync(float[], int, int, int)"/> from a device latent [Z, Fz, h, w]: nothing crosses to the host at all.</summary>
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(FV z, int Fz, int h, int w) => DecodeDeviceFramesCoreAsync(null, z, Fz, h, w);
+
+    private async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesCoreAsync(float[]? z, FV? zDev, int Fz, int h, int w)
     {
         int totalFrames = 4 * Fz - 3, scale = _v21 ? 8 : 16;
         var o = _acc.Allocate1D<float>((long)totalFrames * h * scale * w * scale * 3);
@@ -446,8 +451,8 @@ public sealed class WanVae : IDisposable
                 written += frames;
                 await _acc.SynchronizeAsync();
             }
-            if (_v21) await DecodeCore21Async(z, Fz, h, w, Emit21Async);
-            else await DecodeCoreAsync(z, Fz, h, w, EmitAsync);
+            if (_v21) await DecodeCore21Async(z, Fz, h, w, Emit21Async, zDev);
+            else await DecodeCoreAsync(z, Fz, h, w, EmitAsync, zDev);
             if (written != totalFrames) throw new InvalidOperationException($"decoded {written} frames, expected {totalFrames}");
             return o;
         }
@@ -532,7 +537,14 @@ public sealed class WanVae : IDisposable
     /// weights, in its order), and each tile's crop is unpatchified, clamped and converted straight into the output (<see cref="WanKernels.TileToFrames01"/>): no 12-channel
     /// assembly of the whole clip, and nothing read back. Equal to the host path up to the blends' floating-point contraction (an FMA may round once where the host rounds twice).
     /// </summary>
-    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeTiledDeviceFramesAsync(float[] z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeTiledDeviceFramesAsync(float[] z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
+        => DecodeTiledDeviceFramesCoreAsync(z, null, Fz, h, w, tileSample, strideSample);
+
+    /// <summary><see cref="DecodeTiledDeviceFramesAsync(float[], int, int, int, int, int)"/> from a device latent [48, Fz, h, w]: the tiles are cut on the device too.</summary>
+    public Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeTiledDeviceFramesAsync(FV z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
+        => DecodeTiledDeviceFramesCoreAsync(null, z, Fz, h, w, tileSample, strideSample);
+
+    private async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeTiledDeviceFramesCoreAsync(float[]? z, FV? zDev, int Fz, int h, int w, int tileSample, int strideSample)
     {
         if (_v21) throw new NotSupportedException("tiled decoding is implemented for the Wan 2.2 VAE; decode Wan 2.1 latents with DecodeDeviceFramesAsync");
         const int Z = 48, Ch = 12, P = 2, Ratio = 16;
@@ -561,11 +573,16 @@ public sealed class WanVae : IDisposable
                 for (int j = 0; j < w; j += ts)
                 {
                     int th = Math.Min(tl, h - i), tw = Math.Min(tl, w - j);
-                    var sub = new float[(long)Z * Fz * th * tw];
-                    for (int c = 0; c < Z; c++)
-                        for (int f = 0; f < Fz; f++)
-                            for (int y = 0; y < th; y++)
-                                Array.Copy(z, (((long)c * Fz + f) * h + i + y) * w + j, sub, (((long)c * Fz + f) * th + y) * tw, tw);
+                    float[]? sub = null; Buf? subDev = null;
+                    if (zDev is { } zd) { subDev = _acc.Allocate1D<float>((long)Z * Fz * th * tw); _wk.ExtractLatentTile(zd, subDev.View, Z, Fz, h, w, i, j, th, tw); }
+                    else
+                    {
+                        sub = new float[(long)Z * Fz * th * tw];
+                        for (int c = 0; c < Z; c++)
+                            for (int f = 0; f < Fz; f++)
+                                for (int y = 0; y < th; y++)
+                                    Array.Copy(z!, (((long)c * Fz + f) * h + i + y) * w + j, sub, (((long)c * Fz + f) * th + y) * tw, tw);
+                    }
                     int Hp = th * Ratio / P, Wp = tw * Ratio / P;
                     var tile = _acc.Allocate1D<float>((long)totalFrames * Hp * Wp * Ch);
                     row.Add((tile, Hp, Wp));
@@ -577,7 +594,8 @@ public sealed class WanVae : IDisposable
                         written += frames;
                         await Task.CompletedTask;
                     }
-                    await DecodeCoreAsync(sub, Fz, th, tw, EmitAsync);
+                    await DecodeCoreAsync(sub, Fz, th, tw, EmitAsync, subDev?.View);
+                    if (subDev != null) { await _acc.SynchronizeAsync(); subDev.Dispose(); }       // read by the decoder's first kernel: drain before release
                     if (written != totalFrames) throw new InvalidOperationException($"a tile decoded {written} frames, expected {totalFrames}");
                 }
                 for (int j = 0; j < row.Count; j++)
@@ -633,19 +651,28 @@ public sealed class WanVae : IDisposable
     }
 
     /// <summary>The chunked causal decode of <paramref name="z"/>; every finished chunk's 12-channel head output [frames * Hs * Ws, 12] goes to <paramref name="emit"/> in order.</summary>
-    private async Task DecodeCoreAsync(float[] z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit)
+    private async Task DecodeCoreAsync(float[]? z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit, FV? zDev = null)
     {
         const int Z = 48;
         int hw = h * w;
-        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
-        // z * std + mean (the reference: z / (1 / std) + mean), channel-first -> channel-last
-        var zc = new float[(long)Fz * hw * Z];
-        for (int c = 0; c < Z; c++)
-            for (int f = 0; f < Fz; f++)
-                for (int p = 0; p < hw; p++)
-                    zc[((long)f * hw + p) * Z + c] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+        // z * std + mean (the reference: z / (1 / std) + mean), channel-first -> channel-last: on the host for a host latent, on the device for a device latent
         _caches.Clear();
-        var zIn = _acc.Allocate1D(zc);
+        Buf zIn;
+        if (zDev is { } zd)
+        {
+            zIn = _acc.Allocate1D<float>((long)Fz * hw * Z);
+            _wk.LatentToChannelLast(zd, _w.F32("latents_mean"), _w.F32("latents_std"), zIn.View, Z, Fz, hw);
+        }
+        else
+        {
+            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+            var zc = new float[(long)Fz * hw * Z];
+            for (int c = 0; c < Z; c++)
+                for (int f = 0; f < Fz; f++)
+                    for (int p = 0; p < hw; p++)
+                        zc[((long)f * hw + p) * Z + c] = z![((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+            zIn = _acc.Allocate1D(zc);
+        }
         var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);
         Tap?.Invoke("dec_conv2", zBuf.View, Fz, h, w, Z);
         var EmitAsync = emit;
@@ -797,17 +824,27 @@ public sealed class WanVae : IDisposable
     }
 
     /// <summary>Wan 2.1's chunked causal decode: per latent frame, the head's [frames * H * W, 3] output goes to <paramref name="emit"/> in order (1 frame, then 4 per chunk).</summary>
-    private async Task DecodeCore21Async(float[] z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit)
+    private async Task DecodeCore21Async(float[]? z, int Fz, int h, int w, Func<Buf, int, int, int, Task> emit, FV? zDev = null)
     {
         int Z = LatentChannels, hw = h * w;
-        var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
-        var zc = new float[(long)Fz * hw * Z];
-        for (int c = 0; c < Z; c++)
-            for (int f = 0; f < Fz; f++)
-                for (int p = 0; p < hw; p++)
-                    zc[((long)f * hw + p) * Z + c] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
         _caches.Clear();
-        using var zIn = _acc.Allocate1D(zc);
+        Buf zInBuf;
+        if (zDev is { } zd)
+        {
+            zInBuf = _acc.Allocate1D<float>((long)Fz * hw * Z);
+            _wk.LatentToChannelLast(zd, _w.F32("latents_mean"), _w.F32("latents_std"), zInBuf.View, Z, Fz, hw);
+        }
+        else
+        {
+            var mean = await _w.F32("latents_mean").CopyToHostAsync(); var std = await _w.F32("latents_std").CopyToHostAsync();
+            var zc = new float[(long)Fz * hw * Z];
+            for (int c = 0; c < Z; c++)
+                for (int f = 0; f < Fz; f++)
+                    for (int p = 0; p < hw; p++)
+                        zc[((long)f * hw + p) * Z + c] = z![((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+            zInBuf = _acc.Allocate1D(zc);
+        }
+        using var zIn = zInBuf;
         var zBuf = Pointwise("conv2", zIn, Fz * hw, Z, Z);                                         // post_quant_conv
         int Cm = ConvOut("decoder.conv1");
         for (int i = 0; i < Fz; i++)

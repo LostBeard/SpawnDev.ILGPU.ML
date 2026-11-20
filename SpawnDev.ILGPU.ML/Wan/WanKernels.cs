@@ -446,6 +446,63 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // ---- the denoising loop on the device (Wan22Pipeline with DeviceFrames, rule 4)
+    private Action<Index1D, FV, FV, float>? _cfg;
+    private static void GuidanceCombineImpl(Index1D i, FV cond, FV uncond, float g) => cond[i] = uncond[i] + g * (cond[i] - uncond[i]);
+    /// <summary>Classifier-free guidance in place: cond = uncond + g (cond - uncond).</summary>
+    public void GuidanceCombine(FV cond, FV uncond, float g, int n)
+    {
+        _cfg ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(GuidanceCombineImpl);
+        _cfg(n, cond, uncond, g);
+    }
+    private Action<Index1D, FV, FV, FV, FV, float, float, int>? _fewStep;
+    private static void FewStepImpl(Index1D i, FV latent, FV pred, FV fresh, FV next, float sigma, float sNext, int last)
+    {
+        float x0 = latent[i] - sigma * pred[i];                                         // flow matching: x_t = (1 - sigma) x0 + sigma noise, v = noise - x0
+        next[i] = last != 0 ? x0 : (1f - sNext) * x0 + sNext * fresh[i];
+    }
+    /// <summary>The few-step sampler's update (Wan22Pipeline's FewStep): next = x0 on the last step, else (1 - sNext) x0 + sNext fresh, x0 = latent - sigma pred.</summary>
+    public void FewStepUpdate(FV latent, FV pred, FV fresh, FV next, float sigma, float sNext, bool last, int n)
+    {
+        _fewStep ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, float, float, int>(FewStepImpl);
+        _fewStep(n, latent, pred, fresh, next, sigma, sNext, last ? 1 : 0);
+    }
+    private Action<Index1D, FV, FV, int, int>? _putFirst;
+    private static void PutFirstFrameImpl(Index1D i, FV latent, FV z0, int Fz, int per) { int c = i / per, p = i % per; latent[(long)c * Fz * per + p] = z0[i]; }
+    /// <summary>Image to video: the encoded picture z0 [48, 1, per] into the latent's first frame [48, Fz, per] (the host loop's PutPicture).</summary>
+    public void PutFirstFrame(FV latent, FV z0, int Fz, int per)
+    {
+        _putFirst ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int>(PutFirstFrameImpl);
+        _putFirst(48 * per, latent, z0, Fz, per);
+    }
+
+    // ---- a device latent into the decoder (rule 4): z [Z, Fz, hw] channel-first -> zc [Fz * hw, Z] channel-last, z * std + mean (the host path's transform)
+    private Action<Index1D, FV, FV, FV, FV, int, int, int>? _latentToChannelLast;
+    private static void LatentToChannelLastImpl(Index1D i, FV z, FV mean, FV std, FV zc, int Z, int Fz, int hw)
+    {
+        int c = i % Z, p = (i / Z) % hw, f = i / (Z * hw);
+        zc[i] = z[((long)c * Fz + f) * hw + p] * std[c] + mean[c];
+    }
+    /// <summary>The VAE decoder's input from a device latent: z [Z, Fz, hw] channel-first -> zc [Fz * hw, Z] channel-last, z * std + mean.</summary>
+    public void LatentToChannelLast(FV z, FV mean, FV std, FV zc, int Z, int Fz, int hw)
+    {
+        _latentToChannelLast ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, FV, int, int, int>(LatentToChannelLastImpl);
+        _latentToChannelLast(Fz * hw * Z, z, mean, std, zc, Z, Fz, hw);
+    }
+    // a latent tile: sub [Z, Fz, th, tw] = z [Z, Fz, h, w] at (i0, j0)
+    private Action<Index1D, FV, FV, int, int, int, int, int, int, int, int>? _extractTile;
+    private static void ExtractLatentTileImpl(Index1D idx, FV z, FV sub, int Z, int Fz, int h, int w, int i0, int j0, int th, int tw)
+    {
+        int x = idx % tw, y = (idx / tw) % th, f = (idx / (tw * th)) % Fz, c = idx / (tw * th * Fz);
+        sub[idx] = z[(((long)c * Fz + f) * h + i0 + y) * w + j0 + x];
+    }
+    /// <summary>A tile of a device latent: sub [Z, Fz, th, tw] = z [Z, Fz, h, w] at (i0, j0) (the tiled decode's slice).</summary>
+    public void ExtractLatentTile(FV z, FV sub, int Z, int Fz, int h, int w, int i0, int j0, int th, int tw)
+    {
+        _extractTile ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int, int, int>(ExtractLatentTileImpl);
+        _extractTile(Z * Fz * th * tw, z, sub, Z, Fz, h, w, i0, j0, th, tw);
+    }
+
     // ---- the tiled decode on the device (WanVae.DecodeTiledDeviceFramesAsync): diffusers' blend_v / blend_h in place on tile b, channel-last [F, H, W, C];
     // the weights come from the host as float [wa(0..ext), wb(0..ext)] (computed in double and rounded, as torch multiplies a float tensor by a Python float)
     private Action<Index1D, FV, FV, FV, int, int, int, int, int>? _blendV, _blendH;

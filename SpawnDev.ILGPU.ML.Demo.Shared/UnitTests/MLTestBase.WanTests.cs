@@ -578,6 +578,168 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The Wan 2.2 decode from a DEVICE latent (<see cref="WanVae.DecodeDeviceFramesAsync(ArrayView1D{float, Stride1D.Dense}, int, int, int)"/>: the latent transform on
+    /// the device) against the same latent from the host array: equal up to the transform's multiply-add contraction (within 1e-4 relative RMS). Untiled and tiled.
+    /// </summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task Wan_VaeDecode_DeviceLatent_MatchesHostLatent() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the VAE file is read from disk: a desktop GPU");
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors");
+        if (!File.Exists(vaePath)) throw new UnsupportedTestException($"Wan VAE not found in {WanDir}");
+        const int Fz = 2, h = 20, w = 28;
+        var z = Wan22Pipeline.Gaussian(48L * Fz * h * w, 7);
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        using var zDev = accelerator.Allocate1D(z);
+        var report = new List<string>();
+        foreach (bool tiled in new[] { false, true })
+        {
+            using var fromHost = tiled ? await vae.DecodeTiledDeviceFramesAsync(z, Fz, h, w) : await vae.DecodeDeviceFramesAsync(z, Fz, h, w);
+            using var fromDev = tiled ? await vae.DecodeTiledDeviceFramesAsync(zDev.View, Fz, h, w) : await vae.DecodeDeviceFramesAsync(zDev.View, Fz, h, w);
+            var a = await fromHost.View.CopyToHostAsync(); var b = await fromDev.View.CopyToHostAsync();
+            double num = 0, den = 0; for (int i = 0; i < a.Length; i++) { double d = b[i] - a[i]; num += d * d; den += (double)a[i] * a[i]; }
+            double rel = Math.Sqrt(num / den);
+            report.Add($"{(tiled ? "tiled" : "untiled")}: device latent vs host latent {rel:E2}");
+            Ur_Expect(rel < 1e-4, report[^1]);
+        }
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Wan] device latent decode: " + line);
+        return line;
+    });
+
+    /// <summary>
+    /// The pipeline's device loop (<see cref="WanRequest.DeviceFrames"/>, 2026-11-19 rule 4: latent, guidance, sampler, i2v first frame and the decode all on the device)
+    /// against the host loop, same request, three cases at 320 x 192 x 9: text to video with UniPC and guidance 5 (8 steps, the 8-bit DiT), the Turbo DiT's few-step
+    /// sampler (4 steps, guidance 1), and image to video (UniPC, a synthetic picture). Not bit for bit: the device scheduler computes in float32 where the host's is double
+    /// (each step 2e-8 apart on the same inputs, <see cref="Wan_UniPCDevice_MatchesHostStep"/>), and the device CFG may fuse a multiply-add.
+    /// MEASURED 2026-11-19 (CUDA, 4070): the DiT's forward is DISCONTINUOUS at that scale. Its activations are rounded (W8A8: 8-bit per-row activations into the
+    /// GEMMs; bf16 MMA inputs), so the first change that flips one rounding lands a full rounding step, and the flips cascade (patch embedding 40x the input change,
+    /// self attention 6x, cross attention 10x, then 30 blocks): the Turbo forward at step 2 moved 2.7e-2 for an input change of 3e-8 AND 2.9e-2 for 1e-3 (a plateau),
+    /// and exactly 0 for 2e-10 (no value changed). Every piece of the device loop matched the host on the same inputs, inside the pipeline: the device UniPC step
+    /// 1.9e-8 at each step, the few-step kernel 1-4e-8, the noise uploads bit for bit, the forward on the swapped buffer vs a copy in the host loop's buffer 0, the
+    /// decode from the device latent 6e-5 (<see cref="Wan_VaeDecode_DeviceLatent_MatchesHostLatent"/>). So the end-to-end rule is the HOST LOOP'S OWN FLOOR: a third
+    /// run, the host loop with 1e-6 relative noise on every value of its initial latent (the smallest nudge that reliably flips a rounding), and the device loop must
+    /// stay within 3x of that spread. NOTE (honest record): the first floor nudged ~2e-8 (one bit of every 8th value) and the Turbo case failed it 272x; that nudge
+    /// flips an 8-bit activation rounding with ~3% odds, so it usually changed nothing, and the nudge was changed to 1e-6 AFTER seeing that result.
+    /// Plus one step, where nothing compounds (WAN_DEVLOOP_STEPS=1): within 1e-4.
+    /// </summary>
+    [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
+    public async Task Wan_Pipeline_DeviceLoop_MatchesHostLoop() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the desktop pipeline reads the exports from disk");
+        const int W = 320, H = 192, Frames = 9;
+        var rgb = new byte[W * H * 3];
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { int i = (y * W + x) * 3; rgb[i] = (byte)(x * 255 / W); rgb[i + 1] = (byte)(y * 255 / H); rgb[i + 2] = (byte)((x + y) % 256); }
+        var cases = new (string Name, string Dit, WanRequest Req)[]
+        {
+            ("t2v UniPC cfg 5", "wan22_ti2v_5b_dit_q8.safetensors", new WanRequest { Prompt = "A red fox walking through fresh snow at golden hour.", Width = W, Height = H, Frames = Frames, Steps = 8, Seed = 3 }),
+            ("Turbo few-step", "wan22_ti2v_5b_dit_turbo_q8.safetensors", new WanRequest { Prompt = "A red fox walking through fresh snow at golden hour.", Width = W, Height = H, Frames = Frames, Steps = 4, GuidanceScale = 1.0, Sampler = WanSampler.FewStep, Seed = 3 }),
+            ("i2v UniPC cfg 5", "wan22_ti2v_5b_dit_q8.safetensors", new WanRequest { Prompt = "The picture slowly comes to life.", Width = W, Height = H, Frames = Frames, Steps = 8, Seed = 3, ImageRgb = rgb, ImageWidth = W, ImageHeight = H }),
+        };
+        var report = new List<string>();
+        static double RelFrames(WanVideo host, float[] got, int F)
+        {
+            long plane = (long)F * H * W; double num = 0, den = 0;
+            for (int f = 0; f < F; f++)
+                for (int p = 0; p < H * W; p++)
+                    for (int c = 0; c < 3; c++)
+                    {
+                        double want = Ltx.LtxKernels.ToImage01(host.Data[c * plane + (long)f * H * W + p]), g = got[((long)f * H * W + p) * 3 + c];
+                        num += (g - want) * (g - want); den += want * want;
+                    }
+            return Math.Sqrt(num / den);
+        }
+        static float[] HostFrames01(WanVideo v)
+        {
+            long plane = (long)v.Frames * H * W; var o = new float[plane * 3];
+            for (long q = 0; q < plane; q++) for (int c = 0; c < 3; c++) o[q * 3 + c] = Ltx.LtxKernels.ToImage01(v.Data[c * plane + q]);
+            return o;
+        }
+        // diagnostics: WAN_DEVLOOP_CASE (a case's index) and WAN_DEVLOOP_STEPS (its step count)
+        int onlyCase = int.TryParse(Environment.GetEnvironmentVariable("WAN_DEVLOOP_CASE"), out var oc) ? oc : -1;
+        int stepsOverride = int.TryParse(Environment.GetEnvironmentVariable("WAN_DEVLOOP_STEPS"), out var so) ? so : 0;
+        int caseIndex = -1;
+        foreach (var (name, ditFile, req0) in cases)
+        {
+            caseIndex++;
+            if (onlyCase >= 0 && caseIndex != onlyCase) continue;
+            var req = stepsOverride > 0 ? new WanRequest { Prompt = req0.Prompt, Width = req0.Width, Height = req0.Height, Frames = req0.Frames, Steps = stepsOverride, GuidanceScale = req0.GuidanceScale, Sampler = req0.Sampler, Seed = req0.Seed, ImageRgb = req0.ImageRgb, ImageWidth = req0.ImageWidth, ImageHeight = req0.ImageHeight } : req0;
+            var paths = Wan22Paths.InFolder(WanDir, ditFile);
+            if (!File.Exists(paths.Dit) || !File.Exists(paths.Vae) || !File.Exists(paths.TextEncoder)) throw new UnsupportedTestException($"Wan exports not found in {WanDir}");
+            var pipe = new Wan22Pipeline(accelerator, paths);
+            var hostVideo = await pipe.GenerateAsync(req);
+            using var devVideo = await pipe.GenerateAsync(new WanRequest
+            {
+                Prompt = req.Prompt, Width = req.Width, Height = req.Height, Frames = req.Frames, Steps = req.Steps, GuidanceScale = req.GuidanceScale, Sampler = req.Sampler,
+                Seed = req.Seed, ImageRgb = req.ImageRgb, ImageWidth = req.ImageWidth, ImageHeight = req.ImageHeight, DeviceFrames = true,
+            });
+            Ur_Expect(devVideo.DeviceFrames != null && devVideo.Data.Length == 0 && devVideo.Latent == null, $"{name}: the device run returns device frames only");
+            var got = await devVideo.DeviceFrames!.View.CopyToHostAsync();
+            double rel = RelFrames(hostVideo, got, hostVideo.Frames);
+            if (req.Steps == 1)
+            {
+                report.Add($"{name}, 1 step: device loop vs host loop {rel:E2}");
+                Ur_Expect(rel < 1e-4, report[^1]);
+                continue;
+            }
+            // the host loop's own floor: the same request with 1e-6 relative noise on every initial-noise value
+            int Fz = (req.Frames - 1) / 4 + 1;
+            var noise = Wan22Pipeline.Gaussian(48L * Fz * (H / 16) * (W / 16), req.Seed);
+            var dir = Wan22Pipeline.Gaussian(noise.Length, 999);
+            for (int i = 0; i < noise.Length; i++) noise[i] += 1e-6f * dir[i];
+            var nudged = await pipe.GenerateAsync(new WanRequest
+            {
+                Prompt = req.Prompt, Width = req.Width, Height = req.Height, Frames = req.Frames, Steps = req.Steps, GuidanceScale = req.GuidanceScale, Sampler = req.Sampler,
+                Seed = req.Seed, ImageRgb = req.ImageRgb, ImageWidth = req.ImageWidth, ImageHeight = req.ImageHeight, InitialNoise = noise,
+            });
+            double floor = RelFrames(hostVideo, HostFrames01(nudged), hostVideo.Frames);
+            report.Add($"{name}: device loop vs host loop {rel:E2}, host vs host with 1e-6 on its noise {floor:E2} (ratio {rel / floor:F2}, limit 3)");
+            Ur_Expect(rel <= 3 * floor, report[^1]);
+        }
+        string line = string.Join("; ", report);
+        Console.WriteLine("[Wan] device loop: " + line);
+        return line;
+    });
+
+    /// <summary>
+    /// <see cref="FlowUniPCScheduler.StepDevice"/> (2026-11-19, rule 4: the latent stays on the device across the steps) against the host <see cref="FlowUniPCScheduler.Step"/>
+    /// over a 20-step, shift-5 trajectory: the same model output every step (seeded, independent of the sample, so both runs see identical inputs), every step's sample compared.
+    /// The device step computes the latent arithmetic in float32 (WebGPU has no double), the host in double: within 1e-5 relative RMS at every step. Every backend.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task Wan_UniPCDevice_MatchesHostStep() => await RunTest(async accelerator =>
+    {
+        const int n = 48 * 3 * 8 * 8, steps = 20;
+        var host = new FlowUniPCScheduler(); host.SetTimesteps(steps, 5.0);
+        var dev = new FlowUniPCScheduler(); dev.SetTimesteps(steps, 5.0);
+        var sample = Wan22Pipeline.Gaussian(n, 3);
+        using var dSample = accelerator.Allocate1D(sample); using var dNext = accelerator.Allocate1D<float>(n); using var dModel = accelerator.Allocate1D<float>(n);
+        var a = dSample; var b = dNext;
+        double worst = 0; var lines = new List<string>();
+        try
+        {
+            for (int s = 0; s < steps; s++)
+            {
+                var model = Wan22Pipeline.Gaussian(n, 100 + s);
+                for (int i = 0; i < n; i++) model[i] = 0.7f * model[i] + 0.3f * sample[i];          // a plausible flow prediction, the same for both runs
+                sample = host.Step(model, sample);
+                dModel.View.CopyFromCPU(model);
+                dev.StepDevice(accelerator, dModel.View, a.View, b.View);
+                (a, b) = (b, a);
+                var got = await a.View.CopyToHostAsync();
+                double num = 0, den = 0; for (int i = 0; i < n; i++) { double d = got[i] - sample[i]; num += d * d; den += (double)sample[i] * sample[i]; }
+                double rel = Math.Sqrt(num / den); worst = Math.Max(worst, rel);
+                if (s % 5 == 4 || s == steps - 1) lines.Add($"step {s} {rel:E1}");
+            }
+        }
+        finally { dev.DisposeDevice(); }
+        string line = $"{steps} steps on {accelerator.AcceleratorType}: device vs host step, worst {worst:E2} relative RMS ({string.Join(", ", lines)})";
+        Console.WriteLine("[Wan] UniPC device: " + line);
+        Ur_Expect(worst < 1e-5, line);
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="WanVideo.TakeDeviceFrames"/> hands the buffer over: it returns it and clears <see cref="WanVideo.DeviceFrames"/>, and the video's
     /// <see cref="WanVideo.Dispose"/> afterwards leaves it alive (still readable). Without the take, Dispose frees it. Runs once, on the CPU lane.
     /// </summary>

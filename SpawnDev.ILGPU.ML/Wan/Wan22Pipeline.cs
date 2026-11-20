@@ -352,6 +352,7 @@ public sealed class Wan22Pipeline
         PutPicture(latent);
         Report("denoise", 0, "loading the transformer");
         IReadOnlyList<double>? magRatios = null; (int, int) magSkips = default;
+        MemoryBuffer1D<float, Stride1D.Dense>? devLatent = null;                        // DeviceFrames: the latent never leaves the device
         using (var dw = await LoadWeightsAsync(_paths.Dit, ct))
         using (var dit = new WanDiT(_acc, new DiTKernels(_acc), dw))
         {
@@ -373,6 +374,64 @@ public sealed class Wan22Pipeline
                 if (ratios != null) ratios.Add(await dit.ReadResidualRatioAsync() ?? 1.0);
                 return await lOut.View.CopyToHostAsync();
             }
+            if (req.DeviceFrames)
+            {
+                // rule 4 (2026-11-19, Lore / TJ): the latent, both guidance branches, the CFG combine, the sampler step and the i2v first frame stay on the device;
+                // nothing is read back per step (a Preview, if set, reads the step's x0 back: a host picture by definition). UniPC steps on the device in float32
+                // (FlowUniPCScheduler.StepDevice; the host loop's scheduler arithmetic is double).
+                var wk = new WanKernels(_acc);
+                int n = latent.Length;
+                devLatent = _acc.Allocate1D(latent);
+                using var devOther = _acc.Allocate1D<float>(n);
+                using var devUncond = guided ? _acc.Allocate1D<float>(n) : null;
+                using var z0Dev = z0 != null ? _acc.Allocate1D(z0) : null;
+                using var fresh = req.Sampler == WanSampler.FewStep ? _acc.Allocate1D<float>(n) : null;
+                var cur = devLatent; var nxt = devOther;
+                async Task CallDeviceAsync(int s, int branch, ArrayView1D<float, Stride1D.Dense> o)
+                {
+                    bool skip = mag != null && dit.HasResidual(branch) && mag.Skip(s, branch);
+                    dit.Forward(cur.View, sched.Timesteps[s], i2v, branch, o, reuseResidual: skip);
+                    calls++;
+                    if (ratios != null) ratios.Add(await dit.ReadResidualRatioAsync() ?? 1.0);
+                }
+                try
+                {
+                    for (int s = 0; s < req.Steps; s++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        await CallDeviceAsync(s, 0, lOut.View);
+                        if (guided)
+                        {
+                            await CallDeviceAsync(s, 1, devUncond!.View);
+                            wk.GuidanceCombine(lOut.View, devUncond.View, (float)req.GuidanceScale, n);
+                        }
+                        if (Preview != null)
+                        {
+                            float sg = sched.Sigmas[s];
+                            var lh = await cur.View.CopyToHostAsync(); var ph = await lOut.View.CopyToHostAsync();
+                            var x0p = new float[n];
+                            for (int i = 0; i < n; i++) x0p[i] = lh[i] - sg * ph[i];
+                            PutPicture(x0p);
+                            Preview(new WanPreview(s + 1, req.Steps, x0p, Fz, h, w));
+                        }
+                        if (req.Sampler == WanSampler.FewStep)
+                        {
+                            bool last = s == req.Steps - 1;
+                            if (!last) fresh!.View.CopyFromCPU(Gaussian(n, req.Seed + 7919L * (s + 1)));
+                            wk.FewStepUpdate(cur.View, lOut.View, fresh!.View, nxt.View, sched.Sigmas[s], sched.Sigmas[s + 1], last, n);
+                        }
+                        else sched.StepDevice(_acc, lOut.View, cur.View, nxt.View);
+                        if (z0Dev != null) wk.PutFirstFrame(nxt.View, z0Dev.View, Fz, per);
+                        (cur, nxt) = (nxt, cur);
+                        _acc.Flush();
+                        Report("denoise", (s + 1.0) / req.Steps, $"step {s + 1} of {req.Steps}");
+                    }
+                    if (!ReferenceEquals(cur, devLatent)) devLatent.View.CopyFrom(cur.View);          // the final latent in the buffer that outlives this block
+                    await _acc.SynchronizeAsync();                                                   // the loop's own buffers are released below
+                }
+                finally { sched.DisposeDevice(); }
+            }
+            else
             for (int s = 0; s < req.Steps; s++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -419,7 +478,11 @@ public sealed class Wan22Pipeline
         using (var vae = new WanVae(_acc, vw))
         {
             vae.Trace = req.Trace;
-            if (req.DeviceFrames) deviceFrames = req.TiledDecode ? await vae.DecodeTiledDeviceFramesAsync(latent, Fz, h, w) : await vae.DecodeDeviceFramesAsync(latent, Fz, h, w);
+            if (req.DeviceFrames)
+            {
+                try { deviceFrames = req.TiledDecode ? await vae.DecodeTiledDeviceFramesAsync(devLatent!.View, Fz, h, w) : await vae.DecodeDeviceFramesAsync(devLatent!.View, Fz, h, w); }
+                finally { devLatent?.Dispose(); devLatent = null; }
+            }
             else if (req.RgbaFrames && !req.TiledDecode) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w);
             else video = req.TiledDecode ? await vae.DecodeTiledAsync(latent, Fz, h, w) : await vae.DecodeAsync(latent, Fz, h, w);
             if (!req.DeviceFrames && req.RgbaFrames && req.TiledDecode)
@@ -430,6 +493,7 @@ public sealed class Wan22Pipeline
             }
         }
         Report("decode", 1, "done");
-        return new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent, MagRatios = magRatios, MagCacheSkips = magSkips };
+        return new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3,
+            Latent = req.DeviceFrames ? null : latent, MagRatios = magRatios, MagCacheSkips = magSkips };
     }
 }

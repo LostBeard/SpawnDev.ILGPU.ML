@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML.Wan;
 
 /// <summary>
@@ -90,6 +92,97 @@ public sealed class FlowUniPCScheduler
         if (_lowerOrderNums < _solverOrder) _lowerOrderNums++;
         _stepIndex++;
         return prev;
+    }
+
+    // ---- the same step on the device (2026-11-19, rule 4: the latent stays on the device across the steps) -------------------------------------------------------
+    // The scalars (a, b, c, rho, rk) are computed on the host in double exactly as Step does; every latent-sized operation runs in one float kernel per stage
+    // (WebGPU has no double): out = a X - b M0 - c (rho0 (P - M0) / rk + rhoLast (T - M0)). The x0 history rotates through device buffers (no copies).
+    private Accelerator? _dacc;
+    private MemoryBuffer1D<float, Stride1D.Dense>?[] _dOut = Array.Empty<MemoryBuffer1D<float, Stride1D.Dense>?>();   // x0 history, newest last (as _modelOutputs)
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dLast, _dX0, _dCorr;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _x0K;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, float, float, float, float, float, float, int, int>? _combineK;
+
+    private static void X0Impl(Index1D i, ArrayView1D<float, Stride1D.Dense> sample, ArrayView1D<float, Stride1D.Dense> model, ArrayView1D<float, Stride1D.Dense> x0, float sigma)
+        => x0[i] = sample[i] - sigma * model[i];
+    private static void CombineImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> m0, ArrayView1D<float, Stride1D.Dense> p,
+        ArrayView1D<float, Stride1D.Dense> t, ArrayView1D<float, Stride1D.Dense> o, float a, float b, float c, float rho0, float rkInv, float rhoLast, int usesP, int usesT)
+    {
+        float m = m0[i];
+        float corr = usesP != 0 ? rho0 * ((p[i] - m) * rkInv) : 0f;
+        if (usesT != 0) corr += rhoLast * (t[i] - m);
+        o[i] = a * x[i] - b * m - c * corr;
+    }
+
+    /// <summary>
+    /// <see cref="Step"/> on the device: <paramref name="modelOutput"/> (the guidance-combined prediction at <paramref name="sample"/>) and <paramref name="sample"/> are device
+    /// views of the latent's length; the next sample is written to <paramref name="next"/> (a third view; it may not alias the inputs). The scalars are Step's; the latent
+    /// arithmetic is float32 (no double on WebGPU), so it differs from <see cref="Step"/>'s double path by float rounding. Not with <see cref="EmulateReference"/>.
+    /// Use one mode per run (the history is kept on the device).
+    /// </summary>
+    public void StepDevice(Accelerator acc, ArrayView1D<float, Stride1D.Dense> modelOutput, ArrayView1D<float, Stride1D.Dense> sample, ArrayView1D<float, Stride1D.Dense> next)
+    {
+        if (_timesteps.Length == 0) throw new InvalidOperationException("SetTimesteps first");
+        if (EmulateReference) throw new NotSupportedException("StepDevice computes in float32; EmulateReference is the host path");
+        long n = sample.Length;
+        if (_dacc != acc || _dX0 == null || _dX0.Length != n)
+        {
+            DisposeDevice();
+            _dacc = acc;
+            _dOut = new MemoryBuffer1D<float, Stride1D.Dense>?[_solverOrder];
+            _dX0 = acc.Allocate1D<float>(n); _dLast = acc.Allocate1D<float>(n); _dCorr = acc.Allocate1D<float>(n);
+            _x0K = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(X0Impl);
+            _combineK = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float, float, float, float, float, int, int>(CombineImpl);
+        }
+        double sigmaCur = _sigmas[_stepIndex];
+        _x0K!((int)n, sample, modelOutput, _dX0!.View, (float)sigmaCur);
+        var sampleView = sample;
+        if (_stepIndex > 0 && _dOut[_solverOrder - 1] != null)
+        {
+            // the corrector: corrected sample from the last sample, the x0 history and this x0
+            int order = _thisOrder;
+            double sigmaT = _sigmas[_stepIndex], sigmaS0 = _sigmas[_stepIndex - 1];
+            double alphaT = 1 - sigmaT, lambdaT = Lambda(sigmaT), lambdaS0 = Lambda(sigmaS0), lambdaSi = order >= 2 ? Lambda(_sigmas[_stepIndex - 2]) : 0;
+            Coefficients(lambdaT, lambdaS0, lambdaSi, order, out double hPhi1, out double bH, out double[] rho, corrector: true);
+            double rk = order >= 2 ? (lambdaSi - lambdaS0) / (lambdaT - lambdaS0) : 1;
+            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : m0;
+            _combineK!((int)n, _dLast!.View, m0, prev, _dX0.View, _dCorr!.View, (float)(sigmaT / sigmaS0), (float)(alphaT * hPhi1), (float)(alphaT * bH),
+                (float)(order >= 2 ? rho[0] : 0), (float)(1 / rk), (float)rho[^1], order >= 2 ? 1 : 0, 1);
+            sampleView = _dCorr.View;
+        }
+        // shift the x0 history: the oldest buffer becomes the scratch for the next x0
+        var oldest = _dOut[0];
+        for (int i = 0; i < _solverOrder - 1; i++) _dOut[i] = _dOut[i + 1];
+        _dOut[_solverOrder - 1] = _dX0;
+        _dX0 = oldest ?? acc.Allocate1D<float>(n);
+        int ord = _lowerOrderFinal ? Math.Min(_solverOrder, _timesteps.Length - _stepIndex) : _solverOrder;
+        _thisOrder = Math.Min(ord, _lowerOrderNums + 1);
+        {
+            // the predictor from the (corrected) sample
+            int order = _thisOrder;
+            double sigmaT = _sigmas[_stepIndex + 1], sigmaS0 = _sigmas[_stepIndex];
+            double alphaT = 1 - sigmaT, lambdaT = Lambda(sigmaT), lambdaS0 = Lambda(sigmaS0), lambdaSi = order >= 2 ? Lambda(_sigmas[_stepIndex - 1]) : 0;
+            Coefficients(lambdaT, lambdaS0, lambdaSi, order, out double hPhi1, out double bH, out double[] rho, corrector: false);
+            double rk = order >= 2 ? (lambdaSi - lambdaS0) / (lambdaT - lambdaS0) : 1;
+            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : m0;
+            _combineK!((int)n, sampleView, m0, prev, m0, next, (float)(sigmaT / sigmaS0), (float)(alphaT * hPhi1), (float)(alphaT * bH),
+                (float)(order >= 2 ? rho[0] : 0), (float)(1 / rk), 0f, order >= 2 ? 1 : 0, 0);
+        }
+        // the sample this step started from (after the corrector) is the next corrector's "last sample"
+        _dLast!.View.CopyFrom(sampleView);
+        if (_lowerOrderNums < _solverOrder) _lowerOrderNums++;
+        _stepIndex++;
+    }
+
+    /// <summary>Frees the device buffers of <see cref="StepDevice"/> (also done by the next run's first step on another size or accelerator).</summary>
+    public void DisposeDevice()
+    {
+        foreach (var b in _dOut) b?.Dispose();
+        _dOut = Array.Empty<MemoryBuffer1D<float, Stride1D.Dense>?>();
+        _dLast?.Dispose(); _dX0?.Dispose(); _dCorr?.Dispose();
+        _dLast = _dX0 = _dCorr = null; _dacc = null;
     }
 
     private double Lambda(double sigma) => F(F(Math.Log(F(1 - sigma))) - F(Math.Log(sigma)));
