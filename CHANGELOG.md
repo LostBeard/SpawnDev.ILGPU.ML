@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.24 - 2026-11-19 (nuget.org) - TRELLIS.2 runs on slower GPUs in the browser; Hugging Face resolves once per file; exact attention at fp32 accuracy; SpawnDev.ILGPU 5.4.40
+
+- **SpawnDev.ILGPU 5.4.40** (stable 2026-11-19, Data): the Wasm sub-view copy fix (5.4.39) and a workaround for a Mono wasm interpreter bug that aborted
+  browser pages (`conv.i8` of a managed pointer on 32-bit; dotnet/runtime#137923).
+- **TRELLIS.2 image to 3D completes on an RX 590 in Chrome** (Lore, 2026-11-19, SpawnGen's browser Studio on 5.8.24-local.3, WebGPU on D3D12: 871 s for the
+  512 pipeline, no errors; before it lost the device every run). The two changes below.
 - **TRELLIS.2 in the browser: a command buffer per block** (Lore: image to 3D lost the WebGPU device, DXGI_ERROR_DEVICE_HUNG, on an RX 590 in Chrome;
   the same card completes it on the desktop over OpenCL in 552 s). In the browser `DeviceSync.Fence` is a flush, and DINOv3 (24 layers) and every
   FlowDiT forward (all three flows) went to the GPU as ONE command buffer: ~1 s on an RTX 4070 for a 1.3B-parameter flow forward at 4,096 tokens,
@@ -18,7 +24,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   dispatch over every band voxel of a 2.1M-triangle mesh was the RX 590's hang. Rows and points are independent: chunked == one dispatch BIT FOR BIT
   (`Trellis2_DeviceChunking_MatchesOneDispatch`: 458,179 texture voxels; `Remesh_DistanceGrid_ChunkedSearchesMatchOneDispatch`: all five search entry
   points at 64-point chunks, red-checked). MEASURED with Nsight Systems, a whole 512 image-to-3D run on the RTX 4070: 39,720 launches, the longest 30.3 ms.
-  **Not yet run in a browser.**
+  On the RX 590 in Chrome the device remesh that hung now takes 19.0 s (1,057,983 band voxels -> 1,456,856 faces).
 - **`Trellis2ImageTo3D.Trace` / `TraceSync`**: a line per step before the first pipeline stage (pipeline created, weights prefetch started, image prep,
   DINOv3 weights loaded / converted, kernels precompiled, the DINOv3 forward), the device drained before each with `TraceSync`, so the last line printed
   is where a hang happened. The demo's Image to 3D page turns it on with `?trace=1`.
