@@ -271,10 +271,11 @@ public sealed class SparseKernels
         int tiles = ((M + TiledGemm.BM - 1) / TiledGemm.BM) * ((cout + TiledGemm.BN - 1) / TiledGemm.BN);
         int hasBias = bias.HasValue ? (biasLo.HasValue ? 3 : 1) : 0;
         _tiledGemmSplit(new KernelConfig(tiles, TiledGemm.Threads), x, weight.Cast<global::ILGPU.Half, uint>(), weightLo.Cast<global::ILGPU.Half, uint>(),
-            bias.HasValue ? BiasWords(bias.Value) : _tiledDummyU!.View, biasLo.HasValue ? BiasWords(biasLo.Value) : _tiledDummyU!.View, o, nbr,
+            bias.HasValue ? BiasWords(bias.Value) : _tiledDummyU!.View, biasLo.HasValue ? BiasWords(biasLo.Value) : (_tiledDummyU2 ??= _acc.Allocate1D<uint>(1)).View, o, nbr,
             M, taps * cin, cout, cin, TiledGemm.SplitFlags(hasBias, 0, 0));
     }
     private Action<KernelConfig, FV, UV, UV, UV, UV, FV, IV, int, int, int, int, int>? _tiledGemmSplit;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _tiledDummyU2;                     // the low bias's stand-in: never the same buffer as the bias's (WebGPU aliasing)
 
     /// <summary>
     /// <see cref="ConvTaps"/> on the portable tiled GEMM with fp32 activations all the way (no tensor cores). <paramref name="addToOutput"/> adds the product to what <paramref name="o"/> already

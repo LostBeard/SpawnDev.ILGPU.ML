@@ -144,6 +144,7 @@ public sealed class FlowDiT : IDisposable
             T("self attention", () => _k.Attention(_qkv, 3 * C, 0, _qkv, 3 * C, 1 * C, 2 * C, _scores, _attn, N, N, H, D));
             T("linear out", () => _k.Linear(_attn, _w.BF16(p + "self_attn.to_out.weight"), _w.BF16(p + "self_attn.to_out.bias"), _proj, N, C, C));
             T("gate residual", () => _k.GateResidual(_h, _proj, _modv, 2 * C, N * C, C));
+            _acc.Submit();   // a command buffer per block third in the browser (see the block's end)
 
             // cross attention (no modulation, no RoPE; norm2 is the affine one)
             T("norm affine", () => _k.LayerNormAffine(_h, _hn, _w.BF16(p + "norm2.weight"), _w.BF16(p + "norm2.bias"), N, C, 1e-6f));
@@ -154,6 +155,7 @@ public sealed class FlowDiT : IDisposable
             T("cross attention", () => _k.Attention(_q, C, 0, _kv, 2 * C, 0, C, _scores, _attn, N, condTokens, H, D));
             T("linear out", () => _k.Linear(_attn, _w.BF16(p + "cross_attn.to_out.weight"), _w.BF16(p + "cross_attn.to_out.bias"), _proj, N, C, C));
             T("gate residual", () => _k.GateResidual(_h, _proj, _modv, -1, N * C, C));
+            _acc.Submit();
 
             // feed forward
             T("norm+mod", () => _k.LayerNormModulate(_h, _hn, _modv, 3 * C, 4 * C, N, C, 1e-6f));
@@ -166,7 +168,10 @@ public sealed class FlowDiT : IDisposable
                 if (b == 0) Tap("block0", _h, N * C);
                 if (b == _blocks - 1) Tap("block29", _h, N * C);
             }
-            _acc.Submit();   // one command buffer per block in the browser (DeviceSync.Submit: the GPU watchdog on slower cards)
+            // Three command buffers per block in the browser (DeviceSync.Submit: the Windows GPU watchdog, ~2 s per command buffer on AMD). One per block
+            // was not enough (2026-11-20, Lore: the RX 590 in Chrome still reset twice on 5.8.24, both times inside the sparse-structure flow's sampling,
+            // 557 s of an 871 s run there: a block averages ~0.4-0.8 s on that card and varies into the limit).
+            _acc.Submit();
         }
 
         // out: F.layer_norm (torch default eps 1e-5, no affine), then out_layer

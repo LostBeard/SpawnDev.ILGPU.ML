@@ -99,7 +99,7 @@ public sealed class FlowUniPCScheduler
     // (WebGPU has no double): out = a X - b M0 - c (rho0 (P - M0) / rk + rhoLast (T - M0)). The x0 history rotates through device buffers (no copies).
     private Accelerator? _dacc;
     private MemoryBuffer1D<float, Stride1D.Dense>?[] _dOut = Array.Empty<MemoryBuffer1D<float, Stride1D.Dense>?>();   // x0 history, newest last (as _modelOutputs)
-    private MemoryBuffer1D<float, Stride1D.Dense>? _dLast, _dX0, _dCorr;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dLast, _dX0, _dCorr, _dUnusedP, _dUnusedT;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _x0K;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, float, float, float, float, float, float, int, int>? _combineK;
@@ -132,6 +132,9 @@ public sealed class FlowUniPCScheduler
             _dacc = acc;
             _dOut = new MemoryBuffer1D<float, Stride1D.Dense>?[_solverOrder];
             _dX0 = acc.Allocate1D<float>(n); _dLast = acc.Allocate1D<float>(n); _dCorr = acc.Allocate1D<float>(n);
+            // stand-ins for the combine's unused inputs: WebGPU binds every view read-write and refuses one buffer in two bindings (2026-11-20: the
+            // release sweep's WebGPU lane, "storage buffer aliasing" when m0 was also passed as p and t), so each unused slot gets its own buffer
+            _dUnusedP = acc.Allocate1D<float>(1); _dUnusedT = acc.Allocate1D<float>(1);
             _x0K = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(X0Impl);
             _combineK = acc.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float, float, float, float, float, int, int>(CombineImpl);
@@ -147,7 +150,7 @@ public sealed class FlowUniPCScheduler
             double alphaT = 1 - sigmaT, lambdaT = Lambda(sigmaT), lambdaS0 = Lambda(sigmaS0), lambdaSi = order >= 2 ? Lambda(_sigmas[_stepIndex - 2]) : 0;
             Coefficients(lambdaT, lambdaS0, lambdaSi, order, out double hPhi1, out double bH, out double[] rho, corrector: true);
             double rk = order >= 2 ? (lambdaSi - lambdaS0) / (lambdaT - lambdaS0) : 1;
-            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : m0;
+            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : _dUnusedP!.View;
             _combineK!((int)n, _dLast!.View, m0, prev, _dX0.View, _dCorr!.View, (float)(sigmaT / sigmaS0), (float)(alphaT * hPhi1), (float)(alphaT * bH),
                 (float)(order >= 2 ? rho[0] : 0), (float)(1 / rk), (float)rho[^1], order >= 2 ? 1 : 0, 1);
             sampleView = _dCorr.View;
@@ -166,8 +169,8 @@ public sealed class FlowUniPCScheduler
             double alphaT = 1 - sigmaT, lambdaT = Lambda(sigmaT), lambdaS0 = Lambda(sigmaS0), lambdaSi = order >= 2 ? Lambda(_sigmas[_stepIndex - 1]) : 0;
             Coefficients(lambdaT, lambdaS0, lambdaSi, order, out double hPhi1, out double bH, out double[] rho, corrector: false);
             double rk = order >= 2 ? (lambdaSi - lambdaS0) / (lambdaT - lambdaS0) : 1;
-            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : m0;
-            _combineK!((int)n, sampleView, m0, prev, m0, next, (float)(sigmaT / sigmaS0), (float)(alphaT * hPhi1), (float)(alphaT * bH),
+            var m0 = _dOut[_solverOrder - 1]!.View; var prev = order >= 2 ? _dOut[_solverOrder - 2]!.View : _dUnusedP!.View;
+            _combineK!((int)n, sampleView, m0, prev, _dUnusedT!.View, next, (float)(sigmaT / sigmaS0), (float)(alphaT * hPhi1), (float)(alphaT * bH),
                 (float)(order >= 2 ? rho[0] : 0), (float)(1 / rk), 0f, order >= 2 ? 1 : 0, 0);
         }
         // the sample this step started from (after the corrector) is the next corrector's "last sample"
@@ -181,8 +184,8 @@ public sealed class FlowUniPCScheduler
     {
         foreach (var b in _dOut) b?.Dispose();
         _dOut = Array.Empty<MemoryBuffer1D<float, Stride1D.Dense>?>();
-        _dLast?.Dispose(); _dX0?.Dispose(); _dCorr?.Dispose();
-        _dLast = _dX0 = _dCorr = null; _dacc = null;
+        _dLast?.Dispose(); _dX0?.Dispose(); _dCorr?.Dispose(); _dUnusedP?.Dispose(); _dUnusedT?.Dispose();
+        _dLast = _dX0 = _dCorr = _dUnusedP = _dUnusedT = null; _dacc = null;
     }
 
     private double Lambda(double sigma) => F(F(Math.Log(F(1 - sigma))) - F(Math.Log(sigma)));
