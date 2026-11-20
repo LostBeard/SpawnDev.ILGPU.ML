@@ -244,6 +244,9 @@ public sealed class WanDiT : IDisposable
             Segments((r0, r1, mod) => _k.GateResidual(Rows(_hid, r0, r1 - r0), Rows(_proj, r0, r1 - r0), mod, 5 * C, (r1 - r0) * C, C));
 
             if (Tap != null && Array.IndexOf(TapBlocks, b) >= 0) Tap($"block_{b}", _hid, N * C);
+            // one command buffer per block in the browser (DeviceSync.Submit): a whole forward at 1280x704x9 is ~26 TFLOP, past the ~2 s Windows GPU
+            // watchdog on a slower card (2026-11-19, Lore: an RX 590 in Chrome lost the device in the first forward)
+            _acc.Submit();
         }
         if (!reuseResidual && CacheResiduals)
         {

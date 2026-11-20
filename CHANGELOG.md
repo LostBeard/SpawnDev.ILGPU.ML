@@ -10,6 +10,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   browser pages (`conv.i8` of a managed pointer on 32-bit; dotnet/runtime#137923).
 - **TRELLIS.2 image to 3D completes on an RX 590 in Chrome** (Lore, 2026-11-19, SpawnGen's browser Studio on 5.8.24-local.3, WebGPU on D3D12: 871 s for the
   512 pipeline, no errors; before it lost the device every run). The two changes below.
+- **Wan 2.2 in the browser: a command buffer per DiT block** (Lore: the 5B Turbo lost the WebGPU device on the RX 590 in Chrome, ~50 s into the first
+  forward). `WanDiT.Forward` went to the GPU as one command buffer; at 1280x704x9 (2,640 tokens) a forward is ~26 TFLOP. It now ends a command buffer
+  after every one of its 30 blocks (`DeviceSync.Submit`: a browser flush, nothing on the desktop). The VAE decode already waits after every block.
+  Not yet run on the RX 590.
 - **TRELLIS.2 in the browser: a command buffer per block** (Lore: image to 3D lost the WebGPU device, DXGI_ERROR_DEVICE_HUNG, on an RX 590 in Chrome;
   the same card completes it on the desktop over OpenCL in 552 s). In the browser `DeviceSync.Fence` is a flush, and DINOv3 (24 layers) and every
   FlowDiT forward (all three flows) went to the GPU as ONE command buffer: ~1 s on an RTX 4070 for a 1.3B-parameter flow forward at 4,096 tokens,

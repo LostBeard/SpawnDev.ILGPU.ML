@@ -79,6 +79,7 @@ public abstract partial class MLTestBase
         var idMap = new int[texels]; var bary = new float[texels * 2];
         for (int i = 0; i < texels; i++) { idMap[i] = i % 7 == 0 ? 0 : rng.Next(nf) + 1; float w0 = (float)rng.NextDouble(), w1 = (float)rng.NextDouble() * (1 - w0); bary[i * 2] = w0; bary[i * 2 + 1] = w1; }
         var sk = new SparseKernels(accelerator);
+        bool scatterless = accelerator.AcceleratorType == AcceleratorType.WebGL;
         int was = MeshDistanceGrid.MaxSearchThreadsPerSubmit;
         async Task<(float[] D, int[] B, int[] BD, float[] DD, float[] P, float[] T)> Run(int threads)
         {
@@ -86,8 +87,14 @@ public abstract partial class MLTestBase
             using var grid = MeshDistanceGrid.Build(accelerator, p, f, R, R, R / 2f);
             var d = await grid.DistancesAsync(pts.Select(x => x).ToArray());
             var b = await grid.BandVoxelsAsync(1f, 0.87f);
-            var (bdBuf, bdN) = await grid.BandVoxelsDeviceAsync(sk, 1f, 0.87f);
-            int[] bd; using (bdBuf) bd = (await bdBuf.View.CopyToHostAsync()).Take(bdN * 3).ToArray();
+            // the device band-voxel compaction scatters three coordinates per thread: WebGL's transform feedback cannot (RequiresScatterStores); it is the
+            // device remesh's path, which TRELLIS.2 runs on WebGPU / desktop only, so WebGL compares the host band voxels against themselves
+            int[] bd = b;
+            if (!scatterless)
+            {
+                var (bdBuf, bdN) = await grid.BandVoxelsDeviceAsync(sk, 1f, 0.87f);
+                using (bdBuf) bd = (await bdBuf.View.CopyToHostAsync()).Take(bdN * 3).ToArray();
+            }
             using var ptsDev = accelerator.Allocate1D(pts); using var dd = accelerator.Allocate1D<float>(nPts);
             grid.DistancesDevice(ptsDev.View, nPts, dd.View, 0.25f);
             var ddh = await dd.View.CopyToHostAsync();
@@ -111,7 +118,8 @@ public abstract partial class MLTestBase
             };
             Rm_Expect(one.B.Length > 300 && one.B.Length == one.BD.Length, $"the band must be real and both band paths agree ({one.B.Length / 3} / {one.BD.Length / 3} voxels)");
             foreach (var (name, n, of) in diffs) Rm_Expect(n == 0, $"{name}: chunked differs from one dispatch in {n} of {of} values");
-            return $"{nf} triangles, {one.B.Length / 3} band voxels, {nPts} points, {texels} texels: every search chunked (64) == one dispatch, bit for bit";
+            return $"{nf} triangles, {one.B.Length / 3} band voxels, {nPts} points, {texels} texels: every search chunked (64) == one dispatch, bit for bit"
+                + (scatterless ? " (WebGL: the device band-voxel path skipped, it scatters)" : "");
         }
         finally { MeshDistanceGrid.MaxSearchThreadsPerSubmit = was; }
     });
