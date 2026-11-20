@@ -64,6 +64,40 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Benchmark (2026-11-20): the whole SD 1.5 VAE decode, 64 x 64 latent -> 512 x 512, in the BROWSER (the fp32 checkpoint over HTTP from the local file server:
+    /// <c>node tools/unirig-harness/serve-files.mjs D:/Projects/sd 8769</c>; its VAE keeps the low halves). Warm once, then the median of SD_VAE_REPS (default 3).
+    /// Against <see cref="Sd_VaeConv_Benchmark"/>'s sum, the share of the decode that is not 3x3 convolution. Prints "[SdConvBench] ...". Reported, not asserted.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Sd15_Vae_OverHttp_DecodeBenchmark() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsBrowser()) throw new UnsupportedTestException("the browser benchmark (WebGPU)");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var source = new SdRangeSource(http);
+        try { await http.GetStringAsync(SdServer + "browser/vae_sd15_512/shapes.json"); }
+        catch (Exception e) { throw new UnsupportedTestException($"the local file server is not running ({e.GetType().Name}): node tools/unirig-harness/serve-files.mjs D:/Projects/sd 8769"); }
+        int reps = int.TryParse(Environment.GetEnvironmentVariable("SD_VAE_REPS"), out var rr) ? rr : 3;
+        using var ck = await SdCheckpoint.LoadAsync(accelerator, source, "", Sd15File, new SdCheckpointOptions { LoadUNet = false, LoadTextEncoder = false });
+        var vae = ck.Vae!;
+        const int h = 64, w = 64;
+        var z = Wan.Wan22Pipeline.Gaussian(4L * h * w, 3);
+        using var zin = accelerator.Allocate1D(z); using var img = accelerator.Allocate1D<float>(3L * 64 * h * w);
+        await vae.DecodeAsync(zin.View, h, w, img.View); await accelerator.SynchronizeAsync();       // warm (compile)
+        var times = new List<double>();
+        for (int i = 0; i < reps; i++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await vae.DecodeAsync(zin.View, h, w, img.View);
+            await accelerator.SynchronizeAsync();
+            times.Add(sw.Elapsed.TotalMilliseconds);
+        }
+        times.Sort();
+        string line = $"{accelerator.AcceleratorType} SD 1.5 VAE decode 512x512 (fp32 checkpoint, low halves kept): median {times[times.Count / 2]:F0} ms of {reps} ({string.Join(", ", times.Select(t => t.ToString("F0")))})";
+        Console.WriteLine("[SdConvBench] " + line);
+        return line;
+    });
+
+    /// <summary>
     /// Benchmark (2026-11-20, Lore's queued speed target: the SD VAE decode is 3.3 s on an RX 590 in Chrome, ~70% of it 3x3 convolutions): <see cref="SdKernels.Conv"/>
     /// exact (fp32 activations, the portable tiled GEMM in gather mode, what SdVae runs) at the SD VAE decoder's shapes for a 512 x 512 picture, with fp16 weights only and with
     /// the low halves (an fp32 file's VAE: <see cref="SdWeights.KeepLowHalves"/>). Random data, no files: runs on every fast lane. SD_CONV_SHAPES "H x W x C, ..." overrides,
