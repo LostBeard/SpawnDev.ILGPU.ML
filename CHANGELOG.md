@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Video frames stay on the device** (`DeviceFrames`; Lore / TJ, rule 4: SpawnGen's IMAGE is device-resident). `WanRequest` / `LtxRequest` / `Ltx2Request.DeviceFrames`
+  returns `WanVideo.DeviceFrames`: an owned `MemoryBuffer1D<float>` [Frames, Height, Width, 3] in 0..1 = clamp((x + 1) / 2, 0, 1), ComfyUI's VAEDecode and its IMAGE type
+  (SpawnGen used to rebuild IMAGE from RGBA bytes / 255, which quantised). Every decoded chunk is converted on the device (`LtxKernels.FramesNhwc01`) straight into it;
+  nothing is read back. Wan's tiled decode runs entirely on the device (`WanVae.DecodeTiledDeviceFramesAsync`: each tile's 12-channel output kept on the device, the row /
+  column blends as kernels with the host path's float weights, each tile's crop unpatchified and converted into the output, no whole-clip 12-channel assembly).
+  `WanVideo : IDisposable` (Dispose frees the frames); `TakeDeviceFrames()` hands them over (the property clears, Dispose leaves them). MEASURED 2026-11-19 on CUDA:
+  Wan / LTX / LTX-2 untiled device frames == the host path through the same formula BIT FOR BIT (921,600 / 1,253,376 / 110,592 values; red-checked: a 0.49 scale
+  differs in 919,153 of 921,600); Wan tiled within the blends' FMA rounding of the host tiled path (55,186 of 2,150,400 values differ, at most 1.2e-7).
+
 ## 5.8.24 - 2026-11-19 (nuget.org) - TRELLIS.2 runs on slower GPUs in the browser; Hugging Face resolves once per file; exact attention at fp32 accuracy; SpawnDev.ILGPU 5.4.40
 
 - **SpawnDev.ILGPU 5.4.40** (stable 2026-11-19, Data): the Wasm sub-view copy fix (5.4.39) and a workaround for a Mono wasm interpreter bug that aborted
@@ -13,7 +22,7 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - **Wan 2.2 in the browser: a command buffer per DiT block** (Lore: the 5B Turbo lost the WebGPU device on the RX 590 in Chrome, ~50 s into the first
   forward). `WanDiT.Forward` went to the GPU as one command buffer; at 1280x704x9 (2,640 tokens) a forward is ~26 TFLOP. It now ends a command buffer
   after every one of its 30 blocks (`DeviceSync.Submit`: a browser flush, nothing on the desktop). The VAE decode already waits after every block.
-  Not yet run on the RX 590.
+  Verified on the RX 590 in Chrome with the 5.8.24 package (Lore): 1280x704x9 Turbo completes in 421 s, a clean frame.
 - **TRELLIS.2 in the browser: a command buffer per block** (Lore: image to 3D lost the WebGPU device, DXGI_ERROR_DEVICE_HUNG, on an RX 590 in Chrome;
   the same card completes it on the desktop over OpenCL in 552 s). In the browser `DeviceSync.Fence` is a flush, and DINOv3 (24 layers) and every
   FlowDiT forward (all three flows) went to the GPU as ONE command buffer: ~1 s on an RTX 4070 for a 1.3B-parameter flow forward at 4,096 tokens,

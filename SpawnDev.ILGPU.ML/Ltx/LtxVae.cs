@@ -141,6 +141,21 @@ public sealed class LtxVae : IDisposable
         return o;
     }
 
+    /// <summary>
+    /// <see cref="DecodeAsync"/> into a device buffer the caller owns: frames [8 (Fz - 1) + 1, H, W, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1) (ComfyUI's IMAGE),
+    /// converted on the device (<see cref="LtxKernels.FramesNhwc01"/>); nothing is read back to the host.
+    /// </summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w, float timestep = 0.05f, float noiseScale = 0f, float[]? noise = null)
+    {
+        var video = await DecodeToDeviceAsync(z, Fz, h, w, timestep, noiseScale, noise);
+        int frames = 8 * (Fz - 1) + 1, pixels = 32 * h * 32 * w;
+        var o = _acc.Allocate1D<float>(3L * frames * pixels);
+        _lk.FramesNhwc01(video.View, o.View, frames, pixels, 0);
+        await _acc.SynchronizeAsync();                                                              // the decoded video goes back to the pool below: drain first
+        Drop(video); Flush();
+        return o;
+    }
+
     private async Task<Buf> DecodeToDeviceAsync(float[] z, int Fz, int h, int w, float timestep, float noiseScale, float[]? noise)
     {
         int T = Fz, H = h, W = w, vox = T * H * W;

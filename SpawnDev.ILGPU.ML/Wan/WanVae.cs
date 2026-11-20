@@ -416,6 +416,45 @@ public sealed class WanVae : IDisposable
     }
 
     /// <summary>
+    /// <see cref="DecodeAsync"/> into a device buffer the caller owns: frames [4 Fz - 3, H, W, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1) (ComfyUI's IMAGE). Every decoded
+    /// chunk is unpatchified and converted on the device straight into it (<see cref="Ltx.LtxKernels.FramesNhwc01"/>); nothing is read back to the host.
+    /// </summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeDeviceFramesAsync(float[] z, int Fz, int h, int w)
+    {
+        int totalFrames = 4 * Fz - 3, scale = _v21 ? 8 : 16;
+        var o = _acc.Allocate1D<float>((long)totalFrames * h * scale * w * scale * 3);
+        var lk = new Ltx.LtxKernels(_acc);
+        int written = 0;
+        try
+        {
+            // the chunk buffer is still read by the queued conversion when the emit returns: drain before it is released (WebGPU / Wasm: no dispose under pending work)
+            async Task Emit21Async(Buf head, int frames, int Hs, int Ws)
+            {
+                int pixels = Hs * Ws;
+                using var chunk = _acc.Allocate1D<float>(3L * frames * pixels);
+                _wk.ToChannelFirstClamp3(head.View, chunk.View, frames * pixels);
+                lk.FramesNhwc01(chunk.View, o.View, frames, pixels, written);
+                written += frames;
+                await _acc.SynchronizeAsync();
+            }
+            async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
+            {
+                int pixels = Hs * 2 * Ws * 2;
+                using var chunk = _acc.Allocate1D<float>(3L * frames * pixels);
+                _wk.UnpatchifyVideo(headChunk.View, chunk.View, frames, Hs, Ws);          // [3, frames, 2 Hs, 2 Ws]
+                lk.FramesNhwc01(chunk.View, o.View, frames, pixels, written);
+                written += frames;
+                await _acc.SynchronizeAsync();
+            }
+            if (_v21) await DecodeCore21Async(z, Fz, h, w, Emit21Async);
+            else await DecodeCoreAsync(z, Fz, h, w, EmitAsync);
+            if (written != totalFrames) throw new InvalidOperationException($"decoded {written} frames, expected {totalFrames}");
+            return o;
+        }
+        catch { o.Dispose(); throw; }
+    }
+
+    /// <summary>
     /// <see cref="DecodeAsync"/> in spatial tiles, as diffusers' <c>AutoencoderKLWan.enable_tiling()</c> decodes (the low-memory path: device memory follows the tile, not the frame).
     /// Latent tiles of <paramref name="tileSample"/> / 16 with a stride of <paramref name="strideSample"/> / 16 (defaults 256 / 192 px: 16 / 12 latent positions), each decoded through the
     /// whole causal decoder with fresh caches; the 12-channel outputs before the pixel unshuffle are blended over the overlap (tileSample - strideSample) / 2 = 32 positions with
@@ -485,6 +524,87 @@ public sealed class WanVae : IDisposable
             for (int c = 0; c < 3; c++) Array.Copy(host, c * n * framePixels, result, c * plane + (long)f0 * framePixels, n * framePixels);
         }
         return result;
+    }
+
+    /// <summary>
+    /// <see cref="DecodeTiledAsync"/> into a device buffer the caller owns: frames [4 Fz - 3, H, W, 3] in 0..1 (ComfyUI's IMAGE), the whole tiled decode on the device. Each tile's
+    /// 12-channel output stays on the device, the row / column blends run as kernels (<see cref="WanKernels.BlendV"/> / <see cref="WanKernels.BlendH"/>, the host path's float
+    /// weights, in its order), and each tile's crop is unpatchified, clamped and converted straight into the output (<see cref="WanKernels.TileToFrames01"/>): no 12-channel
+    /// assembly of the whole clip, and nothing read back. Equal to the host path up to the blends' floating-point contraction (an FMA may round once where the host rounds twice).
+    /// </summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> DecodeTiledDeviceFramesAsync(float[] z, int Fz, int h, int w, int tileSample = 256, int strideSample = 192)
+    {
+        if (_v21) throw new NotSupportedException("tiled decoding is implemented for the Wan 2.2 VAE; decode Wan 2.1 latents with DecodeDeviceFramesAsync");
+        const int Z = 48, Ch = 12, P = 2, Ratio = 16;
+        if (tileSample % Ratio != 0 || strideSample % Ratio != 0 || strideSample > tileSample) throw new ArgumentException("tile and stride must be multiples of 16, stride <= tile");
+        int tl = tileSample / Ratio, ts = strideSample / Ratio;
+        int sh = h * Ratio / P, sw = w * Ratio / P, sStride = strideSample / P, blend = tileSample / P - sStride, totalFrames = 4 * Fz - 3;
+        var o = _acc.Allocate1D<float>((long)totalFrames * 2 * sh * 2 * sw * 3);
+        // the blend weights as the host path computes them (double, rounded to float), one table per extent
+        var weightTables = new Dictionary<int, MemoryBuffer1D<float, Stride1D.Dense>>();
+        FV Weights(int ext)
+        {
+            if (!weightTables.TryGetValue(ext, out var t))
+            {
+                var host = new float[2 * Math.Max(1, ext)];
+                for (int k = 0; k < ext; k++) { host[k] = (float)(1.0 - (double)k / ext); host[ext + k] = (float)((double)k / ext); }
+                weightTables[ext] = t = _acc.Allocate1D(host);
+            }
+            return t.View;
+        }
+        List<(MemoryBuffer1D<float, Stride1D.Dense> Data, int Hp, int Wp)>? prev = null, row = null;
+        try
+        {
+            for (int i = 0; i < h; i += ts)
+            {
+                row = new List<(MemoryBuffer1D<float, Stride1D.Dense> Data, int Hp, int Wp)>();
+                for (int j = 0; j < w; j += ts)
+                {
+                    int th = Math.Min(tl, h - i), tw = Math.Min(tl, w - j);
+                    var sub = new float[(long)Z * Fz * th * tw];
+                    for (int c = 0; c < Z; c++)
+                        for (int f = 0; f < Fz; f++)
+                            for (int y = 0; y < th; y++)
+                                Array.Copy(z, (((long)c * Fz + f) * h + i + y) * w + j, sub, (((long)c * Fz + f) * th + y) * tw, tw);
+                    int Hp = th * Ratio / P, Wp = tw * Ratio / P;
+                    var tile = _acc.Allocate1D<float>((long)totalFrames * Hp * Wp * Ch);
+                    row.Add((tile, Hp, Wp));
+                    int written = 0;
+                    async Task EmitAsync(Buf headChunk, int frames, int Hs, int Ws)
+                    {
+                        long n = (long)frames * Hs * Ws * Ch;
+                        tile.View.SubView((long)written * Hs * Ws * Ch, n).CopyFrom(headChunk.View.SubView(0, n));
+                        written += frames;
+                        await Task.CompletedTask;
+                    }
+                    await DecodeCoreAsync(sub, Fz, th, tw, EmitAsync);
+                    if (written != totalFrames) throw new InvalidOperationException($"a tile decoded {written} frames, expected {totalFrames}");
+                }
+                for (int j = 0; j < row.Count; j++)
+                {
+                    var (b, bh, bw) = row[j];
+                    if (prev != null) { var (a, ah, _) = prev[j]; int ext = Math.Min(Math.Min(ah, bh), blend); _wk.BlendV(a.View, b.View, Weights(ext), ah, bh, bw * Ch, ext, totalFrames); }
+                    if (j > 0) { var (a, _, aw) = row[j - 1]; int ext = Math.Min(Math.Min(aw, bw), blend); _wk.BlendH(a.View, b.View, Weights(ext), aw, bw, bh, ext, Ch, totalFrames); }
+                    int y0 = (i / ts) * sStride, x0 = j * sStride;
+                    int ch = Math.Min(Math.Min(sStride, bh), sh - y0), cw = Math.Min(Math.Min(sStride, bw), sw - x0);
+                    _wk.TileToFrames01(b.View, o.View, totalFrames, bh, bw, ch, cw, y0, x0, sh, sw);
+                    _acc.Flush();
+                }
+                // the previous row is read by this row's blends: drain, then release it
+                await _acc.SynchronizeAsync();
+                if (prev != null) foreach (var t in prev) t.Data.Dispose();
+                prev = row; row = null;
+            }
+            await _acc.SynchronizeAsync();
+            return o;
+        }
+        catch { o.Dispose(); throw; }
+        finally
+        {
+            if (prev != null) foreach (var t in prev) t.Data.Dispose();
+            if (row != null) foreach (var t in row) t.Data.Dispose();
+            foreach (var t in weightTables.Values) t.Dispose();
+        }
     }
 
     // diffusers' blend_v / blend_h on channel-last [F, H, W, C] tiles, in place on b (the weights in float32, as torch multiplies a float tensor by a Python float)

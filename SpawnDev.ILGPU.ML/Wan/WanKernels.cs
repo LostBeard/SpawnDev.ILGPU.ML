@@ -446,6 +446,56 @@ public sealed class WanKernels
         _unpatchVideo(3 * F * 4 * H * W, head, video, F, H, W);
     }
 
+    // ---- the tiled decode on the device (WanVae.DecodeTiledDeviceFramesAsync): diffusers' blend_v / blend_h in place on tile b, channel-last [F, H, W, C];
+    // the weights come from the host as float [wa(0..ext), wb(0..ext)] (computed in double and rounded, as torch multiplies a float tensor by a Python float)
+    private Action<Index1D, FV, FV, FV, int, int, int, int, int>? _blendV, _blendH;
+    private static void BlendVImpl(Index1D i, FV a, FV b, FV wts, int ah, int bh, int rowLen, int ext, int frames)
+    {
+        int k = i % rowLen, y = (i / rowLen) % ext, f = i / (rowLen * ext);
+        long ra = ((long)f * ah + ah - ext + y) * rowLen + k, rb = ((long)f * bh + y) * rowLen + k;
+        b[rb] = a[ra] * wts[y] + b[rb] * wts[ext + y];
+    }
+    private static void BlendHImpl(Index1D i, FV a, FV b, FV wts, int aw, int bw, int bh, int ext, int C)
+    {
+        int c = i % C, x = (i / C) % ext, y = (i / (C * ext)) % bh, f = i / (C * ext * bh);
+        long pa = (((long)f * bh + y) * aw + aw - ext + x) * C + c, pb = (((long)f * bh + y) * bw + x) * C + c;
+        b[pb] = a[pa] * wts[x] + b[pb] * wts[ext + x];
+    }
+    /// <summary>diffusers' blend_v on device tiles: rows [0, ext) of <paramref name="b"/> from a's last ext rows (a and b equally wide: rowLen = width * C).</summary>
+    public void BlendV(FV a, FV b, FV wts, int ah, int bh, int rowLen, int ext, int frames)
+    {
+        _blendV ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int>(BlendVImpl);
+        if (ext > 0) _blendV(frames * ext * rowLen, a, b, wts, ah, bh, rowLen, ext, frames);
+    }
+    /// <summary>diffusers' blend_h on device tiles: columns [0, ext) of <paramref name="b"/> from a's last ext columns (equally tall: bh rows).</summary>
+    public void BlendH(FV a, FV b, FV wts, int aw, int bw, int bh, int ext, int C, int frames)
+    {
+        _blendH ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int, int, int, int>(BlendHImpl);
+        if (ext > 0) _blendH(frames * bh * ext * C, a, b, wts, aw, bw, bh, ext, C);
+    }
+
+    // a blended tile's 12-channel output [F, th, tw, 12], its crop [0, ch) x [0, cw) placed at (y0, x0) of the 12-channel grid, unpatchified (channel c * 4 + r * 2 + q, as
+    // UnpatchVideoImpl), clamped to [-1, 1] and converted to ComfyUI's IMAGE: o[F, 2 sh, 2 sw, 3] = clamp((v + 1) / 2, 0, 1)
+    private Action<Index1D, FV, FV, int, int, int, int, int, int, int, int>? _tileToFrames;
+    private static void TileToFrames01Impl(Index1D i, FV tile, FV o, int th, int tw, int ch, int cw, int y0, int x0, int sh, int sw)
+    {
+        int c = i % 3, X = (i / 3) % (2 * cw), Y = (i / (3 * 2 * cw)) % (2 * ch), f = i / (3 * 4 * cw * ch);
+        int q = Y % 2, r = X % 2, y = Y / 2, x = X / 2;
+        float v = tile[(((long)f * th + y) * tw + x) * 12 + c * 4 + r * 2 + q];
+        v = MathF.Max(-1f, MathF.Min(1f, v));
+        float u = (v + 1f) * 0.5f;
+        o[(((long)f * 2 * sh + 2 * y0 + Y) * (2 * sw) + 2 * x0 + X) * 3 + c] = u < 0f ? 0f : (u > 1f ? 1f : u);
+    }
+    /// <summary>
+    /// Tile <paramref name="tile"/> [frames, th, tw, 12] (blended), its crop of <paramref name="ch"/> x <paramref name="cw"/> 12-channel positions placed at (y0, x0) of the
+    /// sh x sw grid, into ComfyUI's IMAGE <paramref name="o"/> [frames, 2 sh, 2 sw, 3]: unpatchified as <see cref="UnpatchifyVideo"/>, clamped, clamp((v + 1) / 2, 0, 1).
+    /// </summary>
+    public void TileToFrames01(FV tile, FV o, int frames, int th, int tw, int ch, int cw, int y0, int x0, int sh, int sw)
+    {
+        _tileToFrames ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int, int, int, int, int, int>(TileToFrames01Impl);
+        if (ch > 0 && cw > 0) _tileToFrames(frames * 4 * ch * cw * 3, tile, o, th, tw, ch, cw, y0, x0, sh, sw);
+    }
+
     // o[r, c0 + c] *= s for c < n over rows [0, rows) of [rows, N] (one part of a fused matrix whose parts carry different scales)
     private Action<Index1D, FV, int, int, int, float>? _scaleColRange;
     private static void ScaleColRangeImpl(Index1D i, FV o, int N, int c0, int n, float s) { long r = i / n; int c = (int)(i % n); o[r * N + c0 + c] *= s; }

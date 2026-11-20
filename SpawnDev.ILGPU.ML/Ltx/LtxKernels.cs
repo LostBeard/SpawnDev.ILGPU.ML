@@ -294,6 +294,28 @@ public sealed class LtxKernels
         _frameRgba(pixels, video, o, frames, pixels, frame);
     }
 
+    // video [3, F, H, W] channel-first in [-1, 1] -> frames [F, H, W, 3] channel-last in 0..1 at frame offset `first`: clamp((v + 1) / 2, 0, 1),
+    // ComfyUI's VAEDecode (its IMAGE type). Written straight into the caller's whole-clip buffer, one decoded chunk at a time.
+    private Action<Index1D, FV, FV, int, int, int>? _framesNhwc01;
+    private static void FramesNhwc01Impl(Index1D i, FV video, FV o, int frames, int pixels, int first)
+    {
+        int c = i % 3, p = (i / 3) % pixels, f = i / (3 * pixels);
+        float q = (video[(long)c * frames * pixels + (long)f * pixels + p] + 1f) * 0.5f;
+        o[((long)(first + f) * pixels + p) * 3 + c] = q < 0f ? 0f : (q > 1f ? 1f : q);
+    }
+    /// <summary>
+    /// A chunk of channel-first video <paramref name="video"/> [3, <paramref name="frames"/>, H, W] in [-1, 1] into <paramref name="o"/>, frames [F, H, W, 3] in 0..1
+    /// (clamp((v + 1) / 2, 0, 1): ComfyUI's IMAGE), at frame <paramref name="first"/>. Nothing leaves the device.
+    /// </summary>
+    public void FramesNhwc01(FV video, FV o, int frames, int pixels, int first)
+    {
+        _framesNhwc01 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(FramesNhwc01Impl);
+        _framesNhwc01(3 * frames * pixels, video, o, frames, pixels, first);
+    }
+
+    /// <summary>The host twin of <see cref="FramesNhwc01"/>'s formula (tests compare the device frames with the host path through it).</summary>
+    public static float ToImage01(float v) { float q = (v + 1f) * 0.5f; return q < 0f ? 0f : (q > 1f ? 1f : q); }
+
     // ---------------------------------------------------------------------------------------------------
     // latent upsampler kernels (same channel-last layout)
     // ---------------------------------------------------------------------------------------------------

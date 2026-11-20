@@ -118,6 +118,11 @@ public sealed class LtxRequest
     /// no host array the size of the whole clip (in the browser, a few clips of floats exhaust the .NET heap).
     /// </summary>
     public bool RgbaFrames { get; init; }
+    /// <summary>
+    /// Return the frames on the device (<see cref="WanVideo.DeviceFrames"/>: [F, H, W, 3] in 0..1, ComfyUI's IMAGE, owned by the caller) instead of host data: converted on the
+    /// device, nothing read back. Takes precedence over <see cref="RgbaFrames"/>.
+    /// </summary>
+    public bool DeviceFrames { get; init; }
 
     /// <summary>
     /// Pictures / clips to condition on (empty or null: text to video). With conditions the pipeline follows LTXConditionPipeline: per-token timesteps, the causal time positions
@@ -283,22 +288,23 @@ public sealed class LtxPipeline : IDisposable
     {
         progress?.Report(new WanProgress("decode", 0, "decoding the video"));
         float[] video = Array.Empty<float>();
-        byte[][]? rgba = null;
+        byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
         using (var vw = await AcquireAsync(_paths.Vae, ct))
         using (var vae = new LtxVae(_acc, vw.W))
         {
-            if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
+            if (req.DeviceFrames) deviceFrames = await vae.DecodeDeviceFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
+            else if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
             else video = await vae.DecodeAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
         }
         progress?.Report(new WanProgress("decode", 1, "done"));
-        return new WanVideo { Data = video, FramesRgba = rgba, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1, Latent = latent };
+        return new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1, Latent = latent };
     }
 
     private static LtxRequest Pass(LtxRequest r, int width, int height, float[]? sigmas, float[]? latents, long seed, float[] embedding) => new()
     {
         Prompt = r.Prompt, Width = width, Height = height, Frames = r.Frames, Sigmas = sigmas, FrameRate = r.FrameRate, Seed = seed, DecodeTimestep = r.DecodeTimestep,
-        DecodeNoiseScale = r.DecodeNoiseScale, Conditions = r.Conditions, ImageCondNoiseScale = r.ImageCondNoiseScale, PromptEmbedding = embedding, Latents = latents, RgbaFrames = r.RgbaFrames,
+        DecodeNoiseScale = r.DecodeNoiseScale, Conditions = r.Conditions, ImageCondNoiseScale = r.ImageCondNoiseScale, PromptEmbedding = embedding, Latents = latents, RgbaFrames = r.RgbaFrames, DeviceFrames = r.DeviceFrames,
     };
 
     private async Task<WanVideo> GenerateMultiScaleAsync(LtxRequest req, IProgress<WanProgress>? progress, CancellationToken ct)

@@ -94,6 +94,11 @@ public sealed class WanRequest
     /// array the size of the whole clip (the browser's .NET heap). With <see cref="TiledDecode"/> the conversion runs on the host after the tiles are blended.
     /// </summary>
     public bool RgbaFrames { get; init; }
+    /// <summary>
+    /// Return the frames on the device (<see cref="WanVideo.DeviceFrames"/>: [F, H, W, 3] in 0..1, ComfyUI's IMAGE, owned by the caller) instead of host data: every decoded chunk
+    /// is converted on the device into one buffer and nothing is read back. Takes precedence over <see cref="RgbaFrames"/>.
+    /// </summary>
+    public bool DeviceFrames { get; init; }
     /// <summary>Optional first frame (image-to-video): RGB bytes, 3 per pixel, row-major; resized and centre-cropped to the output size.</summary>
     public byte[]? ImageRgb { get; init; }
     public int ImageWidth { get; init; }
@@ -108,10 +113,23 @@ public sealed class WanRequest
 }
 
 /// <summary>The result: frames as floats in [-1, 1], channel-first [3, Frames, Height, Width] (the VAE's own layout).</summary>
-public sealed class WanVideo
+public sealed class WanVideo : IDisposable
 {
-    /// <summary>The frames [3, Frames, Height, Width] channel-first in [-1, 1]; empty when the pipeline was asked for <see cref="FramesRgba"/> instead.</summary>
+    /// <summary>The frames [3, Frames, Height, Width] channel-first in [-1, 1]; empty when the pipeline was asked for <see cref="FramesRgba"/> or <see cref="DeviceFrames"/> instead.</summary>
     public required float[] Data { get; init; }
+    /// <summary>
+    /// The frames on the pipeline's accelerator when the request asked for them (<c>DeviceFrames</c>): [Frames, Height, Width, 3] channel-last in 0..1 = clamp((x + 1) / 2, 0, 1)
+    /// of the decoder's [-1, 1] output (ComfyUI's VAEDecode and its IMAGE type). Nothing was read back to the host. The caller owns it: <see cref="Dispose"/> frees it.
+    /// </summary>
+    public MemoryBuffer1D<float, Stride1D.Dense>? DeviceFrames { get => _deviceFrames; init => _deviceFrames = value; }
+    private MemoryBuffer1D<float, Stride1D.Dense>? _deviceFrames;
+    /// <summary>
+    /// Hands <see cref="DeviceFrames"/> over to the caller: returns it and clears the property, so <see cref="Dispose"/> no longer frees it (the caller now owns it, e.g. an
+    /// IMAGE that keeps the buffer). Null when there are none or they were taken already.
+    /// </summary>
+    public MemoryBuffer1D<float, Stride1D.Dense>? TakeDeviceFrames() { var b = _deviceFrames; _deviceFrames = null; return b; }
+    /// <summary>Frees <see cref="DeviceFrames"/> unless they were taken (<see cref="TakeDeviceFrames"/>); nothing else here holds device memory.</summary>
+    public void Dispose() { _deviceFrames?.Dispose(); _deviceFrames = null; }
     /// <summary>
     /// The frames as RGBA bytes, one array per frame, when the request asked for them (<c>RgbaFrames</c>): converted on the device and read back a frame at a time, a quarter of
     /// the float data's size and no array of hundreds of megabytes (the browser's .NET heap runs out after a few 704x480 x97 clips of floats).
@@ -396,14 +414,15 @@ public sealed class Wan22Pipeline
 
         // 4. decode
         Report("decode", 0, "decoding the video");
-        float[] video = Array.Empty<float>(); byte[][]? rgba = null;
+        float[] video = Array.Empty<float>(); byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
         {
             vae.Trace = req.Trace;
-            if (req.RgbaFrames && !req.TiledDecode) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w);
+            if (req.DeviceFrames) deviceFrames = req.TiledDecode ? await vae.DecodeTiledDeviceFramesAsync(latent, Fz, h, w) : await vae.DecodeDeviceFramesAsync(latent, Fz, h, w);
+            else if (req.RgbaFrames && !req.TiledDecode) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w);
             else video = req.TiledDecode ? await vae.DecodeTiledAsync(latent, Fz, h, w) : await vae.DecodeAsync(latent, Fz, h, w);
-            if (req.RgbaFrames && req.TiledDecode)
+            if (!req.DeviceFrames && req.RgbaFrames && req.TiledDecode)
             {
                 var tmp = new WanVideo { Data = video, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3 };
                 rgba = Enumerable.Range(0, tmp.Frames).Select(tmp.GetFrameRgba).ToArray();
@@ -411,6 +430,6 @@ public sealed class Wan22Pipeline
             }
         }
         Report("decode", 1, "done");
-        return new WanVideo { Data = video, FramesRgba = rgba, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent, MagRatios = magRatios, MagCacheSkips = magSkips };
+        return new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = 4 * Fz - 3, Latent = latent, MagRatios = magRatios, MagCacheSkips = magSkips };
     }
 }

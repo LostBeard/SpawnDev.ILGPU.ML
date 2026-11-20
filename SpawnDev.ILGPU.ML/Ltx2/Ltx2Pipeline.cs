@@ -84,6 +84,11 @@ public sealed class Ltx2Request
     public IReadOnlyList<Ltx2Keyframe>? Keyframes { get; init; }
     /// <summary>True (default): the frames come as RGBA bytes, converted on the device a frame at a time; false: one float array [3, Frames, Height, Width] in [-1, 1].</summary>
     public bool RgbaFrames { get; init; } = true;
+    /// <summary>
+    /// Return the frames on the device (<see cref="Ltx2Clip.Video"/>'s <see cref="WanVideo.DeviceFrames"/>: [F, H, W, 3] in 0..1, ComfyUI's IMAGE, owned by the caller) instead of
+    /// host data: converted on the device, nothing read back. Takes precedence over <see cref="RgbaFrames"/>.
+    /// </summary>
+    public bool DeviceFrames { get; init; }
     /// <summary>False: skip the audio decode.</summary>
     public bool Audio { get; init; } = true;
 }
@@ -331,10 +336,11 @@ public sealed class Ltx2Pipeline
         var audioLatent = new float[A];
         Array.Copy(latent, V, audioLatent, 0, A);
         progress?.Report(new WanProgress("decode", 0, "decoding the video"));
-        float[] video = Array.Empty<float>(); byte[][]? rgba = null;
+        float[] video = Array.Empty<float>(); byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         using (var vae = await Ltx2VideoDecoder.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, ct))
         {
-            if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(videoLatent, F, H, W);
+            if (req.DeviceFrames) deviceFrames = await vae.DecodeDeviceFramesAsync(videoLatent, F, H, W);
+            else if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(videoLatent, F, H, W);
             else video = await vae.DecodeAsync(videoLatent, F, H, W);
             await _acc.SynchronizeAsync();
         }
@@ -351,7 +357,7 @@ public sealed class Ltx2Pipeline
         progress?.Report(new WanProgress("decode", 1, "done"));
         return new Ltx2Clip
         {
-            Video = new WanVideo { Data = video, FramesRgba = rgba, Width = req.Width, Height = req.Height, Frames = req.Frames, Latent = videoLatent },
+            Video = new WanVideo { Data = video, FramesRgba = rgba, DeviceFrames = deviceFrames, Width = req.Width, Height = req.Height, Frames = req.Frames, Latent = videoLatent },
             Audio = wav, VideoLatent = videoLatent, AudioLatent = audioLatent, Seconds = seconds,
         };
     }

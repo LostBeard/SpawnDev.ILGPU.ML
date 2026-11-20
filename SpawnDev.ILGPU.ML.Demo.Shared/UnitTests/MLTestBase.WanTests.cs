@@ -523,6 +523,137 @@ public abstract partial class MLTestBase
     public async Task Wan_UmT5_Quantized_MatchesReference() => await RunTest(accelerator => WanUmT5Check(accelerator, "umt5_xxl_enc_q8.safetensors", 0.06, 0.04));
 
     /// <summary>
+    /// <see cref="WanVae.DecodeDeviceFramesAsync"/> (2026-11-19, Lore / TJ: the frames stay on the device, ComfyUI's IMAGE [F, H, W, 3] in 0..1) against the host path: the same
+    /// latent through <see cref="WanVae.DecodeAsync"/> ([3, F, H, W] in [-1, 1], read back) and the same formula on the host (<see cref="Ltx.LtxKernels.ToImage01"/>) must equal
+    /// the device frames BIT FOR BIT. A seeded latent [48, 2, 12, 20] (5 frames of 192 x 320). Desktop devices (the VAE file is read from disk).
+    /// </summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task Wan_VaeDeviceFrames_MatchHostPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the VAE file is read from disk: a desktop GPU");
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors");
+        if (!File.Exists(vaePath)) throw new UnsupportedTestException($"Wan VAE not found in {WanDir}");
+        const int Fz = 2, h = 12, w = 20;
+        var z = Wan22Pipeline.Gaussian(48L * Fz * h * w, 5);
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        var host = await vae.DecodeAsync(z, Fz, h, w);                                 // [3, F, H, W]
+        using var dev = await vae.DecodeDeviceFramesAsync(z, Fz, h, w);                 // [F, H, W, 3]
+        return DeviceFramesCheck(host, await dev.View.CopyToHostAsync(), 4 * Fz - 3, 16 * h, 16 * w);
+    });
+
+    /// <summary>
+    /// <see cref="WanVae.DecodeTiledDeviceFramesAsync"/> (the whole tiled decode on the device: blends, crops, unpatchify, IMAGE conversion) against the host path
+    /// <see cref="WanVae.DecodeTiledAsync"/> through the same formula. A latent [48, 2, 20, 28] = 2 x 3 tiles of 16 at stride 12, so every vertical and horizontal blend
+    /// runs. Equal up to the blends' floating-point contraction (an FMA rounds once where the host rounds twice): at most 1e-5 apart; the line reports how many values differ.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Wan_VaeTiledDeviceFrames_MatchHostTiledPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the VAE file is read from disk: a desktop GPU");
+        var vaePath = Path.Combine(WanDir, "wan22_vae_f16.safetensors");
+        if (!File.Exists(vaePath)) throw new UnsupportedTestException($"Wan VAE not found in {WanDir}");
+        const int Fz = 2, h = 20, w = 28;
+        var z = Wan22Pipeline.Gaussian(48L * Fz * h * w, 6);
+        using var vw = GpuWeights.LoadFile(accelerator, vaePath); using var vae = new WanVae(accelerator, vw);
+        var host = await vae.DecodeTiledAsync(z, Fz, h, w);
+        using var dev = await vae.DecodeTiledDeviceFramesAsync(z, Fz, h, w);
+        var got = await dev.View.CopyToHostAsync();
+        int F = 4 * Fz - 3, H = 16 * h, W = 16 * w;
+        long plane = (long)F * H * W;
+        Ur_Expect(got.Length == 3 * plane, $"device frames hold {got.Length} floats, expected {3 * plane}");
+        int differ = 0; double worst = 0;
+        for (int f = 0; f < F; f++)
+            for (int p = 0; p < H * W; p++)
+                for (int c = 0; c < 3; c++)
+                {
+                    float want = Ltx.LtxKernels.ToImage01(host[c * plane + (long)f * H * W + p]), g = got[((long)f * H * W + p) * 3 + c];
+                    if (want != g) { differ++; worst = Math.Max(worst, Math.Abs(want - g)); }
+                }
+        Ur_Expect(worst <= 1e-5, $"the device tiled decode is {worst:E2} from the host tiled path ({differ} of {got.Length} values differ)");
+        double mn = got.Min(), mx = got.Max();
+        Ur_Expect(mn >= 0 && mx <= 1 && mx - mn > 0.1, $"the frames are in 0..1 and not constant ({mn}..{mx})");
+        string line = $"{F} frames {W}x{H}, 2 x 3 tiles: device tiled == host tiled up to the blends' FMA rounding ({differ} of {got.Length} values differ, worst {worst:E1})";
+        Console.WriteLine("[Wan] device frames (tiled): " + line);
+        return line;
+    });
+
+    /// <summary>
+    /// <see cref="WanVideo.TakeDeviceFrames"/> hands the buffer over: it returns it and clears <see cref="WanVideo.DeviceFrames"/>, and the video's
+    /// <see cref="WanVideo.Dispose"/> afterwards leaves it alive (still readable). Without the take, Dispose frees it. Runs once, on the CPU lane.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Wan_TakeDeviceFrames_HandsOwnershipOver() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.CPU) throw new UnsupportedTestException("host-only: runs on the CPU lane");
+        var data = new float[] { 0.25f, 0.5f, 0.75f, 1f, 0f, 0.125f };
+        var kept = accelerator.Allocate1D(data);
+        var video = new WanVideo { Data = Array.Empty<float>(), DeviceFrames = kept, Width = 1, Height = 2, Frames = 1 };
+        var taken = video.TakeDeviceFrames();
+        Ur_Expect(ReferenceEquals(taken, kept) && video.DeviceFrames == null && video.TakeDeviceFrames() == null, "the take returns the buffer once and clears the property");
+        video.Dispose();
+        var back = await taken!.View.CopyToHostAsync();
+        Ur_Expect(back.SequenceEqual(data), "the taken buffer survives the video's Dispose");
+        taken.Dispose();
+        var freed = accelerator.Allocate1D(data);
+        new WanVideo { Data = Array.Empty<float>(), DeviceFrames = freed, Width = 1, Height = 2, Frames = 1 }.Dispose();
+        Ur_Expect(freed.IsDisposed, "without a take, the video's Dispose frees the buffer");
+        return "take hands the buffer over; Dispose frees only an untaken one";
+    });
+
+    // device frames [F, H, W, 3] in 0..1 against the host path's [3, F, H, W] in [-1, 1] through the same formula: bit for bit, in range, not constant
+    private static string DeviceFramesCheck(float[] host, float[] got, int F, int H, int W)
+    {
+        long plane = (long)F * H * W;
+        Ur_Expect(host.Length == 3 * plane && got.Length == 3 * plane, $"device frames hold {got.Length} floats, the host path {host.Length}, expected {3 * plane}");
+        int bad = 0; string first = "";
+        for (int f = 0; f < F; f++)
+            for (int p = 0; p < H * W; p++)
+                for (int c = 0; c < 3; c++)
+                {
+                    float want = Ltx.LtxKernels.ToImage01(host[c * plane + (long)f * H * W + p]), g = got[((long)f * H * W + p) * 3 + c];
+                    if (BitConverter.SingleToInt32Bits(want) != BitConverter.SingleToInt32Bits(g)) { if (bad++ == 0) first = $"frame {f} pixel {p} channel {c}: {g} vs {want}"; }
+                }
+        Ur_Expect(bad == 0, $"device frames differ from the host path in {bad} of {got.Length} values (first: {first})");
+        double mn = got.Min(), mx = got.Max();
+        Ur_Expect(mn >= 0 && mx <= 1 && mx - mn > 0.1, $"the frames are in 0..1 and not constant ({mn}..{mx})");
+        string line = $"{F} frames {W}x{H}: device frames == host path, bit for bit ({got.Length} values, {mn:F3}..{mx:F3})";
+        Console.WriteLine("[Wan] device frames: " + line);
+        return line;
+    }
+
+    /// <summary><see cref="Ltx.LtxVae.DecodeDeviceFramesAsync"/> against <see cref="Ltx.LtxVae.DecodeAsync"/> through the same formula, bit for bit (the reference fixture's small latent).</summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task Ltx_VaeDeviceFrames_MatchHostPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("the VAE file is read from disk: a desktop GPU");
+        var weightsPath = Path.Combine(LtxDir, "ltx_vae_f16.safetensors"); var fxPath = Path.Combine(LtxDir, "ref", "vae_small.npz");
+        if (!File.Exists(weightsPath) || !File.Exists(fxPath)) throw new UnsupportedTestException($"LTX fixtures not found in {LtxDir} (set LTX_DIR)");
+        using var fx = ZipFile.OpenRead(fxPath);
+        var (latent, ls) = WanNpz(fx, "latent"); var (tArr, _) = WanNpz(fx, "timestep");               // [128, Fz, h, w]
+        int Fz = ls[0] == 128 ? ls[1] : ls[2], h = ls[^2], w = ls[^1];
+        using var weights = GpuWeights.LoadFile(accelerator, weightsPath);
+        using var vae = new Ltx.LtxVae(accelerator, weights);
+        var host = await vae.DecodeAsync(latent, Fz, h, w, tArr[0]);
+        using var dev = await vae.DecodeDeviceFramesAsync(latent, Fz, h, w, tArr[0]);
+        return DeviceFramesCheck(host, await dev.View.CopyToHostAsync(), 8 * (Fz - 1) + 1, 32 * h, 32 * w);
+    });
+
+    /// <summary><see cref="Ltx2.Ltx2VideoDecoder.DecodeDeviceFramesAsync"/> against <see cref="Ltx2.Ltx2VideoDecoder.DecodeAsync"/> through the same formula, bit for bit (a seeded latent [128, 2, 2, 2]).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Ltx2_VideoDeviceFrames_MatchHostPath() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a 27 GB checkpoint from disk: a desktop GPU");
+        var path = Path.Combine(Ltx2_Models(), "lightricks", "ltx-2-19b-dev-fp8.safetensors");
+        if (!File.Exists(path)) throw new UnsupportedTestException($"{path} not found");
+        const int Fz = 2, h = 2, w = 2;
+        var z = Wan22Pipeline.Gaussian(128L * Fz * h * w, 9);
+        using var vae = await Ltx2.Ltx2VideoDecoder.OpenAsync(accelerator, new SpawnDev.ILGPU.ML.Hub.LocalFolderModelSource(Path.GetDirectoryName(path)!), "", Path.GetFileName(path));
+        var host = await vae.DecodeAsync(z, Fz, h, w);
+        using var dev = await vae.DecodeDeviceFramesAsync(z, Fz, h, w);
+        return DeviceFramesCheck(host, await dev.View.CopyToHostAsync(), 8 * (Fz - 1) + 1, 32 * h, 32 * w);
+    });
+
+    /// <summary>
     /// Diagnostic (2026-11-19, Lore's speckle: our pipeline from the reference's torch noise is clean, from our seeded noise it is not): statistics of
     /// <see cref="Wan22Pipeline.Gaussian"/> (seed WAN_SEED, default 42) against the noise of a ref_dit_dump.py file (WAN_NOISE_NPZ), same shape [48, F, h, w]:
     /// mean, std, tails, and the correlation of neighbours along w, h, F and the channels. Reported, not asserted.
