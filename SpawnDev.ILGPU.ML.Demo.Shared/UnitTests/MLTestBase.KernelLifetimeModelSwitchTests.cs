@@ -38,10 +38,24 @@ public abstract partial class MLTestBase
         finally { ShaderArtifactCache.Enabled = was; }
     });
 
+    /// <summary>Run 1 with <c>ReleaseCompilerCaches()</c> after each model's warm first inference (cache on).</summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task<string> KernelLifetime_ModelSwitch_ABA_Release() => await RunTest(accelerator => ModelSwitchABA(accelerator, release: true));
+
+    /// <summary>Run 1 with the release and ShaderArtifactCache off.</summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task<string> KernelLifetime_ModelSwitch_ABA_Release_NoShaderArtifactCache() => await RunTest(async accelerator =>
+    {
+        bool was = ShaderArtifactCache.Enabled;
+        ShaderArtifactCache.Enabled = false;
+        try { return await ModelSwitchABA(accelerator, release: true); }
+        finally { ShaderArtifactCache.Enabled = was; }
+    });
+
     sealed record ModelSwitchStep(string Name, double CreateMs, double FirstRunMs, double SecondRunMs,
         long Compiled, long Loaded, WeakReference Owner, float[]? Output);
 
-    async Task<string> ModelSwitchABA(Accelerator accelerator)
+    async Task<string> ModelSwitchABA(Accelerator accelerator, bool release = false)
     {
         var http = GetHttpClient();
         if (http == null)
@@ -53,13 +67,13 @@ public abstract partial class MLTestBase
         var yoloBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             HuggingFaceClient.GetDownloadUrl("salim4n/yolov8n-detect-onnx", "yolov8n-onnx-web/yolov8n.onnx"));
 
-        var a1 = await DepthStep("A1 cold", accelerator, depthBytes);
-        var b = await YoloStep("B", accelerator, yoloBytes);
+        var a1 = await DepthStep("A1 cold", accelerator, depthBytes, release);
+        var b = await YoloStep("B", accelerator, yoloBytes, release);
         await CollectFromUnwoundStack();
         bool a1Alive = a1.Owner.IsAlive, bAlive = b.Owner.IsAlive;
-        var a2 = await DepthStep("A2 after GC", accelerator, depthBytes);
+        var a2 = await DepthStep("A2 after GC", accelerator, depthBytes, release);
         // Control: reload right after dispose, no GC (what retained kernels would give).
-        var a3 = await DepthStep("A3 no GC", accelerator, depthBytes);
+        var a3 = await DepthStep("A3 no GC", accelerator, depthBytes, release);
 
         for (int i = 0; i < a1.Output!.Length; i++)
         {
@@ -71,7 +85,7 @@ public abstract partial class MLTestBase
 
         string Row(ModelSwitchStep s) =>
             $"{s.Name}: create {s.CreateMs:F0} ms, run1 {s.FirstRunMs:F0} ms, run2 {s.SecondRunMs:F0} ms, compiled +{s.Compiled}, loaded +{s.Loaded}";
-        var report = $"{BackendName} artifactCache={ShaderArtifactCache.Enabled} | {Row(a1)} | {Row(b)} | " +
+        var report = $"{BackendName} artifactCache={ShaderArtifactCache.Enabled} release={release} | {Row(a1)} | {Row(b)} | " +
             $"GC: A1 pipeline alive={a1Alive}, B alive={bAlive} | {Row(a2)} | {Row(a3)} | A2/A3 bit-exact vs A1";
         Console.WriteLine($"[KernelLifetime] {report}");
         return report;
@@ -100,6 +114,20 @@ public abstract partial class MLTestBase
         finally { ShaderArtifactCache.Enabled = was; }
     });
 
+    /// <summary>Run 2 with <c>ReleaseCompilerCaches()</c> after each model's warm first inference (cache on).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> KernelLifetime_LlmDepthSwitch_ABA_Release() => await RunTest(accelerator => LlmDepthSwitchABA(accelerator, release: true));
+
+    /// <summary>Run 2 with the release and ShaderArtifactCache off.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> KernelLifetime_LlmDepthSwitch_ABA_Release_NoShaderArtifactCache() => await RunTest(async accelerator =>
+    {
+        bool was = ShaderArtifactCache.Enabled;
+        ShaderArtifactCache.Enabled = false;
+        try { return await LlmDepthSwitchABA(accelerator, release: true); }
+        finally { ShaderArtifactCache.Enabled = was; }
+    });
+
     /// <summary>A loaded model kept between its load step and its dispose step (so the test body holds no typed local).</summary>
     sealed class SwitchModel : IAsyncDisposable
     {
@@ -116,7 +144,7 @@ public abstract partial class MLTestBase
         }
     }
 
-    async Task<string> LlmDepthSwitchABA(Accelerator accelerator)
+    async Task<string> LlmDepthSwitchABA(Accelerator accelerator, bool release = false)
     {
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available for this backend");
         var hub = new ModelsHostStreamLoader(http);
@@ -125,7 +153,7 @@ public abstract partial class MLTestBase
         await CollectFromUnwoundStack();
         double heap0 = GC.GetTotalMemory(false) / 1048576.0;
 
-        var rows = new List<string> { $"{BackendName} artifactCache={ShaderArtifactCache.Enabled} | start heap {heap0:F1} MiB" };
+        var rows = new List<string> { $"{BackendName} artifactCache={ShaderArtifactCache.Enabled} release={release} | start heap {heap0:F1} MiB" };
         async Task<T> Step<T>(string name, Func<Task<(T Result, string Detail)>> body)
         {
             long c0 = accelerator.CompiledKernelCount, l0 = accelerator.LoadedKernelCount;
@@ -138,18 +166,18 @@ public abstract partial class MLTestBase
             return result;
         }
 
-        var a1 = await Step("1 load+run A (LLM)", () => LlmLoadRun(accelerator, hub));
+        var a1 = await Step("1 load+run A (LLM)", () => LlmLoadRun(accelerator, hub, release));
         string answer1 = a1.Answer;
         var weakA1 = a1.Model.Owner!;
         await Step("2 dispose A", async () => { await a1.Model.DisposeAsync(); return (0, ""); });
         a1 = default;
-        var b = await Step("3 load+run B (depth)", () => DepthLoadRun(accelerator, depthBytes));
+        var b = await Step("3 load+run B (depth)", () => DepthLoadRun(accelerator, depthBytes, release));
         var weakB = b.Owner!;
         await Step("4 dispose B", async () => { await b.DisposeAsync(); return (0, ""); });
         b = null;
         await CollectFromUnwoundStack();
         rows.Add($"collected: A alive={weakA1.IsAlive}, B alive={weakB.IsAlive}");
-        var a2 = await Step("5 reload+run A (LLM)", () => LlmLoadRun(accelerator, hub));
+        var a2 = await Step("5 reload+run A (LLM)", () => LlmLoadRun(accelerator, hub, release));
         string answer2 = a2.Answer;
         await a2.Model.DisposeAsync();
 
@@ -162,7 +190,7 @@ public abstract partial class MLTestBase
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async Task<((SwitchModel Model, string Answer) Result, string Detail)> LlmLoadRun(Accelerator accelerator, ModelsHostStreamLoader hub)
+    async Task<((SwitchModel Model, string Answer) Result, string Detail)> LlmLoadRun(Accelerator accelerator, ModelsHostStreamLoader hub, bool release)
     {
         var sw = Stopwatch.StartNew();
         var m = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
@@ -173,11 +201,12 @@ public abstract partial class MLTestBase
         sw.Restart();
         string answer = await pipe.GenerateAsync(new List<(string, string)> { ("user", "What is the capital of France?") },
             new GenerationConfig { MaxNewTokens = 8, Strategy = "greedy" }, thinking: false);
+        if (release) accelerator.ReleaseCompilerCaches();   // after the warm first inference, as an app would
         return ((model, answer), $" (load {loadMs:F0}, generate 8 tok {sw.Elapsed.TotalMilliseconds:F0})");
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async Task<(SwitchModel Result, string Detail)> DepthLoadRun(Accelerator accelerator, byte[] onnxBytes)
+    async Task<(SwitchModel Result, string Detail)> DepthLoadRun(Accelerator accelerator, byte[] onnxBytes, bool release)
     {
         const int w = 64, h = 48;
         var px = new int[w * h];
@@ -192,6 +221,7 @@ public abstract partial class MLTestBase
         sw.Restart();
         var (raw, _, _, _, _) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);   // reads min/max back: synced
         raw.Dispose();
+        if (release) accelerator.ReleaseCompilerCaches();
         return (model, $" (load {loadMs:F0}, run {sw.Elapsed.TotalMilliseconds:F0})");
     }
 
@@ -205,7 +235,7 @@ public abstract partial class MLTestBase
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async Task<ModelSwitchStep> DepthStep(string name, Accelerator accelerator, byte[] onnxBytes)
+    async Task<ModelSwitchStep> DepthStep(string name, Accelerator accelerator, byte[] onnxBytes, bool release)
     {
         const int w = 64, h = 48;
         var px = new int[w * h];
@@ -229,6 +259,7 @@ public abstract partial class MLTestBase
             var (raw, _, _, ow, oh) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);   // reads min/max back: synced
             run1 = sw.Elapsed.TotalMilliseconds;
             using (raw) output = await raw.CopyToHostAsync<float>(0, ow * oh);
+            if (release) accelerator.ReleaseCompilerCaches();   // after the warm first inference, as an app would
             sw.Restart();
             var (raw2, _, _, _, _) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);
             run2 = sw.Elapsed.TotalMilliseconds;
@@ -244,7 +275,7 @@ public abstract partial class MLTestBase
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async Task<ModelSwitchStep> YoloStep(string name, Accelerator accelerator, byte[] onnxBytes)
+    async Task<ModelSwitchStep> YoloStep(string name, Accelerator accelerator, byte[] onnxBytes, bool release)
     {
         var img = new int[640 * 480];
         for (int y = 0; y < 480; y++)
@@ -264,6 +295,7 @@ public abstract partial class MLTestBase
             sw.Restart();
             await pipeline.DetectAsync(img, 640, 480, confidenceThreshold: 0.1f);
             run1 = sw.Elapsed.TotalMilliseconds;
+            if (release) accelerator.ReleaseCompilerCaches();
             sw.Restart();
             await pipeline.DetectAsync(img, 640, 480, confidenceThreshold: 0.1f);
             run2 = sw.Elapsed.TotalMilliseconds;
