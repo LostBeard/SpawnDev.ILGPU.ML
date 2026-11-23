@@ -302,6 +302,16 @@ public sealed class Wan22Pipeline
 
     public async Task<WanVideo> GenerateAsync(WanRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
+        var result = await GenerateCoreAsync(req, progress, ct).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<WanVideo> GenerateCoreAsync(WanRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
+    {
         if (req.Width % 32 != 0 || req.Height % 32 != 0) throw new ArgumentException("width and height must be multiples of 32");
         if ((req.Frames - 1) % 4 != 0 || req.Frames < 1) throw new ArgumentException("the frame count must be 4n + 1");
         int Fz = (req.Frames - 1) / 4 + 1, h = req.Height / 16, w = req.Width / 16, per = h * w;

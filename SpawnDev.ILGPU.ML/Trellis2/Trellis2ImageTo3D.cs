@@ -184,6 +184,16 @@ public sealed class Trellis2ImageTo3D : IDisposable
     /// </summary>
     public async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> GenerateAsync(IV rgba, int width, int height, Trellis2Options? options, CancellationToken ct = default)
     {
+        var result = await GenerateCoreAsync(rgba, width, height, options, ct).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<(Trellis2Pipeline.Output Output, Trellis2Pipeline Pipeline)> GenerateCoreAsync(IV rgba, int width, int height, Trellis2Options? options, CancellationToken ct = default)
+    {
         options ??= new Trellis2Options();
         if (options.Resolution != 512 && options.Resolution != 1024 && options.Resolution != 1536) throw new ArgumentException("Resolution must be 512, 1024 or 1536");
         if (options.Resolution == 1536 && !options.Cascade) throw new ArgumentException("Resolution 1536 is the 1536_cascade pipeline: set Cascade");

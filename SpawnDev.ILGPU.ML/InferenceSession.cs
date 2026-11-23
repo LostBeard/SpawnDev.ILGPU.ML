@@ -3050,9 +3050,21 @@ public class InferenceSession : IDisposable
 
     private void AfterRun(GraphExecutor exec, Dictionary<string, Tensor> outputs)
     {
+        // First successful run = this model's warm-up: its kernels are compiled, so free ILGPU's compiler caches once
+        // (CompilerCachePolicy: browser backends by default). Owners with a longer warm-up defer it and release themselves.
+        if (!DeferCompilerCacheRelease) CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _accelerator);
         if (!OutputsLiveUntilNextRun) return;
         foreach (var t in outputs.Values) _heldOutputs.Add((exec, t));
     }
+
+    private bool _compilerCachesReleased;
+
+    /// <summary>
+    /// When true, this session does not release ILGPU's compiler caches after its first run (see <see cref="CompilerCachePolicy"/>):
+    /// set by an owner whose warm-up continues past the session's first run (<see cref="Pipelines.GgufGenerator"/>: the prefill runs
+    /// first, the decode kernels compile after it), which then calls <see cref="CompilerCachePolicy.ModelWarmedUp"/> itself.
+    /// </summary>
+    public bool DeferCompilerCacheRelease { get; set; }
 
     private static global::ILGPU.Runtime.MemoryBuffer? BufferOf(Tensor t) => RawBufferOf(t.Data);
 

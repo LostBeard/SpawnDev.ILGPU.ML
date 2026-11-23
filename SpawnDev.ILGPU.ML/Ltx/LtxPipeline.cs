@@ -278,6 +278,16 @@ public sealed class LtxPipeline : IDisposable
     /// <summary>The whole pipeline: <see cref="DenoiseAsync"/> (with <see cref="LtxRequest.Upscale"/>: both passes and the upscaler between them), then the VAE decode.</summary>
     public async Task<WanVideo> GenerateAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
+        var result = await GenerateCoreAsync(req, progress, ct).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<WanVideo> GenerateCoreAsync(LtxRequest req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
+    {
         if (req.Upscale) return await GenerateMultiScaleAsync(req, progress, ct);
         int Fz = (req.Frames - 1) / TemporalRatio + 1, h = req.Height / SpatialRatio, w = req.Width / SpatialRatio;
         if (req.DeviceFrames)

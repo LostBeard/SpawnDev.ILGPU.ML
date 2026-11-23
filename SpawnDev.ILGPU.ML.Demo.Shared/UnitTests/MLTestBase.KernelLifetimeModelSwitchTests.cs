@@ -38,6 +38,34 @@ public abstract partial class MLTestBase
         finally { ShaderArtifactCache.Enabled = was; }
     });
 
+    /// <summary>
+    /// <see cref="CompilerCachePolicy"/>'s default (null): release after warm-up on the browser backends (WebGPU, WebGL, Wasm), where memory
+    /// is the constraint and the shader artifact cache makes a reload compile-free; not on CUDA / OpenCL / CPU (no artifact cache there:
+    /// a reload after a release recompiles every kernel). Forced values apply to every backend.
+    /// </summary>
+    [TestMethod]
+    public async Task CompilerCachePolicy_Default_BrowserBackendsOnly() => await RunTest(async accelerator =>
+    {
+        var saved = CompilerCachePolicy.ReleaseAfterWarmup;
+        try
+        {
+            CompilerCachePolicy.ReleaseAfterWarmup = null;
+            bool browser = accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm;
+            if (CompilerCachePolicy.IsEnabledFor(accelerator) != browser)
+                throw new Exception($"{BackendName}: default policy enabled={CompilerCachePolicy.IsEnabledFor(accelerator)}, expected {browser}");
+            CompilerCachePolicy.ReleaseAfterWarmup = true;
+            if (!CompilerCachePolicy.IsEnabledFor(accelerator)) throw new Exception($"{BackendName}: forced true not honoured");
+            CompilerCachePolicy.ReleaseAfterWarmup = false;
+            if (CompilerCachePolicy.IsEnabledFor(accelerator)) throw new Exception($"{BackendName}: forced false not honoured");
+            // Disabled: a warm-up must not release (and must say so).
+            long before = CompilerCachePolicy.ReleaseCount;
+            if (CompilerCachePolicy.ModelWarmedUp(accelerator) || CompilerCachePolicy.ReleaseCount != before)
+                throw new Exception($"{BackendName}: ModelWarmedUp released while the policy was off");
+        }
+        finally { CompilerCachePolicy.ReleaseAfterWarmup = saved; }
+        await Task.CompletedTask;
+    });
+
     /// <summary>Run 1 with <c>ReleaseCompilerCaches()</c> after each model's warm first inference (cache on).</summary>
     [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
     public async Task<string> KernelLifetime_ModelSwitch_ABA_Release() => await RunTest(accelerator => ModelSwitchABA(accelerator, release: true));
@@ -56,6 +84,15 @@ public abstract partial class MLTestBase
         long Compiled, long Loaded, WeakReference Owner, float[]? Output);
 
     async Task<string> ModelSwitchABA(Accelerator accelerator, bool release = false)
+    {
+        // release = the PRODUCTION hooks (InferenceSession after its first run, CompilerCachePolicy) release, not the test.
+        var policy = CompilerCachePolicy.ReleaseAfterWarmup;
+        CompilerCachePolicy.ReleaseAfterWarmup = release;
+        try { return await ModelSwitchABACore(accelerator, release); }
+        finally { CompilerCachePolicy.ReleaseAfterWarmup = policy; }
+    }
+
+    async Task<string> ModelSwitchABACore(Accelerator accelerator, bool release)
     {
         var http = GetHttpClient();
         if (http == null)
@@ -146,6 +183,23 @@ public abstract partial class MLTestBase
 
     async Task<string> LlmDepthSwitchABA(Accelerator accelerator, bool release = false)
     {
+        // release = the PRODUCTION hooks (GgufGenerator after its first generate, InferenceSession after its first run) release.
+        var policy = CompilerCachePolicy.ReleaseAfterWarmup;
+        CompilerCachePolicy.ReleaseAfterWarmup = release;
+        try { return await LlmDepthSwitchABACore(accelerator, release); }
+        finally { CompilerCachePolicy.ReleaseAfterWarmup = policy; }
+    }
+
+    /// <summary>The policy must have released exactly <paramref name="expected"/> times since <paramref name="before"/>: once per model
+    /// load when enabled (a second run of the same model must not release again), never when disabled.</summary>
+    static void ExpectReleases(long before, int expected, string what)
+    {
+        long got = CompilerCachePolicy.ReleaseCount - before;
+        if (got != expected) throw new Exception($"{what}: CompilerCachePolicy released {got} time(s), expected {expected}");
+    }
+
+    async Task<string> LlmDepthSwitchABACore(Accelerator accelerator, bool release)
+    {
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available for this backend");
         var hub = new ModelsHostStreamLoader(http);
         var depthBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
@@ -181,8 +235,15 @@ public abstract partial class MLTestBase
         b = null;
         await CollectFromUnwoundStack();
         rows.Add($"collected: A alive={weakA1.IsAlive}, B alive={weakB.IsAlive}");
+        int shadersBeforeReload = accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wgBefore ? wgBefore.CachedShaderCount : -1;
         var a2 = await Step("5 reload+run A (LLM)", () => LlmLoadRun(accelerator, hub, release));
         string answer2 = a2.Answer;
+        // SpawnDev.ILGPU 5.4.46: a recompiled kernel emits byte-identical WGSL, so reloading a model whose pipelines are still in the
+        // accelerator's shader cache adds NO entries, even with the artifact cache off (5.4.45: 57 -> 75 on this test, one duplicate
+        // pipeline per recompiled kernel per model switch).
+        if (accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wgAfter && wgAfter.CachedShaderCount != shadersBeforeReload)
+            throw new Exception($"{BackendName}: reloading the LLM grew the WebGPU shader cache {shadersBeforeReload} -> {wgAfter.CachedShaderCount} " +
+                "(non-deterministic WGSL: every model switch would add duplicate pipelines)");
         await Step("6 dispose A", async () => { await a2.Model.DisposeAsync(); return (0, ""); });
         a2 = default;
         // Attribution (WebGPU only): how much of what the disposed models left behind is the accelerator's shader cache.
@@ -200,6 +261,7 @@ public abstract partial class MLTestBase
     [MethodImpl(MethodImplOptions.NoInlining)]
     async Task<((SwitchModel Model, string Answer) Result, string Detail)> LlmLoadRun(Accelerator accelerator, ModelsHostStreamLoader hub, bool release)
     {
+        long releases0 = CompilerCachePolicy.ReleaseCount;
         var sw = Stopwatch.StartNew();
         var m = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", deselect: false);
         var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m.Stream, maxSeqLen: 1024);
@@ -209,7 +271,7 @@ public abstract partial class MLTestBase
         sw.Restart();
         string answer = await pipe.GenerateAsync(new List<(string, string)> { ("user", "What is the capital of France?") },
             new GenerationConfig { MaxNewTokens = 8, Strategy = "greedy" }, thinking: false);
-        if (release) accelerator.ReleaseCompilerCaches();   // after the warm first inference, as an app would
+        ExpectReleases(releases0, release ? 1 : 0, "LLM load + first generate");
         return ((model, answer), $" (load {loadMs:F0}, generate 8 tok {sw.Elapsed.TotalMilliseconds:F0})");
     }
 
@@ -220,6 +282,7 @@ public abstract partial class MLTestBase
         var px = new int[w * h];
         for (int i = 0; i < px.Length; i++) px[i] = (int)((uint)i * 2654435761u & 0xFFFFFFu) | unchecked((int)0xFF000000);
         using var frame = accelerator.Allocate1D(px);
+        long releases0 = CompilerCachePolicy.ReleaseCount;
         var sw = Stopwatch.StartNew();
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 3, 224, 224 } });
@@ -229,7 +292,7 @@ public abstract partial class MLTestBase
         sw.Restart();
         var (raw, _, _, _, _) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);   // reads min/max back: synced
         raw.Dispose();
-        if (release) accelerator.ReleaseCompilerCaches();
+        ExpectReleases(releases0, release ? 1 : 0, "depth load + first run");
         return (model, $" (load {loadMs:F0}, run {sw.Elapsed.TotalMilliseconds:F0})");
     }
 
@@ -254,6 +317,7 @@ public abstract partial class MLTestBase
         using var frame = accelerator.Allocate1D(px);
 
         long c0 = accelerator.CompiledKernelCount, l0 = accelerator.LoadedKernelCount;
+        long releases0 = CompilerCachePolicy.ReleaseCount;
         var sw = Stopwatch.StartNew();
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 3, 224, 224 } });
@@ -267,11 +331,12 @@ public abstract partial class MLTestBase
             var (raw, _, _, ow, oh) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);   // reads min/max back: synced
             run1 = sw.Elapsed.TotalMilliseconds;
             using (raw) output = await raw.CopyToHostAsync<float>(0, ow * oh);
-            if (release) accelerator.ReleaseCompilerCaches();   // after the warm first inference, as an app would
+            ExpectReleases(releases0, release ? 1 : 0, $"{name}: first run");
             sw.Restart();
             var (raw2, _, _, _, _) = await pipeline.EstimateGpuRawAsync(frame.View, w, h, w, h);
             run2 = sw.Elapsed.TotalMilliseconds;
             raw2.Dispose();
+            ExpectReleases(releases0, release ? 1 : 0, $"{name}: second run (must not release again)");
         }
         finally
         {
@@ -293,6 +358,7 @@ public abstract partial class MLTestBase
                 img[y * 640 + x] = (box ? 200 : 50) | ((box ? 180 : 40) << 8) | ((box ? 160 : 30) << 16) | (0xFF << 24);
             }
         long c0 = accelerator.CompiledKernelCount, l0 = accelerator.LoadedKernelCount;
+        long releases0 = CompilerCachePolicy.ReleaseCount;
         var sw = Stopwatch.StartNew();
         var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
         var pipeline = new ObjectDetectionPipeline(session, accelerator);
@@ -303,10 +369,11 @@ public abstract partial class MLTestBase
             sw.Restart();
             await pipeline.DetectAsync(img, 640, 480, confidenceThreshold: 0.1f);
             run1 = sw.Elapsed.TotalMilliseconds;
-            if (release) accelerator.ReleaseCompilerCaches();
+            ExpectReleases(releases0, release ? 1 : 0, $"{name}: first run");
             sw.Restart();
             await pipeline.DetectAsync(img, 640, 480, confidenceThreshold: 0.1f);
             run2 = sw.Elapsed.TotalMilliseconds;
+            ExpectReleases(releases0, release ? 1 : 0, $"{name}: second run (must not release again)");
         }
         finally
         {

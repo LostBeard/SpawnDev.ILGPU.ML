@@ -360,6 +360,16 @@ public sealed class Flux2Pipeline : IDisposable
     /// </summary>
     public async Task<List<Flux2Image>> RunManyAsync(Flux2Request request, int[] seeds, Func<int, Flux2Image, Task>? onImage = null)
     {
+        var result = await RunManyCoreAsync(request, seeds, onImage).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<List<Flux2Image>> RunManyCoreAsync(Flux2Request request, int[] seeds, Func<int, Flux2Image, Task>? onImage = null)
+    {
         if (seeds.Length == 0) throw new ArgumentException("at least one seed");
         if (request.Noise != null && seeds.Length != 1) throw new ArgumentException("Noise can only be given for a single seed");
         var refs = request.References;

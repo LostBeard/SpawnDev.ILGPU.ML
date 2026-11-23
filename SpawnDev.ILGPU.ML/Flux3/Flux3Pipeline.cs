@@ -174,6 +174,16 @@ public sealed class Flux3Pipeline : IDisposable
     /// <summary>Draw with precomputed text rows (tests feed the reference's); null encodes the caption.</summary>
     public async Task<Flux2Image> RunAsync(Flux3Request request, (float[] Rows, int Tokens)? text)
     {
+        var result = await RunCoreAsync(request, text).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<Flux2Image> RunCoreAsync(Flux3Request request, (float[] Rows, int Tokens)? text)
+    {
         int width = request.Width > 0 ? request.Width : 1024, height = request.Height > 0 ? request.Height : 1024;
         if (width % 16 != 0 || height % 16 != 0 || width < 64 || height < 64 || width > 4096 || height > 4096) throw new ArgumentException("Width and height must be multiples of 16 between 64 and 4096");
         int rows = height / 16, cols = width / 16, nImg = rows * cols;

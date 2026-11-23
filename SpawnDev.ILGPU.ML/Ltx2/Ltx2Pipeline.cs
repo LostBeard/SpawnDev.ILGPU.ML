@@ -227,6 +227,16 @@ public sealed class Ltx2Pipeline
     /// <summary>The whole run: encode, sample, decode.</summary>
     public async Task<Ltx2Clip> GenerateAsync(Ltx2Request req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
     {
+        var result = await GenerateCoreAsync(req, progress, ct).ConfigureAwait(false);
+        // First complete run = this model's warm-up: free ILGPU's compiler caches once (CompilerCachePolicy, browser backends by default).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _acc);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<Ltx2Clip> GenerateCoreAsync(Ltx2Request req, IProgress<WanProgress>? progress = null, CancellationToken ct = default)
+    {
         if (req.Width % SpatialRatio != 0 || req.Height % SpatialRatio != 0 || req.Width < SpatialRatio || req.Height < SpatialRatio) throw new ArgumentException("width and height: multiples of 32");
         if (req.Frames < 1 || (req.Frames - 1) % TemporalRatio != 0) throw new ArgumentException("frames: 8 n + 1");
         if (req.Distilled && _paths.DistilledLora == null) throw new InvalidOperationException("the distilled recipe needs Ltx2Paths.DistilledLora");

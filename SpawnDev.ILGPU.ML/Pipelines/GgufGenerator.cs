@@ -288,6 +288,7 @@ public sealed class GgufGenerator : IDisposable
         _session.EnableGGUFDecode(_cache);
         _session.CacheShapeReadbacks = true; // recycle fixed-shape decode buffers + warm-cache stable readbacks
         _session.OutputsLiveUntilNextRun = true; // the prefill's full-prompt logits too, not only the decode steps'
+        _session.DeferCompilerCacheRelease = true; // the session's first run is only the prefill; GenerateAsync releases after the decode too
         _eosId = _tokenizer.EosId;
         _maxSeqLen = maxSeqLen;
         _argmax = new GpuArgMax(accelerator);
@@ -307,6 +308,23 @@ public sealed class GgufGenerator : IDisposable
         IReadOnlyList<int>? stopTokenIds = null,
         Func<string, Task>? onDelta = null,
         CancellationToken ct = default)
+    {
+        var result = await GenerateCoreAsync(promptIds, config, stopStrings, stopTokenIds, onDelta, ct).ConfigureAwait(false);
+        // The first complete generate (prefill + decode, both engines) is this model's warm-up: release ILGPU's compiler caches once
+        // (CompilerCachePolicy). The session engine's own session defers its release to here (constructor).
+        CompilerCachePolicy.OnFirstRun(ref _compilerCachesReleased, _accelerator);
+        return result;
+    }
+
+    private bool _compilerCachesReleased;
+
+    private async Task<GenerationResult> GenerateCoreAsync(
+        int[] promptIds,
+        GenerationConfig? config,
+        IReadOnlyList<string>? stopStrings,
+        IReadOnlyList<int>? stopTokenIds,
+        Func<string, Task>? onDelta,
+        CancellationToken ct)
     {
         if (_batch == null && config != null && (config.MinP > 0f || config.PresencePenalty != 0f || config.Strategy == "sample"))
             throw new NotSupportedException("min-p, the presence penalty and the \"sample\" strategy run on the batch decoder engine (GgufEngine.BatchDecoder); this model runs on the session engine");

@@ -4,6 +4,20 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Compiler caches freed after a model's warm-up** (`CompilerCachePolicy`; TJ go 2026-11-23, SpawnDev.ILGPU 5.4.45). Once per model, right after its first
+  successful run, ML calls `accelerator.ReleaseCompilerCaches()`: `InferenceSession` after its first run (every ONNX pipeline), `GgufGenerator` after its first
+  generate (prefill + decode; its session defers via the new `InferenceSession.DeferCompilerCacheRelease`), and the top-level runs of FLUX.2, FLUX 3, Wan 2.2,
+  LTX, LTX-2 and TRELLIS.2. Default ON for WebGPU / WebGL / Wasm, OFF for CUDA / OpenCL / CPU (`CompilerCachePolicy.ReleaseAfterWarmup`: null = by backend,
+  true / false = always / never). An app that assembles a model from components itself (SD, Z-Image, Qwen-Image, FLUX.1, ACE-Step stages) calls
+  `CompilerCachePolicy.ModelWarmedUp(accelerator)` once after the first complete run. MEASURED (KernelLifetime_* tests, A -> B -> GC -> A, release ON vs OFF): a
+  disposed model leaves 6.5-16 MiB of compiler state on the browser heap without it, ~0 on Wasm and ~4 MiB on WebGPU (its shader cache, by design) with it;
+  reloading a released model compiles nothing on WebGPU / WebGL / Wasm (5.4.45's artifact cache), first-run overhead 0.3-0.5 s; warm runs unchanged. Once per
+  model, never per call or on a timer: a kernel compiled for the first time after a release re-imports shared code (~5-15 ms), so lazy loads stay rare.
+- **SpawnDev.ILGPU 5.4.46** (via 5.4.45): compiled kernels live with their owner (WebGPU's resolve cache now weak); the shader artifact cache covers Wasm and WebGL,
+  so a model reloaded after a release compiles nothing in the browser (release-ON reload overhead WebGL 3965 -> 366 ms, Wasm 937 -> 474 ms); 5.4.46 emits
+  deterministic WGSL / GLSL, so a recompiled kernel no longer adds a duplicate WebGPU pipeline per model switch (asserted by KernelLifetime_LlmDepthSwitch_*:
+  57 cached shaders before and after the reload, 5.4.45 went to 75 with the artifact cache off).
+
 - **Video frames stay on the device** (`DeviceFrames`; Lore / TJ, rule 4: SpawnGen's IMAGE is device-resident). `WanRequest` / `LtxRequest` / `Ltx2Request.DeviceFrames`
   returns `WanVideo.DeviceFrames`: an owned `MemoryBuffer1D<float>` [Frames, Height, Width, 3] in 0..1 = clamp((x + 1) / 2, 0, 1), ComfyUI's VAEDecode and its IMAGE type
   (SpawnGen used to rebuild IMAGE from RGBA bytes / 255, which quantised). Every decoded chunk is converted on the device (`LtxKernels.FramesNhwc01`) straight into it;
