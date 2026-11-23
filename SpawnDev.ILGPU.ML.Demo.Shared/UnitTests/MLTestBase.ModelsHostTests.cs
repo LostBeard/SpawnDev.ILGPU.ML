@@ -346,7 +346,35 @@ public abstract partial class MLTestBase
             Ur_Expect(first.Length == 50, $"the first range arrived ({first.Length} bytes)");
             using var rest = await ranged.ReadUint8ArrayAsync(100);
             Ur_Expect(rest.Length == UnmirroredBytes - 50, $"the rest arrived too ({rest.Length} bytes)");
+            Ur_Expect(ranged.NetworkErrorRetries == 0, $"an HTTP error answer (404) falls back at once, no models-host retry ({ranged.NetworkErrorRetries})");
         }
         Ur_Expect(log.Events.Count == 1, $"the range stream fell back exactly once ({log.Events.Count})");
+    });
+
+    /// <summary>
+    /// A FAST network failure on the models host (no HTTP answer: connection refused here, a reset in the wild) is retried on the models host once
+    /// before the stream falls back to Hugging Face for good: one transient reset used to hand a whole 0.5 GB load to Hugging Face (89 s -> 302 s,
+    /// 2026-11-23). The models host is pointed at a closed local port, so every attempt fails at the network level: the range must be retried once,
+    /// then fall back once, and the bytes still arrive. Browser only (FetchRangeStream).
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task ModelsHost_FetchRangeStream_RetriesANetworkFailureOnceBeforeFallingBack() => await RunTest(async accelerator =>
+    {
+        RequireBrowserRuntime();
+        var saved = ModelsHost.BaseUrl;
+        try
+        {
+            ModelsHost.BaseUrl = "http://127.0.0.1:9";   // the discard port: nothing listens, the connection is refused at once
+            var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
+            Ur_Expect(url.StartsWith("http://127.0.0.1:9/"), $"the URL points at the unreachable models host: {url}");
+            Ur_Expect(ModelsHost.GetFallbackUrl(url)?.StartsWith("https://huggingface.co/") == true, "and has a Hugging Face twin");
+            using var log = new FallbackLog(u => u == url);
+            await using var ranged = new FetchRangeStream(url, UnmirroredBytes);
+            using var all = await ranged.ReadUint8ArrayAsync((int)UnmirroredBytes);
+            Ur_Expect(all.Length == UnmirroredBytes, $"the bytes arrived from the twin ({all.Length} of {UnmirroredBytes})");
+            Ur_Expect(ranged.NetworkErrorRetries == 1, $"the network failure was retried on the models host exactly once ({ranged.NetworkErrorRetries})");
+            Ur_Expect(log.Events.Count == 1, $"then the stream fell back exactly once ({log.Events.Count})");
+        }
+        finally { ModelsHost.BaseUrl = saved; }
     });
 }

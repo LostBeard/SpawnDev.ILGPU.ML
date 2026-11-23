@@ -122,9 +122,16 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
     public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(90);
     public int Attempts { get; set; } = 4;
 
+    /// <summary>
+    /// Ranges retried on the models host after a fast network failure (connection reset / refused) instead of falling back to Hugging Face at once.
+    /// Diagnostics; the tests assert it.
+    /// </summary>
+    public int NetworkErrorRetries { get; private set; }
+
     private async Task<Uint8Array> FetchRangeAsync(long start, long end, CancellationToken ct)
     {
         Exception? last = null;
+        bool retriedNetworkError = false;
         for (int attempt = 1; attempt <= Attempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -132,6 +139,8 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
             TimeSpan? retryAfter = null;
             TaskCompletionSource? gate = null;
             string target = _url;
+            int? httpStatus = null;   // set when the server ANSWERED (with an error); null = no answer (network failure / timeout)
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 // one resolve at a time: the chunks scheduled before the first answer use its result
@@ -148,6 +157,7 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
                 using var resp = await window.Fetch(target, new FetchOptions { Headers = new() { ["Range"] = $"bytes={start}-{end}" }, Signal = signal });
                 if (!resp.Ok)
                 {
+                    httpStatus = (int)resp.Status;
                     if ((int)resp.Status == 429) retryAfter = RetryAfter(resp);
                     throw new IOException($"GET {target} bytes={start}-{end}: HTTP {resp.Status} {resp.StatusText}");
                 }
@@ -163,6 +173,18 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
                 last = ex;
                 // a failure on a resolved URL (a signed URL expires, or anything else): resolve again, now, without the backoff
                 if (target != _url && _rangeUrl == target) { _rangeUrl = null; reResolve = true; }
+                // A FAST network failure with no answer (connection reset / refused) is usually transient: try the models host once more before giving
+                // the whole rest of the stream to Hugging Face, which is several times slower to stream from (MEASURED 2026-11-23: one reset during a
+                // 0.5 GB GGUF load turned 89 s into 302 s). An HTTP error answer (404 / 403 / 429 / 5xx) still falls back at once: the host has
+                // answered. A timeout falls back at once too (a stalled host would otherwise cost RequestTimeout twice).
+                bool fastNetworkFailure = httpStatus == null && clock.Elapsed < RequestTimeout * 0.9;
+                if (!_fellBack && fastNetworkFailure && !retriedNetworkError && ModelsHost.GetFallbackUrl(_url) != null)
+                {
+                    retriedNetworkError = true;
+                    NetworkErrorRetries++;
+                    if (attempt < Attempts) await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
+                    continue;
+                }
                 // The models host could not give this range: switch to the Hugging Face twin for the rest of the stream. Safe mid-file because no
                 // validator is sent here and both hosts serve identical bytes (every mirrored file was checked sha256 against Hugging Face).
                 if (!_fellBack && ModelsHost.GetFallbackUrl(_url) is { } alt)
