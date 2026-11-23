@@ -59,7 +59,14 @@ namespace PlaywrightMultiTest
             {
                 if (test.Project is TestableBlazorWasm blazorProj)
                 {
-                    await test.TestFunc(blazorProj.Page);
+                    try { await test.TestFunc(blazorProj.Page); }
+                    finally
+                    {
+                        // A test that overran its done-wait (still running in the page) or killed the page's runtime gets a fresh page, so the
+                        // next test does not start beside it; the scheduler's lane loop does the same (ported from SpawnDev.ILGPU PMT 3f6bf6b).
+                        if (test.PageRuntimeDied && !string.IsNullOrEmpty(test.TestPageUrl))
+                            await ProjectRunner.RecreateTestPageAsync(blazorProj, test.TestPageUrl!);
+                    }
                     if (test.Result == TestResult.Unsupported)
                     {
                         sw.Stop();

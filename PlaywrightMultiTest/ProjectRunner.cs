@@ -1836,8 +1836,8 @@ namespace PlaywrightMultiTest
                     _pageRuntimeDied = false;
                     if (!string.IsNullOrEmpty(t.TestPageUrl) && page.Context != null)
                     {
-                        LogStatus("The .NET WASM runtime exited on the test page - replacing the page so the "
-                                + "lane can continue. The test that killed it is recorded as failed.");
+                        LogStatus("The test page is unusable (its .NET WASM runtime exited, or a test overran its done-wait and is still "
+                                + "running in it) - replacing the page so the lane can continue. That test is recorded as failed.");
                         var recovered = TestableProjects.OfType<TestableBlazorWasm>().FirstOrDefault();
                         if (recovered != null)
                             page = await RecreateTestPageAsync(recovered, t.TestPageUrl).ConfigureAwait(false);
@@ -1879,7 +1879,7 @@ namespace PlaywrightMultiTest
         /// WebGPU can leave the browser in a state where a plain reload is not enough for
         /// the next backend (Wasm). Swap to a fresh page in the same context.
         /// </summary>
-        private static async Task<IPage> RecreateTestPageAsync(TestableBlazorWasm blazor, string testPageUrl)
+        internal static async Task<IPage> RecreateTestPageAsync(TestableBlazorWasm blazor, string testPageUrl)
         {
             LogStatus("Recreating browser page after WebGPU (fresh page for Wasm lane)...");
             var oldPage = blazor.Page;

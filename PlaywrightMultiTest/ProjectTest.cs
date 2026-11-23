@@ -283,7 +283,7 @@ public class ProjectTest
                     }
                 }, doneTimeoutMs);
             }
-            catch
+            catch (Exception doneWaitError)
             {
                 // A TIMEOUT is the other failure whose cause only the console holds (a stalled await, a lost device, a test's own progress
                 // lines): dump the unfiltered tail before the exception ends the test. MEASURED 2026-11-02: a WebGPU measurement timed out
@@ -292,6 +292,15 @@ public class ProjectTest
                 Console.Error.WriteLine($"[{Name}] *** DONE-WAIT TIMED OUT after {doneTimeoutMs / 1000} s - console tail follows (unfiltered, oldest first) ***");
                 foreach (var line in recentConsole)
                     Console.Error.WriteLine($"  TIMEOUT: {line}");
+                // The test is STILL RUNNING in the page. Kept, the page would start the next test beside it, and the overrun test can change
+                // shared state under it: 2026-11-23 a KernelLifetime test held up by a model download (ERR_CONNECTION_RESET) restored a static
+                // CompilerCachePolicy setting in the middle of the next test, which then failed. Marking the page dead makes the lane replace
+                // it (ProjectRunner: PageRuntimeDied -> _pageRuntimeDied -> recycle), and closing it ends the overrun test. Ported from
+                // SpawnDev.ILGPU PMT 3f6bf6b (Data).
+                Result = TestResult.Error;
+                PageRuntimeDied = true;
+                if (doneWaitError is TimeoutException)
+                    throw new TimeoutException($"The test did not finish within {doneTimeoutMs / 1000} s; its page is replaced so it cannot keep running under the next test.");
                 throw;
             }
 
