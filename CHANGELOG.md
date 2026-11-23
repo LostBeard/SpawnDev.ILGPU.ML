@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.26 - 2026-11-23 (nuget.org) - FLUX.2 picture edit runs on slower GPUs in the browser; compiler caches freed after a model's warm-up; SpawnDev.ILGPU 5.4.46
+
+- **FLUX.2 Klein picture edit completes on an RX 590 in Chrome** (Lore, 2026-11-23, SpawnGen on 5.8.26-local.2: the edit in 105 s and TRELLIS.2 in
+  1020 s, no driver reset; on 5.8.24 / 5.8.25 the edit lost the WebGPU device four times, 25-62 s in). The FLUX.2 transformer's forward went to the GPU
+  as one command buffer, and an edit's reference tokens roughly double the sequence over text to image. It now ends a command buffer after every double
+  and single block (`DeviceSync.Submit`: a browser flush, nothing on the desktop; `Flux2_Transformer_MatchesTheReference` unchanged).
+- **Streaming model loads survive a transient connection reset** (`FetchRangeStream`). The first failure of any range handed the WHOLE rest of the
+  stream to the Hugging Face twin, which streams several times slower: one ERR_CONNECTION_RESET during a 0.5 GB GGUF load turned 89 s into 302 s. A fast
+  network failure with no HTTP answer is now retried on the models host once per range; an HTTP error answer (404 / 403 / 429 / 5xx) and a timeout still
+  fall back at once. New diagnostic `FetchRangeStream.NetworkErrorRetries`.
 - **Compiler caches freed after a model's warm-up** (`CompilerCachePolicy`; TJ go 2026-11-23, SpawnDev.ILGPU 5.4.45). Once per model, right after its first
   successful run, ML calls `accelerator.ReleaseCompilerCaches()`: `InferenceSession` after its first run (every ONNX pipeline), `GgufGenerator` after its first
   generate (prefill + decode; its session defers via the new `InferenceSession.DeferCompilerCacheRelease`), and the top-level runs of FLUX.2, FLUX 3, Wan 2.2,
@@ -16,7 +26,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - **SpawnDev.ILGPU 5.4.46** (via 5.4.45): compiled kernels live with their owner (WebGPU's resolve cache now weak); the shader artifact cache covers Wasm and WebGL,
   so a model reloaded after a release compiles nothing in the browser (release-ON reload overhead WebGL 3965 -> 366 ms, Wasm 937 -> 474 ms); 5.4.46 emits
   deterministic WGSL / GLSL, so a recompiled kernel no longer adds a duplicate WebGPU pipeline per model switch (asserted by KernelLifetime_LlmDepthSwitch_*:
-  57 cached shaders before and after the reload, 5.4.45 went to 75 with the artifact cache off).
+  57 cached shaders before and after the reload, 5.4.45 went to 75 with the artifact cache off). 5.4.43 tiles WebGL buffers to MAX_TEXTURE_SIZE (Lore's
+  no-GPU SD-Turbo).
+
+## 5.8.25 - 2026-11-20 (nuget.org) - tensors stay on the GPU for SpawnGen (device frames, device VAE paths); SD VAE convs 2x; SpawnDev.ILGPU 5.4.42
 
 - **Video frames stay on the device** (`DeviceFrames`; Lore / TJ, rule 4: SpawnGen's IMAGE is device-resident). `WanRequest` / `LtxRequest` / `Ltx2Request.DeviceFrames`
   returns `WanVideo.DeviceFrames`: an owned `MemoryBuffer1D<float>` [Frames, Height, Width, 3] in 0..1 = clamp((x + 1) / 2, 0, 1), ComfyUI's VAEDecode and its IMAGE type
