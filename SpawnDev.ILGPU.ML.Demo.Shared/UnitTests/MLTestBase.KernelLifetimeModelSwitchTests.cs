@@ -162,9 +162,13 @@ public abstract partial class MLTestBase
             double ms = sw.Elapsed.TotalMilliseconds;
             await CollectFromUnwoundStack();
             double heap = GC.GetTotalMemory(false) / 1048576.0;
-            rows.Add($"{name}: {ms:F0} ms{detail}, compiled +{accelerator.CompiledKernelCount - c0}, loaded +{accelerator.LoadedKernelCount - l0}, heap {heap:F1} MiB");
+            rows.Add($"{name}: {ms:F0} ms{detail}, compiled +{accelerator.CompiledKernelCount - c0}, loaded +{accelerator.LoadedKernelCount - l0}, heap {heap:F1} MiB{ShaderCacheNote()}");
             return result;
         }
+        // WebGPU keeps one GPUShaderModule + GPUComputePipeline (+ its WGSL source as the cache key) per distinct kernel for the
+        // accelerator's life, by design (pipeline creation is the expensive part). Reported per step so the heap a disposed model
+        // leaves behind on WebGPU can be attributed (Data, 2026-11-22).
+        string ShaderCacheNote() => accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wg ? $", cached shaders {wg.CachedShaderCount}" : "";
 
         var a1 = await Step("1 load+run A (LLM)", () => LlmLoadRun(accelerator, hub, release));
         string answer1 = a1.Answer;
@@ -179,7 +183,11 @@ public abstract partial class MLTestBase
         rows.Add($"collected: A alive={weakA1.IsAlive}, B alive={weakB.IsAlive}");
         var a2 = await Step("5 reload+run A (LLM)", () => LlmLoadRun(accelerator, hub, release));
         string answer2 = a2.Answer;
-        await a2.Model.DisposeAsync();
+        await Step("6 dispose A", async () => { await a2.Model.DisposeAsync(); return (0, ""); });
+        a2 = default;
+        // Attribution (WebGPU only): how much of what the disposed models left behind is the accelerator's shader cache.
+        if (accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator webgpu)
+            await Step("7 ClearShaderCache", () => { webgpu.ClearShaderCache(); return Task.FromResult((0, "")); });
 
         if (answer2 != answer1)
             throw new Exception($"{BackendName}: reloaded LLM answered differently. first: {answer1} | reload: {answer2}");
