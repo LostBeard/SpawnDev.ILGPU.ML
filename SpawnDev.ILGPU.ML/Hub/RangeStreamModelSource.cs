@@ -88,16 +88,38 @@ public class RangeStreamModelSource : IModelSource
         long marginBytes = BrowserStorageEstimate.DefaultMarginBytes, CancellationToken cancellationToken = default)
         => PlanCoreAsync(files, estimate?.PlanningBudget(marginBytes) ?? long.MaxValue / 2, cancellationToken);
 
+    /// <summary>
+    /// The most model bytes the hub cache may hold, counted from its OWN files; null (the default) = no cap, the browser decides. When set,
+    /// <see cref="PlanCacheAsync(IEnumerable{ValueTuple{string, string}}, long, CancellationToken)"/> plans only what fits under the cap next to
+    /// the requested files already cached, and evicts least-recently-used entries OUTSIDE the requested set to make that room
+    /// (<see cref="OpfsModelCache.TrimAsync"/>); files that do not fit stream.
+    /// </summary>
+    /// <remarks>
+    /// Why an app-set cap and not the browser's numbers: Chrome's quota is a sliding window (see <see cref="BrowserStorageEstimate"/>) and its
+    /// usage figure can miss most of what OPFS really holds - MEASURED 2026-11-24 (Lore, Chrome on Windows): 42.25 GB in the cache's files,
+    /// <c>estimate()</c> usage 3.60 GB of a 14.3 GB quota. Without a cap the cache grows until the browser clears the WHOLE origin under disk
+    /// pressure (it did, mid-session), which costs every model instead of the least recently used one.
+    /// </remarks>
+    public long? MaxCacheBytes { get; set; }
+
     private async Task<(long CachedBytes, long StreamedBytes)> PlanCoreAsync(IEnumerable<(string Repo, string Path)> files, long budgetBytes, CancellationToken cancellationToken)
     {
         CacheFiles.Clear();
         long cached = 0;
         var todo = new List<(string Key, long Bytes)>();
+        var requestedKeys = new List<string>();
         foreach (var (repo, path) in files)
         {
             using var probe = await _hub.OpenForInspectionAsync(repo, path, cancellationToken).ConfigureAwait(false);
-            if (await _hub.Store.ExistsAsync(_hub.CacheKey(repo, path)).ConfigureAwait(false)) cached += probe.Length;
+            var cacheKey = _hub.CacheKey(repo, path);
+            requestedKeys.Add(cacheKey);
+            if (await _hub.Store.ExistsAsync(cacheKey).ConfigureAwait(false)) cached += probe.Length;
             else todo.Add((Key(repo, path), probe.Length));
+        }
+        if (MaxCacheBytes is long cap)
+        {
+            if (cap < 0) throw new InvalidOperationException($"{nameof(MaxCacheBytes)} must not be negative");
+            budgetBytes = Math.Min(budgetBytes, Math.Max(0, cap - cached));   // everything outside the requested set can be evicted for it
         }
         if (todo.Count > 20) throw new ArgumentException("PlanCacheAsync searches subsets exactly: at most 20 uncached files", nameof(files));
         int best = 0; long bestBytes = 0;
@@ -110,6 +132,9 @@ public class RangeStreamModelSource : IModelSource
         long streamed = 0;
         for (int i = 0; i < todo.Count; i++)
             if ((best >> i & 1) != 0) CacheFiles.Add(todo[i].Key); else streamed += todo[i].Bytes;
+        // make the room now, before any planned download starts: the requested files (cached, partial or planned) are never evicted
+        if (MaxCacheBytes is long max)
+            await _hub.Cache.TrimAsync(Math.Max(0, max - bestBytes), requestedKeys, cancellationToken).ConfigureAwait(false);
         return (cached + bestBytes, streamed);
     }
 

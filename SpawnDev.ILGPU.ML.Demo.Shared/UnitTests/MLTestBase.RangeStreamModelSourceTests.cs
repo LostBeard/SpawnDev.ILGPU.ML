@@ -57,6 +57,58 @@ public abstract partial class MLTestBase
         return (new HubModelSource(cache, http), cache);
     }
 
+    /// <summary>
+    /// <see cref="RangeStreamModelSource.MaxCacheBytes"/>: the plan counts the cache's OWN bytes (Chrome's estimate missed 38 of 42 GB, 2026-11-24) and makes room
+    /// by evicting least-recently-used entries outside the requested set; the requested files are never evicted; what cannot fit streams. Real hub files.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public Task RangeStreamModelSource_CacheCapEvictsLeastRecentlyUsedOutsideTheSet() => RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var (hub, cache) = Rs_NewHub(js, http, "ilgpu-ml-test-rangecap");
+        using var _ = cache;
+        if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        await cache.ClearAllAsync();
+        string K(string path) => hub.CacheKey(Rs_Repo, path);
+        async Task Use(string path) { await using var s = await hub.OpenAsync(Rs_Repo, path); await Task.Delay(20); }
+        try
+        {
+            // two entries outside the next run's set. Downloaded tokenizer FIRST, then vocab; then tokenizer used again (a cache hit). By download time
+            // tokenizer is the oldest; by USE vocab is: the eviction below must follow use, so a cache hit has to count.
+            await Use("tokenizer.json"); await Use("vocab.json");
+            await Use("tokenizer.json");
+            var (stored0, _) = await cache.TrimAsync(long.MaxValue);
+            if (stored0 != Rs_VocabJson + Rs_TokenizerJson) throw new Exception($"setup: cache holds {stored0} bytes, expected {Rs_VocabJson + Rs_TokenizerJson}");
+
+            // cap = merges + tokenizer (+ slack): merges is planned, and only the LRU entry (vocab) is evicted to make its room
+            var ranged = new RangeStreamModelSource(hub) { MaxCacheBytes = Rs_MergesTxt + Rs_TokenizerJson + 1000 };
+            var (cached, streamed) = await ranged.PlanCacheAsync(new[] { (Rs_Repo, "merges.txt") }, (BrowserStorageEstimate?)null);
+            if (cached != Rs_MergesTxt || streamed != 0 || !ranged.CacheFiles.Contains($"{Rs_Repo}/merges.txt")) throw new Exception($"plan: cached {cached}, streamed {streamed}, files [{string.Join(", ", ranged.CacheFiles)}]");
+            if (await hub.Store.ExistsAsync(K("vocab.json"))) throw new Exception("the least recently used entry (vocab.json) was not evicted");
+            if (!await hub.Store.ExistsAsync(K("tokenizer.json"))) throw new Exception("the more recently used entry (tokenizer.json) was evicted although the room was already made");
+            await using (var s = await ranged.OpenAsync(Rs_Repo, "merges.txt")) if (s.Length != Rs_MergesTxt) throw new Exception($"merges length {s.Length}");
+            var (stored1, _) = await cache.TrimAsync(long.MaxValue);
+            if (stored1 > ranged.MaxCacheBytes) throw new Exception($"after the run the cache holds {stored1} bytes, over the cap {ranged.MaxCacheBytes}");
+
+            // a cap below the file itself: it streams, and everything outside the set is evicted
+            await cache.RemoveAsync(K("merges.txt"));
+            ranged.MaxCacheBytes = Rs_MergesTxt - 1;
+            (cached, streamed) = await ranged.PlanCacheAsync(new[] { (Rs_Repo, "merges.txt") }, (BrowserStorageEstimate?)null);
+            if (cached != 0 || streamed != Rs_MergesTxt || ranged.CacheFiles.Count != 0) throw new Exception($"tiny cap: cached {cached}, streamed {streamed}, {ranged.CacheFiles.Count} planned");
+            if (await hub.Store.ExistsAsync(K("tokenizer.json"))) throw new Exception("tiny cap: an entry outside the set survived");
+
+            // the requested files are never evicted, even over the cap
+            await Use("tokenizer.json");
+            ranged.MaxCacheBytes = 0;
+            (cached, streamed) = await ranged.PlanCacheAsync(new[] { (Rs_Repo, "tokenizer.json"), (Rs_Repo, "merges.txt") }, (BrowserStorageEstimate?)null);
+            if (cached != Rs_TokenizerJson || streamed != Rs_MergesTxt) throw new Exception($"cap 0: cached {cached}, streamed {streamed}");
+            if (!await hub.Store.ExistsAsync(K("tokenizer.json"))) throw new Exception("cap 0: a requested, already cached file was evicted");
+            Console.WriteLine("[RangeStream] MaxCacheBytes: LRU eviction outside the set, streams what cannot fit, never evicts the set: PASS");
+        }
+        finally { await cache.ClearAllAsync(); }
+    });
+
     /// <summary>The plan with REAL file sizes from the hub: open-ended or unknown headroom caches every file, an exact one picks the best fitting subset.</summary>
     [TestMethod(Timeout = 120000)]
     public Task RangeStreamModelSource_PlanTrustsOnlyAnExactHeadroom() => RunTest(async accelerator =>

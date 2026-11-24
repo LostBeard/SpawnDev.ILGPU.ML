@@ -58,6 +58,9 @@ public class HubModelSource : ICachingModelSource, IDisposable
     /// <summary>The OPFS cache backing this source, for listing, sizing and eviction.</summary>
     public IModelStore Store => _cache;
 
+    /// <summary>The OPFS cache behind <see cref="Store"/> (its LRU trim and storage diagnostics).</summary>
+    public OpfsModelCache Cache => _cache;
+
     /// <summary>
     /// Downloads running right now through this source - for a cache/status page.
     /// </summary>

@@ -10,6 +10,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   processed", downloads included. `OpenOrDownloadAsync` (the path every model load takes) now treats that NotFoundError as a cache miss:
   it reopens (recreates) the directory and retries once, so the file downloads again. A file deleted WHILE it is being read still fails
   that one run; every load after it recovers. Test `ModelsHost_OpfsCacheRecoversWhenTheBrowserClearsStorage` (red-checked).
+- **`RangeStreamModelSource.MaxCacheBytes`: a cap on the model cache, counted from its own files, with least-recently-used eviction.**
+  Chrome's storage numbers cannot bound the cache: its quota is a sliding window, and its usage figure can miss most of what OPFS holds
+  (measured: 42.25 GB in the cache's files, `estimate()` usage 3.60 GB of a 14.3 GB quota). Uncapped, the cache grew until the browser
+  cleared the whole origin. With the cap set, `PlanCacheAsync` plans only what fits next to the requested files already cached, evicts
+  least-recently-used entries outside the requested set to make that room before any download starts, and streams what cannot fit.
+  The requested files and active downloads are never evicted. New `OpfsModelCache.TrimAsync(maxBytes, keep)` (partial downloads go first,
+  then complete entries by last use; a cache hit counts as a use) and `HubModelSource.Cache`. Default null: no cap, unchanged behaviour.
+  Test `RangeStreamModelSource_CacheCapEvictsLeastRecentlyUsedOutsideTheSet` (red-checked: without the hit-time update, and with the
+  order reversed, it fails).
 - TRELLIS.2: when the guided sparse decoder's child count does not match the guide, the error now says whether the subdivision logits
   changed or the count did not run (it synchronizes, recounts and host-counts the positive logits and NaNs), instead of only
   "decoder has 0".

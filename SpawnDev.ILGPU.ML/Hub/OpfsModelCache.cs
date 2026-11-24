@@ -146,7 +146,64 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     public async Task<OPFSStream?> OpenCachedAsync(string cacheKey, CancellationToken ct = default)
     {
         if (!await IsCompleteAsync(cacheKey).ConfigureAwait(false)) return null;
-        return await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
+        var stream = await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
+        await TouchAsync(cacheKey).ConfigureAwait(false);
+        return stream;
+    }
+
+    /// <summary>Record that a complete entry was just used (the order <see cref="TrimAsync"/> evicts in). Never fails the open it follows.</summary>
+    private async Task TouchAsync(string cacheKey)
+    {
+        try
+        {
+            var meta = await ReadMetaAsync(cacheKey).ConfigureAwait(false);
+            if (meta is not { Complete: true }) return;
+            meta.Used = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
+        }
+        catch { /* the order of eviction is a preference; the open already succeeded */ }
+    }
+
+    /// <summary>
+    /// Evict entries until the model bytes this cache holds are at most <paramref name="maxBytes"/>: partial downloads first, then complete
+    /// entries least recently used first. Entries in <paramref name="keep"/> and entries downloading right now are never evicted, so the total
+    /// can stay above <paramref name="maxBytes"/> when those alone exceed it. Returns (bytes held afterwards, bytes freed).
+    /// </summary>
+    /// <remarks>
+    /// The sizes are the cache's own files, not <c>navigator.storage.estimate()</c>: MEASURED 2026-11-24 (Lore, Chrome on Windows, after a
+    /// full row of Studio examples) the origin's OPFS held 110 files / 42.25 GB while <c>estimate()</c> reported usage 3.60 GB of a 14.3 GB
+    /// quota. A cache that plans against that estimate keeps growing until the browser clears the whole origin (it did, mid-session).
+    /// </remarks>
+    public async Task<(long StoredBytes, long FreedBytes)> TrimAsync(long maxBytes, IEnumerable<string>? keep = null, CancellationToken ct = default)
+    {
+        if (maxBytes < 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        if (_cacheDir == null) return (0, 0);
+        var pinned = new HashSet<string>(keep ?? System.Array.Empty<string>(), StringComparer.Ordinal);
+        foreach (var d in Downloader.ActiveDownloads) pinned.Add(d.Key);
+
+        var entries = new List<(string Key, long Size, bool Complete, long Used)>();
+        var handles = await _cacheDir.ValuesList();
+        foreach (var entry in handles)
+        {
+            using var handle = entry;
+            if (handle.Name.EndsWith(MetaSuffix, StringComparison.Ordinal) || handle is not FileSystemFileHandle file) continue;
+            long size;
+            try { size = await file.GetSize(); } catch { continue; }   // raced with a delete
+            var meta = await ReadMetaAsync(handle.Name).ConfigureAwait(false);
+            bool complete = meta is { Complete: true } && (meta.Total < 0 || meta.Total == size);
+            entries.Add((handle.Name, size, complete, complete ? meta!.Used : 0));
+        }
+        long stored = entries.Sum(e => e.Size), freed = 0;
+        foreach (var e in entries.Where(e => !pinned.Contains(e.Key))
+                     .OrderBy(e => e.Complete).ThenBy(e => e.Used).ThenBy(e => e.Key, StringComparer.Ordinal))
+        {
+            if (stored <= maxBytes) break;
+            ct.ThrowIfCancellationRequested();
+            await RemoveAsync(e.Key).ConfigureAwait(false);
+            stored -= e.Size; freed += e.Size;
+        }
+        return (stored, freed);
     }
 
     /// <summary>
@@ -307,6 +364,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             Received = bytesWritten,
             Complete = complete,
             ETag = etag,
+            Used = complete ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : 0,   // a finished download counts as a use
         });
 
     /// <summary>
@@ -472,6 +530,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         public long Received;
         public bool Complete;
         public string? ETag;
+        public long Used;   // unix ms of the last open (0 = never recorded); TrimAsync evicts the oldest first
     }
 
     private async Task<CacheEntryMeta?> ReadMetaAsync(string cacheKey)
@@ -497,6 +556,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
                     case "received": meta.Received = long.TryParse(value, out var r) ? r : 0; break;
                     case "complete": meta.Complete = value == "1"; break;
                     case "etag": meta.ETag = NullIfEmpty(value); break;
+                    case "used": meta.Used = long.TryParse(value, out var u) ? u : 0; break;
                 }
             }
             return meta;
@@ -513,6 +573,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             .Append("received=").Append(meta.Received).Append('\n')
             .Append("complete=").Append(meta.Complete ? '1' : '0').Append('\n')
             .Append("etag=").Append(meta.ETag ?? "").Append('\n')
+            .Append("used=").Append(meta.Used).Append('\n')
             .ToString();
 
         // ~100 bytes of metadata: the managed-heap rule is about BULK data, and this is the metadata
