@@ -8,7 +8,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.UnitTesting.Browser" Version="2.7.0" />
+		<PackageReference Include="SpawnDev.UnitTesting.Browser" Version="2.7.2" />
 		<PackageReference Include="SpawnDev.SpawnJS.Blazor" Version="3.0.7" />
 	</ItemGroup>
 
