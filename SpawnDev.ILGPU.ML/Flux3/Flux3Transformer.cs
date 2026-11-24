@@ -224,6 +224,9 @@ public sealed class Flux3Transformer : IDisposable
         // ---- early blocks: every mode on its own ---------------------------------------------------------------------------------------------
         for (int d = 0; d < _c.EarlyDepth; d++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             for (int m = 0; m < 3; m++)
             {
                 if (counts[m] == 0) continue;
@@ -237,6 +240,9 @@ public sealed class Flux3Transformer : IDisposable
         var segArray = segments.ToArray();
         for (int l = 0; l < _c.SingleDepth; l++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             Block($"single.{l}", segArray, 0, _n);
             if (Probe != null && (l == 0 || l == _c.SingleDepth - 1)) Probe($"single{l + 1}", _x.View, _n, D);
         }

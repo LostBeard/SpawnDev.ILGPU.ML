@@ -138,6 +138,9 @@ public sealed class ClipVisionEncoder : IDisposable
         Probe?.Invoke("pre_layrnorm", _x.View, T, C);
         for (int l = 0; l < Layers; l++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string b = $"vision_model.encoder.layers.{l}.";
             _sk.LayerNorm(_x.View, _n.View, _w.F16(b + "layer_norm1.weight"), _w.F16(b + "layer_norm1.bias"), T, C, Eps);
             foreach (var (proj, off) in new[] { ("q_proj", 0), ("k_proj", C), ("v_proj", 2 * C) })

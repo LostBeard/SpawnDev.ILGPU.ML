@@ -342,6 +342,9 @@ public sealed partial class SdUNet : IDisposable
         _k.Linear(n, _w[p + "proj_in.weight"], _w[p + "proj_in.bias"], h, rows, C, C);
         for (int j = 0; j < m.Depth; j++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string b = $"{p}transformer_blocks.{j}.";
             // self attention
             _k.Sparse.LayerNorm(h, n, _w[b + "norm1.weight"], _w[b + "norm1.bias"], rows, C, 1e-5f);

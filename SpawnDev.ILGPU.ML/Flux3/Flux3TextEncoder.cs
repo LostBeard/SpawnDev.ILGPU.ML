@@ -80,6 +80,9 @@ public sealed class Flux3TextEncoder : IDisposable
         int tap = 0;
         for (int l = 0; l < Layers; l++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string b = $"layers.{l}.";
             _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), T, Hidden, RmsEps);
             _k.Linear(_hn.View, _w.Matrix(b + "self_attn.qkv_proj.weight"), null, _qkv.View, T, Hidden, QkvCols);

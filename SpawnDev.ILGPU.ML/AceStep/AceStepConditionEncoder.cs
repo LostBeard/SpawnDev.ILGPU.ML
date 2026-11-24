@@ -81,11 +81,12 @@ public sealed class AceStepConditionEncoder : IDisposable
         int D = Dim;
         // lyrics -> rows 0 .. lyricTokens - 1
         Lin(lyrics, "encoder.lyric_encoder.embed_tokens", _h.View, lyricTokens, TextWidth, D, bias: true);
-        for (int l = 0; l < _lyricLayers; l++) Layer($"encoder.lyric_encoder.layers.{l}.", lyricTokens, l);
+        // browser: a command buffer per layer (DeviceSync.Submit; a no-op on desktop): a whole encoder in ONE command buffer can outrun a slow GPU's watchdog
+        for (int l = 0; l < _lyricLayers; l++) { Layer($"encoder.lyric_encoder.layers.{l}.", lyricTokens, l); _acc.Submit(); }
         _u.RmsNorm(_h.View, output.SubView(0, (long)lyricTokens * D), B("encoder.lyric_encoder.norm.weight"), lyricTokens, D, Eps);
         // timbre -> row lyricTokens (frame 0 after the final norm)
         Lin(refer, "encoder.timbre_encoder.embed_tokens", _h.View, referFrames, LatentChannels, D, bias: true);
-        for (int l = 0; l < _timbreLayers; l++) Layer($"encoder.timbre_encoder.layers.{l}.", referFrames, l);
+        for (int l = 0; l < _timbreLayers; l++) { Layer($"encoder.timbre_encoder.layers.{l}.", referFrames, l); _acc.Submit(); }
         _u.RmsNorm(_h.View, output.SubView((long)lyricTokens * D, D), B("encoder.timbre_encoder.norm.weight"), 1, D, Eps);
         // text -> the last textTokens rows
         Lin(text, "encoder.text_projector", output.SubView((long)(lyricTokens + 1) * D, (long)textTokens * D), textTokens, TextWidth, D);

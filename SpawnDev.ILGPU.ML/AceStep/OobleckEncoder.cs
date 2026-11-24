@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Trellis2;
 using FV = ILGPU.Runtime.ArrayView1D<float, ILGPU.Stride1D.Dense>;
 
 namespace SpawnDev.ILGPU.ML.AceStep;
@@ -91,6 +92,9 @@ public sealed class OobleckEncoder : IDisposable
             _l.Transpose(c.View, a.View, ch, L);
             for (int i = 0; i < _blocks.Length; i++)
             {
+                // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+                // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+                _acc.Submit();
                 var (s, inC, outC) = _blocks[i];
                 _l.ResidualUnits($"b{i + 1}", a.View, b.View, c.View, inC, L);
                 _l.Snake($"b{i + 1}.snake", a.View, b.View, inC, L);

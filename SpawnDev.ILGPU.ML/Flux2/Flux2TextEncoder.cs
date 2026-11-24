@@ -256,6 +256,11 @@ public sealed class Flux2TextEncoder : IDisposable
             Lin(_act.View, b + "mlp.down_proj.weight", null, _proj.View, _inter, H);
             _k.GateResidual(_h.View, _proj.View, _dummy.View, -1, n * H, H);
             Probe?.Invoke($"layer{l + 1}", _h.View, n, H);
+            // one command buffer per layer in the browser (DeviceSync.Submit; a no-op elsewhere). 2026-11-23, Lore: FLUX.2 Klein lost the WebGPU
+            // device on an RX 590 in Chrome ~20 s into a page's FIRST run, 2 of 17 (DXGI_ERROR_DEVICE_HUNG) - the only run that encodes the prompt
+            // (later runs reuse its embeddings): the whole encoder (27 layers x 512 tokens, ~2.7 TFLOP) went to the GPU as ONE command buffer and
+            // a slow card runs that past the 2 s watchdog. Same fix as the transformer's per block (5.8.26).
+            _acc.Submit();
             if (tap < _taps.Length && l + 1 == _taps[tap])
             {
                 var src = _h.View;

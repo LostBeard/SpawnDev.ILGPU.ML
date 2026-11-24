@@ -149,6 +149,9 @@ public sealed class AceStepDiT : IDisposable
         Probe?.Invoke("proj_in", _h.View, N, D);
         for (int l = 0; l < Layers; l++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string b = $"decoder.layers.{l}.";
             _k.AddBf16(B(b + "scale_shift_table"), _proj.View, _mod.View, 6 * D);
             // self-attention

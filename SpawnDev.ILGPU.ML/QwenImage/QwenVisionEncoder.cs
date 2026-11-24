@@ -186,6 +186,9 @@ public sealed class QwenVisionEncoder : IDisposable
         if (!_k.UsesFlashAttention(HeadDim) && _scores.Length < (long)Heads * maxSeg * maxSeg) throw new InvalidOperationException("scores buffer too small");
         for (int l = 0; l < Depth; l++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string b = $"visual.blocks.{l}.";
             int[] segs = Array.IndexOf(FullAttentionBlocks, l) >= 0 ? pics : windows;
             _u.RmsNorm(_x.View, _hn.View, _w.Vector(b + "norm1.weight"), n, Width, Eps);

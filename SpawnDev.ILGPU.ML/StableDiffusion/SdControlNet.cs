@@ -180,6 +180,9 @@ public sealed class SdControlNet : IDisposable
         var cur = x;
         for (int i = 0; i < _hintBlocks; i++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             string p = $"input_hint_block.{2 * i}.";
             int cout = _w.Shape(p + "weight")[0];
             bool down = cout != c && i > 0 && i < _hintBlocks - 1;      // the channel-changing convolutions between the first and the last (16->32, 32->96, 96->256) have stride 2

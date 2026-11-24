@@ -292,6 +292,9 @@ public sealed class QwenImageTransformer : IDisposable
         Lin(b0, _txtIn.View, "txt_in", _txt.View, _nTxt, TxtDim, Dim);
         for (int k = 0; k < Layers; k++)
         {
+            // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop). A whole forward in ONE command buffer can outrun a slow
+            // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 lost the device on an RX 590 in Chrome until its encoder and transformer submitted per block).
+            _acc.Submit();
             var (w, streamed) = await _w.BlockAsync(k, ct);
             try { Block(w, $"transformer_blocks.{k}."); }
             finally { if (streamed) { await _acc.SynchronizeAsync(); w.Dispose(); } }

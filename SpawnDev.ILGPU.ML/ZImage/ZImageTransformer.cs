@@ -201,7 +201,9 @@ public sealed class ZImageTransformer : IDisposable
     private async Task RunBlockAsync(int k, int row0, int rows, bool modulated, CancellationToken ct)
     {
         var (w, streamed) = await _w.BlockAsync(k, ct);
-        try { Block(w, BlockPrefix(k), row0, rows, modulated); }
+        // browser: a command buffer per block (DeviceSync.Submit; a no-op on desktop): a whole forward in ONE command buffer can outrun a slow
+        // GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 on an RX 590 in Chrome). A streamed block also waits below, before its weights go.
+        try { Block(w, BlockPrefix(k), row0, rows, modulated); _acc.Submit(); }
         finally { if (streamed) { await _acc.SynchronizeAsync(); w.Dispose(); } }
     }
 

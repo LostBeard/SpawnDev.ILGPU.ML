@@ -116,6 +116,10 @@ public sealed class Qwen3KvDecoder : IDisposable
         int C = _hidden, p0 = _pos, rep = _qHeads / _kvHeads;
         for (int l = 0; l < _layers; l++)
         {
+            // browser: a command buffer per layer for a PREFILL (DeviceSync.Submit; a no-op on desktop). A whole multi-token forward in ONE command
+            // buffer can outrun a slow GPU's 2 s watchdog (2026-11-23, Lore: FLUX.2 on an RX 590 in Chrome). A one-token decode step is small: it stays
+            // one command buffer, so generation pays no per-layer submits.
+            if (T > 1) _acc.Submit();
             string b = $"layers.{l}.";
             _u.RmsNorm(_h.View, _hn.View, _w.Vector(b + "input_layernorm.weight"), T, C, RmsEps);
             Lin(_hn.View, b + "self_attn.qkv_proj.weight", _qkv.View, T, C, _qkvCols);
