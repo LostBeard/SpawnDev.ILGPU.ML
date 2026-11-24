@@ -629,6 +629,106 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
+    /// EVERY cache operation works after the browser clears the origin's storage, not only a load (Lore 2026-11-24, 5.8.28-local.3: with a cache cap set the
+    /// plan trims first, TrimAsync listed through the stale directory handle and threw before the load's own recovery could run). The cache directory is
+    /// deleted behind the cache's back before each operation.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task OpfsModelCache_EveryOperationRecoversWhenTheBrowserClearsStorage() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        const string dirName = "ilgpu-ml-test-cleared-ops", key = "fixture";
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+        // two first callers at once: the second must wait for the directory, not read "OPFS is not available"
+        var available = await Task.WhenAll(cache.IsAvailableAsync(), cache.IsAvailableAsync());
+        if (!available[0] && !available[1]) throw new UnsupportedTestException("OPFS unavailable in this context");
+        if (available[0] != available[1]) throw new Exception($"two concurrent first calls disagree: {available[0]}, {available[1]}");
+        using var hub = new HubModelSource(cache, http);
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        var payload = new byte[5000];
+        for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i * 7 + 1);
+
+        async Task AfterClear(string what, Func<Task> operation)
+        {
+            await cache.PutAsync(key, new MemoryStream(payload));
+            if (!await cache.IsCompleteAsync(key)) throw new Exception($"{what}: setup did not store the fixture");
+            await root.RemoveEntry(dirName, recursive: true);
+            try { await operation(); }
+            catch (Exception ex) { throw new Exception($"{what} after the storage was cleared: {ex.Message}", ex); }
+            using var again = await root.GetDirectoryHandle(dirName);   // throws when the operation did not recreate it
+        }
+        try
+        {
+            await AfterClear("ListCachedAsync", async () => { var l = await cache.ListCachedAsync(); if (l.Count != 0) throw new Exception($"{l.Count} entries"); });
+            await AfterClear("GetCacheSizeAsync", async () => { var n = await cache.GetCacheSizeAsync(); if (n != 0) throw new Exception($"{n} bytes"); });
+            await AfterClear("TrimAsync", async () => { var t = await cache.TrimAsync(1); if (t != (0L, 0L)) throw new Exception($"{t}"); });
+            await AfterClear("ClearAllAsync", () => cache.ClearAllAsync());
+            await AfterClear("PutAsync", async () =>
+            {
+                await cache.PutAsync("other", new MemoryStream(payload));
+                await using var s = await cache.OpenCachedAsync("other") ?? throw new Exception("the stored entry is not there");
+                var got = new byte[payload.Length];
+                await s.ReadExactlyAsync(got);
+                if (!got.AsSpan().SequenceEqual(payload)) throw new Exception("stored bytes differ");
+            });
+            // Lore's case: plan with a cap (it trims), then load what was planned
+            await AfterClear("PlanCacheAsync with a cap", async () =>
+            {
+                var ranged = new RangeStreamModelSource(hub) { MaxCacheBytes = 1L << 30 };
+                var (cached, streamed) = await ranged.PlanCacheAsync(new[] { (Rs_Repo, "merges.txt") }, (BrowserStorageEstimate?)null);
+                if (cached != Rs_MergesTxt || streamed != 0) throw new Exception($"cached {cached}, streamed {streamed}");
+                await using var s = await ranged.OpenAsync(Rs_Repo, "merges.txt");
+                if (s.Length != Rs_MergesTxt) throw new Exception($"length {s.Length}");
+            });
+            // several loads hit the stale handle at once
+            await AfterClear("parallel loads", async () =>
+            {
+                var streams = await Task.WhenAll(hub.OpenAsync(Rs_Repo, "merges.txt"), hub.OpenAsync(Rs_Repo, "vocab.json"), hub.OpenAsync(Rs_Repo, "merges.txt"));
+                var lengths = streams.Select(s => s.Length).ToArray();
+                foreach (var s in streams) await s.DisposeAsync();
+                if (!lengths.SequenceEqual(new[] { Rs_MergesTxt, Rs_VocabJson, Rs_MergesTxt })) throw new Exception($"lengths {string.Join(", ", lengths)}");
+            });
+            Console.WriteLine("[OpfsCache] every operation recovers after the storage was cleared: PASS");
+        }
+        finally { try { await root.RemoveEntry(dirName, recursive: true); } catch { } }
+    });
+
+    /// <summary>
+    /// Continuing a download into a file that vanished must FAIL, not extend an empty file to the resume point: the gap would be zeros that count as
+    /// downloaded bytes, and the finished file has the right length.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task OpfsModelCache_ContinuingAVanishedFileFailsInsteadOfZeroFilling() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        const string dirName = "ilgpu-ml-test-vanished", key = "partial";
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+        if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        try
+        {
+            var w = await cache.OpenWriteAsync(key, 0);
+            await using (w.ConfigureAwait(false)) { await w.WriteAsync(new byte[4000]); await w.FlushAsync(); }
+            await cache.SetStateAsync(key, "http://example/x", 8000, 4000, false, null);
+            if ((await cache.GetStateAsync(key)).BytesWritten != 4000) throw new Exception("setup: the partial entry is not resumable");
+            using (var dir = await root.GetDirectoryHandle(dirName)) await dir.RemoveEntry(key);
+            bool failed = false;
+            try { await using var s = await cache.OpenWriteAsync(key, 4000); }
+            catch (IOException) { failed = true; }
+            if (!failed) throw new Exception("continuing at 4000 in a vanished file succeeded: the first 4000 bytes are zeros");
+            var state = await cache.GetStateAsync(key);
+            if (state.BytesWritten != 0) throw new Exception($"after the failure {state.BytesWritten} bytes still count as downloaded");
+            Console.WriteLine("[OpfsCache] continuing a vanished file fails, nothing counts as downloaded: PASS");
+        }
+        finally { try { await root.RemoveEntry(dirName, recursive: true); } catch { } }
+    });
+
+    /// <summary>
     /// Cut a cache entry down to <paramref name="keepBytes"/> and rewrite its sidecar to say "incomplete",
     /// which is exactly the state an interrupted download leaves behind.
     /// </summary>

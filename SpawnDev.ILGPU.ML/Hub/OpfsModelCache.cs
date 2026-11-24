@@ -62,6 +62,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     private readonly Dictionary<string, SemaphoreSlim> _keyGates = new();
     private FileSystemDirectoryHandle? _cacheDir;
     private bool _initialized;
+    private readonly SemaphoreSlim _dirGate = new(1, 1);
 
     /// <summary>Name of the OPFS subdirectory holding cached models.</summary>
     public string CacheDirectoryName { get; set; } = "ilgpu-ml-models";
@@ -183,7 +184,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         foreach (var d in Downloader.ActiveDownloads) pinned.Add(d.Key);
 
         var entries = new List<(string Key, long Size, bool Complete, long Used)>();
-        var handles = await _cacheDir.ValuesList();
+        var handles = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
         foreach (var entry in handles)
         {
             using var handle = entry;
@@ -228,6 +229,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             throw new InvalidOperationException(
                 "OPFS is not available, so no model can be cached or streamed. OPFS needs a secure context " +
                 "(https or localhost) on a browser that supports it.");
+        var dir = _cacheDir;
 
         // The HTTP transport lives in HttpModelDownloader, which drives this class only through
         // IResumableModelStore. This method is the convenience wrapper over "store + HTTP"; it is NOT a
@@ -245,27 +247,51 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             // points at a directory that no longer exists, so every operation through it throws NotFoundError. Open the directory
             // again (it is recreated) and retry once: the entry is gone, so it downloads. A cache that loses its files must cost a
             // download, never the run.
-            await ResetDirectoryAsync().ConfigureAwait(false);
-            if (_cacheDir == null) throw;
+            if (!await ReopenDirectoryAsync(dir).ConfigureAwait(false)) throw;
             return (OPFSStream)await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
         }
     }
 
-    /// <summary>True when <paramref name="ex"/> (or an inner exception) is OPFS's NotFoundError: the cached entry or the cache directory itself is gone.</summary>
+    /// <summary>
+    /// True when <paramref name="ex"/> (or an inner exception) says the stored files are gone: OPFS's NotFoundError (the entry or the cache directory
+    /// itself no longer exists), the FileNotFoundException OPFSStream throws for a missing entry, or <see cref="StoredFileLostException"/>.
+    /// </summary>
     internal static bool IsStorageGone(Exception? ex)
     {
         for (var e = ex; e != null; e = e.InnerException)
-            if (e is JSException { Name: "NotFoundError" }) return true;
+            if (e is JSException { Name: "NotFoundError" } or StoredFileLostException or FileNotFoundException) return true;
         return false;
     }
 
-    /// <summary>Drop the cached OPFS directory handle and open the directory again (created when missing).</summary>
-    private async Task ResetDirectoryAsync()
+    /// <summary>A partial file the store was asked to continue no longer holds the bytes it was to continue from.</summary>
+    internal sealed class StoredFileLostException(string message) : IOException(message);
+
+    /// <summary>
+    /// Replace the cached OPFS directory handle after an operation through <paramref name="stale"/> found the directory gone: open the directory again
+    /// (created when missing). Several loads can fail on the same stale handle at once: the first one reopens, the others use what it opened. The stale
+    /// handle is not disposed here, because another operation may still be inside a call on it. False when OPFS is not available any more.
+    /// </summary>
+    private async Task<bool> ReopenDirectoryAsync(FileSystemDirectoryHandle stale)
     {
-        try { _cacheDir?.Dispose(); } catch { /* already gone */ }
-        _cacheDir = null;
-        _initialized = false;
-        await EnsureInitializedAsync().ConfigureAwait(false);
+        await _dirGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (ReferenceEquals(_cacheDir, stale)) _cacheDir = await OpenDirectoryAsync().ConfigureAwait(false);
+            return _cacheDir != null;
+        }
+        finally { _dirGate.Release(); }
+    }
+
+    /// <summary>Run an operation on the cache directory; when the browser cleared the directory behind the handle, reopen it and run the operation once more.</summary>
+    private async Task<T> WithDirectoryAsync<T>(Func<FileSystemDirectoryHandle, Task<T>> operation)
+    {
+        var dir = _cacheDir!;
+        try { return await operation(dir).ConfigureAwait(false); }
+        catch (Exception ex) when (IsStorageGone(ex))
+        {
+            if (!await ReopenDirectoryAsync(dir).ConfigureAwait(false)) throw;
+            return await operation(_cacheDir!).ConfigureAwait(false);
+        }
     }
 
     private HttpModelDownloader? _downloader;
@@ -349,6 +375,14 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             cancellationToken: cancellationToken).ConfigureAwait(false);
         // Truncate rather than merely seek: anything past the confirmed resume point was never
         // acknowledged, and keeping it would bury unverified bytes inside a file that later says complete.
+        // And never LENGTHEN: when the file vanished after the caller read its state (the browser cleared the origin), OpenOrCreate made an
+        // empty one, and extending it to the resume point would leave zeros that later count as downloaded bytes.
+        if (stream.Length < startOffset)
+        {
+            long held = stream.Length;
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw new StoredFileLostException($"'{key}' holds {held} bytes but was to continue at {startOffset}: the stored file is gone or was cut, so the download must restart.");
+        }
         stream.SetLength(startOffset);
         stream.Seek(startOffset, SeekOrigin.Begin);
         return stream;
@@ -401,8 +435,9 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             await RemoveAsync(key).ConfigureAwait(false);
 
             long written;
-            var dest = await OPFSStream.OpenPath(_cacheDir, key, FileMode.Create, FileAccess.Write,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            // only the OPEN recovers from a cleared directory: nothing of the source has been read yet
+            var dest = await WithDirectoryAsync(d => OPFSStream.OpenPath(d, key, FileMode.Create, FileAccess.Write,
+                cancellationToken: cancellationToken)).ConfigureAwait(false);
             await using (dest.ConfigureAwait(false))
             {
                 await source.CopyToAsync(dest, WriteBufferSize > 0 ? WriteBufferSize : 81920, cancellationToken)
@@ -448,7 +483,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         await EnsureInitializedAsync().ConfigureAwait(false);
         if (_cacheDir == null) return result;
 
-        var entries = await _cacheDir.ValuesList();
+        var entries = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
         foreach (var entry in entries)
         {
             using var handle = entry;
@@ -468,7 +503,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         if (_cacheDir == null) return 0;
 
         long total = 0;
-        var entries = await _cacheDir.ValuesList();
+        var entries = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
         foreach (var entry in entries)
         {
             using var handle = entry;
@@ -484,7 +519,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         await EnsureInitializedAsync().ConfigureAwait(false);
         if (_cacheDir == null) return;
 
-        var entries = await _cacheDir.ValuesList();
+        var entries = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
         foreach (var entry in entries)
         {
             using var handle = entry;
@@ -600,18 +635,27 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     private async Task EnsureInitializedAsync()
     {
         if (_initialized) return;
-        _initialized = true;
+        await _dirGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_initialized) return;
+            _cacheDir = await OpenDirectoryAsync().ConfigureAwait(false);
+            _initialized = true;   // after the open: a concurrent first caller waits for the handle instead of reading "OPFS is not available"
+        }
+        finally { _dirGate.Release(); }
+    }
+
+    /// <summary>The cache directory (created when missing), or null when OPFS is unavailable (insecure context or unsupported browser).</summary>
+    private async Task<FileSystemDirectoryHandle?> OpenDirectoryAsync()
+    {
         try
         {
             using var navigator = _js.Get<Navigator>("navigator");
             using var storage = navigator.Storage;
             using var root = await storage.GetDirectory();
-            _cacheDir = await root.GetDirectoryHandle(CacheDirectoryName, create: true);
+            return await root.GetDirectoryHandle(CacheDirectoryName, create: true);
         }
-        catch
-        {
-            _cacheDir = null; // OPFS unavailable (insecure context or unsupported browser)
-        }
+        catch { return null; }
     }
 
     /// <summary>Release the cached OPFS directory handle. Streams already handed out are unaffected.</summary>

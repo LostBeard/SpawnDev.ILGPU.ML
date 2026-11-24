@@ -10,6 +10,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   processed", downloads included. `OpenOrDownloadAsync` (the path every model load takes) now treats that NotFoundError as a cache miss:
   it reopens (recreates) the directory and retries once, so the file downloads again. A file deleted WHILE it is being read still fails
   that one run; every load after it recovers. Test `ModelsHost_OpfsCacheRecoversWhenTheBrowserClearsStorage` (red-checked).
+  Every other cache operation recovers too (list, size, trim, clear, put, and planning with a cap), parallel loads that fail on the same
+  stale directory reopen it once, and two concurrent first calls no longer let one read "OPFS is not available". Continuing a partial
+  download into a file that vanished now fails and restarts; it used to extend an empty file to the resume point, leaving zeros that
+  counted as downloaded bytes. Tests `OpfsModelCache_EveryOperationRecoversWhenTheBrowserClearsStorage` and
+  `OpfsModelCache_ContinuingAVanishedFileFailsInsteadOfZeroFilling` (each part red-checked).
 - **`RangeStreamModelSource.MaxCacheBytes`: a cap on the model cache, counted from its own files, with least-recently-used eviction.**
   Chrome's storage numbers cannot bound the cache: its quota is a sliding window, and its usage figure can miss most of what OPFS holds
   (measured: 42.25 GB in the cache's files, `estimate()` usage 3.60 GB of a 14.3 GB quota). Uncapped, the cache grew until the browser
