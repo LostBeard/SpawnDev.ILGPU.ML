@@ -4,6 +4,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser** (Lore, RX 590 in Chrome). Two causes, both "too much work in one
+  WebGPU command buffer for a slow card's 2 s driver watchdog":
+  - **Native forwards with no per-block submit.** FLUX.2 Klein lost the device in 3 of 17 FIRST runs of a page on 5.8.26 (0 of 19 later runs),
+    ~20 s in: only a page's first run encodes the prompt (the embeddings are reused), and `Flux2TextEncoder` sent all 27 layers x 512 tokens
+    (~2.7 TFLOP) as ONE command buffer. Now a command buffer per layer / block (`DeviceSync.Submit`: a browser flush, nothing on the desktop)
+    in every native forward that had none: FLUX.2 and FLUX 3 text encoders, FLUX 3 transformer, Qwen-Image transformer and vision encoder,
+    Z-Image, SD UNet and ControlNet, ACE-Step DiT / condition encoder / Oobleck, CLIP vision, and the Qwen3 decoder's prefill (a one-token
+    decode step stays one command buffer).
+  - **GraphExecutor submitted only every 64 nodes.** FLUX.2 Klein (1 of 3 passes) and FLUX 3 Klein (live site) lost the device in their ONNX
+    VAE decode ("GE final sync"): 64 full-resolution convs in one command buffer. New `GraphExecutor.SubmitWorkBudgetFlops` (default 128
+    GFLOP; per executor `SubmitWorkBudgetFlopsOverride`; 0 = off): on WebGPU, `RunAsync` and `Run` end the command buffer before a node that
+    would take the estimated queued work past the budget (`EstimateNodeFlops` from the node's shapes). No wait, no buffer recycling, no math
+    change (bit-identical, tested on every backend; red-checked on both paths). Diagnostic `LastRunWorkSubmitCount`.
+  - Lore on 5.8.27-local.2: 0 losses in 10 fresh-browser first runs and 0 in 10 runs in one page (before: 4 in 27 first runs); run times
+    unchanged (70 s first, 38-39 s warm).
+
 ## 5.8.26 - 2026-11-23 (nuget.org) - FLUX.2 picture edit runs on slower GPUs in the browser; compiler caches freed after a model's warm-up; SpawnDev.ILGPU 5.4.46
 
 - **FLUX.2 Klein picture edit completes on an RX 590 in Chrome** (Lore, 2026-11-23, SpawnGen on 5.8.26-local.2: the edit in 105 s and TRELLIS.2 in
