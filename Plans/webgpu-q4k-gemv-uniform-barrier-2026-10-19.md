@@ -15,3 +15,20 @@ then every later dispatch fails with `Invalid BindGroupLayout`. The AI Chat page
 **Ways out (not done).** (1) In SpawnDev.ILGPU's WGSL emitter, wrap a barrier-containing loop bound / branch condition in `workgroupUniformLoad` (the real fix: every kernel with a barrier in a data-dependent loop benefits, including the M>1 multi-row GEMMs that are currently gated off for browser GPUs). (2) Restructure the Q4_K GEMV to decode the per-thread scales without shared memory (costs the ALU saving that the cache bought on desktop; would need an A/B). 
 
 **Meanwhile.** The demo's caption writer uses `unsloth/Qwen3-4B-GGUF` `Qwen3-4B-Q4_0.gguf` (Q4_0 GEMV compiles).
+
+## Update 2026-11-24 (Tuvok): fixed in SpawnDev.ILGPU 5.4.47; what it does and does not change here (read from the code, nothing measured)
+
+ILGPU 5.4.47 compiles a barrier under an `if` whose condition is read from a view at group-uniform addresses; Data checked with Tint that both
+Q4_K GEMVs compile. In ML the default WebGPU routes do not reach the excluded kernels, traced from the first line of `FusedDequantMatMul.Forward`:
+
+- `M == 1` Q8_0 / Q4_K / Q6_K: `ForwardRows` (since 29027714, 2026-10-31), before `webGpuUniformBarrierUnsafe` is consulted. The guard matters only
+  with `ForceGenericRows` (GGUF_GEMV_ROWS_GENERIC=1).
+- `M > 1`: the tiled GEMM (`EnableTiledGemm`, default on; needs a 256-thread group and K % 16 == 0), before the multi-row branch.
+
+So no default speedup is expected. Adoption:
+
+1. Bump to 5.4.47, remove `webGpuUniformBarrierUnsafe`, with a test that forces `ForceGenericRows` + `EnableWebGPUGemv` and asserts on WebGPU that the
+   Q4_K GEMV compiles and matches the oracle.
+2. Do NOT simply delete the WebGPU exclusion of the multi-row GEMMs. `tunedMultiRow` shares that condition, so with `EnableWebGPUGemv` on (AI Chat sets
+   it) WebGPU prefill would move from the tiled GEMM to the multi-row kernel. Only with a WebGPU measurement showing it is faster; otherwise leave it.
+3. Stale text to fix with it: the `EnableMultiRowGemm` comment says opt-in (it is default on), and Flux3CaptionWriter's reason for choosing Q4_0.
