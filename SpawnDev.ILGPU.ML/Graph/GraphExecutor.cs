@@ -513,6 +513,65 @@ public class GraphExecutor : IDisposable
     public static int SyncIntervalNodes = 64;
 
     /// <summary>
+    /// WebGPU: the most estimated work (floating-point operations) one command buffer carries before the executor submits it, on top of
+    /// the <see cref="SyncIntervalNodes"/> cadence. A GPU driver resets a device whose command buffer runs past its watchdog (2 s on
+    /// Windows); 64 nodes of a full-resolution VAE decoder in one command buffer lost the WebGPU device on an RX 590 in Chrome (FLUX.2 Klein,
+    /// 2026-11-23, Lore: at the decode's final sync, 1 of 3 passes; the FLUX.2 transformer had the same problem per block). Node count says
+    /// nothing about GPU time: a 3x3 conv at 512 x 512 x 128 channels is ~77 GFLOP, an Add is nothing. Submitting is a queue.submit (no
+    /// wait, no buffer recycling; the math is unchanged), so a budget that keeps each command buffer far under the watchdog on a slow GPU costs
+    /// a few submits per forward on a fast one. 0 disables. Per session: <see cref="SubmitWorkBudgetFlopsOverride"/>.
+    /// </summary>
+    public static double SubmitWorkBudgetFlops = 128e9;
+
+    /// <summary>Per-executor override of <see cref="SubmitWorkBudgetFlops"/>; null = the static default.</summary>
+    public double? SubmitWorkBudgetFlopsOverride { get; set; }
+
+    private double EffectiveSubmitWorkBudget => SubmitWorkBudgetFlopsOverride ?? SubmitWorkBudgetFlops;
+
+    /// <summary>DIAGNOSTIC: command buffers submitted in the most recent run because the estimated work reached
+    /// <see cref="SubmitWorkBudgetFlops"/> (WebGPU). Reset per run.</summary>
+    public static int LastRunWorkSubmitCount;
+
+    /// <summary>
+    /// Rough floating-point operations of one node from its input shapes (null = unknown). Conv / ConvTranspose: 2 x the multiply-adds of the
+    /// input resolution (stride ignored: an over-estimate, which only submits earlier). MatMul-like: 2 x M x K x N. Attention: 4 x Q x keys.
+    /// Everything else: the largest input's element count (memory-bound, small next to the budget).
+    /// </summary>
+    internal static double EstimateNodeFlops(string opType, int[]?[] inputShapes)
+    {
+        static double Elems(int[]? s) { if (s == null || s.Length == 0) return 0; double e = 1; foreach (var d in s) e *= Math.Max(d, 1); return e; }
+        int[]? a = inputShapes.Length > 0 ? inputShapes[0] : null, b = inputShapes.Length > 1 ? inputShapes[1] : null;
+        switch (opType)
+        {
+            case "Conv":
+                if (a is { Length: >= 3 } && b is { Length: >= 3 })
+                {   // X [N, Cin, spatial...], W [Cout, Cin/g, k...]
+                    double spatial = 1; for (int i = 2; i < a.Length; i++) spatial *= Math.Max(a[i], 1);
+                    double perOut = 1; for (int i = 1; i < b.Length; i++) perOut *= Math.Max(b[i], 1);
+                    return 2.0 * Math.Max(a[0], 1) * Math.Max(b[0], 1) * spatial * perOut;
+                }
+                break;
+            case "ConvTranspose":
+                if (a is { Length: >= 3 } && b is { Length: >= 3 })
+                {   // X [N, Cin, spatial...], W [Cin, Cout/g, k...]
+                    double perIn = 1; for (int i = 1; i < b.Length; i++) perIn *= Math.Max(b[i], 1);
+                    return 2.0 * Elems(a) * perIn;
+                }
+                break;
+            case "MatMul": case "Gemm": case "FusedLinear": case "BatchedMatMul": case "MatMulInteger":
+                if (a is { Length: >= 1 } && b != null && a[^1] > 0)
+                    return 2.0 * Elems(a) * Elems(b) / a[^1];
+                break;
+            case "FusedAttention":
+                if (a is { Length: >= 2 } && b is { Length: >= 2 })
+                    return 4.0 * Elems(a) * Math.Max(b[^2], 1);
+                break;
+        }
+        double max = 0; foreach (var sh in inputShapes) max = Math.Max(max, Elems(sh));
+        return max;
+    }
+
+    /// <summary>
     /// WebGPU plain forward (no capture): a drain point SUBMITS the pending command encoder (<c>Flush</c>) and returns
     /// the deferred buffers to the pool, instead of awaiting GPU completion. True by default.
     /// </summary>
@@ -1670,6 +1729,8 @@ public class GraphExecutor : IDisposable
 
         // Execute each node in topological order
         int nodeIdx = 0;
+        double workSinceSubmit = 0;   // estimated FLOPs queued since the last submit (WebGPU; see SubmitWorkBudgetFlops)
+        LastRunWorkSubmitCount = 0;
         foreach (var node in _graph.Nodes)
         {
             CurrentRunNodeIndex = nodeIdx;   // pool-miss / reclaim attribution, as in RunAsync
@@ -2474,6 +2535,22 @@ public class GraphExecutor : IDisposable
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
 
+            // Work-based submit (WebGPU, see SubmitWorkBudgetFlops): end the command buffer BEFORE a node that would take the queued work
+            // past the budget - the same rule as RunAsync, so no command buffer can outrun a slow GPU's driver watchdog.
+            if (EffectiveSubmitWorkBudget > 0 && _accelerator.AcceleratorType == AcceleratorType.WebGPU)
+            {
+                var workShapes = new int[]?[nodeInputs.Length];
+                for (int wi = 0; wi < workShapes.Length; wi++) workShapes[wi] = nodeInputs[wi]?.Shape;
+                double workCost = EstimateNodeFlops(node.OpType, workShapes);
+                if (workSinceSubmit > 0 && workSinceSubmit + workCost > EffectiveSubmitWorkBudget)
+                {
+                    _accelerator.Flush();
+                    LastRunWorkSubmitCount++;
+                    workSinceSubmit = 0;
+                }
+                workSinceSubmit += workCost;
+            }
+
             // Execute operator
             var ctx = new OnnxOpContext
             {
@@ -2508,7 +2585,10 @@ public class GraphExecutor : IDisposable
             // Flush() not Synchronize(): the intent is to submit the encoder, not block-wait;
             // and Synchronize() throws on browser in 4.12.0 (submit+wait is desktop-only).
             if (nodeIdx > 0 && nodeIdx % 64 == 0)
+            {
                 _accelerator.Flush();
+                workSinceSubmit = 0;
+            }
 
             // Register outputs
             for (int i = 0; i < node.OutputNames.Length; i++)
@@ -3338,6 +3418,7 @@ public class GraphExecutor : IDisposable
         LastRunSyncDrainCount = 0;
         LastRunSyncDrainMs = 0;
         LastRunSyncDrainByBytesCount = 0;
+        LastRunWorkSubmitCount = 0;
         LastRunDeferredReleaseBytes = 0;
         LastRunPeakPendingReleaseBytes = 0;
         var _runSw = System.Diagnostics.Stopwatch.StartNew();
@@ -3422,6 +3503,7 @@ public class GraphExecutor : IDisposable
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
         long pendingReleaseBytes = 0; // bytes of buffers in pendingReleases; triggers an early drain past the cap
+        double workSinceSubmit = 0;   // estimated FLOPs queued since the last submit (WebGPU; see SubmitWorkBudgetFlops)
         // Unnamed Rents made by the node now executing (see BufferPool.SwapScratchSink), and those waiting for
         // the next drain. Not recorded in a capture regime: a captured plan replays WITHOUT running C#, so a
         // scratch buffer an op filled from the CPU (a params upload) must still hold those bytes at replay -
@@ -3728,6 +3810,7 @@ public class GraphExecutor : IDisposable
                         $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
                 }
                 _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
+                workSinceSubmit = 0;   // the drain submitted (or waited for) everything queued
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var b in pendingScratch) _pool.ReturnScratch(b);
                 pendingScratch.Clear();
@@ -4013,6 +4096,29 @@ public class GraphExecutor : IDisposable
                 var inShapes = string.Join(";", node.InputNames.Where(n => !string.IsNullOrEmpty(n))
                     .Select(n => tensors.TryGetValue(n, out var t) ? "[" + string.Join(",", t.Shape) + "]" : "?"));
                 CaptureKernelShapes.Add($"{node.OpType} in={inShapes}");
+            }
+
+            // Work-based submit (WebGPU): end the command buffer BEFORE a node that would take the queued work past the budget, so no
+            // single command buffer can outrun a slow GPU's driver watchdog. Same capture rule as the drains: skipped while a CUDA-style
+            // capture suppresses drains, kept for a WebGPU forward capture (KeepDrainsDuringCapture).
+            if (EffectiveSubmitWorkBudget > 0 && _accelerator.AcceleratorType == AcceleratorType.WebGPU && !(SuppressDrains && !KeepDrainsDuringCapture))
+            {
+                var shapes = new int[]?[node.InputNames.Length];
+                for (int i = 0; i < shapes.Length; i++)
+                {
+                    var n = node.InputNames[i];
+                    if (string.IsNullOrEmpty(n)) continue;
+                    if (tensors.TryGetValue(n, out var t)) shapes[i] = t.Shape;
+                    else if (halfTensors.TryGetValue(n, out var h)) shapes[i] = h.Shape;
+                }
+                double cost = EstimateNodeFlops(node.OpType, shapes);
+                if (workSinceSubmit > 0 && workSinceSubmit + cost > EffectiveSubmitWorkBudget)
+                {
+                    _accelerator.Flush();
+                    LastRunWorkSubmitCount++;
+                    workSinceSubmit = 0;
+                }
+                workSinceSubmit += cost;
             }
 
             // ── F16 precision-aware pass-through (approach i) ──
