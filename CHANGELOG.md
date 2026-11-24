@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.28 - 2026-11-24 (nuget.org) - the browser model cache: a size cap, and recovery when the browser clears the site's storage
+
 - **The browser model cache recovers when the browser clears the site's storage mid-session.** `OpfsModelCache` kept one OPFS directory
   handle for the page's life; once the browser cleared the origin (seen 2026-11-24 on the live site in Chrome, OPFS went to 0 entries),
   every model load after that failed within 2 s with "A requested file or directory could not be found at the time an operation was
@@ -27,6 +29,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - TRELLIS.2: when the guided sparse decoder's child count does not match the guide, the error now says whether the subdivision logits
   changed or the count did not run (it synchronizes, recounts and host-counts the positive logits and NaNs), instead of only
   "decoder has 0".
+- Checked by Lore on the real Studio page (RX 590, Chrome 158) on 5.8.28-local.4: storage cleared between runs passes 8 of 8 with a 24 GB
+  cap and 8 of 8 without one (5.8.27 fails every run after the clearing); caps of 0.25 and 0.02 GB evict and stream as planned (9 of 9).
 
 ## 5.8.27 - 2026-11-23 (nuget.org) - FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser; SpawnDev.ILGPU 5.4.46
 

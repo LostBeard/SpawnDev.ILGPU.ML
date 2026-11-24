@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.27</Version>
-		<PackageReleaseNotes>v5.8.27 - on SpawnDev.ILGPU 5.4.46. FLUX.2 and FLUX 3 no longer lose the WebGPU device on slower GPUs in the browser (RX 590 in Chrome: FLUX.2 Klein 4 losses in 27 first runs on 5.8.26, 0 in 30 on this; FLUX 3 Klein 0 in 10). Every native model forward now ends a command buffer per layer / block in the browser (the FLUX.2 text encoder went to the GPU as one ~2.7 TFLOP command buffer), and GraphExecutor (ONNX models) submits by estimated work, not only every 64 nodes (GraphExecutor.SubmitWorkBudgetFlops, default 128 GFLOP), so a full-resolution VAE decode is no longer one long command buffer. No math change and no measurable time cost; nothing changes on the desktop backends.</PackageReleaseNotes>
+		<Version>5.8.28</Version>
+		<PackageReleaseNotes>v5.8.28 - on SpawnDev.ILGPU 5.4.46. The browser model cache: when the browser clears the site's storage while the page is open, the next model load downloads again instead of failing (every load after the clearing failed on 5.8.27), and every other cache operation recovers too. RangeStreamModelSource.MaxCacheBytes caps the cache by its own file sizes (navigator.storage.estimate() can miss most of them: 42 GB stored, 3.6 GB reported) and evicts least-recently-used models outside the requested set; default null, unchanged. OpfsModelCache.TrimAsync and HubModelSource.Cache are new. Continuing a partial download whose file vanished restarts instead of leaving zeros. TRELLIS.2: a child-count mismatch in the guided decoder now says whether the logits changed or the count did not run.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
