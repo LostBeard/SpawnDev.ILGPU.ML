@@ -337,7 +337,7 @@ Issues and pull requests are welcome. A bug in this library, in SpawnDev.ILGPU o
 
 ## Support the project
 
-SpawnDev is built by one developer and a small team of AI agents. If it is useful to you, [sponsoring on GitHub](https://github.com/sponsors/LostBeard) directly funds more kernels, more verified models and more backends. Stars, issues and sharing what you build with it help just as much.
+SpawnDev libraries are built and maintained by the SpawnDev development team, which uses AI agents in its daily work. If this one is useful to you, [sponsoring on GitHub](https://github.com/sponsors/LostBeard) directly funds more kernels, more verified models and more backends. Stars, issues and sharing what you build with it help just as much.
 
 ## Credits
 
