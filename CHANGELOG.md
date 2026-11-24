@@ -4,6 +4,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **The browser model cache recovers when the browser clears the site's storage mid-session.** `OpfsModelCache` kept one OPFS directory
+  handle for the page's life; once the browser cleared the origin (seen 2026-11-24 on the live site in Chrome, OPFS went to 0 entries),
+  every model load after that failed within 2 s with "A requested file or directory could not be found at the time an operation was
+  processed", downloads included. `OpenOrDownloadAsync` (the path every model load takes) now treats that NotFoundError as a cache miss:
+  it reopens (recreates) the directory and retries once, so the file downloads again. A file deleted WHILE it is being read still fails
+  that one run; every load after it recovers. Test `ModelsHost_OpfsCacheRecoversWhenTheBrowserClearsStorage` (red-checked).
+- TRELLIS.2: when the guided sparse decoder's child count does not match the guide, the error now says whether the subdivision logits
+  changed or the count did not run (it synchronizes, recounts and host-counts the positive logits and NaNs), instead of only
+  "decoder has 0".
+
 ## 5.8.27 - 2026-11-23 (nuget.org) - FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser; SpawnDev.ILGPU 5.4.46
 
 - **FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser** (Lore, RX 590 in Chrome). Two causes, both "too much work in one
