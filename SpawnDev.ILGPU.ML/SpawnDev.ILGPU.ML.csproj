@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.26</Version>
-		<PackageReleaseNotes>v5.8.26 - on SpawnDev.ILGPU 5.4.46. The FLUX.2 Klein picture edit completes on slower GPUs in the browser (an RX 590 in Chrome lost the device on 5.8.25; the transformer now ends a command buffer after every block). Compiler caches are freed once per model after its warm-up (CompilerCachePolicy, on by default for WebGPU / WebGL / Wasm): a disposed model no longer leaves 6.5-16 MiB of compiler state on the browser heap, and with SpawnDev.ILGPU 5.4.46 a model loaded again compiles nothing in the browser. Apps that assemble a model from components call CompilerCachePolicy.ModelWarmedUp(accelerator) once after its first complete run. Streaming model loads survive a transient connection reset (the models host is retried once before falling back to Hugging Face; one reset used to make a 0.5 GB load 3x slower). SpawnDev.ILGPU 5.4.46: deterministic WGSL / GLSL, the shader artifact cache on Wasm and WebGL, WebGL buffers tiled to MAX_TEXTURE_SIZE.</PackageReleaseNotes>
+		<Version>5.8.27</Version>
+		<PackageReleaseNotes>v5.8.27 - on SpawnDev.ILGPU 5.4.46. FLUX.2 and FLUX 3 no longer lose the WebGPU device on slower GPUs in the browser (RX 590 in Chrome: FLUX.2 Klein 4 losses in 27 first runs on 5.8.26, 0 in 30 on this; FLUX 3 Klein 0 in 10). Every native model forward now ends a command buffer per layer / block in the browser (the FLUX.2 text encoder went to the GPU as one ~2.7 TFLOP command buffer), and GraphExecutor (ONNX models) submits by estimated work, not only every 64 nodes (GraphExecutor.SubmitWorkBudgetFlops, default 128 GFLOP), so a full-resolution VAE decode is no longer one long command buffer. No math change and no measurable time cost; nothing changes on the desktop backends.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

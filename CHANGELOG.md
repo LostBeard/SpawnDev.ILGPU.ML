@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.27 - 2026-11-23 (nuget.org) - FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser; SpawnDev.ILGPU 5.4.46
+
 - **FLUX.2 / FLUX 3 no longer lose the device on slower GPUs in the browser** (Lore, RX 590 in Chrome). Two causes, both "too much work in one
   WebGPU command buffer for a slow card's 2 s driver watchdog":
   - **Native forwards with no per-block submit.** FLUX.2 Klein lost the device in 3 of 17 FIRST runs of a page on 5.8.26 (0 of 19 later runs),
@@ -17,8 +19,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     GFLOP; per executor `SubmitWorkBudgetFlopsOverride`; 0 = off): on WebGPU, `RunAsync` and `Run` end the command buffer before a node that
     would take the estimated queued work past the budget (`EstimateNodeFlops` from the node's shapes). No wait, no buffer recycling, no math
     change (bit-identical, tested on every backend; red-checked on both paths). Diagnostic `LastRunWorkSubmitCount`.
-  - Lore on 5.8.27-local.2: 0 losses in 10 fresh-browser first runs and 0 in 10 runs in one page (before: 4 in 27 first runs); run times
-    unchanged (70 s first, 38-39 s warm).
+  - Lore on 5.8.27-local.2 (RX 590, Chrome, a fresh browser per first run): FLUX.2 Klein 0 losses in 30 first runs + 0 in 10 warm runs
+    (before: 4 in 27 first runs; 30 clean by chance is under 1 in 100), FLUX 3 Klein 0 in 10 first runs, no driver reset. Run times
+    unchanged (FLUX.2 Klein 71-73 s first, 38-39 s warm; FLUX 3 Klein 142-143 s first).
+- Tests: SpawnDev.UnitTesting.Browser 2.7.2. PMT replaces a browser test's page when the test overruns its done-wait (it kept running beside
+  the next test and could change shared state under it).
 
 ## 5.8.26 - 2026-11-23 (nuget.org) - FLUX.2 picture edit runs on slower GPUs in the browser; compiler caches freed after a model's warm-up; SpawnDev.ILGPU 5.4.46
 
