@@ -173,6 +173,23 @@ public sealed class SparseVaeDecoder : IDisposable
             // conv output is never held whole (at 1024 it is 3.9 GB, more than the 2 GiB a WebGPU buffer can be, and it is the largest buffer of the decoder).
             using var offsets = I(n + 1);
             int m = await _sk.CountChildrenAsync(subdiv.View, n, offsets.View);
+            // A guided decoder must find exactly the children the shape decoder found from the SAME logits. 2026-11-23, Lore (RX 590, Chrome, 5.8.27,
+            // 1 run in 5, the GPU shared with another browser): the texture decoder counted 0 children where the shape decoder had 5341 ("guide level 1
+            // has 5341 voxels, decoder has 0"). Either the logits changed between the two decoders or the count's GPU work did not run (a WebGPU
+            // submit dropped by validation leaves the zero-initialised offsets). Say which, instead of failing one level later with no evidence:
+            // recount after a full wait, and count the positive logits on the host. Error path only: the readback happens only on a mismatch.
+            if (guide != null && !_predSubdiv && i + 1 < guide.Count && m != guide[i + 1].Count)
+            {
+                await _acc.SynchronizeAsync();
+                int recount = await _sk.CountChildrenAsync(subdiv.View, n, offsets.View);
+                var host = await subdiv.View.SubView(0, (long)n * 8).CopyToHostAsync();
+                int positive = 0, nan = 0;
+                foreach (var v in host) { if (v > 0f) positive++; else if (float.IsNaN(v)) nan++; }
+                throw new InvalidOperationException($"guided decoder level {i}: counted {m} children from the guide's logits, the shape decoder had {guide[i + 1].Count}; " +
+                    $"recount after a full wait = {recount}; the logits hold {positive} positive of {(long)n * 8} ({nan} NaN). " +
+                    (positive == guide[i + 1].Count ? "The logits are intact: the first count's GPU work did not run or was read too early."
+                                                    : "The logits changed after the shape decoder used them."));
+            }
             var newCoords = I((long)m * 3); using var parent = I(m); using var slot = I(m);
             _sk.WriteChildren(subdiv.View, offsets.View, coords.View, n, newCoords.View, parent.View, slot.View);
             var h2 = F((long)m * outC);
