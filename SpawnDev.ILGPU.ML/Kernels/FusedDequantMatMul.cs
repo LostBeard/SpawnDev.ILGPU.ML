@@ -889,10 +889,6 @@ public class FusedDequantMatMul : IDisposable
         // WebGL falls through to the general per-element M*N kernel below (correct; the pre-GEMV path).
         bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
                        || (_accelerator.AcceleratorType == AcceleratorType.WebGPU && !EnableWebGPUGemv);
-        // WebGPU validates WGSL uniformity: a barrier under a loop or branch whose condition comes from a storage-buffer read is rejected
-        // (Plans/webgpu-q4k-gemv-uniform-barrier-2026-10-19.md). The Q4_K GEMV (barriers inside its per-super-block loop) is such a kernel, so on
-        // WebGPU Q4_K stays on the per-element kernel below: correct, slower. The Q8_0 / Q4_0 / Q4_1 / Q5_0 / Q6_K GEMVs barrier only in the final reduction.
-        bool webGpuUniformBarrierUnsafe = _accelerator.AcceleratorType == AcceleratorType.WebGPU && type == GGMLType.Q4_K;
         // M == 1 of Q8_0 / Q4_K / Q6_K on ForwardRows' word-wise kernels: on a 4070 (tools/llm-bench/gemv_rows_bench.cs) 2.2x the Q8_0 GEMV below, 2.5x the Q4_K one,
         // 3x the Q6_K one. They barrier only in the final reduction (WebGPU-uniform), so WebGPU takes them too instead of the per-element kernel. The opt-in CUDA dp4a /
         // warp kernels keep precedence when enabled; GGUF_GEMV_ROWS_GENERIC=1 restores the per-type GEMVs.
@@ -903,7 +899,7 @@ public class FusedDequantMatMul : IDisposable
             ForwardRows(input, weightQuant, output, 1, K, N, type);
             return;
         }
-        if (M == 1 && !gpuBrowser && !ForcePerElementGemv && !webGpuUniformBarrierUnsafe)
+        if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             // dp4a int8-activation Q4_K GEMV: quantize the activation to int8 (block_q8_1) once, then dot in the
@@ -1231,10 +1227,11 @@ public class FusedDequantMatMul : IDisposable
             return;
         }
 
-        // Multi-row dequant GEMM for M>1 (prefill) — opt-in (GGUF_GEMM_MR=1) until A/B-verified. Same shared-mem
+        // Multi-row dequant GEMM for M>1 (prefill) — on by default (GGUF_GEMM_MR=0 turns it off). Same shared-mem
         // /barrier shape as the GEMV, so it's gated to non-browser-GPU backends (WebGL has no workgroup shared
         // memory; WebGPU's workgroup reduction is slow on Tint/Dawn — both keep the per-element kernel below).
-        // Never on WebGPU, even with EnableWebGPUGemv: these kernels barrier inside data-dependent loops, which WebGPU's WGSL validation rejects.
+        // Never on WebGPU, even with EnableWebGPUGemv: WebGPU prefill runs the tiled GEMM above, and nothing has measured these kernels against it there
+        // (Plans/webgpu-q4k-gemv-uniform-barrier-2026-10-19.md, update 2026-11-24).
         if (M > 1 && EnableMultiRowGemm && !gpuBrowser && _accelerator.AcceleratorType != AcceleratorType.WebGPU && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
         {
             // M>=RB_TILE (large prefill): FLOP-efficient register-blocked tiled dequant GEMM. Smaller M: multi-row.

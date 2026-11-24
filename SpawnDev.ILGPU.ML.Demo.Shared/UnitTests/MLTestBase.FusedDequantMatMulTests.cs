@@ -83,7 +83,7 @@ public abstract partial class MLTestBase
 
     /// <summary>
     /// With <see cref="FusedDequantMatMul.EnableWebGPUGemv"/> on (what the AI Chat and Image Generation pages set) every fused type must still COMPILE and match the oracle at M = 1 (decode) and M = 5 (prefill):
-    /// WebGPU rejects WGSL that puts a barrier under data-dependent control flow, which the Q4_K GEMV and the Q4_K / Q6_K multi-row GEMMs do, so those stay off WebGPU (found with Qwen3-4B Q4_K_M / Q4_0 in Chrome).
+    /// WebGPU rejects WGSL that puts a barrier under data-dependent control flow (found with Qwen3-4B Q4_K_M / Q4_0 in Chrome).
     /// </summary>
     [TestMethod(Timeout = 600000)]
     public async Task FusedDequantMatMul_WebGpuGemvOn_AllTypes_CompileAndMatchOracle() => await RunTest(async accelerator =>
@@ -130,6 +130,47 @@ public abstract partial class MLTestBase
         }
         finally { FusedDequantMatMul.EnableWebGPUGemv = saved; }
         Console.WriteLine("[FusedDequantMatMul] EnableWebGPUGemv on: Q4_0 Q4_1 Q5_0 Q8_0 Q4_K Q6_K at M=1 and M=5 match the oracle");
+    });
+
+    /// <summary>
+    /// The per-type group GEMVs themselves (<see cref="FusedDequantMatMul.ForceGenericRows"/>: the default M = 1 route is ForwardRows, which reaches none of them).
+    /// The Q4_K one barriers under `if (n &lt; N)` with N read from a view: WebGPU rejected it until SpawnDev.ILGPU 5.4.47, and ML kept it off WebGPU.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task FusedDequantMatMul_GenericGemv_WebGpuGemvOn_CompilesAndMatchesOracle() => await RunTest(async accelerator =>
+    {
+        bool savedGemv = FusedDequantMatMul.EnableWebGPUGemv, savedRows = FusedDequantMatMul.ForceGenericRows;
+        try
+        {
+            FusedDequantMatMul.EnableWebGPUGemv = true;
+            FusedDequantMatMul.ForceGenericRows = true;
+            foreach (var type in new[] { GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K })
+            {
+                const int K = 512, N = 70;   // N past one group and not a multiple of it
+                var rng = new Random(1700 + (int)type);
+                var input = new float[K];
+                for (int i = 0; i < K; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+                int bytesPerRow = RowBytes(type, K);
+                var weightBytes = new byte[N * bytesPerRow];
+                var expected = new float[N];
+                for (int n = 0; n < N; n++)
+                {
+                    var rowBytes = MakeBlocks(type, K, rng);
+                    Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+                    var row = ReferenceDequant(type, rowBytes, K);
+                    for (int k = 0; k < K; k++) expected[n] += input[k] * row[k];
+                }
+                using var inputBuf = accelerator.Allocate1D(input);
+                using var weightBuf = AllocatePadded(accelerator, weightBytes);
+                using var outputBuf = accelerator.Allocate1D<float>(N);
+                using var fused = new FusedDequantMatMul(accelerator);
+                fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, 1, K, N, type);
+                await accelerator.SynchronizeAsync();
+                AssertCloseQuant(await outputBuf.CopyToHostAsync<float>(0, N), expected, 2e-3f, $"GenericGemv {type}");
+            }
+        }
+        finally { FusedDequantMatMul.EnableWebGPUGemv = savedGemv; FusedDequantMatMul.ForceGenericRows = savedRows; }
+        Console.WriteLine("[FusedDequantMatMul] generic group GEMVs Q8_0 Q4_K Q6_K at M=1 match the oracle");
     });
 
     private async Task FusedMatMulOracle(GGMLType type) => await RunTest(async accelerator =>

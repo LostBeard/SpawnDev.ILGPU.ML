@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- On SpawnDev.ILGPU 5.4.47. The per-type Q4_K group GEMV compiles on WebGPU (a barrier under a condition read from a view), so the code that
+  kept it off WebGPU is gone. No speed change: `M == 1` Q4_K already runs `ForwardRows` there, and this GEMV is reached only with
+  `ForceGenericRows` (GGUF_GEMV_ROWS_GENERIC=1). The multi-row GEMMs stay off WebGPU (prefill runs the tiled GEMM; not measured against it).
+  Test `FusedDequantMatMul_GenericGemv_WebGpuGemvOn_CompilesAndMatchesOracle` (fails on WebGPU with 5.4.46).
+
 ## 5.8.28 - 2026-11-24 (nuget.org) - the browser model cache: a size cap, and recovery when the browser clears the site's storage
 
 - **The browser model cache recovers when the browser clears the site's storage mid-session.** `OpfsModelCache` kept one OPFS directory
