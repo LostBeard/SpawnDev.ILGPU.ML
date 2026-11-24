@@ -176,8 +176,39 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         // IResumableModelStore. This method is the convenience wrapper over "store + HTTP"; it is NOT a
         // second implementation of the download, because a parallel implementation is exactly how one path
         // ends up with a fix or a guard the other lacks.
-        var stream = await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
-        return (OPFSStream)stream;
+        try
+        {
+            return (OPFSStream)await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsStorageGone(ex))
+        {
+            // The browser cleared this origin's storage while the page was open (2026-11-24, Lore, the live site in Chrome: the
+            // profile's OPFS went to 0 entries mid-session; every model load after that failed within 2 s with "A requested file or
+            // directory could not be found at the time an operation was processed", downloads included). The cached directory handle
+            // points at a directory that no longer exists, so every operation through it throws NotFoundError. Open the directory
+            // again (it is recreated) and retry once: the entry is gone, so it downloads. A cache that loses its files must cost a
+            // download, never the run.
+            await ResetDirectoryAsync().ConfigureAwait(false);
+            if (_cacheDir == null) throw;
+            return (OPFSStream)await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>True when <paramref name="ex"/> (or an inner exception) is OPFS's NotFoundError: the cached entry or the cache directory itself is gone.</summary>
+    internal static bool IsStorageGone(Exception? ex)
+    {
+        for (var e = ex; e != null; e = e.InnerException)
+            if (e is JSException { Name: "NotFoundError" }) return true;
+        return false;
+    }
+
+    /// <summary>Drop the cached OPFS directory handle and open the directory again (created when missing).</summary>
+    private async Task ResetDirectoryAsync()
+    {
+        try { _cacheDir?.Dispose(); } catch { /* already gone */ }
+        _cacheDir = null;
+        _initialized = false;
+        await EnsureInitializedAsync().ConfigureAwait(false);
     }
 
     private HttpModelDownloader? _downloader;

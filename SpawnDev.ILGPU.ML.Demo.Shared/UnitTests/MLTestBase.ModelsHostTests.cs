@@ -1,6 +1,7 @@
 using System.Net;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -260,6 +261,58 @@ public abstract partial class MLTestBase
         {
             cache.Downloader.ActiveDownloadsChanged -= OnActive;
             await cache.RemoveAsync(key);
+        }
+    });
+
+    /// <summary>
+    /// The browser clears the origin's storage while the page is open (2026-11-24, Lore, the live site in Chrome: OPFS went to 0 entries mid-session and
+    /// every model load after that failed with "A requested file or directory could not be found at the time an operation was processed", downloads
+    /// included). The cache holds one OPFS directory handle for the page's life; once its directory is deleted, every operation through it throws
+    /// NotFoundError. Simulated exactly: cache a file, delete the cache DIRECTORY from the OPFS root behind the cache's back, open again - it must download
+    /// again and succeed, and the directory must exist again afterwards. Browser only.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task ModelsHost_OpfsCacheRecoversWhenTheBrowserClearsStorage() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
+        const string dirName = "ilgpu-ml-test-storage-cleared";
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+        if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        using var source = new HubModelSource(cache, http);
+        const string key = "storage-cleared-fixture";
+        await cache.RemoveAsync(key);
+        int downloads = 0;
+        void OnActive() => downloads++;
+        cache.Downloader.ActiveDownloadsChanged += OnActive;
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        try
+        {
+            await using (var s1 = await source.OpenUrlAsync(url, key, UnmirroredBytes)) Ur_Expect(s1.Length == UnmirroredBytes, $"first open: {s1.Length} bytes");
+            Ur_Expect(downloads > 0, "the first open downloaded");
+
+            // what the browser's storage clearing does: the whole cache directory disappears while the cache still holds its handle
+            await root.RemoveEntry(dirName, recursive: true);
+            bool gone;
+            try { using var probe = await root.GetDirectoryHandle(dirName); gone = false; } catch { gone = true; }
+            Ur_Expect(gone, "the cache directory was deleted behind the cache's back (the precondition of this test)");
+
+            downloads = 0;
+            await using (var s2 = await source.OpenUrlAsync(url, key, UnmirroredBytes))
+                Ur_Expect(s2.Length == UnmirroredBytes, $"after the storage was cleared the open still works: {s2.Length} bytes");
+            Ur_Expect(downloads > 0, "the entry was gone, so it downloaded again");
+            using var again = await root.GetDirectoryHandle(dirName);   // throws if the cache did not recreate its directory
+            downloads = 0;
+            await using (var s3 = await source.OpenUrlAsync(url, key, UnmirroredBytes)) Ur_Expect(s3.Length == UnmirroredBytes, $"third open: {s3.Length} bytes");
+            Ur_Expect(downloads == 0, $"and the cache works normally again (a hit): {downloads} download event(s)");
+        }
+        finally
+        {
+            cache.Downloader.ActiveDownloadsChanged -= OnActive;
+            try { await cache.RemoveAsync(key); } catch { }
         }
     });
 
