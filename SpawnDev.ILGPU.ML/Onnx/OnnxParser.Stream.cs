@@ -20,10 +20,12 @@ namespace SpawnDev.ILGPU.ML.Onnx;
 public static partial class OnnxParser
 {
     /// <summary>
-    /// Parse an ONNX model's structure from a seekable stream, recording each large initializer's raw_data
-    /// stream offset instead of materializing it. Initializers whose submessage is &lt;= <paramref name="streamThreshold"/>
-    /// bytes are read whole (parsed by the byte[] path); larger ones record an offset and skip the weight.
+    /// Parse an ONNX model's structure from a seekable stream. A float weight of more than 64 elements, of ANY size, records its stream offset and is never materialized
+    /// (it goes from the stream to the GPU); only the small constants (64 elements or fewer) and the non-float data are read into .NET.
     /// </summary>
+    /// <param name="stream">The model.</param>
+    /// <param name="streamThreshold">Ignored since 2026-07 (every weight streams, see above); kept so existing calls compile. Pass nothing.</param>
+    /// <param name="ct">Cancels the parse.</param>
     public static async Task<OnnxModelProto> ParseFromStreamAsync(
         Stream stream, int streamThreshold = 1024 * 1024, CancellationToken ct = default)
     {

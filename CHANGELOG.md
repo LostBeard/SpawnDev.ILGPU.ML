@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- NEW `ModelResidency` (one per accelerator, owned by the app; approved by TJ 2026-11-25): keeps models on the device while there is room, drops the least recently used idle one when the
+  next would not fit, loads it again on next use. `AcquireAsync(key, load, expectedBytes, tag)` gives a lease; a leased model is never dropped; drops are async and drain the device first; idle pool
+  scratch is reclaimed before any model; an unknown size with a budget drops every idle model before the load; one model over the budget loads with a log line. `ReleaseAsync(tag)`, `ReleaseAllAsync`,
+  `TrimAsync`, `Invalidate()` (lost device), `Register` / `Touch` / `EnsureRoomForAsync` for engines that load themselves, `Evicted` and `Log`. `IDeviceSized.DeviceBytes`. No budget set = nothing is
+  ever dropped. Nothing uses it yet. Tests `ModelResidency_*` (fake device, 6) red-checked: leased eviction, reversed LRU, no drain, unknown size, swallowed load failure.
+- Docs: `streamThreshold` (CreateFromStreamAsync, CreateFromOnnxStreamAsync, ParseFromStreamAsync) has been ignored since July; its doc described the old behaviour.
+
 ## 5.8.31 - 2026-11-25 (nuget.org) - models load whole from hosts that compress responses
 
 - **Models load whole from hosts that compress responses (GitHub Pages gzips .onnx and .tflite).** Found by Bones (article demo: MobileNetV2, 14,246,826 bytes, Content-Length

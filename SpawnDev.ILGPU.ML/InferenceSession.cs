@@ -701,6 +701,7 @@ public class InferenceSession : IDisposable
     /// stream loaders already obey the same rule; this entry point must not break it at detect time.
     /// </para>
     /// </remarks>
+    /// <param name="streamThreshold">Ignored (every ONNX weight streams, whatever its size); kept so existing calls compile.</param>
     public static async Task<InferenceSession> CreateFromStreamAsync(
         Accelerator accelerator, Stream stream,
         Action<string, int>? onProgress = null,
@@ -1463,6 +1464,7 @@ public class InferenceSession : IDisposable
     /// the weight operand of a low-precision-capable op (FusedLinear / MatMul rank-2 / Gemm / Conv group=1) as FP16 on
     /// the device - half the bytes and half the weight bandwidth; compute stays FP32. Opt-in: FP16 weights round to an
     /// 11-bit significand. Default <see cref="WeightStorage.Source"/> keeps each weight in its file's precision.</param>
+    /// <param name="streamThreshold">Ignored (every weight streams, whatever its size); kept so existing calls compile.</param>
     public static async Task<InferenceSession> CreateFromOnnxStreamAsync(
         Accelerator accelerator, Stream stream,
         Action<string, int>? onProgress = null,
