@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.29</Version>
-		<PackageReleaseNotes>v5.8.29 - on SpawnDev.ILGPU 5.4.49 (5.8.28: 5.4.46). A kernel that fails to compile no longer breaks later, unrelated kernels of the same context; barriers under a condition read from a view compile on WebGPU (the Q4_K group GEMV is no longer kept off WebGPU; default routes and speed unchanged). No API change.</PackageReleaseNotes>
+		<Version>5.8.30</Version>
+		<PackageReleaseNotes>v5.8.30 - on SpawnDev.ILGPU 5.4.49. Background removal and RgbaStats.IsFullyOpaqueAsync work on WebGL again (they used Atomic.Max, which WebGL lacks, since 2026-10-19); the counting uses no atomics on any backend now. A NullReferenceException while GraphExecutor reads a runtime constant back is no longer swallowed (an obsolete workaround). FetchRangeStream.FailedRequests (diagnostics). No other API change.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

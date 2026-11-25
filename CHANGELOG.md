@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.30 - 2026-11-25 (nuget.org) - background removal works on WebGL again
+
 - **Background removal works on WebGL again.** `BackgroundRemovalPipeline` (the mask's range check) and `RgbaStats.IsFullyOpaqueAsync` used `Atomic.Max`, which
   WebGL does not have, so both failed there from 2026-10-19 (5.8.x) on: "Atomic.Max is not supported on the WebGL backend". They (and
   `RgbaStats.BorderTouchAsync`) now count with 1024 strided threads and one fold, no atomics (`Preprocessing.DeviceCount`), on every backend. The tests were
