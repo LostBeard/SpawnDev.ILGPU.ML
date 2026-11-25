@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- `FetchRangeStream.FailedRequests`: how many of a stream's range requests failed (each is tried again). Diagnostics.
+- Tests: `HuggingFace_RangeReadersResolveOnce` allows one extra resolve per failed request (a Chrome cache error, ERR_CACHE_OPERATION_NOT_SUPPORTED, failed the
+  5.8.29 sweep once; a failed request resolves again by design). With no failure it still requires exactly one (red-checked: never pinning the CDN URL
+  gives 16 resolves and 0 failures).
+
 ## 5.8.29 - 2026-11-25 (nuget.org) - SpawnDev.ILGPU 5.4.49
 
 - On SpawnDev.ILGPU 5.4.49 (5.8.28 was on 5.4.46). A kernel that fails to compile no longer breaks later kernels in the same context: an app that tries a

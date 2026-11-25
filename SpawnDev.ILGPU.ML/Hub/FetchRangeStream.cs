@@ -128,6 +128,12 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
     /// </summary>
     public int NetworkErrorRetries { get; private set; }
 
+    /// <summary>
+    /// Requests of this stream that failed (each is tried again). A failed request on a resolved URL makes the stream resolve again, so
+    /// <see cref="ResolveRequests"/> can be up to one above the minimum per failure. Diagnostics; the tests assert it.
+    /// </summary>
+    public int FailedRequests { get; private set; }
+
     private async Task<Uint8Array> FetchRangeAsync(long start, long end, CancellationToken ct)
     {
         Exception? last = null;
@@ -171,6 +177,7 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
                 last = ex;
+                FailedRequests++;
                 // a failure on a resolved URL (a signed URL expires, or anything else): resolve again, now, without the backoff
                 if (target != _url && _rangeUrl == target) { _rangeUrl = null; reResolve = true; }
                 // A FAST network failure with no answer (connection reset / refused) is usually transient: try the models host once more before giving

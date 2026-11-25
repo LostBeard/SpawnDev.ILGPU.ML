@@ -166,7 +166,9 @@ public abstract partial class MLTestBase
                 part.ReadBytes().CopyTo(got, off);
             }
             Ur_Expect(got.AsSpan().SequenceEqual(refBytes), "FetchRangeStream: the chunks match the single request");
-            Ur_Expect(fs.ResolveRequests == 1, $"FetchRangeStream: 16 chunks resolved once ({fs.ResolveRequests})");
+            // a request that FAILED (a transient network or browser-cache error: Chrome's ERR_CACHE_OPERATION_NOT_SUPPORTED was seen once in four sweeps) resolves again by
+            // design, so one resolve plus at most one per failure. No failure: exactly one.
+            Ur_Expect(fs.ResolveRequests >= 1 && fs.ResolveRequests <= 1 + fs.FailedRequests, $"FetchRangeStream: 16 chunks resolved once ({fs.ResolveRequests} resolves, {fs.FailedRequests} failed requests)");
             Ur_Expect(fs.RangeUrl != null && !fs.RangeUrl.StartsWith("https://huggingface.co/"), $"FetchRangeStream: the chunks went to the CDN ({fs.RangeUrl?[..Math.Min(60, fs.RangeUrl.Length)]})");
             report.Add($"FetchRangeStream 16 chunks: {fs.ResolveRequests} resolve, to {new Uri(fs.RangeUrl!).Host}");
         }
