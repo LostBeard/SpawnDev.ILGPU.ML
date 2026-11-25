@@ -5547,22 +5547,11 @@ public class GraphExecutor : IDisposable
                                 readbackThisRun[outName] = runtimeConstants[outName];
                         }
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
-                        catch (NullReferenceException) {
-                            // WORKAROUND: SpawnDev.ILGPU 4.9.4 WebGPU CopyToHostAsync NRE on tiny
-                            // (1-element / 4-byte) staging buffers. Tracked via
-                            // _DevComms/SpawnDev.ILGPU/data-to-geordi-webgpu-tiny-readback-nre-2026-05-03.md.
-                            // Cached runtime-constants are an OPTIMIZATION for downstream parameter
-                            // resolution (Slice starts/ends, Reshape dims) - swallowing a single
-                            // readback just means the downstream op reads the value from the GPU
-                            // view directly. Should NOT abort the whole graph run.
-                            // Repro: WebGPUTests.Pipeline_YOLOv8 node 227 'Div' shape=[1].
-                            // Remove this catch when upstream lands the fix in WebGPUMemoryBuffer.
-                        }
                         catch (Exception captureEx)
                         {
                             // The flush during runtime-const capture is the first sync after a
                             // queued kernel might fire its trap (Wasm divide-by-zero, WebGPU
-                            // device error). For non-NRE exceptions we still want the augmented
+                            // device error). We want the augmented
                             // throw because they're real graph-execution failures, not optimization
                             // hiccups. Inline-augment with op log; no wrapping because
                             // SpawnDev.UnitTesting.UnitTestRunner unwraps InnerException on
