@@ -37,7 +37,6 @@ public abstract partial class MLTestBase
 
     private async Task Id_CheckApply(Accelerator accelerator, bool logits, int w, int h, int maskW, int maskH)
     {
-        RequireAtomicsAndScatter(accelerator);          // the mask's range check is an Atomic.Max
         var rnd = new Random(11);
         var rgba = new int[w * h];
         for (int i = 0; i < rgba.Length; i++) rgba[i] = rnd.Next() | (rnd.Next(256) << 24);
@@ -76,6 +75,39 @@ public abstract partial class MLTestBase
     {
         await Id_CheckApply(accelerator, true, 257, 130, 128, 128);
         await Id_CheckApply(accelerator, true, 64, 64, 128, 128);
+    });
+
+    /// <summary>
+    /// The range check and the opacity check visit EVERY element (1024 strided threads, then a fold): one out-of-range mask value, one translucent pixel, at the first, middle or last
+    /// element, for sizes below, at and above the thread count.
+    /// </summary>
+    [TestMethod]
+    public async Task ImageDevice_OneOutlierAnywhere_IsSeen() => await RunTest(async accelerator =>
+    {
+        foreach (var (w, h) in new[] { (3, 3), (33, 31), (32, 32), (41, 25), (45, 45), (70, 60) })
+        {
+            int n = w * h;
+            foreach (int at in new[] { 0, n / 2, n - 1 }.Distinct())
+            {
+                var mask = Enumerable.Repeat(0.5f, n).ToArray();
+                mask[at] = 5f;                                       // a logit: the values are logits, so the sigmoid runs
+                var rgba = new int[n];
+                using (var rb = accelerator.Allocate1D(rgba))
+                using (var mb = accelerator.Allocate1D(mask))
+                using (var got = await BackgroundRemovalPipeline.ApplyMaskAsync(accelerator, rb.View, mb.View, w, h, w, h))
+                {
+                    var px = await got.View.CopyToHostAsync();
+                    int alphaAtHalf = (px[at == 0 ? n - 1 : 0] >> 24) & 255;       // a plain 0.5: sigmoid 0.622 -> 159, no sigmoid -> 128
+                    Id_Expect(Math.Abs(alphaAtHalf - 159) <= 1, $"{w}x{h}: the logit at {at} was not seen (alpha {alphaAtHalf}, 159 when it is, 128 when it is missed)");
+                }
+                var opaque = Enumerable.Repeat(unchecked((int)0xFF102030), n).ToArray();
+                using (var ob = accelerator.Allocate1D(opaque))
+                    Id_Expect(await RgbaStats.IsFullyOpaqueAsync(accelerator, ob.View, w, h), $"{w}x{h}: an opaque picture reported as translucent");
+                opaque[at] = 0x10203040;
+                using (var ob = accelerator.Allocate1D(opaque))
+                    Id_Expect(!await RgbaStats.IsFullyOpaqueAsync(accelerator, ob.View, w, h), $"{w}x{h}: the translucent pixel at {at} was not seen");
+            }
+        }
     });
 
     [TestMethod]
@@ -124,7 +156,6 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ImageDevice_RgbaStats_MatchTheHostLoops() => await RunTest(async accelerator =>
     {
-        RequireAtomicsAndScatter(accelerator);          // the counters are atomics
         int w = 101, h = 77;
         var rnd = new Random(2);
         var px = new int[w * h];

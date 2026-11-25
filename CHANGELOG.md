@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Background removal works on WebGL again.** `BackgroundRemovalPipeline` (the mask's range check) and `RgbaStats.IsFullyOpaqueAsync` used `Atomic.Max`, which
+  WebGL does not have, so both failed there from 2026-10-19 (5.8.x) on: "Atomic.Max is not supported on the WebGL backend". They (and
+  `RgbaStats.BorderTouchAsync`) now count with 1024 strided threads and one fold, no atomics (`Preprocessing.DeviceCount`), on every backend. The tests were
+  skipping WebGL through the atomics gate, and the pipeline test that failed is in the HeavyModel category, which the release sweeps leave out; the gates are
+  gone, and `ImageDevice_OneOutlierAnywhere_IsSeen` checks that no element is missed. `ImageDevice_` + the real RMBG pipeline: 42 tests on 7 lanes, no skips.
+- `GraphExecutor` no longer swallows a `NullReferenceException` while it reads a runtime constant back. It was a workaround for an ILGPU 4.9.4 WebGPU bug in
+  a one-element staging buffer; that code now reuses one staging buffer, and the catch could only hide real failures. Pipeline tests (WebGPU / WebGL / CUDA): no
+  NullReferenceException in 130 passes.
 - `FetchRangeStream.FailedRequests`: how many of a stream's range requests failed (each is tried again). Diagnostics.
 - Tests: `HuggingFace_RangeReadersResolveOnce` allows one extra resolve per failed request (a Chrome cache error, ERR_CACHE_OPERATION_NOT_SUPPORTED, failed the
   5.8.29 sweep once; a failed request resolves again by design). With no failure it still requires exactly one (red-checked: never pinning the CDN URL

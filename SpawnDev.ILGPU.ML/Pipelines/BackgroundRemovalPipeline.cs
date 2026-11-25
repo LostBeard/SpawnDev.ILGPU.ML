@@ -91,10 +91,16 @@ public class BackgroundRemovalPipeline : IDisposable
     }
 
     // ---- the mask, applied on the device -------------------------------------------------------------------------------------------------------------
-    private static void RangeCheckImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<int, Stride1D.Dense> flag)
+    // DeviceCount partial (no atomics: WebGL has no Atomic.Max, which broke background removal there from 2026-10-19 to 2026-11-25)
+    private static void RangeCheckImpl(Index1D p, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<int, Stride1D.Dense> partials, int n)
     {
-        float v = mask[i];
-        if (v < -0.1f || v > 1.1f) Atomic.Max(ref flag[0], 1);
+        int count = 0;
+        for (int i = p; i < n; i += Preprocessing.DeviceCount.Partials)
+        {
+            float v = mask[i];
+            if (v < -0.1f || v > 1.1f) count++;
+        }
+        partials[p] = count;
     }
 
     /// <summary>
@@ -124,12 +130,11 @@ public class BackgroundRemovalPipeline : IDisposable
     /// </summary>
     public static async Task<MemoryBuffer1D<int, Stride1D.Dense>> ApplyMaskAsync(Accelerator accelerator, ArrayView1D<int, Stride1D.Dense> rgba, ArrayView1D<float, Stride1D.Dense> mask, int maskWidth, int maskHeight, int width, int height)
     {
-        var rangeCheck = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(RangeCheckImpl);
+        var rangeCheck = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>(RangeCheckImpl);
         var apply = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int>(ApplyMaskImpl);
-        using var flag = accelerator.Allocate1D<int>(1);
-        flag.MemSetToZero();
-        rangeCheck(maskWidth * maskHeight, mask, flag.View);
-        int sigmoid = (await flag.View.CopyToHostAsync().ConfigureAwait(false))[0];     // one scalar: whether the model output logits
+        // one scalar: whether the model output logits
+        int outOfRange = await Preprocessing.DeviceCount.SumAsync(accelerator, partials => rangeCheck(Preprocessing.DeviceCount.Partials, mask, partials, maskWidth * maskHeight)).ConfigureAwait(false);
+        int sigmoid = outOfRange > 0 ? 1 : 0;
         var result = accelerator.Allocate1D<int>(width * height);
         apply(width * height, rgba, mask, result.View, width, maskWidth, maskHeight, height, sigmoid);
         await accelerator.SynchronizeAsync().ConfigureAwait(false);
