@@ -130,6 +130,9 @@ public class HttpClientModelSource : ICachingModelSource
         var resumed = resumeFrom > 0 && res.StatusCode == System.Net.HttpStatusCode.PartialContent;
         if (resumeFrom > 0 && !resumed) resumeFrom = 0;   // origin ignored Range, or If-Range failed
 
+        // Content-Range gives the exact total; Content-Length is only a hint when the response may be compressed (see InferenceSession.DownloadBytesChunkedAsync)
+        bool totalExact = res.Content.Headers.ContentRange?.Length is > 0;
+        bool encoded = res.Content.Headers.ContentEncoding.Count > 0;
         long total = res.Content.Headers.ContentRange?.Length
                      ?? (res.Content.Headers.ContentLength is { } len ? resumeFrom + len : -1);
         var etag = res.Headers.ETag?.Tag;
@@ -198,7 +201,7 @@ public class HttpClientModelSource : ICachingModelSource
         }
 
         // A short read is a truncated download, not a model.
-        if (total > 0 && written != total)
+        if (total > 0 && written != total && (totalExact || (written < total && !encoded)))
         {
             await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
             throw new IOException(
@@ -206,8 +209,9 @@ public class HttpClientModelSource : ICachingModelSource
                 "The partial entry was kept and the next attempt will resume it.");
         }
 
-        await _store.SetStateAsync(key, url, total > 0 ? total : written, written, true, etag, ct).ConfigureAwait(false);
-        progress?.Report(new ModelDownloadProgress(written, total > 0 ? total : written, resumed));
+        total = written;   // the bytes stored: a compressed Content-Length was only a hint
+        await _store.SetStateAsync(key, url, total, written, true, etag, ct).ConfigureAwait(false);
+        progress?.Report(new ModelDownloadProgress(written, total, resumed));
     }
 
     private SemaphoreSlim GetGate(string key)

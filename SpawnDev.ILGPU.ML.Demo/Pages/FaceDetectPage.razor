@@ -278,10 +278,8 @@
             // litert-community/blaze-face is not mirrored there (it returned 502 on the old hub, 2026-09-26); a remote fallback just
             // threw after a working (or almost-working) local path and looked like the demo was broken.
             //
-            // Known size + cache-bust: CreateFromFileAsync/DownloadBytesChunkedAsync could "succeed" at
-            // 199050 bytes when the browser HTTP cache served a truncated body whose Content-Length
-            // matched the short length (so the incomplete-stream fallback never ran). Measured on
-            // lostbeard.github.io/face with Build 2026-09-27 04:32:24 UTC still FlatBuffer-OOB.
+            // The size is checked here because a truncated copy used to load: GitHub Pages serves this file gzip-encoded, and ML took the compressed
+            // Content-Length (199050) as its size (fixed in ML 5.8.31).
             const int blazeFaceBytes = 229746;
             var modelUrl = $"models/blaze-face/model.tflite?v={blazeFaceBytes}";
             _modelProgress = 50;
@@ -291,7 +289,7 @@
             if (bytes.Length != blazeFaceBytes)
                 throw new InvalidDataException(
                     $"BlazeFace download truncated or corrupt: got {bytes.Length} bytes, expected {blazeFaceBytes}. "
-                    + "Unregister the site's service worker (DevTools → Application) and reload.");
+                    + "Reload the page.");
             _modelProgress = 70;
             StateHasChanged();
             var session = InferenceSession.CreateFromFile(

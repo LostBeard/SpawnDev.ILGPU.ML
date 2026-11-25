@@ -117,14 +117,29 @@ public static class ModelsHost
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+            BrowserCache.RangeNoStore(req);
             using var res = await SendAsync(http, req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (res.IsSuccessStatusCode)
             {
                 // A 206's Content-Length is the PART (1 byte) - only Content-Range carries the file size.
                 var total = res.Content.Headers.ContentRange?.Length;
                 if (total is > 0) return total.Value;
-                if (res.StatusCode == System.Net.HttpStatusCode.OK && res.Content.Headers.ContentLength is > 0 and var full)
+                // a compressed response's Content-Length is not the file's size
+                if (res.StatusCode == System.Net.HttpStatusCode.OK && res.Content.Headers.ContentEncoding.Count == 0 && res.Content.Headers.ContentLength is > 0 and var full)
                     return full;
+                // Content-Range is not CORS-safelisted: a host that does not expose it (GitHub Pages) answers 206 with no visible total. An open-ended range asks for the rest
+                // of the file, and its Content-Length (which IS visible) is then the file's size: with a Range header the browser asks for identity. The body is not read. HEAD
+                // is no substitute: without a Range header the browser asks for gzip, and the Content-Length is the compressed size with its Content-Encoding hidden.
+                if (OperatingSystem.IsBrowser() && res.StatusCode == System.Net.HttpStatusCode.PartialContent)
+                {
+                    using var rest = new HttpRequestMessage(HttpMethod.Get, url);
+                    rest.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, null);
+                    BrowserCache.RangeNoStore(rest);
+                    rest.Options.Set(new HttpRequestOptionsKey<bool>("WebAssemblyEnableStreamingResponse"), true);   // the body is never buffered: disposing the response aborts it
+                    using var restRes = await SendAsync(http, rest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                    if (restRes.StatusCode == System.Net.HttpStatusCode.PartialContent && restRes.Content.Headers.ContentLength is > 0 and var size)
+                        return size;
+                }
             }
         }
         catch (HttpRequestException) { /* fall through to HEAD */ }
@@ -132,7 +147,7 @@ public static class ModelsHost
         using var head = new HttpRequestMessage(HttpMethod.Head, url);
         using var headRes = await SendAsync(http, head, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
         headRes.EnsureSuccessStatusCode();
-        return headRes.Content.Headers.ContentLength ?? -1;
+        return headRes.Content.Headers.ContentEncoding.Count == 0 ? headRes.Content.Headers.ContentLength ?? -1 : -1;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -206,6 +221,12 @@ public static class ModelsHost
     /// <summary>Tell listeners a download fell back. Called by the transports.</summary>
     public static void ReportFallback(string failedUrl, string fallbackUrl, string reason) => Fallback?.Invoke(failedUrl, fallbackUrl, reason);
 
+    // the browser handler's per-request options (response streaming, fetch cache mode): without them a fallback download was buffered whole
+    private static void CopyOptions(HttpRequestMessage from, HttpRequestMessage to)
+    {
+        foreach (var o in from.Options) ((IDictionary<string, object?>)to.Options)[o.Key] = o.Value;
+    }
+
     /// <summary>
     /// <c>http.SendAsync</c> that falls back to the Hugging Face twin when the request is for the models host and it answers
     /// <see cref="ShouldFallBack"/> or cannot be reached. Any other request goes through untouched.
@@ -226,6 +247,7 @@ public static class ModelsHost
         {
             var direct = new HttpRequestMessage(request.Method, alt);   // not disposed here: the returned response may still reference it
             foreach (var h in request.Headers) direct.Headers.TryAddWithoutValidation(h.Key, h.Value);
+            CopyOptions(request, direct);
             if (fallbackAuthorization != null) direct.Headers.Authorization = fallbackAuthorization;
             return await http.SendAsync(direct, completion, cancellationToken).ConfigureAwait(false);
         }
@@ -245,6 +267,7 @@ public static class ModelsHost
         ReportFallback(requestUri!.AbsoluteUri, alt, reason);
         var second = new HttpRequestMessage(request.Method, alt);   // not disposed here: the returned response may still reference it
         foreach (var h in request.Headers) second.Headers.TryAddWithoutValidation(h.Key, h.Value);
+        CopyOptions(request, second);
         if (fallbackAuthorization != null) second.Headers.Authorization = fallbackAuthorization;
         return await http.SendAsync(second, completion, cancellationToken).ConfigureAwait(false);
     }

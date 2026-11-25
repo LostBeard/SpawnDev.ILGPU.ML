@@ -4,6 +4,23 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Models load whole from hosts that compress responses (GitHub Pages gzips .onnx and .tflite).** Found by Bones (article demo: MobileNetV2, 14,246,826 bytes, Content-Length
+  13,120,039). It is also what failed BlazeFace in September (229,746 -> 199,050 bytes), then blamed on the browser cache and a service worker.
+  - `InferenceSession.DownloadBytesChunkedAsync` (every `CreateFromFileAsync` / `CreateFromOnnxAsync` / `CreateFromTFLiteAsync` / GGUF URL load) took Content-Length as the end of
+    the body. With Content-Encoding it is the COMPRESSED size while the browser hands back decoded bytes, so the model was cut off ("Sub-message extends past end of data").
+    It is a size hint now: the body is read to its end. Fewer bytes than an unencoded Content-Length is still rejected as truncated.
+  - Cross-origin loads no longer need a CORS preflight: the request sent a `Cache-Control` header (not CORS-safelisted), which static hosts refuse (GitHub Pages: OPTIONS 405), so the
+    load failed with "Failed to fetch". In the browser it is the fetch cache mode now.
+  - `HttpModelDownloader` (the OPFS model cache): when the host hides Content-Range cross-origin, the size of the first 512 KB segment was taken as the file's size, and a larger model
+    was stored as COMPLETE at 512 KB. The size is unknown then and the segments find the end; every segment must be exactly the bytes asked for. The models host and Hugging Face
+    expose Content-Range and were not affected.
+  - Ranged requests in the browser (`FetchRangeStream`, `HttpRangeStream`, the downloader, the size probe) bypass the HTTP cache. After a page fetched a compressed file
+    without a range, Chrome answered later ranges of it wrongly (ERR_CACHE_OPERATION_NOT_SUPPORTED, the whole file, or an empty body).
+  - `HttpModelDownloader` / `HttpClientModelSource` rejected a whole, compressed download as "truncated"; `ModelsHost.ProbeSizeAsync` could report the compressed size.
+  - A request that falls back to Hugging Face keeps its per-request options (response streaming): the fallback download was buffered whole in the browser.
+  - Tests: `DownloadBytesChunked_CompressedContentLength_ReturnsTheWholeBody`, `HttpClientModelSource_CompressedContentLength_StoresTheWholeFile`,
+    `Download_GzippedByGitHubPages_IsWhole` (live, every browser path, two files). Red-checked: each of the four browser parts put back alone fails it with its symptom.
+
 ## 5.8.30 - 2026-11-25 (nuget.org) - background removal works on WebGL again
 
 - **Background removal works on WebGL again.** `BackgroundRemovalPipeline` (the mask's range check) and `RgbaStats.IsFullyOpaqueAsync` used `Atomic.Max`, which

@@ -160,7 +160,7 @@ public sealed class FetchRangeStream : Stream, IJSReadStream
                 if (target == _url) ResolveRequests++;
                 using var window = SpawnJSRuntime.Instance!.Get<Window>("window");
                 using var signal = AbortSignal.Timeout((float)RequestTimeout.TotalMilliseconds);   // aborts the request AND the body read
-                using var resp = await window.Fetch(target, new FetchOptions { Headers = new() { ["Range"] = $"bytes={start}-{end}" }, Signal = signal });
+                using var resp = await window.Fetch(target, new FetchOptions { Headers = new() { ["Range"] = $"bytes={start}-{end}" }, Signal = signal, Cache = "no-store" }   /* BrowserCache.RangeNoStore */);
                 if (!resp.Ok)
                 {
                     httpStatus = (int)resp.Status;

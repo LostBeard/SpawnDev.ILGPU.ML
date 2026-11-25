@@ -103,6 +103,7 @@ public sealed class HttpRangeStream : Stream
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, target);
                 req.Headers.Range = new RangeHeaderValue(start, end);
+                BrowserCache.RangeNoStore(req);
                 stall.CancelAfter(StallTimeout);
                 bool learn = _rangeUrl == null;
                 if (!_resolved) ResolveRequests++;
@@ -163,7 +164,7 @@ public sealed class HttpRangeStream : Stream
         try
         {
             if (SpawnJSRuntime.Instance is not { } js) return null;
-            using var r = await js.Fetch(url, new FetchOptions { Headers = new() { ["Range"] = "bytes=0-0" } });
+            using var r = await js.Fetch(url, new FetchOptions { Headers = new() { ["Range"] = "bytes=0-0" }, Cache = "no-store" });
             return r.Ok && r.Redirected && !string.IsNullOrEmpty(r.Url) ? r.Url : null;
         }
         catch { return null; }   // no answer: the stream keeps the source URL

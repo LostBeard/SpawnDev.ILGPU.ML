@@ -3243,12 +3243,8 @@ public class InferenceSession : IDisposable
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            // Defeat a browser HTTP cache entry that stored a truncated body with a matching
-            // Content-Length (BlazeFace: CL=199050 body=199050 looked "complete", FlatBuffer OOB).
-            request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
-            {
-                NoCache = true,
-            };
+            // Revalidate rather than take an old cached copy of a file that may have been replaced at the same URL.
+            Hub.BrowserCache.SetMode(request, "no-cache");
 
             // In the BROWSER, HttpCompletionOption.ResponseHeadersRead does NOTHING on its own: the fetch-based
             // handler buffers the whole body into the MANAGED heap unless the request explicitly opts in to
@@ -3266,8 +3262,13 @@ public class InferenceSession : IDisposable
             using var response = await Hub.ModelsHost.SendAsync(http, request, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
+            // Content-Length is a SIZE HINT, never where the body ends. With Content-Encoding (GitHub Pages gzips .onnx and .tflite) it is the COMPRESSED size and the
+            // browser hands back DECODED bytes: MobileNetV2 14,246,826 bytes with Content-Length 13,120,039 (Bones, 2026-11-25), BlazeFace 229,746 with 199,050
+            // (2026-09-27, then blamed on the browser cache and a service worker). Stopping at it returned a truncated model. Cross-origin the Content-Encoding
+            // header itself is hidden (not CORS-safelisted), so a missing header proves nothing.
             var contentLength = response.Content.Headers.ContentLength;
-            expectedLength = contentLength;
+            bool encoded = response.Content.Headers.ContentEncoding.Count > 0;
+            expectedLength = encoded ? null : contentLength;
             using var stream = await response.Content.ReadAsStreamAsync();
 
             // If content length is known, read in 1MB chunks with progress
@@ -3278,14 +3279,16 @@ public class InferenceSession : IDisposable
                 int lastPercent = -1;
                 int yieldCounter = 0;
                 var buffer = new byte[1024 * 1024]; // 1MB chunks
-                while (totalRead < result.Length)
+                while (true)
                 {
-                    int read = await stream.ReadAsync(buffer, 0, Math.Min(buffer.Length, result.Length - totalRead));
+                    int read = await stream.ReadAsync(buffer, 0, buffer.Length);
                     if (read == 0) break;
+                    if (totalRead + read > result.Length)      // more than the hint: a decoded body. Grow by a quarter: a model is megabytes, doubling wastes half of them
+                        Array.Resize(ref result, (int)Math.Min(Array.MaxLength, Math.Max((long)totalRead + read, result.Length + (long)result.Length / 4 + buffer.Length)));
                     Buffer.BlockCopy(buffer, 0, result, totalRead, read);
                     totalRead += read;
 
-                    int pct = (int)(totalRead * 100L / result.Length);
+                    int pct = (int)Math.Min(99, totalRead * 100L / contentLength.Value);   // 100 is reported when the body ended
                     if (pct != lastPercent)
                     {
                         lastPercent = pct;
@@ -3297,13 +3300,14 @@ public class InferenceSession : IDisposable
                         await Task.Yield();
                 }
 
-                // Verify we got the FULL body. Browser WASM streaming can stop early (read==0 before
-                // Content-Length bytes arrive) — especially when a COI service worker re-wraps
-                // `response.body` (same-origin /models/* on GH Pages). Returning a prefix used to
-                // ship a truncated .tflite into FlatBufferReader (BlazeFace 229746→199050, 2026-09-27).
-                if (totalRead == result.Length)
+                // The stream ended. FEWER bytes than an unencoded Content-Length is a truncated body: fall through to a non-streaming, cache-busted GET below.
+                // More bytes than it, or any count with Content-Encoding, is a decoded body (a truncated compressed stream fails in the decoder, not here).
+                if (encoded || totalRead >= contentLength.Value)
+                {
+                    if (totalRead != result.Length) Array.Resize(ref result, totalRead);
+                    onProgress?.Invoke("download", 100);
                     return result;
-                // Incomplete — fall through to a non-streaming, cache-busted GET below.
+                }
             }
             else
             {
@@ -3334,27 +3338,21 @@ public class InferenceSession : IDisposable
         }
 
         // Fallback: non-streaming byte-array download. No WebAssemblyEnableStreamingResponse.
-        // Cache-bust so a truncated streaming response previously stored by the browser HTTP cache
-        // cannot be replayed as a "successful" short body (same BlazeFace failure after the
-        // prefix-return fix alone — fallback still returned 199050 from cache).
+        // Cache-bust: a fresh request, not a copy of the short one.
         onProgress?.Invoke("download", 0);
         var fallbackUrl = url.Contains('?', StringComparison.Ordinal)
             ? url + "&_dl=" + DateTime.UtcNow.Ticks
             : url + "?_dl=" + DateTime.UtcNow.Ticks;
         using var fallbackRequest = new HttpRequestMessage(HttpMethod.Get, fallbackUrl);
-        fallbackRequest.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
-        {
-            NoCache = true,
-            NoStore = true,
-        };
+        Hub.BrowserCache.SetMode(fallbackRequest, "no-store");
         using var fallbackResponse = await Hub.ModelsHost.SendAsync(http, fallbackRequest);
         fallbackResponse.EnsureSuccessStatusCode();
         var bytes = await fallbackResponse.Content.ReadAsByteArrayAsync();
-        var fallbackCl = fallbackResponse.Content.Headers.ContentLength ?? expectedLength;
-        if (fallbackCl.HasValue && bytes.Length != fallbackCl.Value)
-            throw new InvalidDataException(
-                $"Download of '{url}' truncated: got {bytes.Length} bytes, Content-Length {fallbackCl.Value}. "
-                + "A COI service worker re-wrapping response.body is a common cause for same-origin model URLs.");
+        // as above: fewer bytes than an unencoded Content-Length is truncated; more, or any count with Content-Encoding, is a decoded body
+        long? fallbackCl = fallbackResponse.Content.Headers.ContentEncoding.Count > 0 ? null : fallbackResponse.Content.Headers.ContentLength ?? expectedLength;
+        // ... unless the browser hid the Content-Encoding (cross-origin) of a file that compressed to MORE than its size: a ranged probe is answered unencoded, so it has the real size
+        if (fallbackCl.HasValue && bytes.Length < fallbackCl.Value && !(OperatingSystem.IsBrowser() && await Hub.ModelsHost.ProbeSizeAsync(http, url) == bytes.Length))
+            throw new InvalidDataException($"Download of '{url}' truncated: got {bytes.Length} bytes, Content-Length {fallbackCl.Value}.");
         onProgress?.Invoke("download", 100);
         return bytes;
     }

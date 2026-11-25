@@ -433,6 +433,7 @@ public class HttpModelDownloader
         {
             Headers = headers.Count > 0 ? headers : null,
             Signal = abortSignal,
+            Cache = headers.ContainsKey("Range") ? "no-store" : null,      // BrowserCache.RangeNoStore
         }).ConfigureAwait(false);
 
         Response? response = null;
@@ -483,10 +484,13 @@ public class HttpModelDownloader
             resumeFrom = 0;   // origin ignored the Range, or If-Range failed: take the full body
 
         long total;
+        bool totalExact, encoded;
         string? etag;
         using (var respHeaders = response.Headers)
         {
-            total = ParseTotalBytes(respHeaders, resumeFrom);
+            total = ParseTotalBytes(respHeaders, resumeFrom, status, out totalExact);
+            // hidden cross-origin (not CORS-safelisted): absent proves nothing, so a longer body than Content-Length is accepted too
+            encoded = NullIfEmpty(respHeaders.Get("content-encoding")) != null;
             etag = NullIfEmpty(respHeaders.Get("etag"));
         }
 
@@ -547,18 +551,19 @@ public class HttpModelDownloader
 
                     var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                     if (rangeUrl == url) LastResolveRequests++;   // a source that did not redirect: every segment goes to it
-                    var r = await _js.Fetch(rangeUrl, new FetchOptions { Headers = h, Signal = abortSignal })
+                    var r = await _js.Fetch(rangeUrl, new FetchOptions { Headers = h, Signal = abortSignal, Cache = "no-store" })
                         .ConfigureAwait(false);
-                    if (!r.Ok && rangeUrl != url)
+                    if (!r.Ok && (int)r.Status != 416 && rangeUrl != url)
                     {
                         // the resolved URL failed (a signed URL expires): resolve again through the source and use where it lands now
                         r.Dispose();
                         LastResolveRequests++;
-                        r = await _js.Fetch(url, new FetchOptions { Headers = h, Signal = abortSignal }).ConfigureAwait(false);
+                        r = await _js.Fetch(url, new FetchOptions { Headers = h, Signal = abortSignal, Cache = "no-store" }).ConfigureAwait(false);
                         if (r.Ok && r.Redirected && !string.IsNullOrEmpty(r.Url)) rangeUrl = r.Url;
                     }
                     using (r)
                     {
+                        if ((int)r.Status == 416 && total <= 0) return new Uint8Array(0);   // past the end of a file whose size the host hides
                         if (!r.Ok)
                             throw new HttpRequestException(
                                 $"Model download failed mid-file: {(int)r.Status} {r.StatusText} " +
@@ -575,13 +580,14 @@ public class HttpModelDownloader
                     }
                 }
 
-                var inFlight = new Queue<Task<Uint8Array>>();
+                var inFlight = new Queue<(long Start, long Requested, Task<Uint8Array> Data)>();
                 // The first segment's response is already in hand - consume it as segment 0.
                 var firstT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 var firstBytes = await response.Bytes().ConfigureAwait(false);
                 AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - firstT0)
                          * (1000.0 / System.Diagnostics.Stopwatch.Frequency), firstBytes.Length);
-                inFlight.Enqueue(Task.FromResult(firstBytes));
+                inFlight.Enqueue((resumeFrom, MinSegmentBytes, Task.FromResult(firstBytes)));
+                if (total <= 0 && firstBytes.Length < MinSegmentBytes) { total = resumeFrom + firstBytes.Length; tracker.Total = total; }   // the first range reached the end
 
                 long nextRequestAt = resumeFrom + firstBytes.Length;
                 // NOW the total is known (the first 206 carried Content-Range), so size the rest of the
@@ -590,18 +596,30 @@ public class HttpModelDownloader
                 while (inFlight.Count < parallel && (total <= 0 || nextRequestAt < total))
                 {
                     var seg = EffectiveSegmentBytes();
-                    inFlight.Enqueue(FetchSegmentAsync(nextRequestAt, seg));
+                    inFlight.Enqueue((nextRequestAt, seg, FetchSegmentAsync(nextRequestAt, seg)));
                     nextRequestAt += seg;
                 }
 
                 try
                 {
+                    bool atEnd = false;      // unknown total: a short or empty segment ended the file
                     while (inFlight.Count > 0)
                     {
                         ct.ThrowIfCancellationRequested();
-                        using var segBytes = await inFlight.Dequeue().ConfigureAwait(false);
+                        var (segStart, segRequested, segTask) = inFlight.Dequeue();
+                        using var segBytes = await segTask.ConfigureAwait(false);
                         var segLen = segBytes.Length;
-                        if (segLen == 0) break;
+                        if (atEnd)
+                        {
+                            if (segLen > 0) throw new IOException($"Origin sent a short range before byte {segStart} of {url} and more data after it: the file cannot be assembled.");
+                            continue;
+                        }
+                        // the segments are written back to back, so each one must be exactly the bytes asked for
+                        long segExpected = total > 0 ? Math.Min(segRequested, total - segStart) : segRequested;
+                        if (segLen != segExpected && (total > 0 || segLen > segExpected))
+                            throw new IOException($"Model download of {url}: the range at byte {segStart} returned {segLen} bytes, expected {segExpected}.");
+                        if (segLen < segExpected) atEnd = true;      // unknown total
+                        if (segLen == 0) continue;
 
                         await WriteChunkAsync(dest, segBytes, ct).ConfigureAwait(false);
                         writeCount++;
@@ -622,12 +640,12 @@ public class HttpModelDownloader
 
                         if (total > 0 && received >= total) break;
                         // Top the pipeline back up.
-                        if (total <= 0 || nextRequestAt < total)
+                        if (!atEnd && (total <= 0 || nextRequestAt < total))
                         {
                             // Re-sized per request, so the segment tracks the connection as it ramps up
                             // (or degrades) instead of being fixed by the first sample.
                             var seg = EffectiveSegmentBytes();
-                            inFlight.Enqueue(FetchSegmentAsync(nextRequestAt, seg));
+                            inFlight.Enqueue((nextRequestAt, seg, FetchSegmentAsync(nextRequestAt, seg)));
                             nextRequestAt += seg;
                         }
                     }
@@ -637,12 +655,18 @@ public class HttpModelDownloader
                     // Drain anything still outstanding so a failure cannot leave fetches running.
                     while (inFlight.Count > 0)
                     {
-                        try { (await inFlight.Dequeue().ConfigureAwait(false)).Dispose(); }
+                        try { (await inFlight.Dequeue().Data.ConfigureAwait(false)).Dispose(); }
                         catch { /* already failing; nothing to add */ }
                     }
                 }
 
                 await dest.FlushAsync(ct).ConfigureAwait(false);
+                if (total > 0 && written != total)
+                {
+                    await _store.SetStateAsync(key, sourceRef, total, written, false, etag, ct).ConfigureAwait(false);
+                    throw new IOException($"Model download truncated for {url}: got {written} of {total} bytes. The partial entry was kept and the next attempt will resume it.");
+                }
+                total = written;     // the host hid the size: it is what arrived
                 await _store.SetStateAsync(key, sourceRef, total, written, true, etag, ct).ConfigureAwait(false);
                 progress?.Report(new ModelDownloadProgress(received, total, resumed));
                 LastDownloadChunks = LastFetchChunks;
@@ -778,7 +802,7 @@ public class HttpModelDownloader
 
         // A short read is a truncated download, not a model. Leave the entry incomplete so the next attempt
         // resumes it, rather than caching it and failing much later inside a proto reader.
-        if (total > 0 && written != total)
+        if (total > 0 && written != total && (totalExact || (written < total && !encoded)))
         {
             await _store.SetStateAsync(key, sourceRef, total, written, false, etag, ct).ConfigureAwait(false);
             throw new IOException(
@@ -786,8 +810,9 @@ public class HttpModelDownloader
                 "The partial entry was kept and the next attempt will resume it.");
         }
 
-        await _store.SetStateAsync(key, sourceRef, total > 0 ? total : written, written, true, etag, ct).ConfigureAwait(false);
-        progress?.Report(new ModelDownloadProgress(received, total > 0 ? total : written, resumed));
+        total = written;   // the bytes stored: a compressed Content-Length was only a hint
+        await _store.SetStateAsync(key, sourceRef, total, written, true, etag, ct).ConfigureAwait(false);
+        progress?.Report(new ModelDownloadProgress(received, total, resumed));
     }
 
     /// <summary>
@@ -818,15 +843,23 @@ public class HttpModelDownloader
     /// Total file size from the response headers. For a 206 that is the total after the '/' in
     /// <c>Content-Range: bytes A-B/TOTAL</c>; a 206's Content-Length is the PART length, never the file size.
     /// </summary>
-    private static long ParseTotalBytes(Headers headers, long resumeFrom)
+    private static long ParseTotalBytes(Headers headers, long resumeFrom, int status, out bool exact)
     {
+        exact = false;
         var contentRange = headers.Get("content-range");
         if (!string.IsNullOrEmpty(contentRange))
         {
             var slash = contentRange.LastIndexOf('/');
             if (slash >= 0 && long.TryParse(contentRange[(slash + 1)..].Trim(), out var fromRange))
+            {
+                exact = true;
                 return fromRange;
+            }
         }
+        // A 206 whose Content-Range is hidden (not CORS-safelisted: GitHub Pages cross-origin): its Content-Length is this PART. Taking it as the file's size ended the download
+        // after the first segment and marked a 14 MB model complete at 512 KB. The size is unknown; the segments find the end.
+        if (status == 206) return -1;
+        // a hint only: the COMPRESSED size when the response is content-encoded, while fetch hands back decoded bytes
         var contentLength = headers.Get("content-length");
         if (!string.IsNullOrEmpty(contentLength) && long.TryParse(contentLength, out var len))
             return resumeFrom + len;
