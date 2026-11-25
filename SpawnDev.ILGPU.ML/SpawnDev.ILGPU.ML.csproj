@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.28</Version>
-		<PackageReleaseNotes>v5.8.28 - on SpawnDev.ILGPU 5.4.46. The browser model cache: when the browser clears the site's storage while the page is open, the next model load downloads again instead of failing (every load after the clearing failed on 5.8.27), and every other cache operation recovers too. RangeStreamModelSource.MaxCacheBytes caps the cache by its own file sizes (navigator.storage.estimate() can miss most of them: 42 GB stored, 3.6 GB reported) and evicts least-recently-used models outside the requested set; default null, unchanged. OpfsModelCache.TrimAsync and HubModelSource.Cache are new. Continuing a partial download whose file vanished restarts instead of leaving zeros. TRELLIS.2: a child-count mismatch in the guided decoder now says whether the logits changed or the count did not run.</PackageReleaseNotes>
+		<Version>5.8.29</Version>
+		<PackageReleaseNotes>v5.8.29 - on SpawnDev.ILGPU 5.4.49 (5.8.28: 5.4.46). A kernel that fails to compile no longer breaks later, unrelated kernels of the same context; barriers under a condition read from a view compile on WebGPU (the Q4_K group GEMV is no longer kept off WebGPU; default routes and speed unchanged). No API change.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

@@ -4,7 +4,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
-- On SpawnDev.ILGPU 5.4.49. The per-type Q4_K group GEMV compiles on WebGPU (a barrier under a condition read from a view), so the code that
+## 5.8.29 - 2026-11-25 (nuget.org) - SpawnDev.ILGPU 5.4.49
+
+- On SpawnDev.ILGPU 5.4.49 (5.8.28 was on 5.4.46). A kernel that fails to compile no longer breaks later kernels in the same context: an app that tries a
+  kernel and catches the failure (ML does this for the DiT attention) could leave helpers without a body, and unrelated kernels then failed. The per-type Q4_K group GEMV compiles on WebGPU (a barrier under a condition read from a view), so the code that
   kept it off WebGPU is gone. No speed change: `M == 1` Q4_K already runs `ForwardRows` there, and this GEMV is reached only with
   `ForceGenericRows` (GGUF_GEMV_ROWS_GENERIC=1). The multi-row GEMMs stay off WebGPU (prefill runs the tiled GEMM; not measured against it).
   Test `FusedDequantMatMul_GenericGemv_WebGpuGemvOn_CompilesAndMatchesOracle` (fails on WebGPU with 5.4.46).
