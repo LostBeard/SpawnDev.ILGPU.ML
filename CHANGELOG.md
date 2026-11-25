@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.31 - 2026-11-25 (nuget.org) - models load whole from hosts that compress responses
+
 - **Models load whole from hosts that compress responses (GitHub Pages gzips .onnx and .tflite).** Found by Bones (article demo: MobileNetV2, 14,246,826 bytes, Content-Length
   13,120,039). It is also what failed BlazeFace in September (229,746 -> 199,050 bytes), then blamed on the browser cache and a service worker.
   - `InferenceSession.DownloadBytesChunkedAsync` (every `CreateFromFileAsync` / `CreateFromOnnxAsync` / `CreateFromTFLiteAsync` / GGUF URL load) took Content-Length as the end of
@@ -20,6 +22,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - A request that falls back to Hugging Face keeps its per-request options (response streaming): the fallback download was buffered whole in the browser.
   - Tests: `DownloadBytesChunked_CompressedContentLength_ReturnsTheWholeBody`, `HttpClientModelSource_CompressedContentLength_StoresTheWholeFile`,
     `Download_GzippedByGitHubPages_IsWhole` (live, every browser path, two files). Red-checked: each of the four browser parts put back alone fails it with its symptom.
+  - Checked by Bones with the published, trimmed ImageAI example on 5.8.31-local.1: a gzip server at Optimal and Fastest (Content-Length above the file size), and a cross-origin
+    load from GitHub Pages (Chrome 159); 5.8.30 fails both gzip cases.
 
 ## 5.8.30 - 2026-11-25 (nuget.org) - background removal works on WebGL again
 
