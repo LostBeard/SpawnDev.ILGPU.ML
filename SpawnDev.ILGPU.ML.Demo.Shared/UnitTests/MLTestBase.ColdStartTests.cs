@@ -1,7 +1,12 @@
 using System.Diagnostics;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
+using SpawnDev.ILGPU.Wasm;
+using SpawnDev.ILGPU.Wasm.Algorithms;
+using SpawnDev.ILGPU.WebGL;
 using SpawnDev.ILGPU.WebGPU;
+using SpawnDev.ILGPU.WebGPU.Algorithms;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -19,6 +24,39 @@ public abstract partial class MLTestBase
     /// </summary>
     [TestMethod(Timeout = 600000)]
     public async Task<string> ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel() => await RunTest(accelerator => ColdStartMobileNetV2(accelerator));
+
+    /// <summary>
+    /// The browser's "device" stage of a cold start (Bones, 2026-11-26: ~400 ms of MobileNetV2's 1.5 s AOT cold visit), split: the builder, the WebGPU and WebGL probes, the context,
+    /// the WebGPU device. Once the way most pages do it (AllAcceleratorsAsync, then the preferred accelerator) and once WebGPU alone. The page already holds a device, so the browser's
+    /// own first-adapter cost is not in these numbers: the .NET side and the probes are. A measurement.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task<string> ColdStart_DeviceSetup_Stages() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("the browser's WebGPU device setup");
+        string Ms(Stopwatch s) { var v = s.Elapsed.TotalMilliseconds; s.Restart(); return v.ToString("F0"); }
+        var sw = Stopwatch.StartNew();
+        var parts = new List<string>();
+        // the way MobileNetV2's page did it
+        {
+            var b = MLContext.Create(); parts.Add("all: builder " + Ms(sw));
+            b.Wasm(); b.EnableWasmAlgorithms(); parts.Add("wasm " + Ms(sw));
+            await b.WebGPU(); b.EnableWebGPUAlgorithms(); parts.Add("webgpu probe " + Ms(sw));
+            await b.WebGL(); parts.Add("webgl probe " + Ms(sw));
+            using var ctx = b.ToContext(); parts.Add("context " + Ms(sw));
+            using var acc = await ctx.CreatePreferredAcceleratorAsync(); parts.Add("device " + Ms(sw));
+        }
+        sw.Restart();
+        {
+            var b = MLContext.Create(); parts.Add("| webgpu only: builder " + Ms(sw));
+            await b.WebGPU(); b.EnableWebGPUAlgorithms(); parts.Add("webgpu probe " + Ms(sw));
+            using var ctx = b.ToContext(); parts.Add("context " + Ms(sw));
+            using var acc = await ctx.CreatePreferredAcceleratorAsync(); parts.Add("device " + Ms(sw));
+        }
+        var report = "device setup (ms): " + string.Join(", ", parts);
+        Console.WriteLine("[ColdStart] " + report);
+        return report;
+    });
 
     private async Task<string> ColdStartMobileNetV2(Accelerator accelerator)
     {
