@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.32</Version>
-		<PackageReleaseNotes>v5.8.32 - on SpawnDev.ILGPU 5.4.51. NEW ModelResidency: keeps models on the device while there is room within one budget (the accelerator's own), drops the least recently used idle one when the next needs the room, loads it again on next use; leases, tags, registered engines, lost-device recovery; InferenceSession.DeviceBytes; FLUX.2, FLUX 3 and LTX lease their weights from it (Residency). Browser cold start: kernels load on first use, fp32 convolutions on the direct implicit GEMM (a 308 KB shader is gone): MobileNetV2 first visit 8.3 s to 2.0 s in Chrome. Convolutions: Conv and BatchNorm folded, Relu and Clip(0,6) applied in the conv stores, small-output and 1x1 convolutions on faster kernels. WebGPU: SkipCompletionWait on by default (one round trip fewer per run). IModelSource.GetSizeAsync.</PackageReleaseNotes>
+		<Version>5.8.33</Version>
+		<PackageReleaseNotes>v5.8.33 - on SpawnDev.ILGPU 5.4.53. WebGPU: a captured replay ends with its submit instead of a GPU wait (Chrome charges ~2.9 ms per waited submit): MobileNetV2 captured replay with readback 8.0 to 5.1 ms. Convolutions: a 32x32-tile implicit-GEMM kernel for small grids, bit-identical to the 64x64 kernel (MobileNetV2 WebGPU GPU time 1.58 to 1.24 ms, desktop 3x3 at 7x7 1.8x; on by default on the desktop, off in the browser where it costs a first run 72 ms). Model stores: a sidecar that cannot be read throws instead of reading as no record (a scanner holding it made a complete model re-download from byte 0); atomic sidecar writes. ModelResidency: a lazy model is measured at its own first run, not charged for models that load after it in the same prompt.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

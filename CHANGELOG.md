@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.33 - 2026-11-26 (nuget.org) - one GPU wait per captured replay, a small-grid convolution kernel, robust model stores
+
 - **Convolutions: a 32x32-tile implicit-GEMM kernel for small grids** (`Conv2DKernel.SmallTileMaxGroups`, `SmallTileMaxGroups1x1`): the same 256 threads and
   16-wide k blocks with 2x2 outputs per thread, so a convolution whose 64x64 grid launches few workgroups launches four times as many; each output sums the same
   k terms in the same order, so the results are the 64x64 kernel's BIT FOR BIT (`ConvSmallTile_MatchesTheLargeTileKernel_BitForBit`, CUDA / OpenCL / Wasm /
