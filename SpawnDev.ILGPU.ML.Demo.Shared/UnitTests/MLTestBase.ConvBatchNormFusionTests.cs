@@ -70,4 +70,56 @@ public abstract partial class MLTestBase
         if (relBack > 1e-6 || topBack < 0) throw new Exception("the unfolded fallback differs from the unfused graph: " + report);
         return report;
     });
+
+    /// <summary>
+    /// GraphOptimizer's "convact" pass (Conv -> Relu / Clip(0, 6) applied in the convolution's stores): MobileNetV2 with it off (ML_OPT_SKIP=convact), on, and on with the activation
+    /// forced to the separate in-place pass the kernels without the epilogue use. The epilogue is the standalone op's own expression, so all three must agree bit for bit.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task<string> ConvActivation_Fusion_MobileNetV2_BitIdentical() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
+        var rng = new Random(13);
+        var pic = new float[3 * 224 * 224]; for (int i = 0; i < pic.Length; i++) pic[i] = (float)(rng.NextDouble() * 2 - 1);
+        async Task<(float[] Out, int Fused, double WarmMs)> RunModel(bool fuse, bool inPlace)
+        {
+            var savedSkip = Environment.GetEnvironmentVariable("ML_OPT_SKIP");
+            Environment.SetEnvironmentVariable("ML_OPT_SKIP", fuse ? savedSkip : string.IsNullOrEmpty(savedSkip) ? "convact" : savedSkip + ",convact");
+            Operators.ConvOperator.ForceActivationInPlace = inPlace;
+            try
+            {
+                using var session = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false));
+                int fused = Graph.GraphOptimizer.LastConvActivationFused;
+                async Task<float[]> Once()
+                {
+                    using var t = OwnedTensor<float>.FromHost(accelerator, pic, new[] { 1, 3, 224, 224 });
+                    using var o = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [session.InputNames[0]] = t });
+                    return await o[session.OutputNames[0]].ToHostAsync();
+                }
+                var first = await Once();
+                for (int i = 0; i < 4; i++) await Once();
+                var times = new List<double>();
+                for (int i = 0; i < 15; i++) { var sw = Stopwatch.StartNew(); await Once(); times.Add(sw.Elapsed.TotalMilliseconds); }
+                times.Sort();
+                return (first, fuse ? fused : 0, times[times.Count / 2]);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("ML_OPT_SKIP", savedSkip);
+                Operators.ConvOperator.ForceActivationInPlace = false;
+            }
+        }
+        var plain = await RunModel(fuse: false, inPlace: false);
+        var fused = await RunModel(fuse: true, inPlace: false);
+        var inPlaceRun = await RunModel(fuse: true, inPlace: true);
+        static int Differ(float[] a, float[] b) { int d = 0; for (int i = 0; i < a.Length; i++) if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) d++; return d; }
+        int dFused = Differ(plain.Out, fused.Out), dInPlace = Differ(plain.Out, inPlaceRun.Out);
+        var report = $"{accelerator.AcceleratorType}: {fused.Fused} Conv + activation pairs fused; values differing from the unfused graph: epilogue {dFused}, in-place pass {dInPlace} of {plain.Out.Length}; " +
+                     $"warm median: unfused {plain.WarmMs:F1} ms, epilogue {fused.WarmMs:F1} ms, in-place {inPlaceRun.WarmMs:F1} ms";
+        Console.WriteLine("[ConvAct] " + report);
+        if (fused.Fused < 1) throw new Exception("the pass fused nothing in MobileNetV2: " + report);
+        if (dFused != 0 || dInPlace != 0) throw new Exception("a fused activation changed the output: " + report);
+        return report;
+    });
 }

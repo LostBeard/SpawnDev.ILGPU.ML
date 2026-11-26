@@ -35,6 +35,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     to the lease's end it is 5.7 GB, and the failing sequence ran 10 / 10.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **Conv -> Relu / Clip(0, 6) applied in the convolution's stores** (GraphOptimizer pass "convact"; `ML_OPT_SKIP=convact` turns it off). The NCHW direct, implicit-GEMM and
+  depthwise kernels apply it with the standalone ops' own expressions (the same bits, -0 and NaN included); every other convolution path applies it in place after
+  (`Conv2DKernel.ApplyActivationInPlace`). The code rides in the top byte of an int the kernels already take (ILGPU's kernel loaders allow no more parameters than they
+  have); sizes over 2^24 are refused. MobileNetV2: 36 Relu fused, 111 -> 75 WebGPU dispatches, GPU time -0.7 ms (A/B in one page, `Warm_MobileNetV2_PassAB_GpuTime`).
+  Test `ConvActivation_Fusion_MobileNetV2_BitIdentical` (epilogue and in-place path both bit-identical to the unfused graph on WebGPU and CUDA; it caught an in-place path
+  that skipped the activation before this was committed). Conv and model tests 908 passed on every backend (the two compile tests count the fused graph's nodes).
 - **Small-output convolutions take the implicit-GEMM kernel** (Conv2DKernel: the spatial minimum of 64 outputs is gone). MobileNetV2's 7x7 layers ran on the naive
   per-output kernel: 9 convolutions, 3.04 of its 5.69 ms WebGPU GPU time (timestamps, `SessionGraphCapture.ProfileReplayAsync`, new). Now 4.69 ms; warm run 14.8 -> 13.0 ms.
   CUDA / OpenCL: 960->320 at 7x7 0.44 / 0.37 -> 0.14 ms, 320->1280 0.24 -> 0.06, nothing slower (`Conv_DirectVsTiled_Crossover`). Conv and model tests 914 / 0 on every backend.

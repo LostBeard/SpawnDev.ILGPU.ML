@@ -52,8 +52,8 @@ public abstract partial class MLTestBase
         var compiler = new GraphCompiler(registry);
         var compiled = compiler.Compile(graph);
 
-        // 6 ONNX nodes, 5 compiled: the BatchNormalization is folded into the Conv before it (GraphOptimizer "convbn")
-        if (compiled.Nodes.Length != 5) throw new Exception($"Expected 5 nodes (BatchNorm folded into the Conv), got {compiled.Nodes.Length}");
+        // 6 ONNX nodes, 4 compiled: the BatchNormalization and the Relu are folded into the Conv before them (GraphOptimizer "convbn", "convact")
+        if (compiled.Nodes.Length != 4) throw new Exception($"Expected 4 nodes (BatchNorm and Relu folded into the Conv), got {compiled.Nodes.Length}");
 
         // Create random weights
         using var pool = new BufferPool(accelerator);

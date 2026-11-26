@@ -67,6 +67,8 @@ public static class GraphOptimizer
         // Conv -> BatchNormalization (inference) becomes one Conv that folds the BatchNorm into its weight and bias on its first run
         int fusedConvBn = skip.Contains("convbn") ? 0 : FuseConvBatchNorm(optimized);
         LastConvBatchNormFused = fusedConvBn;
+        // Conv -> Relu / Clip(0, 6) becomes one Conv that applies the activation in its stores
+        LastConvActivationFused = skip.Contains("convact") ? 0 : FuseConvActivation(optimized);
 
         // Pass 3: Fuse MatMul → Add (bias) → Activation into FusedLinear
         // LayerNorm FIRST: it matches a nine-node primitive chain, and the later passes rewrite some of
@@ -982,6 +984,63 @@ public static class GraphOptimizer
         }
         if (remove.Count > 0) graph.Nodes = graph.Nodes.Where((_, i) => !remove.Contains(i)).ToList();
         if (OptTrace && fused > 0) Console.WriteLine($"[GraphOptimizer] convbn: {fused} Conv + BatchNormalization pairs fused");
+        return fused;
+    }
+
+    /// <summary>Conv + activation pairs the last <see cref="Optimize"/> fused (pass "convact").</summary>
+    public static int LastConvActivationFused;
+
+    /// <summary>
+    /// Conv -> Relu, or -> Clip with constant min 0 and max 6 (ReLU6) or no max (ReLU), becomes one Conv with <see cref="Operators.ConvOperator.FusedActivation"/>: the kernels apply
+    /// it in their stores (the same expression as the standalone ops, so the same bits), one dispatch and one pass over the activations fewer. Only where the Conv's output feeds
+    /// that activation alone and is not a graph output. MobileNetV2: 36 Relu.
+    /// </summary>
+    private static int FuseConvActivation(ModelGraph graph)
+    {
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        var consumerOf = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int j = 0; j < graph.Nodes.Count; j++)
+            foreach (var input in graph.Nodes[j].Inputs)
+                if (!string.IsNullOrEmpty(input)) { consumers[input] = consumers.GetValueOrDefault(input) + 1; consumerOf[input] = j; }
+        var graphOutputs = new HashSet<string>(graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+        bool AttrFloat(GraphNode n, string name, out float v)
+        {
+            v = 0f;
+            if (n.Attributes == null || !n.Attributes.TryGetValue(name, out var e) || e.ValueKind != JsonValueKind.Number) return false;
+            v = (float)e.GetDouble(); return true;
+        }
+        int Code(GraphNode a)
+        {
+            if (a.OpType == "Relu") return Conv2DKernel.ActRelu;
+            if (a.OpType != "Clip") return Conv2DKernel.ActNone;
+            bool hasMin = a.Inputs.Count > 1 && !string.IsNullOrEmpty(a.Inputs[1]) ? TryConstScalar(graph, a.Inputs[1], out var min) : AttrFloat(a, "min", out min);
+            bool maxGiven = a.Inputs.Count > 2 && !string.IsNullOrEmpty(a.Inputs[2]) || (a.Attributes?.ContainsKey("max") ?? false);
+            bool hasMax = a.Inputs.Count > 2 && !string.IsNullOrEmpty(a.Inputs[2]) ? TryConstScalar(graph, a.Inputs[2], out var max) : AttrFloat(a, "max", out max);
+            if (!hasMin || min != 0f) return Conv2DKernel.ActNone;
+            if (!maxGiven) return Conv2DKernel.ActRelu;
+            return hasMax && max == 6f ? Conv2DKernel.ActRelu6 : Conv2DKernel.ActNone;
+        }
+        var remove = new HashSet<int>();
+        int fused = 0;
+        for (int ci = 0; ci < graph.Nodes.Count; ci++)
+        {
+            var conv = graph.Nodes[ci];
+            if (conv.OpType != "Conv" || conv.Outputs.Count != 1) continue;
+            if (conv.Attributes != null && conv.Attributes.ContainsKey(Operators.ConvOperator.FusedActivation)) continue;
+            string y = conv.Outputs[0];
+            if (graphOutputs.Contains(y) || consumers.GetValueOrDefault(y) != 1 || !consumerOf.TryGetValue(y, out int ai) || remove.Contains(ai)) continue;
+            var act = graph.Nodes[ai];
+            if (act.Outputs.Count != 1 || act.Inputs.Count == 0 || act.Inputs[0] != y) continue;
+            int code = Code(act);
+            if (code == Conv2DKernel.ActNone) continue;
+            conv.Attributes ??= new Dictionary<string, JsonElement>();
+            conv.Attributes[Operators.ConvOperator.FusedActivation] = JsonDocument.Parse(code.ToString(System.Globalization.CultureInfo.InvariantCulture)).RootElement.Clone();
+            conv.Outputs[0] = act.Outputs[0];
+            remove.Add(ai);
+            fused++;
+        }
+        if (remove.Count > 0) graph.Nodes = graph.Nodes.Where((_, i) => !remove.Contains(i)).ToList();
+        if (OptTrace && fused > 0) Console.WriteLine($"[GraphOptimizer] convact: {fused} Conv + activation pairs fused");
         return fused;
     }
 

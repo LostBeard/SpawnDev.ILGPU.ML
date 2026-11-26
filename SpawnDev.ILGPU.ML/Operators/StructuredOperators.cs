@@ -516,7 +516,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     {
         if (ctx.Format != DataFormat.NCHW) return false;
         if (inputs.Length < 2) return false;
-        if (ctx.Attributes.ContainsKey(FusedBatchNormEpsilon)) return false;      // a folded BatchNorm is applied by Execute
+        if (ctx.Attributes.ContainsKey(FusedBatchNormEpsilon) || ctx.Attributes.ContainsKey(FusedActivation)) return false;      // a folded BatchNorm / fused activation is applied by Execute
         var xIn = inputs[0]; var wIn = inputs[1];
         // Activation input must be low-p; weight must be a Tensor (fp32 .Data OR fp16 .HalfData — both handled).
         if (!xIn.IsHalf || wIn.Float == null) return false;
@@ -671,19 +671,39 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     /// <summary>Test switch: run every fused Conv + BatchNorm through the unfolded path (convolution, then BatchNorm), the one half and low-precision weights take.</summary>
     internal static bool ForceBatchNormUnfolded;
 
+    /// <summary>
+    /// Attribute GraphOptimizer's "convact" pass sets on a Conv that absorbed the Relu / Clip(0, 6) after it: the activation code (<see cref="Conv2DKernel.ActRelu"/>,
+    /// <see cref="Conv2DKernel.ActRelu6"/>). The NCHW direct, implicit-GEMM and depthwise kernels apply it in their stores; every other path applies it in place after.
+    /// </summary>
+    internal const string FusedActivation = "_activation";
+
+    /// <summary>Test switch: apply a fused activation as a separate in-place pass after every convolution (the path the kernels without the epilogue take).</summary>
+    internal static bool ForceActivationInPlace;
+
+    [ThreadStatic] private static bool t_activationApplied;     // set by the kernel paths that applied the activation in their stores (ExecuteCore is synchronous)
+
     public void Execute(OnnxOpContext ctx)
     {
+        int act = ctx.GetInt(FusedActivation, Conv2DKernel.ActNone);
         if (ctx.Attributes.TryGetValue(FusedBatchNormEpsilon, out var epsObj) && ctx.Inputs.Length >= 7)
         {
-            ExecuteWithBatchNorm(ctx, Convert.ToSingle(epsObj));
+            ExecuteWithBatchNorm(ctx, Convert.ToSingle(epsObj), act);
             return;
         }
-        ExecuteCore(ctx);
+        RunConv(ctx, act);
+    }
+
+    // the convolution with its activation: in the kernel's stores where it can, else one in-place pass after
+    private void RunConv(OnnxOpContext ctx, int act)
+    {
+        t_activationApplied = false;
+        ExecuteCore(ctx, ForceActivationInPlace ? Conv2DKernel.ActNone : act);
+        if (act != Conv2DKernel.ActNone && !t_activationApplied) reg.Conv2D.ApplyActivationInPlace(ctx.Outputs[0].Data, act);
     }
 
     // Conv + BatchNorm. fp32 weights in the ONNX layout: the BatchNorm is folded into the weight (in place, once) and a folded bias, so the convolution alone gives the BatchNorm's
     // output. Anything else (half or low-precision weights, a channel-last layout): the convolution into a temporary, then the BatchNorm, as the unfused graph did.
-    private void ExecuteWithBatchNorm(OnnxOpContext ctx, float eps)
+    private void ExecuteWithBatchNorm(OnnxOpContext ctx, float eps, int act)
     {
         var w = ctx.Inputs[1];
         int outC = w.Shape[0];
@@ -698,7 +718,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 reg.FoldedConvBias[key] = folded;
             }
             ctx.Inputs[2] = new Tensor(folded.View, new[] { outC });
-            ExecuteCore(ctx);
+            RunConv(ctx, act);
             return;
         }
         var output = ctx.Outputs[0];
@@ -706,16 +726,17 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         try
         {
             ctx.Outputs[0] = tmp;
-            ExecuteCore(ctx);
+            ExecuteCore(ctx, Conv2DKernel.ActNone);                          // the activation comes after the BatchNorm, not in the convolution
         }
         finally { ctx.Outputs[0] = output; }
         var shape = output.Shape;
         var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format) : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
         reg.Normalization.BatchNorm(tmp.Data, output.Data, ctx.Inputs[3].Data, ctx.Inputs[4].Data, ctx.Inputs[5].Data, ctx.Inputs[6].Data, N, C, output.ElementCount / (N * C), eps);
         ctx.Pool.Return(tmp);
+        reg.Conv2D.ApplyActivationInPlace(output.Data, act);
     }
 
-    private void ExecuteCore(OnnxOpContext ctx)
+    private void ExecuteCore(OnnxOpContext ctx, int act)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         var fmt = ctx.Format;
@@ -774,8 +795,11 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                     reg.Conv2D.ForwardDepthwiseNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else
+                {
                     reg.Conv2D.ForwardDepthwisePadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
+                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW, act);
+                    t_activationApplied = act != Conv2DKernel.ActNone;   // only an activation it was given counts as applied
+                }
             }
             else if (group == 1)
             {
@@ -793,8 +817,11 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                     LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
                 else
+                {
                     reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW, act);
+                    t_activationApplied = act != Conv2DKernel.ActNone;   // only an activation it was given counts as applied
+                }
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {

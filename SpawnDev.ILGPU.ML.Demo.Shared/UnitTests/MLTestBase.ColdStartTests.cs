@@ -144,6 +144,51 @@ public abstract partial class MLTestBase
         return report + "; " + opLine;
     });
 
+    /// <summary>
+    /// A/B of one graph-optimizer pass on MobileNetV2's WebGPU GPU time: two captured sessions in the same page, one with the pass skipped (ML_OPT_SKIP), their timed replays
+    /// alternated (GPU timestamps, no host time), medians of 7 each. Env WARM_AB_PASS names the pass (default convact). A measurement.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task<string> Warm_MobileNetV2_PassAB_GpuTime() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("WebGPU timestamps");
+        string pass = Environment.GetEnvironmentVariable("WARM_AB_PASS") is { Length: > 0 } p ? p : "convact";
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
+        var rng = new Random(5);
+        var pic = new float[3 * 224 * 224]; for (int i = 0; i < pic.Length; i++) pic[i] = (float)(rng.NextDouble() * 2 - 1);
+        using var inBuf = accelerator.Allocate1D(pic);
+        var shape = new[] { 1, 3, 224, 224 };
+        async Task<(InferenceSession S, Graph.SessionGraphCapture C)> Make(bool skip)
+        {
+            var saved = Environment.GetEnvironmentVariable("ML_OPT_SKIP");
+            Environment.SetEnvironmentVariable("ML_OPT_SKIP", skip ? (string.IsNullOrEmpty(saved) ? pass : saved + "," + pass) : saved);
+            try
+            {
+                var s = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false));
+                var c = new Graph.SessionGraphCapture(s, accelerator);
+                for (int i = 0; i < 6 && !c.IsCaptured; i++) await c.RunAsync(new Dictionary<string, Tensor> { [s.InputNames[0]] = new Tensor(inBuf.View, shape) });
+                if (!c.IsCaptured) throw new Exception("no capture: " + c.CaptureStatus);
+                return (s, c);
+            }
+            finally { Environment.SetEnvironmentVariable("ML_OPT_SKIP", saved); }
+        }
+        var (sOff, cOff) = await Make(skip: true);
+        var (sOn, cOn) = await Make(skip: false);
+        try
+        {
+            static double Total(string json) { using var d = System.Text.Json.JsonDocument.Parse(json); return d.RootElement.GetProperty("totalMs").GetDouble(); }
+            var off = new List<double>(); var on = new List<double>();
+            for (int i = 0; i < 7; i++) { off.Add(Total(await cOff.ProfileReplayAsync()!)); on.Add(Total(await cOn.ProfileReplayAsync()!)); }
+            off.Sort(); on.Sort();
+            var report = $"MobileNetV2 WebGPU GPU time, pass '{pass}' off / on (median of 7 alternated timed replays): {off[3]:F2} / {on[3]:F2} ms (range {off[0]:F2}-{off[6]:F2} / {on[0]:F2}-{on[6]:F2}); " +
+                         $"dispatches {cOff.DispatchCount} / {cOn.DispatchCount}";
+            Console.WriteLine("[ColdStart] " + report);
+            return report;
+        }
+        finally { cOff.Dispose(); cOn.Dispose(); sOff.Dispose(); sOn.Dispose(); }
+    });
+
     private async Task<string> ColdStartMobileNetV2(Accelerator accelerator)
     {
         if (accelerator is not WebGPUAccelerator web) throw new UnsupportedTestException("the browser's WebGPU shader compile");

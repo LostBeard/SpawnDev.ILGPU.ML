@@ -100,6 +100,35 @@ public class Conv2DKernel : IDisposable
         int, int, int, int, int, int, int, int, int, int>?
         _implicitGemmKernel;
 
+    /// <summary>Activation codes of the conv epilogue (<see cref="ForwardPadded"/>, <see cref="ForwardDepthwisePadded"/>): 0 none, 1 ReLU, 2 ReLU6 (Clip 0..6).</summary>
+    public const int ActNone = 0, ActRelu = 1, ActRelu6 = 2;
+
+    // the same expressions as the standalone kernels (ElementWiseKernels.ReLUImpl, ClipImpl), so a fused activation gives the same bits (-0 and NaN included)
+    private static float ConvAct(float v, int act)
+    {
+        if (act == ActRelu) return v > 0f ? v : 0f;
+        if (act == ActRelu6) { if (v < 0f) v = 0f; if (v > 6f) v = 6f; }
+        return v;
+    }
+
+    // the activation code in the top byte of an int the kernel already takes (ILGPU's kernel loaders allow no more parameters than these kernels have)
+    private static int ConvActPack(int value, int act)
+    {
+        if ((uint)act > ActRelu6) throw new ArgumentOutOfRangeException(nameof(act));
+        if ((uint)value > 0xFFFFFF) throw new NotSupportedException($"conv size {value} does not fit beside the activation code (2^24)");
+        return value | (act << 24);
+    }
+
+    private static void ActivationInPlaceImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> data, int act) => data[i] = ConvAct(data[i], act);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _activationInPlace;
+
+    /// <summary>The conv epilogue's activation on its own, in place: for the convolution paths without it (channel-last, grouped, half and low-precision weights).</summary>
+    public void ApplyActivationInPlace(ArrayView1D<float, Stride1D.Dense> data, int act)
+    {
+        if (act == ActNone || data.Length == 0) return;
+        (_activationInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, int>(ActivationInPlaceImpl))((int)data.Length, data, act);
+    }
+
     private static void Conv2DImplicitGemmImpl(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> weight,
@@ -108,6 +137,7 @@ public class Conv2DKernel : IDisposable
         int inC, int inH, int inW, int outC, int kHW,
         int strideDilHW, int padTL, int outH, int outW, int numTilesN)
     {
+        int act = numTilesN >> 24; numTilesN &= 0xFFFFFF;   // the activation rides in the top byte (ConvActPack)
         // strideDilHW = (strideH << 24) | (strideW << 16) | (dilationH << 8) | dilationW - LoadStreamKernel's typed
         // loaders cap at 14 params, so the small scalars share ints (validated on the host - see Pack16).
         int strideH = strideDilHW >> 24, strideW = (strideDilHW >> 16) & 0xFF;
@@ -194,34 +224,34 @@ public class Conv2DKernel : IDisposable
         if (baseOc + 0 < outC)
         {
             float bb = bias[baseOc + 0];
-            if (baseN + 0 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 0] = c00 + bb;
-            if (baseN + 1 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 1] = c01 + bb;
-            if (baseN + 2 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 2] = c02 + bb;
-            if (baseN + 3 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 3] = c03 + bb;
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 0] = ConvAct(c00 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 1] = ConvAct(c01 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 2] = ConvAct(c02 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 3] = ConvAct(c03 + bb, act);
         }
         if (baseOc + 1 < outC)
         {
             float bb = bias[baseOc + 1];
-            if (baseN + 0 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 0] = c10 + bb;
-            if (baseN + 1 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 1] = c11 + bb;
-            if (baseN + 2 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 2] = c12 + bb;
-            if (baseN + 3 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 3] = c13 + bb;
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 0] = ConvAct(c10 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 1] = ConvAct(c11 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 2] = ConvAct(c12 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 3] = ConvAct(c13 + bb, act);
         }
         if (baseOc + 2 < outC)
         {
             float bb = bias[baseOc + 2];
-            if (baseN + 0 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 0] = c20 + bb;
-            if (baseN + 1 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 1] = c21 + bb;
-            if (baseN + 2 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 2] = c22 + bb;
-            if (baseN + 3 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 3] = c23 + bb;
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 0] = ConvAct(c20 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 1] = ConvAct(c21 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 2] = ConvAct(c22 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 3] = ConvAct(c23 + bb, act);
         }
         if (baseOc + 3 < outC)
         {
             float bb = bias[baseOc + 3];
-            if (baseN + 0 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 0] = c30 + bb;
-            if (baseN + 1 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 1] = c31 + bb;
-            if (baseN + 2 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 2] = c32 + bb;
-            if (baseN + 3 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 3] = c33 + bb;
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 0] = ConvAct(c30 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 1] = ConvAct(c31 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 2] = ConvAct(c32 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 3] = ConvAct(c33 + bb, act);
         }
     }
 
@@ -238,6 +268,7 @@ public class Conv2DKernel : IDisposable
         int inC, int inH, int inW, int outC, int kHW,
         int strideHW, int padTL, int outH, int outW, int dilHW)
     {
+        int act = outW >> 24; outW &= 0xFFFFFF;   // the activation rides in the top byte (ConvActPack)
         // Kernel size, BEGIN pads and dilations are passed PACKED (Pack16) to stay within ILGPU's 15-arg kernel
         // limit; outH/outW are passed whole. Recomputing dims here from a single symmetric pad silently truncated
         // stride-2 SAME convs (192->95 instead of 96), shearing every downstream feature map.
@@ -284,7 +315,7 @@ public class Conv2DKernel : IDisposable
             }
         }
 
-        output[idx] = sum;
+        output[idx] = ConvAct(sum, act);
     }
 
     /// <summary>
@@ -372,7 +403,7 @@ public class Conv2DKernel : IDisposable
         int inC, int inH, int inW,
         int outC, int kH, int kW,
         int stride, int padTop, int padLeft, int padBottom, int padRight,
-        int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
+        int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0, int activation = ActNone)
     {
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
 
@@ -423,7 +454,7 @@ public class Conv2DKernel : IDisposable
             _implicitGemmKernel(cfg, input, weight, bias, output,
                 inC, inH, inW, outC, Pack16(kH, kW, "kernel size"),
                 (stride << 24) | (strideW << 16) | (dilationH << 8) | dilationW,
-                Pack16(padTop, padLeft, "begin pads"), outH, outW, numTilesN);
+                Pack16(padTop, padLeft, "begin pads"), outH, outW, ConvActPack(numTilesN, activation));
             return;
         }
 
@@ -431,7 +462,7 @@ public class Conv2DKernel : IDisposable
         {
             Conv2dKernel(totalOutputElements, input, weight, bias, output,
                 inC, inH, inW, outC, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
-                outH, outW, Pack16(dilationH, dilationW, "dilation"));
+                outH, ConvActPack(outW, activation), Pack16(dilationH, dilationW, "dilation"));
         }
         catch (global::ILGPU.Runtime.OpenCL.CLException clEx)
         {
@@ -534,6 +565,7 @@ public class Conv2DKernel : IDisposable
         int C, int inH, int inW, int kHW,
         int strideHW, int padTL, int outH, int outW, int dilHW)
     {
+        int act = outW >> 24; outW &= 0xFFFFFF;   // the activation rides in the top byte (ConvActPack)
         // Kernel size + begin pads + dilations packed (Pack16). BATCH-aware: idx spans batch*C*outH*outW (this
         // kernel used to compute image 0 only).
         int kH = kHW >> 16, kW = kHW & 0xFFFF;
@@ -564,7 +596,7 @@ public class Conv2DKernel : IDisposable
             }
         }
 
-        output[idx] = sum;
+        output[idx] = ConvAct(sum, act);
     }
 
     public void ForwardDepthwise(
@@ -585,7 +617,7 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int kH, int kW,
         int stride, int padTop, int padLeft, int padBottom, int padRight,
-        int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
+        int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0, int activation = ActNone)
     {
         if (batch < 1) batch = 1;
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
@@ -607,7 +639,7 @@ public class Conv2DKernel : IDisposable
 
         DepthwiseKernel((int)needed, input, weight, bias, output,
             C, inH, inW, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
-            outH, outW, Pack16(dilationH, dilationW, "dilation"));
+            outH, ConvActPack(outW, activation), Pack16(dilationH, dilationW, "dilation"));
     }
 
     // ═══ NHWC Variants (TFLite native layout) ═══
