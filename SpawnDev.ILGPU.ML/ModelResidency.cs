@@ -374,7 +374,14 @@ public sealed class ModelResidency : IAsyncDisposable
         await _room.WaitAsync().ConfigureAwait(false);
         try
         {
-            await MakeRoomAsync(bytes, entry.Key).ConfigureAwait(false);
+            if (bytes == 0)
+            {
+                long known, holds;
+                lock (_sync) { known = _knownBytes.GetValueOrDefault(entry.Key); holds = entry.Bytes; }
+                bytes = known > 0 ? Math.Max(0, known - holds) : 0;        // known: only what is still missing; never measured: 0 = the unknown-size rule
+                if (known > 0 && bytes == 0) bytes = -1;                     // it holds all it was measured at: no room to make
+            }
+            if (bytes >= 0) await MakeRoomAsync(bytes, entry.Key).ConfigureAwait(false);
             if (entry.Model is not IDeviceSized) { long now = _device.AllocatedBytes; lock (_sync) if (entry.LazyFrom < 0) entry.LazyFrom = now; }
         }
         finally { _room.Release(); }
@@ -487,7 +494,8 @@ public sealed class ModelResidency : IAsyncDisposable
             if (guess <= 0)
             {
                 // nothing to go by, and on a small card the load itself is what over-allocates: everything idle goes first
-                Log?.Invoke($"[ModelResidency] '{forKey}' has no known size and no model has been measured: dropping every idle model before it loads. Pass expectedBytes or set UnknownSizeBytes.");
+                Log?.Invoke($"[ModelResidency] '{forKey}' has no known size and no model has been measured: dropping every idle model before it loads ({_device.AllocatedBytes >> 20} MB allocated " +
+                    $"on the device, {ModelBytes() >> 20} MB of it kept models, {free >> 20} MB free{(BudgetBytes is long b ? $" of a {b >> 20} MB budget" : "")}). Pass expectedBytes or set UnknownSizeBytes.");
                 await EvictUntilAsync(() => true, ModelEvictionReason.MakeRoom, forKey).ConfigureAwait(false);
                 return;
             }
@@ -612,10 +620,13 @@ public sealed class ModelLease<T> : IAsyncDisposable, IDisposable where T : clas
     /// For a model that loads its weights after <see cref="ModelResidency.AcquireAsync"/> returned (a lazy wrapper): makes room for <paramref name="bytes"/> more on the device before that load,
     /// as <see cref="ModelResidency.AcquireAsync"/> does before its own (idle scratch first, then the least recently used idle models; this one is leased, so it stays). Without it, only ILGPU's
     /// idle-scratch reclaim makes room for that allocation. The size is read again from <see cref="IDeviceSized"/> when the lease ends.
+    /// <paramref name="bytes"/> 0 = the caller does not know: room for what this key was measured at before, less what the model holds now (nothing, for a model kept with its
+    /// weights); for a key never measured, the unknown-size rule of <see cref="ModelResidency.AcquireAsync"/> (<see cref="ModelResidency.UnknownSizeBytes"/>, else the largest
+    /// model measured, else every idle model dropped). Either way the measuring of a model that does not report its size starts here.
     /// </summary>
-    public Task EnsureRoomAsync(long bytes)
+    public Task EnsureRoomAsync(long bytes = 0)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(bytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _ended) != 0, this);
         return _owner.EnsureRoomForLeaseAsync(_entry, bytes);
     }

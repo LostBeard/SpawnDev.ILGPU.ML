@@ -29,6 +29,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   - Tests `ModelResidency_LazyModels_EnsureRoom_KnownSizes`, `ModelResidency_ModelSource_GetSizeAsync`, `UnknownSizes_*` updated; 4 red-checks.
   - A model that does not implement `IDeviceSized` is measured from the accelerator's own allocation count: over its load (not when another load overlapped it), or from its
     lease's `EnsureRoomAsync` to the lease's end for a model that loads inside the lease (errs high: the run's scratch still held counts). Lore measured 0 GB for every SpawnGen model before.
+  - `lease.EnsureRoomAsync()` / `EnsureRoomAsync(0)` = the caller does not know the size (Lore's lazy pipelines call it after every acquire): room for what the key was
+    measured at before, less what the model holds now (a kept model drops nothing); a key never measured follows the unknown-size rule. Measuring starts there either way.
+    Lore's RX 590 gate (6 GB budget): a FLUX.2 measured at creation (0.2 GB, its weights load later) was kept beside FLUX 3 and the device was lost; measured from this call
+    to the lease's end it is 5.7 GB, and the failing sequence ran 10 / 10.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
 - **fp32 convolutions (fp32 activations and weights) run on the direct implicit-GEMM kernel again, not Conv2DGemm.RunF32.** NEW benchmark `Conv_DirectVsTiled_Crossover`

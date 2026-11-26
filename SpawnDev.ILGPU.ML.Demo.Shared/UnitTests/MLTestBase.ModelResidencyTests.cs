@@ -227,6 +227,10 @@ public abstract partial class MLTestBase
             dev.Allocated += 40;                          // its weights load inside the lease
         }
         Mr(r.Resident.Single(m => m.Key == "lazy").Bytes == 40 && r.KnownSizes["lazy"] == 40, $"lazy: from EnsureRoomAsync to the lease's end ({r.Resident.Single(m => m.Key == "lazy").Bytes})");
+        // EnsureRoomAsync() without a size (Lore calls it after every acquire): a kept model that holds what it was measured at makes no room, so nothing is dropped
+        int dropsBefore = lines.Count(s => s.Contains("dropped"));
+        await using (var l = await r.AcquireAsync("lazy", () => Task.FromResult(lazyStream))) await l.EnsureRoomAsync();
+        Mr(lines.Count(s => s.Contains("dropped")) == dropsBefore && r.Resident.Count == 2, "a kept model's EnsureRoomAsync() drops nothing: " + string.Join(" | ", lines));
         // two loads at once: neither can be told apart from the other, so neither is measured from the device (each keeps its expected size)
         var gate = new TaskCompletionSource();
         async Task<MemoryStream> Slow(long b) { dev.Allocated += b; await gate.Task; return new MemoryStream(); }
