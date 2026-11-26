@@ -35,6 +35,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     to the lease's end it is 5.7 GB, and the failing sequence ran 10 / 10.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **Conv -> BatchNormalization folded into one Conv** (GraphOptimizer pass "convbn"; `ML_OPT_SKIP=convbn` turns it off): the BatchNorm's scale and shift go into the
+  convolution's weight (in place, once, on the device: the weights never come back to .NET) and a folded bias on its first run, as ONNX Runtime does. Only where safe: the
+  Conv's output feeds that BatchNorm alone, its weight is read by no other node, the parameters are per-channel initializers, inference mode, not channel-last. Half and
+  low-precision weights run the convolution and then the BatchNorm (bit-identical to the unfused graph). MobileNetV2: 53 pairs, 53 of its 164 WebGPU dispatches; output within
+  2.5e-6 of its range of the unfused graph, same top-1; warm run on WebGPU 25.0 -> 21.6 ms (CUDA unchanged). Test `ConvBatchNorm_Fusion_MobileNetV2_MatchesUnfused`
+  (folded, fallback, unfused; run 1 = run 21 bit for bit, so no second fold), red-checked; conv and model tests 900 passed on every backend (two compile tests now count the
+  folded graph's nodes).
 - **fp32 convolutions (fp32 activations and weights) run on the direct implicit-GEMM kernel again, not Conv2DGemm.RunF32.** NEW benchmark `Conv_DirectVsTiled_Crossover`
   (RTX 4070, one backend at a time, MobileNetV2's 1x1, ResNet 3x3 and SD-VAE-sized 3x3 convolutions): the direct kernel is as fast or faster on CUDA, OpenCL and WebGPU
   (512->512 at 64x64: 4.25 / 3.71 / 4.37 ms against 4.91 / 4.02 / 5.68), the one exception 320->1280 at 7x7 by 0.1 ms on the desktop; the outputs agree within 4e-6 of

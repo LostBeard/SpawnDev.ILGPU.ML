@@ -193,6 +193,13 @@ public class OperatorRegistry : IDisposable
         return buf.View;
     }
 
+    /// <summary>
+    /// Convolutions with a BatchNormalization folded in (GraphOptimizer's "convbn" pass): the folded bias of each, keyed by its weight's buffer and offset. The weight itself is
+    /// folded IN PLACE on the first run (the pass only fuses a weight no other node reads), so this entry is also the record that it was: a second fold would scale it twice.
+    /// Lifetime is the registry's (disposed with it).
+    /// </summary>
+    internal readonly Dictionary<(MemoryBuffer Buffer, long Offset), MemoryBuffer1D<float, Stride1D.Dense>> FoldedConvBias = new();
+
     public void Register(IOnnxOperator op) => _ops[op.OpType] = op;
 
     public IOnnxOperator Resolve(string opType)
@@ -549,5 +556,7 @@ public class OperatorRegistry : IDisposable
         // Dispose cached zero-bias buffers (one per distinct outC seen).
         foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }
         _zeroBiasCache.Clear();
+        foreach (var b in FoldedConvBias.Values) try { b.Dispose(); } catch { }
+        FoldedConvBias.Clear();
     }
 }

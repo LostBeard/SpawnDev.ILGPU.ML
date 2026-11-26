@@ -58,6 +58,76 @@ public abstract partial class MLTestBase
         return report;
     });
 
+    /// <summary>
+    /// MobileNetV2's warm run (Bones, 2026-11-26: ours 13 ms AOT / 22 ms interpreted against ONNX Runtime Web's 4.9 ms on WebGPU): the plain session against its captured replay
+    /// (<see cref="Graph.SessionGraphCapture"/>), input upload and output readback included, outputs compared bit for bit. How much of a warm run is per-node host work. A measurement.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task<string> Warm_MobileNetV2_DirectVsCapture() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.WebGPU or AcceleratorType.Cuda)) throw new UnsupportedTestException("capture is CUDA and WebGPU");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
+        using var session = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false));
+        string inName = session.InputNames[0], outName = session.OutputNames[0];
+        var shape = new[] { 1, 3, 224, 224 };
+        var rng = new Random(5);
+        float[] Pic() { var p = new float[3 * 224 * 224]; for (int i = 0; i < p.Length; i++) p[i] = (float)(rng.NextDouble() * 2 - 1); return p; }
+        float[] picA = Pic(), picB = Pic();
+        using var inBuf = accelerator.Allocate1D<float>(picA.Length);
+        async Task<float[]> Run(Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>> run, float[] pic)
+        {
+            inBuf.CopyFromCPU(pic);
+            var outs = await run(new Dictionary<string, Tensor> { [inName] = new Tensor(inBuf.View, shape) });
+            return await outs[outName].Data.SubView(0, 1000).CopyToHostAsync();
+        }
+        const int Steps = 40;
+        async Task<double> Median(Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>> run)
+        {
+            var t = new List<double>();
+            for (int i = 0; i < Steps; i++) { var sw = Stopwatch.StartNew(); await Run(run, (i & 1) == 0 ? picA : picB); t.Add(sw.Elapsed.TotalMilliseconds); }
+            t.Sort(); return t[Steps / 2];
+        }
+        var direct = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)session.RunAsync;
+        for (int i = 0; i < 8; i++) await Run(direct, (i & 1) == 0 ? picA : picB);
+        double directMs = await Median(direct);
+        var dA = await Run(direct, picA); var dB = await Run(direct, picB);
+        using var capture = new Graph.SessionGraphCapture(session, accelerator);
+        var captured = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)capture.RunAsync;
+        int setup = 0;
+        while (!capture.IsCaptured && setup < 4) { await Run(captured, picA); setup++; }
+        if (!capture.IsCaptured) throw new Exception("capture never went live: " + capture.CaptureStatus);
+        for (int i = 0; i < 4; i++) await Run(captured, (i & 1) == 0 ? picA : picB);
+        double replayMs = await Median(captured);
+        string split = capture.LastReplaySplit is var (inMs, planMs, syncMs) ? $" [last replay: input copy {inMs:F1}, plan call {planMs:F1}, sync {syncMs:F1} ms]" : "";
+        var rA = await Run(captured, picA); var rB = await Run(captured, picB);
+        int differ = 0;
+        for (int i = 0; i < 1000; i++) { if (BitConverter.SingleToInt32Bits(rA[i]) != BitConverter.SingleToInt32Bits(dA[i])) differ++; if (BitConverter.SingleToInt32Bits(rB[i]) != BitConverter.SingleToInt32Bits(dB[i])) differ++; }
+        var report = $"MobileNetV2 {accelerator.AcceleratorType} warm, median of {Steps} (upload + run + readback): direct {directMs:F1} ms, captured replay {replayMs:F1} ms ({directMs / replayMs:F2}x){split}; " +
+                     $"{capture.DispatchCount} dispatches; replay differs from direct in {differ} of 2000 values";
+        Console.WriteLine("[ColdStart] " + report);
+        if (differ != 0) throw new Exception("the replay is not bit-identical to the direct run: " + report);
+        // where the GPU time goes, per op type: a sync after every node (each node's time includes one sync's latency: the smallest node time is that floor)
+        var timings = new Dictionary<string, double>();
+        bool perOp = Graph.GraphExecutor.PerOpSync;
+        var prevTimings = Graph.GraphExecutor.CapturedNodeTimingsMs;
+        try
+        {
+            Graph.GraphExecutor.PerOpSync = true;
+            var runs = new List<Dictionary<string, double>>();
+            for (int i = 0; i < 3; i++) { Graph.GraphExecutor.CapturedNodeTimingsMs = new(); await Run(direct, picA); runs.Add(Graph.GraphExecutor.CapturedNodeTimingsMs); }
+            foreach (var key in runs[0].Keys) timings[key] = runs.Min(r => r.GetValueOrDefault(key, double.MaxValue));     // best of 3 per node
+        }
+        finally { Graph.GraphExecutor.PerOpSync = perOp; Graph.GraphExecutor.CapturedNodeTimingsMs = prevTimings; }
+        double floor = timings.Values.Min();
+        var byType = timings.GroupBy(kv => kv.Key.Split('_')[1]).Select(g => (Op: g.Key, N: g.Count(), Ms: g.Sum(kv => kv.Value), Net: g.Sum(kv => kv.Value - floor)))
+            .OrderByDescending(x => x.Net).ToList();
+        var opLine = $"per op type with a sync after each node ({timings.Count} nodes, sync floor {floor:F2} ms each): " +
+                     string.Join(", ", byType.Select(x => $"{x.Op} x{x.N} {x.Ms:F1} ms (above floor {x.Net:F1})"));
+        Console.WriteLine("[ColdStart] " + opLine);
+        return report + "; " + opLine;
+    });
+
     private async Task<string> ColdStartMobileNetV2(Accelerator accelerator)
     {
         if (accelerator is not WebGPUAccelerator web) throw new UnsupportedTestException("the browser's WebGPU shader compile");

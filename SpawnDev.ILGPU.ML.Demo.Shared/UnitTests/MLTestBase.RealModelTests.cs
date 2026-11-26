@@ -43,7 +43,8 @@ public abstract partial class MLTestBase
         var registry = new OperatorRegistry(accelerator);
         var compiled = new GraphCompiler(registry).Compile(graph);
 
-        if (compiled.Nodes.Length != 5) throw new Exception($"Expected 5 nodes, got {compiled.Nodes.Length}");
+        // 5 ONNX nodes, 4 compiled: the BatchNormalization is folded into the Conv before it (GraphOptimizer "convbn")
+        if (compiled.Nodes.Length != 4) throw new Exception($"Expected 4 nodes (BatchNorm folded into the Conv), got {compiled.Nodes.Length}");
 
         // Verify operator count is 48+
         if (registry.SupportedOps.Count < 48)

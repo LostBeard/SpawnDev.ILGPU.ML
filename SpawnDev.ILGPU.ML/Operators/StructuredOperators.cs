@@ -516,6 +516,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     {
         if (ctx.Format != DataFormat.NCHW) return false;
         if (inputs.Length < 2) return false;
+        if (ctx.Attributes.ContainsKey(FusedBatchNormEpsilon)) return false;      // a folded BatchNorm is applied by Execute
         var xIn = inputs[0]; var wIn = inputs[1];
         // Activation input must be low-p; weight must be a Tensor (fp32 .Data OR fp16 .HalfData — both handled).
         if (!xIn.IsHalf || wIn.Float == null) return false;
@@ -661,7 +662,60 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 : new[] { new[] { x[0], outC, outH, outW } };
         }
     }
+    /// <summary>
+    /// Attribute GraphOptimizer's "convbn" pass sets on a Conv that absorbed the BatchNormalization after it: the BatchNorm's epsilon. Such a Conv has seven inputs,
+    /// [X, W, B (or none), scale, beta, mean, var], and writes the BatchNorm's output.
+    /// </summary>
+    internal const string FusedBatchNormEpsilon = "_bn_epsilon";
+
+    /// <summary>Test switch: run every fused Conv + BatchNorm through the unfolded path (convolution, then BatchNorm), the one half and low-precision weights take.</summary>
+    internal static bool ForceBatchNormUnfolded;
+
     public void Execute(OnnxOpContext ctx)
+    {
+        if (ctx.Attributes.TryGetValue(FusedBatchNormEpsilon, out var epsObj) && ctx.Inputs.Length >= 7)
+        {
+            ExecuteWithBatchNorm(ctx, Convert.ToSingle(epsObj));
+            return;
+        }
+        ExecuteCore(ctx);
+    }
+
+    // Conv + BatchNorm. fp32 weights in the ONNX layout: the BatchNorm is folded into the weight (in place, once) and a folded bias, so the convolution alone gives the BatchNorm's
+    // output. Anything else (half or low-precision weights, a channel-last layout): the convolution into a temporary, then the BatchNorm, as the unfused graph did.
+    private void ExecuteWithBatchNorm(OnnxOpContext ctx, float eps)
+    {
+        var w = ctx.Inputs[1];
+        int outC = w.Shape[0];
+        if (!ForceBatchNormUnfolded && !w.IsHalf && !LowPWeightDispatch.IsLowP(w) && ctx.Format == DataFormat.NCHW && w.Shape.Length >= 3 && w.Data.Length == w.ElementCount)
+        {
+            (MemoryBuffer, long) key = (((IArrayView)w.Data.BaseView).Buffer!, ((IContiguousArrayView)w.Data.BaseView).IndexInBytes);
+            if (!reg.FoldedConvBias.TryGetValue(key, out var folded))
+            {
+                folded = reg.Accelerator.Allocate1D<float>(outC);
+                var bias = ctx.Inputs[2]?.Data ?? reg.GetOrCreateZeroBias(outC);
+                reg.Normalization.FoldBatchNormIntoConv(w.Data, bias, folded.View, ctx.Inputs[3].Data, ctx.Inputs[4].Data, ctx.Inputs[5].Data, ctx.Inputs[6].Data, outC, eps);
+                reg.FoldedConvBias[key] = folded;
+            }
+            ctx.Inputs[2] = new Tensor(folded.View, new[] { outC });
+            ExecuteCore(ctx);
+            return;
+        }
+        var output = ctx.Outputs[0];
+        var tmp = ctx.Pool.Rent(output.Shape);
+        try
+        {
+            ctx.Outputs[0] = tmp;
+            ExecuteCore(ctx);
+        }
+        finally { ctx.Outputs[0] = output; }
+        var shape = output.Shape;
+        var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format) : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
+        reg.Normalization.BatchNorm(tmp.Data, output.Data, ctx.Inputs[3].Data, ctx.Inputs[4].Data, ctx.Inputs[5].Data, ctx.Inputs[6].Data, N, C, output.ElementCount / (N * C), eps);
+        ctx.Pool.Return(tmp);
+    }
+
+    private void ExecuteCore(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         var fmt = ctx.Format;

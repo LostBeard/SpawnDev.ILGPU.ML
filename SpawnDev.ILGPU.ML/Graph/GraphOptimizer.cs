@@ -64,6 +64,10 @@ public static class GraphOptimizer
         // Pass 2: Eliminate identity/constant-passthrough nodes
         int eliminated = skip.Contains("identity") ? 0 : EliminateIdentityNodes(optimized);
 
+        // Conv -> BatchNormalization (inference) becomes one Conv that folds the BatchNorm into its weight and bias on its first run
+        int fusedConvBn = skip.Contains("convbn") ? 0 : FuseConvBatchNorm(optimized);
+        LastConvBatchNormFused = fusedConvBn;
+
         // Pass 3: Fuse MatMul → Add (bias) → Activation into FusedLinear
         // LayerNorm FIRST: it matches a nine-node primitive chain, and the later passes rewrite some of
         // those same nodes (FuseLinearLayers claims Add, strength reduction rewrites Mul/Div). Matching
@@ -932,6 +936,55 @@ public static class GraphOptimizer
     /// Detect and fuse MatMul → Add → Activation patterns.
     /// Returns the number of fused sequences found.
     /// </summary>
+    /// <summary>Conv + BatchNormalization pairs the last <see cref="Optimize"/> fused (pass "convbn").</summary>
+    public static int LastConvBatchNormFused;
+
+    /// <summary>
+    /// Conv -> BatchNormalization becomes one Conv with the BatchNorm's parameters as inputs 3..6 and its epsilon as <see cref="Operators.ConvOperator.FusedBatchNormEpsilon"/>
+    /// (ONNX Runtime does the same fold; MobileNetV2 has 53 such pairs, 53 of its 164 WebGPU dispatches). Only where it is safe to fold: the Conv's output feeds that BatchNorm
+    /// alone and is not a graph output; the weight is an initializer no other node reads (it is folded in place); the bias, if any, an initializer too; the BatchNorm's
+    /// parameters are initializers with one value per output channel; no training mode; not a channel-last Conv.
+    /// </summary>
+    private static int FuseConvBatchNorm(ModelGraph graph)
+    {
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        var consumerOf = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int j = 0; j < graph.Nodes.Count; j++)
+            foreach (var input in graph.Nodes[j].Inputs)
+                if (!string.IsNullOrEmpty(input)) { consumers[input] = consumers.GetValueOrDefault(input) + 1; consumerOf[input] = j; }
+        var graphOutputs = new HashSet<string>(graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+        static long Count(int[] shape) { long n = 1; foreach (var d in shape) n *= d; return n; }
+        var remove = new HashSet<int>();
+        int fused = 0;
+        for (int ci = 0; ci < graph.Nodes.Count; ci++)
+        {
+            var conv = graph.Nodes[ci];
+            if (conv.OpType != "Conv" || conv.Outputs.Count != 1 || conv.Inputs.Count < 2 || conv.Inputs.Count > 3) continue;
+            if (conv.Attributes != null && conv.Attributes.TryGetValue("_data_format", out var df) && df.ValueKind == JsonValueKind.String && df.GetString() == "NHWC") continue;
+            string y = conv.Outputs[0];
+            if (graphOutputs.Contains(y) || consumers.GetValueOrDefault(y) != 1 || !consumerOf.TryGetValue(y, out int bi) || remove.Contains(bi)) continue;
+            var bn = graph.Nodes[bi];
+            if (bn.OpType != "BatchNormalization" || bn.Inputs.Count != 5 || bn.Outputs.Count != 1 || bn.Inputs[0] != y) continue;
+            if (bn.Attributes != null && bn.Attributes.TryGetValue("training_mode", out var tm) && tm.ValueKind == JsonValueKind.Number && tm.GetDouble() != 0) continue;
+            string w = conv.Inputs[1], b = conv.Inputs.Count > 2 ? conv.Inputs[2] : "";
+            if (!graph.Initializers.TryGetValue(w, out var wShape) || wShape.Length < 3 || consumers.GetValueOrDefault(w) != 1) continue;
+            if (!string.IsNullOrEmpty(b) && !graph.Initializers.ContainsKey(b)) continue;
+            bool paramsOk = true;
+            for (int p = 1; p < 5; p++) paramsOk &= graph.Initializers.TryGetValue(bn.Inputs[p], out var ps) && Count(ps) == wShape[0];
+            if (!paramsOk) continue;
+            var eps = bn.Attributes != null && bn.Attributes.TryGetValue("epsilon", out var e) && e.ValueKind == JsonValueKind.Number ? e : JsonDocument.Parse("1e-05").RootElement.Clone();
+            conv.Inputs = new List<string> { conv.Inputs[0], w, b, bn.Inputs[1], bn.Inputs[2], bn.Inputs[3], bn.Inputs[4] };
+            conv.Attributes ??= new Dictionary<string, JsonElement>();
+            conv.Attributes[Operators.ConvOperator.FusedBatchNormEpsilon] = eps;
+            conv.Outputs[0] = bn.Outputs[0];
+            remove.Add(bi);
+            fused++;
+        }
+        if (remove.Count > 0) graph.Nodes = graph.Nodes.Where((_, i) => !remove.Contains(i)).ToList();
+        if (OptTrace && fused > 0) Console.WriteLine($"[GraphOptimizer] convbn: {fused} Conv + BatchNormalization pairs fused");
+        return fused;
+    }
+
     private static int FuseLinearLayers(ModelGraph graph)
     {
         int fusedCount = 0;
