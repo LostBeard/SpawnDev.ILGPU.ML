@@ -374,7 +374,33 @@ public abstract partial class MLTestBase
                 using var o = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [session.InputNames[0]] = t });
                 await o[session.OutputNames[0]].ToHostAsync();
             }
-            sw.Restart(); await Run(); first = sw.Elapsed.TotalMilliseconds;
+            // the first run split by the executor's profiler: by node-loop phase, and per op (an op's first Execute loads its kernels: ILGPU's IL -> WGSL in .NET, then Chrome's
+            // pipeline creation), with the shaders ILGPU generated meanwhile in order
+            var firstProf = new Dictionary<string, Graph.GraphExecutor.OpProfileEntry>();
+            Graph.GraphExecutor.OpProfile = firstProf;
+            var firstNodes = new Dictionary<string, double>();
+            Graph.GraphExecutor.CapturedNodeTimingsMs = firstNodes;
+            int shadersBefore; lock (shaders) shadersBefore = shaders.Count;
+            global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ResetDispatchProfiling();
+            global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = true;
+            int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+            long alloc0 = GC.GetTotalAllocatedBytes(false);
+            sw.Restart();
+            try { await Run(); }
+            finally { Graph.GraphExecutor.OpProfile = null; Graph.GraphExecutor.CapturedNodeTimingsMs = null; global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = false; }
+            first = sw.Elapsed.TotalMilliseconds;
+            Console.WriteLine($"[ColdStart] first run, slowest node Executes (a node that loads a kernel pays its load): " +
+                              string.Join(", ", firstNodes.OrderByDescending(kv => kv.Value).Take(10).Select(kv => $"{kv.Key} {kv.Value:F0}")) +
+                              $"; the other {Math.Max(0, firstNodes.Count - 10)} nodes {firstNodes.OrderByDescending(kv => kv.Value).Skip(10).Sum(kv => kv.Value):F0} ms");
+            var ph = Graph.GraphExecutor.OpPhaseMs;
+            var WB = typeof(global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend);
+            double Pf(string f) => Convert.ToDouble(WB.GetField(f)!.GetValue(null));
+            Console.WriteLine($"[ColdStart] first run: shader resolve (ILGPU codegen + pipeline creation) {Pf("ProfileCpuShaderResolveMs"):F0} ms, args {Pf("ProfileCpuArgBuildMs"):F0}, " +
+                              $"readback wait {Pf("ProfileReadbackWaitMs"):F0}; GC gen0/1/2 {GC.CollectionCount(0) - gc0}/{GC.CollectionCount(1) - gc1}/{GC.CollectionCount(2) - gc2}, " +
+                              $"allocated {(GC.GetTotalAllocatedBytes(false) - alloc0) / 1048576.0:F0} MB");
+            Console.WriteLine($"[ColdStart] first run by phase: " + string.Join(", ", Graph.GraphExecutor.OpPhaseNames.Select((n, p) => $"{n} {ph[p]:F0}")) +
+                              $" ms (node loop {ph.Sum():F0} of {first:F0}); by op: " +
+                              string.Join(", ", firstProf.OrderByDescending(kv => kv.Value.WallMs).Take(8).Select(kv => $"{kv.Key} x{kv.Value.Count} {kv.Value.WallMs:F0} ms")));
             sw.Restart(); await Run(); second = sw.Elapsed.TotalMilliseconds;
             // MEASURED 2026-11-25: TiledGemm.Gemm (308 KB, 3.9 s in Chrome on a quiet machine) came with every fp32 convolution through Conv2DGemm.RunF32 until that route was
             // removed (Conv_DirectVsTiled_Crossover: the direct implicit GEMM is as fast or faster); its single-mode variants are as large (239 and 203 KB), so the size is the
