@@ -232,6 +232,16 @@ public abstract partial class MLTestBase
                     Console.WriteLine($"[ColdStart] GPU time (one timed replay): total {root.GetProperty("totalMs").GetDouble():F2} ms over {root.GetProperty("ops").GetInt32()} dispatches");
                     foreach (var k in ks.EnumerateArray().Take(12))
                         Console.WriteLine($"[ColdStart]   {k.GetProperty("label").GetString()}: {k.GetProperty("ms").GetDouble():F2} ms x{k.GetProperty("count").GetInt32()}");
+                    // per dispatch (ILGPU 5.4.53+): the convolutions by their workgroup count - does a small grid (late 7x7 / 14x14 layers, few 64-wide tiles) cost
+                    // more per FLOP than a large one? Plan order, so the model's layers top to bottom.
+                    if (root.TryGetProperty("dispatches", out var ds))
+                    {
+                        var rows = ds.EnumerateArray().Select((d, i) => (i, label: d.GetProperty("label").GetString() ?? "",
+                            ms: d.GetProperty("ms").ValueKind == System.Text.Json.JsonValueKind.Number ? d.GetProperty("ms").GetDouble() : double.NaN,
+                            wg: string.Join("x", d.GetProperty("wg").EnumerateArray().Select(v => v.GetInt32())))).ToList();
+                        Console.WriteLine($"[ColdStart] per dispatch (plan order, label ms wg): " + string.Join("; ", rows.Where(r => r.label.Contains("Conv"))
+                            .Select(r => $"{r.i} {r.label.Replace("Kernel_", "").Replace("Impl", "")} {r.ms:F3} {r.wg}")));
+                    }
                 }
                 else Console.WriteLine("[ColdStart] timed replay: " + root.GetRawText()[..Math.Min(200, root.GetRawText().Length)]);
             }

@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **WebGPU: a captured replay no longer waits for the GPU before returning** (`WebGPUGraphCapture.SkipCompletionWait`, null = follow the session's
+  `SkipCompletionWait`, on by default): a replay ends with its submit, and the caller's readback is the one wait. MEASURED (Data, 2026-11-26, plain JS in
+  installed Chrome, RTX 4070): Chrome charges ~2.9 ms for ANY submit that is waited on, however small (Node / Dawn: 0.07-0.14 ms; mapAsync adds nothing), and
+  a replay plus its readback waited twice. MobileNetV2 captured replay with readback ~8.0 -> 5.1 ms (ONNX Runtime Web: 4.9), outputs bit-identical to the
+  direct run; capture tests 11/0 on WebGPU.
+- **SpawnDev.ILGPU 5.4.53** (timed replays report each dispatch: label, GPU ms, workgroups). `Warm_MobileNetV2_DirectVsCapture` prints the per-dispatch
+  convolution times: the late layers that launch 3-16 workgroups take 0.07-0.14 ms each, ~0.9 of the model's 1.64 ms of GPU time (the early ones, 196
+  workgroups, ~0.02 ms): too few workgroups for the GPU, the next kernel target. Also prints the run's phases (the executor's OpProfile), the round trips
+  and a submit-budget A/B (within clock noise).
 - **Model stores: a sidecar that cannot be read no longer reads as "no record"** (Lore, 2026-11-26: SpawnGen's server failed to load SD 1.5 twice with "being
   used by another process" on the UNet and VAE `.meta` sidecars). `FileModelStore` swallowed every read error and returned no sidecar, so a complete model looked
   unrecorded and the downloader started over from byte 0, truncating a multi-GB file; Lore's loads failed only because the lock was still held at the next

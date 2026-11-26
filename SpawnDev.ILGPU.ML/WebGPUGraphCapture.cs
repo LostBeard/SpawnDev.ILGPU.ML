@@ -159,8 +159,22 @@ public sealed class WebGPUGraphCapture : IDisposable
     public double LastInputCopyMs { get; private set; }
     /// <summary>ms the last replay spent in the plan call: one .NET->JS crossing + the JS encode loop + queue.submit.</summary>
     public double LastPlanCallMs { get; private set; }
-    /// <summary>ms the last replay spent awaiting GPU completion (SynchronizeAsync = onSubmittedWorkDone).</summary>
+    /// <summary>ms the last replay spent awaiting GPU completion (SynchronizeAsync = onSubmittedWorkDone); 0 when it skipped the wait (see <see cref="SkipCompletionWait"/>).</summary>
     public double LastSyncMs { get; private set; }
+
+    private InferenceSession? _session;
+
+    /// <summary>
+    /// A replay ends with its submit instead of awaiting GPU completion: what follows on WebGPU's one queue (more dispatches, a readback, the next replay, a host write
+    /// to the input buffer) is ordered after it, and a readback is itself the wait. Null (the default) follows the captured session's
+    /// <see cref="InferenceSession.SkipCompletionWait"/>, ON by default, so one switch covers the direct run and the replay. MEASURED (Data, 2026-11-26, plain JS
+    /// in installed Chrome, RTX 4070): Chrome charges ~2.9 ms for ANY submit that is waited on, however small (Node / Dawn: 0.07-0.14 ms), and a replay plus its
+    /// readback waited twice. Set false where a replay must have completed when ReplayAsync returns (timing a replay without reading it).
+    /// </summary>
+    public bool? SkipCompletionWait { get; set; }
+
+    /// <summary>True when the most recent <see cref="ReplayAsync"/> returned after its submit without awaiting completion.</summary>
+    public bool LastReplayCompletionWaitSkipped { get; private set; }
     /// <summary>JS-side ms of the last replay's encode loop (only when <see cref="CollectTimings"/>).</summary>
     public double LastJsEncodeMs { get; private set; }
     /// <summary>JS-side ms of the last replay's enc.finish()+queue.submit (only when <see cref="CollectTimings"/>).</summary>
@@ -432,7 +446,7 @@ public sealed class WebGPUGraphCapture : IDisposable
             var shapes = new Dictionary<string, int[]>();
             foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
             arenaHandedOff = true;
-            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes, arena, poolPins);
+            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes, arena, poolPins) { _session = session };
         }
         finally
         {
@@ -511,7 +525,9 @@ public sealed class WebGPUGraphCapture : IDisposable
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         await _plan.ReplayAsync();
         var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        await _accelerator.SynchronizeAsync();
+        bool skip = SkipCompletionWait ?? _session?.SkipCompletionWait ?? false;
+        if (!skip) await _accelerator.SynchronizeAsync();
+        LastReplayCompletionWaitSkipped = skip;
         var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         LastInputCopyMs = System.Diagnostics.Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds;
         LastPlanCallMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
