@@ -322,6 +322,17 @@ namespace PlaywrightMultiTest
                         // This enables ShaderDebugService's debug folder persistence.
                         var userDataDir = Path.Combine(Path.GetTempPath(), "SpawnDev.ILGPU.ML.PlaywrightProfile");
                         Directory.CreateDirectory(userDataDir);
+                        // The profile's HTTP cache goes before every run (same change as SpawnDev.ILGPU's PMT, 5.4.50, Data). A corrupt
+                        // entry in it made a boot file fail with net::ERR_CACHE_READ_FAILURE; the .NET loader fetches boot files with
+                        // cache "force-cache" and does not retry, so the test page never started (ILGPU 2026-11-05/10/24/25; here the
+                        // "Failed to fetch / init timeout" runs fixed by deleting the profile). A run publishes fresh files anyway.
+                        // WebGPU's shader caches and the site storage (OPFS model caches) are left alone.
+                        foreach (var cacheDir in new[] { "Cache", "Code Cache" })
+                        {
+                            var path = Path.Combine(userDataDir, "Default", cacheDir);
+                            try { if (Directory.Exists(path)) Directory.Delete(path, true); }
+                            catch (Exception ex) { LogStatus($"Could not clear the profile's {cacheDir} ({ex.Message}); a corrupt entry there can stop the test page from starting"); }
+                        }
                         LogStatus($"Launching Chromium (persistent profile: {userDataDir})...");
                         testableProject.BrowserContext = await testableProject.Playwright.Chromium.LaunchPersistentContextAsync(
                             userDataDir,
