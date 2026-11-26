@@ -117,6 +117,12 @@ public sealed class SessionGraphCapture : IDisposable
         => _webGpu == null ? null
          : (_webGpu.LastInputCopyMs, _webGpu.LastPlanCallMs, _webGpu.LastSyncMs);
 
+    /// <summary>
+    /// Diagnostic (WebGPU, a live plan): one replay with GPU timestamps, GPU milliseconds by kernel label (JSON); null without a WebGPU plan. Where a model's GPU time goes,
+    /// without the per-node syncs that swamp it in the browser. Needs the device's timestamp-query feature.
+    /// </summary>
+    public Task<string>? ProfileReplayAsync() => _webGpu?.ReplayTimedAsync();
+
     /// <summary>Number of GPU dispatches the captured WebGPU plan replays. 0 when no plan is live.</summary>
     public int DispatchCount => _webGpu?.DispatchCount ?? 0;
 

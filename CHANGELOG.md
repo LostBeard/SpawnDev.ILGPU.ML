@@ -35,6 +35,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     to the lease's end it is 5.7 GB, and the failing sequence ran 10 / 10.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **Small-output convolutions take the implicit-GEMM kernel** (Conv2DKernel: the spatial minimum of 64 outputs is gone). MobileNetV2's 7x7 layers ran on the naive
+  per-output kernel: 9 convolutions, 3.04 of its 5.69 ms WebGPU GPU time (timestamps, `SessionGraphCapture.ProfileReplayAsync`, new). Now 4.69 ms; warm run 14.8 -> 13.0 ms.
+  CUDA / OpenCL: 960->320 at 7x7 0.44 / 0.37 -> 0.14 ms, 320->1280 0.24 -> 0.06, nothing slower (`Conv_DirectVsTiled_Crossover`). Conv and model tests 914 / 0 on every backend.
 - **Conv -> BatchNormalization folded into one Conv** (GraphOptimizer pass "convbn"; `ML_OPT_SKIP=convbn` turns it off): the BatchNorm's scale and shift go into the
   convolution's weight (in place, once, on the device: the weights never come back to .NET) and a folded bias on its first run, as ONNX Runtime does. Only where safe: the
   Conv's output feeds that BatchNorm alone, its weight is read by no other node, the parameters are per-channel initializers, inference mode, not channel-last. Half and

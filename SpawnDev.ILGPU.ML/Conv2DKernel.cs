@@ -404,7 +404,10 @@ public class Conv2DKernel : IDisposable
         int gemmN = outH * outW;
         if (_accelerator.MaxNumThreadsPerGroup >= RbBlock * RbBlock
             && _accelerator.AcceleratorType != global::ILGPU.Runtime.AcceleratorType.WebGL
-            && gemmK >= RbBlock && gemmN >= RbTile && outC >= RbReg)
+            // no spatial minimum (it was gemmN >= 64 until 2026-11-25): a small output with many input channels (MobileNetV2's 7x7 layers, K up to 960) is where the
+            // naive kernel is worst, one thread looping over every input with no reuse. MEASURED (RTX 4070, Conv_DirectVsTiled_Crossover, one backend at a time):
+            // 960->320 at 7x7 0.44 -> 0.14 ms CUDA, 0.37 -> 0.14 OpenCL; 320->1280 0.24 -> 0.06 both; nothing slower; MobileNetV2's WebGPU GPU time 5.69 -> 4.69 ms.
+            && gemmK >= RbBlock && outC >= RbReg)
         {
             _implicitGemmKernel ??= _accelerator.LoadStreamKernel<
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

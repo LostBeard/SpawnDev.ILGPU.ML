@@ -103,6 +103,22 @@ public abstract partial class MLTestBase
         var rA = await Run(captured, picA); var rB = await Run(captured, picB);
         int differ = 0;
         for (int i = 0; i < 1000; i++) { if (BitConverter.SingleToInt32Bits(rA[i]) != BitConverter.SingleToInt32Bits(dA[i])) differ++; if (BitConverter.SingleToInt32Bits(rB[i]) != BitConverter.SingleToInt32Bits(dB[i])) differ++; }
+        if (capture.ProfileReplayAsync() is { } timed)
+        {
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(await timed);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("kernels", out var ks))
+                {
+                    Console.WriteLine($"[ColdStart] GPU time (one timed replay): total {root.GetProperty("totalMs").GetDouble():F2} ms over {root.GetProperty("ops").GetInt32()} dispatches");
+                    foreach (var k in ks.EnumerateArray().Take(12))
+                        Console.WriteLine($"[ColdStart]   {k.GetProperty("label").GetString()}: {k.GetProperty("ms").GetDouble():F2} ms x{k.GetProperty("count").GetInt32()}");
+                }
+                else Console.WriteLine("[ColdStart] timed replay: " + root.GetRawText()[..Math.Min(200, root.GetRawText().Length)]);
+            }
+            catch (Exception ex) { Console.WriteLine($"[ColdStart] timed replay unavailable: {ex.GetType().Name}: {ex.Message}"); }
+        }
         var report = $"MobileNetV2 {accelerator.AcceleratorType} warm, median of {Steps} (upload + run + readback): direct {directMs:F1} ms, captured replay {replayMs:F1} ms ({directMs / replayMs:F2}x){split}; " +
                      $"{capture.DispatchCount} dispatches; replay differs from direct in {differ} of 2000 values";
         Console.WriteLine("[ColdStart] " + report);
