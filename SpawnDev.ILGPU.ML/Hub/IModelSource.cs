@@ -43,6 +43,12 @@ public interface IModelSource
     /// <see cref="OpenAsync"/>.
     /// </remarks>
     Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The file's size in bytes WITHOUT downloading it (a cached copy's length, else what the host reports), or null when this source cannot say. For
+    /// <see cref="ModelResidency.AcquireAsync"/>'s expectedBytes before a model's first load (the weight files' total). The default answers null.
+    /// </summary>
+    Task<long?> GetSizeAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => Task.FromResult<long?>(null);
 }
 
 /// <summary>

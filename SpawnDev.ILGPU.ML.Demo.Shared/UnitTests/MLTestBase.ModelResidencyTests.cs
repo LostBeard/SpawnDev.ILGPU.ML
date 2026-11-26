@@ -158,23 +158,95 @@ public abstract partial class MLTestBase
         Task<FakeModel> New(string n, long b) => Task.FromResult(new FakeModel(n, b, log));
         async Task Use(string n, long b, long expected) { await using var l = await r.AcquireAsync(n, () => New(n, b), expected); }
         await Use("a", 10, 10); await Use("b", 10, 10);
-        await Use("x", 10, 0);                        // size unknown: a and b go first, the load itself would be what over-allocates
-        Mr(MrKeys(r) == "x", $"an unknown size drops every idle model before it loads: {MrKeys(r)}");
-        await Use("a", 10, 10); await Use("b", 10, 10);
-        Mr(MrKeys(r) == "x,a,b", $"all fit: {MrKeys(r)}");
+        await Use("x", 10, 0);                        // size unknown: assumed as large as the largest measured (10), and 1000 holds it: nothing goes
+        Mr(MrKeys(r) == "a,b,x", $"an unknown size is assumed to be the largest measured one, which fits: {MrKeys(r)}");
         await Use("x", 10, 0);
         Mr(MrKeys(r) == "a,b,x", $"x is the kept one: nothing dropped: {MrKeys(r)}");
         r.BudgetBytes = 40;
         await Use("c", 10, 10);
         Mr(MrKeys(r) == "a,b,x,c", $"40 is enough for four 10s: {MrKeys(r)}");
-        await Use("d", 10, 0);                        // never seen: unknown
-        Mr(MrKeys(r) == "d", $"d: unknown again: {MrKeys(r)}");
+        await Use("d", 10, 0);                        // never seen: assumed 10, so one goes, the least recently used
+        Mr(MrKeys(r) == "b,x,c,d", $"d: room for one more 10, a dropped: {MrKeys(r)}");
+        r.UnknownSizeBytes = 25;
+        await Use("e", 10, 0);                        // the app's guess: 25 of 40 -> three of the four 10s go (30 free with only d left)
+        Mr(MrKeys(r) == "d,e", $"UnknownSizeBytes = 25 makes room for 25: {MrKeys(r)}");
+
+        // nothing measured (models that do not report a size, no expectedBytes): every idle model goes before an unknown load
+        await using var blind = new ModelResidency(new FakeDevice(log)) { BudgetBytes = 1L << 40 };
+        async Task UseBlind(string n) { await using var l = await blind.AcquireAsync(n, () => Task.FromResult(new MemoryStream())); }
+        await UseBlind("p"); await UseBlind("q");
+        Mr(string.Join(",", blind.Resident.Select(m => m.Key)) == "q", "with nothing measured, an unknown load drops every idle model first");
+        blind.UnknownSizeBytes = 1L << 30;
+        await UseBlind("s");
+        Mr(string.Join(",", blind.Resident.Select(m => m.Key)) == "q,s", "with UnknownSizeBytes set, a 1 TB budget keeps them");
 
         await using var none = new ModelResidency(new FakeDevice(log));
         var lines = new List<string>(); none.Log = lines.Add;
         for (int i = 0; i < 20; i++) await using (var l = await none.AcquireAsync($"m{i}", () => New($"m{i}", 1L << 30), 1L << 30)) { }
         Mr(none.Resident.Count == 20, $"no budget, no free memory: nothing is dropped ({none.Resident.Count})");
         Mr(lines.Count(l => l.Contains("BudgetBytes")) == 1, "it says once what to set");
+    });
+
+    /// <summary>IModelSource.GetSizeAsync: a local file's length without reading it, null for a missing one, and null from a source that does not implement it (the default member).</summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task ModelResidency_ModelSource_GetSizeAsync() => await RunPureTest(async () =>
+    {
+        if (OperatingSystem.IsBrowser()) throw new UnsupportedTestException("a local folder");
+        var dir = Directory.CreateTempSubdirectory("ml-size-").FullName;
+        try
+        {
+            await File.WriteAllBytesAsync(Path.Combine(dir, "w.bin"), new byte[12345]);
+            Hub.IModelSource local = new Hub.LocalFolderModelSource(dir);
+            Mr(await local.GetSizeAsync("", "w.bin") == 12345, "the file's length");
+            Mr(await local.GetSizeAsync("", "missing.bin") == null, "a missing file: null");
+            Hub.IModelSource plain = new Fp8MixedSource(new byte[1]);
+            Mr(await plain.GetSizeAsync("", "x") == null, "a source without GetSizeAsync answers null");
+        }
+        finally { Directory.Delete(dir, true); }
+    });
+
+    private sealed class LazyModel : IDisposable, IDeviceSized
+    {
+        public long Bytes;                  // 0 until its weights load inside a lease
+        public bool Disposed;
+        public long DeviceBytes => Bytes;
+        public void Dispose() => Disposed = true;
+    }
+
+    /// <summary>
+    /// A lazy model (Lore's SpawnGen wrappers: nothing on the device at acquire, the weights load inside the lease): the lease makes room before that load (EnsureRoomAsync), the size is read
+    /// again when the lease ends and remembered per key (the largest), and remembered sizes carry to another manager (KnownSizes / SeedKnownSizes).
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task ModelResidency_LazyModels_EnsureRoom_KnownSizes() => await RunPureTest(async () =>
+    {
+        var log = new List<string>();
+        await using var r = new ModelResidency(new FakeDevice(log)) { BudgetBytes = 100 };
+        Task<FakeModel> New(string n, long b) => Task.FromResult(new FakeModel(n, b, log));
+        await using (var l = await r.AcquireAsync("a", () => New("a", 40), 40)) { }
+        await using (var l = await r.AcquireAsync("b", () => New("b", 40), 40)) { }
+        var lazy = new LazyModel();
+        await using (var l = await r.AcquireAsync("lazy", () => Task.FromResult(lazy), 1))
+        {
+            Mr(MrKeys(r) == "a,b,lazy", $"acquiring the empty wrapper drops nothing: {MrKeys(r)}");
+            await l.EnsureRoomAsync(50);                  // 100 - 81 = 19 free, 50 wanted: the least recently used idle model goes, not the leased one
+            Mr(MrKeys(r) == "b,lazy" && log.Contains("dispose a"), $"room for the lazy load: a dropped: {MrKeys(r)} / {string.Join(",", log)}");
+            lazy.Bytes = 50;                              // its weights load inside the lease
+        }
+        Mr(r.Resident.Single(m => m.Key == "lazy").Bytes == 50 && r.KnownSizes["lazy"] == 50, $"the size is read again when the lease ends: {r.Resident.Single(m => m.Key == "lazy").Bytes}");
+        lazy.Bytes = 30;                                  // it shrank (scratch freed): the entry follows, the remembered size keeps the largest
+        await using (var l = await r.AcquireAsync<LazyModel>("lazy", () => throw new Exception("kept: no load"), 0)) { }
+        Mr(r.Resident.Single(m => m.Key == "lazy").Bytes == 30 && r.KnownSizes["lazy"] == 50, "current size 30, remembered 50");
+
+        // a new session: the remembered sizes go in, so a first load is no longer an unknown size
+        await using var next = new ModelResidency(new FakeDevice(log)) { BudgetBytes = 60, Log = log.Add };
+        await using (var l = await next.AcquireAsync("c", () => New("c", 40), 40)) { }
+        next.SeedKnownSizes(r.KnownSizes);
+        log.Clear();
+        await using (var l = await next.AcquireAsync("lazy", () => Task.FromResult(new LazyModel { Bytes = 50 }))) { }
+        Mr(string.Join(",", next.Resident.Select(m => m.Key)) == "lazy" && log.Contains("dispose c") && !log.Any(s => s.Contains("no known size")),
+            $"the seeded 50 made room (c dropped) without an unknown-size guess: {string.Join(",", next.Resident.Select(m => m.Key))} / {string.Join(",", log)}");
+        await Task.CompletedTask;
     });
 
     /// <summary>The device's own free memory limits without a budget; idle scratch is reclaimed before any model is dropped; ReserveBytes is kept free.</summary>

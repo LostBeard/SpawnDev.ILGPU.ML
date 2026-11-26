@@ -244,6 +244,16 @@ public class HubModelSource : ICachingModelSource, IDisposable
     /// </remarks>
     private static Task<long> ProbeSizeAsync(HttpClient http, string url, CancellationToken ct) => ModelsHost.ProbeSizeAsync(http, url, ct);
 
+    /// <summary>The cached copy's length, else the hub's size for the file (one ranged request, no download); null without an HttpClient or when the hub gives no size.</summary>
+    public async Task<long?> GetSizeAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+    {
+        await using (var cached = await Store.OpenReadAsync(CacheKey(repoId, filePath), cancellationToken).ConfigureAwait(false))
+            if (cached != null) return cached.Length;
+        if (_http == null) return null;
+        long size = await ProbeSizeAsync(_http, HuggingFaceClient.GetDownloadUrl(repoId, filePath, Revision), cancellationToken).ConfigureAwait(false);
+        return size > 0 ? size : null;
+    }
+
     /// <summary>The OPFS cache key for a repo file. Stable across runs, and distinct per revision.</summary>
     public string CacheKey(string repoId, string filePath)
         => $"hf_{repoId.Replace('/', '_')}_{Revision}_{filePath.Replace('/', '_')}";

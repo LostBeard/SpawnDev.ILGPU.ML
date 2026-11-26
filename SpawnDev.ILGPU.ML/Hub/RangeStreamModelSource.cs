@@ -45,6 +45,9 @@ public class RangeStreamModelSource : IModelSource
     protected virtual Task<Stream> DownloadIntoCacheAsync(string repoId, string filePath, CancellationToken cancellationToken)
         => _hub.OpenAsync(repoId, filePath, cancellationToken);
 
+    /// <summary>The cached copy's length, else the host's size for the file, without downloading it (<see cref="HubModelSource.GetSizeAsync"/>).</summary>
+    public Task<long?> GetSizeAsync(string repoId, string filePath, CancellationToken cancellationToken = default) => _hub.GetSizeAsync(repoId, filePath, cancellationToken);
+
     public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
     {
         var cacheKey = _hub.CacheKey(repoId, filePath);

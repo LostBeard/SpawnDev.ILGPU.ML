@@ -19,6 +19,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   when another model needs it, loaded again on the next run; Dispose releases the pipeline's own. Without one, `KeepTransformerResident` / `KeepLoaded` work as before. Tests
   `Flux2_/Flux3_Residency_KeptAndReloaded_SamePicture`, `Ltx_Residency_KeptAndReloaded_SameClip` (CUDA): kept, dropped and reloaded, the output is the same byte for byte (FLUX.2 2474 MB,
   FLUX 3 3472 MB, LTX DiT + VAE 3120 MB). Red: disposing the kept transformer behind the manager crashes the kept run.
+- `ModelResidency`, from Lore's SpawnGen migration (41 load sites, lazy model wrappers):
+  - With a budget and no size, room is made for the largest model the manager has measured (kept, remembered, registered), not for everything: a 1 TB budget dropped every idle
+    model at each first load. With nothing measured it still drops every idle model first. NEW `UnknownSizeBytes` = the app's own guess.
+  - Sizes are read again from `IDeviceSized` when a lease ends and before a drop; the size remembered per key is the largest seen (a lazy wrapper holds nothing at acquire).
+  - NEW `ModelLease.EnsureRoomAsync(bytes)`: room for a load that happens inside the lease (scratch first, then idle models; never the leased one). Without it only ILGPU's idle-scratch
+    reclaim made room there.
+  - NEW `KnownSizes` / `SeedKnownSizes`: remembered sizes survive a reload or a server restart.
+  - Tests `ModelResidency_LazyModels_EnsureRoom_KnownSizes`, `ModelResidency_ModelSource_GetSizeAsync`, `UnknownSizes_*` updated; 4 red-checks.
+- NEW `IModelSource.GetSizeAsync(repoId, filePath)` (default member: null): a file's size without downloading it. LocalFolderModelSource (file length), HubModelSource (cached copy, else one
+  ranged probe), RangeStreamModelSource.
 - `IDeviceSized` on GpuWeights, StreamedModelWeights, Flux1Weights, Flux2Weights, Flux2Transformer, SdCheckpoint, QwenImageTransformer, ZImageTransformer (their existing sizes).
 - Docs: `streamThreshold` (CreateFromStreamAsync, CreateFromOnnxStreamAsync, ParseFromStreamAsync) has been ignored since July; its doc described the old behaviour.
 

@@ -18,6 +18,13 @@ public sealed class LocalFolderModelSource : IModelSource
     public Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
         => File.ReadAllBytesAsync(Resolve(filePath), cancellationToken);
 
+    /// <summary>The file's length; null when it does not exist.</summary>
+    public Task<long?> GetSizeAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+    {
+        var info = new FileInfo(Resolve(filePath));
+        return Task.FromResult<long?>(info.Exists ? info.Length : null);
+    }
+
     /// <summary>True when the file exists (a source for the tests and examples to skip cleanly when a model set is absent).</summary>
     public bool Exists(string filePath) => File.Exists(Resolve(filePath));
 }
