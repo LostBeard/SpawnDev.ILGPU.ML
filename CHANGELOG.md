@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.32 - 2026-11-26 (nuget.org) - model residency, faster browser cold starts and convolutions
+
 - NEW `ModelResidency` (one per accelerator, owned by the app; approved by TJ 2026-11-25): keeps models on the device while there is room, drops the least recently used idle one when the
   next would not fit, loads it again on next use. `AcquireAsync(key, load, expectedBytes, tag)` gives a lease; a leased model is never dropped; drops are async and drain the device first; idle pool
   scratch is reclaimed before any model; an unknown size with a budget drops every idle model before the load; one model over the budget loads with a log line. `ReleaseAsync(tag)`, `ReleaseAllAsync`,
