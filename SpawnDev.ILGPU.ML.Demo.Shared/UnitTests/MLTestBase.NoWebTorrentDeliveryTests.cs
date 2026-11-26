@@ -160,6 +160,75 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// A sidecar held open by another process for a moment (an on-access scanner, an indexer) must neither fail a load nor make a complete
+    /// model look unrecorded. Lore 2026-11-26: "being used by another process" on SD 1.5's sidecars; the old read swallowed the sharing
+    /// violation and reported the complete model as having no record, which sends the downloader back to byte 0 of a multi-GB file.
+    /// Windows only: other systems have no mandatory sharing modes to violate.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task FileModelStore_SidecarHeldByAnotherHandle_WaitsInsteadOfForgetting() => await RunTest(async accelerator =>
+    {
+        if (!OperatingSystem.IsWindows()) throw new UnsupportedTestException("Windows file sharing modes only");
+        var dir = Path.Combine(Path.GetTempPath(), "ilgpu-ml-filestore-share-" + Guid.NewGuid().ToString("N"));
+        var store = new FileModelStore(dir);
+        try
+        {
+            const string key = "hub/unet_model.onnx_data";
+            var payload = new byte[32 * 1024];
+            new Random(77).NextBytes(payload);
+            using (var src = new MemoryStream(payload)) await store.PutAsync(key, src);
+            var meta = Directory.GetFiles(dir, "*.meta").Single();
+
+            // 1. Held with NO sharing (the worst a scanner does), released after 300 ms: the read waits and still sees a complete entry.
+            var holder = new FileStream(meta, FileMode.Open, FileAccess.Read, FileShare.None);
+            _ = Task.Delay(300).ContinueWith(_ => holder.Dispose());
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var state = await store.GetStateAsync(key);
+            if (!state.Complete || state.BytesWritten != payload.Length)
+                throw new Exception($"A held sidecar read as complete={state.Complete} bytes={state.BytesWritten}: the model would be downloaded again from byte 0.");
+            Console.WriteLine($"[NoWT] held sidecar: read waited {sw.ElapsedMilliseconds} ms, complete");
+
+            // 2. A write while it is held, released after 300 ms: waits, then lands whole.
+            holder = new FileStream(meta, FileMode.Open, FileAccess.Read, FileShare.None);
+            _ = Task.Delay(300).ContinueWith(_ => holder.Dispose());
+            await ((IResumableModelStore)store).SetStateAsync(key, "http://example/u", payload.Length, payload.Length, true, "e1");
+            state = await store.GetStateAsync(key);
+            if (!state.Complete || state.ETag != "e1") throw new Exception($"Write under a held sidecar: complete={state.Complete} etag={state.ETag}.");
+
+            // 3. A reader that shares (as our own reads and most scanners do) never blocks a write: the replace is immediate.
+            using (var sharing = new FileStream(meta, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                sw.Restart();
+                await ((IResumableModelStore)store).SetStateAsync(key, "http://example/u", payload.Length, payload.Length, true, "e2");
+                if (sw.ElapsedMilliseconds > 200) throw new Exception($"A write waited {sw.ElapsedMilliseconds} ms behind a reader that shares.");
+            }
+            if ((await store.GetStateAsync(key)).ETag != "e2") throw new Exception("The write beside a sharing reader did not land.");
+
+            // 4. Held for longer than the retries: the read FAILS loudly; it never reports the entry as unrecorded.
+            store.SharingRetryAttempts = 3;
+            using (new FileStream(meta, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                try
+                {
+                    var s = await store.GetStateAsync(key);
+                    throw new Exception($"A sidecar that could not be read returned a state (complete={s.Complete}) instead of throwing.");
+                }
+                catch (IOException) { /* expected */ }
+            }
+
+            // No temporary sidecars left behind; the listing still sees exactly one complete model.
+            if (Directory.GetFiles(dir, "*.tmp.meta").Length != 0) throw new Exception("A temporary sidecar was left behind.");
+            var listed = await store.ListAsync();
+            if (listed.Count != 1 || !listed[0].Complete) throw new Exception($"Listing after the held writes: {listed.Count} entries.");
+            Console.WriteLine("[NoWT] FileModelStore held sidecar (read waits, write waits, sharing reader never blocks, too long throws): PASS");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    });
+
+    /// <summary>
     /// A real pipeline builds end to end from <see cref="HubModelSource"/> - no WebTorrentClient exists in
     /// this test at all.
     /// </summary>

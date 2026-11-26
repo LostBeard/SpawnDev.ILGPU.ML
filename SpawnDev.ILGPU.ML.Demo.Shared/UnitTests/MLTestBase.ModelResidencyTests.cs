@@ -249,6 +249,42 @@ public abstract partial class MLTestBase
         r.BudgetBytes = 1000;
         await using (var l = await r.AcquireAsync("scratchy", () => { dev.Allocated += 50; dev.Reclaimable += 30; return Task.FromResult(new MemoryStream()); })) { }
         Mr(r.Resident.Single(m => m.Key == "scratchy").Bytes == 20, $"only what the device holds counts, not its idle scratch ({r.Resident.Single(m => m.Key == "scratchy").Bytes})");
+
+        // Lore, RX 590, "Speak and listen": one prompt holds both leases until it ends. Kokoro acquires, makes room, loads in its first run; then Parakeet acquires and loads
+        // while Kokoro's lease is still open. Kokoro was remembered at 2.56 GB (its file 0.3 GB): its window ran to the lease's end and took in Parakeet's load.
+        // Now the next growth start ends Kokoro's window, so each is measured at its own load.
+        r.BudgetBytes = 10_000;
+        var tts = await r.AcquireAsync("tts", () => Task.FromResult(new MemoryStream()), 1);
+        await tts.EnsureRoomAsync();
+        dev.Allocated += 7;                               // Kokoro's first run loads its weights
+        var stt = await r.AcquireAsync("stt", () => Task.FromResult(new MemoryStream()), 2);   // Parakeet's node: its load ends Kokoro's window
+        await stt.EnsureRoomAsync();
+        dev.Allocated += 300;                             // Parakeet's weights, Kokoro's lease still open
+        await tts.DisposeAsync();                         // the prompt ends: every lease together
+        await stt.DisposeAsync();
+        Mr(r.Resident.Single(m => m.Key == "tts").Bytes == 7 && r.KnownSizes["tts"] == 7 && r.Resident.Single(m => m.Key == "stt").Bytes == 300,
+            $"two models in one prompt, each measured at its own load: tts {r.Resident.Single(m => m.Key == "tts").Bytes} (expected 7), stt {r.Resident.Single(m => m.Key == "stt").Bytes} (expected 300)");
+
+        // A window that opens while another load is still running cannot be told apart from it: neither is measured, each keeps what it had, and the log says why.
+        var release = new TaskCompletionSource();
+        var slow = r.AcquireAsync("slow", async () => { dev.Allocated += 50; await release.Task; return new MemoryStream(); }, 9);
+        var w = await r.AcquireAsync("w", () => Task.FromResult(new MemoryStream()), 4);
+        await w.EnsureRoomAsync();
+        dev.Allocated += 6;
+        release.SetResult();
+        await (await slow).DisposeAsync();
+        await w.DisposeAsync();
+        Mr(r.Resident.Single(m => m.Key == "slow").Bytes == 9 && r.Resident.Single(m => m.Key == "w").Bytes == 4,
+            $"overlapping: neither measured (slow {r.Resident.Single(m => m.Key == "slow").Bytes}, w {r.Resident.Single(m => m.Key == "w").Bytes})");
+        Mr(lines.Any(s => s.Contains("'w': not measured")), "the log says why: " + string.Join(" | ", lines.TakeLast(3)));
+
+        // alone again: measured; the remembered size keeps the largest
+        await using (var l = await r.AcquireAsync("tts", () => Task.FromResult(new MemoryStream())))
+        {
+            await l.EnsureRoomAsync();
+            dev.Allocated += 5;
+        }
+        Mr(r.Resident.Single(m => m.Key == "tts").Bytes == 5 && r.KnownSizes["tts"] == 7, $"a window alone measures: {r.Resident.Single(m => m.Key == "tts").Bytes}, remembered {r.KnownSizes["tts"]}");
         await Task.CompletedTask;
     });
 

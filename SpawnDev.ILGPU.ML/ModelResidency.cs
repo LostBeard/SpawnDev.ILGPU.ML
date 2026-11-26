@@ -83,10 +83,46 @@ public sealed class ModelResidency : IAsyncDisposable
         public int Generation;
         public bool DropWhenIdle;           // released while leased: dropped when the last lease ends
         public long LazyFrom = -1;          // a model that is not IDeviceSized: device bytes held when its lease asked for room (EnsureRoomAsync), measured again when the lease ends
+        public long LazyStartsAt;           // _growthStarts when that window opened (its own start included)
+        public bool LazyAlone;              // nothing else that grows the device (a load, another lazy window) was open when it opened
     }
 
+    // Measuring by growth (held after - held before) is only true when nothing else grew the device in the window. Loads and lazy windows (EnsureRoomAsync -> lease end,
+    // or -> the next growth start) share one rule. A growth start (a load, a lazy window opening) ENDS every lazy window open then: one that opened alone and saw no other
+    // start measures what the device gained since; in a prompt that runs its models one after another that is the model's own first run, though its lease stays open
+    // until the prompt ends. Before, the window ran to the lease's end and took in what loaded meanwhile (Lore, RX 590, "Speak and listen": Kokoro remembered at 2.56 GB
+    // = Kokoro + Parakeet's load; the largest size seen is the one remembered). A window or load that begins while a load is running is not measured.
     private int _loadsRunning;
-    private long _loadStarts;
+    private long _growthStarts;
+
+    /// <summary>A growth begins: ends the lazy windows open now (see above) and returns its start number. Call before counting the caller's own load as running.</summary>
+    private long StartGrowth(Entry? self)
+    {
+        long held = _device.HeldBytes;                                   // no lock held: the pools take their own
+        List<string>? notes = null;
+        long start;
+        lock (_sync)
+        {
+            long current = Interlocked.Read(ref _growthStarts);
+            foreach (var e in _entries.Values)
+            {
+                if (ReferenceEquals(e, self) || e.LazyFrom < 0) continue;
+                if (e.LazyAlone && current == e.LazyStartsAt && Volatile.Read(ref _loadsRunning) == 0)
+                {
+                    if (held - e.LazyFrom > 0)
+                    {
+                        e.Bytes = held - e.LazyFrom;
+                        if (e.Bytes > _knownBytes.GetValueOrDefault(e.Key)) _knownBytes[e.Key] = e.Bytes;
+                    }
+                }
+                else (notes ??= new()).Add($"[ModelResidency] '{e.Key}': not measured (another load ran in its window); keeps {e.Bytes / (1024 * 1024)} MB");
+                e.LazyFrom = -1;
+            }
+            start = Interlocked.Increment(ref _growthStarts);
+        }
+        if (notes != null) foreach (var n in notes) Log?.Invoke(n);
+        return start;
+    }
 
     private sealed class Holder(string key, Func<bool> isResident, Func<long> bytes, Func<Task<bool>> evict)
     {
@@ -211,12 +247,12 @@ public sealed class ModelResidency : IAsyncDisposable
         {
             T model;
             long heldBefore = _device.HeldBytes;
+            long startsAt = StartGrowth(null);
             bool alone = Interlocked.Increment(ref _loadsRunning) == 1;
-            long startsAt = Interlocked.Increment(ref _loadStarts);
             try { model = await load().ConfigureAwait(false) ?? throw new InvalidOperationException($"The load of '{key}' returned no model."); }
             catch (Exception ex) { Fail(entry, ex); throw; }
             finally { Interlocked.Decrement(ref _loadsRunning); }
-            alone &= Interlocked.Read(ref _loadStarts) == startsAt;          // no other load started while this one ran
+            alone &= Interlocked.Read(ref _growthStarts) == startsAt;        // no other load or lazy window started while this one ran
             bool lost, closed;
             long measured = -1;
             if (model is IDeviceSized sized)
@@ -358,9 +394,18 @@ public sealed class ModelResidency : IAsyncDisposable
         if (entry.Model is not IDeviceSized sized)
         {
             // not sized: a lazy load inside the lease is what the device holds more now than at its EnsureRoomAsync (held: idle scratch the run left in the pools is not counted)
-            long from;
-            lock (_sync) { from = entry.LazyFrom; entry.LazyFrom = -1; }
+            long from; bool alone;
+            lock (_sync)
+            {
+                from = entry.LazyFrom; entry.LazyFrom = -1;
+                alone = entry.LazyAlone && Interlocked.Read(ref _growthStarts) == entry.LazyStartsAt && Volatile.Read(ref _loadsRunning) == 0;
+            }
             if (from < 0) return;
+            if (!alone)
+            {
+                Log?.Invoke($"[ModelResidency] '{entry.Key}': not measured (another load ran in its window); keeps {entry.Bytes / (1024 * 1024)} MB");
+                return;
+            }
             now = _device.HeldBytes - from is > 0 and var grew ? grew : entry.Bytes;
         }
         else
@@ -389,7 +434,23 @@ public sealed class ModelResidency : IAsyncDisposable
                 if (known > 0 && bytes == 0) bytes = -1;                     // it holds all it was measured at: no room to make
             }
             if (bytes >= 0) await MakeRoomAsync(bytes, entry.Key).ConfigureAwait(false);
-            if (entry.Model is not IDeviceSized) { long now = _device.HeldBytes; lock (_sync) if (entry.LazyFrom < 0) entry.LazyFrom = now; }
+            if (entry.Model is not IDeviceSized)
+            {
+                bool open;
+                lock (_sync) open = entry.LazyFrom >= 0;
+                if (!open)
+                {
+                    long start = StartGrowth(entry);                       // ends the windows of the models before it
+                    long now = _device.HeldBytes;
+                    lock (_sync)
+                        if (entry.LazyFrom < 0)
+                        {
+                            entry.LazyFrom = now;
+                            entry.LazyAlone = Volatile.Read(ref _loadsRunning) == 0;
+                            entry.LazyStartsAt = start;
+                        }
+                }
+            }
         }
         finally { _room.Release(); }
     }

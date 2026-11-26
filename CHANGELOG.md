@@ -4,6 +4,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Model stores: a sidecar that cannot be read no longer reads as "no record"** (Lore, 2026-11-26: SpawnGen's server failed to load SD 1.5 twice with "being
+  used by another process" on the UNet and VAE `.meta` sidecars). `FileModelStore` swallowed every read error and returned no sidecar, so a complete model looked
+  unrecorded and the downloader started over from byte 0, truncating a multi-GB file; Lore's loads failed only because the lock was still held at the next
+  sidecar write. Now: sidecar reads share everything (read/write/delete) and retry a sharing violation (10 attempts, 10 ms doubling to 500 ms, about 2.1 s; settable),
+  a sidecar that still cannot be read THROWS; sidecar writes go to a temporary file and replace the sidecar atomically (a reader sees the old record or the new
+  one), retried the same way; `RemoveAsync` and the model file's open retry too. `OpfsModelCache`: NotFoundError is "no sidecar", NoModificationAllowedError
+  (another tab or worker holds it) is retried, anything else throws; `TrimAsync` keeps an entry whose sidecar it cannot read instead of evicting it first.
+  Test: `FileModelStore_SidecarHeldByAnotherHandle_WaitsInsteadOfForgetting` (Windows: a held sidecar is waited for on read and write, a sharing reader never
+  blocks a write, a hold longer than the retries throws).
+- `ModelResidency`: a lazy model's measuring window ends at the next growth start (another load, another lazy window), not only at its lease's end. In a prompt
+  that runs its models one after another, that is the model's own first run, though its lease stays open until the prompt ends. Before, the window ran to the
+  lease's end and took in what loaded meanwhile, and the largest size seen is the one remembered (Lore, RX 590, "Speak and listen": Kokoro remembered at 2.56 GB
+  = Kokoro + Parakeet's 2.4 GB load; Kokoro's file is 0.3 GB). A window or load that begins while another load is still running is not measured (it keeps its
+  prior size; logged "not measured"). Tested in `ModelResidency_NotSized_MeasuredByTheDevice` (Lore's prompt shape, and the overlapping case).
+
 ## 5.8.32 - 2026-11-26 (nuget.org) - model residency, faster browser cold starts and convolutions
 
 - NEW `ModelResidency` (one per accelerator, owned by the app; approved by TJ 2026-11-25): keeps models on the device while there is room, drops the least recently used idle one when the

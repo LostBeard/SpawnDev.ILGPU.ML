@@ -61,8 +61,9 @@ public class FileModelStore : IResumableModelStore
     public async Task<Stream?> OpenReadAsync(string key, CancellationToken cancellationToken = default)
     {
         if (!await ExistsAsync(key, cancellationToken).ConfigureAwait(false)) return null;
-        return new FileStream(PathFor(key), FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: 1 << 20, useAsync: true);
+        var path = PathFor(key);
+        return await RetrySharingAsync<Stream?>(() => Task.FromResult<Stream?>(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 1 << 20, useAsync: true)), cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -96,11 +97,11 @@ public class FileModelStore : IResumableModelStore
     }
 
     /// <inheritdoc/>
-    public Task RemoveAsync(string key, CancellationToken cancellationToken = default)
+    public async Task RemoveAsync(string key, CancellationToken cancellationToken = default)
     {
-        try { File.Delete(PathFor(key)); } catch (DirectoryNotFoundException) { }
-        try { File.Delete(MetaPathFor(key)); } catch (DirectoryNotFoundException) { }
-        return Task.CompletedTask;
+        // retried like the sidecar: PutAsync removes first, and a scanner holding the old file must not fail the put
+        foreach (var path in new[] { PathFor(key), MetaPathFor(key) })
+            await RetrySharingAsync(() => { try { File.Delete(path); } catch (DirectoryNotFoundException) { } return Task.FromResult(0); }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -176,6 +177,8 @@ public class FileModelStore : IResumableModelStore
     }
 
     /// <inheritdoc/>
+    /// <remarks>Written to a temporary file and moved over the sidecar, so a reader sees the old record or the new one, never a half-written one;
+    /// the temporary name ends in the sidecar suffix, so a listing never takes it for a model.</remarks>
     public async Task SetStateAsync(string key, string sourceRef, long totalBytes, long bytesWritten,
         bool complete, string? etag, CancellationToken cancellationToken = default)
     {
@@ -187,18 +190,132 @@ public class FileModelStore : IResumableModelStore
             .Append("complete=").Append(complete ? '1' : '0').Append('\n')
             .Append("etag=").Append(etag ?? "").Append('\n')
             .ToString();
-        await File.WriteAllTextAsync(MetaPathFor(key), text, cancellationToken).ConfigureAwait(false);
+        var meta = MetaPathFor(key);
+        var temp = PathFor(key) + "." + Guid.NewGuid().ToString("N") + ".tmp" + MetaSuffix;
+        try
+        {
+            await File.WriteAllTextAsync(temp, text, cancellationToken).ConfigureAwait(false);
+            await RetrySharingAsync(() => { ReplaceAtomically(temp, meta); return Task.FromResult(0); }, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            try { File.Delete(temp); } catch { /* best effort: the original failure is the one to report */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Moves <paramref name="source"/> over <paramref name="dest"/> in one step. On Windows File.Move cannot replace a file that is open, even by a reader that shares
+    /// delete (measured: ERROR_ACCESS_DENIED for as long as the reader holds it; on-access scanners open files exactly that way). A POSIX-semantics rename
+    /// (FileRenameInfoEx, NTFS since Windows 10 1709) replaces the name at once and leaves open handles on the old file; where the file system does not support it
+    /// (FAT, some network shares) this falls back to File.Move, which the caller retries while the target is held. Elsewhere rename already replaces atomically.
+    /// </summary>
+    private static void ReplaceAtomically(string source, string dest)
+    {
+        if (OperatingSystem.IsWindows() && PosixRename.TryReplace(source, Path.GetFullPath(dest))) return;
+        File.Move(source, dest, overwrite: true);
+    }
+
+    private static class PosixRename
+    {
+        private const uint DELETE = 0x00010000, FILE_ATTRIBUTE_NORMAL = 0x80, OPEN_EXISTING = 3;
+        private const int FileRenameInfoEx = 22;
+        private const uint FILE_RENAME_FLAG_REPLACE_IF_EXISTS = 0x1, FILE_RENAME_FLAG_POSIX_SEMANTICS = 0x2;
+        private const int ERROR_INVALID_FUNCTION = 1, ERROR_NOT_SUPPORTED = 50, ERROR_INVALID_PARAMETER = 87;
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, FileShare share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, IntPtr info, uint size);
+
+        /// <summary>True when replaced; false when the file system does not support it (the caller falls back). Any other failure throws, mapped like .NET's own
+        /// (ERROR_ACCESS_DENIED -> UnauthorizedAccessException, a sharing violation -> IOException with its HResult) so the caller's retry sees it.</summary>
+        public static bool TryReplace(string source, string fullDest)
+        {
+            using var handle = CreateFile(source, DELETE, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (handle.IsInvalid) throw Error(System.Runtime.InteropServices.Marshal.GetLastPInvokeError(), source);
+            // FILE_RENAME_INFO: { ULONG Flags (union with BOOLEAN ReplaceIfExists); HANDLE RootDirectory; DWORD FileNameLength (bytes); WCHAR FileName[] }
+            int rootOffset = IntPtr.Size, lengthOffset = rootOffset + IntPtr.Size, nameOffset = lengthOffset + 4;
+            int nameBytes = fullDest.Length * 2;
+            int size = nameOffset + nameBytes + 2;
+            IntPtr info = System.Runtime.InteropServices.Marshal.AllocHGlobal(size);
+            try
+            {
+                for (int i = 0; i < size; i++) System.Runtime.InteropServices.Marshal.WriteByte(info, i, 0);
+                System.Runtime.InteropServices.Marshal.WriteInt32(info, 0, (int)(FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS));
+                System.Runtime.InteropServices.Marshal.WriteInt32(info, lengthOffset, nameBytes);
+                System.Runtime.InteropServices.Marshal.Copy(fullDest.ToCharArray(), 0, info + nameOffset, fullDest.Length);
+                if (SetFileInformationByHandle(handle, FileRenameInfoEx, info, (uint)size)) return true;
+                int err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+                if (err is ERROR_INVALID_FUNCTION or ERROR_NOT_SUPPORTED or ERROR_INVALID_PARAMETER) return false;
+                throw Error(err, fullDest);
+            }
+            finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(info); }
+        }
+
+        private static Exception Error(int err, string path)
+        {
+            var e = System.Runtime.InteropServices.Marshal.GetExceptionForHR(unchecked((int)0x80070000) | err) ?? new IOException($"Win32 error {err}");
+            return e is UnauthorizedAccessException ? new UnauthorizedAccessException($"Access to '{path}' is denied.", e)
+                : e is IOException io ? new IOException($"Replacing '{path}': {io.Message}", io.HResult) : e;
+        }
     }
 
     private readonly record struct Meta(string Url, long Total, long Received, bool Complete, string? ETag);
 
+    /// <summary>How long a sidecar held open by another process (an on-access scanner, an indexer, a backup tool) is waited for: attempts and the
+    /// first delay, doubled per attempt up to <see cref="SharingRetryMaxDelayMs"/> (10 attempts, about 2.1 s of waiting in all by default).</summary>
+    public int SharingRetryAttempts { get; set; } = 10;
+    /// <summary>The first delay between attempts on a sharing violation, in milliseconds.</summary>
+    public int SharingRetryDelayMs { get; set; } = 10;
+    /// <summary>The longest delay between attempts on a sharing violation, in milliseconds.</summary>
+    public int SharingRetryMaxDelayMs { get; set; } = 500;
+
+    /// <summary>A file another handle holds: opening it reports ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33); replacing or deleting it reports
+    /// ERROR_ACCESS_DENIED (UnauthorizedAccessException) - measured: File.Move over a sidecar a reader holds without sharing. A real permission problem is also
+    /// access denied; it costs the retries and then surfaces unchanged.</summary>
+    private static bool IsHeldElsewhere(Exception e) => e is UnauthorizedAccessException
+        || e is IOException io && io is not FileNotFoundException and not DirectoryNotFoundException && (io.HResult & 0xFFFF) is 32 or 33;
+
+    private async Task<T> RetrySharingAsync<T>(Func<Task<T>> op, CancellationToken ct)
+    {
+        int delay = Math.Max(1, SharingRetryDelayMs);
+        for (int attempt = 1; ; attempt++)
+        {
+            try { return await op().ConfigureAwait(false); }
+            catch (Exception e) when (IsHeldElsewhere(e) && attempt < SharingRetryAttempts)
+            {
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+                delay = Math.Min(delay * 2, Math.Max(delay, SharingRetryMaxDelayMs));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the sidecar. Null means there is none. A sidecar that exists but cannot be read THROWS (after the sharing retries): reading it as
+    /// absent made a complete model look like an unrecorded one, and the downloader then started over from byte 0 - truncating a multi-GB file
+    /// because a scanner held a 200-byte sidecar for a moment (Lore, 2026-11-26: SD 1.5's UNet and VAE sidecars, "used by another process").
+    /// </summary>
     private async Task<Meta?> ReadMetaAsync(string key, CancellationToken ct)
     {
         var path = MetaPathFor(key);
-        if (!File.Exists(path)) return null;
-        try
+        string? text = await RetrySharingAsync<string?>(async () =>
         {
-            var text = await File.ReadAllTextAsync(path, ct).ConfigureAwait(false);
+            try
+            {
+                // Share everything: this read must never be the reason a writer's replace or another reader fails.
+                var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, useAsync: true);
+                await using (fs.ConfigureAwait(false))
+                using (var reader = new StreamReader(fs, Encoding.UTF8))
+                    return await reader.ReadToEndAsync(ct).ConfigureAwait(false);
+            }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
+        }, ct).ConfigureAwait(false);
+        if (text == null) return null;
+        {
             string url = ""; long total = -1, received = 0; bool complete = false; string? etag = null;
             foreach (var line in text.Split('\n'))
             {
@@ -217,6 +334,5 @@ public class FileModelStore : IResumableModelStore
             }
             return new Meta(url, total, received, complete, etag);
         }
-        catch { return null; }
     }
 }

@@ -191,7 +191,15 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             if (handle.Name.EndsWith(MetaSuffix, StringComparison.Ordinal) || handle is not FileSystemFileHandle file) continue;
             long size;
             try { size = await file.GetSize(); } catch { continue; }   // raced with a delete
-            var meta = await ReadMetaAsync(handle.Name).ConfigureAwait(false);
+            CacheEntryMeta? meta;
+            try { meta = await ReadMetaAsync(handle.Name).ConfigureAwait(false); }
+            catch
+            {
+                // a sidecar that cannot be read right now says nothing about the model: keep it (counted, never evicted), as a held file would be
+                pinned.Add(handle.Name);
+                entries.Add((handle.Name, size, true, long.MaxValue));
+                continue;
+            }
             bool complete = meta is { Complete: true } && (meta.Total < 0 || meta.Total == size);
             entries.Add((handle.Name, size, complete, complete ? meta!.Used : 0));
         }
@@ -568,14 +576,28 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         public long Used;   // unix ms of the last open (0 = never recorded); TrimAsync evicts the oldest first
     }
 
+    /// <summary>
+    /// Reads the sidecar; null means there is none (NotFoundError). Any other failure is retried while it is a lock held elsewhere (NoModificationAllowedError:
+    /// another tab or worker holds the file) and otherwise THROWN: reading it as absent made a complete model look unrecorded, and the downloader then
+    /// started over from byte 0 (the desktop store did exactly that, Lore 2026-11-26).
+    /// </summary>
     private async Task<CacheEntryMeta?> ReadMetaAsync(string cacheKey)
     {
-        try
+        string? text = null;
+        for (int attempt = 1, delay = 10; ; attempt++, delay = Math.Min(delay * 2, 500))
         {
-            using var handle = await _cacheDir!.GetFileHandle(cacheKey + MetaSuffix);
-            using var file = await handle.GetFile();
-            var text = await file.Text();
-            if (string.IsNullOrWhiteSpace(text)) return null;
+            try
+            {
+                using var handle = await _cacheDir!.GetFileHandle(cacheKey + MetaSuffix);
+                using var file = await handle.GetFile();
+                text = await file.Text();
+                break;
+            }
+            catch (JSException e) when (e.Name == "NotFoundError") { return null; }
+            catch (JSException e) when (e.Name == "NoModificationAllowedError" && attempt < 10) { await Task.Delay(delay).ConfigureAwait(false); }
+        }
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        {
 
             var meta = new CacheEntryMeta();
             foreach (var line in text.Split('\n'))
@@ -596,7 +618,6 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             }
             return meta;
         }
-        catch { return null; }
     }
 
     private async Task WriteMetaAsync(string cacheKey, CacheEntryMeta meta)
