@@ -731,9 +731,10 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 else if (w.IsHalf && ctx.Outputs[0].Shape.Length == 4 && reg.ConvGemm.Supports(batchN, inC, inH, inW, outC, kH, kW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]))
                     reg.ConvGemm.Run<float>(x.Data, w.HalfData, bias, ctx.Outputs[0].Data, batchN, inC, inH, inW, outC, kH, kW, stride, strideW,
                         padTop, padLeft, dilationH, dilationW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]);
-                else if (!LowPWeightDispatch.IsLowP(w) && ctx.Outputs[0].Shape.Length == 4 && reg.ConvGemm.SupportsExact(batchN, inC, inH, inW, outC, kH, kW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]))
-                    reg.ConvGemm.RunF32<float>(x.Data, w.Data, bias, ctx.Outputs[0].Data, batchN, inC, inH, inW, outC, kH, kW, stride, strideW,
-                        padTop, padLeft, dilationH, dilationW, ctx.Outputs[0].Shape[2], ctx.Outputs[0].Shape[3]);
+                // fp32 activations and fp32 weights take ForwardPadded's implicit GEMM, not Conv2DGemm.RunF32 (removed here 2026-11-25). MEASURED, RTX 4070, one backend at a time,
+                // Conv_DirectVsTiled_Crossover over MobileNetV2's 1x1, ResNet 3x3 and SD-VAE-sized 3x3 convolutions: ForwardPadded as fast or faster on CUDA, OpenCL and WebGPU
+                // (512->512 at 64x64: 4.25 / 3.71 / 4.37 ms against 4.91 / 4.02 / 5.68), the one exception 320->1280 at 7x7 by 0.1 ms on the desktop. And RunF32's 308 KB
+                // TiledGemm shader was 3.9 s of Chrome's cold compile: MobileNetV2's first run in the browser 2388 -> 907 ms, its second 94 -> 30 ms.
                 else if (LowPWeightDispatch.IsLowP(w)) // native low-p weight (NCHW group-1) -> generic low-p kernel, fp32 accumulate
                     LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN, strideW);

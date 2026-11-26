@@ -31,6 +31,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     lease's `EnsureRoomAsync` to the lease's end for a model that loads inside the lease (errs high: the run's scratch still held counts). Lore measured 0 GB for every SpawnGen model before.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **fp32 convolutions (fp32 activations and weights) run on the direct implicit-GEMM kernel again, not Conv2DGemm.RunF32.** NEW benchmark `Conv_DirectVsTiled_Crossover`
+  (RTX 4070, one backend at a time, MobileNetV2's 1x1, ResNet 3x3 and SD-VAE-sized 3x3 convolutions): the direct kernel is as fast or faster on CUDA, OpenCL and WebGPU
+  (512->512 at 64x64: 4.25 / 3.71 / 4.37 ms against 4.91 / 4.02 / 5.68), the one exception 320->1280 at 7x7 by 0.1 ms on the desktop; the outputs agree within 4e-6 of
+  their range. RunF32 brought TiledGemm.Gemm, a 308 KB shader that was 3.9 s of Chrome's cold compile. **MobileNetV2 in the browser: first run 2388 -> 849 ms, second
+  94 -> 30 ms, 11 -> 7 shaders, Chrome's compile 4.2 -> 0.23 s.** The fp16-activation route keeps RunF32 (not measured yet). Conv and model tests 905 / 0 on every backend.
+  (Tried first: TiledGemm with its inner loops kept rolled, 285 KB and slower to compile; Data: ILGPU's unused-helper text costs Dawn no measurable compile time.)
 - **Kernels load on first use, one by one** (ElementWiseKernels, NormalizationKernels, ActivationKernels, PoolingKernels, Conv2DKernel, GatherKernel, ScatterKernel,
   AttentionKernels): the first call of any one used to load the class's whole set, so MobileNetV2's first run compiled about 30 kernels it never runs (every element-wise
   kernel for one ReLU, every normalization for one BatchNorm), each a C# compile and a browser shader compile. Scoped run 1105 / 0 / 58 on every backend.

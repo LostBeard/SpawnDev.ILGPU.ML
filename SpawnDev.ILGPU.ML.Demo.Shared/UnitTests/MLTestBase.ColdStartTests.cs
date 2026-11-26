@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.UnitTesting;
@@ -17,7 +18,9 @@ public abstract partial class MLTestBase
     /// (keyed on the generated code) can answer it: both numbers are real compiles. The difference is what compiling a model's shaders in parallel, before its first run, can save.
     /// </summary>
     [TestMethod(Timeout = 600000)]
-    public async Task<string> ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel() => await RunTest(async accelerator =>
+    public async Task<string> ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel() => await RunTest(accelerator => ColdStartMobileNetV2(accelerator));
+
+    private async Task<string> ColdStartMobileNetV2(Accelerator accelerator)
     {
         if (accelerator is not WebGPUAccelerator web) throw new UnsupportedTestException("the browser's WebGPU shader compile");
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
@@ -51,13 +54,15 @@ public abstract partial class MLTestBase
             }
             sw.Restart(); await Run(); first = sw.Elapsed.TotalMilliseconds;
             sw.Restart(); await Run(); second = sw.Elapsed.TotalMilliseconds;
-            // MEASURED 2026-11-25 by compiling them here too: the single-mode variants are as large (GemmGatherF16Split 239 KB, GemmGatherBf16 203 KB, Gemm 308 KB): the size is the
-            // register tile's unrolling, not the modes. (Their compile times from that run, 5.0 and 5.2 s, are not usable: another session compiled shaders on the GPU meanwhile.
-            // Gemm's 3.9 s is from three runs on a quiet machine.)
+            // MEASURED 2026-11-25: TiledGemm.Gemm (308 KB, 3.9 s in Chrome on a quiet machine) came with every fp32 convolution through Conv2DGemm.RunF32 until that route was
+            // removed (Conv_DirectVsTiled_Crossover: the direct implicit GEMM is as fast or faster); its single-mode variants are as large (239 and 203 KB), so the size is the
+            // register tile, not the modes; keeping its inner loops rolled made it 285 KB and slower to compile. After: 7 shaders, 173 KB, 0.23 s, first run 849 ms (was 2388).
         }
         finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = prev; }
 
         var distinct = shaders.GroupBy(s => s.Wgsl).Select(g => g.First()).Where(s => s.Wgsl.Contains("fn main(")).ToList();
+        if (distinct.Count == 0)
+            throw new UnsupportedTestException("earlier tests on this page compiled every kernel MobileNetV2 uses: a cold start needs this test alone (PMT_FILTER=ColdStart_)");
         long kb = distinct.Sum(s => (long)s.Wgsl.Length) / 1024;
         var native = web.NativeAccelerator;
         var perShader = new List<(string Name, int Kb, double Ms)>();
@@ -87,5 +92,5 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[ColdStart] shader {s.Name}: {s.Kb} KB, {s.Ms:F0} ms");
         if (serial.Ok == 0 || all.Ok == 0) throw new Exception("no shader compiled: the measurement measured nothing. " + report);
         return report;
-    });
+    }
 }
