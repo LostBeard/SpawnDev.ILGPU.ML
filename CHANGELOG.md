@@ -9,6 +9,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   scratch is reclaimed before any model; an unknown size with a budget drops every idle model before the load; one model over the budget loads with a log line. `ReleaseAsync(tag)`, `ReleaseAllAsync`,
   `TrimAsync`, `Invalidate()` (lost device), `Register` / `Touch` / `EnsureRoomForAsync` for engines that load themselves, `Evicted` and `Log`. `IDeviceSized.DeviceBytes`. No budget set = nothing is
   ever dropped. Nothing uses it yet. Tests `ModelResidency_*` (fake device, 6) red-checked: leased eviction, reversed LRU, no drain, unknown size, swallowed load failure.
+- **SpawnDev.ILGPU 5.4.50** (forks 2.4.40): `Accelerator.DeviceMemoryBudgetBytes` / `AllocatedDeviceBytes`. `ModelResidency.BudgetBytes` now sets the accelerator's budget, so the manager, the
+  accelerator's free-memory answer and its idle-scratch reclaim use one number; `TrimAsync` and making room decide from the accelerator's own count of what is allocated.
+- NEW `InferenceSession : IDeviceSized`: `DeviceBytes` = weights, the quantized / low-precision copies it owns and its executors' pooled buffers, each buffer counted once. MEASURED against
+  `AllocatedDeviceBytes` (SqueezeNet, 7 backends): exact right after loading; after a run, kernel scratch is not in it (73.5 % counted on CUDA, OpenCL and WebGPU, 84.7 % Wasm, 100 % CPU, Velocity,
+  WebGL). Dispose gives back all but the accelerator's shared parameter caches (60-72 bytes). Tests `InferenceSession_DeviceBytes_MatchesTheAcceleratorsCount` and
+  `ModelResidency_RealDevice_BudgetDropsTheIdleModel` (two copies under a budget that holds one: the second drops the first and both classify the cat; every backend).
 - Docs: `streamThreshold` (CreateFromStreamAsync, CreateFromOnnxStreamAsync, ParseFromStreamAsync) has been ignored since July; its doc described the old behaviour.
 
 ## 5.8.31 - 2026-11-25 (nuget.org) - models load whole from hosts that compress responses

@@ -429,6 +429,23 @@ public partial class BufferPool : IDisposable, IDeviceMemoryReclaimer
         }
     }
 
+    /// <summary>The raw device buffer behind a typed one (what the accelerator allocated and counts).</summary>
+    internal static MemoryBuffer RawBuffer(MemoryBuffer buffer) => buffer is IArrayView { Buffer: { } raw } ? raw : buffer;
+
+    /// <summary>Adds every device buffer this pool holds (live, free, planned, fp16, low-precision weights) to <paramref name="into"/>: a set, so a buffer two owners list counts once.</summary>
+    internal void CollectDeviceBuffers(HashSet<MemoryBuffer> into)
+    {
+        lock (_sync)
+        {
+            foreach (var b in _allBuffers) into.Add(RawBuffer(b));
+            foreach (var b in _allHalfBuffers) into.Add(RawBuffer(b));
+            foreach (var b in _allLowPBuffers) into.Add(RawBuffer(b));
+            foreach (var b in _captureUnnamedSlots) into.Add(RawBuffer(b));
+            foreach (var b in _pendingFp16Temps) into.Add(RawBuffer(b));
+            foreach (var slot in _slotOf.Values) into.Add(RawBuffer(slot.Buffer));
+        }
+    }
+
     public BufferPool(Accelerator accelerator)
     {
         _accelerator = accelerator;

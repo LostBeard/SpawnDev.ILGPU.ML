@@ -19,7 +19,7 @@ namespace SpawnDev.ILGPU.ML;
 ///   weights_fp16.bin — FP16 weight blob
 ///   manifest_fp16.json — Weight tensor manifest
 /// </summary>
-public class InferenceSession : IDisposable
+public class InferenceSession : IDisposable, IDeviceSized
 {
     private readonly Accelerator _accelerator;
     private readonly OperatorRegistry _registry;
@@ -3357,6 +3357,34 @@ public class InferenceSession : IDisposable
             throw new InvalidDataException($"Download of '{url}' truncated: got {bytes.Length} bytes, Content-Length {fallbackCl.Value}.");
         onProgress?.Invoke("download", 100);
         return bytes;
+    }
+
+    /// <summary>
+    /// Bytes this session holds on the device now: its weights, the quantized / low-precision copies it owns, and the working buffers its executors keep between runs
+    /// (each counted once). Not counted: scratch the operators' kernels keep for themselves, a decode KV cache passed in by the caller, and the accelerator's own staging.
+    /// Right after loading it is exactly what the accelerator allocated for the session (<see cref="Accelerator.AllocatedDeviceBytes"/>, every backend); after runs, kernel scratch makes the
+    /// session hold more than this (SqueezeNet: 73.5 % counted on CUDA, OpenCL and WebGPU). <see cref="ModelResidency"/> decides from the accelerator's own count when a budget is set, so the
+    /// gap never lets it overfill the device. Test: <c>InferenceSession_DeviceBytes_MatchesTheAcceleratorsCount</c>.
+    /// </summary>
+    public long DeviceBytes
+    {
+        get
+        {
+            if (IsDisposed) return 0;
+            var buffers = new HashSet<MemoryBuffer>(ReferenceEqualityComparer.Instance);
+            _pool.CollectDeviceBuffers(buffers);
+            _executor.CollectDeviceBuffers(buffers);
+            foreach (var exec in _shapeExecutors.Values) exec.CollectDeviceBuffers(buffers);
+            if (_ownedBuffers != null)
+                foreach (var owned in _ownedBuffers)
+                {
+                    if (owned is MemoryBuffer mb) buffers.Add(Tensors.BufferPool.RawBuffer(mb));
+                    else if (owned is WeightLoader { DeviceBuffer: { } wb }) buffers.Add(Tensors.BufferPool.RawBuffer(wb));
+                }
+            long total = 0;
+            foreach (var b in buffers) if (!b.IsDisposed) total += b.LengthInBytes;
+            return total;
+        }
     }
 
     /// <summary>True once <see cref="Dispose"/> has run (its weights and buffers are freed).</summary>

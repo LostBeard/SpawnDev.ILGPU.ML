@@ -19,10 +19,98 @@ public abstract partial class MLTestBase
         public bool TryGetFree(out long free) { free = Free ?? 0; return Free != null; }
         public long ReclaimIdle(long bytes) { log.Add("reclaim"); long got = Math.Min(bytes, Idle); Idle -= got; if (Free != null) Free += got; return got; }
         public async Task DrainAsync() { log.Add("drain"); await Task.Yield(); }
+        public long? Budget;
+        public void SetBudget(long? bytes) => Budget = bytes;
     }
 
     private static void Mr(bool ok, string what) { if (!ok) throw new Exception(what); }
     private static string MrKeys(ModelResidency r) => string.Join(",", r.Resident.Select(m => m.Key));
+
+    /// <summary>
+    /// <see cref="InferenceSession.DeviceBytes"/> against the accelerator's own count of what it allocated (ILGPU <c>AllocatedDeviceBytes</c>, 5.4.50): never more than the session added,
+    /// exactly equal right after loading; after a run, never more (kernel scratch is not in it: SqueezeNet 73.5 % on CUDA, OpenCL and WebGPU, 2026-11-25). After Dispose the accelerator gets its bytes back.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task InferenceSession_DeviceBytes_MatchesTheAcceleratorsCount() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available for this backend");
+        var (pixels, width, height) = await LoadCatImage(http);
+        await accelerator.SynchronizeAsync();
+        long before = accelerator.AllocatedDeviceBytes;
+        long sessionBytes, added;
+        {
+            using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "models/squeezenet/model.onnx");
+            long afterCreate = accelerator.AllocatedDeviceBytes - before, createCounted = session.DeviceBytes;
+            var pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(session, accelerator);
+            await pipeline.ClassifyAsync(pixels, width, height, 5);
+            await accelerator.SynchronizeAsync();
+            added = accelerator.AllocatedDeviceBytes - before;
+            sessionBytes = session.DeviceBytes;
+            Console.WriteLine($"[DeviceBytes] {accelerator.AcceleratorType}: after create {createCounted} of {afterCreate} counted; after a run {sessionBytes} of {added} ({(added > 0 ? 100.0 * sessionBytes / added : 0):F1} %)");
+            Mr(createCounted == afterCreate, $"right after loading, the session's own size ({createCounted}) must be exactly what the accelerator allocated ({afterCreate})");
+            Mr(sessionBytes > 0, "the session reports no device bytes");
+            Mr(sessionBytes <= added, $"the session claims {sessionBytes} bytes but the accelerator allocated only {added} since it was created");
+        }
+        await accelerator.SynchronizeAsync();
+        long left = accelerator.AllocatedDeviceBytes - before;
+        Console.WriteLine($"[DeviceBytes] {accelerator.AcceleratorType}: after Dispose {left} bytes still allocated of the {added}");
+        // what stays is the accelerator's shared parameter caches (60-72 bytes measured on every backend), not the session's
+        Mr(left <= 4096, $"Dispose gave back all but {left} of the session's {added} bytes");
+    });
+
+    /// <summary>
+    /// The manager on a real accelerator with ILGPU's budget (5.4.50): two copies of SqueezeNet under a budget that holds one (plus what a run needs). Loading the second must drop the first, the
+    /// accelerator's count must fall back to one model's worth, and both copies must classify the cat. A budget that the manager sets is the accelerator's own (one number for both).
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task ModelResidency_RealDevice_BudgetDropsTheIdleModel() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available for this backend");
+        var (pixels, width, height) = await LoadCatImage(http);
+        var onnx = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var catClasses = new HashSet<int> { 281, 282, 283, 284, 285 };
+        async Task Classify(InferenceSession s, string which)
+        {
+            var results = await new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(s, accelerator).ClassifyAsync(pixels, width, height, 5);
+            Mr(results.Any(r => catClasses.Contains(r.ClassIndex)), $"{which}: no cat in the top 5 ({string.Join(", ", results.Select(r => r.ClassIndex))})");
+        }
+        await accelerator.SynchronizeAsync();
+        long before = accelerator.AllocatedDeviceBytes;
+        long oneModel, weights;
+        {   // measure one copy: its weights (exact right after loading), then with what a run keeps
+            using var probe = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(onnx, writable: false));
+            weights = probe.DeviceBytes;
+            await Classify(probe, "probe");
+            await accelerator.SynchronizeAsync();
+            oneModel = accelerator.AllocatedDeviceBytes - before;
+        }
+        await accelerator.SynchronizeAsync();
+        var log = new List<string>();
+        var evicted = new List<string>();
+        await using var r = new ModelResidency(accelerator) { Log = log.Add };
+        r.Evicted += e => evicted.Add(e.Key);
+        try
+        {
+            // A run's scratch is idle between runs and the budget reclaims it first, so "two do not fit" has to hold for the weights: one copy + a run's scratch (kept free as the reserve)
+            // + half a copy. MEASURED without this: a budget of 1.5 x (weights + scratch) held both copies once their idle scratch was reclaimed, and nothing was dropped.
+            long scratch = oneModel - weights;
+            r.ReserveBytes = scratch;
+            r.BudgetBytes = before + weights + scratch + weights / 2;
+            Mr(accelerator.DeviceMemoryBudgetBytes == r.BudgetBytes, "the manager's budget is the accelerator's");
+            await using (var a = await r.AcquireAsync("squeezenet-a", () => InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(onnx, writable: false)), onnx.Length))
+                await Classify(a.Model, "copy a");
+            await using (var b = await r.AcquireAsync("squeezenet-b", () => InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(onnx, writable: false)), onnx.Length))
+            {
+                await Classify(b.Model, "copy b");
+                await accelerator.SynchronizeAsync();
+                long held = accelerator.AllocatedDeviceBytes - before;
+                Console.WriteLine($"[DeviceBytes] {accelerator.AcceleratorType}: weights {weights}, with a run {oneModel}, budget {r.BudgetBytes - before} over the start, held with copy b {held}; dropped [{string.Join(",", evicted)}]; log: {string.Join(" | ", log)}");
+                Mr(string.Join(",", evicted) == "squeezenet-a", $"loading copy b drops copy a, and only it: [{string.Join(",", evicted)}]");
+                Mr(held <= r.BudgetBytes - before, $"after the drop the device holds {held} bytes for the models, more than the budget allows ({r.BudgetBytes - before})");
+            }
+        }
+        finally { await r.ReleaseAllAsync(); accelerator.DeviceMemoryBudgetBytes = null; }
+    });
 
     /// <summary>The kept model is reused; one over the budget drops the least recently used idle model first, after a drain; leased models are never dropped.</summary>
     [TestMethod(Timeout = 30000)]

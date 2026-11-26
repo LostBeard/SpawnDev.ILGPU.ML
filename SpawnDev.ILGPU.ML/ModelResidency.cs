@@ -48,6 +48,8 @@ public sealed class ModelResidency : IAsyncDisposable
         long ReclaimIdle(long bytes);
         /// <summary>Waits until no queued work can touch memory about to be freed.</summary>
         Task DrainAsync();
+        /// <summary>Sets the device's own budget (ILGPU <c>Accelerator.DeviceMemoryBudgetBytes</c>), so its free-memory answer and its idle-scratch reclaim use the same number.</summary>
+        void SetBudget(long? bytes);
     }
 
     private sealed class AcceleratorDevice(Accelerator accelerator) : IDevice
@@ -55,6 +57,7 @@ public sealed class ModelResidency : IAsyncDisposable
         public bool TryGetFree(out long free) => accelerator.TryGetFreeMemory(out free);
         public long ReclaimIdle(long bytes) => accelerator.ReclaimDeviceMemory(bytes);
         public Task DrainAsync() => accelerator.SynchronizeAsync();
+        public void SetBudget(long? bytes) => accelerator.DeviceMemoryBudgetBytes = bytes;
     }
 
     private sealed class Entry(string key)
@@ -99,7 +102,17 @@ public sealed class ModelResidency : IAsyncDisposable
     /// room (today's behaviour) and <see cref="Log"/> says once what to set. In a browser it must come from the app: a page gets no memory figure.
     /// Lowering it takes effect at the next <see cref="AcquireAsync"/> or at <see cref="TrimAsync"/>.
     /// </summary>
-    public long? BudgetBytes { get; set; }
+    public long? BudgetBytes
+    {
+        get => _budget;
+        set
+        {
+            if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+            _budget = value;
+            _device.SetBudget(value);
+        }
+    }
+    private long? _budget;
 
     /// <summary>Bytes kept free beyond a model's own, for a run's working set (default 0).</summary>
     public long ReserveBytes { get; set; }
@@ -245,11 +258,11 @@ public sealed class ModelResidency : IAsyncDisposable
     /// <summary>Drops every idle model; one in use when its last lease ends. Returns how many were dropped now.</summary>
     public Task<int> ReleaseAllAsync() => DropAsync(_ => true, ModelEvictionReason.Released);
 
-    /// <summary>Drops idle models, least recently used first, until the models are within <see cref="BudgetBytes"/> (after it was lowered). Returns how many were dropped.</summary>
+    /// <summary>Drops idle models, least recently used first, until <see cref="ReserveBytes"/> is free within <see cref="BudgetBytes"/> (after it was lowered), as the accelerator counts it. Returns how many were dropped.</summary>
     public async Task<int> TrimAsync()
     {
         await _room.WaitAsync().ConfigureAwait(false);
-        try { return await EvictUntilAsync(() => BudgetBytes is long b && ModelBytes() + ReserveBytes > b, ModelEvictionReason.Trimmed, null).ConfigureAwait(false); }
+        try { return await EvictUntilAsync(() => BudgetBytes != null && TryFree(0, out long free) && free < ReserveBytes, ModelEvictionReason.Trimmed, null).ConfigureAwait(false); }
         finally { _room.Release(); }
     }
 

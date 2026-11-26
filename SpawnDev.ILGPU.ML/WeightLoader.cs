@@ -36,6 +36,9 @@ public class WeightLoader : IDisposable
     /// </summary>
     private MemoryBuffer1D<float, Stride1D.Dense>? _weightBuffer;
 
+    /// <summary>The one device buffer holding every weight (null before loading and after disposal).</summary>
+    internal MemoryBuffer? DeviceBuffer => _weightBuffer;
+
     /// <summary>Weight tensor views: name → (offset, length) into the single weight buffer.</summary>
     private Dictionary<string, (long offset, int length)> _tensorSlices = new();
 

@@ -319,6 +319,14 @@ public class GraphExecutor : IDisposable
     /// </remarks>
     private List<MemoryBuffer1D<float, Stride1D.Dense>>? _retiredReadbackStaging;
 
+    /// <summary>Adds the device buffers this executor holds (its pool and its readback staging) to <paramref name="into"/>.</summary>
+    internal void CollectDeviceBuffers(HashSet<MemoryBuffer> into)
+    {
+        Pool.CollectDeviceBuffers(into);
+        if (_readbackStaging != null) into.Add(BufferPool.RawBuffer(_readbackStaging));
+        if (_retiredReadbackStaging != null) foreach (var b in _retiredReadbackStaging) into.Add(BufferPool.RawBuffer(b));
+    }
+
     /// <summary>The shared staging buffer, allocated on first use. See <see cref="_readbackStaging"/>.</summary>
     /// <remarks>
     /// 🔴 IT MUST FIT WHAT THE CALLER ASKS FOR. This was a fixed <see cref="MaxSmallReadbackElements"/>
