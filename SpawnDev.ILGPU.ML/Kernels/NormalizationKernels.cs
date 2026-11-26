@@ -678,33 +678,30 @@ public class NormalizationKernels : IDisposable
         int outC, float epsilon)
     {
         int perOut = (int)(weight.Length / outC);
-        FoldBnWeightKernel((int)weight.Length, weight, gamma, variance, perOut, epsilon);
-        FoldBnBiasKernel(outC, bias, foldedBias, gamma, beta, mean, variance, epsilon);
+        // one dispatch, one kernel to compile on the model's first run (it was two: Bones measured MobileNetV2's first run 100-200 ms slower with the fold)
+        FoldBnKernel((int)weight.Length + outC, weight, bias, foldedBias, gamma, beta, mean, variance, (int)weight.Length, perOut, epsilon);
     }
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float>? _foldBnWeightKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float> FoldBnWeightKernel
-        => _foldBnWeightKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float>(FoldBnWeightImpl);
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _foldBnBiasKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float> FoldBnBiasKernel
-        => _foldBnBiasKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(FoldBnBiasImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, float>? _foldBnKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, float> FoldBnKernel
+        => _foldBnKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, float>(FoldBnImpl);
 
-    private static void FoldBnWeightImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> weight, ArrayView1D<float, Stride1D.Dense> gamma, ArrayView1D<float, Stride1D.Dense> variance,
-        int perOut, float eps)
+    // threads 0..weightLength-1: the weight element, scaled in place; threads weightLength..: the folded bias of channel (i - weightLength). The expressions are
+    // BatchNormImpl's (the bias with the convolution's bias as x).
+    private static void FoldBnImpl(Index1D i, ArrayView1D<float, Stride1D.Dense> weight, ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> foldedBias, ArrayView1D<float, Stride1D.Dense> gamma, ArrayView1D<float, Stride1D.Dense> beta, ArrayView1D<float, Stride1D.Dense> mean, ArrayView1D<float, Stride1D.Dense> variance,
+        int weightLength, int perOut, float eps)
     {
-        int c = i / perOut;
-        weight[i] = weight[i] * (gamma[c] * (1f / MathF.Sqrt(variance[c] + eps)));
-    }
-
-    private static void FoldBnBiasImpl(Index1D c, ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> foldedBias, ArrayView1D<float, Stride1D.Dense> gamma,
-        ArrayView1D<float, Stride1D.Dense> beta, ArrayView1D<float, Stride1D.Dense> mean, ArrayView1D<float, Stride1D.Dense> variance, float eps)
-    {
-        // the same expression as BatchNormImpl with the convolution's bias as x
-        float invStd = 1f / MathF.Sqrt(variance[c] + eps);
-        foldedBias[c] = gamma[c] * (bias[c] - mean[c]) * invStd + beta[c];
+        if (i < weightLength)
+        {
+            int c = i / perOut;
+            weight[i] = weight[i] * (gamma[c] * (1f / MathF.Sqrt(variance[c] + eps)));
+        }
+        else
+        {
+            int c = i - weightLength;
+            float invStd = 1f / MathF.Sqrt(variance[c] + eps);
+            foldedBias[c] = gamma[c] * (bias[c] - mean[c]) * invStd + beta[c];
+        }
     }
 
     // Single-pass fused RMSNorm on any backend with a group (everything but WebGL's TF path); fuses the

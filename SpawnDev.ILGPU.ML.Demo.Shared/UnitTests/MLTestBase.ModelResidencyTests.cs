@@ -23,6 +23,8 @@ public abstract partial class MLTestBase
         public void SetBudget(long? bytes) => Budget = bytes;
         public long Allocated;               // what the device has allocated (a model that does not report its size is measured from it)
         public long AllocatedBytes => Allocated;
+        public long Reclaimable;             // idle scratch in the pools: allocated, not held
+        public long HeldBytes => Allocated - Reclaimable;
     }
 
     private static void Mr(bool ok, string what) { if (!ok) throw new Exception(what); }
@@ -243,6 +245,10 @@ public abstract partial class MLTestBase
         await using (var l = await r.AcquireAsync("big", () => Task.FromResult(new MemoryStream()), 20)) { }
         var room = lines.FirstOrDefault(s => s.Contains("room for 'big'")) ?? "";
         Mr(room.Contains("MB other") && room.Contains("dropping idle models"), "the make-room line says what is allocated and why it drops: " + string.Join(" | ", lines));
+        // a load that leaves idle scratch in the pools: 50 allocated, 30 of it reclaimable, the model holds 20 (Lore's overcount: scratch was measured as the model)
+        r.BudgetBytes = 1000;
+        await using (var l = await r.AcquireAsync("scratchy", () => { dev.Allocated += 50; dev.Reclaimable += 30; return Task.FromResult(new MemoryStream()); })) { }
+        Mr(r.Resident.Single(m => m.Key == "scratchy").Bytes == 20, $"only what the device holds counts, not its idle scratch ({r.Resident.Single(m => m.Key == "scratchy").Bytes})");
         await Task.CompletedTask;
     });
 

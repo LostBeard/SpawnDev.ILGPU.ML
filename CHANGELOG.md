@@ -39,6 +39,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     measurement itself waits for SpawnDev.ILGPU 5.4.51's ReclaimableDeviceBytes.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **SpawnDev.ILGPU 5.4.51** (`ReclaimableDeviceBytes`). ModelResidency measures a model that does not report its size by the growth of HELD bytes (allocated minus the idle
+  scratch the pools could give back), not raw allocation growth: Lore's RX 590 gate had 7.3 GB of "kept models" with 4.9 GB allocated, because a load's or run's idle scratch
+  was counted as the model. Test `ModelResidency_NotSized_MeasuredByTheDevice` (50 allocated, 30 idle: 20), red-checked (raw allocation: 50).
+- **1x1 convolution kernel** (`Conv2D1x1GemmImpl`, `Conv2DKernel.Use1x1Kernel`): 1x1, stride-1, unpadded convolutions read the input directly instead of through the im2col
+  decode (two integer divisions and the padding checks per element). Its own kernel: a branch inside the general one made OpenCL's 3x3 convolutions 7-10 % slower. 1x1 shapes
+  20-35 % faster on CUDA and OpenCL, 3x3 unchanged; MobileNetV2's WebGPU GPU time -18 / -19 % (alternated timed replays). **On by default on the desktop, off in the browser:**
+  there it is one more large kernel to compile on a model's first run (MobileNetV2 994 -> ~1280 ms, interpreted .NET + Chrome) for 0.3 - 1.6 ms a run.
+- The BatchNorm fold is one kernel (weight and bias in one dispatch: one compile on the first run, not two); the conv activation epilogue is not inlined (16 inlined copies
+  made the implicit-GEMM shader 58 -> 84 KB and Chrome's compile of it 87 -> 218 ms; now 61 KB). Conv and model tests 923 / 0 on every backend.
+- NEW measurement tests: `Warm_MobileNetV2_PassAB_GpuTime` / `Warm_MobileNetV2_1x1KernelAB_GpuTime` (two captured sessions in one page, alternated timed replays),
+  `ColdStart_MobileNetV2_No1x1Kernel`. Finding: at full GPU clocks MobileNetV2's whole WebGPU GPU time is 1.3 - 1.6 ms; most of a 13 - 18 ms warm run is host work.
 - **Conv -> Relu / Clip(0, 6) applied in the convolution's stores** (GraphOptimizer pass "convact"; `ML_OPT_SKIP=convact` turns it off). The NCHW direct, implicit-GEMM and
   depthwise kernels apply it with the standalone ops' own expressions (the same bits, -0 and NaN included); every other convolution path applies it in place after
   (`Conv2DKernel.ApplyActivationInPlace`). The code rides in the top byte of an int the kernels already take (ILGPU's kernel loaders allow no more parameters than they

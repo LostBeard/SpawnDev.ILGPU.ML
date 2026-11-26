@@ -99,11 +99,33 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense>,
         int, int, int, int, int, int, int, int, int, int>?
         _implicitGemmKernel;
+    private Action<KernelConfig,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>?
+        _implicitGemm1x1Kernel;
+
+    /// <summary>True when a convolution is a plain GEMM over its input: 1x1 kernel, stride 1, no padding, the output the input's size (Conv2D1x1GemmImpl).</summary>
+    /// <summary>
+    /// The 1x1 convolution kernel (Conv2D1x1GemmImpl) for 1x1, stride-1, unpadded convolutions; off = they take the general implicit-GEMM kernel (the same results). Default: on
+    /// the desktop, off in the browser. MEASURED (RTX 4070, MobileNetV2, 2026-11-26): it saves 18-19 % of the model's WebGPU GPU time (1.58 -> 1.28 ms at full clocks, alternated
+    /// timed replays) and makes 1x1 convolutions 20-35 % faster on CUDA and OpenCL, but in the browser it is one more large kernel to compile (interpreted .NET, then Chrome):
+    /// the first run 994 -> 1263 / 1300 ms, paid back only after some hundreds of runs. A page that runs a model many times (video) can turn it on.
+    /// </summary>
+    public static bool Use1x1Kernel = !OperatingSystem.IsBrowser();
+
+    private static bool Conv2D1x1Applies(int kH, int kW, int stride, int strideW, int padTop, int padLeft, int padBottom, int padRight, int inH, int inW, int outH, int outW)
+        => kH == 1 && kW == 1 && stride == 1 && strideW == 1 && padTop == 0 && padLeft == 0 && padBottom == 0 && padRight == 0 && inH == outH && inW == outW;
 
     /// <summary>Activation codes of the conv epilogue (<see cref="ForwardPadded"/>, <see cref="ForwardDepthwisePadded"/>): 0 none, 1 ReLU, 2 ReLU6 (Clip 0..6).</summary>
     public const int ActNone = 0, ActRelu = 1, ActRelu6 = 2;
 
-    // the same expressions as the standalone kernels (ElementWiseKernels.ReLUImpl, ClipImpl), so a fused activation gives the same bits (-0 and NaN included)
+    // the same expressions as the standalone kernels (ElementWiseKernels.ReLUImpl, ClipImpl), so a fused activation gives the same bits (-0 and NaN included).
+    // NOT inlined (as KernelMath.Activate): the implicit-GEMM epilogue calls it 16 times per thread, and inlined, its branches made that shader 58 -> 84 KB and Chrome's
+    // compile of it 87 -> 218 ms (MobileNetV2's cold first run, 2026-11-26).
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static float ConvAct(float v, int act)
     {
         if (act == ActRelu) return v > 0f ? v : 0f;
@@ -259,6 +281,132 @@ public class Conv2DKernel : IDisposable
     /// Conv2D NCHW: one thread per output element. inC, inH, inW, outC, kH, kW,
     /// stride, padding, dilationH, dilationW are captured as scalar parameters.
     /// </summary>
+
+    // Conv2DImplicitGemmImpl for a 1x1, stride-1, unpadded convolution (Conv2D1x1Applies): the same signature, tiles, accumulation order and stores, with the B tile read
+    // as input[k, n] instead of decoding each element through the im2col (two integer divisions and the padding checks per element). Its own kernel, not a branch in the
+    // general one: the branch made OpenCL's 3x3 convolutions 7-10 % slower. MEASURED (RTX 4070, Conv_DirectVsTiled_Crossover): MobileNetV2's 1x1 shapes 20-35 % faster on
+    // CUDA and OpenCL.
+    private static void Conv2D1x1GemmImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kHW,
+        int strideDilHW, int padTL, int outH, int outW, int numTilesN)
+    {
+        int act = numTilesN >> 24; numTilesN &= 0xFFFFFF;   // the activation rides in the top byte (ConvActPack)
+        // strideDilHW = (strideH << 24) | (strideW << 16) | (dilationH << 8) | dilationW - LoadStreamKernel's typed
+        // loaders cap at 14 params, so the small scalars share ints (validated on the host - see Pack16).
+        int strideH = strideDilHW >> 24, strideW = (strideDilHW >> 16) & 0xFF;
+        int kH = kHW >> 16, kW = kHW & 0xFFFF;
+        int padTop = padTL >> 16, padLeft = padTL & 0xFFFF;
+        int dilationH = (strideDilHW >> 8) & 0xFF, dilationW = strideDilHW & 0xFF;
+
+        int K = inC * kH * kW;
+        int N = outH * outW;
+
+        // Batch from Grid.IdxY (DAv3 multi-view); batch=1 dispatches Y=1 so both bases are 0.
+        int batch = Grid.IdxY;
+        int inBatchBase = batch * inC * inH * inW;
+        int outBatchBase = batch * outC * N;
+
+        var aTile = SharedMemory.Allocate<float>(RbTile * RbBlock); // weights: 64 outC x 16 k
+        var bTile = SharedMemory.Allocate<float>(RbBlock * RbTile); // patches: 16 k x 64 n
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;  // outC tile
+        int tileCol = tileIdx % numTilesN;  // output-pixel tile
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / RbBlock;
+        int threadCol = localIdx % RbBlock;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+        float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+        float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + RbBlock - 1) / RbBlock;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            // A tile: plain weight loads (row-major [outC, K] - coalesced along k).
+            for (int r = 0; r < RbReg; r++)
+            {
+                int oc = tileRow * RbTile + threadRow * RbReg + r;
+                int kk = t * RbBlock + threadCol;
+                int sIdx = (threadRow * RbReg + r) * RbBlock + threadCol;
+                aTile[sIdx] = (oc < outC && kk < K) ? weight[oc * K + kk] : 0f;
+            }
+            // B tile: a 1x1, stride-1, unpadded convolution reads input[k, n] directly (k = input channel, n = output pixel = input pixel)
+            for (int r = 0; r < RbReg; r++)
+            {
+                int kk = t * RbBlock + threadRow;
+                int n = tileCol * RbTile + threadCol * RbReg + r;
+                bTile[threadRow * RbTile + threadCol * RbReg + r] = (kk < K && n < N) ? input[inBatchBase + kk * N + n] : 0f;
+            }
+
+            Group.Barrier();
+
+            for (int k = 0; k < RbBlock; k++)
+            {
+                float a0 = aTile[(threadRow * RbReg + 0) * RbBlock + k];
+                float a1 = aTile[(threadRow * RbReg + 1) * RbBlock + k];
+                float a2 = aTile[(threadRow * RbReg + 2) * RbBlock + k];
+                float a3 = aTile[(threadRow * RbReg + 3) * RbBlock + k];
+                float b0 = bTile[k * RbTile + threadCol * RbReg + 0];
+                float b1 = bTile[k * RbTile + threadCol * RbReg + 1];
+                float b2 = bTile[k * RbTile + threadCol * RbReg + 2];
+                float b3 = bTile[k * RbTile + threadCol * RbReg + 3];
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01); c02 = float.MultiplyAddEstimate(a0, b2, c02); c03 = float.MultiplyAddEstimate(a0, b3, c03);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11); c12 = float.MultiplyAddEstimate(a1, b2, c12); c13 = float.MultiplyAddEstimate(a1, b3, c13);
+                c20 = float.MultiplyAddEstimate(a2, b0, c20); c21 = float.MultiplyAddEstimate(a2, b1, c21); c22 = float.MultiplyAddEstimate(a2, b2, c22); c23 = float.MultiplyAddEstimate(a2, b3, c23);
+                c30 = float.MultiplyAddEstimate(a3, b0, c30); c31 = float.MultiplyAddEstimate(a3, b1, c31); c32 = float.MultiplyAddEstimate(a3, b2, c32); c33 = float.MultiplyAddEstimate(a3, b3, c33);
+            }
+
+            Group.Barrier();
+        }
+
+        // Epilogue: C[oc, n] = acc + bias[oc] (bias always read, matching the naive kernel's contract).
+        int baseOc = tileRow * RbTile + threadRow * RbReg;
+        int baseN = tileCol * RbTile + threadCol * RbReg;
+        if (baseOc + 0 < outC)
+        {
+            float bb = bias[baseOc + 0];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 0] = ConvAct(c00 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 1] = ConvAct(c01 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 2] = ConvAct(c02 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 3] = ConvAct(c03 + bb, act);
+        }
+        if (baseOc + 1 < outC)
+        {
+            float bb = bias[baseOc + 1];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 0] = ConvAct(c10 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 1] = ConvAct(c11 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 2] = ConvAct(c12 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 3] = ConvAct(c13 + bb, act);
+        }
+        if (baseOc + 2 < outC)
+        {
+            float bb = bias[baseOc + 2];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 0] = ConvAct(c20 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 1] = ConvAct(c21 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 2] = ConvAct(c22 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 3] = ConvAct(c23 + bb, act);
+        }
+        if (baseOc + 3 < outC)
+        {
+            float bb = bias[baseOc + 3];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 0] = ConvAct(c30 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 1] = ConvAct(c31 + bb, act);
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 2] = ConvAct(c32 + bb, act);
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 3] = ConvAct(c33 + bb, act);
+        }
+    }
+
+    /// <summary>
+    /// Conv2D NCHW: one thread per output element. inC, inH, inW, outC, kH, kW,
+    /// stride, padding, dilationH, dilationW are captured as scalar parameters.
+    /// </summary>
+
     private static void Conv2DImpl(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -440,10 +588,15 @@ public class Conv2DKernel : IDisposable
             // 960->320 at 7x7 0.44 -> 0.14 ms CUDA, 0.37 -> 0.14 OpenCL; 320->1280 0.24 -> 0.06 both; nothing slower; MobileNetV2's WebGPU GPU time 5.69 -> 4.69 ms.
             && gemmK >= RbBlock && outC >= RbReg)
         {
-            _implicitGemmKernel ??= _accelerator.LoadStreamKernel<
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                int, int, int, int, int, int, int, int, int, int>(Conv2DImplicitGemmImpl);
+            var gemm = Use1x1Kernel && Conv2D1x1Applies(kH, kW, stride, strideW, padTop, padLeft, padBottom, padRight, inH, inW, outH, outW)
+                ? (_implicitGemm1x1Kernel ??= _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int, int, int, int, int, int, int, int>(Conv2D1x1GemmImpl))
+                : (_implicitGemmKernel ??= _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int, int, int, int, int, int, int, int>(Conv2DImplicitGemmImpl));
             int numTilesM = (outC + RbTile - 1) / RbTile;
             int numTilesN = (gemmN + RbTile - 1) / RbTile;
             var cfg = new KernelConfig(
@@ -451,7 +604,7 @@ public class Conv2DKernel : IDisposable
                 new Index2D(RbBlock * RbBlock, 1));
             if ((uint)dilationH > 0xFF || (uint)dilationW > 0xFF || (uint)stride > 0x7F || (uint)strideW > 0xFF)
                 throw new NotSupportedException($"Conv2D stride {stride}x{strideW} / dilation {dilationH}x{dilationW} exceeds the implicit-GEMM packed range (stride H 0..127, W 0..255, dilation 0..255)");
-            _implicitGemmKernel(cfg, input, weight, bias, output,
+            gemm(cfg, input, weight, bias, output,
                 inC, inH, inW, outC, Pack16(kH, kW, "kernel size"),
                 (stride << 24) | (strideW << 16) | (dilationH << 8) | dilationW,
                 Pack16(padTop, padLeft, "begin pads"), outH, outW, ConvActPack(numTilesN, activation));

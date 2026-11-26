@@ -25,6 +25,16 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 600000)]
     public async Task<string> ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel() => await RunTest(accelerator => ColdStartMobileNetV2(accelerator));
 
+    /// <summary>The same with <see cref="Conv2DKernel.Use1x1Kernel"/> off (1x1 convolutions on the general kernel): what the 1x1 kernel costs a first run. Run it alone (a cold page).</summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task<string> ColdStart_MobileNetV2_No1x1Kernel() => await RunTest(async accelerator =>
+    {
+        bool was = Conv2DKernel.Use1x1Kernel;
+        Conv2DKernel.Use1x1Kernel = false;
+        try { return "1x1 kernel off: " + await ColdStartMobileNetV2(accelerator); }
+        finally { Conv2DKernel.Use1x1Kernel = was; }
+    });
+
     /// <summary>
     /// The browser's "device" stage of a cold start (Bones, 2026-11-26: ~400 ms of MobileNetV2's 1.5 s AOT cold visit), split: the builder, the WebGPU and WebGL probes, the context,
     /// the WebGPU device. Once the way most pages do it (AllAcceleratorsAsync, then the preferred accelerator) and once WebGPU alone. The page already holds a device, so the browser's
@@ -149,10 +159,16 @@ public abstract partial class MLTestBase
     /// alternated (GPU timestamps, no host time), medians of 7 each. Env WARM_AB_PASS names the pass (default convact). A measurement.
     /// </summary>
     [TestMethod(Timeout = 300000)]
-    public async Task<string> Warm_MobileNetV2_PassAB_GpuTime() => await RunTest(async accelerator =>
+    public async Task<string> Warm_MobileNetV2_PassAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator,
+        Environment.GetEnvironmentVariable("WARM_AB_PASS") is { Length: > 0 } p ? p : "convact"));
+
+    /// <summary>The same A/B for the 1x1 convolution kernel (<see cref="Conv2DKernel.Use1x1Kernel"/> off / on): what it saves per warm run, against what it costs a first run.</summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task<string> Warm_MobileNetV2_1x1KernelAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator, "1x1"));
+
+    private async Task<string> WarmPassAB(Accelerator accelerator, string pass)
     {
         if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("WebGPU timestamps");
-        string pass = Environment.GetEnvironmentVariable("WARM_AB_PASS") is { Length: > 0 } p ? p : "convact";
         var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
         var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
         var rng = new Random(5);
@@ -162,7 +178,10 @@ public abstract partial class MLTestBase
         async Task<(InferenceSession S, Graph.SessionGraphCapture C)> Make(bool skip)
         {
             var saved = Environment.GetEnvironmentVariable("ML_OPT_SKIP");
-            Environment.SetEnvironmentVariable("ML_OPT_SKIP", skip ? (string.IsNullOrEmpty(saved) ? pass : saved + "," + pass) : saved);
+            bool saved1x1 = Conv2DKernel.Use1x1Kernel;
+            // pass "1x1": the 1x1 convolution kernel off in the "off" session (a kernel switch, not an optimizer pass; the capture records whichever kernel ran)
+            if (pass == "1x1") Conv2DKernel.Use1x1Kernel = !skip;
+            else Environment.SetEnvironmentVariable("ML_OPT_SKIP", skip ? (string.IsNullOrEmpty(saved) ? pass : saved + "," + pass) : saved);
             try
             {
                 var s = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false));
@@ -171,7 +190,7 @@ public abstract partial class MLTestBase
                 if (!c.IsCaptured) throw new Exception("no capture: " + c.CaptureStatus);
                 return (s, c);
             }
-            finally { Environment.SetEnvironmentVariable("ML_OPT_SKIP", saved); }
+            finally { Environment.SetEnvironmentVariable("ML_OPT_SKIP", saved); Conv2DKernel.Use1x1Kernel = saved1x1; }
         }
         var (sOff, cOff) = await Make(skip: true);
         var (sOn, cOn) = await Make(skip: false);
@@ -187,7 +206,7 @@ public abstract partial class MLTestBase
             return report;
         }
         finally { cOff.Dispose(); cOn.Dispose(); sOff.Dispose(); sOn.Dispose(); }
-    });
+    }
 
     private async Task<string> ColdStartMobileNetV2(Accelerator accelerator)
     {
