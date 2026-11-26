@@ -9,7 +9,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   unrecorded and the downloader started over from byte 0, truncating a multi-GB file; Lore's loads failed only because the lock was still held at the next
   sidecar write. Now: sidecar reads share everything (read/write/delete) and retry a sharing violation (10 attempts, 10 ms doubling to 500 ms, about 2.1 s; settable),
   a sidecar that still cannot be read THROWS; sidecar writes go to a temporary file and replace the sidecar atomically (a reader sees the old record or the new
-  one), retried the same way; `RemoveAsync` and the model file's open retry too. `OpfsModelCache`: NotFoundError is "no sidecar", NoModificationAllowedError
+  one), retried the same way. On Windows the replace is a POSIX-semantics rename (FileRenameInfoEx, NTFS): measured, File.Move cannot replace a sidecar
+  that a reader sharing delete holds open (access denied for as long as it is held), and on-access scanners open files exactly that way; other file systems fall
+  back to File.Move. A held file reports access denied on replace and a sharing violation on open: both are retried. `RemoveAsync` and the model file's open retry too. `OpfsModelCache`: NotFoundError is "no sidecar", NoModificationAllowedError
   (another tab or worker holds it) is retried, anything else throws; `TrimAsync` keeps an entry whose sidecar it cannot read instead of evicting it first.
   Test: `FileModelStore_SidecarHeldByAnotherHandle_WaitsInsteadOfForgetting` (Windows: a held sidecar is waited for on read and write, a sharing reader never
   blocks a write, a hold longer than the retries throws).
