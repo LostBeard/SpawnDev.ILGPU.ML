@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.34 - 2026-11-26 (nuget.org) - browser shader cache for returning visitors, deterministic random operators
+
 - **Browser: a returning visitor's shaders are imported, not generated again** (`ShaderCacheStore`, on by default in the browser on WebGPU). A model's cold
   first run was mostly ILGPU translating kernels to WGSL in the browser's .NET (MobileNetV2: the first Conv node 450 ms of a ~770 ms first run, loading the
   61 KB implicit-GEMM kernel; shader resolve 8-9 ms, Chrome's compile async), every visit. ILGPU's session export / import (SpawnDev.ILGPU

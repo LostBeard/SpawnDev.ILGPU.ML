@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.33</Version>
-		<PackageReleaseNotes>v5.8.33 - on SpawnDev.ILGPU 5.4.53. WebGPU: a captured replay ends with its submit instead of a GPU wait (Chrome charges ~2.9 ms per waited submit): MobileNetV2 captured replay with readback 8.0 to 5.1 ms. Convolutions: a 32x32-tile implicit-GEMM kernel for small grids, bit-identical to the 64x64 kernel (MobileNetV2 WebGPU GPU time 1.58 to 1.24 ms, desktop 3x3 at 7x7 1.8x; on by default on the desktop, off in the browser where it costs a first run 72 ms). Model stores: a sidecar that cannot be read throws instead of reading as no record (a scanner holding it made a complete model re-download from byte 0); atomic sidecar writes. ModelResidency: a lazy model is measured at its own first run, not charged for models that load after it in the same prompt.</PackageReleaseNotes>
+		<Version>5.8.34</Version>
+		<PackageReleaseNotes>v5.8.34 - on SpawnDev.ILGPU 5.4.54. Browser: ShaderCacheStore keeps the WebGPU shaders a visit generated (OPFS) and imports them on the next visit before any kernel loads, so a returning visitor skips ILGPU translating kernels to WGSL in the browser (MobileNetV2: a fresh accelerator first run 279-326 to 45-60 ms); on by default in the browser, stamped entries reject a rebuilt kernel. InferenceSession.RandomAtMean (random operators output their mean: the Stable Diffusion VAE encoders become deterministic) and RandomSeed (repeatable random operators).</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
