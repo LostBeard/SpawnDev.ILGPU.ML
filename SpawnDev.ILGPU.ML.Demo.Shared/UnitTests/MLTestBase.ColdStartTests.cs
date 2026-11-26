@@ -166,6 +166,48 @@ public abstract partial class MLTestBase
                               $"; outside the loop {(runMs - loop) / Prof:F2}), readback incl. GPU wait {readMs / Prof:F2} ms");
             Console.WriteLine($"[ColdStart] node loop by op (per run): " + string.Join(", ", byOp.OrderByDescending(o => o.Value.Ms).Take(12)
                 .Select(o => $"{o.Key} x{o.Value.N / Prof} {o.Value.Ms / Prof:F2} ms {o.Value.Alloc / Prof / 1024} KB")));
+
+            // the fixed round trips, with the GPU idle: a sync with nothing queued, and the 1000-float readback alone (after a run and a sync)
+            var syncT = new List<double>(); var readT = new List<double>(); var runSyncT = new List<double>();
+            for (int i = 0; i < Prof; i++)
+            {
+                var s2 = Stopwatch.StartNew();
+                await accelerator.SynchronizeAsync();
+                syncT.Add(s2.Elapsed.TotalMilliseconds);
+                inBuf.CopyFromCPU((i & 1) == 0 ? picA : picB);
+                var outs = await session.RunAsync(new Dictionary<string, Tensor> { [inName] = new Tensor(inBuf.View, shape) });
+                s2.Restart();
+                await accelerator.SynchronizeAsync();
+                runSyncT.Add(s2.Elapsed.TotalMilliseconds);
+                s2.Restart();
+                await outs[outName].Data.SubView(0, 1000).CopyToHostAsync();
+                readT.Add(s2.Elapsed.TotalMilliseconds);
+            }
+            static double Med(List<double> l) { l.Sort(); return l[l.Count / 2]; }
+            Console.WriteLine($"[ColdStart] round trips (median of {Prof}): empty SynchronizeAsync {Med(syncT):F2} ms; after RunAsync, SynchronizeAsync (GPU finishing the run) {Med(runSyncT):F2} ms, " +
+                              $"then the 1000-float readback with the GPU idle {Med(readT):F2} ms");
+
+            // the GPU starts only when the run's one command buffer is submitted at its end (MobileNetV2 is ~0.6 GFLOP, the submit budget 128): submitting during the run lets
+            // it start while the host still encodes. Budgets alternated (A B C A B C), outputs compared bit for bit.
+            double savedBudget = Graph.GraphExecutor.SubmitWorkBudgetFlops;
+            var budgets = new[] { savedBudget, 0.15e9, 0.05e9 };
+            var med = new double[budgets.Length][]; for (int b = 0; b < budgets.Length; b++) med[b] = new double[2];
+            var outsBy = new float[budgets.Length][];
+            try
+            {
+                for (int round = 0; round < 2; round++)
+                    for (int b = 0; b < budgets.Length; b++)
+                    {
+                        Graph.GraphExecutor.SubmitWorkBudgetFlops = budgets[b];
+                        for (int i = 0; i < 3; i++) await Run(direct, picA);
+                        med[b][round] = await Median(direct);
+                        outsBy[b] = await Run(direct, picA);
+                    }
+            }
+            finally { Graph.GraphExecutor.SubmitWorkBudgetFlops = savedBudget; }
+            int bd = 0; for (int b = 1; b < budgets.Length; b++) for (int i = 0; i < 1000; i++) if (BitConverter.SingleToInt32Bits(outsBy[b][i]) != BitConverter.SingleToInt32Bits(outsBy[0][i])) bd++;
+            Console.WriteLine($"[ColdStart] submit budget A/B (warm median, two alternated rounds): " +
+                              string.Join(", ", budgets.Select((v, b) => $"{v / 1e9:G3} GFLOP {med[b][0]:F1} / {med[b][1]:F1} ms")) + $"; outputs differ in {bd} values");
         }
         var dA = await Run(direct, picA); var dB = await Run(direct, picB);
         using var capture = new Graph.SessionGraphCapture(session, accelerator);
