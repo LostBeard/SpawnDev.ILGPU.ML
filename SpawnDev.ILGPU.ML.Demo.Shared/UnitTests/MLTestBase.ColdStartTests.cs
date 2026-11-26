@@ -101,6 +101,40 @@ public abstract partial class MLTestBase
         var direct = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)session.RunAsync;
         for (int i = 0; i < 8; i++) await Run(direct, (i & 1) == 0 ? picA : picB);
         double directMs = await Median(direct);
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+        {
+            // the run ends with a submit, not a completion wait: the readback right after waits for the GPU anyway (one round trip instead of two)
+            bool savedSkip = session.SkipCompletionWait;
+            double skipMs, waitMs, waitAgain; float[] sA, wA;
+            try
+            {
+                session.SkipCompletionWait = false; waitMs = await Median(direct); wA = await Run(direct, picA);
+                session.SkipCompletionWait = true; skipMs = await Median(direct); sA = await Run(direct, picA);
+                session.SkipCompletionWait = false; waitAgain = await Median(direct);
+            }
+            finally { session.SkipCompletionWait = savedSkip; }
+            int sd = 0; for (int i = 0; i < 1000; i++) if (BitConverter.SingleToInt32Bits(sA[i]) != BitConverter.SingleToInt32Bits(wA[i])) sd++;
+            Console.WriteLine($"[ColdStart] SkipCompletionWait (WebGPU, the default): warm median {skipMs:F1} ms against {waitMs:F1} / {waitAgain:F1} ms with the completion wait (before / after); outputs differ in {sd} of 1000");
+        }
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+        {
+            // where a plain warm run's host time goes: ILGPU's per-dispatch phases and its GPU waits, averaged over 20 runs (profiling adds a little of its own)
+            const int Prof = 20;
+            var B = typeof(global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend);
+            global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ResetDispatchProfiling();
+            global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = true;
+            var swp = Stopwatch.StartNew();
+            try { for (int i = 0; i < Prof; i++) await Run(direct, (i & 1) == 0 ? picA : picB); }
+            finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = false; }
+            double wall = swp.Elapsed.TotalMilliseconds / Prof;
+            double P(string f) => Convert.ToDouble(B.GetField(f)!.GetValue(null)) / Prof;
+            double resolve = P("ProfileCpuShaderResolveMs"), args = P("ProfileCpuArgBuildMs"), bind = P("ProfileCpuBindGroupMs"), enc = P("ProfileCpuEncodeMs"),
+                   submit = P("ProfileBatchSubmitMs"), sync = P("ProfileSyncWaitMs"), readback = P("ProfileReadbackWaitMs");
+            double dispatches = P("ProfileCpuDispatchCount");
+            double rest = wall - resolve - args - bind - enc - submit - sync - readback;
+            Console.WriteLine($"[ColdStart] host split per warm run (WebGPU, {Prof} runs, {dispatches:F0} dispatches each): wall {wall:F1} ms = shader resolve {resolve:F2}, args {args:F2}, " +
+                              $"bind groups {bind:F2}, encode {enc:F2}, submit {submit:F2}, sync wait {sync:F2}, readback wait {readback:F2}, the rest (graph executor, pool, upload, .NET) {rest:F1}");
+        }
         var dA = await Run(direct, picA); var dB = await Run(direct, picB);
         using var capture = new Graph.SessionGraphCapture(session, accelerator);
         var captured = (Func<Dictionary<string, Tensor>, Task<Dictionary<string, Tensor>>>)capture.RunAsync;

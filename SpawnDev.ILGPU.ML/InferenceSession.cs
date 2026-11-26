@@ -2987,12 +2987,14 @@ public class InferenceSession : IDisposable, IDeviceSized
     }
 
     /// <summary>
-    /// WebGPU only, opt-in: <see cref="RunAsync"/> ends with a SUBMIT instead of awaiting GPU completion
-    /// (<see cref="Graph.GraphExecutor.SkipCompletionWait"/>). For callers that only feed the outputs to more GPU work
-    /// (a render pass, another session) - everything stays ordered on the one WebGPU queue. Firefox resolves the
-    /// completion wait on a ~100 ms poll, so this is the difference between ~10 and full-rate video there.
+    /// WebGPU only, ON by default (since 2026-11-26; opt-in before): <see cref="RunAsync"/> ends with a SUBMIT instead of awaiting GPU completion
+    /// (<see cref="Graph.GraphExecutor.SkipCompletionWait"/>). Everything stays ordered on the one WebGPU queue: further GPU work (a render pass, another session) runs after
+    /// it, a readback (mapAsync) waits for it, pooled buffers are re-used only by work queued after it, and SpawnDev.ILGPU submits pending work before any host write. The
+    /// completion wait was a second round trip before the readback's own: MEASURED (RTX 4070, Chrome, MobileNetV2 warm run with readback) 14.5 / 18.9 ms -> 11.7 / 16.3 ms,
+    /// outputs identical; Firefox resolves the wait on a ~100 ms poll, so there it is the difference between ~10 and full-rate video. Set false where a run must have
+    /// completed when RunAsync returns (timing a run without reading it, or attributing a device error to the run that caused it). Ignored on other backends.
     /// </summary>
-    public bool SkipCompletionWait { get; set; }
+    public bool SkipCompletionWait { get; set; } = true;
 
     /// <summary>True when the most recent <see cref="RunAsync"/> submitted without awaiting completion (WebGPU only).</summary>
     public bool LastRunCompletionWaitSkipped => _lastRunExecutor?.LastRunCompletionWaitSkipped ?? false;

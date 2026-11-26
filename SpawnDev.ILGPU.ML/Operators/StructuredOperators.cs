@@ -514,9 +514,19 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
     /// other case (Conv1D, depthwise, grouped, NHWC, fp16 weight, fp32 input).</summary>
     public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
     {
+        // a folded BatchNorm is applied by Execute (fp32: the unfused BatchNorm had no low-precision path either)
+        if (ctx.Attributes.ContainsKey(FusedBatchNormEpsilon)) return false;
+        if (!TryExecuteHalfCore(ctx, inputs, output, pak)) return false;
+        // a fused activation on the low-precision output, in place: declining here instead sent every Conv -> Relu of a mixed-precision graph back to fp32
+        // (MixedPrecision_Executor_F16MatchesF32_AllBackends: the f16 working set stopped dropping)
+        pak.ActivationInPlace<global::ILGPU.Half>(output.Data, output.ElementCount, ctx.GetInt(FusedActivation, Conv2DKernel.ActNone));
+        return true;
+    }
+
+    private bool TryExecuteHalfCore(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
         if (ctx.Format != DataFormat.NCHW) return false;
         if (inputs.Length < 2) return false;
-        if (ctx.Attributes.ContainsKey(FusedBatchNormEpsilon) || ctx.Attributes.ContainsKey(FusedActivation)) return false;      // a folded BatchNorm / fused activation is applied by Execute
         var xIn = inputs[0]; var wIn = inputs[1];
         // Activation input must be low-p; weight must be a Tensor (fp32 .Data OR fp16 .HalfData — both handled).
         if (!xIn.IsHalf || wIn.Float == null) return false;

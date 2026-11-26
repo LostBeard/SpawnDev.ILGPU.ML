@@ -65,6 +65,28 @@ public sealed class PrecisionAwareKernels : IDisposable
     }
 
     /// <summary>ReLU max(0, x) in precision T (float/Half/bf16). Low-precision I/O, no fp32 temp.</summary>
+    // A Conv's fused activation on its low-precision output, in place (one binding: WebGPU forbids the same buffer as two read_write bindings). The expressions are
+    // ReluImpl's and ClipImpl's in float, so the values are the unfused graph's: act 1 ReLU, 2 ReLU6 (Conv2DKernel.ActRelu / ActRelu6).
+    private static void ActivationInPlaceImpl<T>(Index1D i, ArrayView1D<T, Stride1D.Dense> data, int act)
+        where T : unmanaged, INumber<T>
+    {
+        float x = PrecisionConvert.ConvertToSingle(data[i]);
+        if (act == 1) x = x > 0f ? x : 0f;
+        else if (act == 2) { if (x < 0f) x = 0f; if (x > 6f) x = 6f; }
+        data[i] = PrecisionConvert.ConvertFromSingle<T>(x);
+    }
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Type, Delegate> _actInPlaceCache = new();
+
+    /// <summary>A fused conv activation (1 ReLU, 2 ReLU6) applied in place to a low-precision tensor.</summary>
+    public void ActivationInPlace<T>(ArrayView1D<T, Stride1D.Dense> data, int count, int act)
+        where T : unmanaged, INumber<T>
+    {
+        if (act == 0 || count == 0) return;
+        var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, int>)
+            _actInPlaceCache.GetOrAdd(typeof(T), _ => _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<T, Stride1D.Dense>, int>(ActivationInPlaceImpl<T>));
+        k(count, data, act);
+    }
+
     public void Relu<T>(ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output, int count)
         where T : unmanaged, INumber<T>
     {

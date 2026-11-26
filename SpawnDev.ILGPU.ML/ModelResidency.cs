@@ -515,7 +515,7 @@ public sealed class ModelResidency : IAsyncDisposable
         long Short() => TryFree(own, out long f) ? want + ReserveBytes - f : 0;
         long shortfall = want + ReserveBytes - free;
         if (shortfall <= 0) return;
-        long allocated = _device.AllocatedBytes, models = ModelBytes();
+        long allocated = _device.AllocatedBytes, models = ModelBytes() - own;   // not the incoming model's own reservation (Lore: "kept models" read larger than "allocated")
         long reclaimed = _device.ReclaimIdle(shortfall);                      // idle scratch before any model (7.3 GB idle in pools on a 12 GB card, Vertex 2026-10-12)
         long stillShort = Short();
         // the arithmetic behind a drop, so a drop that looks wrong can be checked (Lore, 2026-11-25: 3.87 GB of models under 6 GB, and a 10 MB model dropped one: the budget counts

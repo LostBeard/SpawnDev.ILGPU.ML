@@ -39,6 +39,16 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     measurement itself waits for SpawnDev.ILGPU 5.4.51's ReclaimableDeviceBytes.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **WebGPU: `InferenceSession.SkipCompletionWait` is ON by default** (opt-in since 5.3.2): a run ends with a submit instead of awaiting GPU completion; everything stays
+  ordered on WebGPU's one queue (a readback waits for the run, pooled buffers are re-used only by later work, host writes are flushed first). The completion wait was a second
+  round trip before the readback's own: MobileNetV2's warm run with readback 14.5 / 18.9 -> 11.7 / 16.3 ms (Chrome, RTX 4070), outputs identical. Set it false where a run must
+  have completed when RunAsync returns (timing a run without reading it). Whole ML suite on the WebGPU lane: 1176 passed, one failure, below.
+- Fused conv activations on the low-precision (fp16 activation) path: applied in place to the half output (`PrecisionAwareKernels.ActivationInPlace`, the same float
+  expressions) instead of declining the half path; "convact" had sent every Conv -> Relu of a mixed-precision graph back to fp32 (`MixedPrecision_Executor_F16MatchesF32_AllBackends`
+  caught it: the f16 working set stopped dropping). A BatchNorm-folded Conv still runs fp32 (the unfused BatchNorm had no half path either).
+- The make-room log line's "kept models" leaves out the incoming model's own reservation (Lore: it read larger than "allocated").
+- Measured: the browser's warm-run host split for MobileNetV2 (`Warm_MobileNetV2_DirectVsCapture`): GPU wait 6.5 - 11 ms (GPU clock state), readback wait 2.6, argument
+  packing 1.8, shader / bind group / encode / submit 0.6, graph executor + pool + upload ~4.9 ms.
 - **SpawnDev.ILGPU 5.4.51** (`ReclaimableDeviceBytes`). ModelResidency measures a model that does not report its size by the growth of HELD bytes (allocated minus the idle
   scratch the pools could give back), not raw allocation growth: Lore's RX 590 gate had 7.3 GB of "kept models" with 4.9 GB allocated, because a load's or run's idle scratch
   was counted as the model. Test `ModelResidency_NotSized_MeasuredByTheDevice` (50 allocated, 30 idle: 20), red-checked (raw allocation: 50).
