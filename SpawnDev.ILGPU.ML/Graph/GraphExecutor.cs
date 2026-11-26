@@ -3398,7 +3398,13 @@ public class GraphExecutor : IDisposable
         string? prevOp = CurrentRunOpType;
         var prevSink = _pool.SwapScratchSink(null);
         _pool.BeginPlannedRun(this, PlannedReuseEligible);
-        try { return await RunAsyncCore(inputs); }
+        try
+        {
+            await ShaderCacheStore.ImportOnceAsync(_accelerator);   // browser WebGPU: the stored shaders, once per page, before this run loads kernels
+            var result = await RunAsyncCore(inputs);
+            ShaderCacheStore.NoteRun(_accelerator);                 // new shaders generated: stored in the background once the page settles
+            return result;
+        }
         finally { _pool.EndPlannedRun(this); CurrentRunNodeIndex = prevNode; CurrentRunOpType = prevOp; _pool.SwapScratchSink(prevSink); }
     }
 

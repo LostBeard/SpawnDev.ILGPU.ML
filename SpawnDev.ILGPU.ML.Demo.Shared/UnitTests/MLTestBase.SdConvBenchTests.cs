@@ -103,7 +103,7 @@ public abstract partial class MLTestBase
     /// the low halves (an fp32 file's VAE: <see cref="SdWeights.KeepLowHalves"/>). Random data, no files: runs on every fast lane. SD_CONV_SHAPES "H x W x C, ..." overrides,
     /// SD_CONV_REPS the timed repeats (default 3). Prints "[SdConvBench] ..." (PMT_CONSOLE_LOG=SdConvBench in the browser). Reported, not asserted.
     /// </summary>
-    [TestMethod(Timeout = 1800000)]
+    [TestMethod(Timeout = 1800000, Category = "HeavyCpu")]   // its own page in Phase C: the shared light page retains every context (~0.9 MiB/test) and ran this out of heap
     public async Task Sd_VaeConv_Benchmark() => await RunTest(async accelerator =>
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU)) throw new UnsupportedTestException("a fast-lane benchmark");

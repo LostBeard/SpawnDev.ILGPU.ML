@@ -4,6 +4,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Browser: a returning visitor's shaders are imported, not generated again** (`ShaderCacheStore`, on by default in the browser on WebGPU). A model's cold
+  first run was mostly ILGPU translating kernels to WGSL in the browser's .NET (MobileNetV2: the first Conv node 450 ms of a ~770 ms first run, loading the
+  61 KB implicit-GEMM kernel; shader resolve 8-9 ms, Chrome's compile async), every visit. ILGPU's session export / import (SpawnDev.ILGPU
+  Docs/precompiled-shaders.md) was there, unused: the store keeps the export in OPFS (`ilgpu-ml-shaders`), imports it before any kernel loads (every async
+  session factory and every executor run, once per page), and rewrites it in the background when new shaders appear (after `ExportQuietMs`, 3 s, of none;
+  `MaxBytes` 8 MB). MEASURED (RTX 4070, Chrome): fresh accelerator first run 279-326 ms generated vs 45-60 ms imported (7 of 7 kernels, IR skipped);
+  `ShaderCacheStore_RoundTrip_ReturnVisitImportsEveryKernel`: first visit 755 ms, return visit 67 ms, 0 misses, outputs bit-identical; the store 201 KB.
+  The file is named by a hash of the ILGPU build and the MVIDs of ML, ML.Kernels and the entry assembly, so a rebuild never imports an old kernel's shader
+  (ILGPU keys entries by signature; from 5.4.54 it also stamps each with the assemblies its shader came from and rejects a mismatch). Export and import
+  stream (ILGPU 5.4.54 `ExportCacheTo` / `ImportCacheFromAsync`): no whole-JSON string. The unit-test page keeps the store off (every PMT run republishes
+  with new MVIDs, and a page compiling hundreds of kernels exported 4.35 MB at a time); cold-start tests turn it off (they measure generation).
+- **SpawnDev.ILGPU 5.4.54** (shader-cache stamps, streaming export / import).
+- Tests: `Sd_VaeConv_Benchmark` and the measurement tests that create fresh accelerators (`ColdStart_MobileNetV2_ShaderCacheImport`,
+  `ShaderCacheStore_RoundTrip_ReturnVisitImportsEveryKernel`, `Warm_MobileNetV2_SmallTileAB_GpuTime`) are `HeavyCpu`: PMT runs them in a fresh page (Phase C).
+  The shared light page retains every context (~0.9 MiB per test); `Sd_VaeConv_Benchmark` ran it out of heap (OutOfMemory) in the 5.8.33 sweep and twice
+  more today. WebGPU lane 1183/0 after.
 - **`InferenceSession.RandomAtMean` and `InferenceSession.RandomSeed`** (Lore, 2026-11-26): the Stable Diffusion VAE encoders exported to ONNX sample their
   posterior inside the graph (`mean + std * RandomNormalLike`, output `latent_sample`), so every encode differed by ~1e-2 in nearly every latent value (sd_turbo,
   SD 1.5; ComfyUI's encode: 0 of 65536 differ), and image-to-image / inpainting were not reproducible for a fixed seed. `RandomAtMean`: RandomNormal(Like)

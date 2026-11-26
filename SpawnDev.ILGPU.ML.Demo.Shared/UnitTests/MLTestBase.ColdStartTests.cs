@@ -35,6 +35,123 @@ public abstract partial class MLTestBase
         finally { Conv2DKernel.Use1x1Kernel = was; }
     });
 
+    /// <summary>
+    /// What ILGPU's session shader export / import (ShaderArtifactSerializer, Docs/precompiled-shaders.md) saves a returning visitor: MobileNetV2's first run on a FRESH
+    /// WebGPU accelerator with the shader cache cleared (ILGPU generates every kernel's WGSL again) against one with the first session's export imported (early hits:
+    /// no IR, no WGSL generation), alternated twice. Run it alone (a cold page). A measurement.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyCpu")]   // fresh accelerators and sessions: kept off the shared light page (Phase C)
+    public async Task<string> ColdStart_MobileNetV2_ShaderCacheImport() => await RunTest(async accelerator =>
+    {
+        if (accelerator is not WebGPUAccelerator) throw new UnsupportedTestException("ILGPU's shader cache is WebGPU");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
+        ShaderCacheStore.Enabled = false;   // this test drives ILGPU's export / import itself (the store's, between visits, is ColdStart_MobileNetV2_ReturnVisit)
+        var input = new float[3 * 224 * 224];
+        var rng = new Random(9);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        async Task<double> FirstRun(Accelerator acc)
+        {
+            using var session = await InferenceSession.CreateFromStreamAsync(acc, new MemoryStream(bytes, writable: false));
+            using var t = OwnedTensor<float>.FromHost(acc, input, new[] { 1, 3, 224, 224 });
+            var sw = Stopwatch.StartNew();
+            using var o = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [session.InputNames[0]] = t });
+            await o[session.OutputNames[0]].ToHostAsync();
+            return sw.Elapsed.TotalMilliseconds;
+        }
+        double cold = await FirstRun(accelerator);
+        var exportSw = Stopwatch.StartNew();
+        string json = ShaderArtifactSerializer.ExportCache();
+        double exportMs = exportSw.Elapsed.TotalMilliseconds;
+        var lines = new List<string>();
+        try
+        {
+            for (int round = 0; round < 2; round++)
+                foreach (bool import in new[] { false, true })
+                {
+                    ShaderArtifactCache.Clear();
+                    double importMs = 0; int registered = 0;
+                    if (import) { var isw = Stopwatch.StartNew(); registered = ShaderArtifactSerializer.ImportCache(json); importMs = isw.Elapsed.TotalMilliseconds; }
+                    long h0 = ShaderArtifactCache.Hits, ir0 = ShaderArtifactCache.IrSkippedHits, m0 = ShaderArtifactCache.Misses;
+                    var b = MLContext.Create(); await b.WebGPU();
+                    using var ctx = b.ToContext();
+                    using var acc = await ctx.CreatePreferredAcceleratorAsync();
+                    double first = await FirstRun(acc);
+                    lines.Add($"{(import ? $"imported ({registered} kernels, {importMs:F0} ms)" : "cache cleared")}: first run {first:F0} ms " +
+                              $"(hits {ShaderArtifactCache.Hits - h0}, of them IR skipped {ShaderArtifactCache.IrSkippedHits - ir0}, misses {ShaderArtifactCache.Misses - m0})");
+                }
+        }
+        finally { ShaderArtifactCache.Clear(); ShaderArtifactSerializer.ImportCache(json); ShaderCacheStore.Enabled = OperatingSystem.IsBrowser(); }
+        var report = $"MobileNetV2 WebGPU: cold first run {cold:F0} ms; export {json.Length / 1024} KB in {exportMs:F0} ms; fresh accelerator, " + string.Join("; ", lines);
+        Console.WriteLine("[ColdStart] " + report);
+        return report;
+    });
+
+    /// <summary>
+    /// <see cref="ShaderCacheStore"/> end to end in one page: a first visit (MobileNetV2 with the store on, the default; its shaders generated, then stored in OPFS in
+    /// the background), then a return visit simulated in the same page (ILGPU's in-memory cache cleared, the store's once-per-page import reset, a fresh WebGPU
+    /// accelerator, a new session). The return visit must import the stored file, load every kernel from it (no misses), and give the first visit's outputs bit for
+    /// bit. A cross-run return visit cannot be shown under PMT: every PMT run republishes the demo trimmed, which gives the assemblies new MVIDs (a new deployment).
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyCpu")]   // fresh accelerators and sessions: kept off the shared light page (Phase C)
+    public async Task<string> ShaderCacheStore_RoundTrip_ReturnVisitImportsEveryKernel() => await RunTest(async accelerator =>
+    {
+        if (accelerator is not WebGPUAccelerator) throw new UnsupportedTestException("ILGPU's shader cache is WebGPU");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
+        var input = new float[3 * 224 * 224];
+        var rng = new Random(7);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        async Task<(double First, float[] Out, long Hits, long Misses)> Visit(Accelerator acc)
+        {
+            long h0 = ShaderArtifactCache.Hits, m0 = ShaderArtifactCache.Misses;
+            using var session = await InferenceSession.CreateFromStreamAsync(acc, new MemoryStream(bytes, writable: false));
+            using var t = OwnedTensor<float>.FromHost(acc, input, new[] { 1, 3, 224, 224 });
+            var sw = Stopwatch.StartNew();
+            float[] o;
+            using (var outs = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [session.InputNames[0]] = t }))
+                o = await outs[session.OutputNames[0]].ToHostAsync();
+            return (sw.Elapsed.TotalMilliseconds, o, ShaderArtifactCache.Hits - h0, ShaderArtifactCache.Misses - m0);
+        }
+        var contexts = new List<Context>();
+        async Task<Accelerator> Fresh() { var b = MLContext.Create(); await b.WebGPU(); var ctx = b.ToContext(); contexts.Add(ctx); return await ctx.CreatePreferredAcceleratorAsync(); }
+        bool storeWas = ShaderCacheStore.Enabled;
+        ShaderCacheStore.Enabled = true;   // the test page keeps it off (MLTestBase); this test is the store
+        try
+        {
+            // a first visit: nothing in memory (other tests in this page compiled other kernels), nothing imported, a fresh accelerator
+            await ShaderCacheStore.ClearAsync();
+            ShaderArtifactCache.Clear();
+            ShaderCacheStore.ResetImportForTest();
+            using var acc1 = await Fresh();
+            var v1 = await Visit(acc1);
+            await ShaderCacheStore.FlushAsync();
+            if (ShaderCacheStore.LastExportBytes == 0) throw new Exception("The first visit generated shaders but nothing was stored.");
+
+            // the return visit: nothing in memory, the stored file imported before any kernel loads
+            ShaderArtifactCache.Clear();
+            ShaderCacheStore.ResetImportForTest();
+            using var acc2 = await Fresh();
+            var v2 = await Visit(acc2);
+            if (ShaderCacheStore.LastImported == 0) throw new Exception("The return visit imported nothing from the store.");
+            if (v2.Misses != 0) throw new Exception($"The return visit generated {v2.Misses} shaders the store should have had ({v2.Hits} hits).");
+            int differ = 0;
+            for (int i = 0; i < v1.Out.Length; i++) if (BitConverter.SingleToInt32Bits(v1.Out[i]) != BitConverter.SingleToInt32Bits(v2.Out[i])) differ++;
+            if (differ != 0) throw new Exception($"{differ} of {v1.Out.Length} outputs differ between the visits.");
+            var report = $"MobileNetV2 WebGPU: first visit {v1.First:F0} ms ({v1.Misses} shaders generated, {v1.Hits} hits), stored " +
+                         $"{ShaderCacheStore.LastExportBytes / 1024} KB as {ShaderCacheStore.Key}; return visit (fresh accelerator, same page) {v2.First:F0} ms, " +
+                         $"{ShaderCacheStore.LastImported} kernels imported, {v2.Hits} hits, 0 misses; outputs identical";
+            Console.WriteLine("[ColdStart] " + report);
+            return report;
+        }
+        finally
+        {
+            ShaderCacheStore.Enabled = storeWas;
+            await ShaderCacheStore.ClearAsync();
+            foreach (var c in contexts) c.Dispose();
+        }
+    });
+
     /// <summary>The same with the 32x32-tile convolution kernel ON (<see cref="Conv2DKernel.SmallTileMaxGroups"/> 32; the browser default is off): what it costs a first run. Run it alone (a cold page).</summary>
     [TestMethod(Timeout = 600000)]
     public async Task<string> ColdStart_MobileNetV2_SmallTile() => await RunTest(async accelerator =>
@@ -295,7 +412,7 @@ public abstract partial class MLTestBase
     public async Task<string> Warm_MobileNetV2_1x1KernelAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator, "1x1"));
 
     /// <summary>The same A/B for the 32x32-tile convolution kernel (<see cref="Conv2DKernel.SmallTileMaxGroups"/> 0 / 32): the late small-grid layers.</summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyCpu")]   // fresh accelerators and sessions: kept off the shared light page (Phase C)
     public async Task<string> Warm_MobileNetV2_SmallTileAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator, "smalltile"));
 
     private async Task<string> WarmPassAB(Accelerator accelerator, string pass)
@@ -362,6 +479,8 @@ public abstract partial class MLTestBase
         var input = new float[3 * 224 * 224];
         var rng = new Random(7);
         for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        bool storeWas = ShaderCacheStore.Enabled;
+        ShaderCacheStore.Enabled = false;   // this measures generating the shaders (a first visit), not importing a previous visit's
         try
         {
             var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
@@ -406,7 +525,7 @@ public abstract partial class MLTestBase
             // removed (Conv_DirectVsTiled_Crossover: the direct implicit GEMM is as fast or faster); its single-mode variants are as large (239 and 203 KB), so the size is the
             // register tile, not the modes; keeping its inner loops rolled made it 285 KB and slower to compile. After: 7 shaders, 173 KB, 0.23 s, first run 849 ms (was 2388).
         }
-        finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = prev; }
+        finally { global::SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.OnShaderCompiled = prev; ShaderCacheStore.Enabled = storeWas; }
 
         var distinct = shaders.GroupBy(s => s.Wgsl).Select(g => g.First()).Where(s => s.Wgsl.Contains("fn main(")).ToList();
         if (distinct.Count == 0)

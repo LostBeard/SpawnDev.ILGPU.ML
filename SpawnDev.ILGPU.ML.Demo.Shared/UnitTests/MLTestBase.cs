@@ -12,6 +12,11 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public abstract partial class MLTestBase : IDisposable
 {
+    // The test page keeps ShaderCacheStore off: every PMT run republishes the demo (new MVIDs, so a stored file can never be imported again), and a page that
+    // compiles hundreds of kernels exports megabytes at a time (MEASURED 4.35 MB: Sd_VaeConv_Benchmark then ran the shared page's heap out). The store's own
+    // tests turn it on.
+    static MLTestBase() => ShaderCacheStore.Enabled = false;
+
     protected abstract Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync();
     protected abstract string BackendName { get; }
 
