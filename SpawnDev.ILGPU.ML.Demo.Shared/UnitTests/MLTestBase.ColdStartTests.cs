@@ -134,6 +134,38 @@ public abstract partial class MLTestBase
             double rest = wall - resolve - args - bind - enc - submit - sync - readback;
             Console.WriteLine($"[ColdStart] host split per warm run (WebGPU, {Prof} runs, {dispatches:F0} dispatches each): wall {wall:F1} ms = shader resolve {resolve:F2}, args {args:F2}, " +
                               $"bind groups {bind:F2}, encode {enc:F2}, submit {submit:F2}, sync wait {sync:F2}, readback wait {readback:F2}, the rest (graph executor, pool, upload, .NET) {rest:F1}");
+
+            // "the rest", split by the executor's own profiler (GraphExecutor.OpProfile / OpPhaseMs; its timestamps add a little): the input upload, RunAsync by
+            // node-loop phase, the readback call, and host time + managed allocation by op type
+            double upMs = 0, runMs = 0, readMs = 0; var phases = new double[Graph.GraphExecutor.OpPhaseMs.Length];
+            var byOp = new Dictionary<string, (double Ms, int N, long Alloc)>();
+            try
+            {
+                for (int i = 0; i < Prof; i++)
+                {
+                    var prof = new Dictionary<string, Graph.GraphExecutor.OpProfileEntry>();
+                    Graph.GraphExecutor.OpProfile = prof;
+                    var s1 = Stopwatch.StartNew();
+                    inBuf.CopyFromCPU((i & 1) == 0 ? picA : picB);
+                    upMs += s1.Elapsed.TotalMilliseconds; s1.Restart();
+                    var outs = await session.RunAsync(new Dictionary<string, Tensor> { [inName] = new Tensor(inBuf.View, shape) });
+                    runMs += s1.Elapsed.TotalMilliseconds;
+                    Graph.GraphExecutor.OpProfile = null;
+                    for (int p = 0; p < phases.Length; p++) phases[p] += Graph.GraphExecutor.OpPhaseMs[p];
+                    s1.Restart();
+                    await outs[outName].Data.SubView(0, 1000).CopyToHostAsync();
+                    readMs += s1.Elapsed.TotalMilliseconds;
+                    foreach (var (op, e) in prof)
+                        byOp[op] = byOp.TryGetValue(op, out var a) ? (a.Ms + e.WallMs, a.N + e.Count, a.Alloc + e.AllocBytes) : (e.WallMs, e.Count, e.AllocBytes);
+                }
+            }
+            finally { Graph.GraphExecutor.OpProfile = null; }
+            double loop = phases.Sum();
+            Console.WriteLine($"[ColdStart] RunAsync split per warm run ({Prof} runs, profiled): upload {upMs / Prof:F2} ms, RunAsync {runMs / Prof:F2} ms (node loop {loop / Prof:F2}: " +
+                              string.Join(", ", Graph.GraphExecutor.OpPhaseNames.Select((n, p) => $"{n} {phases[p] / Prof:F2}")) +
+                              $"; outside the loop {(runMs - loop) / Prof:F2}), readback incl. GPU wait {readMs / Prof:F2} ms");
+            Console.WriteLine($"[ColdStart] node loop by op (per run): " + string.Join(", ", byOp.OrderByDescending(o => o.Value.Ms).Take(12)
+                .Select(o => $"{o.Key} x{o.Value.N / Prof} {o.Value.Ms / Prof:F2} ms {o.Value.Alloc / Prof / 1024} KB")));
         }
         var dA = await Run(direct, picA); var dB = await Run(direct, picB);
         using var capture = new Graph.SessionGraphCapture(session, accelerator);
