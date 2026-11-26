@@ -193,70 +193,66 @@ public class ActivationKernels
     // ── Public API ──
 
     public void SigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
-    { EnsureLoaded(); _sigmoidInPlace!(count, data); }
+    { SigmoidInPlaceLazy(count, data); }
 
     public void TanhInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
-    { EnsureLoaded(); _tanhInPlace!(count, data); }
+    { TanhInPlaceLazy(count, data); }
 
     public void SiLUInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
-    { EnsureLoaded(); _siluInPlace!(count, data); }
+    { SiluInPlace(count, data); }
 
     /// <summary>Fused SwiGLU: out = (gate · sigmoid(gate)) · up. Replaces Sigmoid + Mul + Mul (3 dispatches → 1).</summary>
     public void SwiGLU(ArrayView1D<float, Stride1D.Dense> gate, ArrayView1D<float, Stride1D.Dense> up,
         ArrayView1D<float, Stride1D.Dense> outp, int count)
-    { EnsureLoaded(); _swiGLU!(count, gate, up, outp); }
+    { SwiGLULazy(count, gate, up, outp); }
 
     public void HardSigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
-    { EnsureLoaded(); _hardSigmoidInPlace!(count, data); }
+    { HardSigmoidInPlaceLazy(count, data); }
 
     /// <summary>HardSigmoid with configurable alpha/beta: max(0, min(1, alpha*x + beta)).</summary>
     public void HardSigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float alpha, float beta)
-    { EnsureLoaded(); _hardSigmoidParamsInPlace!(count, data, alpha, beta); }
+    { HardSigmoidParamsInPlace(count, data, alpha, beta); }
 
     public void HardSwishInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
-    { EnsureLoaded(); _hardSwishInPlace!(count, data); }
+    { HardSwishInPlaceLazy(count, data); }
 
     /// <summary>Out-of-place Sigmoid: output[i] = sigmoid(input[i]). Prefer over CopyFrom + InPlace.</summary>
     public void Sigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded(); _sigmoid!(count, input, output); }
+    { SigmoidLazy(count, input, output); }
 
     /// <summary>Out-of-place Tanh.</summary>
     public void Tanh(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded(); _tanh!(count, input, output); }
+    { TanhLazy(count, input, output); }
 
     /// <summary>Out-of-place SiLU (Swish): output[i] = input[i] * sigmoid(input[i]).</summary>
     public void SiLU(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded(); _silu!(count, input, output); }
+    { Silu(count, input, output); }
 
     /// <summary>Out-of-place HardSigmoid with HardSwish defaults (alpha=1/6, beta=0.5).</summary>
     public void HardSigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded(); _hardSigmoid!(count, input, output); }
+    { HardSigmoidLazy(count, input, output); }
 
     /// <summary>Out-of-place HardSigmoid with configurable alpha/beta.</summary>
     public void HardSigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float alpha, float beta)
-    { EnsureLoaded(); _hardSigmoidParams!(count, input, output, alpha, beta); }
+    { HardSigmoidParams(count, input, output, alpha, beta); }
 
     /// <summary>Out-of-place HardSwish: output[i] = input[i] * HardSigmoid(input[i]).</summary>
     public void HardSwish(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded(); _hardSwish!(count, input, output); }
+    { HardSwishLazy(count, input, output); }
 
-    private void EnsureLoaded()
-    {
-        var a = _accelerator;
-        _sigmoidInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SigmoidInPlaceImpl);
-        _tanhInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(TanhInPlaceImpl);
-        _siluInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SiLUInPlaceImpl);
-        _hardSigmoidInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidInPlaceImpl);
-        _hardSigmoidParamsInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsInPlaceImpl);
-        _hardSwishInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSwishInPlaceImpl);
-        _swiGLU ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SwiGLUImpl);
-
-        _sigmoid ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SigmoidImpl);
-        _tanh ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TanhImpl);
-        _silu ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SiLUImpl);
-        _hardSigmoid ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidImpl);
-        _hardSigmoidParams ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsImpl);
-        _hardSwish ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSwishImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> SigmoidInPlaceLazy => _sigmoidInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SigmoidInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> TanhInPlaceLazy => _tanhInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(TanhInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> SiluInPlace => _siluInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SiLUInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> HardSigmoidInPlaceLazy => _hardSigmoidInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float> HardSigmoidParamsInPlace => _hardSigmoidParamsInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> HardSwishInPlaceLazy => _hardSwishInPlace ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSwishInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> SwiGLULazy => _swiGLU ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SwiGLUImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> SigmoidLazy => _sigmoid ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SigmoidImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> TanhLazy => _tanh ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TanhImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> Silu => _silu ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SiLUImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> HardSigmoidLazy => _hardSigmoid ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float> HardSigmoidParams => _hardSigmoidParams ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> HardSwishLazy => _hardSwish ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSwishImpl);
 }

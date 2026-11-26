@@ -413,7 +413,6 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> residualOut, ArrayView1D<float, Stride1D.Dense> normedOut,
         ArrayView1D<float, Stride1D.Dense> weight, ArrayView1D<byte, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds, int rows, int C, float epsilon)
     {
-        EnsureLoaded();
         if (rows <= 0 || C % 32 != 0 || !AddRmsShuffle || _accelerator.AcceleratorType != AcceleratorType.Cuda) return false;
         int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
             : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);
@@ -666,8 +665,7 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> variance,
         int N, int C, int spatial, float epsilon = 1e-5f)
     {
-        EnsureLoaded();
-        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial, epsilon);
+        BatchNormKernel(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial, epsilon);
     }
 
     // Single-pass fused RMSNorm on any backend with a group (everything but WebGL's TF path); fuses the
@@ -697,7 +695,6 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> residualOut, ArrayView1D<float, Stride1D.Dense> normedOut,
         ArrayView1D<float, Stride1D.Dense> weight, int rows, int C, float epsilon, int hasWeight)
     {
-        EnsureLoaded();
         if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
         int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
             : (_rmsFusedGroup = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup) + 1) >> 1);   // a power of two: the partials reduce by a tree
@@ -732,14 +729,13 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> weight,
         int rows, int C, float epsilon = 1e-6f)
     {
-        EnsureLoaded();
         if (TryFusedRMSNorm(input, output, weight, rows, C, epsilon, hasWeight: 1)) return;
 
         // WebGL two-pass. invRms scratch from the reusable ring (no per-call alloc / no _allTempBufs growth);
         // the ring depth keeps a slot out of reach of the still-pending Pass 2 of an earlier call (RentInvRms).
         var rmsInvRms = RentInvRms(rows);
-        _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
-        _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms, C);
+        RmsNormStatsKernel(rows, input, rmsInvRms, C, epsilon);
+        RmsNormApplyKernel(rows * C, input, output, weight, rmsInvRms, C);
     }
 
     /// <summary>
@@ -750,13 +746,12 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int rows, int C, float epsilon = 1e-6f)
     {
-        EnsureLoaded();
         _dummyRmsWeight ??= _accelerator.Allocate1D(new float[1]);
         if (TryFusedRMSNorm(input, output, _dummyRmsWeight.View, rows, C, epsilon, hasWeight: 0)) return;
 
         var rmsInvRms = RentInvRms(rows);
-        _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
-        _rmsNormApplyNoWeightKernel!(rows * C, input, output, rmsInvRms, C);
+        RmsNormStatsKernel(rows, input, rmsInvRms, C, epsilon);
+        RmsNormApplyNoWeightKernel(rows * C, input, output, rmsInvRms, C);
     }
 
     /// <summary>
@@ -851,7 +846,6 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         int N, int C, int spatial, float epsilon = 1e-5f)
     {
-        EnsureLoaded();
         int numSlices = N * C;
 
         // Per-call temp buffers — eliminates the shared-state race under async dispatch
@@ -865,7 +859,7 @@ public class NormalizationKernels : IDisposable
         // and this ignored it, so a model asking for anything but the 1e-5 default was quietly
         // computed wrong. The default here keeps every existing caller on the number it already had.
         if (!TryCoopInstanceNormStats(input, inMeans.View, inInvStds.View, numSlices, spatial, epsilon))
-            _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, epsilon);
+            InstanceNormMeanVarKernel(numSlices, input, inMeans.View, inInvStds.View, spatial, epsilon);
 
         // DIAGNOSTIC capture (opt-in): record buffer refs so caller can async-read.
         // The temp buffers are held alive by _allTempBufs until Dispose, so it's
@@ -883,7 +877,7 @@ public class NormalizationKernels : IDisposable
         }
 
         // Pass 2: apply normalization
-        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
+        InstanceNormApplyKernel(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
     /// <summary>
@@ -906,14 +900,13 @@ public class NormalizationKernels : IDisposable
     {
         if (numGroups <= 0 || C % numGroups != 0)
             throw new ArgumentException($"GroupNorm: {C} channels do not divide into {numGroups} groups");
-        EnsureLoaded();
         int channelsPerGroup = C / numGroups;
         int slices = N * numGroups;
         int sliceLength = channelsPerGroup * spatial;
         var (means, invStds) = GetStatsScratch(slices);
         if (!TryCoopInstanceNormStats(input, means.View, invStds.View, slices, sliceLength, epsilon))
-            _instanceNormMeanVarKernel!(slices, input, means.View, invStds.View, sliceLength, epsilon);
-        _groupNormApplyKernel!(N * C * spatial, input, output, weight, bias, means.View, invStds.View,
+            InstanceNormMeanVarKernel(slices, input, means.View, invStds.View, sliceLength, epsilon);
+        GroupNormApplyKernel(N * C * spatial, input, output, weight, bias, means.View, invStds.View,
             C, spatial, channelsPerGroup, numGroups);
     }
 
@@ -926,12 +919,11 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         int N, int C, int spatial, float epsilon = 1e-5f)
     {
-        EnsureLoaded();
         int numSlices = N * C;
         var (inMeans, inInvStds) = GetStatsScratch(numSlices);
         if (!TryCoopInstanceNormStats(data, inMeans.View, inInvStds.View, numSlices, spatial, epsilon))
-            _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, epsilon);
-        _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
+            InstanceNormMeanVarKernel(numSlices, data, inMeans.View, inInvStds.View, spatial, epsilon);
+        InstanceNormApplyInPlaceKernel(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
     /// <summary>Compute per-(N,C)-slice partial sum and sumSq over <paramref name="spatial"/> elements of
@@ -941,7 +933,6 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> sums, ArrayView1D<float, Stride1D.Dense> sumSqs,
         int N, int C, int spatial)
     {
-        EnsureLoaded();
         if (CoopStatsApplies(N * C, spatial, out int T))
         {
             _instanceNormPartialStatsCoopKernel ??= _accelerator.LoadStreamKernel<
@@ -951,7 +942,7 @@ public class NormalizationKernels : IDisposable
                 input, sums, sumSqs, spatial);
             return;
         }
-        _instanceNormPartialStatsKernel!(N * C, input, sums, sumSqs, spatial);
+        InstanceNormPartialStatsKernel(N * C, input, sums, sumSqs, spatial);
     }
 
     /// <summary>Cooperative <see cref="InstanceNormPartialStatsImpl"/>: one GROUP per slice. Same float
@@ -1030,7 +1021,6 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> sqDevs, ArrayView1D<float, Stride1D.Dense> means,
         int N, int C, int spatial)
     {
-        EnsureLoaded();
         if (CoopStatsApplies(N * C, spatial, out int T))
         {
             _instanceNormPartialSqDevCoopKernel ??= _accelerator.LoadStreamKernel<
@@ -1040,7 +1030,7 @@ public class NormalizationKernels : IDisposable
                 input, sqDevs, means, spatial);
             return;
         }
-        _instanceNormPartialSqDevKernel!(N * C, input, sqDevs, means, spatial);
+        InstanceNormPartialSqDevKernel(N * C, input, sqDevs, means, spatial);
     }
 
     /// <summary>Apply InstanceNorm IN PLACE using EXTERNALLY-provided per-slice means/invStds (skips the local
@@ -1051,8 +1041,7 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> means, ArrayView1D<float, Stride1D.Dense> invStds,
         int N, int C, int spatial)
     {
-        EnsureLoaded();
-        _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, means, invStds, N, C, spatial);
+        InstanceNormApplyInPlaceKernel(N * C * spatial, data, scale, bias, means, invStds, N, C, spatial);
     }
 
     // Per-call temp buffers for InstanceNorm and RMSNorm two-pass kernels.
@@ -1188,65 +1177,22 @@ public class NormalizationKernels : IDisposable
         _dummyRmsWeight = null;
     }
 
-    private void EnsureLoaded()
-    {
-        var a = _accelerator;
-        _batchNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, float>(BatchNormImpl);
-        _instanceNormMeanVarKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, float>(InstanceNormMeanVarImpl);
-        _instanceNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int>(InstanceNormApplyImpl);
-        _groupNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int>(GroupNormApplyImpl);
-        _instanceNormApplyInPlaceKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int>(InstanceNormApplyInPlaceImpl);
-        _instanceNormPartialStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialStatsImpl);
-        _instanceNormPartialSqDevKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialSqDevImpl);
-        _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, float>(RMSNormStatsImpl);
-        _rmsNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int>(RMSNormApplyImpl);
-        _rmsNormApplyNoWeightKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int>(RMSNormApplyNoWeightImpl);
-        _mvnContigStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, float>(MVNContigStatsImpl);
-        _mvnContigApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MVNContigApplyImpl);
-        _mvnNchwChannelStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float>(MVNNchwChannelStatsImpl);
-        _mvnNchwChannelApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int>(MVNNchwChannelApplyImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, float> BatchNormKernel => _batchNormKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, float>(BatchNormImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float> InstanceNormMeanVarKernel => _instanceNormMeanVarKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float>(InstanceNormMeanVarImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int> InstanceNormApplyKernel => _instanceNormApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(InstanceNormApplyImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int> GroupNormApplyKernel => _groupNormApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(GroupNormApplyImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int> InstanceNormApplyInPlaceKernel => _instanceNormApplyInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(InstanceNormApplyInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> InstanceNormPartialStatsKernel => _instanceNormPartialStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialStatsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> InstanceNormPartialSqDevKernel => _instanceNormPartialSqDevKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialSqDevImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float> RmsNormStatsKernel => _rmsNormStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float>(RMSNormStatsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> RmsNormApplyKernel => _rmsNormApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(RMSNormApplyImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> RmsNormApplyNoWeightKernel => _rmsNormApplyNoWeightKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(RMSNormApplyNoWeightImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float> MvnContigStatsKernel => _mvnContigStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, float>(MVNContigStatsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> MvnContigApplyKernel => _mvnContigApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MVNContigApplyImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float> MvnNchwChannelStatsKernel => _mvnNchwChannelStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, float>(MVNNchwChannelStatsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int> MvnNchwChannelApplyKernel => _mvnNchwChannelApplyKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(MVNNchwChannelApplyImpl);
 
     /// <summary>
     /// Contiguous MeanVarianceNormalization: input laid out as [groups, reductionSize].
@@ -1255,10 +1201,9 @@ public class NormalizationKernels : IDisposable
     public void MeanVarianceNormContiguous(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int groups, int reductionSize, float epsilon = 1e-9f)
     {
-        EnsureLoaded();
         var (means, invStds) = GetStatsScratch(groups);
-        _mvnContigStatsKernel!(groups, input, means.View, invStds.View, reductionSize, epsilon);
-        _mvnContigApplyKernel!(groups * reductionSize, input, output, means.View, invStds.View, reductionSize);
+        MvnContigStatsKernel(groups, input, means.View, invStds.View, reductionSize, epsilon);
+        MvnContigApplyKernel(groups * reductionSize, input, output, means.View, invStds.View, reductionSize);
     }
 
     /// <summary>
@@ -1268,10 +1213,9 @@ public class NormalizationKernels : IDisposable
     public void MeanVarianceNormNchwKeepChannel(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int N, int C, int H, int W, float epsilon = 1e-9f)
     {
-        EnsureLoaded();
         var (means, invStds) = GetStatsScratch(C);
-        _mvnNchwChannelStatsKernel!(C, input, means.View, invStds.View, N, C, H, W, epsilon);
-        _mvnNchwChannelApplyKernel!(N * C * H * W, input, output, means.View, invStds.View, N, C, H, W);
+        MvnNchwChannelStatsKernel(C, input, means.View, invStds.View, N, C, H, W, epsilon);
+        MvnNchwChannelApplyKernel(N * C * H * W, input, output, means.View, invStds.View, N, C, H, W);
     }
 
     private static void MVNContigStatsImpl(Index1D g,

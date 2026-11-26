@@ -165,83 +165,66 @@ public class PoolingKernels
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
     {
-        EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"MaxPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _maxPool2d!(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+        MaxPool2d(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void AvgPool2D(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
     {
-        EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"AvgPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _avgPool2d!(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+        AvgPool2d(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void MaxPool2DNHWC(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
     {
-        EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"MaxPool2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _maxPool2dNhwc!(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+        MaxPool2dNhwc(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void AvgPool2DNHWC(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
     {
-        EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"AvgPool2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _avgPool2dNhwc!(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+        AvgPool2dNhwc(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void GlobalAvgPool(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int spatial)
     {
-        EnsureLoaded();
-        _globalAvgPool!(N * C, input, output, spatial, 0);
+        GlobalAvgPoolLazy(N * C, input, output, spatial, 0);
     }
 
-    private void EnsureLoaded()
-    {
-        var a = _accelerator;
-        _maxPool2d ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(MaxPool2DImpl);
-        _avgPool2d ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(AvgPool2DImpl);
-        _maxPool2dNhwc ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(MaxPool2DNHWCImpl);
-        _avgPool2dNhwc ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(AvgPool2DNHWCImpl);
-        _globalAvgPool ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int>(GlobalAvgPoolImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> MaxPool2d => _maxPool2d ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(MaxPool2DImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> AvgPool2d => _avgPool2d ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(AvgPool2DImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> MaxPool2dNhwc => _maxPool2dNhwc ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(MaxPool2DNHWCImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> AvgPool2dNhwc => _avgPool2dNhwc ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(AvgPool2DNHWCImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int> GlobalAvgPoolLazy => _globalAvgPool ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(GlobalAvgPoolImpl);
 }

@@ -31,6 +31,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     lease's `EnsureRoomAsync` to the lease's end for a model that loads inside the lease (errs high: the run's scratch still held counts). Lore measured 0 GB for every SpawnGen model before.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- **Kernels load on first use, one by one** (ElementWiseKernels, NormalizationKernels, ActivationKernels, PoolingKernels, Conv2DKernel, GatherKernel, ScatterKernel,
+  AttentionKernels): the first call of any one used to load the class's whole set, so MobileNetV2's first run compiled about 30 kernels it never runs (every element-wise
+  kernel for one ReLU, every normalization for one BatchNorm), each a C# compile and a browser shader compile. Scoped run 1105 / 0 / 58 on every backend.
+  `Sd_VaeConv_Benchmark` reports a hash of its output (a kernel change that keeps the arithmetic must keep it).
 - NEW test `ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel` (a measurement): MobileNetV2's first WebGPU run compiles 51 shaders (1.3 MB WGSL); Chrome compiles them in 5.0 s one at
   a time, about 4 s all at once, and TiledGemm.Gemm (308 KB, reached by every fp32 convolution through Conv2DGemm.RunF32) is 3.9 s of it.
 - NEW `IModelSource.GetSizeAsync(repoId, filePath)` (default member: null): a file's size without downloading it. LocalFolderModelSource (file length), HubModelSource (cached copy, else one

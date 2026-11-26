@@ -57,8 +57,7 @@ public class GatherKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int numIndices, int innerSize)
     {
-        EnsureLoaded();
-        _gatherAxis0Kernel!(numIndices * innerSize, data, indices, output, innerSize, 0);
+        GatherAxis0Kernel(numIndices * innerSize, data, indices, output, innerSize, 0);
     }
 
     // ── Float-index variant for NLP models (token IDs stored as float) ──
@@ -96,8 +95,7 @@ public class GatherKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int numIndices, int innerSize, int dataRows)
     {
-        EnsureLoaded();
-        _gatherAxis0FloatKernel!(numIndices * innerSize, data, indices, output, innerSize, dataRows);
+        GatherAxis0FloatKernel(numIndices * innerSize, data, indices, output, innerSize, dataRows);
     }
 
     // ── Generic-axis Gather with float indices (GPU) ──
@@ -150,7 +148,6 @@ public class GatherKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int numIdx, int innerSize, int outerSize, int axisSize)
     {
-        EnsureLoaded();
         var packed = new[] { numIdx, innerSize, outerSize, axisSize };
         ArrayView1D<int, Stride1D.Dense> paramsView;
         if (Graph.GraphExecutor.UseCaptureParamSlots)
@@ -162,7 +159,7 @@ public class GatherKernel : IDisposable
         {
             paramsView = (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
         }
-        _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, paramsView);
+        GatherGenericFloatKernel(outerSize * numIdx * innerSize, data, indices, output, paramsView);
     }
 
     /// <summary>
@@ -218,7 +215,6 @@ public class GatherKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int outer, int idxAxis, int inner, int dataAxis)
     {
-        EnsureLoaded();
         var packed = new[] { idxAxis, inner, dataAxis, outer };
         ArrayView1D<int, Stride1D.Dense> paramsView;
         if (Graph.GraphExecutor.UseCaptureParamSlots)
@@ -230,24 +226,15 @@ public class GatherKernel : IDisposable
         {
             paramsView = (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
         }
-        _gatherElementsKernel!(outer * idxAxis * inner, data, indices, output, paramsView);
+        GatherElementsKernel(outer * idxAxis * inner, data, indices, output, paramsView);
     }
 
-    private void EnsureLoaded()
-    {
-        _gatherAxis0Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0Impl);
-        _gatherAxis0FloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0FloatImpl);
-        _gatherGenericFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
-        _gatherElementsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherElementsImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int> GatherAxis0Kernel => _gatherAxis0Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0Impl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int> GatherAxis0FloatKernel => _gatherAxis0FloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0FloatImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> GatherGenericFloatKernel => _gatherGenericFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> GatherElementsKernel => _gatherElementsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherElementsImpl);
 
     public void Dispose()
     {

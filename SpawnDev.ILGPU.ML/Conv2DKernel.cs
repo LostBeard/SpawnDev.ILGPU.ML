@@ -374,7 +374,6 @@ public class Conv2DKernel : IDisposable
         int stride, int padTop, int padLeft, int padBottom, int padRight,
         int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
     {
-        EnsureLoaded();
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
 
         int effKH = dilationH * (kH - 1) + 1;
@@ -427,7 +426,7 @@ public class Conv2DKernel : IDisposable
 
         try
         {
-            _conv2dKernel!(totalOutputElements, input, weight, bias, output,
+            Conv2dKernel(totalOutputElements, input, weight, bias, output,
                 inC, inH, inW, outC, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
                 outH, outW, Pack16(dilationH, dilationW, "dilation"));
         }
@@ -585,7 +584,6 @@ public class Conv2DKernel : IDisposable
         int stride, int padTop, int padLeft, int padBottom, int padRight,
         int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
     {
-        EnsureLoaded();
         if (batch < 1) batch = 1;
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
         int effKH = dilationH * (kH - 1) + 1;
@@ -604,7 +602,7 @@ public class Conv2DKernel : IDisposable
                 $"(C={C} outH={outH} outW={outW}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
 
-        _depthwiseKernel!((int)needed, input, weight, bias, output,
+        DepthwiseKernel((int)needed, input, weight, bias, output,
             C, inH, inW, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
             outH, outW, Pack16(dilationH, dilationW, "dilation"));
     }
@@ -676,7 +674,6 @@ public class Conv2DKernel : IDisposable
         int stride, int padTop, int padLeft, int padBottom, int padRight,
         int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
     {
-        EnsureLoaded();
         if (batch < 1) batch = 1;
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
         int effKH = dilationH * (kH - 1) + 1;
@@ -694,7 +691,7 @@ public class Conv2DKernel : IDisposable
                 $"Conv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
                 $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
-        _conv2dNHWCKernel!((int)needed, input, weight, bias, output,
+        Conv2dNHWCKernel((int)needed, input, weight, bias, output,
             inC, inH, inW, outC, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
             outH, outW, Pack16(dilationH, dilationW, "dilation"));
     }
@@ -761,7 +758,6 @@ public class Conv2DKernel : IDisposable
         int stride, int padTop, int padLeft, int padBottom, int padRight,
         int dilationH = 1, int dilationW = 1, int batch = 1, int strideW = 0)
     {
-        EnsureLoaded();
         if (batch < 1) batch = 1;
         if (strideW <= 0) strideW = stride;   // `stride` is the H stride; W defaults to it (square)
         int effKH = dilationH * (kH - 1) + 1;
@@ -779,39 +775,17 @@ public class Conv2DKernel : IDisposable
                 $"DepthwiseConv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
                 $"(outH={outH} outW={outW} C={C}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
-        _depthwiseNHWCKernel!((int)needed, input, weight, bias, output,
+        DepthwiseNHWCKernel((int)needed, input, weight, bias, output,
             C, inH, inW, Pack16(kH, kW, "kernel size"), Pack16(stride, strideW, "stride"), Pack16(padTop, padLeft, "begin pads"),
             outH, outW, Pack16(dilationH, dilationW, "dilation"));
     }
 
-    private void EnsureLoaded()
-    {
-        _conv2dKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(Conv2DImpl);
-        // Low-p-weight conv kernels are lazy per concrete T (see ForwardPaddedLowPWeight / GetConv2DLowPWeightKernel).
-        _depthwiseKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int>(DepthwiseConv2DImpl);
-        _conv2dNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(Conv2DNHWCImpl);
-        _depthwiseNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int>(DepthwiseConv2DNHWCImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> Conv2dKernel => _conv2dKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(Conv2DImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int> DepthwiseKernel => _depthwiseKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int>(DepthwiseConv2DImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int> Conv2dNHWCKernel => _conv2dNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int, int>(Conv2DNHWCImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int> DepthwiseNHWCKernel => _depthwiseNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, int, int, int>(DepthwiseConv2DNHWCImpl);
 
     public void Dispose() { /* no buffers owned */ }
 }

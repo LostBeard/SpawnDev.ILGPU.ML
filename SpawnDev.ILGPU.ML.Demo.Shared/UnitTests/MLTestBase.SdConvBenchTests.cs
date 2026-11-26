@@ -146,9 +146,14 @@ public abstract partial class MLTestBase
                 times.Sort();
                 return times[times.Count / 2];
             }
-            double tHi = await Time(false), tLo = await Time(true);
+            double tHi = await Time(false);
+            // a hash of the fp16 path's output: a kernel change that claims the same arithmetic in the same order must leave it unchanged
+            var outHi = await y.View.CopyToHostAsync();
+            ulong hash = 14695981039346656037UL;
+            foreach (var v in outHi) { hash ^= BitConverter.SingleToUInt32Bits(v); hash *= 1099511628211UL; }
+            double tLo = await Time(true);
             totalHi += tHi; totalLo += tLo;
-            report.Add($"{H}x{W}x{C}: fp16 {tHi:F1} ms ({flop / tHi / 1e9:F2} TFLOPS), +lo {tLo:F1} ms ({flop / tLo / 1e9:F2} TFLOPS effective)");
+            report.Add($"{H}x{W}x{C}: fp16 {tHi:F1} ms ({flop / tHi / 1e9:F2} TFLOPS, output hash {hash:x16}), +lo {tLo:F1} ms ({flop / tLo / 1e9:F2} TFLOPS effective)");
         }
         string line = $"{accelerator.AcceleratorType} ({accelerator.Name}) median of {reps}: " + string.Join("; ", report) + $"; sum fp16 {totalHi:F0} ms, +lo {totalLo:F0} ms";
         Console.WriteLine("[SdConvBench] " + line);

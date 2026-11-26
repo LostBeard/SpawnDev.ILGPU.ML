@@ -86,8 +86,7 @@ public class AttentionKernels
         ArrayView1D<float, Stride1D.Dense> V,
         int T)
     {
-        EnsureLoaded();
-        _splitHeadsKernel!(H * T * D, qkv, Q, K, V, T);
+        SplitHeadsKernel(H * T * D, qkv, Q, K, V, T);
     }
 
     /// <summary>Merge multi-head output back to [T, C] layout.</summary>
@@ -96,19 +95,11 @@ public class AttentionKernels
         ArrayView1D<float, Stride1D.Dense> output,
         int T)
     {
-        EnsureLoaded();
-        _mergeHeadsKernel!(T * C, input, output, T);
+        MergeHeadsKernel(T * C, input, output, T);
     }
 
-    private void EnsureLoaded()
-    {
-        var accelerator = _accelerator;
-        _splitHeadsKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int>(SplitHeadsImpl);
-        _mergeHeadsKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int>(MergeHeadsImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> SplitHeadsKernel => _splitHeadsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(SplitHeadsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> MergeHeadsKernel => _mergeHeadsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MergeHeadsImpl);
 }

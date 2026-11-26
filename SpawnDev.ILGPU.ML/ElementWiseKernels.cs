@@ -643,15 +643,13 @@ public class ElementWiseKernels : IDisposable
     public void GELU(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int count)
     {
-        EnsureLoaded();
-        _geluKernel!(count, input, output);
+        GeluKernel(count, input, output);
     }
 
     public void ReLU(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int count)
     {
-        EnsureLoaded();
-        _reluKernel!(count, input, output);
+        ReluKernel(count, input, output);
     }
 
     /// <summary>Element-wise subtract: output = a - b</summary>
@@ -685,24 +683,21 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> b,
         ArrayView1D<float, Stride1D.Dense> output, int count)
     {
-        EnsureLoaded();
-        _addKernel!(count, a, b, output);
+        AddKernel(count, a, b, output);
     }
 
     public void Mul(ArrayView1D<float, Stride1D.Dense> a,
         ArrayView1D<float, Stride1D.Dense> b,
         ArrayView1D<float, Stride1D.Dense> output, int count)
     {
-        EnsureLoaded();
-        _mulKernel!(count, a, b, output);
+        MulKernel(count, a, b, output);
     }
 
     /// <summary>In-place bias addition: data[i] += bias[i % C].</summary>
     public void AddBias(ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> bias, int totalElements, int C)
     {
-        EnsureLoaded();
-        _addBiasKernel!(totalElements, data, bias, C);
+        AddBiasKernel(totalElements, data, bias, C);
     }
 
     /// <summary>
@@ -723,8 +718,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias, int totalElements, int rowLength)
     {
         if (rowLength < 1) throw new ArgumentOutOfRangeException(nameof(rowLength), rowLength, "row length must be >= 1");
-        EnsureLoaded();
-        _addRowBiasKernel!(totalElements, data, bias, rowLength);
+        AddRowBiasKernel(totalElements, data, bias, rowLength);
     }
 
     /// <summary>
@@ -746,8 +740,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output, int totalElements, int C)
     {
         if (C < 1) throw new ArgumentOutOfRangeException(nameof(C), C, "broadcast length must be >= 1");
-        EnsureLoaded();
-        _broadcastSubKernel!(totalElements, a, sub, output, C);
+        BroadcastSubKernel(totalElements, a, sub, output, C);
     }
 
     /// <summary>Broadcast multiply: out[i] = a[i] * scale[i % C]. For LayerScale.</summary>
@@ -755,16 +748,14 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> scale,
         ArrayView1D<float, Stride1D.Dense> output, int totalElements, int C)
     {
-        EnsureLoaded();
-        _broadcastMulKernel!(totalElements, input, scale, output, C);
+        BroadcastMulKernel(totalElements, input, scale, output, C);
     }
 
     /// <summary>Scale all elements by a constant: out[i] = in[i] * scalar.</summary>
     public void Scale(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int count, float scalar)
     {
-        EnsureLoaded();
-        _scaleKernel!(count, input, output, scalar);
+        ScaleKernel(count, input, output, scalar);
     }
 
     // ── GPU RGBA pack (Tuvok 2026-07-12): VAE output NCHW [3,H,W] in [-1,1] -> packed RGBA int per pixel.
@@ -804,29 +795,25 @@ public class ElementWiseKernels : IDisposable
     public void TransposeLastTwo(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int batch, int rows, int cols)
     {
-        EnsureLoaded();
-        _transposeLastTwoKernel!(batch * rows * cols, input, output, rows, cols);
+        TransposeLastTwoKernel(batch * rows * cols, input, output, rows, cols);
     }
 
     /// <summary>In-place GELU. No aliasing (single buffer binding).</summary>
     public void GELUInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     {
-        EnsureLoaded();
-        _geluInPlaceKernel!(count, data);
+        GeluInPlaceKernel(count, data);
     }
 
     /// <summary>In-place ReLU: data[i] = max(0, data[i]). Single buffer binding.</summary>
     public void ReLUInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     {
-        EnsureLoaded();
-        _reluInPlaceKernel!(count, data);
+        ReluInPlaceKernel(count, data);
     }
 
     /// <summary>In-place truncate toward zero (ONNX integer-Div post-step). Single buffer binding (WebGPU-safe).</summary>
     public void TruncateInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     {
-        EnsureLoaded();
-        _truncateInPlaceKernel!(count, data);
+        TruncateInPlaceKernel(count, data);
     }
 
     /// <summary>
@@ -839,8 +826,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int T, int C)
     {
-        EnsureLoaded();
-        _concatLastDimKernel!(T * 2 * C, a, b, output, T, C);
+        ConcatLastDimKernel(T * 2 * C, a, b, output, T, C);
     }
 
     /// <summary>
@@ -855,7 +841,6 @@ public class ElementWiseKernels : IDisposable
         int[] aShape, int[] bShape, int[] outShape,
         BroadcastOp op)
     {
-        EnsureLoaded();
         int rank = outShape.Length;
         int outCount = 1;
         for (int i = 0; i < rank; i++) outCount *= outShape[i];
@@ -927,21 +912,19 @@ public class ElementWiseKernels : IDisposable
             BroadcastOp.BitShiftRight => Specs.BroadcastBitShiftRightOp,
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
-        _broadcastBinaryKernel!(outCount, a, b, output, paramsView, opSpec);
+        BroadcastBinaryKernelLazy(outCount, a, b, output, paramsView, opSpec);
     }
 
     /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>
     public void Fill(ArrayView1D<float, Stride1D.Dense> data, int count, float value)
     {
-        EnsureLoaded();
-        _fillKernel!(count, data, value);
+        FillKernel(count, data, value);
     }
 
     /// <summary>In-place scale: data[i] *= scalar. No aliasing (single buffer binding).</summary>
     public void ScaleInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float scalar)
     {
-        EnsureLoaded();
-        _scaleInPlaceKernel!(count, data, scalar);
+        ScaleInPlaceKernel(count, data, scalar);
     }
 
     /// <summary>Add a constant to every element, in place.</summary>
@@ -956,8 +939,7 @@ public class ElementWiseKernels : IDisposable
     /// </remarks>
     public void AddScalarInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float scalar)
     {
-        EnsureLoaded();
-        _addScalarInPlaceKernel!(count, data, scalar);
+        AddScalarInPlaceKernel(count, data, scalar);
     }
 
     /// <summary>
@@ -968,8 +950,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int outH, int outW)
     {
-        EnsureLoaded();
-        _bilinearUpsampleKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
+        BilinearUpsampleKernel(C * outH * outW, input, output, C, inH, inW, outH, outW);
     }
 
     /// <summary>
@@ -1013,7 +994,6 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int[] inputShape, int[] outputShape)
     {
-        EnsureLoaded();
         _nearestUpsampleKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(NearestUpsample4DImpl);
@@ -1057,8 +1037,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int outH, int outW)
     {
-        EnsureLoaded();
-        _bilinearUpsampleACKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
+        BilinearUpsampleACKernel(C * outH * outW, input, output, C, inH, inW, outH, outW);
     }
 
     /// <summary>
@@ -1071,8 +1050,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int outH, int outW, int ctMode = 0, float a = -0.75f, bool excludeOutside = false)
     {
-        EnsureLoaded();
-        _bicubicResizeKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW, ctMode, a, excludeOutside ? 1 : 0);
+        BicubicResizeKernel(C * outH * outW, input, output, C, inH, inW, outH, outW, ctMode, a, excludeOutside ? 1 : 0);
     }
 
     /// <summary>
@@ -1100,8 +1078,7 @@ public class ElementWiseKernels : IDisposable
     public void AddInPlace(ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> other, int count)
     {
-        EnsureLoaded();
-        _addInPlaceKernel!(count, data, other);
+        AddInPlaceKernel(count, data, other);
     }
 
     /// <summary>In-place axpy: data[i] += other[i] * scalar. Two separate buffers required.
@@ -1110,8 +1087,7 @@ public class ElementWiseKernels : IDisposable
     public void AddScaledInPlace(ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> other, int count, float scalar)
     {
-        EnsureLoaded();
-        _addScaledInPlaceKernel!(count, data, other, scalar);
+        AddScaledInPlaceKernel(count, data, other, scalar);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -2056,21 +2032,21 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _truncateKernel;
 
     public void Sqrt(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _sqrtKernel!(count, input, output); }
+    { SqrtKernel(count, input, output); }
     public void Sin(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _sinKernel!(count, input, output); }
+    { SinKernel(count, input, output); }
     public void Cos(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _cosKernel!(count, input, output); }
+    { CosKernel(count, input, output); }
     public void Tan(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _tanKernel!(count, input, output); }
+    { TanKernel(count, input, output); }
     public void ArgMax(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int outerSize, int axisSize, int innerSize)
-    { EnsureLoaded2(); _argMaxKernel!(outerSize * innerSize, input, output, outerSize, axisSize, innerSize); }
+    { ArgMaxKernel(outerSize * innerSize, input, output, outerSize, axisSize, innerSize); }
     public void Exp(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _expKernel!(count, input, output); }
+    { ExpKernel(count, input, output); }
     public void Div(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _divKernel!(count, a, b, output); }
+    { DivKernel(count, a, b, output); }
     public void Pow(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _powKernel!(count, a, b, output); }
+    { PowKernel(count, a, b, output); }
 
     /// <summary>output[i] = a[i] ^ exponent. No exponent BUFFER at all - so no managed array, no CPU
     /// expansion loop, no host-to-device upload, and nothing for the pool to allocate per shape.</summary>
@@ -2084,16 +2060,16 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float,
         ArrayView1D<float, Stride1D.Dense>>? _powScalarKernel;
     public void Abs(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _absKernel!(count, input, output); }
+    { AbsKernel(count, input, output); }
     public void Neg(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _negKernel!(count, input, output); }
+    { NegKernel(count, input, output); }
     public void Reciprocal(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _reciprocalKernel!(count, input, output); }
+    { ReciprocalKernel(count, input, output); }
     public void Erf(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _erfKernel!(count, input, output); }
+    { ErfKernel(count, input, output); }
     public void Where(ArrayView1D<float, Stride1D.Dense> cond, ArrayView1D<float, Stride1D.Dense> x,
         ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _whereKernel!(count, cond, x, y, output); }
+    { WhereKernel(count, cond, x, y, output); }
 
     /// <summary>
     /// N-D broadcast Where on GPU: output = cond != 0 ? x : y, with each input broadcast
@@ -2109,7 +2085,6 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int[] condShape, int[] xShape, int[] yShape, int[] outShape)
     {
-        EnsureLoaded2();
         int rank = outShape.Length;
         int outCount = 1;
         for (int i = 0; i < rank; i++) outCount *= outShape[i];
@@ -2148,15 +2123,15 @@ public class ElementWiseKernels : IDisposable
             paramsView = (_stridesParams ??= new Kernels.ContentParamBuffers<float>(_accelerator)).Get(paramsData);
         }
 
-        _whereBroadcastKernel!(outCount, cond, x, y, output, paramsView);
+        WhereBroadcastKernelLazy(outCount, cond, x, y, output, paramsView);
     }
 
     public void Floor(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _floorKernel!(count, input, output); }
+    { FloorKernel(count, input, output); }
     public void Ceil(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _ceilKernel!(count, input, output); }
+    { CeilKernel(count, input, output); }
     public void Log(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _logKernel!(count, input, output); }
+    { LogKernel(count, input, output); }
 
     // Reduce-family helpers (2026-10-01). ReduceL2 / ReduceSumSquare squared with Mul(x, x, out) and finished with
     // Sqrt(out, out) / Log(out, out): the same buffer in two storage bindings, which WebGPU forbids (RaCo-ALIKED's
@@ -2193,242 +2168,176 @@ public class ElementWiseKernels : IDisposable
     private static void LogInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     { data[idx] = MathF.Log(data[idx]); }
     public void Round(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _roundKernel!(count, input, output); }
+    { RoundKernel(count, input, output); }
     /// <summary>atan2(y, x) elementwise, with IEEE quadrant and signed-zero semantics.</summary>
     public void Atan2(ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _atan2Kernel!(count, y, x, output); }
+    { Atan2Kernel(count, y, x, output); }
     public void Min(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _minKernel!(count, a, b, output); }
+    { MinKernel(count, a, b, output); }
     public void Max(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _maxKernel!(count, a, b, output); }
+    { MaxKernel(count, a, b, output); }
     public void Clip(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float minVal, float maxVal)
-    { EnsureLoaded2(); _clipKernel!(count, input, output, minVal, maxVal); }
+    { ClipKernel(count, input, output, minVal, maxVal); }
     public void ThresholdedRelu(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float alpha)
-    { EnsureLoaded2(); _thresholdedReluKernel!(count, input, output, alpha); }
+    { ThresholdedReluKernel(count, input, output, alpha); }
     public void ShrinkParam(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> fparamsBuf, int count)
-    { EnsureLoaded2(); _shrinkParamKernel!(count, input, output, fparamsBuf); }
+    { ShrinkParamKernel(count, input, output, fparamsBuf); }
     public void DynamicQuantize(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> scaleOut, ArrayView1D<float, Stride1D.Dense> zpOut,
         ArrayView1D<float, Stride1D.Dense> maxBuf, ArrayView1D<float, Stride1D.Dense> minBuf, int count)
-    { EnsureLoaded2(); _dynamicQuantizeKernel!(count, input, output, scaleOut, zpOut, maxBuf, minBuf); }
+    { DynamicQuantizeKernel(count, input, output, scaleOut, zpOut, maxBuf, minBuf); }
     public void IsNaN(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _isNaNKernel!(count, input, output); }
+    { IsNaNKernel(count, input, output); }
     public void Trilu(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int count)
-    { EnsureLoaded2(); _triluKernel!(count, input, output, paramsBuf); }
+    { TriluKernel(count, input, output, paramsBuf); }
     public void LRN(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, ArrayView1D<float, Stride1D.Dense> fparamsBuf, int count)
-    { EnsureLoaded2(); _lrnKernel!(count, input, output, paramsBuf, fparamsBuf); }
+    { LrnKernel(count, input, output, paramsBuf, fparamsBuf); }
     public void Hardmax(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         int outerSize, int axisSize)
-    { EnsureLoaded2(); _hardmaxKernel!(outerSize, input, output, axisSize); }
+    { HardmaxKernel(outerSize, input, output, axisSize); }
     public void LpNorm(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int outerTimesInner)
-    { EnsureLoaded2(); _lpNormKernel!(outerTimesInner, input, output, paramsBuf); }
+    { LpNormKernel(outerTimesInner, input, output, paramsBuf); }
     public void GlobalLpPool(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int nTimesC)
-    { EnsureLoaded2(); _globalLpPoolKernel!(nTimesC, input, output, paramsBuf); }
+    { GlobalLpPoolKernel(nTimesC, input, output, paramsBuf); }
     public void AffineGrid(ArrayView1D<float, Stride1D.Dense> theta, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalPixels)
-    { EnsureLoaded2(); _affineGridKernel!(totalPixels, theta, output, paramsBuf); }
+    { AffineGridKernel(totalPixels, theta, output, paramsBuf); }
     public void LpPool(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
-    { EnsureLoaded2(); _lpPoolKernel!(totalOutput, input, output, paramsBuf); }
+    { LpPoolKernel(totalOutput, input, output, paramsBuf); }
     public void GridSample(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> grid,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
-    { EnsureLoaded2(); _gridSampleKernel!(totalOutput, input, grid, output, paramsBuf); }
+    { GridSampleKernel(totalOutput, input, grid, output, paramsBuf); }
     public void RoiAlign(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> rois,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf,
         ArrayView1D<float, Stride1D.Dense> fparamsBuf, int totalOutput)
-    { EnsureLoaded2(); _roiAlignKernel!(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
+    { RoiAlignKernel(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
     public void ReverseSequence(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> seqLens, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalElements)
-    { EnsureLoaded2(); _reverseSequenceKernel!(totalElements, input, output, seqLens, paramsBuf); }
+    { ReverseSequenceKernel(totalElements, input, output, seqLens, paramsBuf); }
     public void MaxUnpool(ArrayView1D<float, Stride1D.Dense> vals, ArrayView1D<float, Stride1D.Dense> indices,
         ArrayView1D<float, Stride1D.Dense> output, int inputCount, int outSize)
-    { EnsureLoaded2(); _maxUnpoolKernel!(outSize, vals, indices, output, inputCount); }
+    { MaxUnpoolKernel(outSize, vals, indices, output, inputCount); }
     public void DFT(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutputBins)
-    { EnsureLoaded2(); _dftKernel!(totalOutputBins, input, output, paramsBuf); }
+    { DftKernel(totalOutputBins, input, output, paramsBuf); }
     public void Col2Im(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalScatterOps)
-    { EnsureLoaded2(); _col2ImKernel!(totalScatterOps, input, output, paramsBuf); }
+    { Col2ImKernel(totalScatterOps, input, output, paramsBuf); }
     public void MaxRoiPool(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> rois,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf,
         ArrayView1D<float, Stride1D.Dense> fparamsBuf, int totalOutput)
-    { EnsureLoaded2(); _maxRoiPoolKernel!(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
+    { MaxRoiPoolKernel(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
     public void STFT(ArrayView1D<float, Stride1D.Dense> signal, ArrayView1D<float, Stride1D.Dense> window,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalBins)
-    { EnsureLoaded2(); _stftKernel!(totalBins, signal, window, output, paramsBuf); }
+    { StftKernel(totalBins, signal, window, output, paramsBuf); }
     public void CumSum(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int outerTimesInner)
-    { EnsureLoaded2(); _cumSumKernel!(outerTimesInner, input, output, paramsBuf); }
+    { CumSumKernel(outerTimesInner, input, output, paramsBuf); }
     /// <summary>ONNX DeformConv; mask / bias are read only when params flag them (pass distinct placeholder views otherwise).</summary>
     public void DeformConv(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weights,
         ArrayView1D<float, Stride1D.Dense> offsets, ArrayView1D<float, Stride1D.Dense> mask, ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
-    { EnsureLoaded2(); _deformConvKernel!(totalOutput, input, weights, offsets, mask, bias, output, paramsBuf); }
+    { DeformConvKernel(totalOutput, input, weights, offsets, mask, bias, output, paramsBuf); }
     public void Bernoulli(ArrayView1D<float, Stride1D.Dense> probs, ArrayView1D<float, Stride1D.Dense> output,
         int count, int seed)
-    { EnsureLoaded2(); _bernoulliKernel!(count, probs, output, seed); }
+    { BernoulliKernel(count, probs, output, seed); }
     public void CenterCropPad(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutput)
-    { EnsureLoaded2(); _centerCropPadKernel!(totalOutput, input, output, paramsBuf); }
+    { CenterCropPadKernel(totalOutput, input, output, paramsBuf); }
     public void Equal(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _equalKernel!(count, a, b, output); }
+    { EqualKernel(count, a, b, output); }
     public void Greater(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _greaterKernel!(count, a, b, output); }
+    { GreaterKernel(count, a, b, output); }
     public void Less(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _lessKernel!(count, a, b, output); }
+    { LessKernel(count, a, b, output); }
 
     /// <summary>Truncate: round toward zero. output[i] = MathF.Truncate(input[i]).</summary>
     public void Truncate(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
-    { EnsureLoaded2(); _truncateKernel!(count, input, output); }
+    { TruncateKernel(count, input, output); }
 
-    private void EnsureLoaded2()
-    {
-        var a = _accelerator;
-        _sqrtKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SqrtImpl);
-        _sinKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SinImpl);
-        _cosKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CosImpl);
-        _tanKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TanImpl);
-        _argMaxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(ArgMaxImpl);
-        _expKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ExpImpl);
-        _divKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DivImpl);
-        _powKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(PowImpl);
-        _absKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AbsImpl);
-        _negKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(NegImpl);
-        _reciprocalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReciprocalImpl);
-        _erfKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ErfImpl);
-        _whereKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereImpl);
-        _whereBroadcastKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereBroadcastKernel);
-        _floorKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FloorImpl);
-        _ceilKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CeilImpl);
-        _logKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LogImpl);
-        _roundKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(RoundImpl);
-        _atan2Kernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Atan2Impl);
-        _minKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
-        _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
-        _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
-        _thresholdedReluKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(ThresholdedReluImpl);
-        _shrinkParamKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(ShrinkParamImpl);
-        _dynamicQuantizeKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DynamicQuantizeImpl);
-        _isNaNKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(IsNaNImpl);
-        _triluKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(TriluImpl);
-        _lrnKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LRNImpl);
-        _hardmaxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(HardmaxImpl);
-        _lpNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(LpNormImpl);
-        _globalLpPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(GlobalLpPoolImpl);
-        _affineGridKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(AffineGridImpl);
-        _lpPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(LpPoolImpl);
-        _gridSampleKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GridSampleImpl);
-        _roiAlignKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(RoiAlignImpl);
-        _reverseSequenceKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReverseSequenceImpl);
-        _maxUnpoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int>(MaxUnpoolImpl);
-        _dftKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(DFTImpl);
-        _col2ImKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(Col2ImImpl);
-        _maxRoiPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(MaxRoiPoolImpl);
-        _stftKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(STFTImpl);
-        _cumSumKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(CumSumImpl);
-        _deformConvKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DeformConvImpl);
-        _bernoulliKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BernoulliImpl);
-        _centerCropPadKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(CenterCropPadImpl);
-        _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
-        _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
-        _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);
-        _truncateKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TruncateImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> SqrtKernel => _sqrtKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SqrtImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> SinKernel => _sinKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SinImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> CosKernel => _cosKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CosImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> TanKernel => _tanKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TanImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int> ArgMaxKernel => _argMaxKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int>(ArgMaxImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ExpKernel => _expKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ExpImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> DivKernel => _divKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DivImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> PowKernel => _powKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(PowImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> AbsKernel => _absKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AbsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> NegKernel => _negKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(NegImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ReciprocalKernel => _reciprocalKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReciprocalImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ErfKernel => _erfKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ErfImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> WhereKernel => _whereKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> WhereBroadcastKernelLazy => _whereBroadcastKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereBroadcastKernel);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> FloorKernel => _floorKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FloorImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> CeilKernel => _ceilKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CeilImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> LogKernel => _logKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LogImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> RoundKernel => _roundKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(RoundImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> Atan2Kernel => _atan2Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Atan2Impl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> MinKernel => _minKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> MaxKernel => _maxKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float> ClipKernel => _clipKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float> ThresholdedReluKernel => _thresholdedReluKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(ThresholdedReluImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ShrinkParamKernel => _shrinkParamKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ShrinkParamImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> DynamicQuantizeKernel => _dynamicQuantizeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DynamicQuantizeImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> IsNaNKernel => _isNaNKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(IsNaNImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> TriluKernel => _triluKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TriluImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> LrnKernel => _lrnKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LRNImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> HardmaxKernel => _hardmaxKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(HardmaxImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> LpNormKernel => _lpNormKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LpNormImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> GlobalLpPoolKernel => _globalLpPoolKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GlobalLpPoolImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> AffineGridKernel => _affineGridKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AffineGridImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> LpPoolKernel => _lpPoolKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LpPoolImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> GridSampleKernel => _gridSampleKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GridSampleImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> RoiAlignKernel => _roiAlignKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(RoiAlignImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ReverseSequenceKernel => _reverseSequenceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReverseSequenceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> MaxUnpoolKernel => _maxUnpoolKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MaxUnpoolImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> DftKernel => _dftKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DFTImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> Col2ImKernel => _col2ImKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Col2ImImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> MaxRoiPoolKernel => _maxRoiPoolKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxRoiPoolImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> StftKernel => _stftKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(STFTImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> CumSumKernel => _cumSumKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CumSumImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> DeformConvKernel => _deformConvKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DeformConvImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> BernoulliKernel => _bernoulliKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BernoulliImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> CenterCropPadKernel => _centerCropPadKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CenterCropPadImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> EqualKernel => _equalKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> GreaterKernel => _greaterKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> LessKernel => _lessKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> TruncateKernel => _truncateKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TruncateImpl);
 
-    private void EnsureLoaded()
-    {
-        var accelerator = _accelerator;
-        _geluKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GELUImpl);
-        _reluKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReLUImpl);
-        _addKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(AddImpl);
-        _mulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(MulImpl);
-        _addBiasKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int>(AddBiasImpl);
-        _broadcastMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int>(BroadcastMulImpl);
-        _broadcastSubKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int>(BroadcastSubImpl);
-        _addRowBiasKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int>(AddRowBiasImpl);
-        _scaleKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            float>(ScaleImpl);
-        _transposeLastTwoKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int>(TransposeLastTwoImpl);
-        _geluInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>>(GELUInPlaceImpl);
-        _reluInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>>(ReLUInPlaceImpl);
-        _truncateInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>>(TruncateInPlaceImpl);
-        _scaleInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
-        _addScalarInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, float>(AddScalarInPlaceImpl);
-        _fillKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, float>(FillImpl);
-        _broadcastBinaryKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            DelegateSpecialization<Func<float, float, float>>>(BroadcastBinaryKernel);
-        _addInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddInPlaceImpl);
-        _addScaledInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(AddScaledInPlaceImpl);
-        _concatLastDimKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int>(ConcatLastDimImpl);
-        _bilinearUpsampleKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int>(BilinearUpsampleImpl);
-        _bilinearUpsampleACKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int>(BilinearUpsampleACImpl);
-        _bicubicResizeKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, float, int>(BicubicResizeImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> GeluKernel => _geluKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GELUImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> ReluKernel => _reluKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ReLUImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> AddKernel => _addKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> MulKernel => _mulKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MulImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> AddBiasKernel => _addBiasKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(AddBiasImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> BroadcastMulKernel => _broadcastMulKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BroadcastMulImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> BroadcastSubKernel => _broadcastSubKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BroadcastSubImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int> AddRowBiasKernel => _addRowBiasKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(AddRowBiasImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float> ScaleKernel => _scaleKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(ScaleImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int> TransposeLastTwoKernel => _transposeLastTwoKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(TransposeLastTwoImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> GeluInPlaceKernel => _geluInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(GELUInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> ReluInPlaceKernel => _reluInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(ReLUInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>> TruncateInPlaceKernel => _truncateInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(TruncateInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float> ScaleInPlaceKernel => _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float> AddScalarInPlaceKernel => _addScalarInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float>(AddScalarInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float> FillKernel => _fillKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float>(FillImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>> BroadcastBinaryKernelLazy => _broadcastBinaryKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>(BroadcastBinaryKernel);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>> AddInPlaceKernel => _addInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float> AddScaledInPlaceKernel => _addScaledInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(AddScaledInPlaceImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int> ConcatLastDimKernel => _concatLastDimKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(ConcatLastDimImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int> BilinearUpsampleKernel => _bilinearUpsampleKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(BilinearUpsampleImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int> BilinearUpsampleACKernel => _bilinearUpsampleACKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>(BilinearUpsampleACImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, float, int> BicubicResizeKernel => _bicubicResizeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int, float, int>(BicubicResizeImpl);
 
     // ─────────────────────────────────────────────────────────────
     //  Generic unary op via DelegateSpecialization (trig, activation, etc.)
@@ -2519,7 +2428,6 @@ public class ElementWiseKernels : IDisposable
     public async Task ValidateGELUAsync(int count = 1000)
     {
         
-        EnsureLoaded();
         var accelerator = _accelerator;
 
         var rng = new Random(42);

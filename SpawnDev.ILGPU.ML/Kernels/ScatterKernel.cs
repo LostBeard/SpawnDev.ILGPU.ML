@@ -104,7 +104,6 @@ public class ScatterKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int[] indicesShape, int[] dataShape, int axis, int outputCount)
     {
-        EnsureLoaded();
         int rank = Math.Min(dataShape.Length, MaxRank);
         var packed = new int[EParamLen];
         packed[0] = rank;
@@ -125,7 +124,7 @@ public class ScatterKernel : IDisposable
             ixs *= d < indicesShape.Length ? indicesShape[d] : 1;
         }
 
-        _scatterElementsKernel!(outputCount, indices, updates, output, RentParams(packed));
+        ScatterElementsKernel(outputCount, indices, updates, output, RentParams(packed));
     }
 
     // ScatterND params: [0]=indexDepth [1]=sliceSize [2]=numUpdates [3..]=data dims covered by the tuple
@@ -167,7 +166,6 @@ public class ScatterKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int[] dataShape, int indexDepth, int numUpdates, int sliceSize, int outputCount)
     {
-        EnsureLoaded();
         var packed = new int[NDDimBase + MaxRank];
         packed[0] = indexDepth;
         packed[1] = sliceSize;
@@ -175,7 +173,7 @@ public class ScatterKernel : IDisposable
         for (int d = 0; d < indexDepth && d < MaxRank; d++)
             packed[NDDimBase + d] = d < dataShape.Length ? dataShape[d] : 1;
 
-        _scatterNDKernel!(outputCount, indices, updates, output, RentParams(packed));
+        ScatterNDKernel(outputCount, indices, updates, output, RentParams(packed));
     }
 
     private ArrayView1D<int, Stride1D.Dense> RentParams(int[] packed)
@@ -191,15 +189,10 @@ public class ScatterKernel : IDisposable
         return (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
     }
 
-    private void EnsureLoaded()
-    {
-        _scatterElementsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ScatterElementsImpl);
-        _scatterNDKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ScatterNDImpl);
-    }
+    // Each kernel loads on its first use. They were all loaded on the first call of any one: MobileNetV2's first run compiled about 30 kernels it never runs
+    // (every element-wise kernel for one ReLU, every normalization for one BatchNorm; ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel, 2026-11-25).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> ScatterElementsKernel => _scatterElementsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ScatterElementsImpl);
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>> ScatterNDKernel => _scatterNDKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ScatterNDImpl);
 
     public void Dispose()
     {
