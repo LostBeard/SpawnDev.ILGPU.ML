@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Convolutions: a 32x32-tile implicit-GEMM kernel for small grids** (`Conv2DKernel.SmallTileMaxGroups`, `SmallTileMaxGroups1x1`): the same 256 threads and
+  16-wide k blocks with 2x2 outputs per thread, so a convolution whose 64x64 grid launches few workgroups launches four times as many; each output sums the same
+  k terms in the same order, so the results are the 64x64 kernel's BIT FOR BIT (`ConvSmallTile_MatchesTheLargeTileKernel_BitForBit`, CUDA / OpenCL / Wasm /
+  WebGPU, red-checked). Found with ILGPU 5.4.53's per-dispatch timings: MobileNetV2's late layers launched 3-16 workgroups and took ~0.9 of its 1.64 ms.
+  MEASURED (RTX 4070): MobileNetV2 WebGPU GPU time 1.58 -> 1.24 ms (alternated timed replays, twice); desktop 512->512 3x3 at 7x7 1.80x CUDA / 1.78x OpenCL,
+  deep-K pointwise (960->160 at 7x7, 576->96 and 384->64 at 14x14) 1.08-1.20x. Defaults: up to 32 groups on the desktop, 8 where the 1x1 kernel would take the
+  convolution (it beats the 32x32 kernel on wide pointwise grids: 160->960 at 7x7 0.91x, 96->576 at 14x14 0.80x); OFF in the browser, where it is one more
+  42 KB shader to compile (MobileNetV2 first run 774 -> 846 ms, paid back after ~210 runs), like the 1x1 kernel. A page that runs a model many times can set
+  `SmallTileMaxGroups = 32`. Tests: `ConvSmallTile_DesktopAB`, `Warm_MobileNetV2_SmallTileAB_GpuTime`, `ColdStart_MobileNetV2_SmallTile`.
 - **WebGPU: a captured replay no longer waits for the GPU before returning** (`WebGPUGraphCapture.SkipCompletionWait`, null = follow the session's
   `SkipCompletionWait`, on by default): a replay ends with its submit, and the caller's readback is the one wait. MEASURED (Data, 2026-11-26, plain JS in
   installed Chrome, RTX 4070): Chrome charges ~2.9 ms for ANY submit that is waited on, however small (Node / Dawn: 0.07-0.14 ms; mapAsync adds nothing), and

@@ -35,6 +35,16 @@ public abstract partial class MLTestBase
         finally { Conv2DKernel.Use1x1Kernel = was; }
     });
 
+    /// <summary>The same with the 32x32-tile convolution kernel ON (<see cref="Conv2DKernel.SmallTileMaxGroups"/> 32; the browser default is off): what it costs a first run. Run it alone (a cold page).</summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task<string> ColdStart_MobileNetV2_SmallTile() => await RunTest(async accelerator =>
+    {
+        int was = Conv2DKernel.SmallTileMaxGroups;
+        Conv2DKernel.SmallTileMaxGroups = 32;
+        try { return "small-tile kernel on: " + await ColdStartMobileNetV2(accelerator); }
+        finally { Conv2DKernel.SmallTileMaxGroups = was; }
+    });
+
     /// <summary>
     /// The browser's "device" stage of a cold start (Bones, 2026-11-26: ~400 ms of MobileNetV2's 1.5 s AOT cold visit), split: the builder, the WebGPU and WebGL probes, the context,
     /// the WebGPU device. Once the way most pages do it (AllAcceleratorsAsync, then the preferred accelerator) and once WebGPU alone. The page already holds a device, so the browser's
@@ -284,6 +294,10 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task<string> Warm_MobileNetV2_1x1KernelAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator, "1x1"));
 
+    /// <summary>The same A/B for the 32x32-tile convolution kernel (<see cref="Conv2DKernel.SmallTileMaxGroups"/> 0 / 32): the late small-grid layers.</summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task<string> Warm_MobileNetV2_SmallTileAB_GpuTime() => await RunTest(accelerator => WarmPassAB(accelerator, "smalltile"));
+
     private async Task<string> WarmPassAB(Accelerator accelerator, string pass)
     {
         if (accelerator.AcceleratorType != AcceleratorType.WebGPU) throw new UnsupportedTestException("WebGPU timestamps");
@@ -297,8 +311,10 @@ public abstract partial class MLTestBase
         {
             var saved = Environment.GetEnvironmentVariable("ML_OPT_SKIP");
             bool saved1x1 = Conv2DKernel.Use1x1Kernel;
-            // pass "1x1": the 1x1 convolution kernel off in the "off" session (a kernel switch, not an optimizer pass; the capture records whichever kernel ran)
+            int savedSmall = Conv2DKernel.SmallTileMaxGroups;
+            // pass "1x1" / "smalltile": a convolution kernel off in the "off" session (a kernel switch, not an optimizer pass; the capture records whichever kernel ran)
             if (pass == "1x1") Conv2DKernel.Use1x1Kernel = !skip;
+            else if (pass == "smalltile") Conv2DKernel.SmallTileMaxGroups = skip ? 0 : 32;
             else Environment.SetEnvironmentVariable("ML_OPT_SKIP", skip ? (string.IsNullOrEmpty(saved) ? pass : saved + "," + pass) : saved);
             try
             {
@@ -308,7 +324,7 @@ public abstract partial class MLTestBase
                 if (!c.IsCaptured) throw new Exception("no capture: " + c.CaptureStatus);
                 return (s, c);
             }
-            finally { Environment.SetEnvironmentVariable("ML_OPT_SKIP", saved); Conv2DKernel.Use1x1Kernel = saved1x1; }
+            finally { Environment.SetEnvironmentVariable("ML_OPT_SKIP", saved); Conv2DKernel.Use1x1Kernel = saved1x1; Conv2DKernel.SmallTileMaxGroups = savedSmall; }
         }
         var (sOff, cOff) = await Make(skip: true);
         var (sOn, cOn) = await Make(skip: false);

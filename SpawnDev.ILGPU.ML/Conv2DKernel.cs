@@ -282,6 +282,123 @@ public class Conv2DKernel : IDisposable
     /// stride, padding, dilationH, dilationW are captured as scalar parameters.
     /// </summary>
 
+    // Conv2DImplicitGemmImpl with 32x32 output tiles: the same 256 threads and 16-wide k blocks, 2x2 outputs per thread instead of 4x4, so a small convolution launches
+    // four times as many workgroups. Every output accumulates the same k terms in the same order with the same fused multiply-adds, so the results are the 64x64 kernel's
+    // bit for bit. For the convolutions whose 64x64 grid is too small to fill the GPU (SmallTileMaxGroups). MEASURED first (ILGPU 5.4.53 per-dispatch timed replay,
+    // WebGPU, RTX 4070, MobileNetV2): the late layers that launch 3-16 workgroups took 0.07-0.14 ms each, ~0.9 of the model's 1.64 ms of GPU time.
+    private const int SmReg = 2;                  // 2x2 outputs per thread
+    private const int SmTile = RbBlock * SmReg;   // 32x32 output tile
+
+    private static void Conv2DImplicitGemmSmallImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kHW,
+        int strideDilHW, int padTL, int outH, int outW, int numTilesN)
+    {
+        int act = numTilesN >> 24; numTilesN &= 0xFFFFFF;
+        int strideH = strideDilHW >> 24, strideW = (strideDilHW >> 16) & 0xFF;
+        int kH = kHW >> 16, kW = kHW & 0xFFFF;
+        int padTop = padTL >> 16, padLeft = padTL & 0xFFFF;
+        int dilationH = (strideDilHW >> 8) & 0xFF, dilationW = strideDilHW & 0xFF;
+
+        int K = inC * kH * kW;
+        int N = outH * outW;
+        int batch = Grid.IdxY;
+        int inBatchBase = batch * inC * inH * inW;
+        int outBatchBase = batch * outC * N;
+
+        var aTile = SharedMemory.Allocate<float>(SmTile * RbBlock); // weights: 32 outC x 16 k
+        var bTile = SharedMemory.Allocate<float>(RbBlock * SmTile); // patches: 16 k x 32 n
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / RbBlock;
+        int threadCol = localIdx % RbBlock;
+
+        float c00 = 0, c01 = 0;
+        float c10 = 0, c11 = 0;
+
+        int numKTiles = (K + RbBlock - 1) / RbBlock;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            for (int r = 0; r < SmReg; r++)
+            {
+                int oc = tileRow * SmTile + threadRow * SmReg + r;
+                int kk = t * RbBlock + threadCol;
+                int sIdx = (threadRow * SmReg + r) * RbBlock + threadCol;
+                aTile[sIdx] = (oc < outC && kk < K) ? weight[oc * K + kk] : 0f;
+            }
+            for (int r = 0; r < SmReg; r++)
+            {
+                int kk = t * RbBlock + threadRow;
+                int n = tileCol * SmTile + threadCol * SmReg + r;
+                int sIdx = threadRow * SmTile + threadCol * SmReg + r;
+                int ic = kk / (kH * kW);
+                int rem = kk - ic * (kH * kW);
+                int ky = rem / kW;
+                int kx = rem - ky * kW;
+                int oy = n / outW;
+                int ox = n - oy * outW;
+                int iy = oy * strideH + ky * dilationH - padTop;
+                int ix = ox * strideW + kx * dilationW - padLeft;
+                bTile[sIdx] = (kk < K && n < N && iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+                    ? input[inBatchBase + (ic * inH + iy) * inW + ix] : 0f;
+            }
+
+            Group.Barrier();
+
+            for (int k = 0; k < RbBlock; k++)
+            {
+                float a0 = aTile[(threadRow * SmReg + 0) * RbBlock + k];
+                float a1 = aTile[(threadRow * SmReg + 1) * RbBlock + k];
+                float b0 = bTile[k * SmTile + threadCol * SmReg + 0];
+                float b1 = bTile[k * SmTile + threadCol * SmReg + 1];
+                c00 = float.MultiplyAddEstimate(a0, b0, c00); c01 = float.MultiplyAddEstimate(a0, b1, c01);
+                c10 = float.MultiplyAddEstimate(a1, b0, c10); c11 = float.MultiplyAddEstimate(a1, b1, c11);
+            }
+
+            Group.Barrier();
+        }
+
+        int baseOc = tileRow * SmTile + threadRow * SmReg;
+        int baseN = tileCol * SmTile + threadCol * SmReg;
+        if (baseOc + 0 < outC)
+        {
+            float bb = bias[baseOc + 0];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 0] = ConvAct(c00 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 1] = ConvAct(c01 + bb, act);
+        }
+        if (baseOc + 1 < outC)
+        {
+            float bb = bias[baseOc + 1];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 0] = ConvAct(c10 + bb, act);
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 1] = ConvAct(c11 + bb, act);
+        }
+    }
+
+    /// <summary>
+    /// The 64x64-tile grid (workgroups, batch included) at or below which a convolution takes the 32x32-tile kernel (the same results bit for bit, four times the
+    /// workgroups); 0 = never. Default: 32 on the desktop, 0 in the browser. MEASURED (RTX 4070, 2026-11-26): MobileNetV2's WebGPU GPU time 1.58 -> 1.24 ms (alternated timed
+    /// replays, twice), but in the browser it is one more 42 KB shader to compile, the first run 774 -> 846 ms, paid back after ~210 runs; a page that runs a model many
+    /// times (video) can turn it on. Desktop (ConvSmallTile_DesktopAB, CUDA / OpenCL): 512->512 3x3 at 7x7 1.80x / 1.78x; see <see cref="SmallTileMaxGroups1x1"/>.
+    /// </summary>
+    public static int SmallTileMaxGroups = OperatingSystem.IsBrowser() ? 0 : 32;
+
+    /// <summary>
+    /// The limit for a convolution the 1x1 kernel would take (<see cref="Use1x1Kernel"/>), which skips the general kernel's im2col decode: the 32x32 kernel beats it only on the
+    /// smallest grids. MEASURED (RTX 4070, CUDA / OpenCL, ConvSmallTile_DesktopAB): 960->160 at 7x7 (3 groups) 1.12x / 0.98x, 576->96 at 14x14 (8) 1.20x / 1.08x, 384->64 at
+    /// 14x14 (4) 1.20x / 1.09x; but 160->960 at 7x7 (15) 0.91x / 0.90x, 320->1280 (20) 0.88x / 0.80x, 96->576 at 14x14 (36) 0.80x / 0.78x.
+    /// </summary>
+    public static int SmallTileMaxGroups1x1 = 8;
+    private Action<KernelConfig,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>? _implicitGemmSmallKernel;
+
     // Conv2DImplicitGemmImpl for a 1x1, stride-1, unpadded convolution (Conv2D1x1Applies): the same signature, tiles, accumulation order and stores, with the B tile read
     // as input[k, n] instead of decoding each element through the im2col (two integer divisions and the padding checks per element). Its own kernel, not a branch in the
     // general one: the branch made OpenCL's 3x3 convolutions 7-10 % slower. MEASURED (RTX 4070, Conv_DirectVsTiled_Crossover): MobileNetV2's 1x1 shapes 20-35 % faster on
@@ -588,6 +705,23 @@ public class Conv2DKernel : IDisposable
             // 960->320 at 7x7 0.44 -> 0.14 ms CUDA, 0.37 -> 0.14 OpenCL; 320->1280 0.24 -> 0.06 both; nothing slower; MobileNetV2's WebGPU GPU time 5.69 -> 4.69 ms.
             && gemmK >= RbBlock && outC >= RbReg)
         {
+            if ((uint)dilationH > 0xFF || (uint)dilationW > 0xFF || (uint)stride > 0x7F || (uint)strideW > 0xFF)
+                throw new NotSupportedException($"Conv2D stride {stride}x{strideW} / dilation {dilationH}x{dilationW} exceeds the implicit-GEMM packed range (stride H 0..127, W 0..255, dilation 0..255)");
+            int bigGroups = ((outC + RbTile - 1) / RbTile) * ((gemmN + RbTile - 1) / RbTile) * batch;
+            bool takes1x1 = Use1x1Kernel && Conv2D1x1Applies(kH, kW, stride, strideW, padTop, padLeft, padBottom, padRight, inH, inW, outH, outW);
+            if (bigGroups <= (takes1x1 ? Math.Min(SmallTileMaxGroups, SmallTileMaxGroups1x1) : SmallTileMaxGroups))
+            {
+                var small = _implicitGemmSmallKernel ??= _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int, int, int, int, int, int, int, int>(Conv2DImplicitGemmSmallImpl);
+                int smM = (outC + SmTile - 1) / SmTile, smN = (gemmN + SmTile - 1) / SmTile;
+                small(new KernelConfig(new Index2D(smM * smN, batch), new Index2D(RbBlock * RbBlock, 1)), input, weight, bias, output,
+                    inC, inH, inW, outC, Pack16(kH, kW, "kernel size"),
+                    (stride << 24) | (strideW << 16) | (dilationH << 8) | dilationW,
+                    Pack16(padTop, padLeft, "begin pads"), outH, outW, ConvActPack(smN, activation));
+                return;
+            }
             var gemm = Use1x1Kernel && Conv2D1x1Applies(kH, kW, stride, strideW, padTop, padLeft, padBottom, padRight, inH, inW, outH, outW)
                 ? (_implicitGemm1x1Kernel ??= _accelerator.LoadStreamKernel<
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -602,8 +736,6 @@ public class Conv2DKernel : IDisposable
             var cfg = new KernelConfig(
                 new Index2D(numTilesM * numTilesN, batch),
                 new Index2D(RbBlock * RbBlock, 1));
-            if ((uint)dilationH > 0xFF || (uint)dilationW > 0xFF || (uint)stride > 0x7F || (uint)strideW > 0xFF)
-                throw new NotSupportedException($"Conv2D stride {stride}x{strideW} / dilation {dilationH}x{dilationW} exceeds the implicit-GEMM packed range (stride H 0..127, W 0..255, dilation 0..255)");
             gemm(cfg, input, weight, bias, output,
                 inC, inH, inW, outC, Pack16(kH, kW, "kernel size"),
                 (stride << 24) | (strideW << 16) | (dilationH << 8) | dilationW,
