@@ -13,8 +13,10 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 /// The 12B transformer is larger than most cards (11.9 GB as 8-bit floats), so its 57 blocks are split by <see cref="StreamedModelWeights"/>: as many as
 /// <c>residentBytes</c> allows stay on the device, the rest are read from the file for every forward pass.
 /// </summary>
-public sealed class Flux1Weights : IDisposable
+public sealed class Flux1Weights : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => ResidentBytes;
+
     public const int DoubleBlocks = 19, SingleBlocks = 38;
     private readonly StreamedModelWeights _s;
 

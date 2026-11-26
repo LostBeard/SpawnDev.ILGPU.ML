@@ -123,7 +123,19 @@ public sealed class Flux2Pipeline : IDisposable
     public Flux2Pipeline(Accelerator accelerator, Qwen2Tokenizer tokenizer, Func<Task<Flux2Weights>> encoderWeights, Func<Task<Flux2Weights>> transformerWeights, InferenceSession vaeDecoder, Flux2VaeNorm vaeNorm)
     {
         _acc = accelerator; _tokenizer = tokenizer; _encoderWeights = encoderWeights; _transformerWeights = transformerWeights; _vae = vaeDecoder; _norm = vaeNorm;
+        _residencyTag = ModelResidency.NewTag(nameof(Flux2Pipeline));
+        ResidencyKey = _residencyTag + "/transformer";
     }
+
+    /// <summary>
+    /// The application's <see cref="ModelResidency"/> (one per accelerator). With one, the transformer is leased from it for each run and stays on the device while there is room: the manager
+    /// drops it when another model needs the room and it is loaded again on the next run. <see cref="KeepTransformerResident"/> applies only without one. Dispose releases what this pipeline holds there.
+    /// </summary>
+    public ModelResidency? Residency { get; set; }
+
+    /// <summary>What <see cref="Residency"/> knows the transformer by; pipelines given the same key share it. Default: this pipeline's own.</summary>
+    public string ResidencyKey { get; set; }
+    private readonly string _residencyTag;
 
     /// <summary>Files a run reads, as (repo, path): for storage planning (<see cref="RangeStreamModelSource.PlanCacheAsync(IEnumerable{ValueTuple{string, string}}, long, CancellationToken)"/>).</summary>
     public static IReadOnlyList<(string Repo, string Path)> HubFiles(string repo, bool references = false)
@@ -421,7 +433,14 @@ public sealed class Flux2Pipeline : IDisposable
         var imgIds = allIds.ToArray();
         var images = new List<Flux2Image>();
         Flux2Weights tw; Flux2Transformer tr;
-        if (_residentTr != null && _residentTokens == nImg + nRef) { tw = _residentWeights!; tr = _residentTr; }
+        ModelLease<Flux2ResidentTransformer>? lease = null;
+        if (Residency != null)
+        {
+            Report("transformer", 0, 1);
+            lease = await Residency.AcquireAsync(ResidencyKey, async () => new Flux2ResidentTransformer(await _transformerWeights()), tag: _residencyTag);
+            (tw, tr) = lease.Model.For(_acc, nTxt, nImg + nRef);
+        }
+        else if (_residentTr != null && _residentTokens == nImg + nRef) { tw = _residentWeights!; tr = _residentTr; }
         else
         {
             ReleaseResident();
@@ -458,7 +477,8 @@ public sealed class Flux2Pipeline : IDisposable
         finally
         {
             foreach (var t in refTokens) t.Dispose();
-            if (KeepTransformerResident) { _residentWeights = tw; _residentTr = tr; _residentTokens = nImg + nRef; }
+            if (lease != null) await lease.DisposeAsync();
+            else if (KeepTransformerResident) { _residentWeights = tw; _residentTr = tr; _residentTokens = nImg + nRef; }
             else { if (ReferenceEquals(tr, _residentTr)) { _residentTr = null; _residentWeights = null; } tr.Dispose(); tw.Dispose(); }
         }
         return images;
@@ -487,5 +507,21 @@ public sealed class Flux2Pipeline : IDisposable
     private (int Height, int Width) _encoderKey;
 
     /// <summary>Frees the resident VAE decoder and encoder and any kept transformer. The accelerator is not touched.</summary>
-    public void Dispose() { ReleaseResident(); _cachedEmbedsDev?.Dispose(); _cachedEmbedsDev = null; _meanDev?.Dispose(); _stdDev?.Dispose(); _meanDev = _stdDev = null; _encoder?.Dispose(); _encoder = null; _vae.Dispose(); _elementWise?.Dispose(); }
+    public void Dispose() { Residency?.ReleaseLater(_residencyTag); ReleaseResident(); _cachedEmbedsDev?.Dispose(); _cachedEmbedsDev = null; _meanDev?.Dispose(); _stdDev?.Dispose(); _meanDev = _stdDev = null; _encoder?.Dispose(); _encoder = null; _vae.Dispose(); _elementWise?.Dispose(); }
+}
+
+/// <summary>What <see cref="Flux2Pipeline"/> leases from a <see cref="ModelResidency"/>: the transformer's weights, and the transformer built on them for the last size drawn.</summary>
+internal sealed class Flux2ResidentTransformer(Flux2Weights weights) : IDisposable, IDeviceSized
+{
+    private Flux2Transformer? _tr;
+    private int _tokens;
+    public Flux2Weights Weights { get; } = weights;
+    /// <summary>The transformer for this many image tokens: the kept one when the size is the same, else a new one (the old one freed, as the pipeline's own switch does).</summary>
+    public (Flux2Weights, Flux2Transformer) For(Accelerator acc, int textTokens, int imageTokens)
+    {
+        if (_tr == null || _tokens != imageTokens) { _tr?.Dispose(); _tr = new Flux2Transformer(acc, Weights, textTokens, imageTokens); _tokens = imageTokens; }
+        return (Weights, _tr);
+    }
+    public long DeviceBytes => ((IDeviceSized)Weights).DeviceBytes + (_tr?.DeviceBytes ?? 0);
+    public void Dispose() { _tr?.Dispose(); _tr = null; Weights.Dispose(); }
 }

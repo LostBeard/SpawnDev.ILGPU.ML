@@ -10,8 +10,10 @@ namespace SpawnDev.ILGPU.ML.Trellis2;
 /// streamed from the file in bounded chunks (<see cref="SafeTensorsFileReader"/>). Dispose frees the whole stage:
 /// the pipeline keeps one stage's weights on a 12 GB card at a time.
 /// </summary>
-public sealed class GpuWeights : IDisposable
+public sealed class GpuWeights : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => Bytes;
+
     private readonly Dictionary<string, MemoryBuffer1D<BFloat16, Stride1D.Dense>> _bf16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _f16 = new();
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _f32 = new();

@@ -15,8 +15,10 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 /// an anchor tensor and removed. 8-bit float (F8_E4M3) matrices, unscaled or with ComfyUI's per-matrix <c>scale_weight</c> (fp8_scaled files), stay 8-bit and are decoded into one shared bf16 scratch just before their GEMM; 8-bit
 /// vectors are made bf16 when they load. An optional per-load adapter rewrites each loaded set (fusing, renaming) before use.
 /// </summary>
-public sealed class StreamedModelWeights : IDisposable
+public sealed class StreamedModelWeights : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => ResidentBytes;
+
     private readonly Accelerator _acc;
     private readonly IModelSource _source;
     private readonly string _repo, _file, _prefix;

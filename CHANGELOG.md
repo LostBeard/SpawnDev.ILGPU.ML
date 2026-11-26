@@ -15,6 +15,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   `AllocatedDeviceBytes` (SqueezeNet, 7 backends): exact right after loading; after a run, kernel scratch is not in it (73.5 % counted on CUDA, OpenCL and WebGPU, 84.7 % Wasm, 100 % CPU, Velocity,
   WebGL). Dispose gives back all but the accelerator's shared parameter caches (60-72 bytes). Tests `InferenceSession_DeviceBytes_MatchesTheAcceleratorsCount` and
   `ModelResidency_RealDevice_BudgetDropsTheIdleModel` (two copies under a budget that holds one: the second drops the first and both classify the cat; every backend).
+- `Flux2Pipeline`, `Flux3Pipeline`, `LtxPipeline`: NEW `Residency` (+ `ResidencyKey`). With a `ModelResidency` set, each run leases its weights from it: kept while there is room, dropped
+  when another model needs it, loaded again on the next run; Dispose releases the pipeline's own. Without one, `KeepTransformerResident` / `KeepLoaded` work as before. Tests
+  `Flux2_/Flux3_Residency_KeptAndReloaded_SamePicture`, `Ltx_Residency_KeptAndReloaded_SameClip` (CUDA): kept, dropped and reloaded, the output is the same byte for byte (FLUX.2 2474 MB,
+  FLUX 3 3472 MB, LTX DiT + VAE 3120 MB). Red: disposing the kept transformer behind the manager crashes the kept run.
+- `IDeviceSized` on GpuWeights, StreamedModelWeights, Flux1Weights, Flux2Weights, Flux2Transformer, SdCheckpoint, QwenImageTransformer, ZImageTransformer (their existing sizes).
 - Docs: `streamThreshold` (CreateFromStreamAsync, CreateFromOnnxStreamAsync, ParseFromStreamAsync) has been ignored since July; its doc described the old behaviour.
 
 ## 5.8.31 - 2026-11-25 (nuget.org) - models load whole from hosts that compress responses

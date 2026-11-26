@@ -25,8 +25,10 @@ using FV = ArrayView1D<float, Stride1D.Dense>;
 /// text token j at j + max(h/2, w/2) on all three axes. Blocks past the residency budget stream from the file every call (<see cref="StreamedModelWeights"/>); q | k | v and
 /// the text stream's q | k | v are fused as they load (one GEMM each, still 8-bit).
 /// </summary>
-public sealed class QwenImageTransformer : IDisposable
+public sealed class QwenImageTransformer : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => ResidentBytes;
+
     public const int Dim = 3072, Heads = 24, HeadDim = 128, MlpHidden = 12288, InChannels = 64, TxtDim = 3584, Layers = 60, TimeChannels = 256;
     public const float Eps = 1e-6f, RopeTheta = 10000f;
 

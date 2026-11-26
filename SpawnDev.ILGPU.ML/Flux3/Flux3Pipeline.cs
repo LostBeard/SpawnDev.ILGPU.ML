@@ -42,6 +42,8 @@ public sealed class Flux3Pipeline : IDisposable
         InferenceSession vaeDecoder, Flux2VaeNorm vaeNorm, Flux3Config? config = null)
     {
         _acc = accelerator; _tokenizer = tokenizer; _textWeights = textEncoderWeights; _ditWeights = transformerWeights; _config = config ?? new Flux3Config();
+        _residencyTag = ModelResidency.NewTag(nameof(Flux3Pipeline));
+        ResidencyKey = _residencyTag + "/transformer";
         _vae = new Flux2Pipeline(accelerator, null!, null!, null!, vaeDecoder, vaeNorm);
     }
 
@@ -208,11 +210,12 @@ public sealed class Flux3Pipeline : IDisposable
         var textIds = new float[nTxt * 4]; for (int i = 0; i < nTxt; i++) textIds[i * 4 + 3] = i;
         var schedule = Schedule(request.Steps, request.Alpha);
         Report("transformer", 0, 1);
-        var w = _resident ?? await _ditWeights();
+        ModelLease<Flux2Weights>? lease = Residency == null ? null : await Residency.AcquireAsync(ResidencyKey, _ditWeights, tag: _residencyTag);
+        var w = lease?.Model ?? _resident ?? await _ditWeights();
         Lap("transformer weights (load)");
         try
         {
-            if (KeepTransformerResident) _resident = w;
+            if (lease == null && KeepTransformerResident) _resident = w;
             using var tr = new Flux3Transformer(_acc, w, _config, nImg, nCond, nTxt);
             // the caption, references and rotary tables go up once; the latents stay on the device through every step (an Euler kernel updates them): nothing crosses to the CPU until the picture is done
             tr.Prepare(condRows, textRows, imageIds, condIdArray, textIds);
@@ -229,7 +232,8 @@ public sealed class Flux3Pipeline : IDisposable
         }
         finally
         {
-            if (!KeepTransformerResident) { if (ReferenceEquals(w, _resident)) _resident = null; w.Dispose(); }
+            if (lease != null) await lease.DisposeAsync();
+            else if (!KeepTransformerResident) { if (ReferenceEquals(w, _resident)) _resident = null; w.Dispose(); }
         }
         Report("vae", 0, 1);
         var picture = await _vae.DecodeAsync(_vae.ToVaeInput(latents, rows, cols), rows, cols);
@@ -254,8 +258,18 @@ public sealed class Flux3Pipeline : IDisposable
 
     private Flux2Weights? _resident;
 
+    /// <summary>
+    /// The application's <see cref="ModelResidency"/> (one per accelerator). With one, the transformer's weights are leased from it for each run and stay on the device while there is room: the manager
+    /// drops them when another model needs the room and them are loaded again on the next run. <see cref="KeepTransformerResident"/> applies only without one. Dispose releases what this pipeline holds there.
+    /// </summary>
+    public ModelResidency? Residency { get; set; }
+
+    /// <summary>What <see cref="Residency"/> knows the transformer's weights by; pipelines given the same key share them. Default: this pipeline's own.</summary>
+    public string ResidencyKey { get; set; }
+    private readonly string _residencyTag;
+
     /// <summary>Free the transformer weights kept by <see cref="KeepTransformerResident"/>.</summary>
     public void ReleaseResident() { _resident?.Dispose(); _resident = null; }
 
-    public void Dispose() { ReleaseResident(); _vae.Dispose(); }
+    public void Dispose() { Residency?.ReleaseLater(_residencyTag); ReleaseResident(); _vae.Dispose(); }
 }

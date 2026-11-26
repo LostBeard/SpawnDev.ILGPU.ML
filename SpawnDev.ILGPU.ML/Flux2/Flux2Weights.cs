@@ -17,8 +17,10 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 /// (quantize_flux2.py: 5 bits per weight, 2.5 GB for the 3.9B transformer instead of 7.75) dequantised one matrix at a time into a bf16 scratch just before its
 /// GEMM, so the normal tensor-core / tiled GEMM runs on them unchanged. <see cref="Matrix"/> returns a view that is only valid until the next call (it may be the shared scratch).
 /// </summary>
-public sealed class Flux2Weights : IDisposable
+public sealed class Flux2Weights : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => Bytes;
+
     private readonly GpuWeights _w;
     private readonly Accelerator _acc;
     private Q8Linear? _q8;

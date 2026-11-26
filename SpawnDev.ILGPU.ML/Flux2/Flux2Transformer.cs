@@ -21,8 +21,11 @@ using FV = ArrayView1D<float, Stride1D.Dense>;
 /// </code>
 /// Weights from tools/unirig-harness/reference/export_flux2.py (transformer.safetensors). Checked against the reference's own step outputs (golden_klein.py).
 /// </summary>
-public sealed class Flux2Transformer : IDisposable
+public sealed class Flux2Transformer : IDisposable, IDeviceSized
 {
+    /// <summary>The device bytes of its own buffers (activations, positions, scratch); the weights are the <see cref="Flux2Weights"/>'.</summary>
+    public long DeviceBytes { get { long n = 0; foreach (var o in _owned) if (o is MemoryBuffer b && !b.IsDisposed) n += b.LengthInBytes; return n; } }
+
     public const int Dim = 3072, Heads = 24, HeadDim = 128, MlpHidden = 9216, DoubleBlocks = 5, SingleBlocks = 20, InChannels = 128, JointDim = 7680, TimeChannels = 256;
     public const float Eps = 1e-6f, RopeTheta = 2000f;
     public static readonly int[] RopeAxes = { 32, 32, 32, 32 };

@@ -18,8 +18,10 @@ using BV = ArrayView1D<BFloat16, Stride1D.Dense>;
 /// 256-wide timestep embedding (scale 1 + s, gate tanh), 3-axis rotary positions (32 / 48 / 48, theta 256, interleaved pairs), sequences padded to multiples of 32 with
 /// learned pad tokens. Its blocks stream from the file past a residency budget (<see cref="StreamedModelWeights"/>).
 /// </summary>
-public sealed class ZImageTransformer : IDisposable
+public sealed class ZImageTransformer : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => ResidentBytes;
+
     public const int Dim = 3840, Heads = 30, HeadDim = 128, Ffn = 10240, InChannels = 64, CapDim = 2560, AdaDim = 256, TimeChannels = 256, Layers = 30, Refiners = 2, SeqMultiple = 32;
     public const float NormEps = 1e-5f, FinalEps = 1e-6f, RopeTheta = 256f;
     public static readonly int[] RopeAxes = { 32, 48, 48 };

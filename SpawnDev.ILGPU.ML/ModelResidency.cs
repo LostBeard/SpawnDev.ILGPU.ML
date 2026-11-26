@@ -255,6 +255,19 @@ public sealed class ModelResidency : IAsyncDisposable
         return await DropAsync(e => e.Tags.Remove(tag) && e.Tags.Count == 0, ModelEvictionReason.Released).ConfigureAwait(false);
     }
 
+    /// <summary>For a sync Dispose (a pipeline's): <see cref="ReleaseAsync"/> started and not awaited. It still drains the device before it frees anything; a failure goes to <see cref="Log"/>.</summary>
+    internal void ReleaseLater(string tag) => _ = ReleaseLaterAsync(tag);
+
+    private async Task ReleaseLaterAsync(string tag)
+    {
+        try { await ReleaseAsync(tag).ConfigureAwait(false); }
+        catch (Exception ex) { Log?.Invoke($"[ModelResidency] releasing '{tag}' failed: {ex.Message}"); }
+    }
+
+    /// <summary>Unique tags for pipelines that lease from a manager (each releases its own on Dispose).</summary>
+    internal static string NewTag(string owner) => $"{owner}#{Interlocked.Increment(ref s_tags)}";
+    private static int s_tags;
+
     /// <summary>Drops every idle model; one in use when its last lease ends. Returns how many were dropped now.</summary>
     public Task<int> ReleaseAllAsync() => DropAsync(_ => true, ModelEvictionReason.Released);
 

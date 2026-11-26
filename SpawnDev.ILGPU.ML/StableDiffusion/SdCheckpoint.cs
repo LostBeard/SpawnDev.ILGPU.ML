@@ -28,8 +28,10 @@ public sealed class SdCheckpointOptions
 /// and <see cref="Vae"/>. The caller keeps the sampler, the noise, CFG and the latents; <see cref="LatentScale"/> and <see cref="Prediction"/> say how to drive the models.
 /// <see cref="Dispose"/> frees everything.
 /// </summary>
-public sealed class SdCheckpoint : IDisposable
+public sealed class SdCheckpoint : IDisposable, IDeviceSized
 {
+    long IDeviceSized.DeviceBytes => WeightBytes;
+
     public SdFamily Family { get; }
     public SdPrediction Prediction { get; private set; }
     /// <summary>The VAE latent scale: sampler latent = VAE latent x this (0.18215 SD 1.x / 2.x, 0.13025 SDXL).</summary>

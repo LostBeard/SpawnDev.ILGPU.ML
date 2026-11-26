@@ -172,7 +172,22 @@ public sealed class LtxPipeline : IDisposable
     private const int TextLength = 128;
     private const int TemporalRatio = 8, SpatialRatio = 32;
 
-    public LtxPipeline(Accelerator accelerator, IModelSource source, string repo, LtxPaths paths) { _acc = accelerator; _source = source; _repo = repo; _paths = paths; }
+    public LtxPipeline(Accelerator accelerator, IModelSource source, string repo, LtxPaths paths)
+    {
+        _acc = accelerator; _source = source; _repo = repo; _paths = paths;
+        _residencyTag = ModelResidency.NewTag(nameof(LtxPipeline));
+        ResidencyKey = _residencyTag;
+    }
+
+    /// <summary>
+    /// The application's <see cref="ModelResidency"/> (one per accelerator). With one, the DiT, the VAE decoder and encoder and the latent upscaler are each leased from it for each run and stay on the device while there is room: the manager
+    /// drops them when another model needs the room and them are each loaded again on the next run. <see cref="KeepLoaded"/> applies only without one. Dispose releases what this pipeline holds there.
+    /// </summary>
+    public ModelResidency? Residency { get; set; }
+
+    /// <summary>What <see cref="Residency"/> knows these models (each file under it) by; pipelines given the same key share them. Default: this pipeline's own.</summary>
+    public string ResidencyKey { get; set; }
+    private readonly string _residencyTag;
 
     /// <summary>Files on disk: <paramref name="paths"/> are file paths (<see cref="LtxPaths.InFolder"/>).</summary>
     public LtxPipeline(Accelerator accelerator, LtxPaths paths) : this(accelerator, new LocalFolderModelSource(""), "", paths) { }
@@ -196,16 +211,22 @@ public sealed class LtxPipeline : IDisposable
     /// <summary>The weights of <paramref name="file"/> for one stage: kept ones are shared (the lease does not free them), others are freed with the lease.</summary>
     private async Task<WeightsLease> AcquireAsync(string file, CancellationToken ct)
     {
+        if (Residency != null)
+        {
+            var lease = await Residency.AcquireAsync(ResidencyKey + "/" + file, () => LoadWeightsAsync(file, ct), tag: _residencyTag);
+            return new WeightsLease(lease.Model, owned: false, lease);
+        }
         if (_keep && _kept.TryGetValue(file, out var w)) return new WeightsLease(w, owned: false);
         var loaded = await LoadWeightsAsync(file, ct);
         if (_keep) { _kept[file] = loaded; return new WeightsLease(loaded, owned: false); }
         return new WeightsLease(loaded, owned: true);
     }
 
-    private sealed class WeightsLease(GpuWeights w, bool owned) : IDisposable
+    private sealed class WeightsLease(GpuWeights w, bool owned, ModelLease<GpuWeights>? lease = null) : IDisposable
     {
         public GpuWeights W { get; } = w;
-        public void Dispose() { if (owned) W.Dispose(); }
+        // a manager's lease ends here (its model stays until the manager needs the room); a sync end cannot drain, and needs none: nothing is freed
+        public void Dispose() { if (lease != null) lease.Dispose(); else if (owned) W.Dispose(); }
     }
 
     private void ReleaseKept()
@@ -215,7 +236,7 @@ public sealed class LtxPipeline : IDisposable
     }
 
     /// <summary>Frees the weights <see cref="KeepLoaded"/> kept on the device (the accelerator is the application's and is not touched).</summary>
-    public void Dispose() => ReleaseKept();
+    public void Dispose() { Residency?.ReleaseLater(_residencyTag); ReleaseKept(); }
 
     // the last few prompts' T5 outputs: the encoder streams 5 GB of weights per prompt (in the browser about half of a short clip's time), so a new seed, another mode or an
     // extension with the same prompt skips it (an embedding is at most 128 x 4096 floats)
