@@ -21,6 +21,8 @@ public abstract partial class MLTestBase
         public async Task DrainAsync() { log.Add("drain"); await Task.Yield(); }
         public long? Budget;
         public void SetBudget(long? bytes) => Budget = bytes;
+        public long Allocated;               // what the device has allocated (a model that does not report its size is measured from it)
+        public long AllocatedBytes => Allocated;
     }
 
     private static void Mr(bool ok, string what) { if (!ok) throw new Exception(what); }
@@ -203,6 +205,41 @@ public abstract partial class MLTestBase
             Mr(await plain.GetSizeAsync("", "x") == null, "a source without GetSizeAsync answers null");
         }
         finally { Directory.Delete(dir, true); }
+    });
+
+    /// <summary>
+    /// A model that does not report its size (Lore's SpawnGen objects, any app's): measured from the device's own allocation count, over its load (eager) or from its lease's
+    /// EnsureRoomAsync to the lease's end (lazy); a load that overlaps another load is not measured. The make-room log line carries the arithmetic.
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task ModelResidency_NotSized_MeasuredByTheDevice() => await RunPureTest(async () =>
+    {
+        var log = new List<string>();
+        var dev = new FakeDevice(log);
+        var lines = new List<string>();
+        await using var r = new ModelResidency(dev) { BudgetBytes = 100, Log = lines.Add };
+        await using (var l = await r.AcquireAsync("eager", () => { dev.Allocated += 30; return Task.FromResult(new MemoryStream()); })) { }   // no size given: only the device can tell
+        Mr(r.Resident.Single().Bytes == 30 && r.KnownSizes["eager"] == 30, $"eager: the device's gain over the load ({r.Resident.Single().Bytes})");
+        var lazyStream = new MemoryStream();
+        await using (var l = await r.AcquireAsync("lazy", () => Task.FromResult(lazyStream), 1))
+        {
+            await l.EnsureRoomAsync(40);
+            dev.Allocated += 40;                          // its weights load inside the lease
+        }
+        Mr(r.Resident.Single(m => m.Key == "lazy").Bytes == 40 && r.KnownSizes["lazy"] == 40, $"lazy: from EnsureRoomAsync to the lease's end ({r.Resident.Single(m => m.Key == "lazy").Bytes})");
+        // two loads at once: neither can be told apart from the other, so neither is measured from the device (each keeps its expected size)
+        var gate = new TaskCompletionSource();
+        async Task<MemoryStream> Slow(long b) { dev.Allocated += b; await gate.Task; return new MemoryStream(); }
+        var a = r.AcquireAsync("p", () => Slow(5), 7);
+        var b = r.AcquireAsync("q", () => Slow(6), 8);
+        await Task.Yield(); gate.SetResult();
+        await using (var la = await a) await using (var lb = await b) { }
+        Mr(r.Resident.Single(m => m.Key == "p").Bytes == 7 && r.Resident.Single(m => m.Key == "q").Bytes == 8, "overlapping loads keep their expected sizes");
+        dev.Allocated = 95;                               // 95 of 100 allocated: 30 + 40 + 7 + 8 = 85 of it models, 10 other
+        await using (var l = await r.AcquireAsync("big", () => Task.FromResult(new MemoryStream()), 20)) { }
+        var room = lines.FirstOrDefault(s => s.Contains("room for 'big'")) ?? "";
+        Mr(room.Contains("MB other") && room.Contains("dropping idle models"), "the make-room line says what is allocated and why it drops: " + string.Join(" | ", lines));
+        await Task.CompletedTask;
     });
 
     private sealed class LazyModel : IDisposable, IDeviceSized

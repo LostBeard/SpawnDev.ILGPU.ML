@@ -50,6 +50,8 @@ public sealed class ModelResidency : IAsyncDisposable
         Task DrainAsync();
         /// <summary>Sets the device's own budget (ILGPU <c>Accelerator.DeviceMemoryBudgetBytes</c>), so its free-memory answer and its idle-scratch reclaim use the same number.</summary>
         void SetBudget(long? bytes);
+        /// <summary>Everything allocated on the device now (ILGPU <c>Accelerator.AllocatedDeviceBytes</c>): models, pools, caches.</summary>
+        long AllocatedBytes { get; }
     }
 
     private sealed class AcceleratorDevice(Accelerator accelerator) : IDevice
@@ -58,6 +60,7 @@ public sealed class ModelResidency : IAsyncDisposable
         public long ReclaimIdle(long bytes) => accelerator.ReclaimDeviceMemory(bytes);
         public Task DrainAsync() => accelerator.SynchronizeAsync();
         public void SetBudget(long? bytes) => accelerator.DeviceMemoryBudgetBytes = bytes;
+        public long AllocatedBytes => accelerator.AllocatedDeviceBytes;
     }
 
     private sealed class Entry(string key)
@@ -72,7 +75,11 @@ public sealed class ModelResidency : IAsyncDisposable
         public long LastUsed = System.Diagnostics.Stopwatch.GetTimestamp();
         public int Generation;
         public bool DropWhenIdle;           // released while leased: dropped when the last lease ends
+        public long LazyFrom = -1;          // a model that is not IDeviceSized: device bytes allocated when its lease asked for room (EnsureRoomAsync), measured again when the lease ends
     }
+
+    private int _loadsRunning;
+    private long _loadStarts;
 
     private sealed class Holder(string key, Func<bool> isResident, Func<long> bytes, Func<Task<bool>> evict)
     {
@@ -196,8 +203,13 @@ public sealed class ModelResidency : IAsyncDisposable
         else
         {
             T model;
+            long allocBefore = _device.AllocatedBytes;
+            bool alone = Interlocked.Increment(ref _loadsRunning) == 1;
+            long startsAt = Interlocked.Increment(ref _loadStarts);
             try { model = await load().ConfigureAwait(false) ?? throw new InvalidOperationException($"The load of '{key}' returned no model."); }
             catch (Exception ex) { Fail(entry, ex); throw; }
+            finally { Interlocked.Decrement(ref _loadsRunning); }
+            alone &= Interlocked.Read(ref _loadStarts) == startsAt;          // no other load started while this one ran
             bool lost, closed;
             long measured = -1;
             if (model is IDeviceSized sized)
@@ -205,6 +217,10 @@ public sealed class ModelResidency : IAsyncDisposable
                 try { measured = sized.DeviceBytes; }                               // app code: never under the lock
                 catch (Exception ex) { Log?.Invoke($"[ModelResidency] '{key}'.DeviceBytes threw {ex.GetType().Name}: {ex.Message}"); }
             }
+            else if (alone)
+                // a model that does not report its size: what the device gained over its load (Lore, 2026-11-25). Errs high when other work allocated meanwhile (a running prompt's
+                // scratch), low when the pools gave memory back during it; a load that overlapped another load is not measured at all
+                measured = Math.Max(0, _device.AllocatedBytes - allocBefore);
             lock (_sync)
             {
                 lost = entry.Generation != _generation;         // the device went away while it loaded
@@ -331,10 +347,20 @@ public sealed class ModelResidency : IAsyncDisposable
     // a model's size now (a lazy model's weights load inside its lease): the entry holds the current size, the remembered size per key the largest seen
     private void Remeasure(Entry entry)
     {
-        if (entry.Model is not IDeviceSized sized) return;
         long now;
-        try { now = sized.DeviceBytes; }                                      // app code: never under the lock
-        catch (Exception ex) { Log?.Invoke($"[ModelResidency] '{entry.Key}'.DeviceBytes threw {ex.GetType().Name}: {ex.Message}"); return; }
+        if (entry.Model is not IDeviceSized sized)
+        {
+            // not sized: a lazy load inside the lease is what the device gained from its EnsureRoomAsync to now (errs high: it includes the run's scratch still held)
+            long from;
+            lock (_sync) { from = entry.LazyFrom; entry.LazyFrom = -1; }
+            if (from < 0) return;
+            now = Math.Max(entry.Bytes, _device.AllocatedBytes - from);
+        }
+        else
+        {
+            try { now = sized.DeviceBytes; }                                  // app code: never under the lock
+            catch (Exception ex) { Log?.Invoke($"[ModelResidency] '{entry.Key}'.DeviceBytes threw {ex.GetType().Name}: {ex.Message}"); return; }
+        }
         lock (_sync)
         {
             entry.Bytes = now;
@@ -346,7 +372,11 @@ public sealed class ModelResidency : IAsyncDisposable
     {
         var entry = (Entry)entryObject;
         await _room.WaitAsync().ConfigureAwait(false);
-        try { await MakeRoomAsync(bytes, entry.Key).ConfigureAwait(false); }
+        try
+        {
+            await MakeRoomAsync(bytes, entry.Key).ConfigureAwait(false);
+            if (entry.Model is not IDeviceSized) { long now = _device.AllocatedBytes; lock (_sync) if (entry.LazyFrom < 0) entry.LazyFrom = now; }
+        }
         finally { _room.Release(); }
     }
 
@@ -467,8 +497,16 @@ public sealed class ModelResidency : IAsyncDisposable
         long Short() => TryFree(own, out long f) ? want + ReserveBytes - f : 0;
         long shortfall = want + ReserveBytes - free;
         if (shortfall <= 0) return;
-        _device.ReclaimIdle(shortfall);                                       // idle scratch before any model (7.3 GB idle in pools on a 12 GB card, Vertex 2026-10-12)
-        if (Short() <= 0) return;
+        long allocated = _device.AllocatedBytes, models = ModelBytes();
+        long reclaimed = _device.ReclaimIdle(shortfall);                      // idle scratch before any model (7.3 GB idle in pools on a 12 GB card, Vertex 2026-10-12)
+        long stillShort = Short();
+        // the arithmetic behind a drop, so a drop that looks wrong can be checked (Lore, 2026-11-25: 3.87 GB of models under 6 GB, and a 10 MB model dropped one: the budget counts
+        // everything on the device, and the rest was not idle scratch)
+        Log?.Invoke($"[ModelResidency] room for '{forKey}': needs {want >> 20} MB + reserve {ReserveBytes >> 20} MB, {free >> 20} MB free" +
+            $"{(BudgetBytes is long budget ? $" of a {budget >> 20} MB budget" : "")}; {allocated >> 20} MB allocated on the device, {models >> 20} MB of it kept models, " +
+            $"{Math.Max(0, allocated - models) >> 20} MB other (working buffers, caches, other code); idle scratch reclaimed {reclaimed >> 20} MB; " +
+            (stillShort > 0 ? $"{stillShort >> 20} MB still short: dropping idle models." : "enough without dropping a model."));
+        if (stillShort <= 0) return;
         await EvictUntilAsync(() => Short() > 0, ModelEvictionReason.MakeRoom, forKey).ConfigureAwait(false);
         long left = Short();
         if (left > 0)

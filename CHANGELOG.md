@@ -27,6 +27,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     reclaim made room there.
   - NEW `KnownSizes` / `SeedKnownSizes`: remembered sizes survive a reload or a server restart.
   - Tests `ModelResidency_LazyModels_EnsureRoom_KnownSizes`, `ModelResidency_ModelSource_GetSizeAsync`, `UnknownSizes_*` updated; 4 red-checks.
+  - A model that does not implement `IDeviceSized` is measured from the accelerator's own allocation count: over its load (not when another load overlapped it), or from its
+    lease's `EnsureRoomAsync` to the lease's end for a model that loads inside the lease (errs high: the run's scratch still held counts). Lore measured 0 GB for every SpawnGen model before.
+  - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
+    back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
+- NEW test `ColdStart_MobileNetV2_ShaderCompile_SerialVsParallel` (a measurement): MobileNetV2's first WebGPU run compiles 51 shaders (1.3 MB WGSL); Chrome compiles them in 5.0 s one at
+  a time, about 4 s all at once, and TiledGemm.Gemm (308 KB, reached by every fp32 convolution through Conv2DGemm.RunF32) is 3.9 s of it.
 - NEW `IModelSource.GetSizeAsync(repoId, filePath)` (default member: null): a file's size without downloading it. LocalFolderModelSource (file length), HubModelSource (cached copy, else one
   ranged probe), RangeStreamModelSource.
 - `IDeviceSized` on GpuWeights, StreamedModelWeights, Flux1Weights, Flux2Weights, Flux2Transformer, SdCheckpoint, QwenImageTransformer, ZImageTransformer (their existing sizes).
