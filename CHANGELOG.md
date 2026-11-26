@@ -33,6 +33,10 @@ Notable changes per release. Pre-stable; API will change between preview drops.
     measured at before, less what the model holds now (a kept model drops nothing); a key never measured follows the unknown-size rule. Measuring starts there either way.
     Lore's RX 590 gate (6 GB budget): a FLUX.2 measured at creation (0.2 GB, its weights load later) was kept beside FLUX 3 and the device was lost; measured from this call
     to the lease's end it is 5.7 GB, and the failing sequence ran 10 / 10.
+  - With a budget set, free memory is the accelerator's own count alone (budget - allocated, exact on every backend); the models' summed sizes stand in only where the
+    device cannot say. Lore's RX 590 gate (17 workflows x 2 passes, 6 GB budget: 34 / 34, no device loss) showed the summed sizes overcounting (7.3 GB of kept models
+    with 4.9 GB allocated: a size measured over a load includes the run's idle scratch), and capping by them made room early ("-1555 MB free" with 809 MB free). The
+    measurement itself waits for SpawnDev.ILGPU 5.4.51's ReclaimableDeviceBytes.
   - The make-room log line shows its arithmetic: what is needed, what is free of the budget, what is allocated, how much of it is kept models and how much other, what idle scratch gave
     back. Lore saw a 10 MB load drop a 3.6 GB model with 3.9 GB of models under 6 GB: the budget counts everything on the device. Test `ModelResidency_NotSized_MeasuredByTheDevice`, 3 red-checks.
 - **Conv -> Relu / Clip(0, 6) applied in the convolution's stores** (GraphOptimizer pass "convact"; `ML_OPT_SKIP=convact` turns it off). The NCHW direct, implicit-GEMM and

@@ -471,7 +471,10 @@ public sealed class ModelResidency : IAsyncDisposable
         long loading;
         lock (_sync) loading = _entries.Values.Where(e => e.Model == null).Sum(e => e.Reserved) - ownReserved;
         free = known ? measured - loading : long.MaxValue;                    // what other loads are about to take
-        if (BudgetBytes is long budget) { free = Math.Min(free, budget - (ModelBytes() - ownReserved)); known = true; }
+        // the device's own count is exact (with a budget set, ILGPU answers budget - allocated on every backend): the models' summed sizes only stand in where it cannot say.
+        // Summed sizes overcount (Lore, RX 590, 2026-11-26: 7.3 GB of "kept models" with 4.9 GB allocated, a size measured over a load includes the run's idle scratch), and
+        // capping by them made room earlier than needed ("-1555 MB free" with 809 MB really free).
+        if (!known && BudgetBytes is long budget) { free = budget - (ModelBytes() - ownReserved); known = true; }   // ModelBytes counts the loads in flight already
         return known;
     }
 
