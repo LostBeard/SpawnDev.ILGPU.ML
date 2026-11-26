@@ -81,6 +81,39 @@ public class OperatorRegistry : IDisposable
     public LayerNormKernel LayerNorm { get; }
     public SoftmaxKernel Softmax { get; }
     public ElementWiseKernels ElementWise { get; }
+
+    /// <summary>
+    /// The random operators output their distribution's MEAN instead of a sample: RandomNormal / RandomNormalLike give <c>mean</c>, RandomUniform / RandomUniformLike
+    /// <c>(low + high) / 2</c>. For a graph that samples where a caller wants the expected value: the Stable Diffusion VAE encoders exported to ONNX sample their
+    /// posterior inside the graph (<c>mean + std * RandomNormalLike</c>, output <c>latent_sample</c>), so every encode differed by ~1e-2 in nearly every latent value
+    /// (Lore, 2026-11-26, sd_turbo and SD 1.5); at the mean they give the posterior mean, the deterministic encode. Bernoulli and Multinomial still sample (their mean is
+    /// not one of their outcomes); <see cref="RandomSeed"/> makes them repeat. Off by default (ONNX semantics).
+    /// </summary>
+    public bool RandomAtMean { get; set; }
+
+    /// <summary>
+    /// Null (the default): a random operator without its own <c>seed</c> attribute draws fresh values every run (ONNX semantics). Set: each one is seeded from this value
+    /// and its node's output name, so every run with the same seed gives the same values, and different nodes still differ. A <c>seed</c> attribute in the model wins.
+    /// </summary>
+    public int? RandomSeed { get; set; }
+
+    /// <summary>The seed a random operator uses (see <see cref="RandomSeed"/>): the model's own <c>seed</c> attribute, else one derived from <see cref="RandomSeed"/> and the
+    /// node's first output name (FNV-1a: string.GetHashCode differs per process), else a fresh one.</summary>
+    internal int SeedFor(OnnxOpContext ctx)
+    {
+        int own = ctx.GetInt("seed", 0);
+        if (own != 0) return own;
+        if (RandomSeed is int session)
+        {
+            uint h = 2166136261u;
+            foreach (char c in ctx.OutputNames.Length > 0 ? ctx.OutputNames[0] : "") { h ^= c; h *= 16777619u; }
+            h ^= (uint)session; h *= 16777619u;
+            int s = (int)(h & 0x7FFFFFFF);
+            return s == 0 ? 1 : s;
+        }
+        return Random.Shared.Next(1, int.MaxValue);
+    }
+
     public Conv2DKernel Conv2D { get; }
     public Conv1DKernel Conv1D { get; }
 

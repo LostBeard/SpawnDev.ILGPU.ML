@@ -1110,10 +1110,10 @@ public class RandomNormalOperator(OperatorRegistry reg) : IOnnxOperator
     {
         float mean = ctx.GetFloat("mean", 0f);
         float scale = ctx.GetFloat("scale", 1f);
-        int seed = ctx.GetInt("seed", 0);
-        var rng = seed != 0 ? new Random(seed) : new Random();
         int count = ctx.Outputs[0].ElementCount;
         var data = new float[count];
+        if (reg.RandomAtMean) { Array.Fill(data, mean); ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(data); return; }   // OperatorRegistry.RandomAtMean
+        var rng = new Random(reg.SeedFor(ctx));
         for (int i = 0; i < count; i++)
         {
             // Box-Muller transform
@@ -1144,10 +1144,10 @@ public class RandomUniformOperator(OperatorRegistry reg) : IOnnxOperator
     {
         float low = ctx.GetFloat("low", 0f);
         float high = ctx.GetFloat("high", 1f);
-        int seed = ctx.GetInt("seed", 0);
-        var rng = seed != 0 ? new Random(seed) : new Random();
         int count = ctx.Outputs[0].ElementCount;
         var data = new float[count];
+        if (reg.RandomAtMean) { Array.Fill(data, (low + high) * 0.5f); ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(data); return; }   // OperatorRegistry.RandomAtMean
+        var rng = new Random(reg.SeedFor(ctx));
         for (int i = 0; i < count; i++)
             data[i] = low + (float)rng.NextDouble() * (high - low);
         ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(data);
@@ -1353,8 +1353,7 @@ public class MultinomialOperator(OperatorRegistry reg) : IOnnxOperator
         // Output: [batch, sample_size] sampled class indices
         var logProbs = ctx.TryGetInputValues(0);
         int sampleSize = ctx.GetInt("sample_size", 1);
-        int seed = ctx.GetInt("seed", 0);
-        var rng = seed != 0 ? new Random(seed) : new Random();
+        var rng = new Random(reg.SeedFor(ctx));
 
         var shape = ctx.Inputs[0].Shape;
         int batch = shape[0], numClasses = shape[1];

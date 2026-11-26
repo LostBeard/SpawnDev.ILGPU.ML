@@ -4,6 +4,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **`InferenceSession.RandomAtMean` and `InferenceSession.RandomSeed`** (Lore, 2026-11-26): the Stable Diffusion VAE encoders exported to ONNX sample their
+  posterior inside the graph (`mean + std * RandomNormalLike`, output `latent_sample`), so every encode differed by ~1e-2 in nearly every latent value (sd_turbo,
+  SD 1.5; ComfyUI's encode: 0 of 65536 differ), and image-to-image / inpainting were not reproducible for a fixed seed. `RandomAtMean`: RandomNormal(Like)
+  output their `mean`, RandomUniform(Like) their midpoint, so those encoders give the posterior mean, the deterministic encode. `RandomSeed`: each random
+  operator is seeded from the session seed and its node's output name (FNV-1a), so the same seed repeats a run exactly; a `seed` attribute in the model still
+  wins; Bernoulli (it seeded from `Environment.TickCount`) and Multinomial follow it too. Defaults unchanged (fresh samples, ONNX semantics). Test:
+  `InferenceSession_RandomAtMean_And_RandomSeed`, 7/7 lanes, red-checked.
 ## 5.8.33 - 2026-11-26 (nuget.org) - one GPU wait per captured replay, a small-grid convolution kernel, robust model stores
 
 - **Convolutions: a 32x32-tile implicit-GEMM kernel for small grids** (`Conv2DKernel.SmallTileMaxGroups`, `SmallTileMaxGroups1x1`): the same 256 threads and

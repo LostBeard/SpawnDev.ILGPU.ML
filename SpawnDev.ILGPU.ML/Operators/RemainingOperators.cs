@@ -150,8 +150,7 @@ public class BernoulliOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         int count = ctx.Outputs[0].ElementCount;
-        int seed = ctx.GetInt("seed", 0);
-        if (seed == 0) seed = Environment.TickCount;
+        int seed = reg.SeedFor(ctx);   // the model's seed, else OperatorRegistry.RandomSeed per node, else fresh
         // GPU path: per-thread xorshift PRNG, reads probability from input
         reg.ElementWise.Bernoulli(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, seed);
     }

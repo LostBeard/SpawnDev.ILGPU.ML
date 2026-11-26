@@ -2996,6 +2996,19 @@ public class InferenceSession : IDisposable, IDeviceSized
     /// </summary>
     public bool SkipCompletionWait { get; set; } = true;
 
+    /// <summary>
+    /// The graph's random operators output their distribution's mean instead of a sample (RandomNormal(Like): <c>mean</c>; RandomUniform(Like): the midpoint). For the
+    /// Stable Diffusion VAE encoders exported to ONNX, which sample their posterior inside the graph, this is the deterministic encode (the posterior mean). Off by
+    /// default. See <see cref="Operators.OperatorRegistry.RandomAtMean"/>.
+    /// </summary>
+    public bool RandomAtMean { get => _registry.RandomAtMean; set => _registry.RandomAtMean = value; }
+
+    /// <summary>
+    /// Null (default): random operators without their own <c>seed</c> attribute draw fresh values each run. Set: each is seeded from this value and its node, so the
+    /// same seed repeats a run exactly. See <see cref="Operators.OperatorRegistry.RandomSeed"/>.
+    /// </summary>
+    public int? RandomSeed { get => _registry.RandomSeed; set => _registry.RandomSeed = value; }
+
     /// <summary>True when the most recent <see cref="RunAsync"/> submitted without awaiting completion (WebGPU only).</summary>
     public bool LastRunCompletionWaitSkipped => _lastRunExecutor?.LastRunCompletionWaitSkipped ?? false;
 
