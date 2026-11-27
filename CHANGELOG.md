@@ -7,9 +7,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 - `ShaderCacheStore`: the import no longer delays session creation. The async factories START it (it overlaps the model's parse) and await it just before
   compiling, where the first kernels load; and the file is read out of OPFS in one 1 MB read, then imported from memory (the parser's own small reads
   each crossed into JS). Bones (2026-11-26): ~72 ms at the start of every return visit's create.
-- Measured, not yet changed: session creation from the OPFS-backed stream (`ModelHub.OpenStreamFromUrlAsync`) against a MemoryStream of the same file
-  (`ColdStart_MobileNetV2_CreateFromOpfsVsMemory`, three alternated rounds): 276-327 ms vs 68-91 ms; upload 200-218 vs 36-51, parse 38-43 vs 10-17. Each
-  weight is its own async OPFS read (a few hundred for MobileNetV2). Next: read-ahead windows.
+- **Browser: session creation from an OPFS-backed stream is read through multi-MB windows** (`Hub.JSReadAheadStream`, internal; applied by
+  `CreateFromOnnxStreamAsync` to any seekable `IJSReadStream`). Every weight upload and every parser buffer refill was its own async OPFS read (a few
+  hundred for MobileNetV2); now a JS read fetches 8 MB or more and reads inside it are JS subarrays (weights still go JS -> GPU, never into .NET) or
+  copies for the parser's small structure reads. MEASURED (`ColdStart_MobileNetV2_CreateFromOpfsVsMemory`, three alternated rounds): create from the
+  OPFS stream 276-327 -> 109-152 ms (upload 200-218 -> 53-68, parse 38-43 -> 23-26; a MemoryStream of the same file: 57-85). Bones found it (the demo
+  page: ~240 ms of upload). The caller still owns its stream. Every browser lane 3431/0.
 - `ShaderCacheStore`: a page's FIRST export goes `FirstExportQuietMs` (250 ms) after its first run that generated shaders; later ones keep the 3 s
   coalescing. Bones (2026-11-26, 5.8.34): a page closed within 3 s of its first run stored nothing, so its next visit generated every shader again (a closing
   page cannot finish an async OPFS write). Measured: stored 293 ms after the run; the round-trip test requires it within 1.5 s with no flush (red-checked with

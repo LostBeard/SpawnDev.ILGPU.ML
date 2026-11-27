@@ -1482,6 +1482,28 @@ public class InferenceSession : IDisposable, IDeviceSized
         Action<Graph.ModelGraph>? prepareGraph = null,
         WeightStorage weightStorage = WeightStorage.Source)
     {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+        // a seekable JS-backed source (the OPFS stream a page gets from ModelHub) is read through multi-MB windows: every weight and every parser refill was
+        // its own async OPFS read (MobileNetV2: create 276-327 ms against 68-91 from memory; Hub.JSReadAheadStream). The caller still owns its stream.
+        if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && stream.CanSeek && stream is not Hub.JSReadAheadStream)
+        {
+            using var readAhead = new Hub.JSReadAheadStream(stream, leaveOpen: true);
+            return await CreateFromOnnxStreamCoreAsync(accelerator, readAhead, onProgress, inputShapes, enableOptimization, streamThreshold, externalDataStream, ct, prepareGraph, weightStorage).ConfigureAwait(false);
+        }
+        return await CreateFromOnnxStreamCoreAsync(accelerator, stream, onProgress, inputShapes, enableOptimization, streamThreshold, externalDataStream, ct, prepareGraph, weightStorage).ConfigureAwait(false);
+    }
+
+    private static async Task<InferenceSession> CreateFromOnnxStreamCoreAsync(
+        Accelerator accelerator, Stream stream,
+        Action<string, int>? onProgress,
+        Dictionary<string, int[]>? inputShapes,
+        bool enableOptimization,
+        int streamThreshold,
+        Stream? externalDataStream,
+        CancellationToken ct,
+        Action<Graph.ModelGraph>? prepareGraph,
+        WeightStorage weightStorage)
+    {
         _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
