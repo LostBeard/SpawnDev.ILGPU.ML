@@ -11,6 +11,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   only for finished steps, which the timing tests key on). Tests: `VideoPipelines_SayLoadingBeforeTheFirstFileOpens` (all three pipelines, no model read,
   every backend: 7/7) and `Wan_Pipeline_EveryFileOpensUnderALoadingMessage` (HeavyModel, the real files: tokenizer, umT5, DiT, VAE); both red-checked by
   removing the fix (they reproduce the live page's messages).
+- **Demo: what a page says while a model downloads is measured, not guessed.** The model card (`ModelLoadProgress`, 18 pages) showed the page's own
+  coarse percent and an "x / y MB" computed from it (/text-gen: "15 %, 49.5 / 330.0 MB" through its whole 330 MB download), and /generate said
+  "READY" through its 4.4 GB of FLUX.2 downloads (the page marks the model loaded before the weights come). The card now shows the shared source's
+  real bytes whenever a download runs. The download bar moved from `DemoLayout` to `MainLayout`: /ai-chat, /self-consistency, /inspector, /models,
+  /getting-started and /cache download without `DemoLayout` and showed none.
+- **`tools/demo-smoke/demo_page_run.py`**: one driver for every heavy demo page (video, generate, image-to-3d, text-to-3d, text-gen, ai-chat): the
+  page's own steps in a separate Chrome profile, a hard kill mid-download and a second session, then checks that the result shows, the interrupted
+  download continued, the profile grew by the models' size only, and progress (bar or the page's measured line) plus "loading" showed while bytes
+  arrived. All six pass on a local publish (2026-11-27).
 
 ## 5.8.36 - 2026-11-27 - browser model cache: interrupted downloads continue, nothing left on disk; download progress on every demo page
 
