@@ -254,11 +254,15 @@ public sealed class LtxPipeline : IDisposable
             report("text", 1, "the prompt's encoding is cached");
             return e.Embedding;
         }
-        report("text", 0, "encoding the prompt");
+        // "loading X" before X is opened, its work only after: opening a hub file waits for its whole download (the same rule as Wan22Pipeline)
+        report("text", 0, "loading the text encoder");
         var ids = await TokenizeAsync(prompt, ct);
         float[] ctx;
         using (var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct))
+        {
+            report("text", 0, "encoding the prompt");
             ctx = await t5.EncodeAsync(ids, ct);
+        }
         _prompts.Add((prompt, ctx));
         if (_prompts.Count > PromptCacheSize) _prompts.RemoveAt(0);
         report("text", 1, $"{ids.Length} tokens");
@@ -322,13 +326,14 @@ public sealed class LtxPipeline : IDisposable
 
     private async Task<WanVideo> DecodeAsync(LtxRequest req, float[] latent, int Fz, int h, int w, IProgress<WanProgress>? progress, CancellationToken ct)
     {
-        progress?.Report(new WanProgress("decode", 0, "decoding the video"));
+        progress?.Report(new WanProgress("decode", 0, "loading the VAE"));
         float[] video = Array.Empty<float>();
         byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
         using (var vw = await AcquireAsync(_paths.Vae, ct))
         using (var vae = new LtxVae(_acc, vw.W))
         {
+            progress?.Report(new WanProgress("decode", 0, "decoding the video"));
             if (req.DeviceFrames) deviceFrames = await vae.DecodeDeviceFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
             else if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
             else video = await vae.DecodeAsync(latent, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
@@ -340,12 +345,15 @@ public sealed class LtxPipeline : IDisposable
     // DeviceFrames: the decode reads the latent on the device (WanVideo.Latent stays null, as Wan's device run)
     private async Task<WanVideo> DecodeDeviceLatentAsync(LtxRequest req, MemoryBuffer1D<float, Stride1D.Dense> latent, int Fz, int h, int w, IProgress<WanProgress>? progress, CancellationToken ct)
     {
-        progress?.Report(new WanProgress("decode", 0, "decoding the video"));
+        progress?.Report(new WanProgress("decode", 0, "loading the VAE"));
         var decodeNoise = req.DecodeNoiseScale != 0f ? Gaussian(latent.Length, req.Seed + 104729L) : null;
         MemoryBuffer1D<float, Stride1D.Dense> frames;
         using (var vw = await AcquireAsync(_paths.Vae, ct))
         using (var vae = new LtxVae(_acc, vw.W))
+        {
+            progress?.Report(new WanProgress("decode", 0, "decoding the video"));
             frames = await vae.DecodeDeviceFramesAsync(latent.View, Fz, h, w, req.DecodeTimestep, req.DecodeNoiseScale, decodeNoise);
+        }
         progress?.Report(new WanProgress("decode", 1, "done"));
         return new WanVideo { Data = Array.Empty<float>(), DeviceFrames = frames, Width = SpatialRatio * w, Height = SpatialRatio * h, Frames = TemporalRatio * (Fz - 1) + 1 };
     }
@@ -439,6 +447,7 @@ public sealed class LtxPipeline : IDisposable
         var lk = new LtxKernels(_acc);
         using var dw = await AcquireAsync(_paths.Dit, ct);
         using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw.W);
+        Report("denoise", 0, $"running step 1 of {steps}");
         dit.SetGrid(Fz, h, w, (float)TemporalRatio / req.FrameRate, SpatialRatio, SpatialRatio);
         dit.SetContext(0, ctx, rows);
         var lat = _acc.Allocate1D(noise); using var v = _acc.Allocate1D<float>(noise.Length);
@@ -531,11 +540,12 @@ public sealed class LtxPipeline : IDisposable
         var extras = new List<(float[] Tokens, float[] Coords, float Strength)>();
 
         // 2. the conditions through the VAE encoder (normalised latents), blended into the starting latent or kept as extra tokens
-        Report("conditions", 0, "encoding the conditions");
+        Report("conditions", 0, "loading the VAE encoder");
         if (_paths.VaeEncoder == null) throw new InvalidOperationException("conditioning needs the VAE encoder (LtxPaths.VaeEncoder)");
         using (var ew = await AcquireAsync(_paths.VaeEncoder, ct))
         using (var enc = new LtxVaeEncoder(_acc, ew.W))
         {
+            Report("conditions", 0, "encoding the conditions");
             int extraIndex = 0;
             for (int i = 0; i < req.Conditions!.Count; i++)
             {
@@ -609,6 +619,7 @@ public sealed class LtxPipeline : IDisposable
         var lk = new LtxKernels(_acc);
         using var dw = await AcquireAsync(_paths.Dit, ct);
         using var dit = new LtxDiT(_acc, new DiTKernels(_acc), dw.W);
+        Report("denoise", 0, $"running step 1 of {steps}");
         dit.SetPositions(coords);
         dit.SetContext(0, ctx, rows);
         using var lat = _acc.Allocate1D(tokens); using var init = _acc.Allocate1D(tokens); using var v = _acc.Allocate1D<float>(tokens.Length);

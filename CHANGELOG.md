@@ -4,6 +4,14 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Video pipelines say "loading ..." while a model file downloads** (`Wan22Pipeline`, `LtxPipeline`, `Ltx2Pipeline`). Opening a hub file waits for its whole
+  download, and each stage reported its work before opening its file: the live /video page (5.8.36, driven 2026-11-27) said "encoding the prompt" through the
+  6.4 GB umT5 download and "decoding the video" through the 1.4 GB VAE download. Now every stage reports "loading the text encoder / transformer / VAE" before
+  its first open and names its work after it; a "running step 1 of N" message follows the transformer's load (the step messages still start with "step "
+  only for finished steps, which the timing tests key on). Tests: `VideoPipelines_SayLoadingBeforeTheFirstFileOpens` (all three pipelines, no model read,
+  every backend: 7/7) and `Wan_Pipeline_EveryFileOpensUnderALoadingMessage` (HeavyModel, the real files: tokenizer, umT5, DiT, VAE); both red-checked by
+  removing the fix (they reproduce the live page's messages).
+
 ## 5.8.36 - 2026-11-27 - browser model cache: interrupted downloads continue, nothing left on disk; download progress on every demo page
 
 - **Browser model cache: an interrupted download keeps its bytes, and nothing is left on disk** (`OpfsModelCache`). TJ ran the live /video demo

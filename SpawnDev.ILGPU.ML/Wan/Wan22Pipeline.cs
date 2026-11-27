@@ -319,7 +319,9 @@ public sealed class Wan22Pipeline
         void Report(string stage, double f, string msg) => progress?.Report(new WanProgress(stage, f, msg));
 
         // 1. text: the prompt and the negative prompt through umT5, one layer of its weights on the device at a time
-        Report("text", 0, "encoding the prompt");
+        // Each stage says "loading X" BEFORE it opens X and names its work only after: opening a hub file waits for its whole download (HubModelSource.OpenAsync
+        // -> OpfsModelCache.OpenOrDownloadAsync), and 2026-11-27 the live /video page said "encoding the prompt" through the 6.4 GB umT5 download and "decoding
+        // the video" through the 1.4 GB VAE download.
         float[] ctx, ctxNeg; int ctxRows, ctxNegRows;
         bool guided = req.GuidanceScale > 1.0 + 1e-9;                                      // guidance 1 = the conditional prediction alone (no negative prompt, one forward per step)
         var texts = guided ? new[] { req.Prompt, req.NegativePrompt ?? DefaultNegativePrompt } : new[] { req.Prompt };
@@ -328,9 +330,11 @@ public sealed class Wan22Pipeline
         for (int i = 0; i < texts.Length; i++) { int hit = _prompts.FindIndex(p => p.Text == texts[i]); if (hit >= 0) enc[i] = _prompts[hit].Embedding; else missing.Add(i); }
         if (missing.Count > 0)
         {
+            Report("text", 0, "loading the text encoder");
             var idss = new int[missing.Count][];
             for (int k = 0; k < missing.Count; k++) idss[k] = await TokenizeAsync(texts[missing[k]], ct);
             using var t5 = await UmT5Encoder.CreateAsync(_acc, _source, _repo, _paths.TextEncoder, ct);
+            Report("text", 0, "encoding the prompt");
             var got = await t5.EncodeManyAsync(idss, ct);                                  // one pass over the layers for every prompt not cached
             for (int k = 0; k < missing.Count; k++)
             {
@@ -347,10 +351,11 @@ public sealed class Wan22Pipeline
         float[]? z0 = null;
         if (i2v)
         {
-            Report("image", 0, "encoding the picture");
+            Report("image", 0, "loading the VAE");
             var img = PrepareImage(req.ImageRgb!, req.ImageWidth, req.ImageHeight, req.Width, req.Height);
             using var vw = await LoadWeightsAsync(_paths.Vae, ct);
             using var vae = new WanVae(_acc, vw);
+            Report("image", 0, "encoding the picture");
             z0 = await vae.EncodeImageAsync(img, req.Height, req.Width);        // [48, 1, h, w]
             Report("image", 1, "done");
         }
@@ -366,6 +371,7 @@ public sealed class Wan22Pipeline
         using (var dw = await LoadWeightsAsync(_paths.Dit, ct))
         using (var dit = new WanDiT(_acc, new DiTKernels(_acc), dw))
         {
+            Report("denoise", 0, $"running step 1 of {req.Steps}");
             dit.SetGrid(Fz, h, w);
             dit.SetContext(0, ctx, ctxRows); if (guided) dit.SetContext(1, ctxNeg, ctxNegRows);
             var sched = new FlowUniPCScheduler(); sched.SetTimesteps(req.Steps, req.Shift);
@@ -482,11 +488,12 @@ public sealed class Wan22Pipeline
         }
 
         // 4. decode
-        Report("decode", 0, "decoding the video");
+        Report("decode", 0, "loading the VAE");
         float[] video = Array.Empty<float>(); byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         using (var vw = await LoadWeightsAsync(_paths.Vae, ct))
         using (var vae = new WanVae(_acc, vw))
         {
+            Report("decode", 0, "decoding the video");
             vae.Trace = req.Trace;
             if (req.DeviceFrames)
             {

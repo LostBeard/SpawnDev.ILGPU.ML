@@ -206,6 +206,8 @@ public sealed class Ltx2Pipeline
         var context = _acc.Allocate1D<float>(prompts.Count * row);
         try
         {
+            // "loading" before the opens: the Gemma file and the checkpoint download inside them on first use (the same rule as Wan22Pipeline)
+            progress?.Report(new WanProgress("encode", 0, "loading the text encoder"));
             var tokenizer = await LoadTokenizerAsync(_source, _paths.Repo, _paths.TextEncoder, ct);
             using var te = await Gemma3TextEncoder.OpenAsync(_acc, _source, _paths.Repo, _paths.TextEncoder, TextEncoderResidentBytes, ct);
             using var tc = await Ltx2TextConnectors.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, ct);
@@ -359,11 +361,12 @@ public sealed class Ltx2Pipeline
             audioLatent = new float[A];
             Array.Copy(latent, V, audioLatent, 0, A);
         }
-        progress?.Report(new WanProgress("decode", 0, "decoding the video"));
+        progress?.Report(new WanProgress("decode", 0, "loading the video decoder"));
         float[] video = Array.Empty<float>(); byte[][]? rgba = null; MemoryBuffer1D<float, Stride1D.Dense>? deviceFrames = null;
         try
         {
             using var vae = await Ltx2VideoDecoder.OpenAsync(_acc, _source, _paths.Repo, _paths.Checkpoint, ct);
+            progress?.Report(new WanProgress("decode", 0, "decoding the video"));
             if (videoDev != null) deviceFrames = await vae.DecodeDeviceFramesAsync(videoDev.View, F, H, W);
             else if (req.RgbaFrames) rgba = await vae.DecodeRgbaFramesAsync(videoLatent, F, H, W);
             else video = await vae.DecodeAsync(videoLatent, F, H, W);
