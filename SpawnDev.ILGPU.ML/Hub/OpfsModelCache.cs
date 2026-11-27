@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
@@ -98,6 +99,34 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     /// </remarks>
     public int WriteBufferSize { get; set; } = 16 * 1024 * 1024;
 
+    /// <summary>Suffix of the directory that holds an entry's bytes as committed part files (<see cref="PartBytes"/>).</summary>
+    private const string PartsSuffix = ".parts";
+
+    /// <summary>Suffix of the swap file Chrome keeps beside a file while a <c>FileSystemWritableFileStream</c> on it is open.</summary>
+    private const string SwapSuffix = ".crswap";
+
+    /// <summary>
+    /// An entry is stored as a directory of part files of this many bytes, each committed (closed) as soon as it is full. Default 128 MiB.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 WHY PARTS (2026-11-27, the live /video demo, TJ's OS drive nearly filled). Outside a dedicated worker OPFS can only be written through
+    /// <c>createWritable()</c>, and Chrome keeps everything written there in a swap file (<c>name.crswap</c>) until <c>close()</c>: the real file stays at
+    /// 0 bytes for the whole download. MEASURED on the live site with one file per entry: a browser that ended mid-download left the real file at 0 bytes,
+    /// a sidecar saying 1.02 GB were received, and the 1.02 GB swap file on disk as an orphan nothing ever removed; the retry started the file again at
+    /// byte 0. A resume of a partial that did get committed copies the whole partial file into a new swap file first (<c>keepExistingData</c>), so a
+    /// 6 GB partial needs 12 GB. Either way every interrupted attempt of a multi-GB model costs its bytes again, on the network and on the disk.
+    /// With parts, what is on disk under a part's name is always complete (the commit is a rename), an interruption loses at most the part being written,
+    /// a resume continues after the last committed part without copying anything, and the only swap file is one part long. A complete entry is read as
+    /// one Blob over its parts (no copy), so a model never exists twice.
+    /// </remarks>
+    public long PartBytes { get; set; } = 128L * 1024 * 1024;
+
+    /// <summary>
+    /// Swap files older than this are left-overs of a session that ended while it wrote (nothing else removes them) and are deleted when the cache opens
+    /// (<see cref="SweepOrphansAsync()"/>). The age keeps the swap file of a write another tab is doing right now. Default 10 minutes.
+    /// </summary>
+    public TimeSpan OrphanSwapMinAge { get; set; } = TimeSpan.FromMinutes(10);
+
 
     /// <summary>Create a cache over the OPFS directory named by <see cref="CacheDirectoryName"/>.</summary>
     /// <param name="js">The SpawnJS runtime, used for <c>fetch</c> and <c>navigator.storage</c> in any scope.</param>
@@ -144,10 +173,34 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     /// Open a complete cache entry as a seekable JS-side stream, or null when it is absent or incomplete.
     /// Never touches the network. The caller disposes the stream.
     /// </summary>
-    public async Task<OPFSStream?> OpenCachedAsync(string cacheKey, CancellationToken ct = default)
+    public async Task<Stream?> OpenCachedAsync(string cacheKey, CancellationToken ct = default)
     {
-        if (!await IsCompleteAsync(cacheKey).ConfigureAwait(false)) return null;
-        var stream = await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        if (_cacheDir == null) return null;
+        var meta = await ReadMetaAsync(cacheKey).ConfigureAwait(false);
+        if (meta is not { Complete: true }) return null;
+        Stream stream;
+        long single = await GetSingleFileSizeAsync(cacheKey).ConfigureAwait(false);
+        if (single >= 0)
+        {
+            // an entry stored as one file (written before parts)
+            if (meta.Total >= 0 && meta.Total != single) return null;
+            stream = await OPFSStream.OpenPath(_cacheDir!, cacheKey, FileMode.Open, FileAccess.Read, cancellationToken: ct).ConfigureAwait(false);
+        }
+        else
+        {
+            var files = await ReadPartFilesAsync(cacheKey).ConfigureAwait(false);
+            if (files == null) return null;
+            try
+            {
+                long sum = 0;
+                foreach (var f in files) sum += f.Size;
+                if (meta.Total >= 0 && meta.Total != sum) return null;
+                // one Blob over the part files: a view, nothing is copied or read until a range is asked for
+                stream = new BlobStream(files.Count == 0 ? new Blob() : new Blob((IEnumerable<Blob>)files));
+            }
+            finally { foreach (var f in files) f.Dispose(); }
+        }
         await TouchAsync(cacheKey).ConfigureAwait(false);
         return stream;
     }
@@ -184,24 +237,19 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         foreach (var d in Downloader.ActiveDownloads) pinned.Add(d.Key);
 
         var entries = new List<(string Key, long Size, bool Complete, long Used)>();
-        var handles = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
-        foreach (var entry in handles)
+        foreach (var (name, size) in await ListEntriesAsync().ConfigureAwait(false))
         {
-            using var handle = entry;
-            if (handle.Name.EndsWith(MetaSuffix, StringComparison.Ordinal) || handle is not FileSystemFileHandle file) continue;
-            long size;
-            try { size = await file.GetSize(); } catch { continue; }   // raced with a delete
             CacheEntryMeta? meta;
-            try { meta = await ReadMetaAsync(handle.Name).ConfigureAwait(false); }
+            try { meta = await ReadMetaAsync(name).ConfigureAwait(false); }
             catch
             {
                 // a sidecar that cannot be read right now says nothing about the model: keep it (counted, never evicted), as a held file would be
-                pinned.Add(handle.Name);
-                entries.Add((handle.Name, size, true, long.MaxValue));
+                pinned.Add(name);
+                entries.Add((name, size, true, long.MaxValue));
                 continue;
             }
             bool complete = meta is { Complete: true } && (meta.Total < 0 || meta.Total == size);
-            entries.Add((handle.Name, size, complete, complete ? meta!.Used : 0));
+            entries.Add((name, size, complete, complete ? meta!.Used : 0));
         }
         long stored = entries.Sum(e => e.Size), freed = 0;
         foreach (var e in entries.Where(e => !pinned.Contains(e.Key))
@@ -228,7 +276,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     /// <param name="cacheKey">Explicit cache key; derived from the URL path when omitted.</param>
     /// <param name="progress">Optional progress sink, throttled by <see cref="ProgressIntervalMs"/>.</param>
     /// <param name="ct">Cancels the download. A cancelled download leaves a resumable partial entry.</param>
-    public async Task<OPFSStream> OpenOrDownloadAsync(string url, string? cacheKey = null,
+    public async Task<Stream> OpenOrDownloadAsync(string url, string? cacheKey = null,
         IProgress<ModelDownloadProgress>? progress = null, CancellationToken ct = default)
     {
         cacheKey ??= UrlToCacheKey(url);
@@ -245,7 +293,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         // ends up with a fix or a guard the other lacks.
         try
         {
-            return (OPFSStream)await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
+            return await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (IsStorageGone(ex))
         {
@@ -256,7 +304,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             // again (it is recreated) and retry once: the entry is gone, so it downloads. A cache that loses its files must cost a
             // download, never the run.
             if (!await ReopenDirectoryAsync(dir).ConfigureAwait(false)) throw;
-            return (OPFSStream)await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
+            return await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
         }
     }
 
@@ -358,12 +406,15 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         if (_cacheDir == null) return default;
 
         var meta = await ReadMetaAsync(key).ConfigureAwait(false);
+        bool single = await GetSingleFileSizeAsync(key).ConfigureAwait(false) >= 0;
         var onDisk = await GetEntrySizeAsync(key).ConfigureAwait(false);
         if (onDisk < 0 && meta == null) return default;
 
-        // Confirmed bytes are the LESSER of what the sidecar acknowledged and what is actually on disk.
-        // Either can lead the other after a crash, and a resume must trust only what both agree on.
-        var written = meta == null ? Math.Max(0, onDisk) : Math.Max(0, Math.Min(onDisk < 0 ? 0 : onDisk, meta.Received));
+        // What a download may continue from is the COMMITTED parts, never the sidecar's count: a part exists under its name only once it was closed
+        // (the commit is a rename), while the sidecar is written per received segment and runs ahead of the disk by up to one part - and by the whole
+        // download for a single file, whose bytes sat in a swap file until close (see PartBytes). Without a sidecar the source of the bytes is unknown,
+        // so nothing continues. An incomplete single file (an interrupted download of an earlier version) is replaced, not continued.
+        var written = meta == null || single ? 0 : Math.Max(0, onDisk);
         var complete = meta is { Complete: true } && onDisk >= 0 && (meta.Total < 0 || meta.Total == onDisk);
         return new ModelStoreState(onDisk >= 0, complete, complete ? onDisk : written,
             meta?.Total ?? -1, meta?.Url, meta?.ETag);
@@ -379,21 +430,43 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
                 "OPFS is not available, so nothing can be written. It needs a secure context (https or " +
                 "localhost) on a browser that supports it.");
 
-        var stream = await OPFSStream.OpenPath(_cacheDir, key, FileMode.OpenOrCreate, FileAccess.Write,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
-        // Truncate rather than merely seek: anything past the confirmed resume point was never
-        // acknowledged, and keeping it would bury unverified bytes inside a file that later says complete.
-        // And never LENGTHEN: when the file vanished after the caller read its state (the browser cleared the origin), OpenOrCreate made an
-        // empty one, and extending it to the resume point would leave zeros that later count as downloaded bytes.
-        if (stream.Length < startOffset)
+        return await OpenPartedWriteAsync(_cacheDir, key, startOffset).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The writer of an entry's part files, continuing after the committed parts that make up exactly <paramref name="startOffset"/> bytes. Everything else
+    /// in the entry's directory goes first: parts past that point were never acknowledged, and swap files are left-overs of a session that ended while it
+    /// wrote. The entry's single file of an earlier version is removed (it is only ever replaced).
+    /// </summary>
+    private async Task<Stream> OpenPartedWriteAsync(FileSystemDirectoryHandle cacheDir, string key, long startOffset)
+    {
+        try { await cacheDir.RemoveEntry(key).ConfigureAwait(false); } catch { /* no single file */ }
+        var partsDir = await cacheDir.GetDirectoryHandle(key + PartsSuffix, create: true).ConfigureAwait(false);
+        try
         {
-            long held = stream.Length;
-            await stream.DisposeAsync().ConfigureAwait(false);
-            throw new StoredFileLostException($"'{key}' holds {held} bytes but was to continue at {startOffset}: the stored file is gone or was cut, so the download must restart.");
+            var sizes = new Dictionary<string, long>(StringComparer.Ordinal);
+            var names = new List<string>();
+            foreach (var entry in await partsDir.ValuesList().ConfigureAwait(false))
+            {
+                using var handle = entry;
+                names.Add(handle.Name);
+                if (handle is FileSystemFileHandle file && IsPartName(handle.Name))
+                    try { sizes[handle.Name] = await file.GetSize().ConfigureAwait(false); } catch { /* raced with a delete */ }
+            }
+            long sum = 0; int keep = 0;
+            while (sum < startOffset && sizes.TryGetValue(PartName(keep), out long size) && size > 0 && sum + size <= startOffset) { sum += size; keep++; }
+            // Never continue past what is really there: when the parts vanished after the caller read the state (the browser cleared the origin), writing
+            // on at the resume point would leave a hole that later counts as downloaded bytes.
+            if (sum != startOffset)
+                throw new StoredFileLostException($"'{key}' holds {sum} committed bytes at a part boundary but was to continue at {startOffset}: the stored parts are gone or were cut, so the download must restart.");
+            foreach (var name in names)
+            {
+                if (IsPartName(name) && int.Parse(name, CultureInfo.InvariantCulture) < keep) continue;
+                try { await partsDir.RemoveEntry(name, recursive: true).ConfigureAwait(false); } catch { /* held by a live writer elsewhere */ }
+            }
+            return new PartedWriteStream(partsDir, keep, startOffset, Math.Max(1, PartBytes));
         }
-        stream.SetLength(startOffset);
-        stream.Seek(startOffset, SeekOrigin.Begin);
-        return stream;
+        catch { partsDir.Dispose(); throw; }
     }
 
     /// <inheritdoc/>
@@ -444,8 +517,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
 
             long written;
             // only the OPEN recovers from a cleared directory: nothing of the source has been read yet
-            var dest = await WithDirectoryAsync(d => OPFSStream.OpenPath(d, key, FileMode.Create, FileAccess.Write,
-                cancellationToken: cancellationToken)).ConfigureAwait(false);
+            var dest = await WithDirectoryAsync(d => OpenPartedWriteAsync(d, key, 0)).ConfigureAwait(false);
             await using (dest.ConfigureAwait(false))
             {
                 await source.CopyToAsync(dest, WriteBufferSize > 0 ? WriteBufferSize : 81920, cancellationToken)
@@ -481,6 +553,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         await EnsureInitializedAsync().ConfigureAwait(false);
         if (_cacheDir == null) return;
         try { await _cacheDir.RemoveEntry(cacheKey); } catch { /* absent */ }
+        try { await _cacheDir.RemoveEntry(cacheKey + PartsSuffix, recursive: true); } catch { /* absent */ }
         try { await _cacheDir.RemoveEntry(cacheKey + MetaSuffix); } catch { /* absent */ }
     }
 
@@ -491,20 +564,12 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         await EnsureInitializedAsync().ConfigureAwait(false);
         if (_cacheDir == null) return result;
 
-        var entries = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
-        foreach (var entry in entries)
-        {
-            using var handle = entry;
-            if (handle.Name.EndsWith(MetaSuffix, StringComparison.Ordinal)) continue;
-            if (handle is not FileSystemFileHandle fileHandle) continue;
-            long size;
-            try { size = await fileHandle.GetSize(); } catch { continue; }
-            result.Add((handle.Name, size, await IsCompleteAsync(handle.Name).ConfigureAwait(false)));
-        }
+        foreach (var (name, size) in await ListEntriesAsync().ConfigureAwait(false))
+            result.Add((name, size, await IsCompleteAsync(name).ConfigureAwait(false)));
         return result;
     }
 
-    /// <summary>Total bytes held by the cache, sidecars included.</summary>
+    /// <summary>Total bytes held by the cache: every file in it, sidecars, parts and swap files included.</summary>
     public async Task<long> GetCacheSizeAsync()
     {
         await EnsureInitializedAsync().ConfigureAwait(false);
@@ -515,8 +580,17 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         foreach (var entry in entries)
         {
             using var handle = entry;
-            if (handle is not FileSystemFileHandle fileHandle) continue;
-            try { total += await fileHandle.GetSize(); } catch { /* raced with a delete */ }
+            try
+            {
+                if (handle is FileSystemFileHandle fileHandle) total += await fileHandle.GetSize();
+                else if (handle is FileSystemDirectoryHandle sub)
+                    foreach (var inner in await sub.ValuesList().ConfigureAwait(false))
+                    {
+                        using var h = inner;
+                        if (h is FileSystemFileHandle f) try { total += await f.GetSize(); } catch { /* raced with a delete */ }
+                    }
+            }
+            catch { /* raced with a delete */ }
         }
         return total;
     }
@@ -531,7 +605,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         foreach (var entry in entries)
         {
             using var handle = entry;
-            try { await _cacheDir.RemoveEntry(handle.Name); } catch { /* raced with a delete */ }
+            try { await _cacheDir.RemoveEntry(handle.Name, recursive: true); } catch { /* raced with a delete */ }
         }
     }
 
@@ -549,10 +623,17 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     //  Entry + sidecar plumbing
     // ──────────────────────────────────────────────────────────────────────────────────────────────
 
-    private Task<OPFSStream> OpenEntryAsync(string cacheKey, CancellationToken ct) =>
-        OPFSStream.OpenPath(_cacheDir!, cacheKey, FileMode.Open, FileAccess.Read, cancellationToken: ct);
+    private static string PartName(int index) => index.ToString("D6", CultureInfo.InvariantCulture);
 
-    private async Task<long> GetEntrySizeAsync(string cacheKey)
+    private static bool IsPartName(string name)
+    {
+        if (name.Length != 6) return false;
+        foreach (char c in name) if (c < '0' || c > '9') return false;
+        return true;
+    }
+
+    /// <summary>The size of an entry stored as ONE file (entries written before parts), or -1 when there is no such file.</summary>
+    private async Task<long> GetSingleFileSizeAsync(string cacheKey)
     {
         try
         {
@@ -560,6 +641,213 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             return await handle.GetSize();
         }
         catch { return -1; }
+    }
+
+    /// <summary>
+    /// The committed parts of an entry in order, as File objects the caller disposes; null when the entry has no parts directory. Parts count from
+    /// index 0 up to the first one missing or empty: a part under its name is always whole (see <see cref="PartBytes"/>), an empty one was created and
+    /// never committed.
+    /// </summary>
+    private async Task<List<SpawnDev.SpawnJS.JSObjects.File>?> ReadPartFilesAsync(string cacheKey)
+    {
+        FileSystemDirectoryHandle dir;
+        try { dir = await _cacheDir!.GetDirectoryHandle(cacheKey + PartsSuffix).ConfigureAwait(false); }
+        catch { return null; }
+        var files = new List<SpawnDev.SpawnJS.JSObjects.File>();
+        using (dir)
+        {
+            for (int i = 0; ; i++)
+            {
+                SpawnDev.SpawnJS.JSObjects.File file;
+                try
+                {
+                    using var handle = await dir.GetFileHandle(PartName(i)).ConfigureAwait(false);
+                    file = await handle.GetFile().ConfigureAwait(false);
+                }
+                catch { break; }
+                if (file.Size <= 0) { file.Dispose(); break; }
+                files.Add(file);
+            }
+        }
+        return files;
+    }
+
+    /// <summary>The bytes an entry really holds: its single file, else the sum of its committed parts; -1 when it has neither.</summary>
+    private async Task<long> GetEntrySizeAsync(string cacheKey)
+    {
+        long single = await GetSingleFileSizeAsync(cacheKey).ConfigureAwait(false);
+        if (single >= 0) return single;
+        var files = await ReadPartFilesAsync(cacheKey).ConfigureAwait(false);
+        if (files == null) return -1;
+        long sum = 0;
+        foreach (var f in files) { sum += f.Size; f.Dispose(); }
+        return sum;
+    }
+
+    /// <summary>Every entry with the bytes it holds: single files (sidecars and swap files are not entries) and parts directories.</summary>
+    private async Task<List<(string Key, long Size)>> ListEntriesAsync()
+    {
+        var result = new List<(string, long)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var handles = await WithDirectoryAsync(d => d.ValuesList()).ConfigureAwait(false);
+        foreach (var entry in handles)
+        {
+            using var handle = entry;
+            string name = handle.Name;
+            if (handle is FileSystemFileHandle file)
+            {
+                if (name.EndsWith(MetaSuffix, StringComparison.Ordinal) || name.EndsWith(SwapSuffix, StringComparison.Ordinal)) continue;
+                try { long size = await file.GetSize(); if (seen.Add(name)) result.Add((name, size)); } catch { /* raced with a delete */ }
+            }
+            else if (name.EndsWith(PartsSuffix, StringComparison.Ordinal))
+            {
+                string key = name[..^PartsSuffix.Length];
+                long size = await GetEntrySizeAsync(key).ConfigureAwait(false);
+                if (seen.Add(key)) result.Add((key, Math.Max(0, size)));
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Delete the swap files a session left behind when it ended while it wrote (a closed browser, a crash): Chrome keeps a
+    /// <c>FileSystemWritableFileStream</c>'s bytes in <c>name.crswap</c> until close, and nothing removes the file of a writer that is gone. Before parts a
+    /// swap file held a whole interrupted download (MEASURED: 1.02 GB left beside a finished 13.4 GB model set). Only files older than
+    /// <see cref="OrphanSwapMinAge"/> go, so a write another tab is doing now keeps its swap file. Runs when the cache opens; returns the bytes freed.
+    /// </summary>
+    public async Task<long> SweepOrphansAsync()
+    {
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        return _cacheDir == null ? 0 : await SweepOrphansAsync(_cacheDir).ConfigureAwait(false);
+    }
+
+    private async Task<long> SweepOrphansAsync(FileSystemDirectoryHandle cacheDir)
+    {
+        long freed = 0;
+        long cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)OrphanSwapMinAge.TotalMilliseconds;
+        async Task SweepAsync(FileSystemDirectoryHandle dir, bool recurse)
+        {
+            foreach (var entry in await dir.ValuesList().ConfigureAwait(false))
+            {
+                using var handle = entry;
+                if (handle is FileSystemFileHandle file)
+                {
+                    if (!handle.Name.EndsWith(SwapSuffix, StringComparison.Ordinal)) continue;
+                    try
+                    {
+                        long size, modified;
+                        using (var f = await file.GetFile().ConfigureAwait(false)) { size = f.Size; modified = f.LastModified; }
+                        if (modified > cutoff) continue;
+                        await dir.RemoveEntry(handle.Name).ConfigureAwait(false);
+                        freed += size;
+                    }
+                    catch { /* held by a live writer, or gone already */ }
+                }
+                else if (recurse && handle is FileSystemDirectoryHandle sub && handle.Name.EndsWith(PartsSuffix, StringComparison.Ordinal))
+                    await SweepAsync(sub, false).ConfigureAwait(false);
+            }
+        }
+        try { await SweepAsync(cacheDir, true).ConfigureAwait(false); } catch { /* a sweep never fails the cache */ }
+        return freed;
+    }
+
+    /// <summary>
+    /// Writes an entry as part files: each part is its own file, committed (closed) when it reaches the part size and when the stream is disposed.
+    /// See <see cref="PartBytes"/> for why. The payload stays in JS: a chunk is written as it is, or as subarray views when it crosses a part boundary.
+    /// </summary>
+    private sealed class PartedWriteStream : JSWriteStreamBase
+    {
+        private FileSystemDirectoryHandle? _dir;
+        private readonly long _partBytes;
+        private int _index;
+        private long _length, _partFill;
+        private FileSystemFileHandle? _partHandle;
+        private FileSystemHandleWritableStream? _part;
+        private bool _closed;
+
+        public PartedWriteStream(FileSystemDirectoryHandle dir, int nextIndex, long startOffset, long partBytes)
+        {
+            _dir = dir; _index = nextIndex; _length = startOffset; _partBytes = partBytes;
+        }
+
+        public override bool CanWriteSync => false;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => !_closed;
+        public override long Length => _length;
+        public override long Position { get => _length; set => throw new NotSupportedException("a parted entry is written front to back"); }
+
+        public override async Task WriteUint8ArrayAsync(Uint8Array data, CancellationToken cancellationToken = default)
+        {
+            if (_closed || _dir == null) throw new ObjectDisposedException(nameof(PartedWriteStream));
+            long len = data.Length, off = 0;
+            while (off < len)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_part == null)
+                {
+                    _partHandle = await _dir.GetFileHandle(PartName(_index), create: true).ConfigureAwait(false);
+                    _part = await FileSystemHandleWritableStream.Create(_partHandle, false, true).ConfigureAwait(false);
+                    _partFill = 0;
+                }
+                long take = Math.Min(len - off, _partBytes - _partFill);
+                if (off == 0 && take == len) await _part.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+                else
+                {
+                    using var view = data.SubArray(off, off + take);     // a view on the same storage, nothing is copied
+                    await _part.WriteAsync(view, cancellationToken).ConfigureAwait(false);
+                }
+                off += take; _partFill += take; _length += take;
+                if (_partFill >= _partBytes) await CommitPartAsync().ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>Close the part being written: from here its bytes are on disk under the part's name and count as stored.</summary>
+        private async Task CommitPartAsync()
+        {
+            var part = _part; var handle = _partHandle;
+            if (part == null) return;
+            _part = null; _partHandle = null;
+            try { await part.CloseAsync().ConfigureAwait(false); }
+            finally { part.Dispose(); handle?.Dispose(); }
+            _index++;
+        }
+
+        public override void WriteUint8Array(Uint8Array data) => throw new NotSupportedException("OPFS writes are asynchronous: use WriteUint8ArrayAsync");
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (buffer.Length == 0) return;
+            using var bytes = new Uint8Array(buffer.ToArray());       // a managed source (a stream of .NET bytes handed to PutAsync): the only way in
+            await WriteUint8ArrayAsync(bytes, cancellationToken).ConfigureAwait(false);
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => WriteAsync(new ReadOnlyMemory<byte>(buffer, offset, count), cancellationToken).AsTask();
+
+        /// <summary>Nothing to do: bytes become durable when their part is committed, and the store reports only committed parts as written.</summary>
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException("a parted entry is written front to back");
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException("OPFS writes are asynchronous: use WriteAsync");
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (_closed) return;
+            _closed = true;
+            // commit what the last part holds: a cancelled or failed download keeps everything it wrote
+            try { await CommitPartAsync().ConfigureAwait(false); } catch { /* the failure that ended the write is the one to report */ }
+            _dir?.Dispose(); _dir = null;
+            GC.SuppressFinalize(this);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_closed) _ = DisposeAsync().AsTask();      // the commit cannot be awaited here: use await using
+            base.Dispose(disposing);
+        }
     }
 
     /// <summary>
@@ -661,6 +949,7 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         {
             if (_initialized) return;
             _cacheDir = await OpenDirectoryAsync().ConfigureAwait(false);
+            if (_cacheDir != null) await SweepOrphansAsync(_cacheDir).ConfigureAwait(false);
             _initialized = true;   // after the open: a concurrent first caller waits for the handle instead of reading "OPFS is not available"
         }
         finally { _dirGate.Release(); }

@@ -1,0 +1,82 @@
+@using SpawnDev.ILGPU.ML.Hub
+@implements IDisposable
+
+@* Every model download running through the shared HubModelSource, shown on EVERY demo page (DemoLayout renders this).
+   2026-11-27: /video downloaded 13 GB with a bar at 0 % and the text "encoding the prompt": its pipelines open their files without a progress
+   argument, and so do about 80 other call sites. The source knows what is downloading, so the layout shows it and no page has to remember. *@
+@if (_downloads.Count > 0)
+{
+    <div class="adl" id="active-downloads">
+        @foreach (var d in _downloads)
+        {
+            <div class="adl-row">
+                <div class="adl-head">
+                    <span class="adl-name">Downloading @FileName(d.Url)@(d.Resumed ? " (resumed)" : "")</span>
+                    <span class="adl-num">@Size(d.BytesReceived)@(d.TotalBytes > 0 ? " of " + Size(d.TotalBytes) : "")@(d.Fraction is { } f ? $" ({f * 100:F0} %)" : "")@(d.BytesPerSecond > 0 ? $", {d.BytesPerSecond / 1e6:F1} MB/s" : "")</span>
+                </div>
+                <div class="adl-track"><div class="adl-fill" style="width: @((d.Fraction ?? 0) * 100)%"></div></div>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Inject] HubModelSource ModelSource { get; set; } = default!;
+    private IReadOnlyList<ActiveModelDownload> _downloads = Array.Empty<ActiveModelDownload>();
+    private System.Threading.PeriodicTimer? _timer;
+
+    protected override void OnInitialized()
+    {
+        ModelSource.ActiveDownloadsChanged += OnChanged;
+        _downloads = ModelSource.ActiveDownloads;
+        _ = PollAsync();
+    }
+
+    private void OnChanged()
+    {
+        _downloads = ModelSource.ActiveDownloads;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    // the event carries the updates; the timer keeps the rate moving when a download stalls (no bytes, no events) and clears a row that ended between events
+    private async Task PollAsync()
+    {
+        _timer = new System.Threading.PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync())
+            {
+                var now = ModelSource.ActiveDownloads;
+                if (now.Count == 0 && _downloads.Count == 0) continue;
+                _downloads = now;
+                StateHasChanged();
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private static string FileName(string url)
+    {
+        int q = url.IndexOf('?'); if (q >= 0) url = url[..q];
+        int s = url.LastIndexOf('/');
+        return Uri.UnescapeDataString(s >= 0 ? url[(s + 1)..] : url);
+    }
+
+    private static string Size(long bytes) => bytes >= 1_000_000_000 ? $"{bytes / 1e9:F2} GB" : $"{bytes / 1e6:F1} MB";
+
+    public void Dispose()
+    {
+        ModelSource.ActiveDownloadsChanged -= OnChanged;       // the source is a singleton and outlives the page
+        _timer?.Dispose();
+    }
+}
+
+<style>
+    .adl { margin: 0.75rem 0; padding: 0.6rem 0.8rem; border-radius: 8px; border: 1px solid rgba(56,189,248,0.3); background: rgba(56,189,248,0.06); }
+    .adl-row + .adl-row { margin-top: 0.5rem; }
+    .adl-head { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.25rem; }
+    .adl-name { color: #e2e8f0; font-size: 0.85rem; font-weight: 600; word-break: break-all; }
+    .adl-num { color: #7dd3fc; font-size: 0.8rem; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; }
+    .adl-track { height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; }
+    .adl-fill { height: 100%; background: linear-gradient(90deg, #38bdf8, #8b5cf6); border-radius: 4px; transition: width 0.3s ease; }
+</style>

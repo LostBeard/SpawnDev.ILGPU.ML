@@ -43,6 +43,11 @@
             </button>
         </div>
 
+        @if (_downloadNote.Length > 0)
+        {
+            <p class="vid-hint" id="vid-download-note">@_downloadNote</p>
+        }
+
         <div class="vid-settings">
             <div class="vid-setting">
                 <label>Model:</label>
@@ -377,11 +382,58 @@
         _modelStatusText = Ltx ? "LTX-Video 2B" : "Wan 2.2 TI2V-5B";
         if (Ltx) { _size = "480x320"; _frames = 49; }              // the first pass of LTX's recipe: fast; 8n + 1 frames
         else { _size = "640x352"; _frames = 17; }
+        _ = RefreshDownloadNoteAsync();
+    }
+
+    protected override Task OnInitializedAsync() => RefreshDownloadNoteAsync();
+
+    private string _downloadNote = "";
+    private int _downloadNoteVersion;
+    // leaving the page ends its run: a download nobody is watching must not keep writing gigabytes (it continues from its committed parts next time)
+    private readonly CancellationTokenSource _cts = new();
+
+    /// <summary>
+    /// What Generate will download, said BEFORE the click: the selected model's files, their sizes from the cache or the host, and how much of that is
+    /// not in this browser's storage yet. 2026-11-27: the defaults downloaded 13.4 GB onto the drive of the browser profile without a word.
+    /// </summary>
+    private async Task RefreshDownloadNoteAsync()
+    {
+        int version = ++_downloadNoteVersion;
+        try
+        {
+            var files = new List<(string Repo, string File)>();
+            if (Ltx)
+            {
+                var p = LtxPaths.InRepo(LtxPaths.DitFile("q8"), LtxPaths.TextEncoderFile("q8"));
+                files.AddRange(new[] { p.Tokenizer, p.TextEncoder, p.Dit, p.Vae }.Select(f => (LtxPipeline.DefaultRepo, f)));
+            }
+            else
+            {
+                var p = Wan22Paths.InRepo(Wan22Paths.DitFile(_dit == "turbo" ? "turbo_q8" : _dit), Wan22Paths.TextEncoderFile("q8"));
+                files.AddRange(new[] { p.Tokenizer, p.TextEncoder, p.Dit, p.Vae }.Select(f => (Wan22Pipeline.DefaultRepo, f)));
+            }
+            long total = 0, missing = 0;
+            foreach (var (repo, file) in files)
+            {
+                long? size = await ModelSource.GetSizeAsync(repo, file);
+                if (size == null) { if (version == _downloadNoteVersion) { _downloadNote = ""; StateHasChanged(); } return; }      // the host gave no size: say nothing rather than a wrong number
+                total += size.Value;
+                if (!await ModelSource.Store.ExistsAsync(ModelSource.CacheKey(repo, file))) missing += size.Value;
+            }
+            if (version != _downloadNoteVersion) return;
+            _downloadNote = missing == 0
+                ? $"This model's files ({total / 1e9:F1} GB) are in this browser's storage: nothing to download."
+                : $"Generate downloads {missing / 1e9:F1} GB of model files into this browser's storage, on the drive your browser profile is on (the model is {total / 1e9:F1} GB in all). " +
+                  "They download once; a download that is interrupted continues where it stopped. The Model Cache page lists and removes them.";
+        }
+        catch (Exception ex) { Console.WriteLine($"[Video] download note: {ex.Message}"); if (version == _downloadNoteVersion) _downloadNote = ""; }
+        StateHasChanged();
     }
 
     private void PrecisionChanged()
     {
         _pipeline = null; _isModelLoaded = false;
+        _ = RefreshDownloadNoteAsync();
         // each transformer's own recipe; the standard one at the reference's 50 steps: with MagCache that is about the cost of 30 plain steps (browser, 640x352 x17: 30 plain steps 139 s, MagCache at 30 steps 97 s)
         if (Turbo) { _steps = 4; _guidance = 1.0; } else { if (_steps < 12) _steps = 50; if (_guidance <= 1.0) _guidance = 5.0; }
     }
@@ -682,8 +734,8 @@
                 {
                     Prompt = _prompt, Width = width, Height = height, Frames = _frames, Seed = seed, FrameRate = _fps, Upscale = _ltxUpscale, Conditions = conditions,
                     RgbaFrames = true,                                                     // frames as bytes read a frame at a time: floats of whole clips exhaust the tab's .NET heap
-                }, progress)
-                : await _pipeline!.GenerateAsync(request, progress);
+                }, progress, _cts.Token)
+                : await _pipeline!.GenerateAsync(request, progress, _cts.Token);
             try { using var pv = JS.Get<SpawnJSObject>("videoPlayer"); pv.JSRef!.CallVoid("stop", "vid-preview"); } catch { }
             _stage = "showing"; _stageMessage = "the frames"; StateHasChanged();
             await Task.Yield();
@@ -711,12 +763,18 @@
             await Task.Yield();
             player.JSRef!.CallVoid("play", "vid-player", _fps);
         }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
+            Console.WriteLine("[Video] the page was left: the run was cancelled");
+            return;                                                                    // the component is disposed: nothing to render
+        }
         catch (Exception ex)
         {
             _error = ex.Message;
             Console.WriteLine($"[Video] Error: {ex}");
         }
         _isRunning = false;
+        _ = RefreshDownloadNoteAsync();
         StateHasChanged();
     }
 
@@ -741,6 +799,7 @@
 
     public void Dispose()
     {
+        try { _cts.Cancel(); } catch { }
         try { _camera?.Dispose(); } catch { }
         try { _ltxPipeline?.Dispose(); } catch { }
         try { _kokoro?.Dispose(); } catch { }

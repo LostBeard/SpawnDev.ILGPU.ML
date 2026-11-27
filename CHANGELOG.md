@@ -4,6 +4,29 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.36 - 2026-11-27 - browser model cache: interrupted downloads continue, nothing left on disk; download progress on every demo page
+
+- **Browser model cache: an interrupted download keeps its bytes, and nothing is left on disk** (`OpfsModelCache`). TJ ran the live /video demo
+  (2026-11-27): no progress on the page, and his OS drive nearly filled. Cause: an entry was ONE file written through `createWritable()`, and Chrome keeps
+  everything written there in a swap file until `close()`. MEASURED on the live 5.8.35 site: a browser that ended mid-download left the real file at
+  0 bytes, the sidecar saying 1.02 GB were received, and the 1.02 GB swap file on disk for good; the retry downloaded the file again from byte 0
+  (6.4 GB for the Wan text encoder). The resume test had "interrupted" a download with a clean close, which is not how a download dies.
+  Now an entry is a directory of part files (`PartBytes`, 128 MiB), each committed when full: an interruption loses at most the part being written, the
+  next attempt continues after the last committed part (the store reports committed parts, never the sidecar's count), the only swap file is one part
+  long, and a complete entry is read as one Blob over its parts (no copy; still a JS-side `IJSReadStream`). `PutAsync` writes the same way. Entries of
+  earlier versions (one file) stay readable; an incomplete one is replaced. Swap files left by earlier versions are removed when the cache opens
+  (`SweepOrphansAsync`, files older than `OrphanSwapMinAge`; Chrome itself refuses to remove the swap file of a live writer).
+  `OpenOrDownloadAsync` / `OpenCachedAsync` now return `Stream` (they returned `OPFSStream`).
+  Tests: `OpfsModelCache_ADownloadWhoseWriterDiesKeepsItsPartsAndContinues` (the writer is abandoned, never closed: the store offers the committed
+  parts, the retry transfers only the rest, the directory holds the model plus at most one part; red-checked by not committing full parts) and
+  `OpfsModelCache_SweepNeverCostsAWriteInProgress`.
+- **Demo: every page shows the downloads that are running** (`ActiveDownloadsBar` in `DemoLayout`, from the shared `HubModelSource.ActiveDownloads`:
+  file, bytes of total, MB/s). /video downloaded 13.4 GB behind a bar at 0 % that said "encoding the prompt". /video also says before the click how many
+  GB Generate will download and where they go, and leaving the page cancels its run (the download continues from its parts next time).
+- `tools/demo-smoke/video_demo_run.py`: drives a deployed (or locally served) /video with the defaults in a Chrome profile on a chosen drive, can end
+  Chrome mid-download and run again, and fails when a file is fetched twice, the profile outgrows the models, no progress is shown, or no video
+  appears. Run after every Pages deploy.
+
 ## 5.8.35 - 2026-11-26 (nuget.org) - faster browser session creation (OPFS read-ahead), the shader cache off the create path
 
 - Docs: the Chrome cost behind `SkipCompletionWait` (session and captured replay) is cited upstream: ~2.9 ms per waited submit (Chrome 159 / Edge 148;

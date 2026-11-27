@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.35</Version>
-		<PackageReleaseNotes>v5.8.35 - on SpawnDev.ILGPU 5.4.54. Browser: a session created from an OPFS-backed stream (ModelHub) reads it through multi-MB windows, weights still JS to GPU (MobileNetV2 create 276-327 to 109-152 ms; in a real page, Bones: 391 to 235 ms first visit, 443 to 279 ms return visit). ShaderCacheStore: the stored shaders import while the model parses instead of before it, and a page stores its shaders about 300 ms after its first run, so a tab closed soon after keeps them.</PackageReleaseNotes>
+		<Version>5.8.36</Version>
+		<PackageReleaseNotes>v5.8.36 - Browser model cache (OpfsModelCache): a download is stored as part files committed as they fill, so an interrupted download (closed browser, crash, reload) continues after its last committed part instead of starting over, and no multi-GB swap file is left on disk; swap files left by earlier versions are removed when the cache opens. Before: an interrupted 6.4 GB download restarted from byte 0 and its bytes stayed on disk. OpenOrDownloadAsync / OpenCachedAsync return Stream (were OPFSStream). Entries of earlier versions stay readable.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

@@ -181,7 +181,7 @@ public abstract partial class MLTestBase
     {
         var js = RequireBrowserRuntime();
 
-        using var cache = new OpfsModelCache(js) { CacheDirectoryName = "ilgpu-ml-test-opfscache" };
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = "ilgpu-ml-test-opfscache", PartBytes = 256 * 1024 };
         if (!await cache.IsAvailableAsync())
             throw new UnsupportedTestException("OPFS unavailable in this context");
 
@@ -201,8 +201,8 @@ public abstract partial class MLTestBase
         }
 
         // Now cut it back to a partial and re-open: the cache must fetch only the tail.
-        long cut = total / 3;
-        await TruncateCacheEntryAsync(js, cache.CacheDirectoryName, key, OpfsCacheTestUrl, cut, total);
+        long cut = await TruncateCacheEntryAsync(js, cache.CacheDirectoryName, key, OpfsCacheTestUrl, total / 3, total);
+        if (cut <= 0 || cut >= total) throw new Exception($"setup: the entry was cut to {cut} of {total} bytes; the test needs a part boundary in between");
 
         if (await cache.IsCompleteAsync(key))
             throw new Exception("Entry still reports complete after being truncated - the sidecar is not being honoured.");
@@ -223,6 +223,8 @@ public abstract partial class MLTestBase
                     throw new Exception($"Resumed file differs from the reference at offset {i}.");
         }
 
+        if (cache.LastDownloadBytes != total - cut)
+            throw new Exception($"The resume transferred {cache.LastDownloadBytes:N0} bytes; the missing tail is {total - cut:N0} (of {total:N0}).");
         var sawResume = reports.Exists(r => r.Resumed);
         Console.WriteLine($"[OpfsCache] resumed from {cut:N0}/{total:N0}; reports={reports.Count}; " +
                           $"flagged-resumed={sawResume}");
@@ -716,7 +718,7 @@ public abstract partial class MLTestBase
             await using (w.ConfigureAwait(false)) { await w.WriteAsync(new byte[4000]); await w.FlushAsync(); }
             await cache.SetStateAsync(key, "http://example/x", 8000, 4000, false, null);
             if ((await cache.GetStateAsync(key)).BytesWritten != 4000) throw new Exception("setup: the partial entry is not resumable");
-            using (var dir = await root.GetDirectoryHandle(dirName)) await dir.RemoveEntry(key);
+            using (var dir = await root.GetDirectoryHandle(dirName)) await dir.RemoveEntry(key + ".parts", recursive: true);
             bool failed = false;
             try { await using var s = await cache.OpenWriteAsync(key, 4000); }
             catch (IOException) { failed = true; }
@@ -729,31 +731,180 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
-    /// Cut a cache entry down to <paramref name="keepBytes"/> and rewrite its sidecar to say "incomplete",
-    /// which is exactly the state an interrupted download leaves behind.
+    /// Cut a cache entry back to the committed parts that fit in <paramref name="keepBytes"/> and rewrite its sidecar to say "incomplete": the state a
+    /// download that was closed part-way leaves. Returns the bytes kept (a part boundary).
     /// </summary>
-    private static async Task TruncateCacheEntryAsync(SpawnJSRuntime js, string cacheDirName, string key,
+    private static async Task<long> TruncateCacheEntryAsync(SpawnJSRuntime js, string cacheDirName, string key,
         string url, long keepBytes, long total)
     {
         using var navigator = js.Get<Navigator>("navigator");
         using var storage = navigator.Storage;
         using var root = await storage.GetDirectory();
         using var dir = await root.GetDirectoryHandle(cacheDirName, create: true);
+        using var parts = await dir.GetDirectoryHandle(key + ".parts");
 
-        // ⚠️ FileAccess.Write, not ReadWrite: OPFSStream supports Read OR Write and throws
-        // NotSupportedException for ReadWrite (it is either a read blob stream or a writable stream).
-        var data = await SpawnDev.SpawnJS.Toolbox.OPFSStream.OpenPath(dir, key, FileMode.Open, FileAccess.Write);
-        await using (data.ConfigureAwait(false))
+        long kept = 0;
+        bool cutting = false;
+        for (int i = 0; ; i++)
         {
-            data.SetLength(keepBytes);
-            await data.FlushAsync();
+            string name = i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture);
+            long size;
+            try { using var h = await parts.GetFileHandle(name); size = await h.GetSize(); }
+            catch { break; }
+            if (!cutting && kept + size <= keepBytes) { kept += size; continue; }
+            cutting = true;
+            await parts.RemoveEntry(name);
         }
 
-        var meta = $"v=1\nurl={url}\ntotal={total}\nreceived={keepBytes}\ncomplete=0\netag=\n";
+        var meta = $"v=1\nurl={url}\ntotal={total}\nreceived={kept}\ncomplete=0\netag=\n";
         using var metaHandle = await dir.GetFileHandle(key + ".meta", create: true);
         using var writable = await metaHandle.CreateWritable();
         using var bytes = new Uint8Array(System.Text.Encoding.UTF8.GetBytes(meta));
         await writable.Write(bytes);
         await writable.Close();
+        return kept;
     }
+
+    /// <summary>
+    /// 🔴 A download whose writer DIES (the browser is closed, the tab crashes: nothing is closed, nothing is disposed) keeps what it had committed, the
+    /// next attempt continues from there, and the dead attempt leaves nothing on disk beyond one part.
+    /// </summary>
+    /// <remarks>
+    /// The failure this guards (2026-11-27, the live /video demo): with one file per entry Chrome held a download's bytes in a swap file until close, so
+    /// a browser closed mid-download left the real file at 0 bytes and the swap file (1.02 GB measured, 6 GB for the text encoder) on disk for good,
+    /// and the retry downloaded the file again from byte 0. TJ's OS drive nearly filled. The older resume test cut a finished file back with a clean
+    /// close, which is not how a download dies, and passed all along.
+    /// Here the writer is ABANDONED: written to, never flushed, closed or disposed. RED-CHECKED against the one-file store: it reports 0 resumable
+    /// bytes and the test fails on the first assertion.
+    /// </remarks>
+    [TestMethod(Timeout = 120000)]
+    public async Task OpfsModelCache_ADownloadWhoseWriterDiesKeepsItsPartsAndContinues() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        const string dirName = "ilgpu-ml-test-dead-writer", key = "model";
+        const int part = 256 * 1024;
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        try { await root.RemoveEntry(dirName, recursive: true); } catch { }
+        object? abandoned = null;
+        try
+        {
+            // the reference bytes, through another cache directory
+            byte[] full;
+            using (var refCache = new OpfsModelCache(js) { CacheDirectoryName = dirName + "-ref" })
+            {
+                if (!await refCache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+                var r = await refCache.OpenOrDownloadAsync(OpfsCacheTestUrl, "ref");
+                await using (r.ConfigureAwait(false)) { full = new byte[r.Length]; await r.ReadExactlyAsync(full); }
+            }
+            long total = full.Length;
+            if (total < 4L * part) throw new UnsupportedTestException($"the test file is {total} bytes; the test needs at least {4 * part}");
+
+            // the dying attempt: two thirds of the file written and acknowledged in the sidecar, then nothing - no flush, no close, no dispose
+            long sent = total * 2 / 3;
+            using (var first = new OpfsModelCache(js) { CacheDirectoryName = dirName, PartBytes = part })
+            {
+                var w = await first.OpenWriteAsync(key, 0);
+                abandoned = w;
+                for (long o = 0; o < sent; o += 100_000) await w.WriteAsync(full.AsMemory((int)o, (int)Math.Min(100_000, sent - o)));
+                await first.SetStateAsync(key, OpfsCacheTestUrl, total, sent, false, null);
+            }
+
+            // a new session
+            using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName, PartBytes = part };
+            var state = await cache.GetStateAsync(key);
+            long committed = sent / part * part;
+            Console.WriteLine($"[OpfsCache] dead writer: {sent:N0} of {total:N0} bytes were written, the store offers {state.BytesWritten:N0} to continue from (committed parts: {committed:N0})");
+            if (state.Complete) throw new Exception("the interrupted entry reports complete");
+            if (state.BytesWritten != committed)
+                throw new Exception($"After a writer died with {sent:N0} bytes written the store offers {state.BytesWritten:N0} bytes to continue from; the committed parts hold {committed:N0}. " +
+                                    "Zero means the attempt's bytes are lost (and, with a single file, still on disk in a swap file).");
+
+            var reports = new List<ModelDownloadProgress>();
+            var stream = await cache.OpenOrDownloadAsync(OpfsCacheTestUrl, key, new Progress<ModelDownloadProgress>(p => reports.Add(p)));
+            await using (stream.ConfigureAwait(false))
+            {
+                if (stream.Length != total) throw new Exception($"the continued file is {stream.Length} bytes, expected {total}");
+                var got = new byte[total];
+                await stream.ReadExactlyAsync(got);
+                for (long i = 0; i < total; i++) if (got[i] != full[i]) throw new Exception($"the continued file differs from the reference at offset {i}");
+            }
+            if (cache.LastDownloadBytes != total - committed)
+                throw new Exception($"The second attempt transferred {cache.LastDownloadBytes:N0} bytes; only the {total - committed:N0} after the committed parts were missing.");
+
+            // the disk: the model once, plus at most the one part the dead writer never committed (and the sidecar)
+            long held = await cache.GetCacheSizeAsync();
+            Console.WriteLine($"[OpfsCache] dead writer: second attempt transferred {cache.LastDownloadBytes:N0} bytes; the cache directory holds {held:N0} bytes for a {total:N0} byte model");
+            if (held > total + part + 4096)
+                throw new Exception($"The cache directory holds {held:N0} bytes for a {total:N0} byte model: the dead attempt left {held - total:N0} bytes behind (allowed: one part of {part:N0}).");
+            Console.WriteLine("[OpfsCache] a download whose writer died continues from its committed parts and leaves no more than a part: PASS");
+        }
+        finally
+        {
+            GC.KeepAlive(abandoned);
+            try { await root.RemoveEntry(dirName, recursive: true); } catch { }
+            try { await root.RemoveEntry(dirName + "-ref", recursive: true); } catch { }
+        }
+    });
+
+    /// <summary>
+    /// <see cref="OpfsModelCache.SweepOrphansAsync()"/> never costs a write that is in progress: a swap file younger than
+    /// <see cref="OpfsModelCache.OrphanSwapMinAge"/> is not touched, and when the age rule is switched off the writer still commits its bytes
+    /// (MEASURED 2026-11-27: Chrome refuses to remove the swap file of a writer that is alive). Chrome only: other browsers keep no visible swap
+    /// file, and the test skips there.
+    /// The removal of a DEAD writer's swap file cannot be made to happen inside one page (the writer has to die with its browser):
+    /// <c>tools/demo-smoke/video_demo_run.py --kill-after-gb</c> ends Chrome mid-download and checks that no swap file is left afterwards.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task OpfsModelCache_SweepNeverCostsAWriteInProgress() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        const string dirName = "ilgpu-ml-test-orphans";
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        try { await root.RemoveEntry(dirName, recursive: true); } catch { }
+        object? abandoned = null;
+        try
+        {
+            using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+            if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+            using var dir = await root.GetDirectoryHandle(dirName);
+
+            // a write in progress, as another tab's would be
+            const int size = 300_000;
+            using var handle = await dir.GetFileHandle("old-model", create: true);
+            var writable = await handle.CreateWritable();
+            abandoned = writable;
+            using (var bytes = new Uint8Array(new byte[size])) await writable.Write(bytes);
+
+            async Task<List<string>> SwapFilesAsync()
+            {
+                var names = new List<string>();
+                foreach (var e in await dir.ValuesList()) { using var h = e; if (h.Name.EndsWith(".crswap", StringComparison.Ordinal)) names.Add(h.Name); }
+                return names;
+            }
+            if ((await SwapFilesAsync()).Count == 0) throw new UnsupportedTestException("this browser keeps no visible swap file for an open writable");
+
+            long freed = await cache.SweepOrphansAsync();
+            if (freed != 0 || (await SwapFilesAsync()).Count == 0)
+                throw new Exception($"a swap file a few milliseconds old was removed ({freed} bytes freed): it could be another tab's write in progress");
+
+            cache.OrphanSwapMinAge = TimeSpan.Zero;
+            freed = await cache.SweepOrphansAsync();
+            int leftWhileOpen = (await SwapFilesAsync()).Count;
+            await writable.Close();
+            long committed = await handle.GetSize();
+            Console.WriteLine($"[OpfsCache] sweep with the age rule off: freed {freed:N0} bytes, swap files left while the writer was open: {leftWhileOpen}; the writer then committed {committed:N0} bytes");
+            if (committed != size) throw new Exception($"a write in progress lost its bytes to the sweep: the file holds {committed} of {size} bytes");
+            if ((await SwapFilesAsync()).Count != 0) throw new Exception("a swap file is left after the writer closed");
+            Console.WriteLine("[OpfsCache] a sweep never costs a write in progress: PASS");
+        }
+        finally
+        {
+            GC.KeepAlive(abandoned);
+            try { await root.RemoveEntry(dirName, recursive: true); } catch { }
+        }
+    });
 }
