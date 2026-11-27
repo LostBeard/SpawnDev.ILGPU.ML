@@ -2,17 +2,20 @@
 @implements IDisposable
 @* 2026-11-27: /text-gen showed "15 %, 49.5 / 330.0 MB" through its whole 330 MB download while the download bar said 44 % then 73 %: the pages set a
    coarse percent and then open their model file, and an open waits for the whole download (HubModelSource.OpenAsync). The MB figure was the page's
-   percent times the model size, never a measured byte. While the page loads and the shared source downloads, this card shows the real bytes. *@
-<div class="model-progress @(IsComplete ? "complete" : "") @(IsLoading ? "loading" : "")">
+   percent times the model size, never a measured byte. And /generate said "FLUX.2 klein - text encoder: READY" while that 1.95 GB file downloaded:
+   it marks the model loaded once the pipeline exists and the weights come on Generate. So: while the shared source downloads, this card shows the
+   real bytes, whatever the page's flags say. *@
+@{ var dl = Downloading; bool downloading = dl != null && string.IsNullOrEmpty(ErrorMessage); }
+<div class="model-progress @(IsComplete && !downloading ? "complete" : "") @(IsLoading || downloading ? "loading" : "")">
     <div class="mp-header">
         <span class="mp-label">@ModelName</span>
-        @if (IsComplete)
+        @if (downloading)
+        {
+            <span class="mp-status mp-status-loading">@(dl!.Value.Fraction is { } f ? $"downloading {f * 100:F0}%" : "downloading")</span>
+        }
+        else if (IsComplete)
         {
             <span class="mp-status mp-status-ready">Ready</span>
-        }
-        else if (IsLoading && Downloading is { } dl)
-        {
-            <span class="mp-status mp-status-loading">@(dl.Fraction is { } f ? $"downloading {f * 100:F0}%" : "downloading")</span>
         }
         else if (IsLoading)
         {
@@ -28,8 +31,9 @@
         }
     </div>
 
-    @if (IsLoading && Downloading is { } d)
+    @if (downloading)
     {
+        var d = dl!.Value;
         <div class="mp-track">
             <div class="mp-fill" style="width: @((d.Fraction ?? 0) * 100)%;"></div>
         </div>
@@ -79,11 +83,39 @@
 
     private static string Mb(long bytes) => bytes >= 1_000_000_000 ? $"{bytes / 1e9:F2} GB" : $"{bytes / 1e6:F1} MB";
 
-    protected override void OnInitialized() => ModelSource.ActiveDownloadsChanged += OnDownloadsChanged;
+    private System.Threading.PeriodicTimer? _timer;
+    private int _shownCount;
 
-    private void OnDownloadsChanged() { if (IsLoading) _ = InvokeAsync(StateHasChanged); }
+    protected override void OnInitialized()
+    {
+        ModelSource.ActiveDownloadsChanged += OnDownloadsChanged;
+        _ = PollAsync();
+    }
 
-    public void Dispose() => ModelSource.ActiveDownloadsChanged -= OnDownloadsChanged;      // the source is a singleton and outlives the page
+    private void OnDownloadsChanged() => _ = InvokeAsync(StateHasChanged);
+
+    // as ActiveDownloadsBar: the event carries the updates, the timer clears the card when a download ended between events
+    private async Task PollAsync()
+    {
+        _timer = new System.Threading.PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync())
+            {
+                int now = ModelSource.ActiveDownloads.Count;
+                if (now == 0 && _shownCount == 0) continue;
+                _shownCount = now;
+                StateHasChanged();
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    public void Dispose()
+    {
+        ModelSource.ActiveDownloadsChanged -= OnDownloadsChanged;      // the source is a singleton and outlives the page
+        _timer?.Dispose();
+    }
 }
 
 <style>
