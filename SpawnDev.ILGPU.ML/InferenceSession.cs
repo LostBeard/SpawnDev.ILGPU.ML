@@ -3028,6 +3028,9 @@ public class InferenceSession : IDisposable, IDeviceSized
     /// completion wait was a second round trip before the readback's own: MEASURED (RTX 4070, Chrome, MobileNetV2 warm run with readback) 14.5 / 18.9 ms -> 11.7 / 16.3 ms,
     /// outputs identical; Firefox resolves the wait on a ~100 ms poll, so there it is the difference between ~10 and full-rate video. Set false where a run must have
     /// completed when RunAsync returns (timing a run without reading it, or attributing a device error to the run that caused it). Ignored on other backends.
+    /// UPSTREAM: Chrome charges ~2.9 ms for any submit that is waited on (Chrome 159 / Edge 148; empty 0.1 ms; Node + Dawn 0.09-0.16 ms): its GPU process polls
+    /// for finished work on delayed tasks. Tracked at https://issues.chromium.org/issues/40286576 (our numbers: comment 6); cause traced in
+    /// https://issues.chromium.org/issues/42240322; rerun https://lostbeard.github.io/webgpu-wait-latency-test/ to see whether Chrome changed it.
     /// </summary>
     public bool SkipCompletionWait { get; set; } = true;
 

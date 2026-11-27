@@ -170,6 +170,9 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// <see cref="InferenceSession.SkipCompletionWait"/>, ON by default, so one switch covers the direct run and the replay. MEASURED (Data, 2026-11-26, plain JS
     /// in installed Chrome, RTX 4070): Chrome charges ~2.9 ms for ANY submit that is waited on, however small (Node / Dawn: 0.07-0.14 ms), and a replay plus its
     /// readback waited twice. Set false where a replay must have completed when ReplayAsync returns (timing a replay without reading it).
+    /// UPSTREAM: Chrome charges ~2.9 ms for any submit that is waited on (Chrome 159 / Edge 148; empty 0.1 ms; Node + Dawn 0.09-0.16 ms): its GPU process polls
+    /// for finished work on delayed tasks. Tracked at https://issues.chromium.org/issues/40286576 (our numbers: comment 6); cause traced in
+    /// https://issues.chromium.org/issues/42240322; rerun https://lostbeard.github.io/webgpu-wait-latency-test/ to see whether Chrome changed it.
     /// </summary>
     public bool? SkipCompletionWait { get; set; }
 

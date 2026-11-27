@@ -4,6 +4,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- Docs: the Chrome cost behind `SkipCompletionWait` (session and captured replay) is cited upstream: ~2.9 ms per waited submit (Chrome 159 / Edge 148;
+  Node + Dawn 0.09-0.16 ms), tracked at https://issues.chromium.org/issues/40286576 (Data's numbers: comment 6), cause traced in
+  https://issues.chromium.org/issues/42240322, repro page https://lostbeard.github.io/webgpu-wait-latency-test/.
 - `ShaderCacheStore`: the import no longer delays session creation. The async factories START it (it overlaps the model's parse) and await it just before
   compiling, where the first kernels load; and the file is read out of OPFS in one 1 MB read, then imported from memory (the parser's own small reads
   each crossed into JS). Bones (2026-11-26): ~72 ms at the start of every return visit's create.
