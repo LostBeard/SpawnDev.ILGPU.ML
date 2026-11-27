@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.37 - 2026-11-27 - video pipelines say what they load; cached browser models reopen at half the cost
+
 - **Video pipelines say "loading ..." while a model file downloads** (`Wan22Pipeline`, `LtxPipeline`, `Ltx2Pipeline`). Opening a hub file waits for its whole
   download, and each stage reported its work before opening its file: the live /video page (5.8.36, driven 2026-11-27) said "encoding the prompt" through the
   6.4 GB umT5 download and "decoding the video" through the 1.4 GB VAE download. Now every stage reports "loading the text encoder / transformer / VAE" before

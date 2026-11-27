@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.36</Version>
-		<PackageReleaseNotes>v5.8.36 - Browser model cache (OpfsModelCache): a download is stored as part files committed as they fill, so an interrupted download (closed browser, crash, reload) continues after its last committed part instead of starting over, and no multi-GB swap file is left on disk; swap files left by earlier versions are removed when the cache opens. Before: an interrupted 6.4 GB download restarted from byte 0 and its bytes stayed on disk. OpenOrDownloadAsync / OpenCachedAsync return Stream (were OPFSStream). Entries of earlier versions stay readable.</PackageReleaseNotes>
+		<Version>5.8.37</Version>
+		<PackageReleaseNotes>v5.8.37 - Video pipelines (Wan, LTX, LTX-2) report "loading the text encoder / transformer / VAE" while a file opens (an open of a hub file waits for its whole download; the /video page said "encoding the prompt" through a 6.4 GB download). Reopening a cached browser model file costs about half (OpfsModelCache: one part listing, parts fetched at once, no sidecar rewrite for a repeat use; a 48-part entry 55 to 29 ms), and the umT5 encoder opens its file 2 times per prompt instead of 26.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
