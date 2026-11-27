@@ -11,6 +11,9 @@
         </div>
 
         <article class="content px-4">
+            @* every route, not only the DemoLayout pages: /ai-chat (a 0.7-4 GB GGUF), /self-consistency, /inspector, /models, /getting-started and /cache
+               download through the same HubModelSource without DemoLayout, so they showed no bar (driven 2026-11-27) *@
+            <ActiveDownloadsBar />
             @Body
         </article>
 
