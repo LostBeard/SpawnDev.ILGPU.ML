@@ -67,7 +67,8 @@ PAGES = {
         "loading": MODEL_LOADING,
         "result": "picture shown",
     },
-    "image-to-3d": {
+    # one page, two routes (Image3DPage): /text-to-3d draws pictures from the prompt first, /image-to-3d builds from a picture (the first sample)
+    "text-to-3d": {
         "steps": [
             (_enabled("button.t3d-btn:not(.small)"), _click("button.t3d-btn:not(.small)")),
             # several pictures drawn (the page's default): build the first; with one picture the page goes on by itself and this step never fires
@@ -83,6 +84,7 @@ PAGES = {
         "loading": MODEL_LOADING + " || /loading|download/i.test((q('.t3d-stage.running') || {}).innerText || '')",
         "result": "3D model shown",
     },
+    "image-to-3d": None,      # filled below from text-to-3d: the same page, only the steps differ
     "text-gen": {
         "steps": [("!!document.querySelector('.textgen-textarea')", _set_value(".textgen-textarea", "Once upon a time, in a land far away,", "change")),
                   (_enabled("button.run-btn"), _click("button.run-btn"))],
@@ -110,6 +112,11 @@ PAGES = {
         "result": "answer shown",
     },
 }
+
+PAGES["image-to-3d"] = dict(PAGES["text-to-3d"], optional_last_step=False, steps=[
+    (_enabled("button.sample-btn"), _click("button.sample-btn")),                     # the first sample picture (the crown)
+    (_enabled("button.t3d-btn:not(.small)"), _click("button.t3d-btn:not(.small)")),
+])
 
 FETCH_HOOK = r"""
 (() => {
