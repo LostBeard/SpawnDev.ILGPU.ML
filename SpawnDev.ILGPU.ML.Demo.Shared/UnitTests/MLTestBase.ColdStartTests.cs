@@ -155,6 +155,46 @@ public abstract partial class MLTestBase
         }
     });
 
+    /// <summary>
+    /// Session creation from the OPFS-backed stream a page gets from <see cref="Hub.ModelHub.OpenStreamFromUrlAsync"/> against a MemoryStream of the same file,
+    /// alternated three times after one warm-up create, each split by its progress stages (Bones, 2026-11-26: in the demo page upload took ~240 ms against PMT's 57
+    /// from memory). A measurement.
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyCpu")]
+    public async Task<string> ColdStart_MobileNetV2_CreateFromOpfsVsMemory() => await RunTest(async accelerator =>
+    {
+        if (accelerator is not WebGPUAccelerator) throw new UnsupportedTestException("the browser's OPFS stream");
+        var http = GetHttpClient() ?? throw new UnsupportedTestException("HttpClient not available");
+        const string rel = "models/mobilenetv2/model.onnx";
+        var bytes = await http.GetByteArrayAsync(rel);
+        string url = new Uri(http.BaseAddress!, rel).ToString();
+        async Task<(double Total, Dictionary<string, double> Stages, string Kind)> Create(bool opfs)
+        {
+            var stages = new Dictionary<string, double>();
+            var sw = Stopwatch.StartNew();
+            double last = 0;
+            Stream src = opfs ? await OpenSeekableModelStreamAsync(url) : new MemoryStream(bytes, writable: false);
+            string kind = src.GetType().Name;
+            stages["open"] = sw.Elapsed.TotalMilliseconds; last = stages["open"];
+            await using (src)
+            using (await InferenceSession.CreateFromStreamAsync(accelerator, src, (stage, pct) =>
+                   { double now = sw.Elapsed.TotalMilliseconds; stages[stage] = stages.GetValueOrDefault(stage) + now - last; last = now; })) { }
+            return (sw.Elapsed.TotalMilliseconds, stages, kind);
+        }
+        await Create(false);   // warm-up: kernels, interpreter paths
+        await Create(true);    // and the OPFS copy written
+        var lines = new List<string>();
+        for (int round = 0; round < 3; round++)
+            foreach (bool opfs in new[] { true, false })
+            {
+                var r = await Create(opfs);
+                lines.Add($"{(opfs ? "OPFS" : "memory")} ({r.Kind}) {r.Total:F0} ms = " + string.Join(" + ", r.Stages.Select(kv => $"{kv.Key} {kv.Value:F0}")));
+            }
+        var report = "MobileNetV2 WebGPU session create: " + string.Join("; ", lines);
+        Console.WriteLine("[ColdStart] " + report);
+        return report;
+    });
+
     /// <summary>The same with the 32x32-tile convolution kernel ON (<see cref="Conv2DKernel.SmallTileMaxGroups"/> 32; the browser default is off): what it costs a first run. Run it alone (a cold page).</summary>
     [TestMethod(Timeout = 600000)]
     public async Task<string> ColdStart_MobileNetV2_SmallTile() => await RunTest(async accelerator =>

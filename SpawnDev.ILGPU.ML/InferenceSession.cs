@@ -395,7 +395,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Accelerator accelerator, HttpClient http, string basePath,
         Action<string, int>? onProgress = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         // Load graph
         onProgress?.Invoke("graph", 0);
         var graphJson = await http.GetStringAsync($"{basePath}/model_graph.json");
@@ -490,6 +490,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         }
 
         // Compile graph
+        await ShaderCacheStore.ImportOnceAsync(accelerator);   // compiling loads kernels (the BatchNorm fold): the stored shaders first (started before the parse)
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
         var compiler = new GraphCompiler(registry);
@@ -628,7 +629,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         onProgress?.Invoke("download", 0);
         var bytes = await DownloadBytesChunkedAsync(http, modelUrl, onProgress);
         onProgress?.Invoke("download", 100);
@@ -715,7 +716,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Action<Graph.ModelGraph>? prepareGraph = null,
         WeightStorage weightStorage = WeightStorage.Source)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         if (stream == null) throw new ArgumentNullException(nameof(stream));
         if (!stream.CanSeek)
             throw new ArgumentException(
@@ -968,7 +969,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Dictionary<string, int[]>? inputShapes = null,
         HttpClient? http = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         _ = http;   // kept for signature compatibility; delivery no longer needs a separate HTTP client
 
         // ⚠️ BREAKING (2026-09-14): this used to take a WebTorrentClient and prefer a lazy-hash torrent.
@@ -1066,7 +1067,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Accelerator accelerator, HttpClient http, string onnxUrl,
         Action<string, int>? onProgress = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         // Download .onnx file using chunked download to avoid browser WASM OOM
         onProgress?.Invoke("download", 0);
         var onnxBytes = await DownloadBytesChunkedAsync(http, onnxUrl, onProgress);
@@ -1481,7 +1482,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Action<Graph.ModelGraph>? prepareGraph = null,
         WeightStorage weightStorage = WeightStorage.Source)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
         onProgress?.Invoke("parse", 0);
@@ -1544,6 +1545,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         // point FloatConstantData is still empty.
         prepareGraph?.Invoke(graph);
 
+        await ShaderCacheStore.ImportOnceAsync(accelerator);   // compiling loads kernels (the BatchNorm fold): the stored shaders first (started before the parse)
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
         // Snapshot the CLEAN constant seeds before Compile folds seq-specific values onto the graph
@@ -1967,7 +1969,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Accelerator accelerator, HttpClient http, string tfliteUrl,
         Action<string, int>? onProgress = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         onProgress?.Invoke("download", 0);
         var tfliteBytes = await DownloadBytesChunkedAsync(http, tfliteUrl, onProgress);
         onProgress?.Invoke("download", 100);
@@ -2044,7 +2046,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Accelerator accelerator, HttpClient http, string ggufUrl,
         Action<string, int>? onProgress = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         onProgress?.Invoke("download", 0);
         var ggufBytes = await DownloadBytesChunkedAsync(http, ggufUrl, onProgress);
         onProgress?.Invoke("download", 100);
@@ -2236,7 +2238,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false,
         Action<ModelGraph, Dictionary<string, float[]>>? graphTransform = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         await using var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 1 << 20, useAsync: true);
         return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct, acceptInputsEmbeds, graphTransform: graphTransform);
@@ -2255,7 +2257,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false, GGUF.GGUFModel? parsedHeader = null,
         Action<ModelGraph, Dictionary<string, float[]>>? graphTransform = null)
     {
-        await ShaderCacheStore.ImportOnceAsync(accelerator);   // the stored shaders before any kernel loads (browser WebGPU; ShaderCacheStore)
+        _ = ShaderCacheStore.ImportOnceAsync(accelerator);   // starts the stored shaders' import while the model parses; the first run awaits it before its kernels load (browser WebGPU; awaiting it here put its OPFS read ahead of the parse: ~72 ms of a return visit's create, Bones 2026-11-26)
         if (!stream.CanSeek)
             throw new ArgumentException("CreateFromGGUFStreamAsync requires a seekable stream.", nameof(stream));
 
@@ -2295,6 +2297,7 @@ public class InferenceSession : IDisposable, IDeviceSized
         var constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
         var floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
 
+        await ShaderCacheStore.ImportOnceAsync(accelerator);   // compiling loads kernels (the BatchNorm fold): the stored shaders first (started before the parse)
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
         var compiled = new GraphCompiler(registry) { EnableOptimization = true }.Compile(graph);

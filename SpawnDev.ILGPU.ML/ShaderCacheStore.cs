@@ -69,8 +69,13 @@ public static class ShaderCacheStore
         {
             var stream = await ((IModelStore)Store).OpenReadAsync(Key).ConfigureAwait(false);
             if (stream == null) return;
+            // the file is small (MaxBytes): one large read out of OPFS, then the import from memory. Reading it through the OPFS stream in the parser's own small
+            // pieces crossed into JS for each (Bones, 2026-11-26: ~72 ms at the start of a return visit's session create, against 11-28 ms from memory)
+            var bytes = new MemoryStream();
             await using (stream.ConfigureAwait(false))
-                LastImported = await ShaderArtifactSerializer.ImportCacheFromAsync(stream).ConfigureAwait(false);   // ILGPU 5.4.54: read as it streams, no whole string
+                await stream.CopyToAsync(bytes, 1 << 20).ConfigureAwait(false);
+            bytes.Position = 0;
+            LastImported = await ShaderArtifactSerializer.ImportCacheFromAsync(bytes).ConfigureAwait(false);
             _exportedAtMisses = ShaderArtifactCache.Misses;   // what is stored is what the page has: export again only when it generates more
         }
         catch (Exception e) { Console.WriteLine($"[ShaderCacheStore] import failed, shaders will be generated: {e.GetType().Name}: {e.Message}"); }

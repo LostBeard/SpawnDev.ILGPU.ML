@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- `ShaderCacheStore`: the import no longer delays session creation. The async factories START it (it overlaps the model's parse) and await it just before
+  compiling, where the first kernels load; and the file is read out of OPFS in one 1 MB read, then imported from memory (the parser's own small reads
+  each crossed into JS). Bones (2026-11-26): ~72 ms at the start of every return visit's create.
+- Measured, not yet changed: session creation from the OPFS-backed stream (`ModelHub.OpenStreamFromUrlAsync`) against a MemoryStream of the same file
+  (`ColdStart_MobileNetV2_CreateFromOpfsVsMemory`, three alternated rounds): 276-327 ms vs 68-91 ms; upload 200-218 vs 36-51, parse 38-43 vs 10-17. Each
+  weight is its own async OPFS read (a few hundred for MobileNetV2). Next: read-ahead windows.
 - `ShaderCacheStore`: a page's FIRST export goes `FirstExportQuietMs` (250 ms) after its first run that generated shaders; later ones keep the 3 s
   coalescing. Bones (2026-11-26, 5.8.34): a page closed within 3 s of its first run stored nothing, so its next visit generated every shader again (a closing
   page cannot finish an async OPFS write). Measured: stored 293 ms after the run; the round-trip test requires it within 1.5 s with no flush (red-checked with
