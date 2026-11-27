@@ -17,10 +17,31 @@ string[] routes =
     "/", "/getting-started", "/pipelines", "/ai-chat",
     "/classify", "/depth", "/detect", "/style", "/remove-bg", "/pose", "/super-res", "/face", "/clip",
     "/sentiment", "/embeddings", "/whisper", "/tts", "/text-gen",
-    "/generate", "/image-to-3d", "/depth-voxel",
-    "/explain", "/train", "/snake",
+    "/generate", "/image-to-3d", "/text-to-3d", "/video", "/depth-voxel",
+    "/explain", "/train", "/snake", "/self-consistency",
     "/benchmark", "/models", "/cache", "/inspector", "/tests",
 ];
+
+// The list above is by hand, and it went stale: /video, /text-to-3d and /self-consistency were added to the demo and never to this list (found
+// 2026-11-27, after /video shipped broken). Run from the repo root, the script now refuses to start while a page of the demo is missing from it.
+var pagesDir = Path.Combine(Directory.GetCurrentDirectory(), "SpawnDev.ILGPU.ML.Demo", "Pages");
+if (Directory.Exists(pagesDir))
+{
+    var unlisted = new List<string>();
+    foreach (var file in Directory.GetFiles(pagesDir, "*.razor"))
+        foreach (var line in File.ReadLines(file))
+        {
+            if (!line.StartsWith("@page \"")) continue;
+            var route = line.Split('"')[1];
+            if (route.Contains('{') || route == "/not-found" || routes.Contains(route)) continue;
+            unlisted.Add($"{route} ({Path.GetFileName(file)})");
+        }
+    if (unlisted.Count > 0)
+    {
+        Console.WriteLine("These demo pages are not in the smoke list; add them to `routes` first: " + string.Join(", ", unlisted));
+        return 2;
+    }
+}
 
 Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
 var profileDir = Path.Combine(Path.GetTempPath(), "spawndev-ml-smoke-profile");
