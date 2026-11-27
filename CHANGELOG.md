@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.35 - 2026-11-26 (nuget.org) - faster browser session creation (OPFS read-ahead), the shader cache off the create path
+
 - Docs: the Chrome cost behind `SkipCompletionWait` (session and captured replay) is cited upstream: ~2.9 ms per waited submit (Chrome 159 / Edge 148;
   Node + Dawn 0.09-0.16 ms), tracked at https://issues.chromium.org/issues/40286576 (Data's numbers: comment 6), cause traced in
   https://issues.chromium.org/issues/42240322, repro page https://lostbeard.github.io/webgpu-wait-latency-test/.
