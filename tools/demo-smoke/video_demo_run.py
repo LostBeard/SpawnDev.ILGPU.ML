@@ -17,7 +17,7 @@ started from byte 0, the storage entries, and the profile folder's real size on 
 --kill-after-gb N ends Chrome the hard way (as a crash or a closed browser does) once N GB were requested, starts it again on the same profile and
 clicks Generate again. Checks, all must hold for exit code 0:
   - a video is shown;
-  - download progress was visible while bytes were arriving (the #active-downloads bar);
+  - download progress was visible while bytes were arriving (the #active-downloads bar), and the page's own progress line said "loading" then;
   - no file is started from byte 0 twice within a session (one-byte ranges are size probes and do not count; a range may ask past the end of
     the file, so a file's requested bytes can exceed its size by up to one segment);
   - across the kill, each file's requested bytes stay within its size plus --slack-mb (the interrupted attempt's bytes are continued, not fetched again);
@@ -185,6 +185,9 @@ async def session(args, log, state, clear_first, kill_after_gb):
                 if arriving:
                     state["samples_downloading"] += 1
                     if st["downloads"].strip(): state["samples_with_bar"] += 1
+                    # the page's own line must say it is loading while a file downloads (5.8.36 said "encoding the prompt" through the 6.4 GB umT5
+                    # download and "decoding the video" through the VAE's: opening a file waits for its whole download)
+                    if "loading" in (st["text"] or "").lower(): state["samples_saying_loading"] += 1
                 print(f"{st['sec']:5d}s disk {st['diskGB']:6.2f} GB requested {down / 1e9:6.2f} GB | page: {st['bar']} '{st['text'].strip()[:44]}' | downloads: '{' / '.join(st['downloads'].split(chr(10)))[:110]}'", flush=True)
                 if st["error"]: verdict = "page error: " + st["error"]; break
                 if st["hasVideo"] and not st["running"]: verdict = "video shown: " + st["info"]; break
@@ -208,7 +211,7 @@ async def run(args):
     free = shutil.disk_usage(drive + "\\").free
     if free < args.need_gb * 1e9: sys.exit(f"{drive} has {free / 1e9:.1f} GB free, the run needs {args.need_gb} GB")
     os.makedirs(args.profile, exist_ok=True)
-    state = {"session": 1, "base_disk": None, "peak_disk": 0, "requested": {}, "totals": {}, "problems": set(), "samples_downloading": 0, "samples_with_bar": 0}
+    state = {"session": 1, "base_disk": None, "peak_disk": 0, "requested": {}, "totals": {}, "problems": set(), "samples_downloading": 0, "samples_with_bar": 0, "samples_saying_loading": 0}
     with open(args.log, "w", encoding="utf-8") as log:
         verdict = await session(args, log, state, clear_first=not args.reuse, kill_after_gb=args.kill_after_gb)
         print("SESSION 1:", verdict, flush=True)
@@ -231,6 +234,9 @@ async def run(args):
     print(f"samples with bytes arriving: {state['samples_downloading']}, of which the page showed the download bar: {state['samples_with_bar']}")
     if state["samples_downloading"] and state["samples_with_bar"] < 0.8 * state["samples_downloading"]:
         state["problems"].add(f"download progress was visible in {state['samples_with_bar']} of {state['samples_downloading']} samples taken while bytes were arriving")
+    print(f"samples with bytes arriving: {state['samples_downloading']}, of which the page's own line said it was loading: {state['samples_saying_loading']}")
+    if state["samples_downloading"] and state["samples_saying_loading"] < 0.8 * state["samples_downloading"]:
+        state["problems"].add(f"the page's line said it was loading in {state['samples_saying_loading']} of {state['samples_downloading']} samples taken while bytes were arriving")
     print("VERDICT:", verdict)
     for p in sorted(state["problems"]): print("PROBLEM:", p)
     ok = verdict.startswith("video shown") and not state["problems"]
