@@ -31,9 +31,28 @@ jobs:
     - name: Install .NET WASM Build Tools
       run: dotnet workload install wasm-tools        
 
+    # The AOT publish outgrows the runner's 16 GB at its peak (parallel clang -O2 on the big .bc files, ~8 min in). 2026-11-27: three of four
+    # deploys died there with "MSB4166: Child node exited prematurely" (the kernel's OOM kill); the job then hung and GitHub kept no log.
+    # Extra swap lets the peak through at full optimization; the sampler below prints memory every 30 s so the peak is on record.
+    - name: Add swap for the AOT peak
+      run: |
+        free -m
+        sudo fallocate -l 16G /mnt/aot.swap
+        sudo chmod 600 /mnt/aot.swap
+        sudo mkswap /mnt/aot.swap
+        sudo swapon /mnt/aot.swap
+        free -m
+        df -h /mnt .
+
     # publishes Blazor project to the publish-folder
     - name: Publish .NET Core Project
-      run: dotnet publish ./SpawnDev.ILGPU.ML.Demo/ --nologo -c:Release -p:DemoAot=true --output publish
+      run: |
+        ( while sleep 30; do echo "[mem] $(date +%T) $(free -m | awk '/Mem:/{printf "used %d/%d MB", $3, $2} /Swap:/{printf ", swap %d MB", $3}')  top: $(ps -eo rss=,comm= --sort=-rss | head -3 | awk '{printf "%s %d MB; ", $2, $1/1024}')"; done ) &
+        sampler=$!
+        dotnet publish ./SpawnDev.ILGPU.ML.Demo/ --nologo -c:Release -p:DemoAot=true --output publish
+        status=$?
+        kill $sampler
+        exit $status
       
     # The pushed branch refuses files over 100 MB: the AOT runtime (dotnet.native.wasm, ~130 MB) ships as its .gz copy only;
     # index.html's loadBootResource fetches the .gz copies off localhost
