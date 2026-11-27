@@ -125,8 +125,11 @@ public abstract partial class MLTestBase
             ShaderCacheStore.ResetImportForTest();
             using var acc1 = await Fresh();
             var v1 = await Visit(acc1);
-            await ShaderCacheStore.FlushAsync();
-            if (ShaderCacheStore.LastExportBytes == 0) throw new Exception("The first visit generated shaders but nothing was stored.");
+            // the page's first export must land soon after its first run, not after ExportQuietMs: a tab may close right after its answer (Bones, 2026-11-26)
+            var exportSw = Stopwatch.StartNew();
+            while (ShaderCacheStore.LastExportBytes == 0 && exportSw.ElapsedMilliseconds < 1500) await Task.Delay(25);
+            double exportLatency = exportSw.Elapsed.TotalMilliseconds;
+            if (ShaderCacheStore.LastExportBytes == 0) throw new Exception("The first visit's shaders were not stored within 1.5 s of its run (a tab closed then would lose them).");
 
             // the return visit: nothing in memory, the stored file imported before any kernel loads
             ShaderArtifactCache.Clear();
@@ -139,7 +142,7 @@ public abstract partial class MLTestBase
             for (int i = 0; i < v1.Out.Length; i++) if (BitConverter.SingleToInt32Bits(v1.Out[i]) != BitConverter.SingleToInt32Bits(v2.Out[i])) differ++;
             if (differ != 0) throw new Exception($"{differ} of {v1.Out.Length} outputs differ between the visits.");
             var report = $"MobileNetV2 WebGPU: first visit {v1.First:F0} ms ({v1.Misses} shaders generated, {v1.Hits} hits), stored " +
-                         $"{ShaderCacheStore.LastExportBytes / 1024} KB as {ShaderCacheStore.Key}; return visit (fresh accelerator, same page) {v2.First:F0} ms, " +
+                         $"{ShaderCacheStore.LastExportBytes / 1024} KB as {ShaderCacheStore.Key} {exportLatency:F0} ms after the run; return visit (fresh accelerator, same page) {v2.First:F0} ms, " +
                          $"{ShaderCacheStore.LastImported} kernels imported, {v2.Hits} hits, 0 misses; outputs identical";
             Console.WriteLine("[ColdStart] " + report);
             return report;

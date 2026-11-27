@@ -80,6 +80,11 @@ public static class ShaderCacheStore
     /// once it settles, not after every run (an export writes the whole set).</summary>
     public static int ExportQuietMs { get; set; } = 3000;
 
+    /// <summary>The quiet period before a page's FIRST export: short, because a tab may close soon after its first answer (Bones, 2026-11-26: a page closed
+    /// within 3 s of its first run stored nothing, so its next visit generated every shader again; a closing page cannot finish an async OPFS write).</summary>
+    public static int FirstExportQuietMs { get; set; } = 250;
+    private static bool _exportedThisPage;
+
     /// <summary>The largest store written (the import cost grows with it: 201 KB imports in 11-28 ms); a larger export is skipped and logged.</summary>
     public static int MaxBytes { get; set; } = 8 * 1024 * 1024;
 
@@ -96,7 +101,7 @@ public static class ShaderCacheStore
         try
         {
             long seen;
-            do { seen = ShaderArtifactCache.Misses; await Task.Delay(ExportQuietMs).ConfigureAwait(false); }
+            do { seen = ShaderArtifactCache.Misses; await Task.Delay(_exportedThisPage ? ExportQuietMs : FirstExportQuietMs).ConfigureAwait(false); }
             while (ShaderArtifactCache.Misses != seen);
             _exportedAtMisses = seen;
             // estimate first and build nothing MaxBytes would reject (MEASURED: a test page that compiled hundreds of kernels exported 4.35 MB at a time; built as a
@@ -119,6 +124,7 @@ public static class ShaderCacheStore
             buffer.Position = 0;
             await Store.PutAsync(Key, buffer).ConfigureAwait(false);
             LastExportBytes = length;
+            _exportedThisPage = true;
             // files of other builds can never be imported again (their key no longer matches): remove them
             foreach (var e in await ((IModelStore)Store).ListAsync().ConfigureAwait(false))
                 if (e.Key != Key) await Store.RemoveAsync(e.Key).ConfigureAwait(false);
@@ -130,7 +136,7 @@ public static class ShaderCacheStore
     public static Task FlushAsync() => _export ?? Task.CompletedTask;
 
     /// <summary>Tests: forget this page's import, so the next session imports the stored file again as a new visit would.</summary>
-    internal static void ResetImportForTest() { _import = null; _exportedAtMisses = -1; LastImported = 0; }
+    internal static void ResetImportForTest() { _import = null; _exportedAtMisses = -1; LastImported = 0; _exportedThisPage = false; }
 
     /// <summary>Deletes every stored shader file (all builds' keys).</summary>
     public static async Task ClearAsync()

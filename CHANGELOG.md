@@ -4,6 +4,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- `ShaderCacheStore`: a page's FIRST export goes `FirstExportQuietMs` (250 ms) after its first run that generated shaders; later ones keep the 3 s
+  coalescing. Bones (2026-11-26, 5.8.34): a page closed within 3 s of its first run stored nothing, so its next visit generated every shader again (a closing
+  page cannot finish an async OPFS write). Measured: stored 293 ms after the run; the round-trip test requires it within 1.5 s with no flush (red-checked with
+  the old 3 s). 5.8.34 in the field (Bones, Chrome 159, 5 rounds): return visit click-to-answer 1730 -> 1211 ms, first run 835 -> 272 ms; Data's SpawnDev.AI
+  demo first token 7.9 s first visit, 5.4 s on the next (7.6-9.0 s every visit before).
 ## 5.8.34 - 2026-11-26 (nuget.org) - browser shader cache for returning visitors, deterministic random operators
 
 - **Browser: a returning visitor's shaders are imported, not generated again** (`ShaderCacheStore`, on by default in the browser on WebGPU). A model's cold
