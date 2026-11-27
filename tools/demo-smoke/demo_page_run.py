@@ -24,7 +24,7 @@ runs the page's steps again. Checks, all must hold for exit code 0:
   - across the kill, each file's requested bytes stay within its size plus --slack-mb (the interrupted attempt's bytes are continued, not fetched again);
   - the profile never grows by more than the models' total size plus --slack-mb (plus 0.3 GB for the browser's own files).
 """
-import argparse, asyncio, json, os, shutil, subprocess, sys, time, urllib.request
+import argparse, asyncio, json, os, re, shutil, subprocess, sys, time, urllib.request
 
 import websockets
 
@@ -278,7 +278,9 @@ async def session(args, page, log, state, clear_first, kill_after_gb):
                 arriving = down - last_down > 4e6 and in_progress; last_down = down
                 if arriving:
                     state["samples_downloading"] += 1
-                    if st["downloads"].strip(): state["samples_with_bar"] += 1
+                    # progress is visible through the shared download bar, or through the page's own line when it carries a measured figure
+                    # (/ai-chat's GGUF loader does not go through HubModelSource, so the bar stays empty; its line says "Downloading ... 92%")
+                    if st["downloads"].strip() or (st["loading"] and re.search(r"\d+(\.\d+)?\s*%|\d+(\.\d+)?\s*[MG]B", st["text"] or "")): state["samples_with_bar"] += 1
                     # the page's own line must say it is loading while a file downloads (5.8.36 /video said "encoding the prompt" through the 6.4 GB
                     # umT5 download and "decoding the video" through the VAE's: opening a file waits for its whole download)
                     if st["loading"]: state["samples_saying_loading"] += 1
