@@ -488,8 +488,18 @@ public abstract partial class MLTestBase
         {
             var bytes = await http.GetByteArrayAsync("models/mobilenetv2/model.onnx");
             var sw = Stopwatch.StartNew();
-            using var session = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false));
+            // session creation by its own progress stages (detect, graph, weights, compile, ready): each callback's time since the last
+            var stages = new List<string>();
+            double lastMark = 0;
+            void Progress(string stage, int percent)
+            {
+                double now = sw.Elapsed.TotalMilliseconds;
+                stages.Add($"{stage} {percent}% +{now - lastMark:F0}");
+                lastMark = now;
+            }
+            using var session = await InferenceSession.CreateFromStreamAsync(accelerator, new MemoryStream(bytes, writable: false), Progress);
             create = sw.Elapsed.TotalMilliseconds;
+            Console.WriteLine($"[ColdStart] create {create:F0} ms by stage (ms since the previous callback): {string.Join(", ", stages)}, then +{create - lastMark:F0} to return");
             async Task Run()
             {
                 using var t = OwnedTensor<float>.FromHost(accelerator, input, new[] { 1, 3, 224, 224 });
