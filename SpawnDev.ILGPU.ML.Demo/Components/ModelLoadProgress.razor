@@ -1,9 +1,18 @@
+@using SpawnDev.ILGPU.ML.Hub
+@implements IDisposable
+@* 2026-11-27: /text-gen showed "15 %, 49.5 / 330.0 MB" through its whole 330 MB download while the download bar said 44 % then 73 %: the pages set a
+   coarse percent and then open their model file, and an open waits for the whole download (HubModelSource.OpenAsync). The MB figure was the page's
+   percent times the model size, never a measured byte. While the page loads and the shared source downloads, this card shows the real bytes. *@
 <div class="model-progress @(IsComplete ? "complete" : "") @(IsLoading ? "loading" : "")">
     <div class="mp-header">
         <span class="mp-label">@ModelName</span>
         @if (IsComplete)
         {
             <span class="mp-status mp-status-ready">Ready</span>
+        }
+        else if (IsLoading && Downloading is { } dl)
+        {
+            <span class="mp-status mp-status-loading">@(dl.Fraction is { } f ? $"downloading {f * 100:F0}%" : "downloading")</span>
         }
         else if (IsLoading)
         {
@@ -19,17 +28,19 @@
         }
     </div>
 
-    @if (IsLoading)
+    @if (IsLoading && Downloading is { } d)
+    {
+        <div class="mp-track">
+            <div class="mp-fill" style="width: @((d.Fraction ?? 0) * 100)%;"></div>
+        </div>
+        <div class="mp-detail">loading: downloading @Mb(d.Received)@(d.Total > 0 ? " of " + Mb(d.Total) : "")@(d.Files > 1 ? $" ({d.Files} files)" : "")</div>
+    }
+    else if (IsLoading)
     {
         <div class="mp-track">
             <div class="mp-fill" style="width: @(ProgressPercent)%;"></div>
         </div>
-        @if (TotalSizeMB > 0)
-        {
-            <div class="mp-detail">
-                @((TotalSizeMB * ProgressPercent / 100).ToString("F1")) / @TotalSizeMB.ToString("F1") MB
-            </div>
-        }
+        <div class="mp-detail">loading@(TotalSizeMB > 0 ? $" (about {TotalSizeMB:F0} MB on first use)" : "")</div>
     }
 
     @if (!string.IsNullOrEmpty(ErrorMessage))
@@ -45,6 +56,34 @@
     [Parameter] public double ProgressPercent { get; set; }
     [Parameter] public double TotalSizeMB { get; set; }
     [Parameter] public string? ErrorMessage { get; set; }
+
+    [Inject] HubModelSource ModelSource { get; set; } = default!;
+
+    private readonly record struct DownloadSum(long Received, long Total, int Files)
+    {
+        public double? Fraction => Total > 0 ? Math.Clamp((double)Received / Total, 0, 1) : null;
+    }
+
+    /// <summary>Every download running through the shared source, summed; null when none is running.</summary>
+    private DownloadSum? Downloading
+    {
+        get
+        {
+            var all = ModelSource.ActiveDownloads;
+            if (all.Count == 0) return null;
+            long got = 0, total = 0; bool known = true;
+            foreach (var x in all) { got += x.BytesReceived; if (x.TotalBytes > 0) total += x.TotalBytes; else known = false; }
+            return new DownloadSum(got, known ? total : 0, all.Count);
+        }
+    }
+
+    private static string Mb(long bytes) => bytes >= 1_000_000_000 ? $"{bytes / 1e9:F2} GB" : $"{bytes / 1e6:F1} MB";
+
+    protected override void OnInitialized() => ModelSource.ActiveDownloadsChanged += OnDownloadsChanged;
+
+    private void OnDownloadsChanged() { if (IsLoading) _ = InvokeAsync(StateHasChanged); }
+
+    public void Dispose() => ModelSource.ActiveDownloadsChanged -= OnDownloadsChanged;      // the source is a singleton and outlives the page
 }
 
 <style>
