@@ -165,9 +165,8 @@ public class ProjectTest
             // enormous; PMT_CONSOLE_LOG=<substring> keeps only matching lines, PMT_CONSOLE_LOG=1 (or *)
             // keeps everything for one scoped run.
             //   PMT_CONSOLE_LOG=[BufferPool] PMT_FILTER=SomeTest dotnet test PlaywrightMultiTest/...
-            var logFilter = Environment.GetEnvironmentVariable("PMT_CONSOLE_LOG");
-            var wantAllLogs = logFilter is "1" or "*";
-            var captureLogs = !string.IsNullOrEmpty(logFilter);
+            // (a comma list keeps a line matching any term: ConsoleLogFilter)
+            var captureLogs = ConsoleLogFilter.Enabled;
             var consoleLogs = new List<string>();
 
             // ⚠️ A ROLLING TAIL OF EVERY CONSOLE LINE, kept regardless of PMT_CONSOLE_LOG.
@@ -219,9 +218,8 @@ public class ProjectTest
                     consoleErrors.Add(msg.Text);
                 else if (msg.Type == "warning")
                     consoleWarnings.Add(msg.Text);
-                else if (captureLogs && msg.Text != null
-                         && (wantAllLogs || msg.Text.Contains(logFilter!, StringComparison.OrdinalIgnoreCase)))
-                    consoleLogs.Add(msg.Text);
+                else if (captureLogs && ConsoleLogFilter.Matches(msg.Text))
+                    consoleLogs.Add(msg.Text!);
             }
             page.Console += OnConsole;
 

@@ -1378,14 +1378,12 @@ namespace PlaywrightMultiTest
         /// </summary>
         private static void EchoMatchingConsoleLines(string testName, string[] lines)
         {
-            var logFilter = Environment.GetEnvironmentVariable("PMT_CONSOLE_LOG");
-            if (string.IsNullOrEmpty(logFilter)) return;
-            bool all = logFilter is "1" or "*";
+            if (!ConsoleLogFilter.Enabled) return;
             var kept = lines.Where(l =>
                     !l.StartsWith("TEST: ", StringComparison.Ordinal)
                     && !l.StartsWith("RESULTS:", StringComparison.Ordinal)
                     && !l.StartsWith("READY:", StringComparison.Ordinal)
-                    && (all || l.Contains(logFilter, StringComparison.OrdinalIgnoreCase)))
+                    && ConsoleLogFilter.Matches(l))          // a comma list: any term
                 .ToList();
             if (kept.Count == 0) return;
             // ⚠️ Console.ERROR, like the browser lane's echo. `dotnet test` does not surface a testhost's
