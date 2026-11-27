@@ -201,19 +201,33 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
             }
             finally { foreach (var f in files) f.Dispose(); }
         }
-        await TouchAsync(cacheKey).ConfigureAwait(false);
+        await TouchAsync(cacheKey, meta).ConfigureAwait(false);
         return stream;
     }
 
-    /// <summary>Record that a complete entry was just used (the order <see cref="TrimAsync"/> evicts in). Never fails the open it follows.</summary>
-    private async Task TouchAsync(string cacheKey)
+    /// <summary>The key this instance last recorded a use for, and the value it wrote (see <see cref="TouchAsync"/>).</summary>
+    private string? _lastTouchedKey;
+    private long _lastTouchedUsed;
+
+    /// <summary>How long a repeated use of the same entry may go unrecorded (bounds the drift when another tab records uses in between).</summary>
+    private const long RepeatTouchWindowMs = 60_000;
+
+    /// <summary>
+    /// Record that a complete entry was just used (the order <see cref="TrimAsync"/> evicts in). Never fails the open it follows.
+    /// The write is skipped when this instance's last recorded use was THIS entry, the stored value is still the one it wrote, and that was under
+    /// <see cref="RepeatTouchWindowMs"/> ago: the entry is already the most recent, so the order cannot change. A model read per layer reopens its file
+    /// every layer (the Wan umT5 encoder 25 times a prompt), and rewriting the sidecar was about half of each reopen. Any other entry used in between
+    /// makes the next use of this one write again, so a cache hit always counts (RangeStreamModelSource_CacheCapEvictsLeastRecentlyUsedOutsideTheSet).
+    /// </summary>
+    private async Task TouchAsync(string cacheKey, CacheEntryMeta meta)
     {
         try
         {
-            var meta = await ReadMetaAsync(cacheKey).ConfigureAwait(false);
-            if (meta is not { Complete: true }) return;
-            meta.Used = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (cacheKey == _lastTouchedKey && meta.Used == _lastTouchedUsed && now - meta.Used is >= 0 and < RepeatTouchWindowMs) return;
+            meta.Used = now;
             await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
+            _lastTouchedKey = cacheKey; _lastTouchedUsed = now;
         }
         catch { /* the order of eviction is a preference; the open already succeeded */ }
     }
@@ -653,21 +667,34 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
         FileSystemDirectoryHandle dir;
         try { dir = await _cacheDir!.GetDirectoryHandle(cacheKey + PartsSuffix).ConfigureAwait(false); }
         catch { return null; }
+        // ONE listing, then every part's File at once. It was two awaited calls per part in sequence: MEASURED 2026-11-27, a complete 48-part entry
+        // (the Wan umT5 file is 48 parts of 128 MiB, and its encoder reopens it once per layer, 25 times a prompt) took 24.7 ms to list and 54 ms to open
+        // (Benchmark_OpfsModelCache_ReopenAPartedEntry).
         var files = new List<SpawnDev.SpawnJS.JSObjects.File>();
         using (dir)
         {
-            for (int i = 0; ; i++)
+            var byIndex = new Dictionary<int, FileSystemFileHandle>();
+            try
             {
-                SpawnDev.SpawnJS.JSObjects.File file;
-                try
+                foreach (var entry in await dir.ValuesList().ConfigureAwait(false))
                 {
-                    using var handle = await dir.GetFileHandle(PartName(i)).ConfigureAwait(false);
-                    file = await handle.GetFile().ConfigureAwait(false);
+                    if (entry is FileSystemFileHandle fh && IsPartName(fh.Name)) byIndex[int.Parse(fh.Name, CultureInfo.InvariantCulture)] = fh;
+                    else entry.Dispose();
                 }
-                catch { break; }
-                if (file.Size <= 0) { file.Dispose(); break; }
-                files.Add(file);
+                var ordered = new List<FileSystemFileHandle>();
+                for (int i = 0; byIndex.TryGetValue(i, out var h); i++) ordered.Add(h);           // consecutive from 0: the first missing index ends the entry
+                var got = await Task.WhenAll(ordered.Select(async h =>
+                {
+                    try { return await h.GetFile().ConfigureAwait(false); } catch { return null; }  // raced with a delete
+                })).ConfigureAwait(false);
+                bool ended = false;
+                foreach (var f in got)
+                {
+                    if (ended || f == null || f.Size <= 0) { ended = true; f?.Dispose(); continue; }   // an empty part was created and never committed
+                    files.Add(f);
+                }
             }
+            finally { foreach (var h in byIndex.Values) h.Dispose(); }
         }
         return files;
     }

@@ -11,6 +11,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   only for finished steps, which the timing tests key on). Tests: `VideoPipelines_SayLoadingBeforeTheFirstFileOpens` (all three pipelines, no model read,
   every backend: 7/7) and `Wan_Pipeline_EveryFileOpensUnderALoadingMessage` (HeavyModel, the real files: tokenizer, umT5, DiT, VAE); both red-checked by
   removing the fix (they reproduce the live page's messages).
+- **Reopening a cached browser model file costs about half** (`OpfsModelCache`): an open listed the parts with two awaited calls per part in sequence
+  and rewrote the sidecar ("last used") every time. Now one directory listing and every part's File at once, and no rewrite when this cache's last
+  recorded use was the same entry (any other entry used in between still makes the next use count). A complete 48-part entry: 55 to 29 ms per reopen
+  (`Benchmark_OpfsModelCache_ReopenAPartedEntry`, all browser lanes). OPFS and range-source tests 54/54.
+- **The umT5 encoder opens its file twice per prompt, not 26 times** (`UmT5Encoder`): the layer reads share one stream, rewound per layer. Wan/LTX
+  prompt encodes in the browser skip 24 reopens of the 6.4 GB file (0.7-1.4 s). Reference parity unchanged (`Wan_UmT5_MatchesReference`,
+  `Wan_UmT5_Quantized_MatchesReference`); `Wan_Pipeline_EveryFileOpensUnderALoadingMessage` fails above 2 opens (red-checked: 26).
 - **Demo: what a page says while a model downloads is measured, not guessed.** The model card (`ModelLoadProgress`, 18 pages) showed the page's own
   coarse percent and an "x / y MB" computed from it (/text-gen: "15 %, 49.5 / 330.0 MB" through its whole 330 MB download), and /generate said
   "READY" through its 4.4 GB of FLUX.2 downloads (the page marks the model loaded before the weights come). The card now shows the shared source's

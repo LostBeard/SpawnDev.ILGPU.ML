@@ -28,6 +28,7 @@ public sealed class UmT5Encoder : IDisposable
     private readonly IModelSource _source;
     private readonly string _repo, _file;
     private readonly Stream _embeddings;                         // kept open: the rows of the prompt are read from it
+    private Stream? _layerFile;                                  // the file for the layer reads, opened at the first one (LoadLayerAsync)
     private readonly SafeTensorInfo _embeddingInfo;
     private readonly bool _embeddingQuantized;
     private readonly bool _embeddingF16;                         // fp16 rows (ComfyUI's files); otherwise bf16, or the 8-bit blocks
@@ -164,7 +165,12 @@ public sealed class UmT5Encoder : IDisposable
     /// <summary>Load the tensors of one layer (or the final norm) from the file, in file order.</summary>
     private async Task<GpuWeights> LoadLayerAsync(Func<string, bool> filter, CancellationToken ct)
     {
-        await using var stream = await _source.OpenAsync(_repo, _file, ct);
+        // ONE stream for every layer read, rewound to the header each time. It was opened once per layer (25 opens a prompt for the 24-layer encoder), and
+        // reopening a cached file in the browser costs 29-55 ms (a 48-part OPFS entry, Benchmark_OpfsModelCache_ReopenAPartedEntry, 2026-11-27).
+        // The layers load one after another (EncodeManyAsync), never two at once, so sharing the position is safe.
+        _layerFile ??= await _source.OpenAsync(_repo, _file, ct);
+        _layerFile.Position = 0;
+        var stream = _layerFile;
         using var empty = System.Text.Json.JsonDocument.Parse("{}");
         if (!_hfLayout) return await GpuWeights.LoadAsync(_acc, stream, empty.RootElement, _file, filter, ct);
         // the Hugging Face names: load the tensors that make up the ones asked for (our names), then rewrite them into our layout on the device
@@ -257,5 +263,5 @@ public sealed class UmT5Encoder : IDisposable
         }
     }
 
-    public void Dispose() => _embeddings.Dispose();
+    public void Dispose() { _embeddings.Dispose(); _layerFile?.Dispose(); }
 }

@@ -91,6 +91,11 @@ public abstract partial class MLTestBase
             if (!firsts.Any(o => o.File == name)) throw new Exception($"{Path.GetFileName(name)} was never opened: {lines}");
         var bad = firsts.Where(o => !o.Shown.Contains(": loading ")).ToList();
         if (bad.Count > 0) throw new Exception("opened while the page named other work: " + string.Join("; ", bad.Select(o => $"{Path.GetFileName(o.File)} under \"{o.Shown}\"")));
-        return lines;
+        // the umT5 file: one open for the embedding rows, one for the layer reads. It was opened once per layer (25 a prompt), and a reopen of a cached
+        // browser file costs 29-55 ms (UmT5Encoder.LoadLayerAsync, Benchmark_OpfsModelCache_ReopenAPartedEntry)
+        int t5Opens = source.Opens.Count(o => o.File == paths.TextEncoder);
+        Console.WriteLine($"[Wan] first opens: the umT5 file was opened {t5Opens} times for one prompt encode");
+        if (t5Opens > 2) throw new Exception($"the umT5 file was opened {t5Opens} times for one prompt encode (expected 2: the embedding rows, the layers)");
+        return lines + $"; umT5 opened {t5Opens} times";
     });
 }

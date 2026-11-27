@@ -907,4 +907,59 @@ public abstract partial class MLTestBase
             try { await root.RemoveEntry(dirName, recursive: true); } catch { }
         }
     });
+
+    /// <summary>
+    /// What reopening a complete multi-part entry costs: the Wan umT5 encoder opens its 6.4 GB file once per layer (24 layers + the final norm,
+    /// UmT5Encoder.LoadLayerAsync), and the file is 48 parts of 128 MiB. Here the 2.1 MB test file is stored as 48 parts and reopened 25 times; each open
+    /// reads 8 bytes near the end (the last part) and must match the first open's bytes. The per-open time goes to the console.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task Benchmark_OpfsModelCache_ReopenAPartedEntry() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        const string dirName = "ilgpu-ml-test-reopen";
+        using var probe = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+        if (!await probe.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        var key = OpfsModelCache.UrlToCacheKey(OpfsCacheTestUrl) + ".reopen";
+        await probe.RemoveAsync(key);
+        long total;
+        {
+            var s = await probe.OpenOrDownloadAsync(OpfsCacheTestUrl, key + ".size");
+            await using (s.ConfigureAwait(false)) total = s.Length;
+            await probe.RemoveAsync(key + ".size");
+        }
+        const int parts = 48, opens = 25;
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName, PartBytes = (total + parts - 1) / parts };
+        try
+        {
+            var tail = new byte[8]; long at = total - 16;
+            var first = await cache.OpenOrDownloadAsync(OpfsCacheTestUrl, key);              // downloads and commits 48 parts
+            await using (first.ConfigureAwait(false)) { first.Position = at; await first.ReadExactlyAsync(tail); }
+            var times = new List<double>();
+            var got = new byte[8];
+            for (int i = 0; i < opens; i++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var s = await cache.OpenOrDownloadAsync(OpfsCacheTestUrl, key);              // the same URL, as the encoder's reopen passes it
+                await using (s.ConfigureAwait(false)) { s.Position = at; await s.ReadExactlyAsync(got); }
+                times.Add(sw.Elapsed.TotalMilliseconds);
+                if (!got.AsSpan().SequenceEqual(tail)) throw new Exception($"open {i + 1}: the last part's bytes differ from the first open's");
+            }
+            times.Sort();
+            double sum = 0; foreach (var t in times) sum += t;
+            // the split: IsCompleteAsync reads the sidecar and lists the parts (sizes) like an open, without the Blob, the read or the sidecar write an open makes
+            var check = new List<double>();
+            for (int i = 0; i < opens; i++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!await cache.IsCompleteAsync(key)) throw new Exception("the entry stopped being complete");
+                check.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            check.Sort();
+            var report = $"reopen of a complete {parts}-part entry ({total:N0} bytes), {opens} opens with an 8-byte read in the last part: median {times[opens / 2]:F1} ms, max {times[^1]:F1} ms, total {sum:F0} ms; IsCompleteAsync (sidecar + part listing) median {check[opens / 2]:F1} ms";
+            Console.WriteLine("[OpfsCache] " + report);
+            return report;
+        }
+        finally { await cache.RemoveAsync(key); }
+    });
 }
