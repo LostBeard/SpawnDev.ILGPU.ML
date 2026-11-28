@@ -3137,7 +3137,7 @@ public sealed class GgufBatchDecoder : IDisposable
     /// max M, their weights e^(m_c - M) and sums l_c are found ONCE into shared memory (the per-value kernel had every thread re-read every chunk's
     /// (m, l) twice and take every exp: two serial chains of global loads, 29 links each at 1,830 tokens), then each thread sums its value over the chunks
     /// in the same order with the same fused multiply-adds, four partials loaded ahead: bit-identical (a max takes no rounding; each weight is the
-    /// same exp of the same operands). Needs nch <= CombineMaxChunks.
+    /// same exp of the same operands). Needs nch &lt;= CombineMaxChunks.
     /// </summary>
     private static void AttnCombineGroupImpl(FV part, FV ml, FV o, IV posBuf, int nch, int ck, int H, int mode)
     {

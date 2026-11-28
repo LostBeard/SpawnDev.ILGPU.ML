@@ -30,7 +30,7 @@ public enum BandScale
 /// Short-time spectra of multi-channel audio on the device (asked for by Riker for AssistZ, 2026-11-02: 48 kHz stereo from a GPU ring buffer, a frame every
 /// 1024 samples; and the STFT under <see cref="WhisperMelPreprocessor"/>). Frames are read from a planar ring (<c>[channel][ringLength]</c>, ringLength a
 /// power of two) by their END sample: frame k covers samples <c>[end_k - N, end_k)</c> with <c>end_k = firstEnd + k * hop</c> (positions counted from the
-/// start of the stream, so they wrap through the ring by <c>& (ringLength - 1)</c>); every end must lie in the ring's live range
+/// start of the stream, so they wrap through the ring by <c>&amp; (ringLength - 1)</c>); every end must lie in the ring's live range
 /// <c>[writePos - ringLength + N, writePos]</c>, <c>writePos</c> being the count of samples written so far. A power-of-two N runs a radix-2 FFT (the real
 /// signal as an N/2-point complex FFT in shared memory, one group of 256 threads per frame and channel); any other N a direct real DFT. Outputs stay on the
 /// device: power <c>[frames][channels][N/2 + 1]</c> (linear, or 10 log10(max(p, floor))), and optionally pooled bands <c>[frames][channels][bands]</c>

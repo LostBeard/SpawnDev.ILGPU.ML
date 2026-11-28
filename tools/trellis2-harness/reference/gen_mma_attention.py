@@ -282,7 +282,7 @@ w("    /// 4.5 times its variation and scores reach 3.5e4: 4.6e-2 from float64 w
 w("    /// it only has to be the same for every key. Then the k columns are scaled by Pow2Scale(scl[1]) and the v columns (vOff .. vOff + cols) by")
 w("    /// Pow2Scale(scl[2]): <see cref=\"MaxAbs\"/>'s maxima of the centred k and of v.")
 w("    /// An element is a k (v) value when it lies in one of the Nk rows of the k (v) region: column (e - kOff) % kvStride below cols, row (e - kOff) / kvStride")
-w("    /// below Nk. k and v may share each row (vOff < kvStride: Wan, LTX) or be whole blocks (vOff = Nk * kvStride: Anima). Until 2026-11-28 the column came from")
+w("    /// below Nk. k and v may share each row (vOff &lt; kvStride: Wan, LTX) or be whole blocks (vOff = Nk * kvStride: Anima). Until 2026-11-28 the column came from")
 w("    /// e % kvStride alone, which only holds for the shared-row layout: with blocks every v value was taken for a key, centred and scaled by k's power of two,")
 w("    /// and left fp16's range (Inf, then NaN in the attention; MEASURED on Anima's block 0: 760 of 16384 head vectors NaN).")
 w("    /// </summary>")
