@@ -1427,13 +1427,28 @@ public class ElementWiseKernels : IDisposable
         output[idx] = p == 2 ? MathF.Sqrt(sum) : (p == 1 ? sum : MathF.Pow(sum, 1f / p));
     }
 
+    /// <summary>
+    /// PyTorch's reflect_coordinates: <paramref name="x"/> mirrored into [twiceLow / 2, twiceHigh / 2] (the bounds are passed doubled so the
+    /// half-pixel edges of align_corners = 0 stay integers). One pixel along the axis (twiceLow == twiceHigh) maps everything to 0.
+    /// </summary>
+    private static float GridSampleReflect(float x, float twiceLow, float twiceHigh)
+    {
+        if (twiceLow == twiceHigh) return 0f;
+        float min = twiceLow * 0.5f, span = (twiceHigh - twiceLow) * 0.5f;
+        x = MathF.Abs(x - min);
+        float flips = MathF.Floor(x / span);
+        float extra = x - flips * span;                  // fmod for x >= 0
+        int odd = (int)flips & 1;
+        return odd == 0 ? extra + min : span - extra + min;
+    }
+
     private static void GridSampleImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> grid, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
-        // params: [N, C, Hin, Win, Hout, Wout, alignCorners] (float-stored, cast to int)
+        // params: [N, C, Hin, Win, Hout, Wout, alignCorners, paddingMode] (float-stored, cast to int); paddingMode 0 zeros, 1 border, 2 reflection
         int C = (int)paramsArr[1]; int Hin = (int)paramsArr[2]; int Win = (int)paramsArr[3];
-        int Hout = (int)paramsArr[4]; int Wout = (int)paramsArr[5]; int alignCorners = (int)paramsArr[6];
+        int Hout = (int)paramsArr[4]; int Wout = (int)paramsArr[5]; int alignCorners = (int)paramsArr[6]; int paddingMode = (int)paramsArr[7];
         // idx = n * C * Hout * Wout + c * Hout * Wout + h * Wout + w
         int tmp = idx;
         int w = tmp % Wout; tmp /= Wout;
@@ -1453,6 +1468,19 @@ public class ElementWiseKernels : IDisposable
         {
             ix = ((gx + 1f) * Win - 1f) * 0.5f;
             iy = ((gy + 1f) * Hin - 1f) * 0.5f;
+        }
+        // padding (PyTorch grid_sampler_compute_source_index, which ONNX and onnxruntime follow): border clamps the source coordinate to the image;
+        // reflection mirrors it about the image edges (the pixel centres with align_corners, the outer pixel edges without), then clamps. After either,
+        // a tap that falls outside has zero weight, so the zero-padding reads below stay correct. Zeros (0) samples the coordinate as it is.
+        if (paddingMode == 2)
+        {
+            if (alignCorners != 0) { ix = GridSampleReflect(ix, 0f, 2f * (Win - 1)); iy = GridSampleReflect(iy, 0f, 2f * (Hin - 1)); }
+            else { ix = GridSampleReflect(ix, -1f, 2f * Win - 1f); iy = GridSampleReflect(iy, -1f, 2f * Hin - 1f); }
+        }
+        if (paddingMode != 0)
+        {
+            ix = MathF.Min(MathF.Max(ix, 0f), Win - 1);
+            iy = MathF.Min(MathF.Max(iy, 0f), Hin - 1);
         }
         // Bilinear interpolation
         int x0 = (int)MathF.Floor(ix); int y0 = (int)MathF.Floor(iy);

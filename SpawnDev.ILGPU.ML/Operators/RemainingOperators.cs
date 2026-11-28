@@ -293,16 +293,18 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
         int N = xShape[0], C = xShape[1], Hin = xShape[2], Win = xShape[3];
         int Hout = gridShape[1], Wout = gridShape[2];
         int alignCorners = ctx.GetInt("align_corners", 0);
-        // The kernel is bilinear with zero padding (D-FINE / RT-DETR deformable attention). Other modes used to run as that in silence.
+        // Bilinear, padding zeros / border / reflection. Border and reflection used to run as zeros in silence (5.3.x), then threw (Bones, 2026-11-27:
+        // RaCo-ALIKED keypoint sampling in SpawnScene uses border; 50 of 59 photos were left unplaced). Nearest and cubic are not implemented.
         var mode = ctx.GetString("mode", "linear");
         var padding = ctx.GetString("padding_mode", "zeros");
-        if (mode is not ("linear" or "bilinear") || padding != "zeros" || xShape.Length != 4)
+        int paddingMode = padding switch { "zeros" => 0, "border" => 1, "reflection" => 2, _ => -1 };
+        if (mode is not ("linear" or "bilinear") || paddingMode < 0 || xShape.Length != 4)
             throw new NotSupportedException($"GridSample: mode '{mode}', padding_mode '{padding}' on rank {xShape.Length} is not implemented "
-                + "(bilinear, zeros, 4-D only).");
+                + "(bilinear with zeros, border or reflection padding, 4-D only).");
         int totalOutput = N * C * Hout * Wout;
 
         // GPU path: bilinear interpolation, one thread per output element
-        var paramsData = new float[] { N, C, Hin, Win, Hout, Wout, alignCorners };
+        var paramsData = new float[] { N, C, Hin, Win, Hout, Wout, alignCorners, paddingMode };
         var paramsBuf = reg.ParamsView(paramsData);
         reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf, totalOutput);
     }

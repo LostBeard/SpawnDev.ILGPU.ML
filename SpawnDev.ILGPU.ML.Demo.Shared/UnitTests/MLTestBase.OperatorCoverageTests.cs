@@ -1747,6 +1747,57 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View, input, 1e-4f, "GridSample identity: ");
     });
 
+    /// <summary>
+    /// GridSample bilinear with padding_mode zeros / border / reflection x align_corners 0 / 1 against onnxruntime (tools/gen_gridsample_ref.py builds the
+    /// same closed-form input [1,2,5,7] and grid [1,4,6,2] reaching +-1.6, so samples fall outside the image and the padding decides the value).
+    /// Border and reflection ran as zeros in silence in 5.3.x and threw since; SpawnScene's RaCo-ALIKED keypoint sampling uses border (Bones, 2026-11-27).
+    /// </summary>
+    [TestMethod]
+    public async Task Op_GridSample_PaddingModes_MatchOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        const int N = 1, C = 2, H = 5, W = 7, HO = 4, WO = 6;
+        var input = new float[N * C * H * W];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(Math.Sin(i * 0.37) + i * 0.01);
+        var grid = new float[N * HO * WO * 2];
+        for (int i = 0; i < grid.Length; i++) grid[i] = (float)(1.6 * Math.Sin(i * 0.53 + 0.2));
+        // onnxruntime 1.24.3, onnx 1.20.1 (tools/gen_gridsample_ref.py)
+        var expected = new Dictionary<string, float[]>
+        {
+            ["zeros/0"] = new float[] { -0.1022672f, 0f, 0f, 0.1298732f, 0f, 0.02903592f, -0.01916103f, 0f, -0.01315457f, 0.003437582f, 0f, 0.07029565f, 0f, 0f, 0.1850397f, 0f, 0f, -0.1526819f, 0f, 0f, 0.6726499f, 0f, 0f, -0.6192682f, 0.1250104f, 0f, 0f, 0.2636804f, 0f, 0.02876952f, 0.05939322f, 0f, 0.01305409f, 0.008311021f, 0f, 0.1320783f, 0f, 0f, 0.3136449f, 0f, 0f, 0.09248767f, 0f, 0f, 0.9863931f, 0f, 0f, -0.08444044f },
+            ["zeros/1"] = new float[] { -0.3075055f, 0f, -0.07588089f, 0.5053473f, 0f, 0.2004692f, -0.167322f, 0f, 0.1255822f, 0.3253005f, 0f, 0.003070861f, -0.06774748f, 0f, 0.4987687f, 0.1913949f, 0f, -0.3150949f, -0.006719999f, 0f, 0.7930253f, 0.09551682f, 0f, -0.5624383f, 0.276019f, 0f, -0.02591556f, 0.9632919f, 0f, 0.2681278f, 0.3104252f, 0f, 0.2692168f, 0.7033972f, 0f, 0.2260099f, 0.3058417f, 0f, 0.7831398f, 0.4870645f, 0f, 0.0903974f, 0.2675889f, 0f, 1.196554f, 0.3062586f, 0f, 0.01879591f },
+            ["border/0"] = new float[] { -0.3075505f, 0.353629f, -0.1727731f, 0.5902358f, 0f, 0.5928825f, -0.1716162f, 0.353629f, -0.06439726f, 0.4567511f, 0f, 0.192502f, -0.03861752f, 0.353629f, 0.3481947f, 0.3197379f, 0f, -0.2172484f, 0.1065606f, 0.353629f, 0.7652131f, 0.1745006f, 0f, -0.6192682f, 0.3759469f, 1.076892f, -0.0024129f, 1.198351f, 0.7242885f, 0.5874428f, 0.5319568f, 1.076892f, 0.06390536f, 1.104285f, 0.7242885f, 0.3616914f, 0.6845974f, 1.076892f, 0.5901949f, 0.9996176f, 0.7242885f, 0.131599f, 0.8317256f, 1.076892f, 1.122131f, 0.8745525f, 0.7242885f, -0.08444044f },
+            ["border/1"] = new float[] { -0.3550801f, 0.353629f, -0.1563622f, 0.6511965f, 0f, 0.3268131f, -0.2427347f, 0.353629f, 0.1682237f, 0.536781f, 0f, 0.003472149f, -0.1287359f, 0.353629f, 0.4987687f, 0.4251975f, 0f, -0.3150949f, -0.01778849f, 0.353629f, 0.7930253f, 0.3088357f, 0f, -0.5624383f, 0.3187222f, 1.076892f, -0.05340232f, 1.241309f, 0.7242885f, 0.4371128f, 0.4503351f, 1.076892f, 0.3606294f, 1.160681f, 0.7242885f, 0.255543f, 0.5811699f, 1.076892f, 0.7831398f, 1.082049f, 0.7242885f, 0.0903974f, 0.7083337f, 1.076892f, 1.196554f, 0.9902296f, 0.7242886f, 0.01879591f },
+            ["reflection/0"] = new float[] { -0.3075505f, 0.154909f, -0.1500546f, 0.5902358f, 0.1697595f, 0.5928825f, -0.1716162f, 0.1581849f, -0.06439726f, 0.4567511f, 0.1830602f, 0.192502f, -0.02696963f, 0.1330271f, 0.3481947f, 0.3173789f, 0.2242301f, -0.2172484f, 0.06427816f, 0.08245487f, 0.7652131f, 0.2700621f, 0.2886061f, -0.6192682f, 0.3759469f, 0.2116596f, 0.01386155f, 1.198351f, 0.2357589f, 0.5874428f, 0.5319568f, 0.2678309f, 0.06390536f, 1.104285f, 0.3078258f, 0.3616914f, 0.6291345f, 0.31249f, 0.5901949f, 0.8646746f, 0.4200823f, 0.131599f, 0.5942515f, 0.3483268f, 1.122131f, 0.7090568f, 0.5682418f, -0.08444044f },
+            ["reflection/1"] = new float[] { -0.2486337f, 0.3213752f, -0.008795843f, 0.4942607f, 0.004105723f, 0.2413899f, -0.07029614f, 0.3267169f, 0.207063f, 0.3557959f, 0.0002920004f, -0.006335318f, 0.0207878f, 0.3194149f, 0.4987687f, 0.3020096f, 0.02863051f, -0.3150949f, 0.03375479f, 0.2734642f, 0.7930253f, 0.3144253f, 0.08909252f, -0.5624383f, 0.3308528f, 0.3823725f, 0.06342162f, 0.9504842f, 0.0579154f, 0.351278f, 0.4004765f, 0.3450296f, 0.3965357f, 0.7270637f, 0.004742648f, 0.2488744f, 0.3884149f, 0.3096611f, 0.7831398f, 0.5829742f, 0.05896944f, 0.0903974f, 0.306286f, 0.3325654f, 1.196554f, 0.5064205f, 0.184772f, 0.01879591f },
+        };
+        using var inBuf = accelerator.Allocate1D(input);
+        using var gridBuf = accelerator.Allocate1D(grid);
+        using var outBuf = accelerator.Allocate1D<float>(N * C * HO * WO);
+        var reg = new OperatorRegistry(accelerator);
+        var report = new List<string>();
+        foreach (var (key, want) in expected)
+        {
+            var parts = key.Split('/');
+            var ctx = new OnnxOpContext
+            {
+                Inputs = new[] { new Tensor(inBuf.View, new[] { N, C, H, W }), new Tensor(gridBuf.View, new[] { N, HO, WO, 2 }) },
+                Outputs = new[] { new Tensor(outBuf.View, new[] { N, C, HO, WO }) },
+                Attributes = new Dictionary<string, object> { ["mode"] = "linear", ["padding_mode"] = parts[0], ["align_corners"] = long.Parse(parts[1]) },
+                Pool = new BufferPool(accelerator),
+                InputNames = new[] { "X", "grid" },
+                ConstantValues = new Dictionary<string, float[]>()
+            };
+            reg.Resolve("GridSample")!.Execute(ctx);
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.View.CopyToHostAsync();
+            float maxErr = 0f; int at = -1;
+            for (int i = 0; i < want.Length; i++) { float e = MathF.Abs(got[i] - want[i]); if (e > maxErr) { maxErr = e; at = i; } }
+            report.Add($"{key} max |diff| {maxErr:E1}");
+            if (!(maxErr <= 1e-5f)) throw new Exception($"GridSample {key}: max |diff| {maxErr} vs onnxruntime at {at} (got {got[at]}, want {want[at]})");
+        }
+        Console.WriteLine("[GridSample] padding modes vs onnxruntime: " + string.Join("; ", report));
+    });
+
     [TestMethod]
     public async Task Op_NMS_BasicSelection() => await RunTest(async accelerator =>
     {
