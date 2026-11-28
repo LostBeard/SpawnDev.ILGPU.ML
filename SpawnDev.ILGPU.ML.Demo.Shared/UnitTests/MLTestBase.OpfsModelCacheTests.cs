@@ -909,6 +909,119 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Reading a big entry end to end the way a model upload does (IJSReadStream, 16 MiB at a time): stored as parts (every download since 5.8.36; the
+    /// cache serves a Blob over the part files) against stored as one file (entries written before 5.8.36; served by OPFSStream). Same 384 MiB
+    /// (3 parts of 128 MiB), three reads each, alternating; both reads must return the same bytes. Lore's SpawnGen visits (2026-11-27) read one-file
+    /// entries only, so the parted path for big models had no measurement. MB/s go to the console.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task Benchmark_OpfsModelCache_PartedVsOneFileRead() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+        const string dirName = "ilgpu-ml-test-partread";
+        const int chunk = 16 << 20, chunks = 24;                       // 384 MiB
+        const long total = (long)chunk * chunks;
+        using var navigator = js.Get<Navigator>("navigator");
+        using var storage = navigator.Storage;
+        using var root = await storage.GetDirectory();
+        try { await root.RemoveEntry(dirName, recursive: true); } catch { }
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = dirName };
+        if (!await cache.IsAvailableAsync()) throw new UnsupportedTestException("OPFS unavailable in this context");
+        try
+        {
+            // the same bytes for both: one 16 MiB pattern repeated (the byte at offset o is (o * 31 + o / 4093) & 255)
+            var pattern = new byte[chunk];
+            for (int i = 0; i < chunk; i++) pattern[i] = (byte)((i * 31 + i / 4093) & 255);
+            using (var src = new RepeatStream(pattern, chunks)) await cache.PutAsync("parted", src);        // parts of PartBytes (128 MiB)
+            using (var dir = await root.GetDirectoryHandle(dirName, create: true))
+            {
+                using (var fh = await dir.GetFileHandle("onefile", create: true))
+                using (var w = await fh.CreateWritable())
+                using (var u = new Uint8Array(pattern))
+                {
+                    for (int c = 0; c < chunks; c++) await w.Write(u);
+                    await w.Close();
+                }
+                var meta = $"v=1\nurl=\ntotal={total}\nreceived={total}\ncomplete=1\netag=\n";
+                using var mh = await dir.GetFileHandle("onefile.meta", create: true);
+                using var mw = await mh.CreateWritable();
+                using var mb = new Uint8Array(System.Text.Encoding.UTF8.GetBytes(meta));
+                await mw.Write(mb); await mw.Close();
+            }
+            async Task<(double Ms, string Type, byte[] Probe)> ReadAll(string key)
+            {
+                Stream s;
+                if (key == "onefile-blob")
+                {
+                    // the one-file entry through the same reader the parts use (a BlobStream over its File): splits "Blob reader" from "several parts"
+                    using var d = await root.GetDirectoryHandle(dirName);
+                    using var h = await d.GetFileHandle("onefile");
+                    s = new SpawnDev.SpawnJS.Toolbox.BlobStream(await h.GetFile());
+                }
+                else s = await cache.OpenCachedAsync(key) ?? throw new Exception($"'{key}' did not open as a complete entry");
+                await using (s.ConfigureAwait(false))
+                {
+                    if (s.Length != total) throw new Exception($"'{key}' is {s.Length} bytes, expected {total}");
+                    var jr = s as SpawnDev.SpawnJS.Toolbox.IJSReadStream ?? throw new Exception($"'{key}' opened as {s.GetType().Name}, not an IJSReadStream");
+                    var probe = new byte[chunks * 8];
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    long read = 0; int c = 0;
+                    while (read < total)
+                    {
+                        using var a = await jr.ReadUint8ArrayAsync(chunk);
+                        long n = a.Length; if (n <= 0) break;
+                        if (c < chunks) { using var sub = a.SubArray(0, 8); var head = sub.ReadBytes(); System.Array.Copy(head, 0, probe, c * 8, Math.Min(8, head.Length)); }
+                        read += n; c++;
+                    }
+                    double ms = sw.Elapsed.TotalMilliseconds;
+                    if (read != total) throw new Exception($"'{key}' read {read} of {total} bytes");
+                    return (ms, s.GetType().Name, probe);
+                }
+            }
+            var parted = new List<double>(); var one = new List<double>(); var oneBlob = new List<double>(); string pType = "", oType = ""; byte[]? pProbe = null, oProbe = null, bProbe = null;
+            for (int round = 0; round < 3; round++)
+            {
+                var p = await ReadAll("parted"); parted.Add(p.Ms); pType = p.Type; pProbe = p.Probe;
+                var o = await ReadAll("onefile"); one.Add(o.Ms); oType = o.Type; oProbe = o.Probe;
+                var b = await ReadAll("onefile-blob"); oneBlob.Add(b.Ms); bProbe = b.Probe;
+            }
+            if (!pProbe!.AsSpan().SequenceEqual(oProbe) || !bProbe!.AsSpan().SequenceEqual(oProbe)) throw new Exception("the three reads returned different bytes");
+            parted.Sort(); one.Sort(); oneBlob.Sort();
+            double mbps(double ms) => total / 1e6 / (ms / 1000);
+            var report = $"384 MiB read in 16 MiB pieces, median of 3: parts ({pType}, 3 x 128 MiB) {parted[1]:F0} ms = {mbps(parted[1]):F0} MB/s; "
+                + $"one file ({oType}) {one[1]:F0} ms = {mbps(one[1]):F0} MB/s; one file through BlobStream {oneBlob[1]:F0} ms = {mbps(oneBlob[1]):F0} MB/s";
+            Console.WriteLine("[OpfsCache] " + report);
+            return report;
+        }
+        finally { try { await root.RemoveEntry(dirName, recursive: true); } catch { } }
+    });
+
+    /// <summary>A read-only stream of <paramref name="block"/> repeated <paramref name="count"/> times (synthetic test content, nothing allocated per read).</summary>
+    private sealed class RepeatStream(byte[] block, int count) : Stream
+    {
+        private long _pos;
+        private readonly long _len = (long)block.Length * count;
+        public override bool CanRead => true; public override bool CanSeek => false; public override bool CanWrite => false;
+        public override long Length => _len;
+        public override long Position { get => _pos; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int n)
+        {
+            int done = 0;
+            while (done < n && _pos < _len)
+            {
+                int at = (int)(_pos % block.Length), take = (int)Math.Min(Math.Min(n - done, block.Length - at), _len - _pos);
+                Buffer.BlockCopy(block, at, buffer, offset + done, take);
+                done += take; _pos += take;
+            }
+            return done;
+        }
+        public override void Flush() { }
+        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
+        public override void SetLength(long v) => throw new NotSupportedException();
+        public override void Write(byte[] b, int o, int n) => throw new NotSupportedException();
+    }
+
+    /// <summary>
     /// What reopening a complete multi-part entry costs: the Wan umT5 encoder opens its 6.4 GB file once per layer (24 layers + the final norm,
     /// UmT5Encoder.LoadLayerAsync), and the file is 48 parts of 128 MiB. Here the 2.1 MB test file is stored as 48 parts and reopened 25 times; each open
     /// reads 8 bytes near the end (the last part) and must match the first open's bytes. The per-open time goes to the console.
