@@ -127,9 +127,16 @@ public abstract partial class MLTestBase
                     worst = Math.Max(worst, double.IsNaN(e) ? double.PositiveInfinity : e);
                     parts.Add($"{mine} {e:E2}" + (nan > 0 ? $" ({nan} NaN)" : ""));
                 }
+                string? dumpDir = row == 0 ? Environment.GetEnvironmentVariable("ANIMA_DUMP_B0") : null;   // tools/anima-ref/bisect_block0.py reads these
                 foreach (var (name, buf) in extra)
                 {
                     var got = await buf.View.CopyToHostAsync();
+                    if (dumpDir != null)
+                    {
+                        Directory.CreateDirectory(dumpDir);
+                        var bytes = new byte[got.Length * 4]; Buffer.BlockCopy(got, 0, bytes, 0, bytes.Length);
+                        File.WriteAllBytes(Path.Combine(dumpDir, $"{name}_f32_{got.Length}.raw"), bytes);
+                    }
                     int nan = got.Count(float.IsNaN), inf = got.Count(float.IsInfinity);
                     double mx = got.Where(float.IsFinite).Select(f => Math.Abs((double)f)).DefaultIfEmpty(0).Max();
                     parts.Add($"{name} nan {nan} inf {inf} max {mx:G3}");
