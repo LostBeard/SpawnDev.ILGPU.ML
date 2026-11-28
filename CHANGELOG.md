@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **GridSample: border and reflection padding** (`GridSampleOperator`, `ElementWiseKernels.GridSample`). 5.3.x ran them as zeros in silence, then they
+  threw; SpawnScene's RaCo-ALIKED keypoint sampling uses border (Bones: 9 of 59 photos placed instead of 57). PyTorch / ONNX / onnxruntime semantics:
+  border clamps the source coordinate, reflection mirrors it (about pixel centres with align_corners, about the outer edges without). Nearest and
+  cubic still throw. `Op_GridSample_PaddingModes_MatchOnnxRuntime`: 6 cases vs onnxruntime 1.24.3, max |diff| <= 4.8e-7 on all 7 lanes.
+- **Dependencies: SpawnJS 3.0.12 and SpawnJS.Blazor 3.0.12** (were pinned at 3.0.8 / 3.0.7, so every ML consumer resolved SpawnJS 3.0.8), **ILGPU
+  5.4.55** (its SpawnJS floor is 3.0.12). No new build warnings in ML.
+- **Built with SDK 10** (`global.json`, 10.0.100 latestFeature): the machine got SDK 11 on 2026-11-27 and the repo had no global.json, so 5.8.36 and
+  5.8.37 were built with SDK 11 (checked: 5.8.37 restores and runs in a net10 app on SDK 10.0.403).
+
 ## 5.8.37 - 2026-11-27 - video pipelines say what they load; cached browser models reopen at half the cost
 
 - **Video pipelines say "loading ..." while a model file downloads** (`Wan22Pipeline`, `LtxPipeline`, `Ltx2Pipeline`). Opening a hub file waits for its whole
