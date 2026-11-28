@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.8.37</Version>
-		<PackageReleaseNotes>v5.8.37 - Video pipelines (Wan, LTX, LTX-2) report "loading the text encoder / transformer / VAE" while a file opens (an open of a hub file waits for its whole download; the /video page said "encoding the prompt" through a 6.4 GB download). Reopening a cached browser model file costs about half (OpfsModelCache: one part listing, parts fetched at once, no sidecar rewrite for a repeat use; a 48-part entry 55 to 29 ms), and the umT5 encoder opens its file 2 times per prompt instead of 26.</PackageReleaseNotes>
+		<Version>5.8.38</Version>
+		<PackageReleaseNotes>v5.8.38 - GridSample border and reflection padding (PyTorch / ONNX semantics; they ran as zeros in 5.3.x, then threw): SpawnScene's RaCo-ALIKED keypoint sampling runs again, matching onnxruntime on CPU and WebGPU. Dependencies: SpawnJS 3.0.12 and SpawnJS.Blazor 3.0.12 (ML had pinned 3.0.8, so consumers never got 3.0.9-3.0.12), SpawnDev.ILGPU 5.4.55. Built with SDK 10 (global.json).</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

@@ -4,6 +4,8 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+## 5.8.38 - 2026-11-27 - GridSample border/reflection padding; SpawnJS 3.0.12, ILGPU 5.4.55
+
 - **GridSample: border and reflection padding** (`GridSampleOperator`, `ElementWiseKernels.GridSample`). 5.3.x ran them as zeros in silence, then they
   threw; SpawnScene's RaCo-ALIKED keypoint sampling uses border (Bones: 9 of 59 photos placed instead of 57). PyTorch / ONNX / onnxruntime semantics:
   border clamps the source coordinate, reflection mirrors it (about pixel centres with align_corners, about the outer edges without). Nearest and
