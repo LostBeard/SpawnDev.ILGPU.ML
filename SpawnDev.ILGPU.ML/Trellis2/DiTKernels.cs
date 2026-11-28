@@ -71,6 +71,18 @@ public sealed class DiTKernels
             _gemv(new KernelConfig(M * ((N + GemvCols - 1) / GemvCols), GemvThreads), x, w, b, o, K, N, bias.HasValue ? 1 : 0, (int)act);
             return;
         }
+        if (UseMma(M, K, N) && !PreciseActivations && EnableMmaV6)
+        {
+            // the fast path: activations packed to bf16 once (cvt-rn rounding, as KernelBf16Dense staged them), then the cp.async / ldmatrix V6 pipeline
+            long words = (long)M * K / 2;
+            EnsurePackA(words);
+            _packBf16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV>(PackBf16Impl);
+            _packBf16((int)words, x.SubView(0, (long)M * K), _packA!.View.SubView(0, words));
+            _mmaV6Epi ??= _acc.LoadStreamKernel<ArrayView1D<U4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, int, int, int, int, int, int>(MmaGemm.KernelBf16PackedV6Epi);
+            int tilesV6 = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
+            _mmaV6Epi(new KernelConfig(tilesV6, MmaGemm.V5Threads), _packA.View.SubView(0, words).Cast<uint, U4>(), w.Cast<BFloat16, U4>(), b, o, o, M, K, N, bias.HasValue ? 1 : 0, (int)act, 0);
+            return;
+        }
         if (UseMma(M, K, N) && PreciseActivations && F16SplitActivations)
         {
             PrepareGemmScales(x, w, M, K, N);
@@ -100,6 +112,31 @@ public sealed class DiTKernels
         }
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
+    }
+
+    /// <summary>
+    /// The fast tensor-core path (bf16 activations) packs the activations once and runs MmaGemm.KernelBf16PackedV6Epi (cp.async, ldmatrix, three stages)
+    /// instead of KernelBf16Dense (register-staged). MEASURED 2026-11-28 RTX 4070: V6 46.3 TFLOPS where the dense kernel is 29.3 (M 1600, 4096 -> 4096);
+    /// cuBLAS bf16 50-54 on the DiT shapes. Env ML_MMA_V6=0 = the dense kernel (A/B).
+    /// </summary>
+    public static bool EnableMmaV6 { get; set; } = Environment.GetEnvironmentVariable("ML_MMA_V6") != "0";
+    private Action<KernelConfig, ArrayView1D<U4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, int, int, int, int, int, int>? _mmaV6Epi;
+    private Action<Index1D, FV, UV>? _packBf16;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _packA;
+    private readonly List<MemoryBuffer1D<uint, Stride1D.Dense>> _retiredPackA = new();   // outgrown packs: queued launches may still read them
+    // o[i] = bf16(x[2i]) | bf16(x[2i + 1]) << 16, round to nearest even (cvt.rn.bf16x2's rounding for finite values)
+    private static void PackBf16Impl(Index1D i, FV x, UV o)
+    {
+        uint a = (uint)Interop.FloatAsInt(x[2L * i]), b = (uint)Interop.FloatAsInt(x[2L * i + 1]);
+        a = (a + 0x7FFFu + ((a >> 16) & 1u)) >> 16;
+        b = (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;
+        o[i] = a | (b << 16);
+    }
+    private void EnsurePackA(long words)
+    {
+        if (_packA != null && _packA.Length >= words) return;
+        if (_packA != null) _retiredPackA.Add(_packA);
+        _packA = _acc.Allocate1D<uint>(Math.Max(words, (_packA?.Length ?? 0) * 3 / 2));
     }
 
     // ---------------------------------------------------------------------------------------------------

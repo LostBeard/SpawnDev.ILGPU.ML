@@ -1379,7 +1379,7 @@ kernel_packed_v7r(swiglu=True)
 
 
 
-def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, small=False):
+def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, small=False, epi=False):
     """Kernel{Bf16|F16}PackedV6{Acc} (2026-11-05): V5 (4 warps of 64 x 64, cp.async, ldmatrix, column-major block order) with THREE stages:
     two K tiles in flight while one computes. Rows are 64 bytes with no padding and the 16-byte chunks XOR-swizzled (chunk c of row r at
     c ^ ((r >> 1) & 3)), so the 8 row addresses of every ldmatrix 8 x 8 read land in 8 distinct bank groups and 3 stages fit the 48 KB of
@@ -1396,9 +1396,18 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, 
     if small:
         MT5, NT5 = 2, 4
     BMx, WMr, WNc = ("BMS", 32, 32) if small else ("BM", 64, 64)
-    name = f"Kernel{dtype}PackedV6{'M32' if small else ''}{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}{'SplitK' if splitk else ''}"
-    w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
-    if swiglu:
+    name = f"Kernel{dtype}PackedV6{'M32' if small else ''}{'Acc' if acc else ''}{'Split' if split else ''}{'SwiGLU' if swiglu else ''}{'SplitK' if splitk else ''}{'Epi' if epi else ''}"
+    if epi:
+        # 2026-11-28: DiTKernels.Linear's fast tensor-core path (bf16 activations): the fp32 activations are packed to bf16 once (cvt.rn, the rounding
+        # KernelBf16Dense applies while staging), then this kernel. MEASURED (Bench_TrainingGemm_TensorCores, RTX 4070, M 1600, 4096 -> 4096): V6 46.3
+        # TFLOPS where KernelBf16Dense (register-staged, no cp.async / ldmatrix) is 29.3; cuBLAS bf16 50-54 on the DiT shapes (Plans/gemm-accumulation-precision).
+        w("    /// <summary>16-bit A and W with nn.Linear's epilogue: C = act(A W^T + bias) (+ res when hasRes): V6's pipeline. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
+        w(f"    public static unsafe void {name}(U4V Au, U4V Wu, BV bias, FV C, FV res, int M, int K, int N, int hasBias, int act, int hasRes)")
+    else:
+        w(f"    /// <summary>16-bit A and W: C = A W^T * sc[1]{' + D' if acc else ''}; V5 with three cp.async stages and swizzled rows. grid = ceil(M/128) * ceil(N/128), group = 128 (V5Threads). sm_80+.</summary>")
+    if epi:
+        pass
+    elif swiglu:
         w("    /// <summary>The gate | up GEMM with SwiGLU in the epilogue: W rows are gate and up interleaved in 8-row blocks (n-tile 2j = gate, 2j + 1 = up of")
         w("    /// the same 8 columns), N = 2 Nff; writes f16 words S [M, Nff / 2] = cvt.rn(silu(g) u), the expression ActivationKernels.SwiGLUImpl computes")
         w("    /// and the rounding FusedDequantMatMul.PackA16Impl applies: the down projection's packed input, bit-identical to the separate passes.</summary>")
@@ -1428,7 +1437,8 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, 
     w("        int warp = tid >> 5, lane = tid & 31;")
     w("        int g = lane >> 2, t = lane & 3;")
     w("        int wm = 0, wn = warp;" if small else "        int wm = warp >> 1, wn = warp & 1;")
-    w("        float inv = sc[1];")
+    if not epi:
+        w("        float inv = sc[1];")
     w(f"        var aS = SharedMemory.Allocate<uint>({ST} * {BMx} * {RW});")
     w(f"        var bS = SharedMemory.Allocate<uint>({ST} * BN * {RW});")
     for mt in range(MT5):
@@ -1516,7 +1526,16 @@ def kernel_packed_v6(dtype, acc=False, split=False, swiglu=False, splitk=False, 
             w("        {")
             w(f"            int m0 = tileRow * {BMx} + wm * {WMr} + {mt * 16} + g, m1 = m0 + 8;")
             w(f"            int n0 = tileCol * BN + wn * {WNc} + {nt * 8} + 2 * t, n1 = n0 + 1;")
-            if split:
+            if epi:
+                w("            float bias0 = 0f, bias1 = 0f;")
+                w("            if (hasBias != 0) { if (n0 < N) bias0 = PrecisionConvert.ConvertToSingle(bias[n0]); if (n1 < N) bias1 = PrecisionConvert.ConvertToSingle(bias[n1]); }")
+                for (mrow, ci0, ci1) in (("m0", 0, 1), ("m1", 2, 3)):
+                    w(f"            if ({mrow} < M)")
+                    w("            {")
+                    for (ncol, ci, b) in (("n0", ci0, "bias0"), ("n1", ci1, "bias1")):
+                        w(f"                if ({ncol} < N) {{ float v = Activate(c{mt}{nt}{ci} + {b}, act); if (hasRes != 0) v += res[(long){mrow} * N + {ncol}]; C[(long){mrow} * N + {ncol}] = v; }}")
+                    w("            }")
+            elif split:
                 w("            if (n0 < N)")
                 w("            {")
                 w("                int seg = n0 < N0 ? 0 : (n0 < N0 + N1 ? 1 : 2);")
@@ -1546,6 +1565,7 @@ kernel_packed_v6("F16", split=True)
 kernel_packed_v6("F16", swiglu=True)
 kernel_packed_v6("F16", splitk=True)
 kernel_packed_v6("F16", splitk=True, small=True)
+kernel_packed_v6("Bf16", epi=True)
 w("    // silu(g) u for two columns, rounded to f16 and packed (low half = the first): ActivationKernels.SwiGLUImpl's expression, PackA16Impl's rounding")
 w("    private static uint SwiPack(float g0, float u0, float g1, float u1)")
 w("    {")

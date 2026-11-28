@@ -88,18 +88,22 @@ public abstract partial class MLTestBase
         var kinds = new List<(string Name, DiTKernels K)>();
         if (accelerator.AcceleratorType == AcceleratorType.Cuda)
         {
-            kinds.Add(("tensor cores fast (bf16 act)", new DiTKernels(accelerator) { PreciseActivations = false }));
+            kinds.Add(("tensor cores fast (bf16 act, V6)", new DiTKernels(accelerator) { PreciseActivations = false }));
             kinds.Add(("tensor cores precise (fp16 hi+lo, scaled)", new DiTKernels(accelerator) { PreciseActivations = true }));
         }
         else kinds.Add(("tiled fp32", new DiTKernels(accelerator)));
         var lines = new List<string>();
-        bool mmaWas = DiTKernels.EnableTensorCores, splitWas = DiTKernels.F16SplitActivations;
+        bool mmaWas = DiTKernels.EnableTensorCores, splitWas = DiTKernels.F16SplitActivations, v6Was = DiTKernels.EnableMmaV6;
         try
         {
             for (int pass = 0; pass < (accelerator.AcceleratorType == AcceleratorType.Cuda ? 3 : 1); pass++)
             {
-                if (pass == 1) { DiTKernels.F16SplitActivations = false; kinds = new() { ("tensor cores precise (bf16 hi+lo, before)", new DiTKernels(accelerator) { PreciseActivations = true }) }; }
-                if (pass == 2) { DiTKernels.F16SplitActivations = splitWas; DiTKernels.EnableTensorCores = false; kinds = new() { ("tiled fp32 (tensor cores off)", new DiTKernels(accelerator)) }; }
+                if (pass == 1)
+                {
+                    DiTKernels.F16SplitActivations = false; DiTKernels.EnableMmaV6 = false;
+                    kinds = new() { ("tensor cores fast (bf16 act, dense kernel, before)", new DiTKernels(accelerator) { PreciseActivations = false }), ("tensor cores precise (bf16 hi+lo, before)", new DiTKernels(accelerator) { PreciseActivations = true }) };
+                }
+                if (pass == 2) { DiTKernels.F16SplitActivations = splitWas; DiTKernels.EnableMmaV6 = v6Was; DiTKernels.EnableTensorCores = false; kinds = new() { ("tiled fp32 (tensor cores off)", new DiTKernels(accelerator)) }; }
                 foreach (var (name, k) in kinds)
                 {
                     k.Linear(xA.View, wA.View, null, oA.View, Ma, Ka, Na);
@@ -126,7 +130,24 @@ public abstract partial class MLTestBase
                 }
             }
         }
-        finally { DiTKernels.EnableTensorCores = mmaWas; DiTKernels.F16SplitActivations = splitWas; }
+        finally { DiTKernels.EnableTensorCores = mmaWas; DiTKernels.F16SplitActivations = splitWas; DiTKernels.EnableMmaV6 = v6Was; }
+        // the V6 fast path against the dense kernel on the same bf16-rounded operands (same MMA order: expected bit-identical), with a bias and GELU
+        if (accelerator.AcceleratorType == AcceleratorType.Cuda)
+        {
+            var kf = new DiTKernels(accelerator) { PreciseActivations = false };
+            using var bb = accelerator.Allocate1D(Enumerable.Range(0, Na).Select(i => (BFloat16)(float)(i % 7 * 0.01)).ToArray());
+            using var o2 = accelerator.Allocate1D<float>(Ma * Na);
+            DiTKernels.EnableMmaV6 = true;
+            kf.Linear(xA.View, wA.View, bb.View, oA.View, Ma, Ka, Na, DiTKernels.Act.GeluErf);
+            DiTKernels.EnableMmaV6 = false;
+            kf.Linear(xA.View, wA.View, bb.View, o2.View, Ma, Ka, Na, DiTKernels.Act.GeluErf);
+            DiTKernels.EnableMmaV6 = v6Was;
+            await accelerator.SynchronizeAsync();
+            var v6o = await oA.View.CopyToHostAsync(); var dense = await o2.View.CopyToHostAsync();
+            int diff = 0; double maxd = 0;
+            for (int i = 0; i < v6o.Length; i++) if (v6o[i] != dense[i]) { diff++; maxd = Math.Max(maxd, Math.Abs(v6o[i] - dense[i])); }
+            lines.Add($"V6 vs dense kernel (bias + GELU): {diff} of {v6o.Length} values differ, max {maxd:E1}");
+        }
         // M = 1 (Anima's adaLN modulations and timestep MLP): the GEMV against the general path, accuracy (float64) and time
         {
             var k1 = new DiTKernels(accelerator) { PreciseActivations = true };
