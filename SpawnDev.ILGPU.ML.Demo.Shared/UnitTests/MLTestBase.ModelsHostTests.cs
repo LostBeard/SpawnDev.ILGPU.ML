@@ -317,6 +317,43 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>Turns <see cref="ModelsHost.UseMirrorIndex"/> off for a block (the fallback tests exercise the path the index avoids).</summary>
+    /// <summary>
+    /// A failed read of the mirror index is read again after <c>ModelsHost.MirrorIndexRetryAfter</c>, not kept for the life of the process (2026-11-27: one
+    /// 20 s timeout in the 5.8.38 sweep left that process sending an unmirrored file to the models host, and ModelsHost_TheHuggingFaceTokenNeverReachesTheModelsHost
+    /// failed on it). Offline: the models host is the discard port (connection refused at once, so every read fails).
+    /// </summary>
+    [TestMethod(Timeout = 30000)]
+    public async Task ModelsHost_AFailedMirrorIndexReadIsRetried() => await RunTest(async accelerator =>
+    {
+        var savedBase = ModelsHost.BaseUrl; var savedRetry = ModelsHost.MirrorIndexRetryAfter; var savedUse = ModelsHost.UseMirrorIndex;
+        try
+        {
+            ModelsHost.UseMirrorIndex = true;
+            ModelsHost.BaseUrl = "http://127.0.0.1:9";
+            ModelsHost.ResetMirrorIndex();
+            var url = HuggingFaceClient.GetDownloadUrl(UnmirroredRepo, UnmirroredFile);
+            int start = ModelsHost.MirrorIndexLoadAttempts;
+
+            ModelsHost.MirrorIndexRetryAfter = TimeSpan.FromHours(1);          // inside the window: the failure stands, no new read
+            Ur_Expect(await ModelsHost.PreferredUrlAsync(url) == url, "with no index the models host is asked first");
+            await ModelsHost.PreferredUrlAsync(url);
+            int inWindow = ModelsHost.MirrorIndexLoadAttempts - start;
+            Ur_Expect(inWindow == 1, $"inside the retry window the failed index is read once, not per request ({inWindow} reads)");
+
+            ModelsHost.MirrorIndexRetryAfter = TimeSpan.Zero;                   // the window has passed: the next request reads the index again
+            await ModelsHost.PreferredUrlAsync(url);
+            await ModelsHost.PreferredUrlAsync(url);
+            int after = ModelsHost.MirrorIndexLoadAttempts - start;
+            Ur_Expect(after == 3, $"after the window every request reads the failed index again until it is read ({after} reads, expected 3)");
+            Console.WriteLine($"[ModelsHost] failed mirror index: {inWindow} read inside the window, {after} after it");
+        }
+        finally
+        {
+            ModelsHost.BaseUrl = savedBase; ModelsHost.MirrorIndexRetryAfter = savedRetry; ModelsHost.UseMirrorIndex = savedUse;
+            ModelsHost.ResetMirrorIndex();
+        }
+    });
+
     private sealed class MirrorIndexOff : IDisposable
     {
         private readonly bool _was = ModelsHost.UseMirrorIndex;

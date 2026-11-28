@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **The models-host mirror index is read again after a failed read** (`ModelsHost`): a read that failed (the 20 s timeout, no network) was kept for the
+  life of the process, so every file was then tried on the models host first: in a browser tab a 404 and a wasted round trip per unmirrored file until the
+  page reloaded. Found in the 5.8.38 sweep (one process hit the timeout; `ModelsHost_TheHuggingFaceTokenNeverReachesTheModelsHost` failed on it, 4/4 alone).
+  A failed read now stands for `MirrorIndexRetryAfter` (30 s), then the next request reads the index again; a good read is kept as before.
+  `ModelsHost_AFailedMirrorIndexReadIsRetried` (offline, the discard port), all 7 lanes; red-checked with the retry disabled (1 read instead of 3).
+
 ## 5.8.38 - 2026-11-27 - GridSample border/reflection padding; SpawnJS 3.0.12, ILGPU 5.4.55
 
 - **GridSample: border and reflection padding** (`GridSampleOperator`, `ElementWiseKernels.GridSample`). 5.3.x ran them as zeros in silence, then they

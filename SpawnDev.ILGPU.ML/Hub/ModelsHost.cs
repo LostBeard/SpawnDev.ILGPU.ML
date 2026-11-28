@@ -168,13 +168,30 @@ public static class ModelsHost
     private static readonly object IndexLock = new();
     private static Task<Dictionary<string, HashSet<string>>?>? _index;
     private static string? _indexBase;
+    private static DateTime _indexStartedUtc;
+
+    /// <summary>
+    /// How long a failed read of the index stands before the next request reads it again. A read that failed used to stand for the life of the process
+    /// (2026-11-27: one 20 s timeout in a sweep left that process sending every unmirrored file to the models host first; in a browser tab that is a
+    /// 404 and a wasted round trip per file until the page reloads). A read that succeeded is kept as before (<see cref="ResetMirrorIndex"/>).
+    /// </summary>
+    internal static TimeSpan MirrorIndexRetryAfter { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>How many times the index was requested from the host in this process (tests).</summary>
+    internal static int MirrorIndexLoadAttempts;
 
     private static Task<Dictionary<string, HashSet<string>>?> MirrorIndexAsync()
     {
         lock (IndexLock)
         {
             var b = BaseUrl.TrimEnd('/');
-            if (_index == null || _indexBase != b) { _indexBase = b; _index = LoadIndexAsync(b); }
+            bool failed = _index is { IsCompleted: true } t && (!t.IsCompletedSuccessfully || t.Result == null);
+            if (_index == null || _indexBase != b || (failed && DateTime.UtcNow - _indexStartedUtc >= MirrorIndexRetryAfter))
+            {
+                _indexBase = b; _indexStartedUtc = DateTime.UtcNow;
+                Interlocked.Increment(ref MirrorIndexLoadAttempts);
+                _index = LoadIndexAsync(b);
+            }
             return _index;
         }
     }
