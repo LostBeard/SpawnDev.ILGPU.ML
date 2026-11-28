@@ -20,6 +20,10 @@ import sys
 BM = BN = 128
 BK = 8
 KU = int(os.environ.get("GEMM_KU", "1"))   # inner k steps emitted per loop iteration (1 = the plain 8-trip loop, 8 = fully unrolled)
+# Two-level accumulation (Plans/gemm-accumulation-precision-2026-11-28.md): each k step's products into fresh partials, added into the running sums
+# after it. The order alone costs 5x in fp32 accuracy at K = 1024 (sequential 4.9e-7, blocks of 8 1.8e-7); 64 more registers per thread. A/B switch.
+TWO_LEVEL = os.environ.get("GEMM_TWO_LEVEL", "0") == "1"
+FOLD = int(os.environ.get("GEMM_FOLD", "1"))   # k steps per partial (1 = blocks of 8 products, 4 = blocks of 32); the fold is a uniform branch
 TH = 256
 LD = 132          # shared row stride (floats): 132 % 32 = 4 -> the transposed stores are conflict free
 
@@ -66,6 +70,9 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
         w(f"        int bOff{r} = ((bN{r} * K) >> 1) + bW{r};")
     for i in range(8):
         w("        float " + ", ".join(f"c{i}{j} = 0f" for j in range(8)) + ";")
+    if TWO_LEVEL and FOLD > 1:
+        for i in range(8):
+            w("        float " + ", ".join(f"p{i}{j} = 0f" for j in range(8)) + ";")
     # The k loop is emitted once per variant actually used (bf16 dense, f16 dense, f16 gathered), each free of mode branches; the epilogue
     # is shared. MEASURED on WebGPU: mode branches inside one shared loop cost ~7% of GEMM throughput.
     def kloop(f16v, gatherv, indent):
@@ -141,6 +148,10 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
         # reconciled. This kernel holds three k-loops (gather / f16 / bf16) in one shader, so unrolling triples the unrolled code.)
         ku = min(KU, BK)
         body_indent = sp + "    "
+        acc = "p" if TWO_LEVEL else "c"
+        if TWO_LEVEL and FOLD == 1:
+            for i in range(8):
+                w(f"{sp}    float " + ", ".join(f"p{i}{j} = 0f" for j in range(8)) + ";")
         if ku < BK:
             w(f"{sp}    for (int kk = 0; kk < {BK}; kk{'++' if ku == 1 else f' += {ku}'})")
             w(f"{sp}    {{")
@@ -158,10 +169,20 @@ def kernel(name, BK, variants=((True, True), (True, False), (False, False)), sum
                 w(f"{ind}float b{j} = Bs[bb + {s * LD + 16 * j}];")
             for i in range(8):
                 # explicit multiply-add: as fast on a context built without EnableFloatingPointContraction (SpawnDev.ILGPU 5.4.18 strict default)
-                w(f"{ind}" + " ".join(f"c{i}{j} = float.MultiplyAddEstimate(a{i}, b{j}, c{i}{j});" for j in range(8)))
+                w(f"{ind}" + " ".join(f"{acc}{i}{j} = float.MultiplyAddEstimate(a{i}, b{j}, {acc}{i}{j});" for j in range(8)))
             if ku > 1:
                 w(f"{body_indent}}}")
         if ku < BK:
+            w(f"{sp}    }}")
+        if TWO_LEVEL and FOLD == 1:
+            for i in range(8):
+                w(f"{sp}    " + " ".join(f"c{i}{j} += p{i}{j};" for j in range(8)))
+        elif TWO_LEVEL:
+            # fold every FOLD k steps (and after the last): k0 is uniform across the group, so the branch does not diverge
+            w(f"{sp}    if (((k0 / {BK}) % {FOLD}) == {FOLD - 1} || kn >= K)")
+            w(f"{sp}    {{")
+            for i in range(8):
+                w(f"{sp}        " + " ".join(f"c{i}{j} += p{i}{j}; p{i}{j} = 0f;" for j in range(8)))
             w(f"{sp}    }}")
         w(f"{sp}    Group.Barrier();")
         w(f"{sp}}}")
