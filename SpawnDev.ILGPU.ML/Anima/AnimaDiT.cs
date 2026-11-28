@@ -178,7 +178,7 @@ public sealed class AnimaDiT : IDisposable
                 throw new InvalidDataException($"LoRA {key}: A [{string.Join(", ", l.Weights.Shape(m.A))}], B [{string.Join(", ", l.Weights.Shape(m.B))}] for a [{N}, {K}] Linear");
             var t = _loraT.SubView(0, (long)M * m.Rank);
             var u = _loraU.SubView(0, (long)M * N);
-            l.Mat.Linear(_k, x, m.A, null, t, M, K, m.Rank);
+            if (!_ak.LoraDown(x, l.Weights.BF16(m.A), t, M, K, m.Rank)) l.Mat.Linear(_k, x, m.A, null, t, M, K, m.Rank);
             l.Mat.Linear(_k, t, m.B, null, u, M, m.Rank, N);
             _ak.AxpyInPlace(o, u, l.Strength, M * N);
         }

@@ -231,6 +231,58 @@ public sealed class AnimaKernels
         _axpy(count, x, y, s);
     }
 
+    // t[m, j] = sum_k x[m, k] * a[j, k] for a LoRA's down projection (R = its rank, a few dozen): one 256-thread group per row m. The threads split K;
+    // four outputs at a time are reduced in shared memory. The general GEMM tiles a 32-wide output badly: MEASURED 2026-11-28 RTX 4070, 1024 x 8192 x 32 took
+    // 1.34 ms there, as long as the 1024 x 8192 x 2048 Linear it patches (Benchmark_AnimaLora_LinearShapes).
+    private const int DownGroup = 256;
+    private Action<KernelConfig, FV, BV, FV, int, int>? _loraDown;
+    private static void LoraDownImpl(FV x, BV a, FV t, int K, int R)
+    {
+        int m = Grid.IdxX, tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(4 * DownGroup);
+        long xb = (long)m * K;
+        for (int j0 = 0; j0 < R; j0 += 4)
+        {
+            float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+            long a0 = (long)j0 * K;
+            for (int k = tid; k < K; k += DownGroup)
+            {
+                float v = x[xb + k];
+                s0 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(a[a0 + k]), s0);
+                if (j0 + 1 < R) s1 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(a[a0 + K + k]), s1);
+                if (j0 + 2 < R) s2 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(a[a0 + 2L * K + k]), s2);
+                if (j0 + 3 < R) s3 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(a[a0 + 3L * K + k]), s3);
+            }
+            sh[tid] = s0; sh[DownGroup + tid] = s1; sh[2 * DownGroup + tid] = s2; sh[3 * DownGroup + tid] = s3;
+            Group.Barrier();
+            for (int st = DownGroup / 2; st > 0; st >>= 1)
+            {
+                if (tid < st)
+                {
+                    sh[tid] += sh[tid + st]; sh[DownGroup + tid] += sh[DownGroup + tid + st];
+                    sh[2 * DownGroup + tid] += sh[2 * DownGroup + tid + st]; sh[3 * DownGroup + tid] += sh[3 * DownGroup + tid + st];
+                }
+                Group.Barrier();
+            }
+            if (tid < 4 && j0 + tid < R) t[(long)m * R + j0 + tid] = sh[tid * DownGroup];
+            Group.Barrier();                                  // the next four reuse the shared array
+        }
+    }
+    /// <summary>
+    /// A LoRA's down projection t = x A^T (x [M, K] fp32, A [R, K] bf16, t [M, R]), for the small R of a LoRA. False when this backend cannot run 256-thread
+    /// groups (the caller then uses the general Linear).
+    /// </summary>
+    public bool LoraDown(FV x, BV a, FV t, int M, int K, int R)
+    {
+        if (_acc.MaxNumThreadsPerGroup < DownGroup) return false;
+        _loraDown ??= _acc.LoadStreamKernel<FV, BV, FV, int, int>(LoraDownImpl);
+        _loraDown(new KernelConfig(M, DownGroup), x, a, t, K, R);
+        return true;
+    }
+
+    // (Tried 2026-11-28 and dropped: a thread per output summing all of K from a transposed A [K, R], lanes reading consecutive A^T values: bit-identical to the
+    // Linear, but 0.52 ms against LoraDown's 0.139 on the 4070 (CUDA) at 1024 x 2048 x 32; 0.100 against 0.122 on its OpenCL.)
+
     // x = act(x), IN PLACE, the activation of the fused Linear epilogue (Trellis2.KernelMath.Activate: the same device function)
     private Action<Index1D, FV, int>? _act;
     private static void ActivateImpl(Index1D i, FV x, int act) => x[i] = Trellis2.KernelMath.Activate(x[i], act);
