@@ -31,6 +31,11 @@ On Anima block 0's real cross v projection: cuBLAS fp32 1.3e-7, numpy CPU fp32 2
   kernel, 37.7-38.8 TFLOPS (dense 35.3-36.8). cuBLAS bf16 50-54: still 1.37x. V6 reached 46 TFLOPS at K 4096 (Bench_TrainingGemm_TensorCores); at the
   DiT's K 1536 the per-tile prologue / epilogue and the separate pack pass weigh more. Next: a larger N tile or 4 stages at short K; the pack fused
   into the producer (LayerNormModulate / GELU writing bf16 words); then a split-K or stream-K schedule for the small grids.
+  MEASURED where the 1.37x is (tools/anima-ref/torch_bf16_outdtype.py, cuBLAS bf16 at the DiT shapes, TFLOPS qkv / mlp-up / mlp-down):
+  bf16 out 56.0 / 56.7 / 59.1; fp32 out (torch.mm out_dtype) 54.0 / 56.0 / 57.9: the output width costs cuBLAS 2-4%, so it is NOT our gap.
+  fp32 in through a separate cast 51.9 / 37.0 / 46.0; fp32 in + out with casts 42.7 / 40.3 / 45.5: doing OUR job (fp32 activations in and out) with
+  separate passes, cuBLAS lands near our 37.7-38.8. Targets, in order: (a) the V6 main loop at K 1536 (~40 TFLOPS kernel-only vs cuBLAS 54-58 with
+  fp32 out); (b) the activation pack fused into its producer, so no pass converts A.
 - Still open: gap 3 (TiledGemm for WebGPU / OpenCL: 1.5x slower, 2.6x less accurate than cuBLAS fp32) and the precise kernel's 11%.
 
 ## The three gaps (each must close WITHOUT trading speed for accuracy)
