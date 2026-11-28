@@ -36,16 +36,17 @@ public abstract partial class MLTestBase
         if (accelerator.AcceleratorType == AcceleratorType.Cuda)
         {
             kinds.Add(("tensor cores fast (bf16 act)", new DiTKernels(accelerator) { PreciseActivations = false }));
-            kinds.Add(("tensor cores precise (bf16 hi+lo)", new DiTKernels(accelerator) { PreciseActivations = true }));
+            kinds.Add(("tensor cores precise (fp16 hi+lo, scaled)", new DiTKernels(accelerator) { PreciseActivations = true }));
         }
         else kinds.Add(("tiled fp32", new DiTKernels(accelerator)));
         var lines = new List<string>();
-        bool mmaWas = DiTKernels.EnableTensorCores;
+        bool mmaWas = DiTKernels.EnableTensorCores, splitWas = DiTKernels.F16SplitActivations;
         try
         {
-            for (int pass = 0; pass < (accelerator.AcceleratorType == AcceleratorType.Cuda ? 2 : 1); pass++)
+            for (int pass = 0; pass < (accelerator.AcceleratorType == AcceleratorType.Cuda ? 3 : 1); pass++)
             {
-                if (pass == 1) { DiTKernels.EnableTensorCores = false; kinds = new() { ("tiled fp32 (tensor cores off)", new DiTKernels(accelerator)) }; }
+                if (pass == 1) { DiTKernels.F16SplitActivations = false; kinds = new() { ("tensor cores precise (bf16 hi+lo, before)", new DiTKernels(accelerator) { PreciseActivations = true }) }; }
+                if (pass == 2) { DiTKernels.F16SplitActivations = splitWas; DiTKernels.EnableTensorCores = false; kinds = new() { ("tiled fp32 (tensor cores off)", new DiTKernels(accelerator)) }; }
                 foreach (var (name, k) in kinds)
                 {
                     k.Linear(xA.View, wA.View, null, oA.View, Ma, Ka, Na);
@@ -72,7 +73,7 @@ public abstract partial class MLTestBase
                 }
             }
         }
-        finally { DiTKernels.EnableTensorCores = mmaWas; }
+        finally { DiTKernels.EnableTensorCores = mmaWas; DiTKernels.F16SplitActivations = splitWas; }
         string line = $"{accelerator.AcceleratorType}: " + string.Join(" | ", lines) + " (cuBLAS fp32 16.1-17.1 TFLOPS 3.1e-7; bf16 50-54 TFLOPS 2.6e-3)";
         Console.WriteLine("[Benchmark] GEMM vs cuBLAS: " + line);
         return line;

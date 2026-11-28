@@ -65,6 +65,14 @@ public sealed class DiTKernels
     {
         EnsureDummies();
         var b = bias ?? _dummyB!.View;   // never read when hasBias == 0 (a separate buffer: WebGPU forbids binding w twice)
+        if (UseMma(M, K, N) && PreciseActivations && F16SplitActivations)
+        {
+            PrepareGemmScales(x, w, M, K, N);
+            _mmaLinearF16x2 ??= _acc.LoadStreamKernel<ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, UV, int, int, int, int, int, int>(MmaGemm.KernelF16x2Dense);
+            int tilesF = ((M + MmaGemm.BM - 1) / MmaGemm.BM) * ((N + MmaGemm.BN - 1) / MmaGemm.BN);
+            _mmaLinearF16x2(new KernelConfig(tilesF, MmaGemm.Threads), x.Cast<float, F4>(), w.Cast<BFloat16, U4>(), b, o, o, _gemmScl!.View, M, K, N, bias.HasValue ? 1 : 0, (int)act, 0);
+            return;
+        }
         if (UseMma(M, K, N))
         {
             var kernel = PreciseActivations
@@ -86,6 +94,44 @@ public sealed class DiTKernels
         }
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
+    }
+
+    /// <summary>
+    /// With <see cref="PreciseActivations"/> on the tensor cores: split the activations into fp16 hi + lo at a power-of-two scale (22 bits; MmaGemm.KernelF16x2Dense)
+    /// instead of bf16 hi + lo (16 bits; KernelBf16x2Dense). Same two MMA passes. MEASURED 2026-11-28 RTX 4070 (Benchmark_Gemm_VsCublas): the bf16 split was 2.5e-6
+    /// from float64 at ~20 TFLOPS where cuBLAS fp32 is 3.1e-7 at 17 (Plans/gemm-accumulation-precision-2026-11-28.md). Static: env ML_PRECISE_SPLIT=bf16 turns it off (A/B).
+    /// </summary>
+    public static bool F16SplitActivations { get; set; } = Environment.GetEnvironmentVariable("ML_PRECISE_SPLIT") != "bf16";
+    private Action<KernelConfig, ArrayView1D<F4, Stride1D.Dense>, ArrayView1D<U4, Stride1D.Dense>, BV, FV, FV, UV, int, int, int, int, int, int>? _mmaLinearF16x2;
+    private Action<Index1D, FV, FV, UV, int, int, int, int, int, int>? _gemmMaxAbs;
+    private Action<Index1D, BV, UV, long, int>? _maxAbsBf16;
+    private MemoryBuffer1D<uint, Stride1D.Dense>? _gemmScl;
+
+    // max |w| of a bf16 tensor as fp32 bits into dst[slot] (zero it first): a grid-stride loop, a warp max, one atomic per warp. Launch MmaAttention.MaxAbsThreads.
+    private static void MaxAbsBf16Impl(Index1D i, BV src, UV dst, long n, int slot)
+    {
+        uint m = 0u;
+        for (long x = i.X; x < n; x += MmaAttention.MaxAbsThreads)
+        {
+            uint b = (uint)Interop.FloatAsInt(PrecisionConvert.ConvertToSingle(src[x])) & 0x7FFFFFFFu;
+            m = b > m ? b : m;
+        }
+        for (int d = 1; d < 32; d <<= 1) { uint v = Warp.ShuffleXor(m, d); m = v > m ? v : m; }
+        if (Warp.LaneIdx == 0) Atomic.Max(ref dst[slot], m);
+    }
+
+    // The scales KernelF16x2Dense reads, on the stream: _gemmScl[0] = max|x|, [1] = max|w|, both of THIS call. Not cached per weight buffer: streamed
+    // blocks and dequantised fp8 weights reuse one device buffer for different tensors (2026-11-28: a cache keyed by the buffer gave FLUX.1 and LTX-2 a
+    // stale, smaller max, an fp16 overflow and NaN from the deep blocks on).
+    private void PrepareGemmScales(FV x, BV w, int M, int K, int N)
+    {
+        EnsureDummies();
+        _gemmScl ??= _acc.Allocate1D<uint>(2);
+        _gemmMaxAbs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, UV, int, int, int, int, int, int>(MmaAttention.MaxAbs);
+        _maxAbsBf16 ??= _acc.LoadAutoGroupedStreamKernel<Index1D, BV, UV, long, int>(MaxAbsBf16Impl);
+        _gemmScl.MemSetToZero();
+        _gemmMaxAbs(MmaAttention.MaxAbsThreads, x, _dummyF!.View, _gemmScl.View, 0, M, K, 0, K, 0);
+        _maxAbsBf16(MmaAttention.MaxAbsThreads, w.SubView(0, (long)N * K), _gemmScl.View, (long)N * K, 1);
     }
 
     /// <summary>
