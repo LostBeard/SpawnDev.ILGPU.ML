@@ -1,8 +1,10 @@
-﻿# SpawnDev.ILGPU.ML Changelog
+# SpawnDev.ILGPU.ML Changelog
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
+
+## 5.8.39 - 2026-11-28 - Anima (DiT, LLM adapter, ControlNet-LLLite); exact-attention NaN fix; mirror-index retry
 
 - **Anima** (circlestone-labs; Cosmos-Predict2-2B MiniTrainDIT + its LLM adapter, one file): `Anima.AnimaDiT` (28 blocks, 2048 wide, returns the flow
   velocity) and `Anima.AnimaLlmAdapter` (Qwen3-0.6B final states + T5 ids -> the 1024-wide context rows), on the shared DiT kernels plus `AnimaKernels`
