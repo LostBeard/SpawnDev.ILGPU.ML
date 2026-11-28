@@ -4,6 +4,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Anima LoRA** (`Anima.AnimaLora`, `AnimaDiT.AddLora`; PEFT lora_A / lora_B, e.g. circlestone-labs anima-turbo-lora-v0.2): `strength (x A^T) B^T` added to
+  each patched DiT Linear (before its activation), the bf16 base untouched. ComfyUI keeps the patched weight exact: the same merge re-rounded to bf16 misses its
+  output by 0.21 (float64 reference `tools/anima-ref/anima_lora_ref.py`, `check_lora.py`). Only the DiT blocks are patched (ComfyUI's adapter output is
+  unchanged; this file's adapter lora_B are all zero). Against ComfyUI (SpawnGen's run 10): strength 1.0 2.6e-5 .. 3.2e-5, 0.5 9.8e-6 .. 1.1e-5, CUDA and
+  OpenCL; red checks 0.60 (wrong strength) and 0.73 (no LoRA). Cost: 0.43 against 0.26 s a call at 512 x 512 (CUDA). Test `Anima_Lora_MatchesComfyUi`.
+
 ## 5.8.39 - 2026-11-28 - Anima (DiT, LLM adapter, ControlNet-LLLite); exact-attention NaN fix; mirror-index retry
 
 - **Anima** (circlestone-labs; Cosmos-Predict2-2B MiniTrainDIT + its LLM adapter, one file): `Anima.AnimaDiT` (28 blocks, 2048 wide, returns the flow

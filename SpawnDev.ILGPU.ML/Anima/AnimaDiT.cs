@@ -94,6 +94,7 @@ public sealed class AnimaDiT : IDisposable
     {
         if (h % 2 != 0 || w % 2 != 0) throw new ArgumentException("the latent height and width must be even (1x2x2 patches)");
         FreeWorkspace();
+        _loraT = _loraU = default; _loraTRank = 0;                     // freed with the workspace; the next Forward sizes them for this grid
         _t = frames; _h = h; _wd = w; _n = frames * (h / 2) * (w / 2);
         int N = _n, C = _dim, kvRows = Math.Max(N, ContextRows);
         var table = AnimaKernels.DitRopePhases(frames, h / 2, w / 2);
@@ -132,9 +133,56 @@ public sealed class AnimaDiT : IDisposable
     // m = Linear(Linear(SiLU(emb), name.1 [rank, C]), name.2 [width, rank]) + adaln[0 .. width)
     private void Modulation(string name, int width)
     {
-        _mat.Linear(_k, _eAct, name + ".1.weight", null, _lo, 1, _dim, _rank);
-        _mat.Linear(_k, _lo, name + ".2.weight", null, _mod, 1, _rank, width);
+        Lin(_eAct, name + ".1.weight", _lo, 1, _dim, _rank);
+        Lin(_lo, name + ".2.weight", _mod, 1, _rank, width);
         _k.GateResidual(_mod, _adaln, default, -1, width, width);
+    }
+
+    private readonly List<AnimaLora> _loras = new();
+    private FV _loraT, _loraU;
+    private int _loraTRank;
+
+    /// <summary>The LoRAs applied to every <see cref="Forward"/>, in order.</summary>
+    public IReadOnlyList<AnimaLora> Loras => _loras;
+
+    /// <summary>Apply <paramref name="lora"/> from the next call on (ComfyUI's LoraLoaderModelOnly; its <see cref="AnimaLora.Strength"/> is read at every call). Not owned.</summary>
+    public void AddLora(AnimaLora lora) => _loras.Add(lora);
+
+    /// <summary>Stop applying <paramref name="lora"/> (it stays open; the caller disposes it).</summary>
+    public bool RemoveLora(AnimaLora lora) => _loras.Remove(lora);
+
+    // the LoRA scratch for this grid: t = x A^T [M, rank], u = t B^T [M, N] (M up to max(tokens, 512 context rows), N up to the MLP's width). In the grid's
+    // workspace, so SetGrid frees it with the rest; a larger rank allocates a new t and leaves the old one there (queued work may still read it).
+    private void EnsureLoraScratch()
+    {
+        int rank = _loras.Max(l => l.Rank);
+        long rows = Math.Max(_n, ContextRows);
+        if (_loraU.Length == 0) _loraU = Alloc(rows * Math.Max(_ffn, 3L * _dim));
+        if (rank > _loraTRank) { _loraT = Alloc(rows * rank); _loraTRank = rank; }
+    }
+
+    // o = act(x W^T + sum_l strength_l (x A_l^T) B_l^T): the plain Linear when no LoRA patches this weight
+    private void Lin(FV x, string weight, FV o, int M, int K, int N, DiTKernels.Act act = DiTKernels.Act.None)
+    {
+        string key = _loras.Count == 0 ? "" : weight[Prefix.Length..^".weight".Length];
+        if (_loras.Count == 0 || !_loras.Any(l => l.Strength != 0f && l.TryGet(key, out _)))
+        {
+            _mat.Linear(_k, x, weight, null, o, M, K, N, act);
+            return;
+        }
+        _mat.Linear(_k, x, weight, null, o, M, K, N);
+        foreach (var l in _loras)
+        {
+            if (l.Strength == 0f || !l.TryGet(key, out var m)) continue;
+            if (l.Weights.Shape(m.A)[1] != K || l.Weights.Shape(m.B)[0] != N)
+                throw new InvalidDataException($"LoRA {key}: A [{string.Join(", ", l.Weights.Shape(m.A))}], B [{string.Join(", ", l.Weights.Shape(m.B))}] for a [{N}, {K}] Linear");
+            var t = _loraT.SubView(0, (long)M * m.Rank);
+            var u = _loraU.SubView(0, (long)M * N);
+            l.Mat.Linear(_k, x, m.A, null, t, M, K, m.Rank);
+            l.Mat.Linear(_k, t, m.B, null, u, M, m.Rank, N);
+            _ak.AxpyInPlace(o, u, l.Strength, M * N);
+        }
+        _ak.ActivateInPlace(o, act, M * N);
     }
 
     /// <summary>
@@ -164,6 +212,7 @@ public sealed class AnimaDiT : IDisposable
 
         FV k = _kv.SubView(0, (long)N * C), vv = _kv.SubView((long)N * C, (long)N * C);
         FV kc = _kv.SubView(0, (long)L * C), vc = _kv.SubView((long)L * C, (long)L * C);
+        if (_loras.Count > 0) EnsureLoraScratch();
         var ll = LLLite;
         if (ll != null && ll.Tokens != N) throw new InvalidOperationException($"the LLLite's picture gives {ll.Tokens} tokens, this grid has {N}: SetPictureAsync with 8 x the latent's size");
         for (int b = 0; b < _blocks; b++)
@@ -181,9 +230,9 @@ public sealed class AnimaDiT : IDisposable
                 kIn = ll.Apply(b, AnimaLLLite.Target.K, _hn, N) ?? _hn;
                 vIn = ll.Apply(b, AnimaLLLite.Target.V, _hn, N) ?? _hn;
             }
-            _mat.Linear(_k, qIn, p + "self_attn.q_proj.weight", null, _q, N, C, C);
-            _mat.Linear(_k, kIn, p + "self_attn.k_proj.weight", null, k, N, C, C);
-            _mat.Linear(_k, vIn, p + "self_attn.v_proj.weight", null, vv, N, C, C);
+            Lin(qIn, p + "self_attn.q_proj.weight", _q, N, C, C);
+            Lin(kIn, p + "self_attn.k_proj.weight", k, N, C, C);
+            Lin(vIn, p + "self_attn.v_proj.weight", vv, N, C, C);
             _wk.RowRmsNorm(_q, _w.BF16(p + "self_attn.q_norm.weight"), N * H, D, 0, D, 1e-6f);
             _wk.RowRmsNorm(k, _w.BF16(p + "self_attn.k_norm.weight"), N * H, D, 0, D, 1e-6f);
             _ak.RopeHalf(_q, _phases!.View, N, C, 0, H, D);
@@ -191,30 +240,30 @@ public sealed class AnimaDiT : IDisposable
             if (b == 0) { Tap?.Invoke("b0_mod_sa", _mod, 3 * C); Tap?.Invoke("b0_q", _q, N * C); Tap?.Invoke("b0_k", k, N * C); Tap?.Invoke("b0_v", vv, N * C); }
             _k.Attention(_q, C, 0, _kv, C, 0, N * C, _scores, _attn, N, N, H, D);
             if (b == 0) Tap?.Invoke("b0_attn_sa", _attn, N * C);
-            _mat.Linear(_k, _attn, p + "self_attn.output_proj.weight", null, _proj, N, C, C);
+            Lin(_attn, p + "self_attn.output_proj.weight", _proj, N, C, C);
             _k.GateResidual(_hid, _proj, _mod, 2 * C, N * C, C);
 
             // cross attention over all 512 context rows (zero padding unmasked), no RoPE
             Modulation(p + "adaln_modulation_cross_attn", 3 * C);
             _k.LayerNormModulate(_hid, _hn, _mod, 0, C, N, C, 1e-6f);
-            _mat.Linear(_k, _hn, p + "cross_attn.q_proj.weight", null, _q, N, C, C);
-            _mat.Linear(_k, ctx.View, p + "cross_attn.k_proj.weight", null, kc, L, ContextDim, C);
-            _mat.Linear(_k, ctx.View, p + "cross_attn.v_proj.weight", null, vc, L, ContextDim, C);
+            Lin(_hn, p + "cross_attn.q_proj.weight", _q, N, C, C);
+            Lin(ctx.View, p + "cross_attn.k_proj.weight", kc, L, ContextDim, C);
+            Lin(ctx.View, p + "cross_attn.v_proj.weight", vc, L, ContextDim, C);
             _wk.RowRmsNorm(_q, _w.BF16(p + "cross_attn.q_norm.weight"), N * H, D, 0, D, 1e-6f);
             _wk.RowRmsNorm(kc, _w.BF16(p + "cross_attn.k_norm.weight"), L * H, D, 0, D, 1e-6f);
             if (b == 0) { Tap?.Invoke("b0_after_sa", _hid, N * C); Tap?.Invoke("b0_kc", kc, L * C); Tap?.Invoke("b0_vc", vc, L * C); }
             _k.Attention(_q, C, 0, _kv, C, 0, L * C, _scores, _attn, N, L, H, D);
             if (b == 0) Tap?.Invoke("b0_attn_ca", _attn, N * C);
-            _mat.Linear(_k, _attn, p + "cross_attn.output_proj.weight", null, _proj, N, C, C);
+            Lin(_attn, p + "cross_attn.output_proj.weight", _proj, N, C, C);
             _k.GateResidual(_hid, _proj, _mod, 2 * C, N * C, C);
 
             // MLP, exact GELU
             Modulation(p + "adaln_modulation_mlp", 3 * C);
             _k.LayerNormModulate(_hid, _hn, _mod, 0, C, N, C, 1e-6f);
             FV fc1In = ll?.Apply(b, AnimaLLLite.Target.MlpFc1, _hn, N) ?? _hn;
-            _mat.Linear(_k, fc1In, p + "mlp.layer1.weight", null, _mlp, N, C, _ffn, DiTKernels.Act.GeluErf);
+            Lin(fc1In, p + "mlp.layer1.weight", _mlp, N, C, _ffn, DiTKernels.Act.GeluErf);
             if (b == 0) Tap?.Invoke("b0_mlp_hidden", _mlp, N * _ffn);
-            _mat.Linear(_k, _mlp, p + "mlp.layer2.weight", null, _proj, N, _ffn, C);
+            Lin(_mlp, p + "mlp.layer2.weight", _proj, N, _ffn, C);
             _k.GateResidual(_hid, _proj, _mod, 2 * C, N * C, C);
 
             if (Tap != null && Array.IndexOf(TapBlocks, b) >= 0) Tap($"block_{b}", _hid, N * C);

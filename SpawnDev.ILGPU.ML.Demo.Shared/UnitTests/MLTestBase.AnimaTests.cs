@@ -217,6 +217,60 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="AnimaLora"/> (anima-turbo-lora-v0.2 on anima-base-v1.0) against ComfyUI's LoraLoaderModelOnly (SpawnGen's run 10: strength 1.0 and 0.5 and a
+    /// no-LoRA control, cfg 1, seed 42): the denoised output of the calls with the LoRA at each strength (the same LoRA object, its Strength changed between calls),
+    /// the control without it, and two red checks (the 1.0 call at 0.5; the 1.0 call without the LoRA). ANIMA_BASE / ANIMA_LORA / ANIMA_LORA_RUN override the paths.
+    /// </summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task Anima_Lora_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a 4 GB weight file from disk: a desktop GPU");
+        string basePath = Environment.GetEnvironmentVariable("ANIMA_BASE") ?? "D:/Projects/anima/anima-base-v1.0.safetensors";
+        string loraPath = Environment.GetEnvironmentVariable("ANIMA_LORA") ?? "D:/Projects/anima/anima-turbo-lora-v0.2.safetensors";
+        string run = Environment.GetEnvironmentVariable("ANIMA_LORA_RUN") ?? "D:/users/tj/Projects/_DevComms/anima-run10-turbo-lora-2026-11-28";
+        foreach (var f in new[] { basePath, loraPath }) if (!File.Exists(f)) throw new UnsupportedTestException($"{f} not found");
+        if (!Directory.Exists(run)) throw new UnsupportedTestException($"SpawnGen's run 10 not found in {run}");
+        float[] Raw(string prefix)
+        {
+            var hit = Directory.GetFiles(run, prefix + "_f32_*.raw").Single();
+            var n = Path.GetFileNameWithoutExtension(hit)[(prefix.Length + 5)..].Split('x').Select(long.Parse).Aggregate(1L, (a, b) => a * b);
+            return F2_Raw(hit, n);
+        }
+        using var bw = GpuWeights.LoadFile(accelerator, basePath, n => !n.StartsWith(AnimaLlmAdapter.Prefix, StringComparison.Ordinal));
+        using var lora = new AnimaLora(accelerator, GpuWeights.LoadFile(accelerator, loraPath));
+        Ur_Expect(lora.Modules == 448 && lora.Rank == 32, $"the turbo LoRA should patch 448 DiT Linears at rank 32: {lora.Modules}, rank {lora.Rank}");
+        using var dit = new AnimaDiT(accelerator, new DiTKernels(accelerator) { PreciseActivations = true }, bw);
+        const int per = AnimaKernels.LatentChannels * 64 * 64;
+        dit.SetGrid(1, 64, 64);
+        using var lat = accelerator.Allocate1D<float>(per); using var v = accelerator.Allocate1D<float>(per);
+        var sw = System.Diagnostics.Stopwatch.StartNew(); var times = new List<double>();
+        async Task<double> Call(string tag, int call, float? strength)
+        {
+            var x = Raw($"{tag}_call_{call}_input"); var sig = Raw($"{tag}_call_{call}_timestep"); var ctx = Raw($"{tag}_call_{call}_c_c_crossattn"); var gold = Raw($"{tag}_call_{call}_output");
+            int rows = AnimaDiT.ContextRows;
+            while (rows > 0 && ctx.AsSpan((rows - 1) * AnimaDiT.ContextDim, AnimaDiT.ContextDim).IndexOfAnyExcept(0f) < 0) rows--;
+            dit.SetContext(0, ctx.AsSpan(0, rows * AnimaDiT.ContextDim).ToArray(), rows);
+            lat.View.CopyFromCPU(x);
+            dit.RemoveLora(lora);
+            if (strength is float s) { lora.Strength = s; dit.AddLora(lora); }
+            sw.Restart();
+            dit.Forward(lat.View, sig[0], 0, v.View);
+            var vv = await v.View.CopyToHostAsync();
+            times.Add(sw.Elapsed.TotalSeconds);
+            var den = new float[per];
+            for (int i = 0; i < per; i++) den[i] = x[i] - sig[0] * vv[i];
+            return F2_RelRms(den, gold);
+        }
+        double l100 = await Call("lora100", 0, 1f), l100b = await Call("lora100", 1, 1f), l050 = await Call("lora050", 0, 0.5f), ctrl = await Call("nolora", 0, null);
+        double wrongStrength = await Call("lora100", 0, 0.5f), without = await Call("lora100", 0, null);
+        string line = $"strength 1: call 0 {l100:E2}, call 1 {l100b:E2}; strength 0.5: call 0 {l050:E2}; no LoRA (control) {ctrl:E2}; red checks: the 1.0 call at 0.5 {wrongStrength:E2}, without the LoRA {without:E2}"
+            + $" | calls {string.Join(" / ", times.Select(t => t.ToString("F2")))} s (with, with, with, without, with, without)";
+        Console.WriteLine("[Anima] LoRA vs ComfyUI (denoised): " + line);
+        Ur_Expect(new[] { l100, l100b, l050, ctrl }.Max() < 1e-4 && wrongStrength > 0.1 && without > 0.1, line);   // PRE-REGISTERED 2026-11-28 (as the DiT's): float64 8.2e-6 / 8.6e-6 / 2.2e-6 / 2.4e-6; 0.60 / 0.73
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="AnimaDiT"/> against ComfyUI's first two sampler calls (512 x 512, CFG batch [negative, positive], sigma 0.9999667 then 0.9): every row's
     /// velocity v, compared as ComfyUI records it (the denoised x - sigma * v), from that call's own input latent and c_crossattn.
     /// </summary>

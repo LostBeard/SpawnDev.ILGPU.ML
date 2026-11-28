@@ -47,12 +47,15 @@ def main():
         v = A.dit_forward(x, t, ctx, w, block_hook=hook)
         return A.denoise_flow(x, t, v), out, time.time() - ts
 
-    # the adapter: with the LoRA on its blocks it must CHANGE (so "unchanged in ComfyUI" means ComfyUI does not patch it)
+    # the adapter: ComfyUI's output is the same with and without the LoRA. NOT a test of whether ComfyUI patches it: in anima-turbo-lora-v0.2 every
+    # llm_adapter lora_B is ZERO (printed below), so patching it changes nothing either. The DiT-only rule follows the observation.
     q = d('pos_0', 'cond')
     ids = np.rint(d('pos_0', 't5xxl_ids')).astype(np.int64)[None]
     ad_ref = d('lora100', 'tap_diffusion_model_llm_adapter_0_out0')
+    ad_b = [k for k in lst.header if 'llm_adapter' in k and k.endswith('lora_B.weight')]
+    print(f'adapter lora_B tensors: {len(ad_b)}, largest |value| {max(float(np.abs(lst.get(k)).max()) for k in ad_b):.3g}')
     report('adapter, no LoRA vs lora100 tap', A.adapter_forward(q, ids, base), ad_ref)
-    report('alt: adapter WITH the LoRA on its blocks vs lora100 tap', A.adapter_forward(q, ids, LoraWeights(base, lst, 1.0)), ad_ref, 'should be worse')
+    report('adapter WITH the LoRA on its blocks vs lora100 tap', A.adapter_forward(q, ids, LoraWeights(base, lst, 1.0)), ad_ref, 'info: lora_B all zero')
     report('nolora adapter tap vs lora100 adapter tap', d('nolora', 'tap_diffusion_model_llm_adapter_0_out0'), ad_ref, 'info: Lore 0.0')
     base.drop('net.llm_adapter.')
 

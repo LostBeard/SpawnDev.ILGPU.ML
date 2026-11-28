@@ -221,6 +221,27 @@ public sealed class AnimaKernels
         _addScaled(count, x, y, o, s);
     }
 
+    // x += s * y, IN PLACE on x (y a separate buffer)
+    private Action<Index1D, FV, FV, float>? _axpy;
+    private static void AxpyImpl(Index1D i, FV x, FV y, float s) => x[i] = float.MultiplyAddEstimate(s, y[i], x[i]);
+    /// <summary>x += s * y (a LoRA's update onto its Linear's output).</summary>
+    public void AxpyInPlace(FV x, FV y, float s, int count)
+    {
+        _axpy ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, float>(AxpyImpl);
+        _axpy(count, x, y, s);
+    }
+
+    // x = act(x), IN PLACE, the activation of the fused Linear epilogue (Trellis2.KernelMath.Activate: the same device function)
+    private Action<Index1D, FV, int>? _act;
+    private static void ActivateImpl(Index1D i, FV x, int act) => x[i] = Trellis2.KernelMath.Activate(x[i], act);
+    /// <summary>The DiT kernels' activation (<see cref="Trellis2.DiTKernels.Act"/>) applied in place: for a Linear whose output a LoRA changes before it.</summary>
+    public void ActivateInPlace(FV x, Trellis2.DiTKernels.Act act, int count)
+    {
+        if (act == Trellis2.DiTKernels.Act.None) return;
+        _act ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, int>(ActivateImpl);
+        _act(count, x, (int)act);
+    }
+
     // o = [rgb * 2 - 1 (zeroed where mask >= 0.5 when maskedInput), mask >= 0.5 ? 1 : -1]   (rgb [3, H, W] in [0, 1], mask [H, W])
     private Action<Index1D, FV, FV, FV, int, int>? _inpaintPic;
     private static void InpaintPictureImpl(Index1D i, FV rgb, FV mask, FV o, int HW, int maskedInput)
