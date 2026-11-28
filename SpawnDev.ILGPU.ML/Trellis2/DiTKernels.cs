@@ -65,6 +65,12 @@ public sealed class DiTKernels
     {
         EnsureDummies();
         var b = bias ?? _dummyB!.View;   // never read when hasBias == 0 (a separate buffer: WebGPU forbids binding w twice)
+        if (UseGemv(M))
+        {
+            _gemv ??= _acc.LoadStreamKernel<FV, BV, BV, FV, int, int, int, int>(GemvImpl);
+            _gemv(new KernelConfig(M * ((N + GemvCols - 1) / GemvCols), GemvThreads), x, w, b, o, K, N, bias.HasValue ? 1 : 0, (int)act);
+            return;
+        }
         if (UseMma(M, K, N) && PreciseActivations && F16SplitActivations)
         {
             PrepareGemmScales(x, w, M, K, N);
@@ -95,6 +101,58 @@ public sealed class DiTKernels
         _linear ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int>(LinearImpl);
         _linear(M * N, x, w, b, o, M, K, N, bias.HasValue ? 1 : 0, (int)act);
     }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Small-M Linear (a GEMV per row): one 256-thread group per (row m, block of GemvCols outputs). Each thread sums its slice of K (k = tid, tid + 256, ...)
+    // for the block's outputs, then a shared-memory tree adds the 256 partials. W is read once per row, coalesced; the sum is short runs then a tree
+    // (near-pairwise accuracy) where the tiled GEMM ran one register through all of K. MEASURED reason (Plans/gemm-accumulation-precision-2026-11-28.md):
+    // Anima's M = 1 adaLN modulations carried most of its per-call error (4.8e-6 from float64 on the first one; ComfyUI's fp32 2.6e-7), and the 128-row
+    // tiled GEMM used 1 of its 128 rows there.
+    // ---------------------------------------------------------------------------------------------------
+    private const int GemvThreads = 256, GemvCols = 8;
+    /// <summary>Linears with fewer rows than this run the GEMV (<see cref="EnableGemv"/>).</summary>
+    public const int GemvMaxRows = 4;
+    /// <summary>The small-M GEMV path (env ML_GEMV=0 turns it off for A/B).</summary>
+    public static bool EnableGemv { get; set; } = Environment.GetEnvironmentVariable("ML_GEMV") != "0";
+    private Action<KernelConfig, FV, BV, BV, FV, int, int, int, int>? _gemv;
+    private static void GemvImpl(FV x, BV w, BV bias, FV o, int K, int N, int hasBias, int act)
+    {
+        int nb = (N + GemvCols - 1) / GemvCols;
+        int m = Grid.IdxX / nb, n0 = (Grid.IdxX % nb) * GemvCols, tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvCols * GemvThreads);
+        long xb = (long)m * K;
+        float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f, s4 = 0f, s5 = 0f, s6 = 0f, s7 = 0f;
+        long w0 = (long)n0 * K;
+        int cols = N - n0 < GemvCols ? N - n0 : GemvCols;
+        for (int k = tid; k < K; k += GemvThreads)
+        {
+            float v = x[xb + k];
+            s0 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + k]), s0);
+            if (cols > 1) s1 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + K + k]), s1);
+            if (cols > 2) s2 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 2L * K + k]), s2);
+            if (cols > 3) s3 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 3L * K + k]), s3);
+            if (cols > 4) s4 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 4L * K + k]), s4);
+            if (cols > 5) s5 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 5L * K + k]), s5);
+            if (cols > 6) s6 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 6L * K + k]), s6);
+            if (cols > 7) s7 = float.MultiplyAddEstimate(v, PrecisionConvert.ConvertToSingle(w[w0 + 7L * K + k]), s7);
+        }
+        sh[tid] = s0; sh[GemvThreads + tid] = s1; sh[2 * GemvThreads + tid] = s2; sh[3 * GemvThreads + tid] = s3;
+        sh[4 * GemvThreads + tid] = s4; sh[5 * GemvThreads + tid] = s5; sh[6 * GemvThreads + tid] = s6; sh[7 * GemvThreads + tid] = s7;
+        Group.Barrier();
+        for (int st = GemvThreads / 2; st > 0; st >>= 1)
+        {
+            if (tid < st)
+                for (int j = 0; j < GemvCols; j++) sh[j * GemvThreads + tid] += sh[j * GemvThreads + tid + st];
+            Group.Barrier();
+        }
+        if (tid < cols)
+        {
+            float v = sh[tid * GemvThreads];
+            if (hasBias != 0) v += PrecisionConvert.ConvertToSingle(bias[n0 + tid]);
+            o[(long)m * N + n0 + tid] = KernelMath.Activate(v, act);
+        }
+    }
+    private bool UseGemv(int M) => EnableGemv && M < GemvMaxRows && _acc.MaxNumThreadsPerGroup >= GemvThreads && _acc.AcceleratorType != AcceleratorType.WebGL;
 
     /// <summary>
     /// With <see cref="PreciseActivations"/> on the tensor cores: split the activations into fp16 hi + lo at a power-of-two scale (22 bits; MmaGemm.KernelF16x2Dense)
