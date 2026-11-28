@@ -27,7 +27,11 @@ On Anima block 0's real cross v projection: cuBLAS fp32 1.3e-7, numpy CPU fp32 2
 - NEW, small M (2c1706f9): a GEMV for M < 4 (all backends but WebGL): 9x more accurate (~9e-8) and 4-14x faster than the tiled GEMM at M = 1. This was
   the rest of Anima's error (its adaLN modulations are M = 1): Anima DiT vs ComfyUI 1.78e-5 -> 2.74e-6 (float64 reference 2.4e-6); 8 LoRA steps
   1.07e-3 -> 5.8e-4 (float64 3.8e-4). Anima forward unchanged (0.26-0.35 vs 0.29 s, noisy).
-- Still open: gap 1 (MmaGemm fast path 1.5x behind cuBLAS bf16) and gap 3 (TiledGemm for WebGPU / OpenCL: 1.5x slower, 2.6x less accurate than cuBLAS fp32).
+- Gap 1 PARTLY (61cc5dfc): the fast path now packs A to bf16 and runs KernelBf16PackedV6Epi (V6 + nn.Linear epilogue): bit-identical to the dense
+  kernel, 37.7-38.8 TFLOPS (dense 35.3-36.8). cuBLAS bf16 50-54: still 1.37x. V6 reached 46 TFLOPS at K 4096 (Bench_TrainingGemm_TensorCores); at the
+  DiT's K 1536 the per-tile prologue / epilogue and the separate pack pass weigh more. Next: a larger N tile or 4 stages at short K; the pack fused
+  into the producer (LayerNormModulate / GELU writing bf16 words); then a split-K or stream-K schedule for the small grids.
+- Still open: gap 3 (TiledGemm for WebGPU / OpenCL: 1.5x slower, 2.6x less accurate than cuBLAS fp32) and the precise kernel's 11%.
 
 ## The three gaps (each must close WITHOUT trading speed for accuracy)
 1. Fast path: 1.5x slower than cuBLAS bf16 at the same quality -> MmaGemm tuning (tile shape, cp.async multi-stage pipeline, ldmatrix, epilogue).
