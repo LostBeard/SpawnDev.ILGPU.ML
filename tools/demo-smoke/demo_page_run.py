@@ -225,8 +225,13 @@ class Cdp:
 
 async def session(args, page, log, state, clear_first, kill_after_gb):
     """One browser session: open the page, take its steps, sample until its result, an error, the kill point or the time limit. Returns the verdict."""
+    # The throttling flags: with the window covered or the display off (TJ's desk at night), Chrome holds a page's timers to one wake-up a second, then
+    # one a minute; /text-gen yields per token, so it fell from 13-29 to 0.9 tokens/s and then to one token a minute (2026-11-28, 01:00). The run must
+    # measure the page, not the state of the desktop.
     chrome = subprocess.Popen([CHROME, f"--user-data-dir={args.profile}", f"--remote-debugging-port={args.port}", "--remote-allow-origins=*",
-                               "--no-first-run", "--no-default-browser-check", "--window-size=1300,1000", "about:blank"])
+                               "--no-first-run", "--no-default-browser-check", "--window-size=1300,1000",
+                               "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+                               "about:blank"])
     print(f"session {state['session']}: chrome pid {chrome.pid}", flush=True)
     verdict, killed = "timeout", False
     steps = page["steps"]; first_ready = steps[0][0]; status = status_js(page)
