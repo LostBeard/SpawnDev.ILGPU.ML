@@ -40,13 +40,21 @@ public sealed class UnigramTokenizer
         _unkScore = min - 10f;
     }
 
-    /// <summary>Read <c>model.vocab</c> ([piece, score] pairs), <c>model.unk_id</c> and the post-processor's end-of-sequence id from a Hugging Face tokenizer.json.</summary>
+    /// <summary>
+    /// Read <c>model.vocab</c> ([piece, score] pairs), <c>model.unk_id</c> and the post-processor's end-of-sequence id from a Hugging Face tokenizer.json.
+    /// Older files (e.g. google-t5/t5-base's) have no <c>model.type</c>: a model without one is read as Unigram when its vocab is [piece, score] pairs
+    /// (a BPE or WordPiece vocab is an object of piece -> id), and refused otherwise.
+    /// </summary>
     public static UnigramTokenizer FromTokenizerJson(Stream json)
     {
         using var doc = JsonDocument.Parse(json);
         var model = doc.RootElement.GetProperty("model");
-        if (model.GetProperty("type").GetString() != "Unigram") throw new NotSupportedException("a Unigram tokenizer.json");
-        var vocab = model.GetProperty("vocab");
+        if (!model.TryGetProperty("vocab", out var vocab)) throw new NotSupportedException("a Unigram tokenizer.json: model.vocab is missing");
+        if (model.TryGetProperty("type", out var type) && type.ValueKind != JsonValueKind.Null)
+        {
+            if (type.GetString() != "Unigram") throw new NotSupportedException($"a Unigram tokenizer.json, not model.type \"{type.GetString()}\"");
+        }
+        else if (!IsPairVocab(vocab)) throw new NotSupportedException("a Unigram tokenizer.json: no model.type and the vocab is not [piece, score] pairs");
         int n = vocab.GetArrayLength();
         var pieces = new string[n]; var scores = new float[n];
         int i = 0;
@@ -56,6 +64,14 @@ public sealed class UnigramTokenizer
         if (doc.RootElement.TryGetProperty("post_processor", out var pp) && pp.ValueKind == JsonValueKind.Object && pp.TryGetProperty("special_tokens", out var st)
             && st.TryGetProperty("</s>", out var s) && s.TryGetProperty("ids", out var ids) && ids.GetArrayLength() > 0) eos = ids[0].GetInt32();
         return new UnigramTokenizer(pieces, scores, unk, eos);
+    }
+
+    // [[piece, score], ...]: the Unigram vocab shape (checked on the first entry; an empty array is not a vocab)
+    private static bool IsPairVocab(JsonElement vocab)
+    {
+        if (vocab.ValueKind != JsonValueKind.Array || vocab.GetArrayLength() == 0) return false;
+        var e = vocab[0];
+        return e.ValueKind == JsonValueKind.Array && e.GetArrayLength() == 2 && e[0].ValueKind == JsonValueKind.String && e[1].ValueKind == JsonValueKind.Number;
     }
 
     /// <summary>

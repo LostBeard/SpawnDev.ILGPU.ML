@@ -21,6 +21,9 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   every value was centred and scaled as a key and left fp16's range. It now places each element by its row and column in each region. No model shipped
   before used that layout; Anima found it (760 of 16384 head vectors NaN in block 0). `Ltx2_ExactAttentionKernels_MatchFloat64` now runs every pass in
   both layouts (all lanes; red-checked: the old split gives a non-finite output).
+- **`UnigramTokenizer.FromTokenizerJson` reads the older tokenizer.json format without `model.type`** (google-t5/t5-base's: only `unk_id` and the
+  vocab; found by Lore: it threw KeyNotFoundException). An untyped model is read as Unigram when its vocab is [piece, score] pairs and refused otherwise; a
+  typed non-Unigram model is still refused. `UnigramTokenizer_ReadsTokenizerJsonWithoutModelType` (host only; red-checked with the old read).
 - **The models-host mirror index is read again after a failed read** (`ModelsHost`): a read that failed (the 20 s timeout, no network) was kept for the
   life of the process, so every file was then tried on the models host first: in a browser tab a 404 and a wasted round trip per unmirrored file until the
   page reloaded. Found in the 5.8.38 sweep (one process hit the timeout; `ModelsHost_TheHuggingFaceTokenNeverReachesTheModelsHost` failed on it, 4/4 alone).
