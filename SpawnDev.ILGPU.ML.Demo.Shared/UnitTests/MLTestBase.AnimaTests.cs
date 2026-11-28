@@ -271,6 +271,70 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Run 10's whole 8-step euler sampling (cfg 1) on the GPU with and without the turbo LoRA, against ComfyUI's final latent (out_samples is
+    /// latent_format.process_out(x) = x * std_c + mean_c, the Wan 2.1 constants; compared here in the model's space). The final latents are written to
+    /// _scratch/anima-ref/gpu_replay_{tag}_final_f32.raw for tools/anima-ref/compare_replay_final.py's float64 replay. MEASURED first in float64
+    /// (replay_lora_steps.py): exact arithmetic lands 3.8e-4 from ComfyUI with the LoRA and 5.8e-6 without: the LoRA's trajectory amplifies rounding.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task Anima_Lora_EightStepsMatchComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a 4 GB weight file from disk: a desktop GPU");
+        string basePath = Environment.GetEnvironmentVariable("ANIMA_BASE") ?? "D:/Projects/anima/anima-base-v1.0.safetensors";
+        string loraPath = Environment.GetEnvironmentVariable("ANIMA_LORA") ?? "D:/Projects/anima/anima-turbo-lora-v0.2.safetensors";
+        string run = Environment.GetEnvironmentVariable("ANIMA_LORA_RUN") ?? "D:/users/tj/Projects/_DevComms/anima-run10-turbo-lora-2026-11-28";
+        foreach (var f in new[] { basePath, loraPath }) if (!File.Exists(f)) throw new UnsupportedTestException($"{f} not found");
+        if (!Directory.Exists(run)) throw new UnsupportedTestException($"SpawnGen's run 10 not found in {run}");
+        float[] Raw(string prefix)
+        {
+            var hit = Directory.GetFiles(run, prefix + "_f32_*.raw").Single();
+            var n = Path.GetFileNameWithoutExtension(hit)[(prefix.Length + 5)..].Split('x').Select(long.Parse).Aggregate(1L, (a, b) => a * b);
+            return F2_Raw(hit, n);
+        }
+        float[] mean = { -0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f, 0.9653f, -0.1517f, 1.5508f, 0.4134f, -0.0715f, 0.5517f, -0.3632f, -0.1922f, -0.9497f, 0.2503f, -0.2921f };
+        float[] std = { 2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f, 3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f };
+        using var bw = GpuWeights.LoadFile(accelerator, basePath, n => !n.StartsWith(AnimaLlmAdapter.Prefix, StringComparison.Ordinal));
+        using var lora = new AnimaLora(accelerator, GpuWeights.LoadFile(accelerator, loraPath));
+        using var dit = new AnimaDiT(accelerator, new DiTKernels(accelerator) { PreciseActivations = true }, bw);
+        const int HW = 64 * 64, per = AnimaKernels.LatentChannels * HW;
+        dit.SetGrid(1, 64, 64);
+        using var lat = accelerator.Allocate1D<float>(per); using var v = accelerator.Allocate1D<float>(per);
+        string outDir = Environment.GetEnvironmentVariable("ANIMA_REPLAY_OUT") ?? "D:/users/tj/Projects/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML/_scratch/anima-ref";
+        var report = new List<string>(); double worstLora = 0, worstPlain = 0;
+        foreach (var (tag, withLora) in new[] { ("lora100", true), ("nolora", false) })
+        {
+            var s = Raw($"{tag}_call_0_c_transformer_options_sample_sigmas");
+            var x = Raw($"{tag}_call_0_input"); var ctx = Raw($"{tag}_call_0_c_c_crossattn");
+            int rows = AnimaDiT.ContextRows;
+            while (rows > 0 && ctx.AsSpan((rows - 1) * AnimaDiT.ContextDim, AnimaDiT.ContextDim).IndexOfAnyExcept(0f) < 0) rows--;
+            dit.SetContext(0, ctx.AsSpan(0, rows * AnimaDiT.ContextDim).ToArray(), rows);
+            dit.RemoveLora(lora);
+            if (withLora) { lora.Strength = 1f; dit.AddLora(lora); }
+            for (int i = 0; i + 1 < s.Length; i++)
+            {
+                lat.View.CopyFromCPU(x);
+                dit.Forward(lat.View, s[i], 0, v.View);
+                var vv = await v.View.CopyToHostAsync();
+                // euler on the flow model: D = x - s v; x' = x + (s' - s)(x - D) / s = x + (s' - s) v; the last step (s' = 0) leaves D
+                for (int j = 0; j < per; j++) x[j] = s[i + 1] == 0f ? x[j] - s[i] * vv[j] : x[j] + (s[i + 1] - s[i]) * vv[j];
+            }
+            var gold = Raw($"{tag}_out_samples");
+            var goldModel = new float[per];
+            for (int j = 0; j < per; j++) { int c = j / HW; goldModel[j] = (gold[j] - mean[c]) / std[c]; }
+            double e = F2_RelRms(x, goldModel);
+            if (withLora) worstLora = e; else worstPlain = e;
+            report.Add($"{tag} {e:E2}");
+            Directory.CreateDirectory(outDir);
+            var bytes = new byte[per * 4]; Buffer.BlockCopy(x, 0, bytes, 0, bytes.Length);
+            File.WriteAllBytes(Path.Combine(outDir, $"gpu_replay_{tag}_final_f32.raw"), bytes);
+        }
+        string line = $"{accelerator.AcceleratorType}: 8-step final latent vs ComfyUI (model space): {string.Join(", ", report)} (float64: lora100 3.8e-4, nolora 5.8e-6)";
+        Console.WriteLine("[Anima] LoRA 8 steps: " + line);
+        Ur_Expect(worstLora < 1e-2 && worstPlain < 1e-3, line);   // PRE-REGISTERED 2026-11-28: Lore's bound 1e-2 for the LoRA trajectory (float64 itself is 3.8e-4 off); 1e-3 without
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="AnimaDiT"/> against ComfyUI's first two sampler calls (512 x 512, CFG batch [negative, positive], sigma 0.9999667 then 0.9): every row's
     /// velocity v, compared as ComfyUI records it (the denoised x - sigma * v), from that call's own input latent and c_crossattn.
     /// </summary>
