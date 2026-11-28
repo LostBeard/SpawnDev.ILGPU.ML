@@ -1,40 +1,37 @@
-# fp32 GEMM accumulation order: the port's per-call error vs ComfyUI's CPU fp32 (2026-11-28, Tuvok)
+# GEMM accuracy and speed against cuBLAS on the same card (2026-11-28, Tuvok)
 
-## Finding
-Anima's DiT matches ComfyUI's fp32 dumps to ~1-2e-5 a call, ComfyUI itself is ~2.5e-6 from float64: ours is ~5x further from exact. Through the turbo
-LoRA's 8 steps that becomes 1.0e-3 (ComfyUI 3.8e-4 from float64; tools/anima-ref/replay_lora_steps.py). Bisected op by op (bisect_block0.py):
-the attention kernels add nothing; every Linear carries the error, the first one already (the adaLN vector: 1.3e-6 where ComfyUI's is 2.6e-7).
+TJ (2026-11-28): a fix that makes us slower than ComfyUI on the same hardware at the same quality is a bad fix; it means the problem is not solved
+correctly. So the yardstick is PyTorch CUDA = what ComfyUI runs on this GPU, measured on this machine (D:\Projects\venv-torchcuda, torch 2.14.1+cu126).
 
-Root cause (gemm_accumulation_error.py, Anima block 0's cross-attention v projection, exact inputs, K = 1024):
+## Measured, RTX 4070 (tools/anima-ref/torch_gemm_compare.py, Benchmark_Gemm_VsCublas)
 
-| fp32 summation of the K products | relRMS from float64 |
-|---|---|
-| sequential, one register per output (our TiledGemm / LinearImpl order) | 4.92e-7 (the GPU measured 4.9e-7 on OpenCL: the same) |
-| numpy fp32 matmul (blocked BLAS = ComfyUI's CPU) | 2.04e-7 |
-| two-level: blocks of 8 / 16 / 32 / 64, block sums added | 1.80e-7 / 1.30e-7 / 9.84e-8 / 8.71e-8 |
+Speed at the DiT shapes, 4096 tokens: qkv 1536 -> 4608 / mlp-up 1536 -> 6144 / mlp-down 6144 -> 1536. Accuracy: random [M, 2048] x [2048, 2048]^T,
+bf16-exact weights, relRMS from float64 (cuBLAS: M = 1024; ours: M = 256; the per-element error is the same statistic).
 
-CUDA's precise path (MmaGemm.KernelBf16x2Dense: activations as bf16 hi + lo = ~16 bits) is worse on the same op: 8.6e-7. Its accumulation is already
-two-level (each k step's MMA from zero, then an fp32 add); the activation split is the limit there (the exact attention fixed the same with fp16 hi + lo
-at power-of-two scales, 22 bits: 3e-6 -> 6e-8).
-
-## MEASURED (same day): TiledGemm two-level (gen_tiled_gemm.py GEMM_TWO_LEVEL=1, GEMM_FOLD=k steps per partial; default output unchanged)
-
-| RTX 4070, Trellis2_DiTKernels_Benchmark (4096 tokens, qkv / mlp-up / mlp-down) | OpenCL TFLOPS | WebGPU TFLOPS |
+| path | relRMS | TFLOPS |
 |---|---|---|
-| sequential (shipped) | 11.5 / 11.9 / 11.1 | 10.3 / 10.6 / 10.0 |
-| two-level, a partial per k step of 8 | 9.3 / 9.4 / 9.1 (-20%) | 8.0 / 8.2 / 8.2 (-21%) |
-| two-level, a partial per 4 k steps (32) | 8.8 / 9.5 / 9.2 | 7.6 / 7.8 / 7.7 |
+| cuBLAS bf16 (ComfyUI's normal GPU dtype) | 2.6e-3 | 50.1 / 53.6 / 51.9 |
+| OURS tensor cores fast (MmaGemm, bf16 activations) | 1.7e-3 | 33.2 / 33.6 / 34.6 |
+| cuBLAS TF32 | 2.1e-4 | 26.6 / 25.6 / 23.6 |
+| cuBLAS fp32 (ComfyUI --force-fp32) | 3.1e-7 | 16.9 / 17.1 / 16.1 |
+| OURS tensor cores precise (MmaGemm x2, bf16 hi + lo activations) | 2.5e-6 | 19.6 / 19.9 / 21.1 |
+| OURS tiled fp32 (TiledGemm): CUDA (tensor cores off) / OpenCL / WebGPU | 8.1e-7 | 11.0-10.0 / 11.4-12.0 / 7.7-9.9 |
 
-The cost is the second set of 64 accumulators (register pressure), not the adds: folding 4x less often is no faster. Accuracy (OpenCL, blocks of 8):
-Anima DiT call_0 vs ComfyUI's dump 1.69e-5 -> 2.46e-6 (7x; the float64 reference is 2.4e-6 from the same dump), call_1 1.35e-6; adaLN 1.3e-6 -> 3.2e-7;
-the cross v projection 4.9e-7 -> 1.8e-7 (numpy's prediction for blocks of 8). CUDA's GEMMs at M >= 16 are MmaGemm (not affected); its small-M ones are.
+On Anima block 0's real cross v projection: cuBLAS fp32 1.3e-7, numpy CPU fp32 2.7e-7, ours sequential 4.9e-7 (OpenCL) / 8.6e-7 (CUDA precise).
 
-Conclusion proposed (needs TJ: a speed / parity trade on a core kernel): a second TiledGemm variant chosen by the existing DiTKernels.PreciseActivations
-(the ComfyUI-parity models already set it and already pay for x2 MMA passes on CUDA), plus fp16 hi + lo for MmaGemm's precise path. Speed models keep
-the sequential kernel. Not shipped.
+## The three gaps (each must close WITHOUT trading speed for accuracy)
+1. Fast path: 1.5x slower than cuBLAS bf16 at the same quality -> MmaGemm tuning (tile shape, cp.async multi-stage pipeline, ldmatrix, epilogue).
+2. Precise path: faster than cuBLAS fp32 but 8x less accurate. The bf16 hi + lo split keeps ~16 activation bits. Fix: fp16 hi + lo at power-of-two
+   scales (MmaAttention.KernelExact's trick: 3e-6 -> 6e-8 there): 22 bits, still two MMA passes (same speed), weights bf16 -> fp16 exact under a
+   per-tensor power-of-two scale. Target: <= 3e-7 at >= 19 TFLOPS (better than cuBLAS fp32 on both).
+3. Tiled fp32 (WebGPU, OpenCL, CPU): 1.5x slower and 2.6x less accurate than cuBLAS fp32. The two-level sum (below) fixed the accuracy (7x on Anima)
+   but cost 20% (a second register set): rejected. Needs a redesign: split K across warps within the CTA (each warp's sum is K / S long, one
+   shared-memory reduction at the end: no extra registers), plus the speed work cuBLAS has (double-buffered shared memory, wider loads).
 
-## The fix to measure before deciding (a core change: every model, every backend, bitwise)
-1. TiledGemm (and LinearImpl): a fresh partial per BK tile (or every 32 k), added into the output's running sum: 5x on the order alone. Cost: a second
-   accumulator per register-tile output (register pressure; measure the GEMM speed on WebGPU, OpenCL, CUDA before / after).
-2. MmaGemm precise: fp16 hi + lo activations at a power-of-two scale (MmaAttention.KernelExact's trick) instead of bf16 hi + lo.
-3. Gate: the Anima / LTX-2 / Z-Image / Qwen-Image / FLUX parity tests before / after, plus the speed benchmarks; full sweep.
+## Rejected: two-level accumulation in TiledGemm (gen_tiled_gemm.py GEMM_TWO_LEVEL=1, kept as an A/B switch, default output unchanged)
+Anima DiT vs ComfyUI's dump 1.69e-5 -> 2.46e-6 on OpenCL, but TiledGemm 11.5 -> 9.3 TFLOPS (OpenCL), 10.3 -> 8.0 (WebGPU); folding every 4 k steps
+was no faster (the cost is the registers, not the adds).
+
+## Root cause of our per-call parity error (how this started)
+Anima's DiT matched ComfyUI's CPU fp32 dumps to ~1-2e-5 a call where ComfyUI itself is ~2.5e-6 from float64; bisected op by op (bisect_block0.py):
+every Linear carries it (attention adds nothing). gemm_accumulation_error.py: sequential fp32 over K = 4.92e-7 on the v projection (= the GPU's 4.9e-7).
