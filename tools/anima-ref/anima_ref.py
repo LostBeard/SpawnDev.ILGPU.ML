@@ -201,13 +201,16 @@ def adaln_mod(emb, adaln, w, prefix):
     return sh[:, None, :], sc[:, None, :], g[:, None, :]
 
 
-def dit_attention(x, ctx, w, p, cos=None, sin=None, rope_mode='half', eps_qk=EPS_QK):
+def dit_attention(x, ctx, w, p, cos=None, sin=None, rope_mode='half', eps_qk=EPS_QK, pre=None):
     """Self (ctx None) or cross attention. q/k/v Linear no bias; per-head RMSNorm(128, eps) on q and k with
-    weights q_norm/k_norm; RoPE (self only) on q and k AFTER the norm; SDPA scale 1/sqrt(128); output_proj."""
+    weights q_norm/k_norm; RoPE (self only) on q and k AFTER the norm; SDPA scale 1/sqrt(128); output_proj.
+    pre(target, x) -> x' (optional, self-attention only): perturbs the INPUT of q_proj / k_proj / v_proj (targets 'q', 'k', 'v'),
+    as ControlNet-LLLite does (anima_lllite_ref.py)."""
     src = x if ctx is None else ctx
-    q = _heads(linear(x, w(p + '.q_proj.weight')), N_HEADS)
-    k = _heads(linear(src, w(p + '.k_proj.weight')), N_HEADS)
-    v = _heads(linear(src, w(p + '.v_proj.weight')), N_HEADS)
+    xq, xk, xv = (x, src, src) if pre is None else (pre('q', x), pre('k', src), pre('v', src))
+    q = _heads(linear(xq, w(p + '.q_proj.weight')), N_HEADS)
+    k = _heads(linear(xk, w(p + '.k_proj.weight')), N_HEADS)
+    v = _heads(linear(xv, w(p + '.v_proj.weight')), N_HEADS)
     q = rms_norm(q, w(p + '.q_norm.weight'), eps_qk)
     k = rms_norm(k, w(p + '.k_norm.weight'), eps_qk)
     if cos is not None:
@@ -221,18 +224,19 @@ def dit_attention(x, ctx, w, p, cos=None, sin=None, rope_mode='half', eps_qk=EPS
     return linear(o, w(p + '.output_proj.weight'))
 
 
-def dit_block(x, emb, ctx, adaln, cos, sin, w, i, rope_mode='half', eps_qk=EPS_QK, gelu=gelu_exact, eps_ln=EPS_LN):
-    """x [B,L,2048], emb [B,2048] (t_embedding_norm output), ctx [B,512,1024], adaln [B,6144]."""
+def dit_block(x, emb, ctx, adaln, cos, sin, w, i, rope_mode='half', eps_qk=EPS_QK, gelu=gelu_exact, eps_ln=EPS_LN, pre=None):
+    """x [B,L,2048], emb [B,2048] (t_embedding_norm output), ctx [B,512,1024], adaln [B,6144].
+    pre(target, x) -> x' (optional): LLLite-style input perturbations of self_attn q/k/v ('q', 'k', 'v') and mlp.layer1 ('fc1')."""
     p = f'net.blocks.{i}'
     sh, sc, g = adaln_mod(emb, adaln, w, p + '.adaln_modulation_self_attn')
     n = layer_norm(x, eps_ln) * (1.0 + sc) + sh
-    x = x + g * dit_attention(n, None, w, p + '.self_attn', cos, sin, rope_mode, eps_qk)
+    x = x + g * dit_attention(n, None, w, p + '.self_attn', cos, sin, rope_mode, eps_qk, pre=pre)
     sh, sc, g = adaln_mod(emb, adaln, w, p + '.adaln_modulation_cross_attn')
     n = layer_norm(x, eps_ln) * (1.0 + sc) + sh
     x = x + g * dit_attention(n, ctx, w, p + '.cross_attn', eps_qk=eps_qk)
     sh, sc, g = adaln_mod(emb, adaln, w, p + '.adaln_modulation_mlp')
     n = layer_norm(x, eps_ln) * (1.0 + sc) + sh
-    h = gelu(linear(n, w(p + '.mlp.layer1.weight')))
+    h = gelu(linear(n if pre is None else pre('fc1', n), w(p + '.mlp.layer1.weight')))
     x = x + g * linear(h, w(p + '.mlp.layer2.weight'))
     return x
 
@@ -270,16 +274,16 @@ def denoise_flow(x, t, v):
     return x - np.asarray(t, dtype=np.float64)[:, None, None, None, None] * v
 
 
-def dit_forward(x, t, ctx, w, block_hook=None):
+def dit_forward(x, t, ctx, w, block_hook=None, pre_for_block=None):
     """Full DiT: x [B,16,T,H,W], t [B] (sigma), ctx [B,512,1024] -> raw velocity v [B,16,T,H,W]
-    (NOT the denoised latent: see denoise_flow)."""
+    (NOT the denoised latent: see denoise_flow). pre_for_block(i) -> dit_block's pre (or None) for an LLLite."""
     B, C, T, H, W = x.shape
     Hp, Wp = H // PATCH[1], W // PATCH[2]
     h = x_embedder(pad_mask_channel(x), w).reshape(B, T * Hp * Wp, D_MODEL)
     _, adaln, emb = t_embedder(t, w)
     cos, sin = dit_rope_cos_sin(rope_angles(T, Hp, Wp))
     for i in range(N_BLOCKS):
-        h = dit_block(h, emb, ctx, adaln, cos, sin, w, i)
+        h = dit_block(h, emb, ctx, adaln, cos, sin, w, i, pre=None if pre_for_block is None else pre_for_block(i))
         if block_hook is not None:
             block_hook(i, h)
     y = final_layer(h, emb, adaln, w)

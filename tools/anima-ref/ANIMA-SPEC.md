@@ -230,6 +230,35 @@ output. Regenerate: `python check_anima.py` (155 s on this machine; weights are 
   (`_scratch/anima-ref/probe6.py`). The adaLN vector reaches 72 (fp32 ulp ~8e-6) and differs from the tap by 2.6e-7 relRMS, and
   the block amplifies that ~10x. No stage is above 1e-5.
 
+## 6b. ControlNet-LLLite v2 (added 2026-11-28)
+
+Source: kohya-ss sd-scripts `networks/control_net_lllite_anima.py` and `anima_minimal_inference_control_net_lllite.py` (Apache-2.0, main 88ff6b53).
+ComfyUI's AnimaLLLiteApply (GPL-3) was not read; Lore's black-box run (`_DevComms/anima-run4-lllite-2026-11-28`: anima-base-v1.0 +
+anima-lllite-inpainting-v2, strength 1; run5 = the same graph without it) checks it (`check_lllite.py`, 161 s).
+
+- Picture (inpainting, 4 channels): rgb in [-1, 1] with the masked part ZEROED (rgb * (mask < 0.5), i.e. mid grey, not black), plus the mask as
+  mask * 2 - 1 (1 = repaint). Size = 8 x the latent's; the trunk's two stride-4 convs give one row per DiT token, (row, col) order.
+- Trunk, GroupNorm groups = largest of 8/4/2/1 dividing C, eps 1e-5, affine; LayerNorm eps 1e-5 affine: conv1 4x4 s4 -> GN SiLU -> conv2 3x3 p1 ->
+  GN SiLU -> conv3 4x4 s4 -> GN SiLU -> N x (GN SiLU conv3x3 GN SiLU conv3x3 + skip) -> proj 1x1 -> flatten -> LayerNorm = cx [S, cond_emb].
+- Module (one per target Linear: blocks.i.self_attn q/k/v_proj, mlp.layer1): c = cx + depth_embed; h = SiLU(down(x)); (gamma, beta) =
+  chunk2(cond_to_film(c)); m = SiLU(mid(cat[c, h]) * (1 + gamma) + beta); the Linear then reads x + up(m) * strength.
+
+| stage | max abs | relRMS | note |
+|---|---|---|---|
+| control (run5) blocks.0, no LLLite, own tapped inputs | 3.331e-05 | 4.756e-07 | |
+| run4 blocks.0 WITHOUT the LLLite (its effect) | 1.147e+01 | 2.713e-01 | should be worse |
+| run4 blocks.0 WITH the LLLite | 3.491e-05 | 5.132e-07 | |
+| alt: masked part black (-1) | 3.436e+00 | 3.382e-02 | should be worse |
+| alt: rgb not masked | 1.632e+01 | 4.978e-02 | should be worse |
+| alt: mask channel {0, 1} | 5.027e+00 | 1.175e-01 | should be worse |
+| alt: mask channel inverted | 9.213e+00 | 1.237e-01 | should be worse |
+| alt: GN / LN eps 1e-6 | 4.361e-04 | 4.348e-06 | worse |
+| alt: strength 0.5 | 5.598e+00 | 1.330e-01 | should be worse |
+| run4 blocks.27 WITH the LLLite | 1.438e-02 | 1.967e-07 | |
+| END-TO-END run4 call_0 denoised (t = 1.0) | 8.704e-06 | 1.346e-06 | |
+| END-TO-END run4 call_1 denoised (t = 0.75) | 5.207e-06 | 1.037e-06 | |
+| END-TO-END run5 control call_0 / call_1 | 9.289e-06 / 2.502e-06 | 6.602e-06 / 1.043e-06 | |
+
 ## 7. Files
 - `anima_ref.py` - the float64 reference (one function per stage; `dit_forward`, `denoise_flow`, `adapter_forward`, `pad_context`).
 - `check_anima.py` - runs every stage against the taps / dumps, prints the table above, writes `_scratch/anima-ref/check_results.json`

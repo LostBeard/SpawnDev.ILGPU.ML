@@ -52,6 +52,12 @@ public sealed class AnimaDiT : IDisposable
     /// <summary>Test hook: (stage name, activation view, element count); valid only during the call.</summary>
     public Action<string, FV, int>? Tap { get; set; }
 
+    /// <summary>
+    /// A ControlNet-LLLite applied to every <see cref="Forward"/> while set (both CFG slots; set it to null for the steps outside its start / end range).
+    /// Its picture must give this grid's token count (<see cref="AnimaLLLite.SetPictureAsync"/> with 8 x the latent's size).
+    /// </summary>
+    public AnimaLLLite? LLLite { get; set; }
+
     /// <summary>Blocks whose output is tapped (as "block_N").</summary>
     public int[] TapBlocks { get; set; } = { 0, 13, 27 };
 
@@ -158,6 +164,8 @@ public sealed class AnimaDiT : IDisposable
 
         FV k = _kv.SubView(0, (long)N * C), vv = _kv.SubView((long)N * C, (long)N * C);
         FV kc = _kv.SubView(0, (long)L * C), vc = _kv.SubView((long)L * C, (long)L * C);
+        var ll = LLLite;
+        if (ll != null && ll.Tokens != N) throw new InvalidOperationException($"the LLLite's picture gives {ll.Tokens} tokens, this grid has {N}: SetPictureAsync with 8 x the latent's size");
         for (int b = 0; b < _blocks; b++)
         {
             string p = $"{P}blocks.{b}.";
@@ -165,9 +173,17 @@ public sealed class AnimaDiT : IDisposable
             // self attention: per-head RMSNorm on q and k, rotate-half RoPE, no mask
             Modulation(p + "adaln_modulation_self_attn", 3 * C);
             _k.LayerNormModulate(_hid, _hn, _mod, 0, C, N, C, 1e-6f);
-            _mat.Linear(_k, _hn, p + "self_attn.q_proj.weight", null, _q, N, C, C);
-            _mat.Linear(_k, _hn, p + "self_attn.k_proj.weight", null, k, N, C, C);
-            _mat.Linear(_k, _hn, p + "self_attn.v_proj.weight", null, vv, N, C, C);
+            // an LLLite perturbs the INPUT of each projection it has a module for (its own buffers; null = the plain input)
+            FV qIn = _hn, kIn = _hn, vIn = _hn;
+            if (ll != null)
+            {
+                qIn = ll.Apply(b, AnimaLLLite.Target.Q, _hn, N) ?? _hn;
+                kIn = ll.Apply(b, AnimaLLLite.Target.K, _hn, N) ?? _hn;
+                vIn = ll.Apply(b, AnimaLLLite.Target.V, _hn, N) ?? _hn;
+            }
+            _mat.Linear(_k, qIn, p + "self_attn.q_proj.weight", null, _q, N, C, C);
+            _mat.Linear(_k, kIn, p + "self_attn.k_proj.weight", null, k, N, C, C);
+            _mat.Linear(_k, vIn, p + "self_attn.v_proj.weight", null, vv, N, C, C);
             _wk.RowRmsNorm(_q, _w.BF16(p + "self_attn.q_norm.weight"), N * H, D, 0, D, 1e-6f);
             _wk.RowRmsNorm(k, _w.BF16(p + "self_attn.k_norm.weight"), N * H, D, 0, D, 1e-6f);
             _ak.RopeHalf(_q, _phases!.View, N, C, 0, H, D);
@@ -195,7 +211,8 @@ public sealed class AnimaDiT : IDisposable
             // MLP, exact GELU
             Modulation(p + "adaln_modulation_mlp", 3 * C);
             _k.LayerNormModulate(_hid, _hn, _mod, 0, C, N, C, 1e-6f);
-            _mat.Linear(_k, _hn, p + "mlp.layer1.weight", null, _mlp, N, C, _ffn, DiTKernels.Act.GeluErf);
+            FV fc1In = ll?.Apply(b, AnimaLLLite.Target.MlpFc1, _hn, N) ?? _hn;
+            _mat.Linear(_k, fc1In, p + "mlp.layer1.weight", null, _mlp, N, C, _ffn, DiTKernels.Act.GeluErf);
             if (b == 0) Tap?.Invoke("b0_mlp_hidden", _mlp, N * _ffn);
             _mat.Linear(_k, _mlp, p + "mlp.layer2.weight", null, _proj, N, _ffn, C);
             _k.GateResidual(_hid, _proj, _mod, 2 * C, N * C, C);

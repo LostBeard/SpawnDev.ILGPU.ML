@@ -10,6 +10,11 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   against SpawnGen's ComfyUI taps). Against ComfyUI's dumps: the adapter 2.8e-6 .. 1.0e-5 relative RMS, the DiT's denoised output 7.5e-6 .. 1.8e-5 on the
   first two sampler calls (both CFG rows), CUDA and OpenCL; 0.26 s a call at 512 x 512 on an RTX 4070 (CUDA). Tests `Anima_LlmAdapter_MatchesComfyUi`,
   `Anima_DiT_MatchesComfyUi`, `Anima_DiT_StagesMatchComfyUiTaps` (HeavyModel; need the weights and the dumps on disk).
+- **Anima ControlNet-LLLite** (`Anima.AnimaLLLite`, v2: kohya-ss sd-scripts, e.g. anima-lllite-inpainting-v2): the conditioning trunk turns a picture into
+  one row per DiT token, and each module perturbs the input of a self-attention q / k / v or the MLP's first Linear; set `AnimaDiT.LLLite`.
+  `AnimaKernels.InpaintPicture` builds the 4-channel inpainting picture (masked RGB + mask). Against ComfyUI's AnimaLLLiteApply (black box; float64
+  reference `tools/anima-ref/anima_lllite_ref.py`, checked by `check_lllite.py`): the denoised output of both sampler calls 4.9e-6 .. 7.0e-6 (CUDA,
+  OpenCL), the LLLite's own effect 0.90; about 10% on a call (0.32 against 0.29 s at 512 x 512, CUDA). Test `Anima_LLLite_MatchesComfyUi`.
 - **Fixed: NaN from the precise (exact tensor-core) attention when k and v are separate blocks** (`MmaAttention.SplitPairs`, CUDA with
   `PreciseActivations`, the default for the ComfyUI-parity models): the split pass took an element's column from `e % kvStride`, which is only right when k
   and v share each row (vOff < kvStride, as every model so far laid them out). With all keys first and then all values (vOff = Nk * kvStride, Anima's DiT),

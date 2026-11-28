@@ -145,6 +145,78 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="AnimaLLLite"/> (anima-lllite-inpainting-v2 on anima-base-v1.0) against ComfyUI's AnimaLLLiteApply (SpawnGen's black-box run4: the Painter
+    /// rectangle mask on compositor-a.png, strength 1, cfg 1, 2 steps; run5 = the same graph without the LLLite). Both sampler calls' denoised outputs with the
+    /// LLLite, run5's first call without it (the same DiT on the same base), and the red check: run4's call without the LLLite must miss by far.
+    /// ANIMA_BASE / ANIMA_LLLITE / ANIMA_LLLITE_RUN override the paths.
+    /// </summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel")]
+    public async Task Anima_LLLite_MatchesComfyUi() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL)) throw new UnsupportedTestException("reads a 4 GB weight file from disk: a desktop GPU");
+        string basePath = Environment.GetEnvironmentVariable("ANIMA_BASE") ?? "D:/Projects/anima/anima-base-v1.0.safetensors";
+        string llPath = Environment.GetEnvironmentVariable("ANIMA_LLLITE") ?? "D:/Projects/anima/anima-lllite-inpainting-v2.safetensors";
+        string run = Environment.GetEnvironmentVariable("ANIMA_LLLITE_RUN") ?? "D:/users/tj/Projects/_DevComms/anima-run4-lllite-2026-11-28";
+        foreach (var f in new[] { basePath, llPath, Path.Combine(run, "compositor-a.png") })
+            if (!File.Exists(f)) throw new UnsupportedTestException($"{f} not found");
+        float[] Raw(string dir, string prefix)
+        {
+            var hit = Directory.GetFiles(Path.Combine(run, dir), prefix + "_f32_*.raw").Single();
+            var n = Path.GetFileNameWithoutExtension(hit)[(prefix.Length + 5)..].Split('x').Select(long.Parse).Aggregate(1L, (a, b) => a * b);
+            return F2_Raw(hit, n);
+        }
+        // the picture (ComfyUI IMAGE, [0, 1]) and the Painter's mask (its alpha: 1 = repaint), channel-first
+        var rgba = Preprocessing.PngDecoder.DecodePixels(File.ReadAllBytes(Path.Combine(run, "compositor-a.png"))) ?? throw new InvalidDataException("compositor-a.png");
+        var mrgba = Preprocessing.PngDecoder.DecodePixels(File.ReadAllBytes(Path.Combine(run, "painter-lllite-rect.png"))) ?? throw new InvalidDataException("painter-lllite-rect.png");
+        const int PH = 512, PW = 512, HW = PH * PW;
+        var rgb = new float[3 * HW]; var mask = new float[HW];
+        for (int p = 0; p < HW; p++) { for (int c = 0; c < 3; c++) rgb[c * HW + p] = rgba[p * 4 + c] / 255f; mask[p] = mrgba[p * 4 + 3] / 255f; }
+
+        using var bw = GpuWeights.LoadFile(accelerator, basePath, n => !n.StartsWith(AnimaLlmAdapter.Prefix, StringComparison.Ordinal));
+        using var lw = GpuWeights.LoadFile(accelerator, llPath);
+        var kernels = new DiTKernels(accelerator) { PreciseActivations = true };
+        using var dit = new AnimaDiT(accelerator, kernels, bw);
+        using var ll = new AnimaLLLite(accelerator, kernels, lw);
+        Ur_Expect(ll.PictureChannels == 4 && ll.Modules == 112 && ll.ResBlocks == 4 && ll.CondEmbDim == 64 && ll.MlpDim == 64,
+            $"inpainting-v2 should read as 4 channels, 112 modules, 4 res blocks, 64 / 64: {ll.PictureChannels}, {ll.Modules}, {ll.ResBlocks}, {ll.CondEmbDim} / {ll.MlpDim}");
+        var ak = new AnimaKernels(accelerator);
+        using var rgbB = accelerator.Allocate1D(rgb); using var maskB = accelerator.Allocate1D(mask); using var pic = accelerator.Allocate1D<float>(4 * HW);
+        ak.InpaintPicture(rgbB.View, maskB.View, pic.View, PH, PW);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await ll.SetPictureAsync(pic.View, PH, PW);
+        double condMs = sw.Elapsed.TotalMilliseconds;
+
+        const int C = AnimaKernels.LatentChannels, per = C * 64 * 64;
+        dit.SetGrid(1, 64, 64);
+        using var lat = accelerator.Allocate1D<float>(per); using var v = accelerator.Allocate1D<float>(per);
+        async Task<double> Call(string dir, int call, bool withLLLite)
+        {
+            var x = Raw(dir, $"call_{call}_input"); var sig = Raw(dir, $"call_{call}_timestep"); var ctx = Raw(dir, $"call_{call}_c_c_crossattn"); var gold = Raw(dir, $"call_{call}_output");
+            int rows = AnimaDiT.ContextRows;
+            while (rows > 0 && ctx.AsSpan((rows - 1) * AnimaDiT.ContextDim, AnimaDiT.ContextDim).IndexOfAnyExcept(0f) < 0) rows--;
+            dit.SetContext(0, ctx.AsSpan(0, rows * AnimaDiT.ContextDim).ToArray(), rows);
+            lat.View.CopyFromCPU(x);
+            dit.LLLite = withLLLite ? ll : null;
+            dit.Forward(lat.View, sig[0], 0, v.View);
+            var vv = await v.View.CopyToHostAsync();
+            var den = new float[per];
+            for (int i = 0; i < per; i++) den[i] = x[i] - sig[0] * vv[i];
+            return F2_RelRms(den, gold);
+        }
+        var times = new List<double>();
+        async Task<double> Timed(string dir, int call, bool withLLLite) { sw.Restart(); double e = await Call(dir, call, withLLLite); times.Add(sw.Elapsed.TotalSeconds); return e; }
+        double l0 = await Timed("run4-lllite", 0, true);         // the first call compiles the kernels
+        double l1 = await Timed("run4-lllite", 1, true);
+        double c0 = await Timed("run5-control", 0, false);
+        double off = await Timed("run4-lllite", 0, false);       // red check: the same call without the LLLite
+        string line = $"with the LLLite: call 0 {l0:E2}, call 1 {l1:E2}; control (no LLLite) call 0 {c0:E2}; run4 call 0 WITHOUT the LLLite {off:E2} (must be large)"
+            + $" | picture -> rows {condMs:F0} ms; calls {string.Join(" / ", times.Select(t => t.ToString("F2")))} s (with, with, without, without; incl. the host reads)";
+        Console.WriteLine("[Anima] LLLite vs ComfyUI (denoised): " + line);
+        Ur_Expect(Math.Max(Math.Max(l0, l1), c0) < 1e-4 && off > 0.1, line);   // PRE-REGISTERED 2026-11-28 (as the DiT's): the float64 reference is 1.3e-6 / 1.0e-6 / 6.6e-6; without the LLLite 1.2
+        return line;
+    });
+
+    /// <summary>
     /// <see cref="AnimaDiT"/> against ComfyUI's first two sampler calls (512 x 512, CFG batch [negative, positive], sigma 0.9999667 then 0.9): every row's
     /// velocity v, compared as ComfyUI records it (the denoised x - sigma * v), from that call's own input latent and c_crossattn.
     /// </summary>

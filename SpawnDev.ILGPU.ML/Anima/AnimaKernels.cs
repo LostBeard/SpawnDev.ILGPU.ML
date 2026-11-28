@@ -116,6 +116,131 @@ public sealed class AnimaKernels
         _gather(M * C, table, ids, o, C);
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // ControlNet-LLLite (AnimaLLLite): the conditioning trunk's convolutions and norms, and each module's small elementwise steps
+    // ---------------------------------------------------------------------------------------------------
+
+    // y[o, oy, ox] = bias[o] + sum_{c, ky, kx} w[o, c, ky, kx] * x[c, oy * s - p + ky, ox * s - p + kx]   (zero padding; channel-first)
+    private Action<Index1D, FV, BV, BV, FV, int, int, int, int, int, int, int, int>? _conv;
+    private static void ConvImpl(Index1D i, FV x, BV w, BV bias, FV y, int cin, int H, int W, int Ho, int Wo, int k, int s, int p)
+    {
+        int ox = i % Wo, rest = i / Wo, oy = rest % Ho, o = rest / Ho;
+        float acc = PrecisionConvert.ConvertToSingle(bias[o]);
+        long wb = (long)o * cin * k * k;
+        for (int c = 0; c < cin; c++)
+        {
+            long xb = (long)c * H * W, wc = wb + (long)c * k * k;
+            for (int ky = 0; ky < k; ky++)
+            {
+                int iy = oy * s - p + ky;
+                if (iy < 0 || iy >= H) continue;
+                for (int kx = 0; kx < k; kx++)
+                {
+                    int ix = ox * s - p + kx;
+                    if (ix < 0 || ix >= W) continue;
+                    acc = float.MultiplyAddEstimate(PrecisionConvert.ConvertToSingle(w[wc + ky * k + kx]), x[xb + (long)iy * W + ix], acc);
+                }
+            }
+        }
+        y[i] = acc;
+    }
+    /// <summary>
+    /// Direct 2-D convolution, channel-first ([cin, H, W] -> [cout, Ho, Wo]), square kernel <paramref name="k"/>, stride, zero padding, bf16 weights
+    /// [cout, cin, k, k] (torch layout) and bias. For the LLLite conditioning trunk (runs once per picture). Returns (Ho, Wo).
+    /// </summary>
+    public (int Ho, int Wo) Conv2d(FV x, BV w, BV bias, FV y, int cin, int H, int W, int cout, int k, int stride, int pad)
+    {
+        int Ho = (H + 2 * pad - k) / stride + 1, Wo = (W + 2 * pad - k) / stride + 1;
+        _conv ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, FV, int, int, int, int, int, int, int, int>(ConvImpl);
+        _conv(cout * Ho * Wo, x, w, bias, y, cin, H, W, Ho, Wo, k, stride, pad);
+        return (Ho, Wo);
+    }
+
+    // x[c, p] = x[c, p] * gamma[c] + beta[c], then SiLU when silu != 0, IN PLACE (channel-first, HW values per channel)
+    private Action<Index1D, FV, BV, BV, int, int>? _chanAffine;
+    private static void ChannelAffineImpl(Index1D i, FV x, BV gamma, BV beta, int HW, int silu)
+    {
+        int c = i / HW;
+        float v = x[i] * PrecisionConvert.ConvertToSingle(gamma[c]) + PrecisionConvert.ConvertToSingle(beta[c]);
+        x[i] = silu != 0 ? v / (1f + MathF.Exp(-v)) : v;
+    }
+    /// <summary>Per-channel affine (bf16 gamma, beta) and optional SiLU on a channel-first [C, HW] tensor, in place.</summary>
+    public void ChannelAffine(FV x, BV gamma, BV beta, int C, int HW, bool silu)
+    {
+        _chanAffine ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, BV, int, int>(ChannelAffineImpl);
+        _chanAffine(C * HW, x, gamma, beta, HW, silu ? 1 : 0);
+    }
+
+    // dst[r, c] = src[r, c] + v[c]
+    private Action<Index1D, FV, BV, FV, int>? _addRow;
+    private static void AddRowImpl(Index1D i, FV src, BV v, FV dst, int C) => dst[i] = src[i] + PrecisionConvert.ConvertToSingle(v[i % C]);
+    /// <summary>dst = src + v broadcast over the rows ([rows, C] + bf16 [C]).</summary>
+    public void AddRow(FV src, BV v, FV dst, int rows, int C)
+    {
+        _addRow ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, BV, FV, int>(AddRowImpl);
+        _addRow(rows * C, src, v, dst, C);
+    }
+
+    // o[r, :ca] = a[r], o[r, ca:] = b[r]
+    private Action<Index1D, FV, FV, FV, int, int>? _concat;
+    private static void ConcatImpl(Index1D i, FV a, FV b, FV o, int ca, int cb)
+    {
+        int w = ca + cb, r = i / w, c = i % w;
+        o[i] = c < ca ? a[(long)r * ca + c] : b[(long)r * cb + c - ca];
+    }
+    /// <summary>Row-wise concatenation [rows, ca] ++ [rows, cb] -> [rows, ca + cb].</summary>
+    public void Concat(FV a, FV b, FV o, int rows, int ca, int cb)
+    {
+        _concat ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(ConcatImpl);
+        _concat(rows * (ca + cb), a, b, o, ca, cb);
+    }
+
+    // m[r, j] = SiLU(m[r, j] * (1 + gb[r, j]) + gb[r, D + j]), IN PLACE
+    private Action<Index1D, FV, FV, int>? _filmSilu;
+    private static void FilmSiluImpl(Index1D i, FV m, FV gb, int D)
+    {
+        int r = i / D, j = i % D;
+        long g = (long)r * 2 * D + j;
+        float v = float.MultiplyAddEstimate(m[i], 1f + gb[g], gb[g + D]);
+        m[i] = v / (1f + MathF.Exp(-v));
+    }
+    /// <summary>FiLM then SiLU, in place: m = SiLU(m * (1 + gamma) + beta), (gamma, beta) = the two halves of each row of gb [rows, 2D].</summary>
+    public void FilmSilu(FV m, FV gb, int rows, int D)
+    {
+        _filmSilu ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int>(FilmSiluImpl);
+        _filmSilu(rows * D, m, gb, D);
+    }
+
+    // o = x + s * y
+    private Action<Index1D, FV, FV, FV, float>? _addScaled;
+    private static void AddScaledImpl(Index1D i, FV x, FV y, FV o, float s) => o[i] = float.MultiplyAddEstimate(s, y[i], x[i]);
+    /// <summary>o = x + s * y (three separate buffers).</summary>
+    public void AddScaled(FV x, FV y, FV o, float s, int count)
+    {
+        _addScaled ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, float>(AddScaledImpl);
+        _addScaled(count, x, y, o, s);
+    }
+
+    // o = [rgb * 2 - 1 (zeroed where mask >= 0.5 when maskedInput), mask >= 0.5 ? 1 : -1]   (rgb [3, H, W] in [0, 1], mask [H, W])
+    private Action<Index1D, FV, FV, FV, int, int>? _inpaintPic;
+    private static void InpaintPictureImpl(Index1D i, FV rgb, FV mask, FV o, int HW, int maskedInput)
+    {
+        int c = i / HW, p = i % HW;
+        bool hole = mask[p] >= 0.5f;
+        o[i] = c == 3 ? (hole ? 1f : -1f) : (hole && maskedInput != 0 ? 0f : rgb[i] * 2f - 1f);
+    }
+    /// <summary>
+    /// The 4-channel inpainting picture of an LLLite (kohya's _build_inpaint_cond_image): rgb [3, H, W] in [0, 1] (ComfyUI's IMAGE range) to [-1, 1],
+    /// zeroed (= mid grey) where the mask marks the part to repaint when <paramref name="maskedInput"/>, plus the binarised mask as a 4th channel in {-1, 1}
+    /// (1 = repaint). MEASURED against ComfyUI (tools/anima-ref/check_lllite.py): black instead of 0 in the hole costs 3.4e-2 on block 0, a {0, 1} mask
+    /// channel 1.2e-1, an inverted mask 1.2e-1.
+    /// </summary>
+    public void InpaintPicture(FV rgb, FV mask, FV o, int H, int W, bool maskedInput = true)
+    {
+        _inpaintPic ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, FV, int, int>(InpaintPictureImpl);
+        _inpaintPic(4 * H * W, rgb, mask, o, H * W, maskedInput ? 1 : 0);
+    }
+
     /// <summary>
     /// The DiT's rotate-half phase table [N, 64, 2] for a T x H/2 x W/2 token grid (head dim 128): pairs 0..21 temporal (t * theta_t^(-2j/44)),
     /// 22..42 rows, 43..63 columns (index * theta_hw^(-2k/42), theta_hw = 10000 * 4^(42/40)). Computed in double, stored as float (the taps match it
