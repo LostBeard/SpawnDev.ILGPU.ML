@@ -4,6 +4,18 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+- **Anima** (circlestone-labs; Cosmos-Predict2-2B MiniTrainDIT + its LLM adapter, one file): `Anima.AnimaDiT` (28 blocks, 2048 wide, returns the flow
+  velocity) and `Anima.AnimaLlmAdapter` (Qwen3-0.6B final states + T5 ids -> the 1024-wide context rows), on the shared DiT kernels plus `AnimaKernels`
+  (the Cosmos patch layout, rotate-half RoPE, the cos-first timestep sinusoid). Conventions from the spec in `tools/anima-ref` (a float64 reference checked
+  against SpawnGen's ComfyUI taps). Against ComfyUI's dumps: the adapter 2.8e-6 .. 1.0e-5 relative RMS, the DiT's denoised output 7.5e-6 .. 1.8e-5 on the
+  first two sampler calls (both CFG rows), CUDA and OpenCL; 0.26 s a call at 512 x 512 on an RTX 4070 (CUDA). Tests `Anima_LlmAdapter_MatchesComfyUi`,
+  `Anima_DiT_MatchesComfyUi`, `Anima_DiT_StagesMatchComfyUiTaps` (HeavyModel; need the weights and the dumps on disk).
+- **Fixed: NaN from the precise (exact tensor-core) attention when k and v are separate blocks** (`MmaAttention.SplitPairs`, CUDA with
+  `PreciseActivations`, the default for the ComfyUI-parity models): the split pass took an element's column from `e % kvStride`, which is only right when k
+  and v share each row (vOff < kvStride, as every model so far laid them out). With all keys first and then all values (vOff = Nk * kvStride, Anima's DiT),
+  every value was centred and scaled as a key and left fp16's range. It now places each element by its row and column in each region. No model shipped
+  before used that layout; Anima found it (760 of 16384 head vectors NaN in block 0). `Ltx2_ExactAttentionKernels_MatchFloat64` now runs every pass in
+  both layouts (all lanes; red-checked: the old split gives a non-finite output).
 - **The models-host mirror index is read again after a failed read** (`ModelsHost`): a read that failed (the 20 s timeout, no network) was kept for the
   life of the process, so every file was then tried on the models host first: in a browser tab a 404 and a wasted round trip per unmirrored file until the
   page reloaded. Found in the 5.8.38 sweep (one process hit the timeout; `ModelsHost_TheHuggingFaceTokenNeverReachesTheModelsHost` failed on it, 4/4 alone).

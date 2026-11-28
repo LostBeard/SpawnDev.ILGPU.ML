@@ -445,7 +445,7 @@ public sealed class DiTKernels
     private Action<KernelConfig, FV, UV, FV, UV, int, int, int, int, int, int, int, int>? _flashExact;
     private Action<KernelConfig, FV, UV, FV, FV, int, int, int, int, int, int, int, int, int>? _flashBias;   // BiasedAttention on the tensor cores
     private Action<KernelConfig, FV, UV, FV, FV, UV, int, int, int, int, int, int, int, int, int>? _flashExactBias;
-    private Action<Index1D, FV, UV, FV, UV, int, int, int, int>? _splitPairs;
+    private Action<Index1D, FV, UV, FV, UV, int, int, int, int, int>? _splitPairs;
     private Action<Index1D, FV, FV, UV, int, int, int, int, int, int>? _maxAbs;
     private Action<Index1D, FV, FV, int, int, int>? _keyMean;
     private MemoryBuffer1D<uint, Stride1D.Dense>? _kvSplit;
@@ -582,7 +582,7 @@ public sealed class DiTKernels
     private void PrepareExact(FV q, int qStride, int qOff, FV kv, int kvStride, int kOff, int vOff, int Nq, int Nk, int H, int D)
     {
         if ((kvStride & 1) != 0 || (kOff & 1) != 0 || (vOff & 1) != 0) throw new ArgumentException("the tensor-core attention reads k / v as pairs: kvStride, kOff and vOff must be even");
-        _splitPairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, UV, int, int, int, int>(MmaAttention.SplitPairs);
+        _splitPairs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, UV, FV, UV, int, int, int, int, int>(MmaAttention.SplitPairs);
         _keyMean ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, int, int, int>(MmaAttention.KeyMean);
         _maxAbs ??= _acc.LoadAutoGroupedStreamKernel<Index1D, FV, FV, UV, int, int, int, int, int, int>(MmaAttention.MaxAbs);
         long pairs = ((long)(Nk - 1) * kvStride + Math.Max(kOff, vOff) + H * D + 1) / 2;
@@ -594,7 +594,7 @@ public sealed class DiTKernels
         _maxAbs(MmaAttention.MaxAbsThreads, q, _kMean.View, _scl.View, 0, Nq, qStride, qOff, H * D, 0);
         _maxAbs(MmaAttention.MaxAbsThreads, kv, _kMean.View, _scl.View, 1, Nk, kvStride, kOff, H * D, 1);
         _maxAbs(MmaAttention.MaxAbsThreads, kv, _kMean.View, _scl.View, 2, Nk, kvStride, vOff, H * D, 0);
-        _splitPairs((int)pairs, kv, _kvSplit.View, _kMean.View, _scl.View, kvStride, kOff, vOff, H * D);
+        _splitPairs((int)pairs, kv, _kvSplit.View, _kMean.View, _scl.View, kvStride, kOff, vOff, H * D, Nk);
     }
 
     /// <summary>

@@ -1277,18 +1277,25 @@ public abstract partial class MLTestBase
                         want[i * C + h * D + d] = (float)(acc / sum);
                     }
                 }
-            using var q = accelerator.Allocate1D(qh); using var kv = accelerator.Allocate1D(kvh); using var o = accelerator.Allocate1D<float>((long)Nq * C);
-            async Task<double> Run(Trellis2.DiTKernels k)
+            // the same keys and values as two blocks (all k rows, then all v rows: kvStride C, vOff Nk * C; Anima's DiT): every kernel takes any vOff. The exact
+            // tensor-core kernel's split pass took the column from e % kvStride until 2026-11-28, which treated every v value as a key in this layout (NaN on Anima).
+            var blocks = new float[Nk * 2 * C];
+            for (int j = 0; j < Nk; j++) { Array.Copy(kvh, j * 2 * C, blocks, j * C, C); Array.Copy(kvh, j * 2 * C + C, blocks, Nk * C + j * C, C); }
+            using var q = accelerator.Allocate1D(qh); using var kv = accelerator.Allocate1D(kvh); using var kvb = accelerator.Allocate1D(blocks); using var o = accelerator.Allocate1D<float>((long)Nq * C);
+            async Task<double> Run(Trellis2.DiTKernels k, bool blockLayout = false)
             {
                 o.View.MemSetToZero();
-                k.Attention(q.View, C, 0, kv.View, 2 * C, 0, C, default, o.View, Nq, Nk, H, D);
+                if (blockLayout) k.Attention(q.View, C, 0, kvb.View, C, 0, Nk * C, default, o.View, Nq, Nk, H, D);
+                else k.Attention(q.View, C, 0, kv.View, 2 * C, 0, C, default, o.View, Nq, Nk, H, D);
                 await accelerator.SynchronizeAsync();
                 var got = await o.View.CopyToHostAsync();
-                Ur_Expect(got.All(float.IsFinite), "a non-finite attention output");
+                Ur_Expect(got.All(float.IsFinite), $"a non-finite attention output{(blockLayout ? " (k and v as blocks)" : "")}");
                 return F2_RelRms(got, want);
             }
             double ep = await Run(portable), ex = await Run(exactTc), ef = await Run(fast);
-            report.Add($"q x {qScale:G3}, k x {kScale:G3}, v x {vScale:G3}, k common x {kCommon:G3}: portable {ep:E2}, exact tensor cores {ex:E2}, fast {ef:E2}");
+            double bp = await Run(portable, true), bx = await Run(exactTc, true), bf = await Run(fast, true);
+            report.Add($"q x {qScale:G3}, k x {kScale:G3}, v x {vScale:G3}, k common x {kCommon:G3}: portable {ep:E2}, exact tensor cores {ex:E2}, fast {ef:E2}; k, v as blocks: {bp:E2} / {bx:E2} / {bf:E2}");
+            ep = Math.Max(ep, bp); ex = Math.Max(ex, bx);
             if (kCommon != 0 && Trellis2.DiTKernels.EnableTensorCores && SpawnDev.ILGPU.ML.Kernels.CudaCaps.TensorCores(accelerator))
             {
                 // the red check of the centring: the same kernel without it must be clearly worse on these keys
